@@ -4087,8 +4087,10 @@ def any_reservation_node_pool(name, zones=("us-central1-a",), machine_type="n2-s
 
 def open_reservation(name, zone, machine_type="n2-standard-2", count=1, in_use=0, project="acme", **extra):
     """One `reservations list` item that each matching machine can consume:
-    not "specific required". The field names are those of the reservation read
-    from the same cluster's project; the counts are strings."""
+    not "specific required". A trimmed copy of such a reservation, read from
+    a throwaway cluster's project on 2026-11-25: the field
+    `specificReservationRequired` is present with the value false, and the
+    counts are strings."""
     return {
         "kind": "compute#reservation",
         "name": name,
@@ -4240,6 +4242,19 @@ class AnyReservationPoolTest(unittest.TestCase):
         self.assertIn("were not read in this run: any-pool", entry["checks_unevaluated"][0]["reason"])
         self.assertEqual(entry["commands"], [])
         self.assertTrue(entry["limitations"].startswith("an earlier limitation; reservation-mismatch-risk could not be judged: "))
+
+    def test_the_procedure_describes_the_arm(self):
+        """The procedure's text for (e), held in step with the collector: the
+        setting, the severity, the collector's own Impact and the marker."""
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        section = text.split(f"(`{self.SLUG}`)")[1].split("\n#### ")[0]
+        lines = {line.split(":**")[0]: line for line in section.splitlines() if line.startswith("- **")}
+        self.assertIn(f"(e) a node pool consumes any matching reservation (`config.reservationAffinity.consumeReservationType: {fs.POOL_ANY_RESERVATION}`)", lines["- **Flag when"])
+        self.assertIn("a node pool with no reservation setting consumes a matching reservation of its zone in the same way", lines["- **Flag when"])
+        self.assertIn(f"`{fs.ANY_RESERVATION_SEVERITY}` for unallocated capacity mismatches ((c) and (e))", lines["- **Severity"])
+        self.assertIn("For (d) and (e) the collector writes the arm's own Impact", lines["- **Impact"])
+        self.assertIn("For (e): `kind: manual`", lines["- **Remediation"])
+        self.assertIn(f"`needs_triage: {fs.RESERVED_POOL_TRIAGE}`", lines["- **Remediation"])
 
     def test_an_entry_with_no_such_pool_is_left_as_it_is(self):
         entry = {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"}

@@ -56,7 +56,10 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
   nothing here does. The node pool form is 3.10(d), `file_reserved_pools`: its
   pool and reservation shapes
   are pinned by `test_fleet_stockout.py` against responses read from a
-  throwaway cluster (GKE 1.35.8) on 2026-11-18.
+  throwaway cluster (GKE 1.35.8) on 2026-11-18. 3.10(e), a node pool that
+  consumes any matching reservation while each such reservation is in
+  another zone, is `file_any_reservation_pools`, with shapes read on
+  2026-11-24 and 2026-11-25.
 
 The rest need a read this collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
