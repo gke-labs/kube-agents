@@ -1417,12 +1417,19 @@ func (a *adapter) publishUsage(ctx context.Context, t resultTelemetry) {
 // artifacts, the milestone stream the gateway's rolling line renders at zero
 // model cost. (The spec's explicit progress tool is the stage 3 shape;
 // mapping the narration is the playground stand-in, recorded in the
-// findings.) An input that does not marshal publishes nothing.
+// findings.) An input that does not marshal publishes nothing. A call id,
+// when the harness gives one, goes beside the input as callId, never in it,
+// so it joins the call to a refused-call log record without changing what
+// the input matches.
 func (a *adapter) publishActivity(ctx context.Context, ev Event) {
-	entry, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"tool":  ev.Tool,
 		"input": ev.Input,
-	})
+	}
+	if ev.CallID != "" {
+		fields["callId"] = ev.CallID
+	}
+	entry, err := json.Marshal(fields)
 	if err != nil {
 		return
 	}

@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 )
 
 // TestOnlyARefusedCallLineReachesTheWorkerLog: of everything a harness
@@ -92,5 +95,66 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 	}
 	if strings.Contains(logs.String(), "secret") {
 		t.Errorf("other stderr reached the log: %s", logs.String())
+	}
+}
+
+// TestACoreAgentToolCallsActivityCarriesItsCallID: end to end, a core-agent
+// tool call's activity entry carries the harness's call id as callId,
+// beside the input and never in it, so it joins a refused-call record; the
+// input is passed as it was. A harness that gives no id, Claude Code here,
+// gets no callId key at all.
+func TestACoreAgentToolCallsActivityCarriesItsCallID(t *testing.T) {
+	for _, c := range []struct {
+		name, script string
+		driver       Driver
+		wantCallID   string
+	}{
+		{"core-agent", `
+read first || exit 1
+echo '{"type":"init","session":"s1","model":"m"}'
+echo '{"type":"tool_call","id":"adk-42","tool":"bash","input":{"command":"kubectl get pods"}}'
+echo '{"type":"tool_result","id":"adk-42","tool":"bash","text":"ok"}'
+echo '{"type":"result","text":"done"}'
+`, NewCoreAgentDriver(coreagentwire.Policy{}, nil), "adk-42"},
+		{"claude-code", `
+read first || exit 1
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"kubectl get pods"}}]}}'
+echo '{"type":"result","subtype":"success","result":"done"}'
+`, nil, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			url := startServer(t)
+			cl := testClient(t, url)
+			session, taskID := "chat-callid-"+c.name, "task-callid-"+c.name
+			submit(t, cl, session, taskID, "look")
+			cfg := adapterConfig(url, taskID, session, stub(t, c.script))
+			cfg.Driver = c.driver
+			if out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second); out.err != nil {
+				t.Fatalf("run: %v", out.err)
+			}
+			a := foldTask(t, cl, session, taskID).Artifact(lib.ArtifactActivity)
+			if a == nil || len(a.Parts) != 1 {
+				t.Fatalf("activity artifact %+v, want one entry", a)
+			}
+			var entry map[string]json.RawMessage
+			if err := json.Unmarshal(a.Parts[0].Data, &entry); err != nil {
+				t.Fatal(err)
+			}
+			var input map[string]any
+			if err := json.Unmarshal(entry["input"], &input); err != nil || len(input) != 1 || input["command"] != "kubectl get pods" {
+				t.Errorf("input %s, want exactly the call's arguments", entry["input"])
+			}
+			raw, has := entry["callId"]
+			if c.wantCallID == "" {
+				if has {
+					t.Errorf("entry %s has a callId the harness never gave", a.Parts[0].Data)
+				}
+				return
+			}
+			var id string
+			if err := json.Unmarshal(raw, &id); err != nil || id != c.wantCallID {
+				t.Errorf("callId %s, want %q", raw, c.wantCallID)
+			}
+		})
 	}
 }

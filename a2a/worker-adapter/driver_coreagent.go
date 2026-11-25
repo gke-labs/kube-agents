@@ -164,7 +164,7 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	case coreagentwire.TypeText:
 		return []Event{{Kind: EventProgress, Text: ln.Text}}, nil
 	case coreagentwire.TypeToolCall:
-		return []Event{{Kind: EventActivity, Tool: ln.Tool, Input: ln.Input}}, nil
+		return []Event{{Kind: EventActivity, Tool: ln.Tool, Input: ln.Input, CallID: ln.ID}}, nil
 	case coreagentwire.TypeToolResult:
 		return []Event{{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}}, nil
 	case coreagentwire.TypeResult:
