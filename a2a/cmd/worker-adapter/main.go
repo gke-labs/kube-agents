@@ -286,6 +286,9 @@ func resetPaths(v string) []string {
 func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
 	cfg.HarnessCommand = profileHarnessCommand()
 	cfg.HarnessCommandNoDelegate = nil
+	// The persona is a profile worker's instruction layer; the session
+	// lines are not its own.
+	cfg.Driver = workeradapter.WithInstructions(cfg.Driver, nil)
 	cfg.DelegateSocket = ""
 	return cfg
 }
@@ -349,6 +352,11 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
 		return workeradapter.Config{}, false
 	}
+	// core-agent reads a session pod's system-prompt lines from each turn's
+	// envelope, not its argv. No delegate line: core-agent has no delegate
+	// tool yet (its MCP servers aren't wired), and a model told of a tool it
+	// doesn't have calls it. A profile worker drops these (profileModeConfig).
+	driver = workeradapter.WithInstructions(driver, sessionPrompts(os.Getenv))
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
 	log.Info("harness selected", "harness", string(harness))
@@ -431,9 +439,22 @@ func sessionWriteRefusalDir(session, workdir string) string {
 	return filepath.Join(workdir, writeRefusalSubdir)
 }
 
-// harnessCommand builds the harness argv: the native binary driven over the
-// headless stream-json contract. A2A_HARNESS_CMD overrides the whole argv
-// (tests, stubs); A2A_HARNESS_EXTRA_ARGS appends without replacing.
+// sessionPrompts is a session pod's system-prompt lines for its cluster
+// access, before the delegate line, which goes only with the delegate tool.
+// The no-cluster line keys on the view, not on Bash: a view pod whose
+// override leaves Bash out still holds the broker's URL, token file and
+// shims, so telling it they aren't there would be false. It gets neither.
+func sessionPrompts(getenv func(string) string) []string {
+	_, _, clusterView, bashView := sessionToolLists(getenv)
+	switch {
+	case bashView:
+		return []string{clusterViewPrompt}
+	case !clusterView && getenv(lib.EnvProfileExecutor) != "true":
+		return []string{noClusterPrompt}
+	}
+	return nil
+}
+
 func harnessCommand() []string {
 	if cmd := os.Getenv("A2A_HARNESS_CMD"); cmd != "" {
 		return strings.Fields(cmd)
@@ -459,7 +480,7 @@ func harnessCommand() []string {
 	// control; this list agreeing with it is what keeps the failure legible.
 	// Under A2A_CLUSTER_VIEW the egress fence has one more peer, the
 	// credential broker, and Bash is what reaches it.
-	allowed, disallowed, clusterView, bashView := sessionToolLists(os.Getenv)
+	allowed, disallowed, _, _ := sessionToolLists(os.Getenv)
 	// The delegate tool has its own switch, independent of
 	// A2A_ALLOWED_TOOLS: it is appended to whatever surface was resolved
 	// above, including an explicit override, because the gateway -- not
@@ -467,15 +488,7 @@ func harnessCommand() []string {
 	// A2A_DELEGATE_TOOL=off is the one way to run without it, for a stub
 	// harness in tests or an older image.
 	delegateTool := delegateToolEnabled()
-	var prompts []string
-	// The no-cluster line keys on the view, not on Bash: a view pod whose
-	// override leaves Bash out still holds the broker's URL, token file and
-	// shims, so telling it they aren't there would be false. It gets neither.
-	if bashView {
-		prompts = append(prompts, clusterViewPrompt)
-	} else if !clusterView && os.Getenv(lib.EnvProfileExecutor) != "true" {
-		prompts = append(prompts, noClusterPrompt)
-	}
+	prompts := sessionPrompts(os.Getenv)
 	if delegateTool {
 		allowed += "," + delegateToolID
 		prompts = append(prompts, delegatePrompt)

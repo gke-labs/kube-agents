@@ -39,6 +39,10 @@ type Envelope struct {
 	// MCP lists the MCP servers the turn may use, built at the start of the
 	// process and closed at its exit.
 	MCP []MCPServer `json:"mcp,omitempty"`
+	// Instructions are the worker's own system-prompt lines for the turn
+	// (a session pod's, as Claude Code gets them on --append-system-prompt),
+	// added to the agent's instruction, never to the conversation's history.
+	Instructions []string `json:"instructions,omitempty"`
 }
 
 // Policy is a turn's tool policy: the tools the model is offered and the
