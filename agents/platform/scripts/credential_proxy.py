@@ -494,7 +494,7 @@ BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
 # The session role's own share of that pool. Session pods are opened by chat
-# conversations, and under the cluster-view flag all of them draw on the one
+# conversations, and under the session pods' cluster view all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
 # conversation holding slow reads could starve the shell for the slot wait.
 # Counted before the pool is asked, and refused at once rather than queued:
@@ -2558,8 +2558,8 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
 # a2a-chat role reach the Teams routes (see _teams_route_roles).
 TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
-# The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# The session pod the A2A gateway spawns, under the session pods' cluster
+# view (the session route's default, or the operator's A2A_SESSION_CLUSTER_VIEW). Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
 # executes model output, and the read-only posture command_policy enforces is
 # the view it gets. A demo aid until declarative profiles carry a session's
@@ -2598,6 +2598,16 @@ CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
 CALLER_ROLE_CURATOR = "curator"
+# The callers whose project-wide cluster listings (`gcloud container clusters
+# list`, `operations list`) drop the install's excluded clusters (#7031). The
+# platform agent's own shell keeps the full list: its upgrade-readiness watch
+# grades an excluded cluster's versions from it, as the exclusion's docs say.
+# The scope role is left out too: its lookups are the reconcile's own, matched
+# token for token (scope_policy.SHAPES), and the reconcile leaves excluded
+# clusters out by itself.
+LISTING_FILTERED_ROLES = frozenset({CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE})
+# The project segment of a relayed GKE path (v1/projects/<project>/...).
+API_RELAY_PROJECT_SEGMENT = 2
 CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -14960,6 +14970,15 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def _mcp_listing_tool(server_name: str, message: Any) -> str | None:
+    """The gke listing tool a tools/call names (mcp_policy.GKE_LISTING_TOOLS), or None."""
+    if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if name in mcp_policy.GKE_LISTING_TOOLS else None
+
+
 def mcp_relay_decision(
     principal: Principal | None, server_name: str, message: dict[str, Any] | None
 ) -> tuple[command_policy.Decision, frozenset[str] | None]:
@@ -16093,6 +16112,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         exclusions = getattr(self, "exclusions", None)
         if exclusions is not None:
             try:
+                if principal.role in LISTING_FILTERED_ROLES:
+                    # A project-wide cluster listing drops excluded clusters for
+                    # these callers (cluster_metadata_scope.scoped_listing_argv).
+                    argv = cluster_metadata_scope.scoped_listing_argv(argv, exclusions)
                 argv = cluster_metadata_scope.scoped_argv(argv, exclusions)
             except scope_exclude.ExcludedCluster as exc:
                 self._refuse_excluded_cluster(exc, request_id, audit, count)
@@ -16747,7 +16770,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # check was still let through for that resource, and over the cap
                 # the upstream has served it.
                 LOGGER.info(API_RELAY_BODY_CHECKED_LOG, request_id, decision.rule_id, resource)
-        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and (
+            self.headers.get(GET_CREDENTIALS_CHECK_HEADER) or CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES
+        ):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
             segments = path.split("/")
@@ -16855,6 +16880,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
+            relay_exclusions = getattr(self, "exclusions", None)
+            if (decision.rule_id == api_policy.GKE_CLUSTER_LIST_RULE and relay_exclusions is not None
+                    and CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES):
+                # The relay is the shell's: its listing drops excluded clusters
+                # only when the shell is among the filtered callers (#7031).
+                # The route's pattern fixes the path: v1/projects/<project>/...
+                try:
+                    upstream = replace(upstream, body=cluster_metadata_scope.filtered_cluster_list(
+                        upstream.body, path.split("/")[API_RELAY_PROJECT_SEGMENT], relay_exclusions,
+                    ))
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, lambda _status: None)
+                    return
         # `resource` has passed the route's body check, so it is logged as it is. The
         # audit mapping stays identifiers and outcomes.
         LOGGER.info(
@@ -17106,6 +17144,30 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
                 reply_body = filtered
+        listing_tool = _mcp_listing_tool(server_name, message)
+        if (
+            refused is None
+            and listing_tool is not None
+            and principal is not None
+            and principal.role in LISTING_FILTERED_ROLES
+            and upstream.status < HTTPStatus.MULTIPLE_CHOICES
+        ):
+            # A gke listing drops the install's excluded clusters for these
+            # callers (#7031); a reply the broker can't read is refused while
+            # any cluster is excluded rather than relayed whole. Unreachable
+            # today: this relay admits chat and profile, and profile workers are
+            # refused the gke server, so it applies only if chat joins the set.
+            try:
+                if self.exclusions.excluded_names_pattern() is not None:
+                    filtered = mcp_policy.filter_listing_reply(
+                        listing_tool, reply_body, self._is_excluded_cluster,
+                    )
+                    if filtered is None:
+                        refused = ("UPSTREAM_UNREADABLE", "the upstream listing reply could not be read")
+                    else:
+                        reply_body = filtered
+            except scope_exclude.ExcludedCluster:
+                refused = ("UPSTREAM_UNREADABLE", "the install's scope file can't be read, so the listing isn't relayed")
         if refused is not None:
             code, reason = refused
             LOGGER.warning(
@@ -18941,6 +19003,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         except scope_exclude.ExcludedCluster as exc:
             return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
         return None
+
+    def _is_excluded_cluster(self, project: str, location: str, cluster: str) -> bool:
+        """Whether the install excludes this cluster (holds aside), for a listing filter."""
+        try:
+            self.exclusions.check(project, location, cluster, include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            if exc.rule == scope_exclude.RULE_EXCLUDE_UNREADABLE:
+                raise
+            return True
+        return False
 
     def _refuse_excluded_cluster(
         self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,

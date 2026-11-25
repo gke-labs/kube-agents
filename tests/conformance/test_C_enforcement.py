@@ -1279,8 +1279,7 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
-        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
-        the operator's cluster-view flag, kube-proxy on 8443 and the credential
+        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under the session pods' cluster view, kube-proxy on 8443 and the credential
         broker on 8765) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
@@ -1296,8 +1295,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         - Automount stays off, so the default-audience token -- the one the API
           server accepts -- is never mounted.
         - Every token that is mounted is a projected token naming an audience
-          that is not the API server's: the bus, and, under the operator's
-          A2A_SESSION_CLUSTER_VIEW flag, the session audience accepted by
+          that is not the API server's: the bus, and, under the session pods'
+          cluster view (the session route's default, or the operator's
+          A2A_SESSION_CLUSTER_VIEW=true), the session audience accepted by
           kube-proxy and the credential broker. The API server refuses both for
           anything else, so neither is a cluster credential even though both
           are Kubernetes ones; TokenReview and each proxy's per-audience policy
@@ -1337,7 +1337,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "bus credential moved, this test has to move with it",
         )
         # The audiences a session pod may hold, by constant name: the bus, and
-        # the broker's session audience that the cluster-view flag projects.
+        # the broker's session audience that the cluster view projects.
         # Anything else is a token for a destination the fence never admitted.
         permitted_audiences = ("lib.BusTokenAudience", "credentialProxySessionAudience")
         for projection in projections:
@@ -1900,6 +1900,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
@@ -1925,6 +1926,15 @@ class C1IsolationIsStructural(unittest.TestCase):
                     re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
                     "the shim no longer reads %s by that name" % name,
                 )
+
+        # KUBE_PROXY_MODE gates the session kubectl wrapper's write-attempt
+        # record: the spawner sets it, the wrapper and the client read it. A
+        # rename on either side records nothing, and no session turn stops.
+        with self.subTest(env="KUBE_PROXY_MODE"):
+            self._one_match(r'Name:\s*"KUBE_PROXY_MODE"', spawner, "the spawner's render of KUBE_PROXY_MODE")
+            self.assertRegex(shim, r'KUBE_PROXY_MODE_ENV\s*=\s*"KUBE_PROXY_MODE"', "the client no longer reads KUBE_PROXY_MODE")
+            wrapper = (h.REPO_ROOT / "deploy" / "sandbox" / "session-kubectl.sh").read_text(encoding="utf-8")
+            self.assertIn("${KUBE_PROXY_MODE:-}", wrapper, "the kubectl wrapper no longer reads KUBE_PROXY_MODE")
 
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
