@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -1111,7 +1112,10 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 				// have found after the cut (", password: x", a URL's
 				// credential) is still tracked, as it is when the value
 				// ends at the cut.
-				scrubEnvRest(rest, sink)
+				// In its line context ("value: <redacted>, ..."), so a key
+				// after the cut is not read as starting a line of its own,
+				// which would read its value to the line's end.
+				scrubEnvRest("value: "+Redacted+s[cutAt:cutAt+1]+rest, sink)
 			}
 		}
 	}
@@ -1516,7 +1520,9 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 		// only as a last resort, so a scheme word never joins the value.
 		// A note after it is left only when no word of it may be a value
 		// (tableNoteAfterSpan); else the rest of the cell goes with it.
-		if len(code) == 1 && (end >= cellHi || n[end] == ' ' || n[end] == '\t') && tableNoteAfterSpan(class, n[end:cellHi]) {
+		// A span that ends at or past the cell's trimmed end (its content
+		// may end in a blank) has nothing after it: the slice is not taken.
+		if len(code) == 1 && (end >= cellHi || (n[end] == ' ' || n[end] == '\t') && tableNoteAfterSpan(class, n[end:cellHi])) {
 			cands = [][2]int{span, {valueLo, cellHi}, {cellLo, cellHi}}
 		} else {
 			cands = [][2]int{{valueLo, cellHi}, span, {cellLo, cellHi}}
@@ -1576,11 +1582,23 @@ func schemeProse(v string) bool {
 func tableNoteAfterSpan(class secretKeyClass, rest string) bool {
 	for _, w := range strings.Fields(rest) {
 		w = trimValueEdges(strings.TrimLeft(trimValueEdges(w), "([{"))
-		if valueTokenShaped(w) || class == strongSecretKeyClass && !valueNotASecret(w) {
+		if valueTokenShaped(w) || class == strongSecretKeyClass && !tableNoteWordUnderStrongKey(w) {
 			return false
 		}
 	}
 	return true
+}
+
+// tableNoteWordUnderStrongKey says whether a word after a code span, under a
+// strong key, is plainly a note: a state word ("rotated", "(none)") or one
+// with no letter or digit ("/", "-"). A short number or a placeholder, which
+// valueNotASecret lets pass elsewhere, may be the rest of the value here.
+func tableNoteWordUnderStrongKey(w string) bool {
+	lower := strings.ToLower(w)
+	if credentialStateWords[lower] || credentialWholeValueWords[lower] || plainHyphenatedStatePhrase(w) {
+		return true
+	}
+	return !strings.ContainsFunc(w, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) })
 }
 
 // tableKeyNamed says whether a table's key cell names a credential

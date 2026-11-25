@@ -732,7 +732,8 @@ a status message is the bridge's own text. There are two passes:
      the API proxy) leaves kind off its items, whether the list's kind comes before its items or
      after them (keys sorted). A quoted YAML `stringData` value is tracked both as written and with
      its escapes read, and a `data` value that ends in whitespace is also tracked as the base64 of
-     its trimmed value. JSON cut short is
+     its trimmed value, as a spare: it takes only free room and is the first entry dropped when room
+     is needed, so it never costs a value its place. JSON cut short is
      scanned object by object: a data block is read for its own object's kind, whatever other
      kinds the text holds. kubectl prints a block before its object's kind, so an item cut inside
      its data counts as a Secret only when every item of its list before it was one, and a single
@@ -760,7 +761,7 @@ a status message is the bridge's own text. There are two passes:
    and 768 KiB, shape-caught values 128 entries and 256 KiB. Each tool result has an allowance in
    each pool (Secret 128 entries and 256 KiB, shape-caught 64 entries and 96 KiB, charged with
    what it actually added) and may evict only its own earlier entries, never an earlier
-   result's. Past its allowance a new value replaces that result's own oldest entry. When a pool
+   result's, except an earlier result's spare trimmed forms, which go first. Past its allowance a new value replaces that result's own oldest entry. When a pool
    is full of earlier results' entries the value is refused, and at finalize the bridge logs how
    many it refused, at debug and as a number only (`seen-set refused N values`). So a task whose
    results hold more secret values than the pools keep tracks the earliest ones; the rest are

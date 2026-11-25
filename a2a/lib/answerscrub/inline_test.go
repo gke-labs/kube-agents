@@ -1005,6 +1005,9 @@ func TestSeenSecrets_ABlockEnvValueCutAtACommaIsTracked(t *testing.T) {
 		"- name: API_TOKEN\n  value: synthtoken0001abcd, rotated weekly\n":                             {"synthtoken0001abcd"},
 		// Another credential pair after the comma is read as its own.
 		"- name: API_TOKEN\n  value: synthtoken0001abcd, password: synthpass0002wxyz\n": {"synthtoken0001abcd", "synthpass0002wxyz"},
+		// With words after the second value too: it is read in its line
+		// context, not as a line of its own that runs to the end.
+		"- name: DB_PASSWORD\n  value: synthpass0001abcd, password: plumgravy7731kqzx is the old one\n": {"synthpass0001abcd", "plumgravy7731kqzx"},
 	} {
 		var s Seen
 		s.CollectToolResult(terminalResult(t, in))
@@ -1052,6 +1055,13 @@ func TestSeenSecrets_APlainWordAfterASchemeWordInATableIsNotTracked(t *testing.T
 // out from under its header.
 func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 	cases := []struct{ in, want string }{
+		// A short number or a placeholder after the span, under a strong key,
+		// may be the rest of the value: the whole cell goes.
+		{"| Key | Value |\n|---|---|\n| password | `admin` / 12345 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// A code span whose content ends in a blank or a tab, at the cell's
+		// end: no panic, and the value is redacted.
+		{"| Key | Value |\n|---|---|\n| DB password | `synthtoken0001abcd ` |\n", "| Key | Value |\n|---|---|\n| DB password | `[redacted]` |\n"},
+		{"| Key | Value |\n|---|---|\n| DB password | `synthtoken0001abcd\t` |\n", "| Key | Value |\n|---|---|\n| DB password | `[redacted]` |\n"},
 		{"| Key | Value |\n|---|---|\n| api_token | Bearer `synthtoken0001abcd` |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted]` |\n"},
 		{"| Key | Value |\n|---|---|\n| password | `quietpasture` (rotated) |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` (rotated) |\n"},
 		// The every-pipe split also redacts a fragment, as before: fail
