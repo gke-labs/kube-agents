@@ -22,6 +22,10 @@ import (
 // their tools before the turn fails.
 var mcpStartBound = 60 * time.Second
 
+// mcpConfigParent is where buildMCP makes its private config directory
+// ("" is the system temp dir); a test points it elsewhere to watch it.
+var mcpConfigParent = ""
+
 // mcpLog is where a server's elicitation notices go.
 var mcpLog = func(s string) { fmt.Fprintln(os.Stderr, "core-agent-harness: mcp:", s) }
 
@@ -37,8 +41,10 @@ var mcpLog = func(s string) { fmt.Fprintln(os.Stderr, "core-agent-harness: mcp:"
 // tool its entry names.
 //
 // Servers come only from the Envelope: core-agent's builder reads them from
-// an mcp.json in a fresh private directory, written and removed here, and
-// reads no other config. No value is interpolated: a ${env:NAME} in an env
+// an mcp.json in a fresh 0700 directory and reads no other config. The
+// directory is gone when buildMCP returns, before the agent is built and
+// before any tool runs, so a command the turn runs (same UID) never finds a
+// config still waiting to be read. No value is interpolated: a ${env:NAME} in an env
 // value fails the turn rather than reading the harness's environment.
 func buildMCP(ctx context.Context, servers []coreagentwire.MCPServer, gate *permissions.Gate) ([]adktool.Toolset, func(), error) {
 	if len(servers) == 0 {
@@ -48,7 +54,7 @@ func buildMCP(ctx context.Context, servers []coreagentwire.MCPServer, gate *perm
 	if err != nil {
 		return nil, func() {}, err
 	}
-	dir, err := os.MkdirTemp("", "core-agent-mcp-")
+	dir, err := os.MkdirTemp(mcpConfigParent, "core-agent-mcp-")
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("mcp config dir: %w", err)
 	}

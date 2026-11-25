@@ -92,9 +92,17 @@ func gone(t *testing.T, pidFile string) bool {
 func TestEachServerRegistersOnlyItsGrantedTools(t *testing.T) {
 	srv, pidFile := fakeServer(t, "fake", "a,b,c", "a", "b")
 	deleg, _ := fakeServer(t, "a2a", "delegate", "delegate")
+	parent := t.TempDir()
+	prev := mcpConfigParent
+	mcpConfigParent = parent
+	t.Cleanup(func() { mcpConfigParent = prev })
 	sets, closeAll, err := buildMCP(context.Background(), []coreagentwire.MCPServer{srv, deleg}, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The config core-agent read is gone before any tool can run.
+	if left, _ := os.ReadDir(parent); len(left) != 0 {
+		t.Errorf("the MCP config directory outlived buildMCP: %v", left)
 	}
 	var names []string
 	for _, ts := range sets {
