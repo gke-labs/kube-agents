@@ -126,8 +126,11 @@ func seenSecretKeySkipped(key string, saToken bool) bool {
 // number only). So neither pool can flush the other, and no result, a
 // forged or huge one included, can flush what earlier results carried; a
 // task whose results hold more values than the pools keep tracks the
-// earliest ones. A value both pools would hold is kept in the Secret pool
-// when it can take the value, else in the shape pool: in exactly one.
+// earliest ones. A spare form of a value (addSpareLocked) is the one
+// exception: it takes only free room, and any result's spare is dropped
+// before another entry when room is needed. A value both pools would
+// hold is kept in the Secret pool when it can take the value, else in the
+// shape pool: in exactly one.
 type Seen struct {
 	mu      sync.Mutex
 	set     map[string]bool // value -> held in the Secret pool
@@ -148,6 +151,9 @@ type seenPool struct {
 type seenEntry struct {
 	v   string
 	gen uint64
+	// spare: an extra form of a value (addSpareLocked), dropped before any
+	// other entry whenever room is needed.
+	spare bool
 }
 
 type seenCharge struct {
@@ -194,8 +200,10 @@ func (s *Seen) addPlain(v string, fromSecret bool, gen uint64) {
 // addEncoded tracks a Secret data value: the base64 form as given, and the
 // decoded value when it decodes to text, trimmed, with that trimmed value's
 // own base64 when trimming changed it (a file's or echo's trailing newline
-// gone, as a re-encoding of the value would have it). A value that decodes
-// to fewer than seenSecretMinBytes is not tracked in either form.
+// gone, as a re-encoding of the value would have it). That third form is a
+// spare (addSpareLocked): it never takes the place of another value. A
+// value that decodes to fewer than seenSecretMinBytes is not tracked in
+// either form.
 func (s *Seen) addEncoded(b64 string, gen uint64) {
 	b64 = strings.TrimSpace(b64)
 	raw, err := base64.StdEncoding.DecodeString(b64)
@@ -211,8 +219,36 @@ func (s *Seen) addEncoded(b64 string, gen uint64) {
 	trimmed := strings.TrimSpace(string(raw))
 	s.addLocked(trimmed, true, gen)
 	if trimmed != string(raw) {
-		s.addLocked(base64.StdEncoding.EncodeToString([]byte(trimmed)), true, gen)
+		s.addSpareLocked(base64.StdEncoding.EncodeToString([]byte(trimmed)), gen)
 	}
+}
+
+// addSpareLocked tracks v in the Secret pool for generation gen only while
+// gen's allowance and the pool both have room for it, evicting nothing,
+// and as a spare: the first entry dropped when another value needs room.
+// So the Secret pool's other entries are exactly what they would be with
+// no spare form tracked at all.
+func (s *Seen) addSpareLocked(v string, gen uint64) {
+	if s.closed || !seenSecretSized(v) || strings.Contains(v, Redacted) {
+		return
+	}
+	if _, held := s.set[v]; held {
+		return
+	}
+	if s.set == nil {
+		s.set = make(map[string]bool)
+		s.charge = make(map[seenCharge]seenUse)
+	}
+	p, maxEntries, maxBytes, allowEntries, allowBytes := s.pool(true)
+	key := seenCharge{gen, true}
+	u := s.charge[key]
+	if u.entries+1 > allowEntries || u.bytes+len(v) > allowBytes || len(p.entries)+1 > maxEntries || p.bytes+len(v) > maxBytes {
+		return
+	}
+	p.entries = append(p.entries, seenEntry{v, gen, true})
+	p.bytes += len(v)
+	s.set[v] = true
+	s.charge[key] = seenUse{u.entries + 1, u.bytes + len(v)}
 }
 
 func seenSecretSized(v string) bool {
@@ -229,6 +265,12 @@ func (s *Seen) addLocked(v string, fromSecret bool, gen uint64) {
 		s.charge = make(map[seenCharge]seenUse)
 	}
 	inSecret, held := s.set[v]
+	// Held only as a spare: added as if not held, the spare dropped only
+	// once the add is sure to succeed, so a refused add keeps it tracked.
+	spare := held && inSecret && s.secret.holdsSpare(v)
+	if spare {
+		inSecret, held = false, false
+	}
 	if held && (!fromSecret || inSecret) {
 		return
 	}
@@ -241,30 +283,54 @@ func (s *Seen) addLocked(v string, fromSecret bool, gen uint64) {
 	if allowEntries < 1 || len(v) > allowBytes {
 		return
 	}
+	// Other results' spares can be dropped for it too.
+	for _, e := range p.entries {
+		if e.spare && e.gen != gen {
+			own.entries++
+			own.bytes += len(e.v)
+		}
+	}
 	if len(p.entries)-own.entries+1 > maxEntries || p.bytes-own.bytes+len(v) > maxBytes {
 		s.refused++
 		return
+	}
+	if spare {
+		s.removeLocked(&s.secret, true, func(e seenEntry) bool { return e.spare && e.v == v })
 	}
 	if held {
 		// A shape-caught value a Secret also holds moves to the Secret pool.
 		s.removeLocked(&s.shape, false, func(e seenEntry) bool { return e.v == v })
 	}
+	// A spare goes first, its own result's within the allowance and any
+	// result's within the pool, then gen's own oldest entry.
 	for u := s.charge[key]; u.entries+1 > allowEntries || u.bytes+len(v) > allowBytes; u = s.charge[key] {
-		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
+		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen && e.spare }) &&
+			!s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
 			return // nothing of its own left to replace: refused
 		}
 	}
 	for len(p.entries)+1 > maxEntries || p.bytes+len(v) > maxBytes {
-		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
+		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.spare }) &&
+			!s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
 			s.refused++
 			return
 		}
 	}
-	p.entries = append(p.entries, seenEntry{v, gen})
+	p.entries = append(p.entries, seenEntry{v, gen, false})
 	p.bytes += len(v)
 	s.set[v] = fromSecret
 	u := s.charge[key]
 	s.charge[key] = seenUse{u.entries + 1, u.bytes + len(v)}
+}
+
+// holdsSpare says whether v is one of p's spares.
+func (p *seenPool) holdsSpare(v string) bool {
+	for _, e := range p.entries {
+		if e.spare && e.v == v {
+			return true
+		}
+	}
+	return false
 }
 
 // removeLocked drops the oldest entry of p that match says, and says

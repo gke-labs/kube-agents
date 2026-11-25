@@ -928,3 +928,77 @@ func TestSeenSecrets_AnEnvValueAfterASchemeWordIsTrackedAsItsEscapesRead(t *test
 		t.Fatalf("tracked: %q", s.Values())
 	}
 }
+
+// The trimmed value's own base64 is a spare form: tracking it never costs a
+// result a value it would have kept without it. One result's first Secret
+// value stays tracked after 22 more Secrets with two newline-ended values
+// each (44 such values, more than a third of the result's allowance).
+func TestSeenSecrets_TheTrimmedFormNeverEvictsAValue(t *testing.T) {
+	items := []string{fmt.Sprintf(`{"apiVersion":"v1","kind":"Secret","metadata":{"name":"first"},"type":"Opaque","data":{"password":%q}}`, b64("quietpasture-harbor"))}
+	for i := 0; i < 22; i++ {
+		items = append(items, fmt.Sprintf(`{"apiVersion":"v1","kind":"Secret","metadata":{"name":"s%d"},"type":"Opaque","data":{"a":%q,"b":%q}}`,
+			i, b64(fmt.Sprintf("synthfilevalue-a-%04d\n", i)), b64(fmt.Sprintf("synthfilevalue-b-%04d\n", i))))
+	}
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"apiVersion":"v1","kind":"List","items":[`+strings.Join(items, ",")+`]}`))
+	want := "The app logs in to the database with [redacted] today."
+	if got := Scrub("The app logs in to the database with quietpasture-harbor today.", &s); got != want {
+		t.Errorf("Scrub = %q, want %q", got, want)
+	}
+}
+
+// A value held only as a spare whose own add the target pool refuses stays
+// tracked as the spare: the spare is dropped only once the add succeeds.
+func TestSeenSecrets_ARefusedAddKeepsTheSpare(t *testing.T) {
+	var s Seen
+	for i := 0; i < seenShapePoolEntries/2; i++ {
+		s.AddShape(fmt.Sprintf("synthshapefill-%04d", i)) // the value and its base64
+	}
+	s.addEncoded(b64("synthfilevalue-0001\n"), s.newGen())
+	spare := b64("synthfilevalue-0001")
+	if !s.Has(spare) {
+		t.Fatalf("the spare form is not tracked; tracked %q", s.Values())
+	}
+	refused := s.refused
+	s.AddShape(spare) // the shape pool is full of earlier results' entries
+	if s.refused == refused {
+		t.Fatal("the shape pool did not refuse the add")
+	}
+	if !s.Has(spare) {
+		t.Error("a refused add dropped the spare: the value is tracked in neither form")
+	}
+}
+
+// Room for a later result is taken from earlier results' spares only:
+// every value those results would hold with no spare form stays tracked.
+func TestSeenSecrets_OnlySparesOfEarlierResultsAreEvicted(t *testing.T) {
+	var s Seen
+	a := s.newGen()
+	var aVals []string
+	for i := 0; i < 40; i++ {
+		v := fmt.Sprintf("synthfilevalue-a-%04d", i)
+		s.addEncoded(b64(v+"\n"), a)
+		aVals = append(aVals, v, b64(v+"\n"))
+	}
+	var others []string
+	for _, r := range []string{"b", "c"} {
+		g := s.newGen()
+		for i := 0; i < seenSecretResultEntries/2; i++ {
+			v := fmt.Sprintf("synthvalue-%s-%04d", r, i)
+			s.addPlain(v, true, g)
+			others = append(others, v, b64(v))
+		}
+	}
+	d := s.newGen()
+	for i := 0; i < seenSecretResultEntries/2; i++ {
+		s.addPlain(fmt.Sprintf("synthvalue-d-%04d", i), true, d)
+	}
+	for _, v := range append(aVals, others...) {
+		if !s.Has(v) {
+			t.Errorf("%q, a value kept with no spare form, was evicted", v)
+		}
+	}
+	if s.Has(b64("synthfilevalue-a-0000")) {
+		t.Error("no spare was evicted to make room: the test does not exercise eviction")
+	}
+}

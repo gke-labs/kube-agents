@@ -1046,24 +1046,56 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 	pair := func(re *regexp.Regexp, nameG, valueG int) {
 		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
 			name := s[m[2*nameG]:m[2*nameG+1]]
+			if !inlineSecretKey(name) {
+				continue
+			}
 			lo, hi := m[2*valueG], m[2*valueG+1]
 			var decoded string
+			// The value's candidate ends, the first that reads as a value
+			// taken: a quoted value's closing quote; an unquoted one's
+			// line end, then its first , } or ] (a note, a URL or another
+			// value after it on the line).
+			var ends []int
+			cutAt, rest := -1, "" // an unquoted value's first , } or ], and the text after it
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
 				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
-			} else if hi = lo + envUnquotedValue(s[lo:hi]); hi <= lo {
-				continue
+				ends = []int{hi}
+			} else {
+				if strings.HasPrefix(s[lo:hi], "#") {
+					continue
+				}
+				ends = []int{lo + envUnquotedValue(s[lo:hi])}
+				if cut := strings.IndexAny(s[lo:hi], ",}]"); cut >= 0 {
+					ends = append(ends, lo+envUnquotedValue(s[lo:lo+cut]))
+					cutAt, rest = lo+cut, s[lo+cut+1:hi]
+				}
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
 				lo += sloc[1] // the scheme word stays, as under a key
 			}
-			v := s[lo:hi]
-			if !inlineSecretKey(name) || strings.Contains(v, Redacted[:len(Redacted)-1]) || !classValueRedacted(secretKeyClassOf(name), v, false) {
+			var reads []int // the candidate ends that read as a value, in order
+			for _, end := range ends {
+				if end > lo && !strings.Contains(s[lo:end], Redacted[:len(Redacted)-1]) && classValueRedacted(secretKeyClassOf(name), s[lo:end], false) {
+					reads = append(reads, end)
+				}
+			}
+			if len(reads) == 0 {
 				continue
 			}
+			hi = reads[0]
+			v := s[lo:hi]
 			spans = append(spans, [2]int{lo, hi})
 			if keyClearlyNamesSecret(name) {
 				sink.emit(v)
+				// The value cut at its first , } or ] is tracked too when
+				// it also reads as one: the line's whole text may hold a
+				// note after it, which an answer leaves off.
+				for _, end := range reads[1:] {
+					if end != hi {
+						sink.emit(s[lo:end])
+					}
+				}
 				// A quoted value is also tracked as its escapes read
 				// (a JSON or YAML "\"" is the value's own quote), past a
 				// scheme word as the value itself is.
@@ -1074,6 +1106,13 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 					sink.emit(decoded)
 				}
 			}
+			if cutAt >= 0 && hi > cutAt && sink != nil {
+				// The whole line went as the value: what other rules would
+				// have found after the cut (", password: x", a URL's
+				// credential) is still tracked, as it is when the value
+				// ends at the cut.
+				scrubEnvRest(rest, sink)
+			}
 		}
 	}
 	pair(envNameValueFlowPattern, 1, 2)
@@ -1081,6 +1120,13 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 	pair(envValueNamePattern, 2, 1)
 	return redactSpans(s, spans)
 }
+
+// scrubEnvRest is scrubInlineTo, run over the text after an env value's
+// first , } or ] for what it tracks; set in init, since the rules include
+// scrubEnvNameValuePairs itself.
+var scrubEnvRest func(s string, sink secretSink) string
+
+func init() { scrubEnvRest = scrubInlineTo }
 
 // envUnquotedValue is the length of an unquoted env value with a trailing
 // comment (a # after a blank, or one opening the value) and the blanks
@@ -1468,7 +1514,9 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 		// first span alone.
 		// The whole cell is read past the scheme word first, and with it
 		// only as a last resort, so a scheme word never joins the value.
-		if len(code) == 1 && (end >= cellHi || n[end] == ' ' || n[end] == '\t') {
+		// A note after it is left only when no word of it may be a value
+		// (tableNoteAfterSpan); else the rest of the cell goes with it.
+		if len(code) == 1 && (end >= cellHi || n[end] == ' ' || n[end] == '\t') && tableNoteAfterSpan(class, n[end:cellHi]) {
 			cands = [][2]int{span, {valueLo, cellHi}, {cellLo, cellHi}}
 		} else {
 			cands = [][2]int{{valueLo, cellHi}, span, {cellLo, cellHi}}
@@ -1485,10 +1533,14 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 		return nil
 	}
 	value := n[lo:hi]
+	// After an auth-scheme word, text plainly not a value, or a word that
+	// names the scheme's own use (Basic authentication), is prose: not
+	// tracked. Anything else there is.
+	track := named && (lo < valueLo || valueLo == cellLo || !schemeProse(value))
 	if idx != nil {
 		lo, hi = idx[lo], idx[hi-1]+1
 	}
-	if named {
+	if track {
 		// As written, and with its markdown taken out when that differs
 		// (a code span inside the value): an answer may echo either.
 		sink.emit(text[lo:hi])
@@ -1497,6 +1549,38 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sin
 		}
 	}
 	return [][2]int{{cell[0] + lo, cell[0] + hi}}
+}
+
+// schemeUseWords are the words that follow an auth-scheme word in prose
+// about the scheme rather than in front of a credential ("Basic
+// authentication", "Bearer token").
+var schemeUseWords = map[string]bool{
+	"auth": true, "authentication": true, "authorization": true, "authorisation": true,
+	"credential": true, "credentials": true, "token": true, "tokens": true,
+	"scheme": true, "header": true, "headers": true, "login": true,
+}
+
+// schemeProse says whether v, the text after an auth-scheme word, is
+// plainly not a value (valueNotASecret) or one of schemeUseWords.
+func schemeProse(v string) bool {
+	v = trimValueEdges(v)
+	return valueNotASecret(v) || schemeUseWords[strings.ToLower(v)]
+}
+
+// tableNoteAfterSpan says whether rest, the text of a table cell after
+// the code span holding its value, is a note that may stay: no word of it
+// token-shaped and, under a key of the strong class (where every other
+// word reads as a value), every word plainly not a value (valueNotASecret:
+// "(rotated)", "/"). Anything else may be a second value or the value
+// itself (`appuser` synthtoken0001abcd).
+func tableNoteAfterSpan(class secretKeyClass, rest string) bool {
+	for _, w := range strings.Fields(rest) {
+		w = trimValueEdges(strings.TrimLeft(trimValueEdges(w), "([{"))
+		if valueTokenShaped(w) || class == strongSecretKeyClass && !valueNotASecret(w) {
+			return false
+		}
+	}
+	return true
 }
 
 // tableKeyNamed says whether a table's key cell names a credential
