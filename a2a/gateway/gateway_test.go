@@ -1382,6 +1382,13 @@ type fakeSpawner struct {
 	// started is each pod's start time for PodStarted; startedErr fails it.
 	started    map[string]time.Time
 	startedErr error
+	// warm is what WarmPods lists; warmSpawns records SpawnWarm's names,
+	// each added to warm as a pod not yet Ready; warmSpawnErr fails
+	// SpawnWarm and warmErr fails WarmPods.
+	warm         []warmPod
+	warmSpawns   []string
+	warmSpawnErr error
+	warmErr      error
 	// liveSpawns makes each spawn count in live, as the pod it creates
 	// would in the cluster, and maxLive the most live has been since; the
 	// session-cap line's tests free a slot by lowering live.

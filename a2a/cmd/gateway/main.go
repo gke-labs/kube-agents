@@ -224,10 +224,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("config", "err", err)
 		return err
 	}
-	if cfg.SessionHarnessRefused != "" {
-		log.Error("A2A_SESSION_HARNESS names a harness this gateway doesn't spawn sessions for; session pods run the default harness (claude-code)",
-			"harness", cfg.SessionHarnessRefused)
-	}
+	logSessionHarnessRefused(log, cfg)
 	// The install's Tier resources, rendered by the operator (#3659): the
 	// mint validates every grant against the tier table.
 	capability.StartTierFile(ctx, os.Getenv, log)
@@ -651,4 +648,16 @@ func newInjectDoor(cfg *gateway.Config, log *slog.Logger) (*gateway.InjectAdapte
 		door.AllowConfirm()
 	}
 	return door, nil
+}
+
+// logSessionHarnessRefused says, at error level, that A2A_SESSION_HARNESS
+// named a harness this gateway doesn't spawn sessions for and that session
+// pods run the default harness instead. It is the gateway's half of making
+// that fallback loud (the operator's is the SessionHarness condition).
+func logSessionHarnessRefused(log *slog.Logger, cfg *gateway.Config) {
+	if cfg.SessionHarnessRefused == "" {
+		return
+	}
+	log.Error("A2A_SESSION_HARNESS names a harness this gateway doesn't spawn sessions for; session pods run the default harness (claude-code)",
+		"harness", cfg.SessionHarnessRefused)
 }
