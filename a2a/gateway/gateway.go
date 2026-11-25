@@ -241,6 +241,28 @@ type Gateway struct {
 	// triggerMint, when set, mints trigger run grants in place of the cap
 	// bucket's minter (tests: a mint that fails).
 	triggerMint func(ctx context.Context, taskID string, e capability.Entry) (capability.Ref, error)
+	// homeReporters post a schedule trigger's report to the install's home
+	// channel (scheduled_reports.go), the chat.notify routes of this term
+	// (SetHomeReporters); guarded by homeReportersMu.
+	homeReportersMu sync.Mutex
+	homeReporters   []homeReporter
+	// scheduledRetry is how long a terminal whose scheduled report failed
+	// to post waits before it is redelivered: scheduledPostRetryDelay, per
+	// gateway so a test can shorten it on its own.
+	scheduledRetry time.Duration
+	// scheduleClock is a scheduled run's finish time, which names its
+	// thread's day (schedule_threads.go): time.Now, unless a test steps it.
+	scheduleClock func() time.Time
+	// claimClock is what a day's thread claim is aged by against the time
+	// the server stored it: time.Now, unless a test skews it.
+	claimClock func() time.Time
+	// scheduledKVHook, when a test sets it, runs before each scheduled
+	// record or thread operation, with the bucket's name: a slow store.
+	scheduledKVHook func(bucket string)
+	// reportIncidents keeps each posted report against the thread it
+	// landed in, for a reply there to be answered with it
+	// (schedule_threads.go); nil keeps nothing.
+	reportIncidents reportIncidentWriter
 	// reports keeps the notify route's posts into conversations for the
 	// replies under them (reports.go).
 	reports pushedReports
@@ -686,6 +708,9 @@ func New(o Options) (*Gateway, error) {
 		peopleKeyer:      peopleKeys,
 		peoplePurgeRetry: peopleRetryInterval,
 		feedbackRetry:    feedbackRetryInterval,
+		scheduledRetry:   scheduledPostRetryDelay,
+		scheduleClock:    time.Now,
+		claimClock:       time.Now,
 		peopleRetry:      peopleRetryInterval,
 		peoplePurgeList:  listPeopleKeys,
 		log:              log,
@@ -2251,7 +2276,9 @@ func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionReco
 	g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
 		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
-	g.relayTerminal(ctx, rec, rs, taskID, status, source)
+	// The heal has no delivery to hand back: a scheduled report's failed post
+	// is its last (terminalTry zero).
+	g.relayTerminal(ctx, rec, rs, taskID, status, source, terminalTry{})
 }
 
 // runFoldedDelegate runs the delegate request a task's fold carries, if any,
