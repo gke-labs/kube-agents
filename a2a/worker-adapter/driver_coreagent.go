@@ -115,6 +115,12 @@ func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return nil
 // mid-turn short of interrupting it.
 func (coreAgentDriver) HoldsSteers() bool { return true }
 
+// OneTurnPerProcess: the harness reads one envelope and ends with its turn,
+// so a held steer written at the turn boundary is refused rather than left
+// unread in the pipe (processEncoder). The per-turn restart work runs held
+// steers in a fresh process.
+func (coreAgentDriver) OneTurnPerProcess() {}
+
 // coreAgentDecoder maps the harness's event lines onto Events: one
 // EventToolResult per tool call, an erroring step included.
 type coreAgentDecoder struct {

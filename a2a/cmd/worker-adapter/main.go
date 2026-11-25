@@ -418,9 +418,6 @@ func sessionWriteRefusalDir(session, workdir string) string {
 	return filepath.Join(workdir, writeRefusalSubdir)
 }
 
-// harnessCommand builds the harness argv: the native binary driven over the
-// headless stream-json contract. A2A_HARNESS_CMD overrides the whole argv
-// (tests, stubs); A2A_HARNESS_EXTRA_ARGS appends without replacing.
 // sessionToolLists is a session pod's tool allowlist and denylist, whether
 // it has the cluster view, and whether that view's Bash is allowed. The view
 // is only on when Bash is actually allowed: an override that leaves it out
@@ -458,6 +455,9 @@ func sessionPrompts(getenv func(string) string) []string {
 	return nil
 }
 
+// harnessCommand builds the harness argv: the native binary driven over the
+// headless stream-json contract. A2A_HARNESS_CMD overrides the whole argv
+// (tests, stubs); A2A_HARNESS_EXTRA_ARGS appends without replacing.
 func harnessCommand() []string {
 	if cmd := os.Getenv("A2A_HARNESS_CMD"); cmd != "" {
 		return strings.Fields(cmd)
