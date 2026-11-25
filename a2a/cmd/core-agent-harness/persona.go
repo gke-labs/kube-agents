@@ -20,8 +20,10 @@ import (
 // coreagent.Snapshot: the instructions file's text and every skill's files,
 // into memory, so nothing written to those paths later in the turn is read.
 // The directory is rendered read-only to this process by a second UID
-// (#6713), and PrepareTurn checks it before each spawn. core-agent's own
-// skills loader (env interpolation, discovery) is not used.
+// (#6713); when the persona is required, coreagent.VerifyRendering checks it
+// (nothing writable, nothing owned by this user, the content manifest
+// matches) before it is read. core-agent's own skills loader (env
+// interpolation, discovery) is not used.
 //
 // A skill's listing and instructions come from memory. When the model loads
 // a skill, its instructions start with the skill's directory on disk, which
@@ -29,7 +31,8 @@ import (
 // Code, whose skills name "the base directory the harness gives").
 //
 // A missing dir is no persona, unless required: a pod configured for a
-// persona that finds none fails the turn rather than run without it.
+// persona that finds none fails the turn rather than run without it, as does
+// one that isn't a sealed rendering matching its manifest.
 func loadPersona(ctx context.Context, dir string, required bool) (string, []adktool.Toolset, error) {
 	if dir == "" {
 		return "", nil, nil
@@ -43,6 +46,13 @@ func loadPersona(ctx context.Context, dir string, required bool) (string, []adkt
 		// No persona rendered for this pod: the turn runs on core-agent's
 		// own prompt.
 		return "", nil, nil
+	}
+	if required {
+		// A pod configured for a persona reads only a sealed rendering that
+		// matches the manifest written beside it.
+		if err := coreagent.VerifyRendering(dir, personaOwnerUID); err != nil {
+			return "", nil, err
+		}
 	}
 	r, err := coreagent.Snapshot(dir)
 	if err != nil {
@@ -127,3 +137,8 @@ func executables(skills fs.FS) (map[string][]string, error) {
 	})
 	return exec, err
 }
+
+// personaOwnerUID is the user a rendering must not belong to: the harness's
+// own, which could make it writable again. Tests, which write the rendering
+// as the same user, turn the check off.
+var personaOwnerUID = os.Getuid()

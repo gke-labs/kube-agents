@@ -142,8 +142,14 @@ worker refuses `antigravity`, which has no persona adapter yet.
 - **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
   each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
   for a directory a user other than the harness's writes before the harness
-  runs. The harness takes the instructions as a layer above its own system
-  prompt and lists the skills to the model. When the model loads a skill,
+  runs: on a profile worker, an init container's
+  `worker-adapter render-persona`, which renders into an emptyDir with a
+  content manifest beside it and seals it read-only, and the worker mounts
+  it read-only. With `A2A_CORE_AGENT_PERSONA_REQUIRED` set, the harness
+  checks it with `coreagent.VerifyRendering` (nothing writable or owned by
+  its user, the manifest matches) before reading it. The harness takes the
+  instructions as a layer above its own system prompt and lists the skills
+  to the model. When the model loads a skill,
   its instructions open with the skill's directory on disk and its scripts
   by absolute path, which is how the shell may run them.
   `coreagent.Snapshot` reads the directory into memory once, beside its
