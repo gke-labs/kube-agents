@@ -218,6 +218,21 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		a2aNATSCABundleVolume(agent),
 	}
 	volumes = append(volumes, rendered.Volumes...)
+	initContainers := rendered.InitContainers
+	if profile.Spec.Harness.Type == coreAgentHarnessType {
+		// The persona is rendered and sealed before the worker starts, by a
+		// user the harness doesn't run as, and the worker reads it through a
+		// read-only mount, which is what keeps the harness from changing it.
+		// A read-only mount is also outside the per-task reset below.
+		volumes = append(volumes, corev1.Volume{Name: profileWorkerAgentPersonaVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse(profileWorkerAgentPersonaSizeLimit)),
+		}}})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name: profileWorkerAgentPersonaVolume, MountPath: coreAgentPersonaPath, SubPath: coreAgentPersonaSubPath, ReadOnly: true,
+		})
+		env = append(env, corev1.EnvVar{Name: coreAgentPersonaRequiredEnv, Value: "true"})
+		initContainers = append(append([]corev1.Container(nil), initContainers...), coreAgentPersonaRenderContainer(agent, profile))
+	}
 	// Every writable mount is emptied by the worker after each task, so one
 	// task's files never reach the next on a warm pod. The list is derived
 	// from the mounts, so a writable mount added later is on it too.
@@ -240,7 +255,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
 		Volumes:        volumes,
-		InitContainers: rendered.InitContainers,
+		InitContainers: initContainers,
 		Containers: []corev1.Container{{
 			Name:         profileWorkerContainer,
 			Image:        profile.Spec.Harness.Image,
@@ -511,4 +526,50 @@ func (r *PlatformAgentReconciler) deleteProfileCABundle(ctx context.Context, age
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, bundle))
+}
+
+// The core-agent persona render (#6713): an init container renders the
+// profile's persona with the worker image's own `worker-adapter
+// render-persona`, as coreAgentPersonaRenderUID, into the subdirectory of an
+// emptyDir that the worker mounts read-only at coreAgentPersonaPath, where
+// the harness reads it (its --persona-dir), and the worker is told the
+// persona is required, so a pod whose render didn't land runs no turn.
+const (
+	coreAgentHarnessType               = "core-agent"
+	profileWorkerAgentPersonaVolume    = "agent-persona"
+	profileWorkerAgentPersonaSizeLimit = "64Mi"
+	coreAgentPersonaPath               = "/var/lib/agent-persona"
+	coreAgentPersonaSubPath            = "persona"
+	coreAgentPersonaRenderPath         = "/var/lib/agent-persona-render"
+	coreAgentPersonaRequiredEnv        = "A2A_CORE_AGENT_PERSONA_REQUIRED"
+	coreAgentPersonaRenderName         = "persona-render"
+	// coreAgentPersonaRenderUID is not profileWorkerUID: the files it writes
+	// aren't the worker's.
+	coreAgentPersonaRenderUID = 1001
+)
+
+// coreAgentPersonaRenderContainer renders and seals the persona. It gets only
+// the broker's address, which the render names as its MCP servers' relay
+// target: no credential, token or bus configuration.
+func coreAgentPersonaRenderContainer(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile) corev1.Container {
+	return corev1.Container{
+		Name:  coreAgentPersonaRenderName,
+		Image: profile.Spec.Harness.Image,
+		Command: []string{
+			"/usr/local/bin/worker-adapter", "render-persona", "--harness", coreAgentHarnessType,
+			"--in", profilepod.PersonaMountPath, "--out", coreAgentPersonaRenderPath + "/" + coreAgentPersonaSubPath,
+		},
+		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)}},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: profilepod.PersonaVolumeName, MountPath: profilepod.PersonaMountPath, ReadOnly: true},
+			{Name: profileWorkerAgentPersonaVolume, MountPath: coreAgentPersonaRenderPath},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                ptr.To(int64(coreAgentPersonaRenderUID)),
+			RunAsNonRoot:             ptr.To(true),
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		},
+	}
 }

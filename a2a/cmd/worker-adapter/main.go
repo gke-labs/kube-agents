@@ -168,6 +168,13 @@ func run() int {
 		return 0
 	}
 
+	// `worker-adapter render-persona` renders the profile's persona into a
+	// directory and seals it, from an init container that runs as a user the
+	// harness doesn't, before the worker starts (worker-adapter/render_persona.go).
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.RenderPersonaCommand {
+		return renderPersonaMain(os.Args[2:], os.Getenv)
+	}
+
 	cfg, ok := configFromEnv(log)
 	if !ok {
 		return 1

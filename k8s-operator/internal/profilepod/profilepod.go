@@ -33,6 +33,9 @@ const (
 	// PersonaMountPath is where the persona image is mounted. The worker's
 	// persona adapter reads it from here.
 	PersonaMountPath = "/persona"
+	// PersonaVolumeName is the persona's volume, for a container beside the
+	// worker that reads the persona too.
+	PersonaVolumeName = personaVolumeName
 
 	// ToolsMountRoot is the parent of every tools image's mount.
 	ToolsMountRoot = "/opt/tools"
