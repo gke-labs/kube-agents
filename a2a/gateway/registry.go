@@ -63,12 +63,13 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
-	// LineClosed marks a live message a Google Chat stop closed, a Stop
-	// press or a typed stop (chat_stop_press.go): it reads "cancel sent"
-	// with no Stop control, and the relay leaves it so until the terminal
-	// edit (updateRollingLine, showBusy). False for every other stop: one
-	// typed on another backend, or on Google Chat on a task with no line
-	// or when the armed card stop answers it (cardStopWanted); such a line
+	// LineClosed marks a live message a stop closed on a backend whose
+	// Stop button is on the line (Google Chat, Teams), a Stop press or a
+	// typed stop (chat_stop_press.go): it reads "cancel sent" with no Stop
+	// control, and the relay leaves it so until the terminal edit
+	// (updateRollingLine, showBusy). False for every other stop: one typed
+	// on another backend, or on such a backend on a task with no line or
+	// when the armed card stop answers it (cardStopWanted); such a line
 	// keeps moving until the terminal.
 	LineClosed bool `json:"lineClosed,omitempty"`
 	// Capability pins this task's root entry in the `cap` bucket: the key
@@ -868,8 +869,8 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 }
 
 // markQuietCancel records that taskID's cancel answers for itself: a Stop
-// button on Slack or Google Chat, or a stop typed on Google Chat
-// (TaskRef.QuietCancel).
+// button on Slack, Google Chat or Teams, or a stop typed on Google Chat or
+// Teams (TaskRef.QuietCancel).
 func (rec *SessionRecord) markQuietCancel(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {

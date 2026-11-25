@@ -1,0 +1,306 @@
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+)
+
+const (
+	// shippedPersonas are the persona directories under agents/, relative to
+	// this package. shippedPersonaDirs adds every persona image's build
+	// context from the publish workflow, wherever it lives.
+	shippedPersonas = "../../../agents/*/persona"
+	// publishWorkflow builds and pushes every released image.
+	publishWorkflow = "../../../.github/workflows/docker-publish-ghcr.yml"
+	// repoRoot is the repository root, relative to this package.
+	repoRoot = "../../.."
+	// personaDockerfiles are their images' Dockerfiles.
+	personaDockerfiles = "../../Dockerfile.persona-*"
+	// regenerate is what a failure tells the reader to run, from the
+	// repository root: the Makefile's persona-manifests target, which
+	// docs-generate also runs.
+	regenerate = "make persona-manifests (or make docs-generate)"
+)
+
+// Every shipped persona carries a content manifest that matches it, so the
+// image built from it (COPY . /files/) is verified by the profile worker at
+// start. A persona edited without regenerating its manifest fails here, not
+// in a pod.
+func TestShippedPersonasCarryAMatchingManifest(t *testing.T) {
+	for _, dir := range shippedPersonaDirs(t) {
+		// What the image holds: the files a clean checkout has, so an
+		// ignored local file can't fail (or pass) this.
+		rels, err := gitPersonaFiles(dir)
+		if err != nil {
+			t.Skipf("git can't list %s: %v", dir, err)
+		}
+		image := t.TempDir()
+		for _, rel := range rels {
+			data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(image, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dst, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p, err := persona.LoadWithOptions(image, persona.Options{RequireIntegrity: true})
+		if err != nil {
+			t.Errorf("%s: %v\nregenerate the shipped personas' manifests from the repository root: %s", dir, err, regenerate)
+			continue
+		}
+		if p.Integrity != persona.IntegrityVerified {
+			t.Errorf("%s: integrity %v, want verified", dir, p.Integrity)
+		}
+	}
+}
+
+// Each persona image copies its whole build context, the persona
+// directory, to /files, and its dockerignore leaves out only .DS_Store
+// files, which the persona format refuses anyway. So the image carries the
+// committed manifest and exactly the files it describes.
+func TestPersonaImagesShipTheCommittedManifest(t *testing.T) {
+	dockerfiles, err := filepath.Glob(personaDockerfiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var images int
+	for _, df := range dockerfiles {
+		if strings.HasSuffix(df, ".dockerignore") {
+			continue
+		}
+		images++
+		raw, err := os.ReadFile(df)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !regexp.MustCompile(`(?m)^COPY \. /files/$`).Match(raw) {
+			t.Errorf("%s does not copy its whole context to /files/", df)
+		}
+		ignore, err := os.ReadFile(df + ".dockerignore")
+		if err != nil {
+			t.Fatalf("%s has no dockerignore: %v", df, err)
+		}
+		for _, line := range strings.Split(string(ignore), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if line != ".DS_Store" && line != "**/.DS_Store" {
+				t.Errorf("%s.dockerignore leaves out %q, which the committed manifest would still list", df, line)
+			}
+		}
+	}
+	dirs := shippedPersonaDirs(t)
+	if images != len(dirs) {
+		t.Errorf("%d persona Dockerfiles for %d shipped personas (%v)", images, len(dirs), dirs)
+	}
+}
+
+// copyDir copies a persona directory for a test to change.
+func copyDir(t *testing.T, src string) string {
+	t.Helper()
+	dst := t.TempDir()
+	err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		if d.IsDir() {
+			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dst, rel), data, 0o644)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+// manifest writes a manifest that validate --require-integrity accepts,
+// replaces a stale one, and refuses a tree holding a symlink.
+func TestManifestCommand(t *testing.T) {
+	dir := copyDir(t, "../../lib/persona/testdata/example")
+	var out, errb strings.Builder
+	if code := run([]string{"validate", "--require-integrity", "--in", dir}, &out, &errb); code != 1 {
+		t.Fatalf("validate --require-integrity without a manifest = %d, want 1 (%s)", code, errb.String())
+	}
+	if code := run([]string{"manifest", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("manifest = %d: %s", code, errb.String())
+	}
+	if code := run([]string{"validate", "--require-integrity", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("validate after manifest = %d: %s", code, errb.String())
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"validate", "--in", dir}, &out, &errb); code != 1 {
+		t.Fatalf("validate of a changed persona = %d, want 1", code)
+	}
+	if code := run([]string{"manifest", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("manifest over a stale one = %d: %s", code, errb.String())
+	}
+	if err := os.Symlink("../SKILL.md", filepath.Join(dir, "skills/triage/scripts/link.md")); err != nil {
+		t.Fatal(err)
+	}
+	errb.Reset()
+	if code := run([]string{"manifest", "--in", dir}, &out, &errb); code != 1 || !strings.Contains(errb.String(), "not a regular file") {
+		t.Errorf("manifest over a symlink = %d (%s), want 1 naming it", code, errb.String())
+	}
+}
+
+// publishedPersonaRE is one build step in the publish workflow whose
+// Dockerfile is a persona image's: its context, then its file.
+var publishedPersonaRE = regexp.MustCompile(`(?m)^\s+context: (\S+)\n\s+file: (a2a/Dockerfile\.persona-\S+)$`)
+
+// shippedPersonaDirs finds every shipped persona directory on its own: the
+// persona directories under agents/, plus each persona image's build
+// context in the publish workflow. Every persona Dockerfile must appear in
+// that workflow, so a new persona image can't be left out of the check by
+// living somewhere else.
+func shippedPersonaDirs(t *testing.T) []string {
+	t.Helper()
+	seen := map[string]bool{}
+	globbed, err := filepath.Glob(shippedPersonas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range globbed {
+		seen[filepath.Clean(d)] = true
+	}
+	raw, err := os.ReadFile(publishWorkflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := map[string]bool{}
+	for _, m := range publishedPersonaRE.FindAllStringSubmatch(string(raw), -1) {
+		seen[filepath.Clean(filepath.Join(repoRoot, m[1]))] = true
+		published[filepath.Base(m[2])] = true
+	}
+	dockerfiles, err := filepath.Glob(personaDockerfiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, df := range dockerfiles {
+		if !strings.HasSuffix(df, ".dockerignore") && !published[filepath.Base(df)] {
+			t.Errorf("%s is not built by %s, so its persona directory isn't known here", df, publishWorkflow)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no shipped personas found")
+	}
+	dirs := make([]string, 0, len(seen))
+	for d := range seen {
+		dirs = append(dirs, d)
+	}
+	return dirs
+}
+
+// manifest works on a persona directory given as a symlink, as the
+// worker's check reads one.
+func TestManifestCommandFollowsASymlinkedDir(t *testing.T) {
+	dir := copyDir(t, "../../lib/persona/testdata/example")
+	link := filepath.Join(t.TempDir(), "persona")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb strings.Builder
+	if code := run([]string{"manifest", "--in", link}, &out, &errb); code != 0 {
+		t.Fatalf("manifest through a symlink = %d: %s", code, errb.String())
+	}
+	if code := run([]string{"validate", "--require-integrity", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("validate of the target = %d: %s", code, errb.String())
+	}
+}
+
+// manifest --git covers what git would check out and nothing else: an
+// ignored file in the directory is neither listed nor removed, and a new
+// file not yet added is listed.
+func TestManifestCommandFromGitLeavesIgnoredFilesAlone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	repo := t.TempDir()
+	dir := filepath.Join(repo, "persona")
+	if err := os.Rename(copyDir(t, "../../lib/persona/testdata/example"), dir); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("__pycache__/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("init", "-q")
+	git("add", ".")
+	git("commit", "-qm", "persona")
+	ignored := filepath.Join(dir, "skills/triage/scripts/__pycache__/events.cpython-312.pyc")
+	if err := os.MkdirAll(filepath.Dir(ignored), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ignored, []byte("bytecode"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skills/notes/new.md"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb strings.Builder
+	if code := run([]string{"manifest", "--git", "--in", dir}, &out, &errb); code != 0 {
+		t.Fatalf("manifest --git = %d: %s", code, errb.String())
+	}
+	manifest, err := os.ReadFile(filepath.Join(dir, persona.IntegrityManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(manifest), "__pycache__") {
+		t.Errorf("the ignored file is in the manifest:\n%s", manifest)
+	}
+	if !strings.Contains(string(manifest), "./skills/notes/new.md") {
+		t.Errorf("the new, unignored file is not in the manifest:\n%s", manifest)
+	}
+	if _, err := os.Stat(ignored); err != nil {
+		t.Errorf("the ignored file was removed: %v", err)
+	}
+}
+
+// manifest --git loads what it covered, so a persona that doesn't load fails
+// the command (and make persona-manifests with it), not only the later test.
+func TestManifestCommandFromGitRefusesAPersonaThatDoesNotLoad(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	repo := t.TempDir()
+	dir := filepath.Join(repo, "persona")
+	if err := os.Rename(copyDir(t, "../../lib/persona/testdata/example"), dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "persona.yaml"), []byte("name: [unclosed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "-C", repo, "init", "-q")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	var out, errb strings.Builder
+	if code := run([]string{"manifest", "--git", "--in", dir}, &out, &errb); code == 0 {
+		t.Fatal("manifest --git accepted a persona whose persona.yaml doesn't parse")
+	}
+}
