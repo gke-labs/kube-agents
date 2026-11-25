@@ -44,8 +44,9 @@ const (
 	OriginSeqUnknown = "unknown"
 	// EnvClusterView is the spawner telling the worker that this pod has
 	// the credential broker's read-only kubectl/gcloud wrappers on PATH
-	// (the operator's A2A_SESSION_CLUSTER_VIEW flag, rendered onto the
-	// gateway and translated here per pod). Literal "true" is on. One
+	// (the session pods' cluster view, which the operator turns on for the
+	// session route or under its A2A_SESSION_CLUSTER_VIEW flag, renders onto
+	// the gateway, and the gateway translates here per pod). Literal "true" is on. One
 	// constant for both ends, like EnvOriginSeq above: a spelling that
 	// drifted would leave a pod with the token and the shims but no Bash,
 	// and nothing would say so.
