@@ -239,15 +239,6 @@ func grantedTools(grants []string, server string) ([]string, bool) {
 	return tools, whole
 }
 
-// DelegateServer is the worker's own per-task delegate server, which the
-// worker adds to a turn's MCP servers when the task can delegate: this
-// binary's delegate-mcp, reached over the socket env names, with the single
-// delegate tool. Its name is persona.ReservedServer, which no persona can
-// declare.
-func DelegateServer(self string, env map[string]string) persona.MCPServer {
-	return persona.MCPServer{Name: persona.ReservedServer, Command: self, Args: []string{"delegate-mcp"}, Env: maps.Clone(env), Tools: []string{"delegate"}}
-}
-
 // IsScriptPath reports whether a path relative to a skill's directory is one
 // a script may have.
 func IsScriptPath(rel string) bool { return scriptPathRE.MatchString(rel) }
