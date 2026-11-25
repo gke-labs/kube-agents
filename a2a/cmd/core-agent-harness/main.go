@@ -163,6 +163,12 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	if instructions != "" {
 		opts = append(opts, agent.WithExtraInstruction(instructions))
 	}
+	// The worker's own lines for the turn (a session pod's cluster access),
+	// after the persona, in the instruction layer: never in the history,
+	// which the envelope carries back on the next turn.
+	for _, line := range env.Instructions {
+		opts = append(opts, agent.WithExtraInstruction(line))
+	}
 	a, err := agent.New(llm, opts...)
 	if err != nil {
 		return fmt.Errorf("agent: %w", err)
