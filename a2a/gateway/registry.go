@@ -89,6 +89,11 @@ type ActiveTask struct {
 	// task across gateway restarts; it goes with ActiveTask when the task is
 	// released or ends.
 	NoFirstEventNoticeAt time.Time `json:"noFirstEventNoticeAt,omitempty"`
+	// WaitingNoticeAt is when the waiting notice was first shown on this
+	// child's line (noticeChildWaiting, #7015), and WaitingNoticeOthers the
+	// count it last showed, so the line is edited only when that changes.
+	WaitingNoticeAt     time.Time `json:"waitingNoticeAt,omitzero"`
+	WaitingNoticeOthers int       `json:"waitingNoticeOthers,omitempty"`
 	// LineNote suffixes every render of the rolling line (taskStart.LineNote);
 	// on the record so a gateway restart keeps rendering it.
 	LineNote string `json:"lineNote,omitempty"`
