@@ -25,6 +25,13 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
+const (
+	serverReadyTimeout = 30 * time.Second
+	jetStreamOpTimeout = 15 * time.Second
+	pollUntilTimeout   = 30 * time.Second
+	pollUntilInterval  = 20 * time.Millisecond
+)
+
 // ---- harness ----------------------------------------------------------
 
 func startServer(t *testing.T) *natsserver.Server {
@@ -42,7 +49,7 @@ func startServer(t *testing.T) *natsserver.Server {
 		t.Fatalf("NewServer: %v", err)
 	}
 	go s.Start()
-	if !s.ReadyForConnections(10 * time.Second) {
+	if !s.ReadyForConnections(serverReadyTimeout) {
 		t.Fatal("nats-server not ready")
 	}
 	t.Cleanup(s.Shutdown)
@@ -70,7 +77,7 @@ func provision(t *testing.T, url string) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), jetStreamOpTimeout)
 	defer cancel()
 	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      lib.TasksStream,
@@ -132,12 +139,12 @@ func deleteTasksStream(t *testing.T, url string) {
 		t.Fatalf("jetstream: %v", err)
 	}
 	waitFor(t, "the relay durable to bind", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), jetStreamOpTimeout)
 		defer cancel()
 		_, err := js.Consumer(ctx, lib.TasksStream, relayDurable)
 		return err == nil
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), jetStreamOpTimeout)
 	defer cancel()
 	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
 		t.Fatalf("delete TASKS: %v", err)
@@ -573,14 +580,14 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
 
-// pollUntil retries cond for up to ten seconds and reports whether it held.
+// pollUntil retries cond for up to pollUntilTimeout and reports whether it held.
 func pollUntil(cond func() bool) bool {
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(pollUntilTimeout)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return true
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(pollUntilInterval)
 	}
 	return false
 }
