@@ -57,8 +57,10 @@ func TestAProfilesHarnessTypeReachesItsWorkersOnlyWhenSet(t *testing.T) {
 
 // TestAProfileWhoseHarnessTheOperatorDoesntRenderIsRefused: a type the
 // CRD's enum would refuse, admitted by an older, newer or edited CRD, is
-// refused whole with HarnessNotSupported, never rendered as Claude Code.
-// Absent and claude-code render.
+// refused whole with HarnessNotSupported, never rendered as another
+// harness. Absent and core-agent render. claude-code stays in the enum so an
+// existing profile validates, but the worker image no longer carries it, so
+// it is refused too.
 func TestAProfileWhoseHarnessTheOperatorDoesntRenderIsRefused(t *testing.T) {
 	agent := a2aTestAgent()
 	for _, c := range []struct {
@@ -66,10 +68,11 @@ func TestAProfileWhoseHarnessTheOperatorDoesntRenderIsRefused(t *testing.T) {
 		refused bool
 	}{
 		{"", false},
-		{"claude-code", false},
+		{"core-agent", false},
+		{"claude-code", true},
 		{"antigravity", true},
-		{"Claude-Code", true},
-		{" claude-code", true},
+		{"Core-Agent", true},
+		{" core-agent", true},
 	} {
 		p := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) { p.Spec.Harness.Type = c.harness })
 		r := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{p})["auditor"]
@@ -91,7 +94,7 @@ func TestTheHarnessTypeIsNotOnTheCard(t *testing.T) {
 	agent := a2aTestAgent()
 	plain := testAgentProfile(agent.Namespace, "auditor")
 	typed := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
-		p.Spec.Harness.Type = agentv1alpha1.AgentProfileHarnessClaudeCode
+		p.Spec.Harness.Type = agentv1alpha1.AgentProfileHarnessCoreAgent
 	})
 	a, err := json.Marshal(desiredAgentCard(&plain))
 	if err != nil {

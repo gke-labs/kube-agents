@@ -724,7 +724,7 @@ type Config struct {
 	// SessionHarness is the harness every session pod runs, passed to it as
 	// A2A_HARNESS (A2A_SESSION_HARNESS, from the PlatformAgent's
 	// spec.harness.sessionWorker.type). Empty is the worker's default,
-	// Claude Code, and adds nothing to the pod.
+	// core-agent, and adds nothing to the pod.
 	SessionHarness string
 	// SessionHarnessRefused is an A2A_SESSION_HARNESS value outside
 	// sessionHarnesses (CRD or image skew). The gateway is shared by every
@@ -1649,7 +1649,7 @@ const envSessionHarness = "A2A_SESSION_HARNESS"
 
 // sessionHarnesses are the harnesses the gateway spawns session pods for.
 // Antigravity joins when its worker isolation lands.
-var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
+var sessionHarnesses = map[string]bool{string(persona.CoreAgent): true}
 
 // clampDelegationRounds is the DelegationRoundsMax New keeps: unset is one, a
 // value outside 1 to lib.DelegateRoundsCeiling is clamped into it, and any

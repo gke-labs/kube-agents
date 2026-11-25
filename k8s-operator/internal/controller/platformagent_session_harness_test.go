@@ -29,7 +29,11 @@ func TestTheSessionHarnessReachesTheGatewayOnlyWhenSet(t *testing.T) {
 	}{
 		{"no sessionWorker", nil, "", false},
 		{"sessionWorker without type", &agentv1alpha1.SessionWorkerSpec{}, "", false},
-		{"claude-code", &agentv1alpha1.SessionWorkerSpec{Type: "claude-code"}, "claude-code", true},
+		{"core-agent", &agentv1alpha1.SessionWorkerSpec{Type: "core-agent"}, "core-agent", true},
+		// claude-code stays in the enum so an existing object still
+		// validates, but the worker image no longer carries it: it is not
+		// rendered, and session pods run the default harness.
+		{"claude-code", &agentv1alpha1.SessionWorkerSpec{Type: "claude-code"}, "", false},
 		// A value a newer CRD admitted (after a rollback, say) is not
 		// rendered: the shared gateway keeps serving on the default harness.
 		{"unsupported", &agentv1alpha1.SessionWorkerSpec{Type: "antigravity"}, "", false},
@@ -86,6 +90,9 @@ func TestAnUnsupportedSessionHarnessIsReportedAndClears(t *testing.T) {
 	if c == nil || c.Status != "False" || c.Reason != sessionHarnessReasonNotSupported {
 		t.Fatalf("condition %+v, want False %s", c, sessionHarnessReasonNotSupported)
 	}
+	if !strings.Contains(c.Message, "the default harness, core-agent") {
+		t.Errorf("message %q doesn't name the default harness, core-agent", c.Message)
+	}
 	if len(rec.Events) != 1 {
 		t.Errorf("%d events over two passes, want one Warning", len(rec.Events))
 	}
@@ -93,7 +100,7 @@ func TestAnUnsupportedSessionHarnessIsReportedAndClears(t *testing.T) {
 		t.Errorf("the gateway is given %q, want nothing", forGateway)
 	}
 
-	for _, fixed := range []*agentv1alpha1.SessionWorkerSpec{{Type: "claude-code"}, nil} {
+	for _, fixed := range []*agentv1alpha1.SessionWorkerSpec{{Type: "core-agent"}, nil} {
 		agent.Spec.Harness.SessionWorker = &agentv1alpha1.SessionWorkerSpec{Type: "antigravity"}
 		sync()
 		agent.Spec.Harness.SessionWorker = fixed
@@ -186,7 +193,7 @@ func TestTheReconcileWritesTheSessionHarnessConditionOnce(t *testing.T) {
 	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
 		t.Fatal(err)
 	}
-	got.Spec.Harness.SessionWorker = &agentv1alpha1.SessionWorkerSpec{Type: "claude-code"}
+	got.Spec.Harness.SessionWorker = &agentv1alpha1.SessionWorkerSpec{Type: "core-agent"}
 	if err := cl.Update(ctx, got); err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +202,6 @@ func TestTheReconcileWritesTheSessionHarnessConditionOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c := meta.FindStatusCondition(got.Status.Conditions, sessionHarnessCondition); c != nil {
-		t.Errorf("claude-code left the condition: %+v", c)
+		t.Errorf("core-agent left the condition: %+v", c)
 	}
 }

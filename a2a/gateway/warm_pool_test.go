@@ -598,6 +598,8 @@ func TestAConfigChangeRetiresTheWarmPodsMadeUnderTheOldOne(t *testing.T) {
 		"scope":        func() { cfg.AuthorityScope = "namespace/team-b" },
 		"capability":   func() { cfg.CapabilityOptional = true },
 		"deadline":     func() { cfg.TaskDeadline = 45 * time.Minute },
+		// The install names a session harness: the pod's A2A_HARNESS moves.
+		"session harness": func() { cfg.SessionHarness = "core-agent" },
 	} {
 		saved := *cfg
 		change()
@@ -622,6 +624,39 @@ func TestAConfigChangeRetiresTheWarmPodsMadeUnderTheOldOne(t *testing.T) {
 			t.Fatalf("%d warm pods created, want a replacement", n)
 		}
 	})
+}
+
+// A warm pod is built from the same session pod spec as a cold spawn, so it
+// runs the same harness: none named, the worker's default (core-agent), and
+// one the install names, as A2A_HARNESS. A gateway with a harness it doesn't
+// render (claude-code, which the worker image no longer carries) names none.
+func TestAWarmPodRunsTheSessionHarness(t *testing.T) {
+	for _, c := range []struct{ harness, want string }{
+		{"", ""},
+		{"core-agent", "core-agent"},
+		{"claude-code", ""},
+	} {
+		cfg := &Config{Namespace: "ns", WorkerImage: "worker:1", SessionServiceAccount: "sa", TaskDeadline: 30 * time.Minute,
+			SessionReuse: true, SessionHarness: c.harness}
+		cs := k8sfake.NewSimpleClientset()
+		s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+		if err := s.SpawnWarm(context.Background(), "chat-otter-wharness"); err != nil {
+			t.Fatal(err)
+		}
+		pod, err := cs.CoreV1().Pods("ns").Get(context.Background(), "chat-otter-wharness", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, set := "", false
+		for _, e := range pod.Spec.Containers[0].Env {
+			if e.Name == lib.EnvHarness {
+				got, set = e.Value, true
+			}
+		}
+		if got != c.want || set != (c.want != "") {
+			t.Errorf("harness %q: the warm pod's A2A_HARNESS is set=%v %q, want %q", c.harness, set, got, c.want)
+		}
+	}
 }
 
 // The claim index is not all that keeps a pod to one conversation: a pod

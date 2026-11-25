@@ -184,7 +184,8 @@ var ErrHarnessRemoved = errors.New("the claude-code harness was removed from the
 func DriverFor(h persona.Harness) (Driver, error) {
 	switch h {
 	case "":
-		return nil, ErrNoHarness
+		// Absent is the image's harness, core-agent.
+		return newCoreAgentDriver(), nil
 	case persona.ClaudeCode:
 		return nil, ErrHarnessRemoved
 	case persona.Antigravity:

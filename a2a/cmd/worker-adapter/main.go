@@ -854,16 +854,18 @@ func selfPath() string {
 var protectAdapter = workeradapter.ProtectProcess
 
 // selectHarness picks the pod's harness: lib.EnvHarness, else on a profile
-// worker lib.EnvProfileHarness (its older name). It returns the harness's
-// stream driver and argv builder. Neither set is an error (ErrNoHarness):
-// until a harness runs by default, the worker refuses to start rather than
-// run nothing (#6707). claude-code, the prototype harness
-// removed from the image, is refused too, as is a value the worker doesn't
-// know: a typo would otherwise run the wrong harness without a word.
+// worker lib.EnvProfileHarness (its older name), else core-agent, the
+// harness the worker image carries. It returns the harness's stream driver
+// and argv builder. claude-code, the prototype harness removed from the
+// image, is refused, as is a value the worker doesn't know: a typo would
+// otherwise run the wrong harness without a word.
 func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
 	h := persona.Harness(getenv(lib.EnvHarness))
 	if h == "" && getenv(lib.EnvProfileWorker) == "true" {
 		h = persona.Harness(getenv(lib.EnvProfileHarness))
+	}
+	if h == "" {
+		h = persona.CoreAgent
 	}
 	driver, err := workeradapter.DriverFor(h)
 	if err != nil {

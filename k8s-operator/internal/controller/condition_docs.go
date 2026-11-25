@@ -72,7 +72,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    sessionHarnessCondition,
 		Written: "While spec.harness.sessionWorker.type names a harness this operator doesn't render",
-		Meaning: "`status: False`, `Reason: SessionHarnessNotSupported`, with a Warning event: the CRD admitted a session harness this operator doesn't know (after a rollback, for example), so the operator doesn't pass it to the gateway and session pods run the default harness, `claude-code`. Removed once the value is supported or unset.",
+		Meaning: "`status: False`, `Reason: SessionHarnessNotSupported`, with a Warning event: the CRD admitted a session harness this operator doesn't know (after a rollback, for example), so the operator doesn't pass it to the gateway and session pods run the default harness, `core-agent`. Removed once the value is supported or unset.",
 	},
 	{
 		Type:    dispatcherCeilingCondition,

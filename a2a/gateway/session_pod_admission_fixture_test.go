@@ -54,7 +54,7 @@ func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
 			c.KubeProxyCAConfigMap = "pa-kube-proxy-ca-bundle"
 			c.KubeProxyHostContext = "in-cluster"
 		}},
-		{"harness", func(c *Config, _ *SessionRecord) { c.SessionHarness = "claude-code" }},
+		{"harness", func(c *Config, _ *SessionRecord) { c.SessionHarness = "core-agent" }},
 	}
 	var pods []corev1.Pod
 	for _, shape := range shapes {

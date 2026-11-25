@@ -14,14 +14,15 @@ import (
 )
 
 // TestAnUnknownSessionHarnessKeepsTheGatewayServing: A2A_SESSION_HARNESS
-// unset or claude-code is taken as is. Any other value (antigravity from a
-// newer operator, a typo, a case variant, padding) still starts the gateway,
+// unset or core-agent is taken as is. Any other value (claude-code, which the
+// worker image no longer carries; antigravity from a newer operator; a typo,
+// a case variant, padding) still starts the gateway,
 // which is shared by every conversation, on the default harness and records
 // the value for main to log, rather than refusing to start and taking the
 // whole chat surface down.
 func TestAnUnknownSessionHarnessKeepsTheGatewayServing(t *testing.T) {
 	setBaseEnv(t)
-	for _, ok := range []string{"", "claude-code"} {
+	for _, ok := range []string{"", "core-agent"} {
 		t.Setenv(envSessionHarness, ok)
 		cfg, err := FromEnv()
 		if err != nil {
@@ -31,7 +32,7 @@ func TestAnUnknownSessionHarnessKeepsTheGatewayServing(t *testing.T) {
 			t.Errorf("%q: SessionHarness %q refused %q", ok, cfg.SessionHarness, cfg.SessionHarnessRefused)
 		}
 	}
-	for _, bad := range []string{"antigravity", "claude", "Claude-Code", " claude-code"} {
+	for _, bad := range []string{"claude-code", "antigravity", "claude", "Core-Agent", " core-agent"} {
 		t.Setenv(envSessionHarness, bad)
 		cfg, err := FromEnv()
 		if err != nil {
@@ -54,8 +55,9 @@ func TestASessionPodCarriesTheHarnessOnlyWhenNamedAndTheWaiverEmptyAlways(t *tes
 		set     bool
 	}{
 		{"", false},
-		{"claude-code", true},
+		{"core-agent", true},
 		// A Config built without FromEnv is checked again at spawn.
+		{"claude-code", false},
 		{"antigravity", false},
 	} {
 		cfg := Config{Namespace: ns, WorkerImage: "worker", SessionServiceAccount: "sa", TaskDeadline: 15 * time.Minute, SessionHarness: c.harness}

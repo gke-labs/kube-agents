@@ -173,15 +173,17 @@ spec:
                       type: string
                     type:
                       description: |-
-                        Type is the harness the worker image runs. Absent is claude-code. The
-                        operator passes it to the worker as A2A_HARNESS, which the worker
-                        adapter's harness selector reads to pick its stream driver, argv and
-                        env, and persona adapter. It is passed only when set, so a profile that
-                        leaves it out renders as it did before the field existed. It is pod
-                        configuration only: it is not on the profile's card, and no bus
-                        subject or permission depends on it. claude-code is the only value
-                        accepted today.
+                        Type is the harness the worker image runs. Absent is core-agent, the
+                        harness the worker image carries. The operator passes it to the worker
+                        as A2A_HARNESS, which the worker adapter's harness selector reads to
+                        pick its stream driver, argv and env, and persona adapter. It is passed
+                        only when set. It is pod configuration only: it is not on the profile's
+                        card, and no bus subject or permission depends on it. claude-code is
+                        still accepted so an existing profile validates, but the worker image no
+                        longer carries it, and the operator refuses such a profile with a
+                        condition.
                       enum:
+                        - core-agent
                         - claude-code
                       type: string
                   required:

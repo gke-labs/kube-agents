@@ -491,11 +491,8 @@ func isDispatcherBucketUser(name string) bool {
 }
 
 // renderableHarness is the harness the worker image runs for a profile that
-// names none, and the only one the operator renders workers for. It is empty:
-// the worker image carries no harness until another is available (#6707), so
-// no profile renders a worker. Tests that exercise the rest of the render set
-// it in their package's test files; nothing outside tests does.
-var renderableHarness = ""
+// names none, and the only one the operator renders workers for: core-agent.
+var renderableHarness = agentv1alpha1.AgentProfileHarnessCoreAgent
 
 // agentProfileHarnessRefusal is the refusal for a profile whose harness the
 // worker image can't run.

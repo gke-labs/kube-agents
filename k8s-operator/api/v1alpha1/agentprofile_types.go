@@ -276,22 +276,27 @@ type AgentProfileHarness struct {
 	// +optional
 	MaxTurns int32 `json:"maxTurns,omitempty"`
 
-	// Type is the harness the worker image runs. Absent is claude-code. The
-	// operator passes it to the worker as A2A_HARNESS, which the worker
-	// adapter's harness selector reads to pick its stream driver, argv and
-	// env, and persona adapter. It is passed only when set, so a profile that
-	// leaves it out renders as it did before the field existed. It is pod
-	// configuration only: it is not on the profile's card, and no bus
-	// subject or permission depends on it. claude-code is the only value
-	// accepted today.
-	// +kubebuilder:validation:Enum=claude-code
+	// Type is the harness the worker image runs. Absent is core-agent, the
+	// harness the worker image carries. The operator passes it to the worker
+	// as A2A_HARNESS, which the worker adapter's harness selector reads to
+	// pick its stream driver, argv and env, and persona adapter. It is passed
+	// only when set. It is pod configuration only: it is not on the profile's
+	// card, and no bus subject or permission depends on it. claude-code is
+	// still accepted so an existing profile validates, but the worker image no
+	// longer carries it, and the operator refuses such a profile with a
+	// condition.
+	// +kubebuilder:validation:Enum=core-agent;claude-code
 	// +optional
 	Type string `json:"type,omitempty"`
 }
 
 // AgentProfileHarnessClaudeCode is the AgentProfile harness type for Claude
-// Code, and what an absent type means.
+// Code, which the worker image no longer carries.
 const AgentProfileHarnessClaudeCode = "claude-code"
+
+// AgentProfileHarnessCoreAgent is the AgentProfile harness type for
+// core-agent, and what an absent type means.
+const AgentProfileHarnessCoreAgent = "core-agent"
 
 // AgentProfileBus holds the profile's blackboard grants, written without the
 // a2a.topics. prefix.

@@ -4010,13 +4010,14 @@ type ManagedRepoEntry struct {
 // SessionWorkerSpec configures the session pods the A2A gateway spawns.
 type SessionWorkerSpec struct {
 	// Type is the harness the session worker image runs. Absent is
-	// claude-code. The operator passes it to the gateway as
-	// A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
-	// to each session pod as A2A_HARNESS, which the worker adapter's
-	// harness selector reads. It is pod configuration only: no route, bus
-	// subject or permission depends on it. claude-code is the only value
-	// accepted today.
-	// +kubebuilder:validation:Enum=claude-code
+	// core-agent, the harness the worker image carries. The operator passes
+	// it to the gateway as A2A_SESSION_HARNESS, only when it is set, and the
+	// gateway passes it to each session pod as A2A_HARNESS, which the worker
+	// adapter's harness selector reads. It is pod configuration only: no
+	// route, bus subject or permission depends on it. claude-code is still
+	// accepted so an existing install validates, but the worker image no
+	// longer carries it.
+	// +kubebuilder:validation:Enum=core-agent;claude-code
 	// +optional
 	Type string `json:"type,omitempty"`
 }

@@ -704,7 +704,7 @@ func (s *podSpawner) sessionPodSpec(rec *SessionRecord, taskID, primer string, o
 	// The harness, and the isolation waiver rendered empty on every session
 	// pod: pod env overrides the image's ENV, so a worker image can't set
 	// the waiver. The harness is added only when the install names one;
-	// unset is the worker's default, Claude Code. The waiver goes when the
+	// unset is the worker's default, core-agent. The waiver goes when the
 	// worker isolation lands (#6710).
 	{
 		c := &pod.Spec.Containers[0]

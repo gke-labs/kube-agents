@@ -895,7 +895,7 @@
             },
             {
               "name": "A2A_HARNESS",
-              "value": "claude-code"
+              "value": "core-agent"
             },
             {
               "name": "A2A_HARNESS_UNISOLATED"
