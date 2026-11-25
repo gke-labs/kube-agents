@@ -1,5 +1,7 @@
 package lib
 
+import "strings"
+
 // Session consumer naming — the contract between a session worker and the
 // grants the auth callout mints for it.
 //
@@ -69,10 +71,25 @@ const (
 	// EnvProfileWorkerOneShot ends a profile worker after its first task: a
 	// Job's pod. Literal "1" or "true" is on.
 	EnvProfileWorkerOneShot = "PROFILE_WORKER_ONE_SHOT"
-	// EnvProfileHarness names the persona adapter a profile worker renders
-	// its persona with (persona.ClaudeCode is the default and, for now, the
-	// only one written).
+	// EnvHarness names the harness a worker runs, session pod or profile
+	// worker alike (persona.ClaudeCode or persona.Antigravity): its driver,
+	// its argv and env, and a profile worker's persona adapter. Unset is
+	// Claude Code; a value the worker doesn't know refuses to start.
+	// Antigravity also needs EnvHarnessUnisolated and A2A_HARNESS_PATH
+	// (cmd/worker-adapter's selectHarness).
+	EnvHarness = "A2A_HARNESS"
+	// EnvProfileHarness is EnvHarness's older name, read only by a profile
+	// worker and only when EnvHarness is unset. It once picked the persona
+	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
+	// EnvHarnessUnisolated must be HarnessUnisolatedAllow for a worker to
+	// select persona.Antigravity, which runs without its per-task HOME
+	// locking and workspace scrub until #6710 lands; #6710 removes it.
+	// Nothing in the operator or chart sets it to allow; the operator
+	// renders it empty beside A2A_HARNESS on a profile that names
+	// spec.harness.type.
+	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
+	HarnessUnisolatedAllow = "allow"
 	// EnvPersonaIntegrity sets whether a profile worker requires its persona
 	// to carry a build-time content manifest (persona.IntegrityManifestFile).
 	// PersonaIntegrityRequired refuses a persona without one; unset loads it
@@ -135,6 +152,23 @@ func SessionConsumerName(session, role string) string {
 // /readyz and /healthz on. The operator's readiness probe names it, so the
 // two ends share this number.
 const ProfileWorkerStatusPort = 8080
+
+// The session pod's shipped Claude Code home: the persona file and the
+// skills directory cmd/session-persona writes at image build, beside the
+// state the harness keeps in the same directory.
+const (
+	SessionHomePersonaFile = "CLAUDE.md"
+	SessionHomeSkillsDir   = "skills"
+)
+
+// SessionHomeCovers reports whether a path relative to the session pod's
+// Claude Code home is part of what the image shipped there, and so what its
+// build-time content manifest covers: the persona file and everything under
+// the skills directory. The harness's own state beside them is not.
+func SessionHomeCovers(rel string) bool {
+	return rel == SessionHomePersonaFile || rel == SessionHomeSkillsDir ||
+		strings.HasPrefix(rel, SessionHomeSkillsDir+"/")
+}
 
 // ProfilePersonaDir is where a profile pod mounts its persona, read-only
 // (#3662). The operator's profilepod.PersonaMountPath is the same path.

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -695,6 +696,44 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 	if got := resetPaths(""); len(got) != 0 {
 		t.Errorf("resetPaths(\"\") = %q, want none", got)
+	}
+}
+
+// harnessConfigDir is where the session check and the settings lookup both
+// look: $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
+func TestHarnessConfigDir(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, "/cfg")
+	t.Setenv("HOME", "/home/u")
+	if got := harnessConfigDir(); got != "/cfg" {
+		t.Errorf("with %s set: %q", claudeConfigDirEnv, got)
+	}
+	t.Setenv(claudeConfigDirEnv, "")
+	if got := harnessConfigDir(); got != filepath.Join("/home/u", claudeDefaultConfigDir) {
+		t.Errorf("with HOME only: %q", got)
+	}
+	t.Setenv("HOME", "")
+	if got := harnessConfigDir(); got != "" {
+		t.Errorf("with neither: %q", got)
+	}
+}
+
+// TestSessionWriteRefusalDir: only a session pod with the cluster view keeps a
+// per-turn write-refusal record, under its workdir.
+func TestSessionWriteRefusalDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, session, clusterView, want string
+	}{
+		{"session with the cluster view", "chat-a", "true", "/scratch/.kube-agents"},
+		{"session without the cluster view", "chat-a", "", ""},
+		{"cluster view spelled otherwise", "chat-a", "TRUE", ""},
+		{"no session (a profile pod)", "", "true", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(lib.EnvClusterView, tc.clusterView)
+			if got := sessionWriteRefusalDir(tc.session, "/scratch"); got != tc.want {
+				t.Fatalf("sessionWriteRefusalDir(%q) = %q, want %q", tc.session, got, tc.want)
+			}
+		})
 	}
 }
 

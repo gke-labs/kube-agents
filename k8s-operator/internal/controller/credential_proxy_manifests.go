@@ -271,8 +271,15 @@ const (
 	// the two emptyDir caps, for the writable layer and the container's logs.
 	// The sizing test holds the limit to the caps plus this.
 	credentialProxyEphemeralStorageHeadroom = "1Gi"
-	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
-	// vcs scratch). The kubelet evicts the pod when either
+	// The emptyDir sizeLimits of the broker's /tmp and of its state volume. The
+	// state volume holds the commands' HOME (gcloud's config, kubectl's caches),
+	// their kubeconfigs, their workspace and TMPDIR, and the vcs scratch trees.
+	// It holds no gcloud log files: the broker turns gcloud's file logging off
+	// for every command it runs (GCLOUD_FILE_LOGGING_OFF_ENV in
+	// credential_proxy.py). With it on, gcloud keeps a log file for each
+	// command for 30 days; the exec tier measured about 386KiB a command
+	// (#4536), and nothing bounded those files here. The kubelet evicts the
+	// pod when either
 	// fills, whatever the container's ephemeral-storage limit, and the default
 	// render keeps these figures, each under the container's limit so that a
 	// runaway in one volume cannot take the other's share. A CR override that
@@ -800,6 +807,9 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 	// The scope declaration in every mode: spec.scope.exclude.clusters is
 	// refused at the broker for every caller (scope_exclude.py).
 	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
+	// spec.hold, refused the same way from its own ConfigMap
+	// (buildHoldConfigMap), which a hold edit changes without a roll.
+	mounts = append(mounts, holdMount())
 	// The token for the audit-report store and nothing else
 	// (auditReportStoreBrokerVolumes); AUDIT_REPORT_STORE_TOKEN_FILE names it.
 	mounts = append(mounts, auditReportStoreBrokerMounts(agent)...)
@@ -925,6 +935,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	// beside their place on allowedBrokerCallers (scopeBrokerPeers).
 	callers = append(callers, scopeBrokerPeers(agent)...)
 	callers = append(callers, a2aCuratorBrokerPeers(agent)...)
+	callers = append(callers, teamsInboundBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -1018,7 +1029,7 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	// The scope declaration, in every mode (CREDENTIAL_PROXY_SCOPE_FILE): the
 	// broker refuses an excluded cluster for every caller from it, and under
 	// mode next the scope role reads it to bound its arguments.
-	volumes = append(volumes, scopeConfigVolume(agent))
+	volumes = append(volumes, scopeConfigVolume(agent), holdVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	// The token the broker presents to the audit-report store.
 	volumes = append(volumes, auditReportStoreBrokerVolumes(agent)...)

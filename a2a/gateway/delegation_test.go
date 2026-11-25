@@ -2813,6 +2813,16 @@ func TestTheWakeGuideFollowsWhereTheAnswerGoes(t *testing.T) {
 	}
 }
 
+// A door wake gives the whole answer, and a report format the question asked
+// for wins over brevity there too (#6538): the closing guide says so in its
+// own words, not only by naming the constant.
+func TestADoorWakeAnswersInTheFormatTheQuestionAskedFor(t *testing.T) {
+	door := wakeText(lib.StateCompleted, "task-1", "triage the OOM; give options and a 'To authorize:' line", nil, "found it", "", true, false, false)
+	if want := "in the format their question asked for if it gave one"; !strings.Contains(door, want) {
+		t.Errorf("door wake doesn't tell the session to keep the asked-for format (%q); it ends %q", want, door[max(0, len(door)-200):])
+	}
+}
+
 // The guide is chosen from whether the person asking has seen the child's
 // result: a door caller hasn't (it gets only the wake's reply), and neither
 // has a chat whose child terminal a heal found (its status card carries no

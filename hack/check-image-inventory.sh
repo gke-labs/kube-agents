@@ -210,6 +210,8 @@ check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
 check_base_image node a2a/Dockerfile.console NODE_IMAGE NODE_VERSION
 check_base_image golang a2a/Dockerfile.console GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.teams-inbound GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.teams-inbound DISTROLESS_IMAGE DISTROLESS_VERSION
 # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
 # builder base to compare: its runtime base is the platform-agent image of the
 # same build, passed as a build arg with no default, so there is no runtime
@@ -280,6 +282,7 @@ check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile fil
 # its build context and the payload under /files, where profilepod mounts it.
 check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/
 check_literal_from busybox a2a/Dockerfile.persona-tse . /files/
+check_literal_from busybox a2a/Dockerfile.persona-fleet-audit . /files/
 
 # The calls above name their files, so a third plugin copied from the pair
 # (agentplugins/README.md, "Adding a plugin"), or a second persona image copied
@@ -355,6 +358,7 @@ check_go_directive a2a/Dockerfile.dispatcher GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.console GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.teams-inbound GOLANG_VERSION a2a/go.mod
 check_go_directive hack/ghes-proxy/Dockerfile GOLANG_VERSION hack/ghes-proxy/go.mod
 check_go_directive a2a/Dockerfile.web-console GOLANG_VERSION a2a/go.mod
 
@@ -449,6 +453,7 @@ check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platf
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
 check_compiled_image_name a2a-dispatcher k8s-operator/internal/controller/platformagent_a2a_dispatcher.go a2aDispatcherImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
+check_compiled_image_name a2a-teams-inbound k8s-operator/internal/controller/platformagent_teams_inbound.go a2aTeamsInboundImageName
 check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
 check_compiled_image_name kube-proxy k8s-operator/internal/controller/kube_proxy_manifests.go kubeProxyRepositoryName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
@@ -713,6 +718,8 @@ check_toggle profiles.cluster --set profiles.cluster.enabled=true
 # The GKE Support Agent's AgentProfile (#3842) adds its persona image the
 # same way.
 check_toggle profiles.tse --set profiles.tse.enabled=true
+# The fleet-audit AgentProfile (#5623) adds its persona image the same way.
+check_toggle profiles.fleetAudit --set profiles.fleetAudit.enabled=true
 # The Hindsight memory store adds its API and Postgres images. hindsight.enabled
 # is a tri-state that follows the memory provider when null; true turns the
 # store on whatever the provider says.

@@ -48,7 +48,14 @@ pause, so a pause decided before the arm is not made after it.
 `--chain` does that for the stage's five alone. It leaves every other job as it finds
 it: a case that triggered one of them (bench/tf/prebuilt/unchanged-manifest-digest)
 pauses it again itself, and a pause here between its mark and the tick's claim would
-drop its run.
+drop its run. A case can trigger one of the five as well
+(bench/tf/prebuilt/audit-chat-report fires `compliance-audit`), and `trigger_job` lifts
+a pause as it marks the job. So the due mark and the run under way are read again
+before each pause of a stage audit, in every round, and an audit that has either by
+then is left: without that, a mark landing after the decision, or after a first pause
+and before its read-back, was paused away. The read and the pause are two steps, so
+a mark that lands between them, inside the one `hermes cron pause` call, is still
+paused away: the window is that call and no longer the pass.
 
 Records what it paused in `<home>/.ci-paused-audits.json`, and `--resume` resumes
 exactly those. ci-eval-pr.sh runs the resume from its EXIT trap: a Prow lease's
@@ -156,7 +163,8 @@ def stage_finished(stage, jobs):
     All five once the stage is done; before that, fired (adopted runs included) and not the
     mark awaiting its run. Then no run claimed or
     running younger than STALE_SECONDS; and not marked due and unclaimed, whoever marked
-    it. Raises on a marker or ledger it cannot read, which the caller takes as none.
+    it. Raises on a marker or ledger it cannot read, which the decision takes as none
+    and the read before a pause (still_finished) as no change to the decision.
     """
     try:
         with open(STAGE_MARKER, encoding="utf-8") as fh:
@@ -198,6 +206,18 @@ def stage_finished(stage, jobs):
             conn.close()
         going = {str(jid) for jid, claimed in rows if (when := stamp(claimed)) is None or when >= since}
     return fired - due - going
+
+
+def still_finished(jid, stage):
+    """Whether a stage audit has no run due or under way, read afresh before its pause.
+
+    Returns that and why the read failed, or None. A failed read counts as finished:
+    the decision already made stands, and the caller names the audit in its line.
+    """
+    try:
+        return jid in stage_finished(stage, jobs_in(ROSTER)), None
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
+        return True, str(exc)
 
 
 def hermes(action, jid):
@@ -290,12 +310,28 @@ def pause():
     failed, failed_ids, retryable = [], set(), False
     dropped = []
     unrecorded = []
+    unread_again = {}
     pending = list(targets)
     clean_reads = 0
     for round_no in range(PAUSE_ROUNDS):
         if round_no:
             time.sleep(PAUSE_ROUND_SLEEP_SECONDS)
         for jid in pending:
+            # A case's stack can mark a stage audit due between the decision and here,
+            # or between two rounds, and a pause now would drop that run before the
+            # tick claims it. Only an audit the stage is past was a target, so this
+            # asks one thing more: is a run of it due or under way by now. Before the
+            # read of the stack's state file below, which stays the last thing before
+            # the pause.
+            if jid in finished:
+                idle, unread_why = still_finished(jid, held_by_stage)
+                if unread_why and jid not in unread_again:
+                    unread_again[jid] = unread_why
+                if not idle:
+                    if jid not in dropped:
+                        dropped.append(jid)
+                        left.append(f"{jid} (due or under way since the decision)")
+                    continue
             # The stack can arm between the decision and here; its chain needs the five
             # runnable, so a stage audit not yet paused is left from then on.
             if jid in held_by_stage and armed():
@@ -335,6 +371,10 @@ def pause():
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")
         + (f"; record not written again after pausing {', '.join(unrecorded)}" if unrecorded else "")
+        + (
+            f"; not read again before the pause of {', '.join(f'{jid} ({why})' for jid, why in unread_again.items())}"
+            if unread_again else ""
+        )
     )
     if not failed:
         return OK

@@ -132,6 +132,18 @@
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
         },
+        "delegation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "roundsMax": {
+              "description": "Delegate requests one AgentProfile task may make. Only 1 is supported until a profile task's later rounds ship.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -200,6 +212,15 @@
         },
         "envFromSecret": {
           "type": "string"
+        },
+        "masterKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "generate": {
+              "type": "boolean"
+            }
+          }
         },
         "maxTokens": {
           "type": "integer",
@@ -2184,6 +2205,15 @@
                 "tenantId": {
                   "type": "string"
                 },
+                "inbound": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    }
+                  }
+                },
                 "allowedUsers": {
                   "type": "array",
                   "items": {
@@ -2515,6 +2545,112 @@
           }
         },
         "cluster": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "persona": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                }
+              }
+            },
+            "harness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                },
+                "model": {
+                  "type": "string"
+                },
+                "maxTurns": {
+                  "type": "integer"
+                }
+              }
+            },
+            "allowedTiers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["read", "unattended"] }
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "activeDeadlineSeconds": {
+                  "type": "integer"
+                },
+                "ttlSecondsAfterFinished": {
+                  "type": "integer"
+                }
+              }
+            },
+            "concurrency": {
+              "type": "integer"
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "fleetAudit": {
           "type": "object",
           "additionalProperties": false,
           "properties": {

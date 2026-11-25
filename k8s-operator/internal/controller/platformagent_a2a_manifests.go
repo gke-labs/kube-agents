@@ -307,9 +307,17 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
-	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
-	a2aImagePullRefsSep    = ","
+	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	// a2aSessionHarnessEnvVar carries spec.harness.sessionWorker.type to
+	// the gateway (a2a/gateway/config.go reads it).
+	a2aSessionHarnessEnvVar = "A2A_SESSION_HARNESS"
+	// sessionHarnessCondition is False (reason sessionHarnessReasonNotSupported)
+	// while spec.harness.sessionWorker.type names a harness this operator
+	// doesn't render, and absent otherwise.
+	sessionHarnessCondition          = "SessionHarness"
+	sessionHarnessReasonNotSupported = "SessionHarnessNotSupported"
+	a2aImagePullRefsEnvVar           = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep              = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -525,6 +533,18 @@ const (
 	// control, rendered at the gateway's default (a2aCardStopTimeout).
 	a2aCardStopEnvVar        = "A2A_CARD_STOP"
 	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aDelegationRoundsMaxEnvVar is a controller-read setting rendered onto
+	// the gateway under the same name: how many delegate requests one
+	// profile task may make (the gateway's delegation.rounds rule, #6789).
+	// The chart sets it from operator.delegation.roundsMax. Rendered
+	// explicitly at 1, the only value supported until a profile task's later
+	// rounds land: the operator refuses any other value, logging why at
+	// startup (ValidateA2ADelegationRoundsMax) and rendering 1, and the
+	// gateway clamps one over 1 the same way.
+	a2aDelegationRoundsMaxEnvVar = "A2A_DELEGATION_ROUNDS_MAX"
+	// a2aDelegationRoundsSupported is the one value a2aDelegationRoundsMax
+	// renders until rounds past the first are supported.
+	a2aDelegationRoundsSupported = 1
 	// a2aCardStopTimeout is the gateway's default wait for a card-stop
 	// control, rendered explicitly: above the bridge's worst case for one
 	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
@@ -1159,8 +1179,8 @@ const (
 	// twice back to back, or the inject door's, whose read takes no lock and
 	// replays before and after its wait -- one asker, two replays, either
 	// way. The operator renders the gateway's A2A_DEFAULT_ADDRESSEE from
-	// spec.harness.tuning.defaultRoute, "platform" unless the field says
-	// otherwise (resolveA2ADefaultRoute), so on that default a plain
+	// spec.harness.tuning.defaultRoute (resolveA2ADefaultRoute); where it
+	// resolves to "platform" (the default, or a fallback) a plain
 	// conversation's task is a bridge run and a session pod is spawned only
 	// for a Delegate or a session-routed record; the conversations being
 	// asked about while their task runs are therefore the bridge's
@@ -1239,14 +1259,20 @@ const (
 	// brings its own workers, so a second replica doubles the dispatch row.
 	// spec.deployment.replicas is not read here.
 	//
-	// Where the floor hides all this. The budget is maxSessions*3 + the
-	// reserve, 32 at the default concurrency, and a stream is created at
-	// max(64, budget), so a default install (maxSessions=10, budget 62)
-	// still renders 64. The first maxSessions whose budget clears the floor
-	// is 11 (65); it was 13 when the reserve was 28 and 17 when it was 16.
-	// Above it the stream is 16 wider than it would have been, and so is the
-	// web user's unreapable-durable ceiling, which is the trade the block
-	// above already states.
+	// Where the floor hides all this, at the bridge's own default of 2
+	// workers, where the reserve is 32. On the platform route the budget is
+	// maxSessions*3 + the reserve, and a stream is created at max(64,
+	// budget), so maxSessions=10 (budget 62) still renders 64. The first
+	// maxSessions whose budget clears the floor is 11 (65); it was 13 when
+	// the reserve was 28 and 17 when it was 16. Above it the stream is 16
+	// wider than it would have been, and so is the web user's
+	// unreapable-durable ceiling, which is the trade the block above already
+	// states. On the session route a session counts
+	// a2aTasksConsumersPerSessionOnSessionRoute (7), so at 32 the floor is
+	// cleared from maxSessions=5 (67). A default render runs the operator's
+	// rendered bridge at 10 workers, a reserve of 80, which is above the
+	// floor from one session on either route: 110 at the default
+	// maxSessions on platform, 150 on session.
 	//
 	// A declared bridge concurrency moves the reserve by
 	// a2aTasksReplayTailFactor*(a2aTasksReplayAsk+a2aTasksReplayLookAhead),
@@ -1327,6 +1353,18 @@ const (
 	// replays, held a2aTasksReplayTailFactor times like every
 	// trigger-paced source in the table (a2aTasksConsumersPerSession).
 	a2aTasksReplaySessionAsks = a2aTasksReplayTailFactor * a2aTasksReplayAsk
+	// a2aTasksConsumersPerSessionOnSessionRoute is one session's share of
+	// TASKS on the session route: the named consumers it creates and the
+	// asks on its conversation. The session cap's fit to a live stream
+	// always divides by it (a2aSessionsFit, resolveA2ASessionCap), whatever
+	// route the install resolved to, so a fallback to platform, which counts
+	// fewer per session, cannot feed back into the fit that caused it.
+	a2aTasksConsumersPerSessionOnSessionRoute = a2aSessionConsumersPerSession + a2aTasksReplaySessionAsks
+	// a2aSessionsFitUnbounded is a2aSessionsFit's answer for a stream with no
+	// consumer limit (max_consumers -1): more sessions than maxSessions'
+	// Maximum allows, so the effective cap is maxSessions. The provision
+	// script writes the same number for the same stream.
+	a2aSessionsFitUnbounded = math.MaxInt32
 	// a2aTasksReplayLookAhead is the pre-spawn look-ahead replays one bridge
 	// worker holds: lib.TaskInReplay at most once per dequeue, and at most
 	// Concurrency of them in hand across the bridge at once, which the bridge
@@ -1553,6 +1591,36 @@ func a2aCardStop() string {
 		return "true"
 	}
 	return "false"
+}
+
+// a2aDelegationRoundsMax renders the gateway's A2A_DELEGATION_ROUNDS_MAX: the
+// operator's own setting when it is the supported value, and that value
+// otherwise. Unset, malformed and over the supported value all render 1;
+// ValidateA2ADelegationRoundsMax says why at startup.
+func a2aDelegationRoundsMax() string {
+	return strconv.Itoa(a2aDelegationRoundsSupported)
+}
+
+// ValidateA2ADelegationRoundsMax refuses an A2A_DELEGATION_ROUNDS_MAX on the
+// operator other than unset or 1, naming the variable and the reason. The
+// operator logs it at startup and renders 1 (a2aDelegationRoundsMax), rather
+// than stopping every install's reconcile over a setting the gateway would
+// clamp anyway.
+func ValidateA2ADelegationRoundsMax() error {
+	v := strings.TrimSpace(os.Getenv(a2aDelegationRoundsMaxEnvVar))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return fmt.Errorf("%s %q refused: need an integer, and only %d is supported; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	if n > a2aDelegationRoundsSupported {
+		return fmt.Errorf("%s %q refused: rounds above %d are not supported yet; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	return nil
 }
 
 // renderA2ANATSDebug is the bus's debug line, present only while the
@@ -3896,9 +3964,22 @@ fi`
 	reserve := strconv.Itoa(reserveN)
 	perSessionN := a2aTasksConsumersPerSession(agent)
 	oneSession := strconv.Itoa(perSessionN + reserveN)
-	maxSessionsN := resolveA2AMaxSessions(agent)
-	maxSessions := strconv.Itoa(maxSessionsN)
+	// The sessions the check counts are the effective cap
+	// (a2aTasksConsumerBudget), so the arithmetic and the words quote it.
+	maxSessionsN := resolveA2AEffectiveSessions(agent)
+	sessionsIs, sessionsEq := a2aSessionCapWords(agent)
+	sessionsAt := strings.Replace(sessionsIs, " is ", " at ", 1)
 	perSession := strconv.Itoa(perSessionN)
+	// Where the spec asks for the session route, fits is computed before the
+	// check, in the shape the operator's own fit shares
+	// (a2aProvisionSessionsFitBlock). On the platform route the script stays
+	// as it was, fits computed inside the refusal, so its Job is unchanged.
+	liveConsumersRead := a2aProvisionLiveConsumersRead
+	fitsInRefusal := `  fits=$(( (live_consumers - ` + reserve + `) / ` + perSession + ` ))
+`
+	if a2aSpecDefaultRoute(agent) == agentv1alpha1.DefaultRouteSession {
+		liveConsumersRead, fitsInRefusal = a2aProvisionSessionsFitBlock(reserveN, perSessionN), ""
+	}
 	// What a session's share is, said as the refusal says it: the named
 	// consumers it creates, and on the session route the replays of its
 	// conversation's task too.
@@ -4019,10 +4100,10 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
     echo "  - the operator renders the bridge; unset, it runs ` + renderedDefault + ` - which is" >&2`
 		}
 		thirdLever = `  if [ "${workers_fit}" -ge 1 ]; then
-    echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and ` + workerLever + `
+    echo "Or keep ` + sessionsAt + ` and ` + workerLever + `
     echo "  the most this stream has room for beside those sessions: the reserve is ` + fixedReserve + ` plus ` + perWorker + ` a worker." >&2
   else
-    echo "Fewer bridge workers alone will not fit it beside spec.harness.tuning.maxSessions=` + maxSessions + `: one worker" >&2
+    echo "Fewer bridge workers alone will not fit it beside ` + sessionsEq + `: one worker" >&2
     echo "  still needs ` + oneWorker + `, more than this stream holds. One session beside one worker needs ` + oneAndOne + `;" >&2
     echo "  below that, only deleting the TASKS stream and provisioning again fits." >&2
   fi
@@ -4430,22 +4511,15 @@ if [ -w "` + a2aProvisionTerminationLogPath + `" ]; then
 fi
 
 ` + readNote + `required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
-live_consumers="$(printf '%s' "${tasks_json}" \
-  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
-if [ -z "${live_consumers}" ]; then
-  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
-  exit 1
-fi
-if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
+` + liveConsumersRead + `if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
-  echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session ` + perSessionWhat + `," >&2
+  echo "  ` + sessionsIs + `, each session ` + perSessionWhat + `," >&2
   echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
 ` + bridgeNote + `  echo "Provisioning does not change this limit on an existing stream, and it could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
   echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
-  fits=$(( (live_consumers - ` + reserve + `) / ` + perSession + ` ))
-` + workersFit + `  if [ "${fits}" -ge 1 ]; then
+` + fitsInRefusal + workersFit + `  if [ "${fits}" -ge 1 ]; then
     echo "So either lower spec.harness.tuning.maxSessions to at most ${fits} - the most a" >&2
     echo "  stream holding ${live_consumers} consumers has room for, with ` + reserve + ` of them reserved and" >&2
     echo "  the rest going ` + perSession + ` to a session - or delete the TASKS stream and provision again." >&2
@@ -4500,6 +4574,33 @@ fi
 echo "a2a provisioning complete"
 `
 }
+
+// a2aProvisionSessionsFitBlock is the provision script's read of TASKS'
+// max_consumers off tasks_json and its sessions-fit arithmetic: fits is how
+// many sessions the live stream has room for beside reserve at perSession
+// each, a2aSessionsFit in shell, with a2aSessionsFitUnbounded for a stream
+// with no limit. The closing check's refusal quotes it.
+// TestTheProvisionScriptFitsWhatTheOperatorFits runs this block under bash
+// against the Go function, so the operator's fitted cap and the number the
+// refusal tells an operator to lower maxSessions to cannot drift apart.
+func a2aProvisionSessionsFitBlock(reserve, perSession int) string {
+	return a2aProvisionLiveConsumersRead + `if [ "${live_consumers}" = "-1" ]; then
+  fits=` + strconv.Itoa(a2aSessionsFitUnbounded) + `
+else
+  fits=$(( (live_consumers - ` + strconv.Itoa(reserve) + `) / ` + strconv.Itoa(perSession) + ` ))
+fi
+`
+}
+
+// a2aProvisionLiveConsumersRead is the provision script's read of TASKS'
+// max_consumers off tasks_json, refusing when it finds none.
+const a2aProvisionLiveConsumersRead = `live_consumers="$(printf '%s' "${tasks_json}" \
+  | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_consumers}" ]; then
+  echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+`
 
 // a2aProvisionCapLowerBlock is the provision script's report for one
 // stream's byte cap, after cap_check has read it (#4476). Provisioning does
@@ -5360,6 +5461,10 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// unset as 0); the workloads behind an opt-in operator flag come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
+	// The Teams inbound receiver, a CR field like the exec tier.
+	if teamsInboundEnabled(agent) {
+		n += int64(ptr.Deref(buildA2ATeamsInboundDeployment(agent).Spec.Replicas, 1))
+	}
 	// The profile dispatcher and the MCP server, each on unless its flag is
 	// "false" (operator.profileDispatcher.enabled and operator.mcpServer.enabled
 	// in the chart).
@@ -5392,20 +5497,84 @@ func sessionQuantity(agent *agentv1alpha1.PlatformAgent, request bool, name core
 	return q.String()
 }
 
-// resolveA2ADefaultRoute is spec.harness.tuning.defaultRoute, or
-// DefaultRoutePlatform when it is unset: the gateway's own default, so an
-// install that sets nothing routes as it did before the field existed. The
-// gateway's A2A_DEFAULT_ADDRESSEE and the platform agent container's (which
-// the hermes-bridge sidecar copies) all come from here, so the two cannot disagree. Only the CRD's two values are
-// routes: anything else that reaches here (a CR written past the schema)
-// falls through to DefaultRoutePlatform rather than naming an addressee no
-// executor owns.
-func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil &&
-		*limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
+// a2aSpecDefaultRoute is the route spec.harness.tuning.defaultRoute asks
+// for: DefaultRouteSession when it says `session`, DefaultRoutePlatform when
+// it is unset or says `platform`, so an install that sets nothing routes as
+// it did before the field existed. Only the CRD's two values are routes:
+// anything else that reaches here (a CR written past the schema) is
+// DefaultRoutePlatform rather than an addressee no executor owns. Everything
+// the session route adds (the session cap's fit to TASKS, its condition and
+// the provision Job's wait for it) runs only where this says session.
+func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
+	if limits := agentTuning(agent); limits != nil && limits.DefaultRoute != nil && *limits.DefaultRoute == agentv1alpha1.DefaultRouteSession {
 		return agentv1alpha1.DefaultRouteSession
 	}
 	return agentv1alpha1.DefaultRoutePlatform
+}
+
+// resolveA2ADefaultRoute is the route the operator renders: the spec's
+// (a2aSpecDefaultRoute), with two exceptions on the session route, both
+// read off status.effectiveSessionCap, which resolveA2ASessionCap writes
+// from the TASKS stream's live width before anything is rendered.
+//
+// A cap below 1 is DefaultRoutePlatform: TASKS has no room for one session's
+// consumers, so a session route would spawn pods that cannot consume.
+//
+// A cap still waiting on its first reading (a2aSessionCapWaiting: a pass on
+// a provisioned bus that could not read its width and has no earlier
+// reading) keeps `session` where the field says so and `platform` where it
+// is unset. An unset field resolves to platform today, so that second case
+// waits on a later change making session the default; until then the wait
+// is an opted-in install's, whose route stays session at maxSessions while
+// resolveA2ASessionCap holds the provision Job, and the pass that reads the
+// width fits the cap. A bus never provisioned does not wait: its TASKS will
+// be created at maxSessions' width. With no cap and no wait, which the
+// reconcile never renders on the session route (resolveA2ASessionCap sets
+// one or the other first), the route is the spec's at maxSessions.
+//
+// The gateway's A2A_DEFAULT_ADDRESSEE and the platform agent container's
+// (which the hermes-bridge sidecar copies) all come from here, so the two
+// cannot disagree.
+func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
+	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't
+	// change the route: an explicit `session` routes to session with the
+	// view on or off. The view is on only where that flag is `true`
+	// (a2aSessionClusterViewEnabled); nothing sets it from defaultRoute, and
+	// making it the session route's default is a later step of
+	// gke-labs/kube-agents#6538.
+	// A CRD that prunes status.effectiveSessionCap can't keep the cap the
+	// session route renders from, so that install stays on platform.
+	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
+		a2aSessionCapPrunedHeld(agent) {
+		return agentv1alpha1.DefaultRoutePlatform
+	}
+	stored := agent.Status.EffectiveSessionCap
+	if stored == nil {
+		if limits := agentTuning(agent); a2aSessionCapWaiting(agent) && (limits == nil || limits.DefaultRoute == nil) {
+			return agentv1alpha1.DefaultRoutePlatform
+		}
+		return agentv1alpha1.DefaultRouteSession
+	}
+	if *stored < 1 {
+		return agentv1alpha1.DefaultRoutePlatform
+	}
+	return agentv1alpha1.DefaultRouteSession
+}
+
+// resolveA2AEffectiveSessions is the session cap the operator renders: the
+// gateway's A2A_MAX_SESSIONS, the session ResourceQuota and the provision
+// Job's consumer check (a2aTasksConsumerBudget). On the session route it is
+// status.effectiveSessionCap, held to maxSessions in case the field was
+// lowered since the cap was read; on the platform route, or before a cap
+// has been read, it is maxSessions. The width a new TASKS stream is created
+// at does not read it (a2aTasksMaxConsumers), so a fitted cap never narrows
+// the stream the next one is created as.
+func resolveA2AEffectiveSessions(agent *agentv1alpha1.PlatformAgent) int {
+	configured := resolveA2AMaxSessions(agent)
+	if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession || agent.Status.EffectiveSessionCap == nil {
+		return configured
+	}
+	return min(configured, *agent.Status.EffectiveSessionCap)
 }
 
 // a2aDefaultAddresseeEnv is the A2A_DEFAULT_ADDRESSEE entry both containers
@@ -6359,8 +6528,12 @@ func a2aTasksReserve(agent *agentv1alpha1.PlatformAgent) int {
 // deliberately the budget and not the rendered max_consumers: an existing
 // stream sized at the floor holds a default install fine, and failing it for
 // being below a floor it was never going to be below is a false alarm.
+//
+// The sessions it counts are the effective cap (resolveA2AEffectiveSessions),
+// so an install whose cap was fitted to a narrower stream passes the check
+// rather than refusing on a stream it already fits.
 func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
-	return resolveA2AMaxSessions(agent)*a2aTasksConsumersPerSession(agent) + a2aTasksReserve(agent)
+	return resolveA2AEffectiveSessions(agent)*a2aTasksConsumersPerSession(agent) + a2aTasksReserve(agent)
 }
 
 // a2aTasksConsumersPerSession is the multiplier the session cap takes in the
@@ -6371,10 +6544,43 @@ func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
 // stay in the reserve's bridge row and the multiplier is the named
 // consumers alone, as it always was.
 func a2aTasksConsumersPerSession(agent *agentv1alpha1.PlatformAgent) int {
-	if resolveA2ADefaultRoute(agent) == agentv1alpha1.DefaultRouteSession {
-		return a2aSessionConsumersPerSession + a2aTasksReplaySessionAsks
+	return a2aTasksConsumersPerSessionOn(resolveA2ADefaultRoute(agent))
+}
+
+// a2aTasksConsumersPerSessionOn is a2aTasksConsumersPerSession for a named
+// route.
+func a2aTasksConsumersPerSessionOn(route string) int {
+	if route == agentv1alpha1.DefaultRouteSession {
+		return a2aTasksConsumersPerSessionOnSessionRoute
 	}
 	return a2aSessionConsumersPerSession
+}
+
+// a2aSessionCapWords names the session count the provision check budgets
+// for, as "<x> is N" and "<x>=N": spec.harness.tuning.maxSessions while the
+// effective cap is the configured one, and the fitted cap with the field
+// beside it while it is lower, so a refusal's number and its words agree.
+func a2aSessionCapWords(agent *agentv1alpha1.PlatformAgent) (is, eq string) {
+	configured, effective := resolveA2AMaxSessions(agent), resolveA2AEffectiveSessions(agent)
+	if effective == configured {
+		return fmt.Sprintf("spec.harness.tuning.maxSessions is %d", configured), fmt.Sprintf("spec.harness.tuning.maxSessions=%d", configured)
+	}
+	return fmt.Sprintf("the session cap is %d (status.effectiveSessionCap, maxSessions %d fitted to TASKS)", effective, configured),
+		fmt.Sprintf("the session cap of %d (status.effectiveSessionCap, maxSessions %d fitted to TASKS)", effective, configured)
+}
+
+// a2aSessionsFit is how many sessions a TASKS stream of liveMaxConsumers has
+// room for beside reserve, at perSession consumers each: (live - reserve) /
+// perSession, in integer division, which truncates toward zero in Go as in
+// the provision script's shell arithmetic, so the two agree on every width
+// (TestTheProvisionScriptFitsWhatTheOperatorFits). A negative answer is a
+// stream narrower than its reserve. live == -1 is a stream with no consumer
+// limit, and the answer is a2aSessionsFitUnbounded.
+func a2aSessionsFit(liveMaxConsumers, reserve, perSession int) int {
+	if liveMaxConsumers == -1 {
+		return a2aSessionsFitUnbounded
+	}
+	return (liveMaxConsumers - reserve) / perSession
 }
 
 // a2aProfileDurablesAllowed is PROFILE_SUBMITS's max_consumers: one durable
@@ -6385,9 +6591,14 @@ func a2aTasksConsumersPerSession(agent *agentv1alpha1.PlatformAgent) int {
 // work lands.
 const a2aProfileDurablesAllowed = 16 * 2 * 2
 
-// a2aTasksMaxConsumers is what a fresh TASKS stream is created with.
+// a2aTasksMaxConsumers is what a fresh TASKS stream is created with: the
+// budget at the configured maxSessions on the route the spec asks for,
+// never at the fitted cap or a fallback route (resolveA2AEffectiveSessions),
+// so a stream recreated on a fitted install comes back wide enough for
+// maxSessions rather than as narrow as the one it replaced.
 func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
-	if budget := a2aTasksConsumerBudget(agent); budget > a2aTasksMaxConsumersFloor {
+	budget := resolveA2AMaxSessions(agent)*a2aTasksConsumersPerSessionOn(a2aSpecDefaultRoute(agent)) + a2aTasksReserve(agent)
+	if budget > a2aTasksMaxConsumersFloor {
 		return budget
 	}
 	return a2aTasksMaxConsumersFloor
@@ -6421,9 +6632,9 @@ func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
 // third number the remedy wants, what the live stream holds, is on the bus
 // and in the pod log.
 func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
-	maxSessions := resolveA2AMaxSessions(agent)
+	_, sessionsEq := a2aSessionCapWords(agent)
 	workers, capped, defaulted := a2aBridgeWorkers(agent)
-	need := fmt.Sprintf("spec.harness.tuning.maxSessions=%d needs (%d)", maxSessions, a2aTasksConsumerBudget(agent))
+	need := fmt.Sprintf("%s needs (%d)", sessionsEq, a2aTasksConsumerBudget(agent))
 	ways := "the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream"
 	fits := "the maxSessions that fits"
 	finish := "The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
@@ -6455,8 +6666,8 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		if a2aBridgeRendered(agent) && !defaulted {
 			reserve = fmt.Sprintf("the reserve is %d at %d %s and %d at %d", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency)
 		}
-		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; %s)",
-			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
+		need = fmt.Sprintf("%s and the %d bridge %s %s need together (%d; %s)",
+			sessionsEq, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
 		if capped {
 			need += fmt.Sprintf(". %s more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", countIs, a2aBridgeConcurrencyMax)
 		}
@@ -6503,7 +6714,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent)) + a2aQuotaHeadroom(agent)
+	limit := int64(resolveA2AEffectiveSessions(agent)) + a2aQuotaHeadroom(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -7122,6 +7333,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
+			{Name: "A2A_KUBE_PROXY_MODE", Value: kubeProxyMode},
 		}
 		// The kubectl admission's tier, normalised as for the shell sandbox;
 		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
@@ -7331,7 +7543,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the number a `kubectl describe` reader sees is
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
-		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AEffectiveSessions(agent))},
 		// The session pod's requests and limits (#2371), always all four,
 		// resolved per key over the defaults (ResolveSessionResources), so
 		// the rendered Deployment states what the gateway will request.
@@ -7358,11 +7570,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
 		// Where a plain conversation's first message goes:
 		// spec.harness.tuning.defaultRoute, `platform` when
-		// unset (resolveA2ADefaultRoute). Rendered explicitly
-		// at that default, like A2A_MAX_SESSIONS above, so
-		// the flip to the session route is an edit to a value
-		// already in the live Deployment. The session route
-		// needs the spawner the line above arms.
+		// unset (resolveA2ADefaultRoute, which on the session
+		// route also reads the fitted session cap). Rendered
+		// explicitly at every value, like A2A_MAX_SESSIONS
+		// above. The session route needs the spawner the line
+		// above arms.
 		a2aDefaultAddresseeEnv(agent),
 		// The image those sessions run. Rendered even
 		// when it matches the gateway's own default, so
@@ -7397,6 +7609,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// bound beside the switch.
 		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
 		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
+		// The delegation rounds a profile task may use,
+		// rendered explicitly at the one value supported
+		// (a2aDelegationRoundsMax), so a reader of the live
+		// Deployment sees the bound, and lifting it is an
+		// edit to a value already there.
+		{Name: a2aDelegationRoundsMaxEnvVar, Value: a2aDelegationRoundsMax()},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS
@@ -7454,6 +7672,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, a2aTierMembershipEnv(agent)...)
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
+	}
+	// The session worker's harness (spec.harness.sessionWorker.type), only
+	// when set: an install that leaves it out renders the gateway it had,
+	// so an operator upgrade doesn't roll the gateway for it. The gateway
+	// reads unset as Claude Code.
+	if t := a2aSessionHarness(agent); t != "" {
+		env = append(env, corev1.EnvVar{Name: a2aSessionHarnessEnvVar, Value: t})
 	}
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
@@ -7655,6 +7880,13 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// builtinSchedulesCondition is the BuiltinSchedules condition
+	// reconcileBuiltinSchedules computed, nil when there's nothing to say;
+	// builtinSchedulesRequeue is how soon the renderer wants to look again
+	// (a replaced schedule's deletion in flight, a write that raced), zero
+	// for no need.
+	builtinSchedulesCondition *metav1.Condition
+	builtinSchedulesRequeue   time.Duration
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
@@ -7780,6 +8012,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	}
 	if a2aCuratorEnabled() {
 		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
+	}
+	if teamsInboundEnabled(agent) {
+		fences = append(fences, buildTeamsInboundNetworkPolicy(agent, dnsClusterIPs))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -8105,6 +8340,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
 		return state, err
 	}
+	if err := r.reconcileTeamsInbound(ctx, agent); err != nil {
+		return state, err
+	}
 	// The MCP server, the other console client, under its flag and for the
 	// same reasons: after the fences, ahead of the gateway's hold. Its
 	// broker identity first, so the ServiceAccount exists before the pod
@@ -8145,6 +8383,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	state.scopeCondition = scopeOutcome.condition
 	state.scopeRequeue = scopeOutcome.requeue
+
+	// The built-in AgentSchedules (platformagent_builtin_schedules.go).
+	builtinCondition, builtinRequeue, err := r.reconcileBuiltinSchedules(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.builtinSchedulesCondition = builtinCondition
+	state.builtinSchedulesRequeue = builtinRequeue
 
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
@@ -8292,10 +8538,15 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				}
 			}
 		}
-		if hold := calloutHold || busHold || state.busHeld || migrationHold || metaHold; hold {
+		// The session cap (resolveA2ASessionCap): a Job rendered before
+		// the bus's TASKS width has been read once would check the stream
+		// against maxSessions, and refuse an install whose cap the reading
+		// would fit. It waits for the reading.
+		capHold := a2aSessionCapWaiting(agent)
+		if hold := calloutHold || busHold || state.busHeld || migrationHold || metaHold || capHold; hold {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready, the bus is on its current config and rolled out, no bus migration is under way, and its meta group is formed",
-				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld, "waitingOnMigration", migrationHold, "waitingOnMetaGroup", metaHold)
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready, the bus is on its current config and rolled out, no bus migration is under way, its meta group is formed, and its TASKS width has been read",
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld, "waitingOnMigration", migrationHold, "waitingOnMetaGroup", metaHold, "waitingOnSessionCap", capHold)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
@@ -9604,4 +9855,66 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionHarnessSpec is spec.harness.sessionWorker.type as written, ""
+// when unset.
+func a2aSessionHarnessSpec(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.SessionWorker == nil {
+		return ""
+	}
+	return agent.Spec.Harness.SessionWorker.Type
+}
+
+// a2aSessionHarnessSupported is whether the operator renders a session
+// harness: claude-code. Antigravity joins when its worker isolation lands.
+func a2aSessionHarnessSupported(t string) bool {
+	return t == agentv1alpha1.AgentProfileHarnessClaudeCode
+}
+
+// a2aSessionHarness is the session harness the gateway is given: the
+// spec's value when this operator supports it, else "". An unsupported
+// value (a CRD that admitted more than this operator knows) is not
+// rendered, so the shared gateway keeps serving and session pods run the
+// default harness; syncSessionHarness says so on the SessionHarness
+// condition and in a Warning event. A refused AgentProfile only loses its
+// own pool, so it is refused instead (HarnessNotSupported).
+func a2aSessionHarness(agent *agentv1alpha1.PlatformAgent) string {
+	if t := a2aSessionHarnessSpec(agent); a2aSessionHarnessSupported(t) {
+		return t
+	}
+	return ""
+}
+
+// syncSessionHarness writes the SessionHarness condition: False with
+// reason SessionHarnessNotSupported, and a Warning event once it is first
+// stored, while the spec names a session harness this operator doesn't
+// render; removed once the value is supported or unset.
+func (r *PlatformAgentReconciler) syncSessionHarness(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	t := a2aSessionHarnessSpec(agent)
+	if t == "" || a2aSessionHarnessSupported(t) {
+		if meta.RemoveStatusCondition(&agent.Status.Conditions, sessionHarnessCondition) {
+			return r.Status().Update(ctx, agent)
+		}
+		return nil
+	}
+	msg := fmt.Sprintf("spec.harness.sessionWorker.type %q is not a harness this operator renders (supported: %s); session pods run the default harness, %s", t, agentv1alpha1.AgentProfileHarnessClaudeCode, agentv1alpha1.AgentProfileHarnessClaudeCode)
+	prior := meta.FindStatusCondition(agent.Status.Conditions, sessionHarnessCondition)
+	first := prior == nil || prior.Reason != sessionHarnessReasonNotSupported || prior.Message != msg
+	if !meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: sessionHarnessCondition, Status: metav1.ConditionFalse, Reason: sessionHarnessReasonNotSupported,
+		Message: msg, ObservedGeneration: agent.Generation,
+	}) {
+		return nil
+	}
+	// The event only once the condition is stored: a write that conflicts
+	// leaves the condition unstored, so the next pass would read it as
+	// first and warn again.
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	if first {
+		r.recordEvent(agent, "Warning", sessionHarnessReasonNotSupported, msg)
+	}
+	return nil
 }

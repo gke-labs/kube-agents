@@ -401,7 +401,8 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 		CredentialProxyURL:   "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
 		KubeProxyURL:         "https://agent-kube-proxy.test-ns.svc.cluster.local:8443",
 		KubeProxyCAConfigMap: "agent-kube-proxy-ca-bundle",
-		KubeProxyHostContext: "in-cluster"}
+		KubeProxyHostContext: "in-cluster",
+		KubeProxyMode:        "read-only-dry-run"}
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
 	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
@@ -441,6 +442,7 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 		env["KUBE_PROXY_URL"] != cfg.KubeProxyURL ||
 		env["KUBE_PROXY_CA_FILE"] != kubeProxyCAMountPath+"/"+kubeProxyCAFile ||
 		env["KUBE_PROXY_HOST_CONTEXT"] != cfg.KubeProxyHostContext ||
+		env["KUBE_PROXY_MODE"] != cfg.KubeProxyMode ||
 		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
 		t.Fatalf("cluster-view env = %v", env)
 	}

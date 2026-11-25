@@ -23,8 +23,8 @@ pull request.
 One rule needs more than PyYAML: on a case that no other rule faults, each check
 entry is read and loaded with the harness's own YAML reader and parser, which
 are in the bench package (`make test-bench-deps`). Where that package is not installed, as
-in the lint's job, or is another checkout's, the rule does not run and the CLI says so on its
-last line;
+in the lint's job, or is another checkout's, or has installed data behind
+`bench/pyproject.toml`, the rule does not run and the CLI says so on its last line;
 `bench/tests/test_case_entries_load.py` gates it in the job that installs the
 package.
 
@@ -44,12 +44,14 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import functools
+import importlib.metadata
 import importlib.util
 import ipaddress
 import json
 import pathlib
 import re
 import sys
+import tomllib
 from typing import Any
 
 import yaml
@@ -72,6 +74,9 @@ PROFILE_HOOK_MODULE_NAME = "bench_profile_hook"
 # The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
 SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
 SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
+# The runner's reader of `scope_hold:` (hack/ci-eval-pr.sh), loaded the same way.
+SCOPE_HOLD_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_hold.py"
+SCOPE_HOLD_MODULE_NAME = "bench_scope_hold"
 # The top-level key a case declares its total of requested pull requests under
 # (bench/kube_agents_bench/lane.py's REQUESTED_KEY); the check types that request a
 # pull request, as lane.py's REQUESTING_CHECK_TYPES names them; and the keys a check
@@ -103,6 +108,29 @@ FIELD_CHECK_STALE = (
     "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
     "tree: this interpreter resolves it to {path}, not to this checkout's bench/. Install this "
     "checkout's with `make test-bench-deps` and run this again."
+)
+# An editable install resolves to this checkout's source after each pull, but two things are as
+# old as the install: the entry points that register this repository's check types, and the
+# installed devops-bench. After a pull that changes bench/pyproject.toml they are behind it, and
+# the rule would refuse an entry that a run loads.
+BENCH_PYPROJECT = BENCH_DIR / "pyproject.toml"
+BENCH_DISTRIBUTION = "kube-agents-bench"
+HARNESS_DISTRIBUTION = "devops-bench"
+VERIFIER_ENTRY_POINT_GROUP = "devops_bench.verifiers"
+# Where pip and uv record the commit of a package that is installed from a git URL (PEP 610).
+DIRECT_URL_FILE = "direct_url.json"
+HARNESS_PIN = re.compile(r"devops-bench\s*@\s*git\+\S+@([0-9a-f]{40})\s*$")
+NO_RECORDED_COMMIT = "no recorded commit"
+ENTRY_POINTS_BEHIND = "its installed entry points of the {group} group differ from bench/pyproject.toml for: {names}"
+# pip can keep the old commit of a git pin when the version did not change.
+HARNESS_BEHIND = (
+    "the installed devops-bench is at {installed}, and bench/pyproject.toml pins {pinned} (if the "
+    "install keeps the old commit, uninstall devops-bench first or use a new environment)"
+)
+PYPROJECT_UNREADABLE = "bench/pyproject.toml cannot be read ({error}), so the installed data cannot be compared with it"
+FIELD_CHECK_STALE_DATA = (
+    "bench-case-check: the field check did NOT run: the bench package is installed, but behind the "
+    "tree: {difference}. Install it again with `make test-bench-deps` and run this again."
 )
 # A run's record is never committed beside a case: a public file names the run
 # and its outcome, nothing from inside the record. The harness writes runs
@@ -241,6 +269,15 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # A measurement, not a regression guard: six concurrent sessions each
+    # fanning out cluster reads, run by hand in held presubmit twins that
+    # restrict the smoke to it, before and after a change to the cluster
+    # pool. In a roster it would hold a lane for most of an hour on a one-pod
+    # pool and share session workers with the other cases.
+    "session-burst-cluster-reads": (
+        "#7014: a concurrency measurement run by hand in held smoke twins restricted to it; "
+        "a roster seat would share session workers with other cases and skew it"
+    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -374,6 +411,33 @@ FIXTURE_NOT_READY = {
         "#2567 item 2: needs a pool with a live node whose surge node or green pool exceeds a "
         "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
         "$9 an hour standing or about $7 a run on a per-run cluster"
+    ),
+    # #2581 holds the check (its owner's answer of 2026-11-23). The shape that
+    # the case reads, the fleet's multi-process workload on a pool with no pod
+    # PID limit, is not shown as the fault in live tests and is a setting at
+    # the platform's default, which fixture rule 9 does not take as a fixture.
+    # A fixture for the node's own PIDPressure needs a node of its own and a
+    # privileged pod that lowers kernel.pid_max. In one test each, a Deployment
+    # of that pod made hundreds of refused pods an hour, and one pod with no
+    # controller made none. It is not on the fleet. #5410 owns the gap.
+    "node-pid-pressure-fork-exhaustion": (
+        "#5410: the check is on hold under #2581; the shape that the case reads is the platform's "
+        "default (fixture rule 9); a fixture for the node's PIDPressure needs a node of its own "
+        "and a privileged pod that lowers kernel.pid_max, which is not on the fleet and which no "
+        "issue plans"
+    ),
+    # Needs the order of two times on one node: a workload container that
+    # starts before a per-node agent's pod is Ready. That order is evidence
+    # only on a node made after the agent's DaemonSet, and a workload's restart
+    # resets it. The fleet's pools make a node only at an upgrade or a repair,
+    # and its two zero-node pools are read by other cases as empty; the cost,
+    # not tried, is a pool of its own with one standing small node. The first
+    # plan's signal, a label only a fixture writes, is not a fixture (fixture
+    # rule 9). #5411 owns the gap and proposes the first plan's check.
+    "node-kubelet-startup-admission-race": (
+        "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
+        "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
+        "tried, is a pool of its own with one standing small node whose two times stay readable"
     ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the
@@ -566,6 +630,13 @@ FIXTURE_NOT_READY = {
     # 2027-02-17. The entry goes in the pull request that moves the case to
     # the nightly file on that date, once the fixture-state scan reads both
     # roles ready on every pool project.
+    # Needs a Deployment with a name of 47 characters or more whose live pod is
+    # idle and whose replaced pod, inside the seven-day window, was busy. No
+    # planted Deployment with a long name has a replaced pod.
+    "cost-long-name-replaced-pod-window": (
+        "#7048: needs the long-name-replaced-pod role, a long-named Deployment with an idle live pod "
+        "and a busy pod replaced inside the audit's seven-day window; no pool project carries one"
+    ),
     "compute-declared-intent-no-finding": (
         "#1408: needs the declared-orphan-snapshot and orphan-snapshot roles past their "
         "91-day age gate (bench/tf/fleet/fixtures.json ready_after_hours); the pool's "
@@ -624,6 +695,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "required_phrases",
         "forbidden_phrases",
         "any_of_phrases",
+        "required_patterns",
+        "forbidden_patterns",
         "every_finding_named",
     ),
     # No field: the verifier's own model refuses a spec that binds nothing
@@ -637,6 +710,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: "this run's report is in the store" is the assertion, and
     # `status` and `required_finding_phrases` only narrow it.
     "audit_report_stored": (),
+    # Likewise: "this run's shadow report is on its shadow stream, marked
+    # shadow" is the assertion. `required_finding_phrases` is required by the
+    # verifier's own model.
+    "shadow_report_stored": (),
     # The audits whose part of the reply is graded against the store.
     "report_store_reply": ("audits",),
     # No field, deliberately: the freshness binding is the assertion and every
@@ -700,6 +777,14 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading. No field: "no row of the audit's
+    # changed since the stack's snapshot" is the whole assertion; `source`
+    # (required by the verifier's model) and `check_prefix` say whose rows.
+    "findings_queue_untouched": (),
+    # This repository, schedule-status-reading. No field: "the fired run's
+    # report went to no chat" is the whole assertion; `schedule` names the
+    # AgentSchedule whose fired run is graded.
+    "schedule_report_not_posted": (),
     # This repository, agent-pod-reading: how many of a workload's events the
     # session daemon folded into its newest incident. The count is the
     # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
@@ -805,10 +890,55 @@ GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
 
+def declared_bench_data() -> tuple[dict[str, str], str | None]:
+    """The check types that bench/pyproject.toml registers, each with its target, and the
+    devops-bench commit that it pins."""
+    project = tomllib.loads(BENCH_PYPROJECT.read_text(encoding="utf-8")).get("project", {})
+    pins = [match.group(1) for dependency in project.get("dependencies", []) if (match := HARNESS_PIN.match(dependency))]
+    return dict(project.get("entry-points", {}).get(VERIFIER_ENTRY_POINT_GROUP, {})), (pins[0] if pins else None)
+
+
+def installed_bench_data() -> tuple[dict[str, str], str | None]:
+    """The same two, as the last install wrote them into this environment. A distribution that is
+    not there has no entry points; one with no record of a git commit has no commit."""
+    try:
+        entry_points = {
+            entry.name: entry.value
+            for entry in importlib.metadata.distribution(BENCH_DISTRIBUTION).entry_points
+            if entry.group == VERIFIER_ENTRY_POINT_GROUP
+        }
+    except importlib.metadata.PackageNotFoundError:
+        entry_points = {}
+    try:
+        record = json.loads(importlib.metadata.distribution(HARNESS_DISTRIBUTION).read_text(DIRECT_URL_FILE) or "{}")
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        record = {}
+    vcs = record.get("vcs_info") if isinstance(record, dict) else None
+    return entry_points, (vcs.get("commit_id") if isinstance(vcs, dict) else None)
+
+
+def installed_data_behind() -> str | None:
+    """How the installed data differs from bench/pyproject.toml, or None when the two agree. The
+    entry points are compared by name and target."""
+    try:
+        declared, pinned = declared_bench_data()
+    except (OSError, ValueError) as exc:
+        return PYPROJECT_UNREADABLE.format(error=f"{type(exc).__name__}: {exc}")
+    installed, commit = installed_bench_data()
+    differences = []
+    differing = sorted(name for name in declared.keys() | installed.keys() if declared.get(name) != installed.get(name))
+    if differing:
+        differences.append(ENTRY_POINTS_BEHIND.format(group=VERIFIER_ENTRY_POINT_GROUP, names=", ".join(differing)))
+    if commit != pinned:
+        differences.append(HARNESS_BEHIND.format(installed=commit or NO_RECORDED_COMMIT, pinned=pinned or NO_RECORDED_COMMIT))
+    return "; ".join(differences) or None
+
+
 @functools.lru_cache(maxsize=1)
 def spec_parser() -> tuple[Any, Any] | str:
     """The harness's YAML reader and its parser of a case's entries, or the note that says why
-    the rule cannot run here: the bench package is not installed, or it is another checkout's."""
+    the rule cannot run here: the bench package is not installed, it is another checkout's, or
+    its installed data is behind bench/pyproject.toml."""
     try:
         import kube_agents_bench  # noqa: PLC0415 -- the package whose installed entry points register this repository's check types
         from devops_bench.tasks.loader import safe_parse_yaml  # noqa: PLC0415
@@ -818,6 +948,9 @@ def spec_parser() -> tuple[Any, Any] | str:
     origin = getattr(kube_agents_bench, "__file__", None)
     if not origin or pathlib.Path(origin).resolve().parent != BENCH_PACKAGE_DIR.resolve():
         return FIELD_CHECK_STALE.format(path=pathlib.Path(origin).resolve().parent if origin else "a package with no file")
+    difference = installed_data_behind()
+    if difference:
+        return FIELD_CHECK_STALE_DATA.format(difference=difference)
     return safe_parse_yaml, parse_entries
 
 
@@ -921,6 +1054,15 @@ def scope_exclude_reader() -> Any:
     spec = importlib.util.spec_from_file_location(SCOPE_EXCLUDE_MODULE_NAME, SCOPE_EXCLUDE_FILE)
     if spec is None or spec.loader is None:
         raise CaseError(f"{SCOPE_EXCLUDE_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scope_hold_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(SCOPE_HOLD_MODULE_NAME, SCOPE_HOLD_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{SCOPE_HOLD_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -1708,6 +1850,18 @@ def validate_case(
                 )
             elif set(slots) >= catalog:
                 problems.append("'scope_exclude:' excludes every seeded slot; leave at least one in scope")
+
+    # The hold a case puts on the install (agent_cluster, all, a reason). The
+    # runner runs a holding case alone after every other unit, in a loop of its
+    # own; a case that also excluded scope would run twice, once in each loop.
+    if "scope_hold" in spec:
+        reader = scope_hold_reader()
+        try:
+            reader.declared_hold(path)
+        except reader.ScopeHoldError as exc:
+            problems.append(f"{exc}")
+        if "scope_exclude" in spec:
+            problems.append("'scope_hold:' and 'scope_exclude:' in one case: the runner runs each in a phase of its own; declare one")
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

@@ -1367,7 +1367,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT", "A2A_KUBE_PROXY_MODE"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1388,6 +1388,18 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
 		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
+	}
+	// The mode the gateway passes session pods is the one kube-proxy runs:
+	// their kubectl wrapper treats a failed write as refused only under a
+	// read-only mode.
+	var proxyMode string
+	for _, e := range buildKubeProxyDeployment(agent, "", true, "tls-hash").Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "KUBE_PROXY_MODE" {
+			proxyMode = e.Value
+		}
+	}
+	if proxyMode == "" || on["A2A_KUBE_PROXY_MODE"].Value != proxyMode {
+		t.Errorf("A2A_KUBE_PROXY_MODE = %+v, kube-proxy's KUBE_PROXY_MODE = %q; want them equal", on["A2A_KUBE_PROXY_MODE"], proxyMode)
 	}
 }
 
@@ -1920,6 +1932,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 		{"mcp", "buildA2AMCPDeployment", mcp.Spec.Template.Spec},
 		{"curator", "buildA2ACuratorDeployment", curator.Spec.Template.Spec},
+		{"teams-inbound", "buildA2ATeamsInboundDeployment", buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent)).Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1994,6 +2007,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 	curator := buildA2ACuratorDeployment(agent)
+	teamsInbound := buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent))
 
 	cases := []struct {
 		render    string
@@ -2066,6 +2080,11 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// the same reasoning: it reads its token and credential files by
 		// absolute path and writes nothing.
 		{render: "mcp", builder: "buildA2AMCPDeployment", container: "mcp", spec: mcp.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The Teams inbound receiver, on the same distroless static nonroot
+		// base and UID 1000: it reads its token by absolute path and writes
+		// nothing, so traversable is enough; the render sets WorkingDir "/".
+		{render: "teams-inbound", builder: "buildA2ATeamsInboundDeployment", container: teamsInboundContainer, spec: teamsInbound.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 		// The OKF memory curator runs from the console image too, writing only
 		// to its mounted /var/lib/curator emptyDir by absolute path.
@@ -6932,6 +6951,11 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 		t.Setenv(a2aProfileDispatcherEnvVar, "false")
 		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
 			t.Fatalf("standing pods with the dispatcher off = %d, want %d", got, base-1)
+		}
+	})
+	t.Run("the Teams inbound receiver", func(t *testing.T) {
+		if got := a2aStandingPods(teamsInboundTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the Teams inbound receiver = %d, want %d", got, base+1)
 		}
 	})
 }

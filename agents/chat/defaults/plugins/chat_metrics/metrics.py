@@ -1,6 +1,7 @@
 """Inbound chat messages, new sessions and failed turns by platform, the board's
-cards that gave up, and the proposals ledger by origin, read from Session KV,
-in the Prometheus text exposition.
+cards that gave up, the proposals ledger by origin, read from Session KV, and
+the profiles' on-demand skill loads by skill (skill_invocations.py), in the
+Prometheus text exposition.
 
 Hand-rolled, like the credential broker's registry: prometheus_client is not in
 the agent image, and four small counters do not justify a dependency
@@ -33,6 +34,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import quote
+
+from chat_metrics.skill_invocations import (
+    SKILL_INVOCATIONS_HELP,
+    SKILL_INVOCATIONS_METRIC,
+    SKILL_LABEL,
+    SkillInvocationsCounter,
+)
 
 logger = logging.getLogger("hermes.plugin.chat_metrics")
 
@@ -379,17 +387,20 @@ def stuck_lock_wait_seconds() -> float:
 
 class ChatMetrics:
     """Four counters, by platform: inbound messages, new sessions, errored turns
-    and thumbs-downs; the board's gave_up cards and the proposals ledger, read
-    at scrape time; and the dispatcher's failed-tick streak, by board."""
+    and thumbs-downs; the board's gave_up cards, the proposals ledger and the
+    profiles' skill loads, read at scrape time; and the dispatcher's failed-tick
+    streak, by board."""
 
     def __init__(
         self,
         kanban: Optional[KanbanGaveUpCounter] = None,
         proposals: Optional[ProposalsOpenedGauge] = None,
         clock: Callable[[], float] = time.monotonic,
+        skills: Optional[SkillInvocationsCounter] = None,
     ) -> None:
         self._kanban = kanban or KanbanGaveUpCounter()
         self._proposals = proposals or ProposalsOpenedGauge()
+        self._skills = skills or SkillInvocationsCounter()
         self._clock = clock
         self._lock_wait_seconds = stuck_lock_wait_seconds()
         self._lock = threading.Lock()
@@ -412,8 +423,9 @@ class ChatMetrics:
         self._dispatch_in_quarantine: set[str] = set()
 
     def prime(self) -> None:
-        """Take the board's baseline now rather than at the first scrape."""
+        """Take the board's and the audit files' baselines now rather than at the first scrape."""
         self._kanban.count()
+        self._skills.counts()
 
     def record_inbound(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
@@ -612,6 +624,12 @@ class ChatMetrics:
         ]
         for board, since in dispatch_stuck:
             lines.append(f'{KANBAN_DISPATCHER_STUCK_SECONDS_METRIC}{{{BOARD_LABEL}="{_label_value(board)}"}} {int(max(0.0, now - since))}')
+        lines += [
+            f"# HELP {SKILL_INVOCATIONS_METRIC} {SKILL_INVOCATIONS_HELP}",
+            f"# TYPE {SKILL_INVOCATIONS_METRIC} counter",
+        ]
+        for skill, count in sorted(self._skills.counts().items()):
+            lines.append(f'{SKILL_INVOCATIONS_METRIC}{{{SKILL_LABEL}="{_label_value(skill)}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",

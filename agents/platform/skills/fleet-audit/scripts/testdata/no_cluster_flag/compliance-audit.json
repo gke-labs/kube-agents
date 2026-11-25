@@ -1,0 +1,41 @@
+{
+  "audit": "compliance-audit",
+  "checks_revision": "<checks_revision>",
+  "clusters": [
+    {
+      "autopilot": false,
+      "error": "cluster describe gate failed (rc=0): ",
+      "location": "us-central1",
+      "name": "acme/us-central1/c1",
+      "outcome": "gate-failed",
+      "project": "acme"
+    },
+    {
+      "autopilot": false,
+      "error": "cluster describe gate failed (rc=0): ",
+      "location": "us-east1",
+      "name": "acme/us-east1/c2",
+      "outcome": "gate-failed",
+      "project": "acme"
+    },
+    {
+      "autopilot": false,
+      "cluster_status": "PROVISIONING",
+      "error": "cluster status is PROVISIONING, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
+      "location": "us-west1",
+      "name": "acme/us-west1/c3",
+      "outcome": "unreachable",
+      "project": "acme"
+    },
+    {
+      "error": "scope narrowed to project 'acme' by `--project`: discovery was skipped, so no other project in this fleet was named or read, and this run cannot speak for their clusters.",
+      "location": "global",
+      "name": "project/UNENUMERATED_PROJECTS",
+      "outcome": "gate-failed",
+      "project": ""
+    }
+  ],
+  "finished_at": "<finished_at>",
+  "started_at": "<started_at>",
+  "version": 1
+}

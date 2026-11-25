@@ -3,6 +3,7 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,11 @@ const (
 	EventProgress
 	// EventActivity is a tool invocation (Event.Tool, Event.Input).
 	EventActivity
+	// EventToolResult marks that one tool step's result is in, so the call
+	// that ran it has exited. It carries no field. The adapter reads the
+	// write-refusal record on it (refusal.go), never the result itself. A
+	// driver emits exactly one per tool step.
+	EventToolResult
 	// EventResult ends a turn: Event.Text is the deliverable, Event.Failed
 	// and Event.Token whether it failed and the reason token, and
 	// Event.Telemetry what the turn cost.
@@ -152,4 +158,20 @@ func (a *adapter) turnDirs(env []string) TurnDirs {
 		}
 	}
 	return dirs
+}
+
+// DriverFor is the driver for harness h, the value of the worker's harness
+// selector. Empty means Claude Code. Antigravity is agyDriver; the worker
+// refuses it without its isolation waiver (cmd/worker-adapter's
+// selectHarness). Anything else is refused as unknown. A worker
+// never falls back to Claude Code for a value it does not know: a typo would
+// otherwise run the wrong harness without a word.
+func DriverFor(h persona.Harness) (Driver, error) {
+	switch h {
+	case "", persona.ClaudeCode:
+		return claudeDriver{}, nil
+	case persona.Antigravity:
+		return agyDriver{}, nil
+	}
+	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
 }
