@@ -2142,12 +2142,13 @@ func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent 
 		r.kanbanAdmissionWarningsLogged.Delete(key)
 	}
 
-	cm := buildConfigMap(agent, agentPlugins)
 	// The agent's model.api_key reads its inference gateway key from the env
 	// the pod template carries in the same pass (inference_key_callers.go).
+	apiKey := agentPlaceholderAPIKey
 	if inferenceKeyCallersFrom(ctx).sends(inferenceKeyClassAgent) {
-		cm.Data[managedConfigKey] = renderConfigYAMLWith(agent, agentPlugins, agentInferenceKeyConfigRef)
+		apiKey = agentInferenceKeyConfigRef
 	}
+	cm := buildConfigMapWith(agent, agentPlugins, apiKey)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}

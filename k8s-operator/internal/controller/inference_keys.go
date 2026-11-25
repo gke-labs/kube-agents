@@ -438,7 +438,7 @@ func crdSchemaHasInferenceKeys(crd *unstructured.Unstructured, version string) b
 }
 
 // errInferenceKeysStatusPruned is a record write the served CRD dropped.
-var errInferenceKeysStatusPruned = errors.New("the served PlatformAgent CRD has no status.inferenceKeys")
+var errInferenceKeysStatusPruned = errors.New("the served PlatformAgent CRD's status.inferenceKeys schema isn't current")
 
 // recordedSecretUIDs is status.inferenceKeys.secretUIDs, by Secret name.
 func recordedSecretUIDs(agent *agentv1alpha1.PlatformAgent) map[string]types.UID {
@@ -564,7 +564,7 @@ func (r *PlatformAgentReconciler) createRecorded(ctx context.Context, agent *age
 func (r *PlatformAgentReconciler) notWrittenFor(what string, err error) inferenceKeysOutcome {
 	if errors.Is(err, errInferenceKeysStatusPruned) {
 		r.forgetServedCRDAnswer()
-		return notWritten("the served PlatformAgent CRD has no status.inferenceKeys, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
+		return notWritten("the served PlatformAgent CRD's status.inferenceKeys schema isn't current, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
 	}
 	if errors.Is(err, errReservedSecretTerminating) {
 		return notWritten(what+" is being deleted; the operator creates its own once it's gone", true)
@@ -726,7 +726,7 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		return notWritten("the PlatformAgent CRD could not be read to check it has status.inferenceKeys ("+apiFailure(err)+"); nothing is written on this pass", true)
 	case !has:
 		return inferenceKeysOutcome{condition: inferenceKeysCondition(metav1.ConditionFalse, inferenceKeysReasonCRDOutdated,
-			"the served PlatformAgent CRD has no status.inferenceKeys, so the operator creates no inference gateway key until the current PlatformAgent CRD is applied")}
+			"the served PlatformAgent CRD's status.inferenceKeys schema isn't current, so the operator creates no inference gateway key until the current PlatformAgent CRD is applied")}
 	}
 
 	recorded := recordedSecretUIDs(agent)

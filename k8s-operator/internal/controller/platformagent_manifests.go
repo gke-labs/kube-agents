@@ -635,6 +635,12 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
+	return buildConfigMapWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// buildConfigMapWith is buildConfigMap with the managed config's
+// model.api_key set to apiKey (renderConfigYAMLWith).
+func buildConfigMapWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -644,7 +650,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 			Name:      agent.Name + "-config",
 			Namespace: agent.Namespace,
 		},
-		Data: buildConfigMapData(agent, agentPlugins),
+		Data: buildConfigMapDataWith(agent, agentPlugins, apiKey),
 	}
 }
 
@@ -676,8 +682,14 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 // agent could still repoint its own model endpoint and keep that across restarts. Hence
 // the split: immutable keys are pinned, mutable operator-owned keys are merged.
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
+	return buildConfigMapDataWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// buildConfigMapDataWith is buildConfigMapData with the managed config's
+// model.api_key set to apiKey.
+func buildConfigMapDataWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) map[string]string {
 	data := map[string]string{
-		managedConfigKey:  renderConfigYAML(agent, agentPlugins),
+		managedConfigKey:  renderConfigYAMLWith(agent, agentPlugins, apiKey),
 		managedEnvKey:     renderManagedEnvForPlugins(agent, agentPlugins),
 		"leader_elect.py": leaderElectScript,
 	}
