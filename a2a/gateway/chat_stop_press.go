@@ -15,8 +15,8 @@ import (
 // line to cancelSentNotice with the Stop control gone, so the line a person
 // pressed is the one that answers. The relay leaves the line so
 // (ActiveTask.LineClosed) until its terminal edit makes it "canceled". A
-// stop typed on Google Chat with a line to answer on takes the same answer
-// (chatTypedStop): the word and the button read alike, one line and no
+// stop typed on Google Chat or on Teams with a line to answer on takes the
+// same answer (chatTypedStop): the word and the button read alike, one line and no
 // posts, where a DM's thread-less key would otherwise put the line, the
 // "cancel sent" post and the relay's "canceled" each in a message of its
 // own. A second typed stop while the cancel is pending moves "cancel
@@ -36,10 +36,21 @@ import (
 // have written it a moment before the press.
 const staleStopNotice = "ℹ️ this task has ended"
 
-// isChatStopPress reports a stop from Google Chat's Stop button rather than
-// the word, as stopGatedBackends describes Chat's press (stopgate.go).
+// refusedPressLineMark opens the line a refused press is answered on
+// (tellRefusedOnLine): a hand, not a state, since the task's state is
+// whatever it was.
+const refusedPressLineMark = "✋ "
+
+// lineStopBackends are the backends whose Stop button is the adapter's own
+// drawing on the task's line, and so is answered on that line: Google Chat,
+// and Teams, whose button is on the line's card (teams_press.go).
+var lineStopBackends = map[string]bool{gchatBackend: true, teamsBackend: true}
+
+// isChatStopPress reports a stop from a Stop button drawn on the task's
+// line (lineStopBackends) rather than the word, as stopGatedBackends
+// describes that backend's press (stopgate.go).
 func isChatStopPress(msg InboundMessage, backend string) bool {
-	return backend == gchatBackend && isStopPress(msg, backend)
+	return lineStopBackends[backend] && isStopPress(msg, backend)
 }
 
 // chatStopPress answers a Stop press on rec's active task: the quiet cancel,
@@ -93,14 +104,16 @@ func (g *Gateway) stopOnLine(ctx context.Context, rec *SessionRecord, authority 
 	return true
 }
 
-// isChatTypedStop reports a stop typed on Google Chat: the word, from the
-// backend's own ingress, naming no task (a press names one, and so does a
-// program's cancel) and not a click.
+// isChatTypedStop reports a stop typed on a backend whose Stop button is on
+// the task's line (lineStopBackends): the word, from the backend's own
+// ingress, naming no task (a press names one, and so does a program's
+// cancel) and not a click. It is answered on the line as a press is, so the
+// line and its button never outlive a stop the word already sent.
 func isChatTypedStop(msg InboundMessage, backend string) bool {
-	return backend == gchatBackend && msg.TaskID == "" && !msg.Click
+	return lineStopBackends[backend] && msg.TaskID == "" && !msg.Click
 }
 
-// chatTypedStop answers a stop typed on Google Chat on rec's active task,
+// chatTypedStop answers a stop typed on Google Chat or Teams on rec's active task,
 // which has a line, as a press is answered (stopOnLine). A second stop
 // while the cancel is pending closes the line on cancelAlreadySentNotice,
 // which also lands the close a first edit missed. No message of the
@@ -115,6 +128,43 @@ func (g *Gateway) chatTypedStop(ctx context.Context, rec *SessionRecord, authori
 		return
 	}
 	g.stopOnLine(ctx, rec, authority)
+}
+
+// tellRefusedOnLine answers a refused Stop press on Teams, which has no
+// message only the presser sees (tellRefusedPresser's way on Google Chat):
+// the running task's line reads refusedPressNotice, its Stop button kept,
+// until the relay next updates the line. Without it the button a
+// non-requester pressed looks slow rather than refused. It is said on the
+// running task's own line whichever line was pressed (a delegating parent's
+// line stops the running child), since that is the line the relay keeps
+// writing; and never in a direct message, where the only other member is
+// the one who asked. The notice names nobody.
+//
+// The relay skips an update that renders the line it last wrote
+// (relayState.lastLine), so the refusal clears that memory: the next
+// update writes the line again even when its text has not changed, which
+// is every update under the default display mode. A queued task whose line
+// holds the busy notice is left as it is: the relay keeps that notice until
+// the task starts (relayState.busyShown), so a refusal there would stay as
+// long.
+func (g *Gateway) tellRefusedOnLine(rec *SessionRecord, msg InboundMessage, backend string) {
+	active := rec.ActiveTask
+	if backend != teamsBackend || msg.Kind == sessionKindDM || active == nil || active.StatusMsgID == "" {
+		return
+	}
+	g.mu.Lock()
+	rs := g.relays[active.TaskID]
+	g.mu.Unlock()
+	if rs != nil && rs.busyShown && lineStillSubmitted(rs) {
+		return
+	}
+	if !g.editLine(rec.Key, active.StatusMsgID, withLineNote(refusedPressLineMark+refusedPressNotice, active.LineNote), active.TaskID) {
+		return
+	}
+	if rs != nil {
+		rs.lastLine = ""
+	}
+	g.log.Info("refused stop press: said on the line", "backend", backend, "conversation", rec.Key)
 }
 
 // closeLineOnPress edits the active task's line to text with no Stop
