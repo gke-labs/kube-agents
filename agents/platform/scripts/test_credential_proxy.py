@@ -1627,6 +1627,8 @@ class GitHardeningTest(unittest.TestCase):
             "gpg.ssh.defaultKeyCommand": "false",
             "gpg.x509.program": "false",
             "help.autocorrect": "0",
+            # A push stays in the repository that the command names.
+            "push.recurseSubmodules": "no",
         }
         for key, value in expected.items():
             result = executor.execute(
@@ -1964,6 +1966,228 @@ class GitHardeningTest(unittest.TestCase):
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
+
+    # -- a push that also pushes the submodules -------------------------------
+
+    SUBMODULE_PUSH_REFUSAL = (
+        "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+        "inside each submodule too, and the broker judges only the repository that the command names."
+    )
+
+    def superproject_with_a_submodule(self, name):
+        """With the host's git: a clone of one remote, with a submodule of a second remote.
+        Each remote has the one branch `release-trunk`, and both work trees are on that
+        branch, as a push into a submodule needs. The submodule has one commit that its
+        remote does not have, and the superproject records it. No git variable and no
+        config file of the host is read. Returns the superproject, a function that says if
+        the submodule's remote got that commit, and the environment of the git calls."""
+        base = Path(self.temp_dir.name) / name
+        base.mkdir()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_DEFAULT_REF_FORMAT="files")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+
+        def must(*arguments):
+            done = subprocess.run(["git", *arguments], env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(0, done.returncode, f"git {' '.join(arguments)}: {done.stderr}{done.stdout}")
+            return done.stdout.strip()
+
+        remotes = {}
+        for remote_name in ("superproject", "module"):
+            remotes[remote_name] = base / f"{remote_name}.git"
+            seed = base / f"{remote_name}-seed"
+            must("init", "--quiet", "--bare", "-b", "release-trunk", str(remotes[remote_name]))
+            must("clone", "--quiet", str(remotes[remote_name]), str(seed))
+            (seed / "README.md").write_text(f"{remote_name}\n", encoding="utf-8")
+            must("-C", str(seed), "add", ".")
+            must("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+            must("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+        superproject = base / "clone"
+        must("clone", "--quiet", str(remotes["superproject"]), str(superproject))
+        # A submodule from a local path needs the file protocol, which git allows a user only by name.
+        must("-C", str(superproject), "-c", "protocol.file.allow=always", "submodule", "add", "--quiet", str(remotes["module"]), "module")
+        module = superproject / "module"
+        self.assertTrue((module / ".git").is_file())
+        (module / "change.txt").write_text("a change in the submodule\n", encoding="utf-8")
+        must("-C", str(module), "add", ".")
+        must("-C", str(module), *identity, "commit", "--quiet", "-m", "a change in the submodule")
+        must("-C", str(superproject), "add", ".")
+        must("-C", str(superproject), *identity, "commit", "--quiet", "-m", "add the module")
+        made = must("-C", str(module), "rev-parse", "HEAD")
+        self.assertNotEqual(made, must("-C", str(remotes["module"]), "rev-parse", "release-trunk"))
+
+        def module_remote_got_the_commit():
+            return made == must("-C", str(remotes["module"]), "rev-parse", "release-trunk")
+
+        return superproject, module_remote_got_the_commit, environment
+
+    def forced_config_layer(self, executor, without=None):
+        """The executor's forced config, as the environment layer that git reads; `without`
+        leaves one key out, for the control of a pin."""
+        environment = executor.environment
+        count = int(environment["GIT_CONFIG_COUNT"])
+        pairs = tuple((environment[f"GIT_CONFIG_KEY_{index}"], environment[f"GIT_CONFIG_VALUE_{index}"]) for index in range(count))
+        kept = tuple(pair for pair in pairs if pair[0] != without)
+        if without is not None:
+            self.assertEqual(count - 1, len(kept), f"{without} is not in the forced config")
+        return credential_proxy._git_forced_config_environment(kept)
+
+    def test_a_push_does_not_push_the_submodules_whatever_the_repository_config_says(self):
+        # `push.recurseSubmodules = on-demand` (or `only`, the same class) and
+        # `submodule.recurse = true` each make a plain `git push` also push inside each
+        # submodule, to that submodule's own remote. The agent can write both in `.git/config`,
+        # the argv has no flag for the push guard to see, and the guard judges only the
+        # repository that the command names. The control shows that the push goes into the
+        # submodule without the pin, so the first half is not true of a fixture that could
+        # never push there.
+        executor = self.executor()
+        for number, setting in enumerate(("[push]\n\trecurseSubmodules = on-demand\n", "[submodule]\n\trecurse = true\n")):
+            for pinned in (False, True):
+                with self.subTest(config=setting.split()[0], pinned=pinned):
+                    superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(
+                        f"config-{number}-{'pinned' if pinned else 'control'}"
+                    )
+                    self.append_repository_config(superproject, "\n" + setting)
+                    layer = self.forced_config_layer(executor, without=None if pinned else "push.recurseSubmodules")
+                    pushed = subprocess.run(
+                        ["git", "push", "origin", "HEAD:release-trunk"],
+                        cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(0, pushed.returncode, pushed.stderr)
+                    self.assertEqual(not pinned, module_remote_got_the_commit(), pushed.stderr)
+
+    def test_a_push_that_asks_git_to_push_the_submodules_is_refused(self):
+        # The flag outranks the forced config, so the pin above does not hold it: the control
+        # is the refusal. The test below runs the spellings that push into a submodule with git.
+        from credential_proxy import GIT_PUSH_RECURSE_SUBMODULES_REFUSAL, git_push_violation
+
+        self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, GIT_PUSH_RECURSE_SUBMODULES_REFUSAL)
+        for flags in (
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules=only"],
+            ["--recurse-submodules=check"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+            # The rule is each value but the word `no`: a value that git reads as on-demand
+            # under another name, values that git reads as off, and values that git refuses.
+            ["--recurse-submodules=only-is-on-demand"],
+            ["--recurse-submodules=false"],
+            ["--recurse-submodules=No"],
+            ["--recurse-submodules=yes"],
+            ["--recurse-submodules=none"],
+            ["--recurse-submodules="],
+            # The last one wins in git; the guard does not rely on the order.
+            ["--recurse-submodules=no", "--recurse-submodules=on-demand"],
+            ["--recurse-submodules=on-demand", "--recurse-submodules=no"],
+        ):
+            for argv in (
+                ["git", "push", *flags, "origin", "HEAD:feature"],
+                ["git", "push", "origin", "HEAD:feature", *flags],
+                ["git", "-C", "clone", "push", *flags, "origin", "HEAD:feature"],
+            ):
+                with self.subTest(argv=argv[1:]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_argument_violation(argv))
+        # The flag as the last word has no value: not `no`.
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL, git_push_violation(["git", "push", "origin", "HEAD:feature", "--recurse-submodules"])
+        )
+        # The flag in a push of tags only (the one push with no refspec that the guard lets
+        # pass), after an option that takes the next word, and as a prefix that names two
+        # options (an error in git).
+        for argv in (
+            ["git", "push", "--tags", "--recurse-submodules=on-demand", "origin"],
+            ["git", "push", "-o", "x", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--repo", "origin", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--rec=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--re=on-demand", "origin", "HEAD:feature"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+        # A prefix that names two options with the value `no` passes this rule; git itself
+        # stops on the prefix.
+        self.assertIsNone(git_push_violation(["git", "push", "--re=no", "origin", "HEAD:feature"]))
+        # Pass-through: the value `no`, the negated flag, no flag, and a command that is not a push.
+        for argv in (
+            ["git", "push", "--recurse-submodules=no", "origin", "HEAD:feature"],
+            ["git", "push", "--recurse-submodules", "no", "origin", "HEAD:feature"],
+            ["git", "push", "--no-recurse-submodules", "origin", "HEAD:feature"],
+            ["git", "push", "origin", "HEAD:feature"],
+            ["git", "fetch", "--recurse-submodules=on-demand", "origin"],
+            ["git", "submodule", "update", "--init"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertIsNone(git_push_violation(argv))
+                self.assertIsNone(git_argument_violation(argv))
+        # After `--` the word is a refspec, and another rule judges it.
+        self.assertNotEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "origin", "--", "--recurse-submodules=on-demand"]),
+        )
+        # The refusals that come before it in the argv keep their text.
+        self.assertIn("`git push --all` is refused", git_push_violation(["git", "push", "--all", "--recurse-submodules=on-demand"]) or "")
+        # Through the executor's own check, with the lease switch on and off, and through an alias.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(repository, "\n[alias]\n\tdeep = push --recurse-submodules=on-demand\n")
+        for lease in (False, True):
+            executor.require_git_lease = lease
+            for argv in (
+                ["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+                ["git", "deep", "origin", "HEAD:feature"],
+            ):
+                with self.subTest(lease=lease, argv=argv[1]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, executor.git_lease_violation(argv, cwd=str(repository)))
+        # In a clone that the guard refuses for its ref format too, the flag's refusal answers first.
+        self.append_repository_config(repository, "\n[extensions]\n\trefStorage = reftable\n")
+        self.assertIn("reftable", git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repository) or "")
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"], cwd=repository),
+        )
+
+    def test_git_takes_each_spelling_of_the_submodule_push_flag_that_is_refused(self):
+        # With the host's git and the executor's forced config: the flag with the value
+        # `on-demand` or `only`, in each spelling of the name and of the value's place, pushes
+        # inside the submodule. So the pin does not hold the flag, and git reads these
+        # spellings as the guard does. `check` is in the list of the test above and not here:
+        # it stops the push and pushes nothing into a submodule.
+        executor = self.executor()
+        layer = self.forced_config_layer(executor)
+        self.assertIn("push.recurseSubmodules", layer.values())
+        for number, flags in enumerate((
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+        )):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"flag-{number}")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertTrue(module_remote_got_the_commit(), pushed.stderr)
+                self.assertEqual(
+                    self.SUBMODULE_PUSH_REFUSAL,
+                    git_argument_violation(["git", "push", *flags, "origin", "HEAD:release-trunk"]),
+                )
+        # The value `no` and the negated flag keep the push out of the submodule, also where
+        # the repository config asks for it.
+        for number, flags in enumerate((["--recurse-submodules=no"], ["--no-recurse-submodules"])):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"off-{number}")
+                self.append_repository_config(superproject, "\n[push]\n\trecurseSubmodules = on-demand\n")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject,
+                    env={**environment, **self.forced_config_layer(executor, without="push.recurseSubmodules")},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertFalse(module_remote_got_the_commit(), pushed.stderr)
 
     def test_the_help_viewer_cannot_run_a_command(self):
         # `git help -m <page>` runs `man.<man.viewer>.cmd` through
