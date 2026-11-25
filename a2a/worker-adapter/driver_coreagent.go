@@ -78,7 +78,7 @@ func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
 		return nil, err
 	}
 	if len(b) > coreagentwire.MaxEnvelopeBytes {
-		return nil, fmt.Errorf("the conversation's history is over %d bytes", coreagentwire.MaxEnvelopeBytes)
+		return nil, fmt.Errorf("the turn's envelope (its message, policy, MCP servers, instructions and the conversation's history) is over %d bytes", coreagentwire.MaxEnvelopeBytes)
 	}
 	return b, nil
 }
@@ -128,6 +128,11 @@ func (coreAgentDriver) HoldsSteers() bool { return true }
 // unread in the pipe (processEncoder). The per-turn restart work runs held
 // steers in a fresh process.
 func (coreAgentDriver) OneTurnPerProcess() {}
+
+// KeepsOnlyCompletedTurns: a turn's events join the conversation's history
+// only at a completed result (coreAgentDecoder), so the session loop keeps
+// the primer until a turn completes (runSessionLoop).
+func (coreAgentDriver) KeepsOnlyCompletedTurns() {}
 
 // coreAgentDecoder maps the harness's event lines onto Events: one
 // EventToolResult per tool call, an erroring step included.
