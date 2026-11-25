@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -217,12 +218,6 @@ class ArgumentTest(ScopeFileTestCase):
                 self.assertIsNone(admitted)
                 self.assertEqual(scope_policy.RULE_SCOPE_ARGUMENT, refusal.rule)
 
-    def test_an_explicit_project_is_not_probed(self):
-        # Contract §5: the publisher never probes scope.json `projects`; the
-        # gateway admits them from the file.
-        refusal, _ = self.check([*CLUSTERS_LIST[:5], "explicit-proj", CLUSTERS_LIST[6]])
-        self.assertEqual(scope_policy.RULE_SCOPE_ARGUMENT, refusal.rule)
-
     def test_the_probe_and_the_naming_call_wait_for_a_lookup(self):
         for argv in (CLUSTERS_LIST, PROJECT_DESCRIBE):
             with self.subTest(argv=argv):
@@ -237,7 +232,10 @@ class ArgumentTest(ScopeFileTestCase):
     def test_a_scope_file_that_cannot_be_read_refuses_everything(self):
         for content in (None, "", "not json", "[]",
                         json.dumps({**DECLARATION, "folders": "111"}),
-                        json.dumps({**DECLARATION, "folders": [111]})):
+                        json.dumps({**DECLARATION, "folders": [111]}),
+                        json.dumps({**DECLARATION, "projects": "explicit-proj"}),
+                        json.dumps({**DECLARATION, "exclude": {"projects": [7]}}),
+                        json.dumps({**DECLARATION, "exclude": []})):
             with self.subTest(content=content):
                 path = Path(self.scope_file)
                 if content is None:
@@ -256,6 +254,120 @@ class ArgumentTest(ScopeFileTestCase):
         self.write_declaration({**DECLARATION, "folders": []})
         refusal, _ = self.check(ASSET_SEARCH)
         self.assertEqual(scope_policy.RULE_SCOPE_ARGUMENT, refusal.rule)
+
+
+def clusters_list(project):
+    return [*CLUSTERS_LIST[:5], project, CLUSTERS_LIST[6]]
+
+
+class DirectProjectTest(ScopeFileTestCase):
+    """`clusters list` also takes the management project and the declared `projects` the
+    reconcile keeps; no other shape takes them."""
+
+    MANAGEMENT = "mgmt-proj"
+
+    def check(self, argv, extras=False, management_project=MANAGEMENT):
+        return scope_policy.check(argv, extras=extras, scope_file=self.scope_file, window=self.window,
+                                  management_project=management_project)
+
+    def declare(self, projects, exclude=()):
+        self.write_declaration({**DECLARATION, "projects": list(projects),
+                                "exclude": {"projects": list(exclude), "clusters": []}})
+
+    def assert_admitted(self, argv, **kwargs):
+        refusal, admitted = self.check(argv, **kwargs)
+        self.assertIsNone(refusal)
+        self.assertEqual(scope_policy.SHAPE_CLUSTERS_LIST, admitted.shape)
+
+    def assert_refused(self, argv, **kwargs):
+        refusal, admitted = self.check(argv, **kwargs)
+        self.assertIsNone(admitted)
+        self.assertEqual(scope_policy.RULE_SCOPE_ARGUMENT, refusal.rule)
+        return refusal
+
+    def test_the_management_project_is_admitted(self):
+        self.assert_admitted(clusters_list(self.MANAGEMENT))
+
+    def test_an_exclude_entry_never_removes_the_management_project(self):
+        # The reconcile records such an entry and does not apply it.
+        self.declare(["explicit-proj"], exclude=[self.MANAGEMENT, "mgmt-*", "*"])
+        self.assert_admitted(clusters_list(self.MANAGEMENT))
+
+    def test_a_declared_project_is_admitted(self):
+        self.assert_admitted(clusters_list("explicit-proj"))
+
+    def test_a_declared_project_no_exclude_entry_matches_is_admitted(self):
+        self.declare(["explicit-proj", "team-a"], exclude=["legacy-*", "other-proj", "123456789012"])
+        self.assert_admitted(clusters_list("explicit-proj"))
+        self.assert_admitted(clusters_list("team-a"))
+
+    def test_a_declared_project_excluded_by_id_is_refused(self):
+        self.declare(["explicit-proj", "team-a"], exclude=["team-a"])
+        self.assert_refused(clusters_list("team-a"))
+        self.assert_admitted(clusters_list("explicit-proj"))
+
+    def test_a_declared_project_excluded_by_glob_is_refused(self):
+        self.declare(["legacy-one", "team-a"], exclude=["legacy-*"])
+        self.assert_refused(clusters_list("legacy-one"))
+        self.assert_admitted(clusters_list("team-a"))
+
+    def test_an_undeclared_project_outside_the_window_is_refused(self):
+        refusal = self.assert_refused(clusters_list("stranger-proj"))
+        self.assertNotIn("stranger-proj", refusal.message)
+
+    def test_the_management_project_without_the_variable_is_refused(self):
+        # Neither declared nor in the window: only the variable admits it.
+        self.assert_refused(clusters_list(self.MANAGEMENT), management_project="")
+
+    def test_the_management_project_and_declared_projects_open_no_other_shape(self):
+        self.declare([self.MANAGEMENT, "explicit-proj"])
+        for project in (self.MANAGEMENT, "explicit-proj"):
+            for argv in ([*SHARED_VPC[:4], project, SHARED_VPC[5]],
+                         [*METRICS_SCOPE[:5], f"locations/global/metricsScopes/{project}", METRICS_SCOPE[6]]):
+                with self.subTest(argv=argv):
+                    self.assert_refused(argv)
+
+    def test_a_declared_project_records_nothing(self):
+        _, admitted = self.check(clusters_list("explicit-proj"))
+        scope_policy.record(admitted, "c1 us-central1\n", scope_file=self.scope_file, window=self.window)
+        declaration = self.declaration()
+        self.assertFalse(self.window.holds(scope_policy.KIND_PROJECTS, "explicit-proj", declaration.digest))
+
+    def test_a_window_member_is_still_admitted_and_still_expires(self):
+        # The member window is unchanged: a member an asset search returned is admitted
+        # whatever the management project or the declared projects are, until it closes.
+        self.declare(["explicit-proj"], exclude=["p-*"])
+        _, admitted = self.check(ASSET_SEARCH)
+        scope_policy.record(admitted, ASSET_OUTPUT, scope_file=self.scope_file, window=self.window)
+        for management in (self.MANAGEMENT, ""):
+            with self.subTest(management=management):
+                self.assert_admitted(clusters_list("p-one"), management_project=management)
+                self.assert_refused(clusters_list("p-three"), management_project=management)
+        self.clock.now += scope_policy.MEMBER_WINDOW_SECONDS
+        self.assert_refused(clusters_list("p-one"))
+
+    def test_the_variable_is_named_beside_the_scope_file(self):
+        self.assertEqual("CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT", scope_policy.MANAGEMENT_PROJECT_ENV)
+
+
+class ExcludedByParityTest(unittest.TestCase):
+    """scope_policy._excluded_by is a copy of the reconcile's; the two agree on every case."""
+
+    def test_the_table(self):
+        import cluster_agent_reconcile
+
+        patterns = ["team-a", "legacy-*", "*-sandbox", "proj-?", "[ab]-*", "123456789012", "*[0-9]*"]
+        cases = [
+            ("team-a", patterns), ("team-b", patterns), ("legacy-one", patterns), ("legacy", patterns),
+            ("x-sandbox", patterns), ("proj-1", patterns), ("proj-12", patterns), ("a-one", patterns),
+            ("c-one", patterns), ("123456789012", patterns), ("999", patterns), ("p9", patterns),
+            ("Team-A", ["team-a"]), ("team-a", []), ("123", ["*"]), ("123", ["12*"]), ("123", ["123"]),
+            ("anything", ["*"]), ("team-a", ("team-a",)),
+        ]
+        for project, given in cases:
+            with self.subTest(project=project, patterns=given):
+                self.assertEqual(cluster_agent_reconcile._excluded_by(project, list(given)),
+                                 scope_policy._excluded_by(project, given))
 
 
 ASSET_OUTPUT = json.dumps([
@@ -450,3 +562,33 @@ class MemberWindowTest(ScopeFileTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FalsyNonListFieldsFailClosedTest(unittest.TestCase):
+    """A falsy non-list `projects` or `exclude.projects` (`{}`, `""`, `false`)
+    is malformed, not empty: it refuses everything rather than dropping the
+    exclusions."""
+
+    def test_falsy_non_lists_are_refused(self):
+        for value in ({}, "", False, 0):
+            for key in ("projects", "exclude"):
+                with self.subTest(key=key, value=value):
+                    doc = {"projects": ["p-1"], "exclude": {"projects": []}}
+                    if key == "projects":
+                        doc["projects"] = value
+                    else:
+                        doc["exclude"] = {"projects": value}
+                    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                        json.dump(doc, f)
+                    self.addCleanup(os.unlink, f.name)
+                    with self.assertRaises(ValueError):
+                        scope_policy.load_declaration(f.name)
+
+    def test_null_reads_as_empty(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"projects": None, "exclude": {"projects": None}}, f)
+        self.addCleanup(os.unlink, f.name)
+        decl = scope_policy.load_declaration(f.name)
+        self.assertEqual(decl.projects, frozenset())
+        self.assertEqual(decl.exclude_projects, ())
+

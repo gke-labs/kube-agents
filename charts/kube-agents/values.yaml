@@ -1552,11 +1552,13 @@ platformAgent:
     # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
     #
-    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
-    # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
+    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the kubectl cost table
+    # (deploy/sandbox/kubectl-costs.json) that fleet-wide reads are charged
     # from; "fleet" for clusters of tens of thousands of Pods, unset for
-    # "default". Forwarded to the shell sandbox and, under the session
-    # cluster view, to the A2A gateway for the session pods it starts.
+    # "default". Forwarded to the shell sandbox, to the credential broker
+    # (stateful and exec tiers), which charges a brokered cluster-wide kubectl
+    # read from the same column, and, under the session cluster view, to the
+    # A2A gateway for the session pods it starts.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
