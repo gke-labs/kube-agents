@@ -3973,7 +3973,7 @@ type SessionWorkerSpec struct {
 	// harness selector reads. It is pod configuration only: no route, bus
 	// subject or permission depends on it. claude-code is the only value
 	// accepted today.
-	// +kubebuilder:validation:Enum=claude-code
+	// +kubebuilder:validation:Enum=claude-code;core-agent
 	// +optional
 	Type string `json:"type,omitempty"`
 }

@@ -9919,6 +9919,7 @@ spec:
                             accepted today.
                           enum:
                             - claude-code
+                            - core-agent
                           type: string
                       type: object
                     stallWatch:

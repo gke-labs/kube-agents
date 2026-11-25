@@ -493,5 +493,5 @@ func isDispatcherBucketUser(name string) bool {
 // agentProfileHarnessSupported is whether the operator renders workers for
 // a profile's spec.harness.type: absent (Claude Code) or claude-code.
 func agentProfileHarnessSupported(t string) bool {
-	return t == "" || t == agentv1alpha1.AgentProfileHarnessClaudeCode
+	return t == "" || t == agentv1alpha1.AgentProfileHarnessClaudeCode || t == "core-agent" // harness A/B twin only
 }
