@@ -1110,6 +1110,9 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 		return nil, nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
 	jobTemplates := dispatchJobTemplates(agent, profiles, imageVolumes, signingKey.Public)
+	// Each tier's inference gateway key, once the gateway serves it, into the
+	// one rendering both readers take (inference_key_callers.go).
+	withTierInferenceKeys(jobTemplates, inferenceKeyCallersFrom(ctx))
 	// Wanted: the chart's signal, and the policy in the cluster as
 	// rendered. A read that answers neither way changes nothing.
 	signal := dispatcherJobPolicyRendered()

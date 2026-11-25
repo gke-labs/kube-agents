@@ -179,6 +179,28 @@ func A2ACredentialSecretNames(agentName string) []string {
 	}
 }
 
+// inferenceKeySecretInfix sits between the agent's name and the class in an
+// inference gateway caller-key Secret's name.
+const inferenceKeySecretInfix = "-inference-key-"
+
+// InferenceCallerKeysSecretName is the Secret holding the inference gateway's
+// caller-key map, which the gateway mounts. The operator writes it.
+const InferenceCallerKeysSecretName = "litellm-caller-keys" // #nosec G101 -- Secret name, not a credential
+
+// IsInferenceKeySecretName reports whether name is one of the Secrets the
+// operator writes the inference gateway's caller keys into for a PlatformAgent
+// of that name: <agent>-inference-key-<class>, each class's key (a probe key
+// among them), or the caller-key map. A caller is given its own class's key
+// by the operator's render alone; the webhook refuses a user volume that
+// mounts any of them.
+func IsInferenceKeySecretName(agentName, name string) bool {
+	if name == InferenceCallerKeysSecretName {
+		return true
+	}
+	class, ok := strings.CutPrefix(name, agentName+inferenceKeySecretInfix)
+	return ok && class != ""
+}
+
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
 // overridden by user Deployment specs or injected into the credential proxy.
 //
@@ -3167,6 +3189,13 @@ type InferenceKeysStatus struct {
 	// the PlatformAgent's namespace.
 	// +optional
 	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
+	// TierUnboundAt maps a tier whose key Secret is recorded to when the
+	// operator first found no bound profile listing it. While the applied
+	// dispatch config still lists such a tier as live, its key is kept for at
+	// most the drain window from then. An entry goes when a bound profile
+	// lists the tier again, and on the pass after its key is deleted.
+	// +optional
+	TierUnboundAt map[string]metav1.Time `json:"tierUnboundAt,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was
