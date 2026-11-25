@@ -191,7 +191,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, session_trajectory, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -3353,6 +3353,27 @@ def _inject_tokens(
     return tokens
 
 
+def _fill_session_args(exchange: inject.Exchange) -> None:
+    """Fill the turn's inputless activity parts from its session pod's capture.
+
+    Only when a call part arrived without ``input`` (a gateway that strips
+    them), and only on the session route: a conversation with no live
+    session pod (the platform route, or a pod already gone) reads nothing.
+    A pod whose adapter has no capture, or a capture that disagrees with the
+    parts, fills nothing (:mod:`session_trajectory`).
+    """
+    fold = exchange.fold
+    parts = fold.call_parts()
+    if not exchange.task_id or not any(part.get(inject.ACTIVITY_INPUT_KEY) is None for _, part in parts):
+        return
+    pod = _session_pod_of(exchange.conversation)
+    if not pod:
+        return
+    captured = session_trajectory.capture(_kubectl_target(f"pod/{pod}"), exchange.task_id, _EXEC_TIMEOUT)
+    if captured is not None:
+        fold.fill_inputs(session_trajectory.merge(parts, captured))
+
+
 def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
     """Map a folded conversation onto the canonical result.
 
@@ -3368,7 +3389,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     trace at all (``inject_transport.EVENT_ENTRY_ACTIVITY``; a door that
     cannot show it writes neither, and the scorer sets router-scope
     ``tool_called`` checks with no ``result`` pattern aside then, or when
-    the marker reports a loss).
+    the marker reports a loss). On the session route a call part that
+    arrived without its input takes it from the session pod's own capture
+    (:func:`_fill_session_args`).
     Tokens are the front door's usage as the probe reported it, null when
     the harness holds none (:func:`_inject_tokens`), and ``metadata`` says which
     buckets mean what and why they are null (:func:`_inject_tokens_note`).
@@ -3377,6 +3400,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     stored beside the task id so the record joins to the gateway's ingress
     log.
     """
+    _fill_session_args(exchange)
     fold = exchange.fold
     return AgentResult(
         output=fold.deliverable,

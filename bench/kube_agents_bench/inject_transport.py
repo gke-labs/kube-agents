@@ -855,6 +855,10 @@ class Fold:
     # Whether the read that ended the wait carried no trace the fold could
     # adopt, so ``activity`` is an earlier read's (:meth:`note_trace_stale`).
     activity_stale: bool = False
+    # Inputs read from the session pod's own capture for parts that arrived
+    # without one, by the part's index in ``activity``
+    # (:meth:`fill_inputs`, :mod:`kube_agents_bench.session_trajectory`).
+    captured_inputs: dict[int, Any] = field(default_factory=dict)
     progress: str = ""
     # The front door's and the chain's children's token counts, from the
     # read after the terminal that asks for them (:meth:`InjectTask._read_usage`);
@@ -916,6 +920,28 @@ class Fold:
         self.activity_dropped = dropped
         self.activity_malformed = malformed
         self.activity_stale = False
+        self.captured_inputs = {}
+
+    def call_parts(self) -> list[tuple[int, dict[str, Any]]]:
+        """The parts :meth:`activity_entries` writes as calls, each with its
+        index in ``activity``, in stream order: not the bridge's truncated
+        stand-in, not a card worker's, not one with no tool name."""
+        out: list[tuple[int, dict[str, Any]]] = []
+        for index, part in enumerate(self.activity or []):
+            if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
+                continue
+            worker = part.get(ACTIVITY_WORKER_KEY)
+            if worker is not None and (not isinstance(worker, str) or worker.startswith(ACTIVITY_WORKER_PREFIXES)):
+                continue
+            tool = part.get(ACTIVITY_TOOL_KEY)
+            if isinstance(tool, str) and tool:
+                out.append((index, part))
+        return out
+
+    def fill_inputs(self, inputs: dict[int, Any]) -> None:
+        """Take the inputs the session pod's capture holds for parts that
+        carry none, by part index (``session_trajectory.merge``)."""
+        self.captured_inputs = dict(inputs)
 
     def note_trace_stale(self) -> None:
         """The read that ended the wait carried no trace this fold could adopt.
@@ -938,8 +964,9 @@ class Fold:
         "status": ...}``, the api transport's ``ToolCall.to_dict`` shape,
         with the part's own status word (``completed``, ``error``,
         ``interrupted``) or the api shape's ``called`` when the part has
-        none. A part with no ``input`` maps to empty args; an input that is
-        not an object is kept under the key it arrived by. The bridge's
+        none. A part with no ``input`` takes the one the session pod's
+        capture holds for it (:meth:`fill_inputs`), or maps to empty args;
+        an input that is not an object is kept under the key it arrived by. The bridge's
         ``truncated`` stand-in for calls past its budget is a count and not
         a call: its ``dropped`` joins the door's ``activityDropped`` in the
         marker and no entry is written for it, and a part with no tool name
@@ -975,7 +1002,7 @@ class Fold:
         dropped = self.activity_dropped
         malformed = self.activity_malformed
         input_truncated = 0
-        for part in self.activity:
+        for index, part in enumerate(self.activity):
             if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
                 # The stand-in exists only because calls were dropped; a
                 # count this side cannot read is still a loss, on
@@ -997,6 +1024,11 @@ class Fold:
                 malformed += 1
                 continue
             raw_input = part.get(ACTIVITY_INPUT_KEY)
+            if raw_input is None:
+                # The part's own input wins whenever it has one (a gateway
+                # that still publishes inputs); the session pod's capture
+                # fills only a part that arrived without one.
+                raw_input = self.captured_inputs.get(index)
             if isinstance(raw_input, dict):
                 args = raw_input
                 if (
