@@ -125,12 +125,13 @@ LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "exclude
 # COLLABORATION_VERBS because only a library caller runs them.
 BROKER_VERBS: tuple[str, ...] = (
     "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
-    "proposal-claim", "revision-contains", "proposal-practice-label", "proposal-reviews",
-    "proposal-closer",
+    "proposal-claim", "revision-contains", "proposal-practice-label", "proposal-classify-risk",
+    "proposal-risk-label", "proposal-reviews", "proposal-closer",
 )
 # Served to library callers only (`vcs_client.snapshot`, the `pr_opened` hook's
 # claim, the post-merge check's ancestry and change-request reads, the fleet
-# audit's auto-merge label, the proposal sweep's closer check), so `capabilities` does not advertise them: no
+# audit's auto-merge label, deterministic PR risk classification and labelling,
+# the proposal sweep's closer check), so `capabilities` does not advertise them: no
 # `vcs.py` command runs them, and an advertised verb sends the agent to a
 # command that does not exist.
 LIBRARY_VERBS: frozenset[str] = frozenset(
@@ -139,6 +140,8 @@ LIBRARY_VERBS: frozenset[str] = frozenset(
         "proposal-claim",
         "revision-contains",
         "proposal-practice-label",
+        "proposal-classify-risk",
+        "proposal-risk-label",
         "proposal-reviews",
         "proposal-closer",
     }

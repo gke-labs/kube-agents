@@ -13379,7 +13379,7 @@ class VcsRouteTest(unittest.TestCase):
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
              "proposal-commits", "proposal-reviews", "proposal-closer", "proposal-claim",
-             "issue-list", "issue-view", "branch-view", "revision-contains"},
+             "proposal-classify-risk", "issue-list", "issue-view", "branch-view", "revision-contains"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )

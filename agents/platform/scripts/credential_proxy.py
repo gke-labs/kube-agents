@@ -14681,6 +14681,7 @@ def build_vcs_broker(
         # describe and a namespaced kubectl get, through the same executor,
         # kubeconfig selection and output cap as a caller's.
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
+        auto_label_risk=True,
         on_decision_memory_check=(
             metrics.record_decision_memory_check if metrics is not None else None
         ),
