@@ -480,6 +480,62 @@ func TestTheBrokerConfersTheScopeRoleOnlyBehindTheGatewayPodPolicy(t *testing.T)
 	}
 }
 
+// The broker learns the management project, which the scope role's
+// `clusters list` takes, only while the role is conferred
+// (scopePublisherMayRun) and spec.harness.projectId names one: the same
+// project the publisher's KUBEAGENTS_MANAGEMENT_PROJECT names.
+func TestTheBrokerLearnsTheManagementProjectOnlyWithTheScopeRole(t *testing.T) {
+	const name = "CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT"
+	cases := []struct {
+		name    string
+		policy  string
+		owned   bool
+		scope   *agentv1alpha1.ScopeSpec
+		harness *agentv1alpha1.HarnessSpec
+		want    string // empty: not rendered
+	}{
+		{"role conferred, harness project", "true", true, nil, &agentv1alpha1.HarnessSpec{ProjectID: "kagents-dev"}, "kagents-dev"},
+		{"role conferred, no harness", "true", true, nil, nil, ""},
+		{"role conferred, empty harness project", "true", true, nil, &agentv1alpha1.HarnessSpec{}, ""},
+		{"no gateway pod policy", "", true, nil, &agentv1alpha1.HarnessSpec{ProjectID: "kagents-dev"}, ""},
+		{"account not ours", "true", false, nil, &agentv1alpha1.HarnessSpec{ProjectID: "kagents-dev"}, ""},
+		{"nothing to resolve", "true", true, &agentv1alpha1.ScopeSpec{Projects: []string{"team-a"}},
+			&agentv1alpha1.HarnessSpec{ProjectID: "kagents-dev"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aGatewayPodPolicyEnvVar, tc.policy)
+			agent := scopePublisherAgent()
+			if tc.scope != nil {
+				agent.Spec.Scope = tc.scope
+			}
+			agent.Spec.Harness = tc.harness
+			value, count := envValueCount(scopeBrokerEnv(agent, tc.owned), name)
+			if tc.want == "" {
+				if count != 0 {
+					t.Errorf("%s rendered %d times (%q), want absent", name, count, value)
+				}
+				return
+			}
+			if count != 1 || value != tc.want {
+				t.Errorf("%s = %q (x%d), want exactly one %q", name, value, count, tc.want)
+			}
+			// The same project the publisher counts and lists.
+			job := buildScopePublisherJob(agent, time.Now(), scopeMemberHash(agent))
+			if got, _ := brokerEnvValue(job.Spec.Template.Spec.Containers[0].Env, "KUBEAGENTS_MANAGEMENT_PROJECT"); got != value {
+				t.Errorf("publisher KUBEAGENTS_MANAGEMENT_PROJECT = %q, broker %s = %q", got, name, value)
+			}
+			// And it reaches the broker's container.
+			owned := allBrokerCallersOwned
+			owned.scope = tc.owned
+			c := buildCredentialProxyDeploymentForPlugins(agent, "hash", nil, owned, credentialProxyProfileConfig{}, false).Spec.Template.Spec.Containers[0]
+			if got, count := envValueCount(c.Env, name); count != 1 || got != tc.want {
+				t.Errorf("broker container %s = %q (x%d), want %q", name, got, count, tc.want)
+			}
+		})
+	}
+}
+
 // The declaration mounts beside the forge CA mounts, never above them: the
 // runtime cannot create a mount point inside a read-only ConfigMap volume,
 // so a nested mount would stop the broker on every install with a forge CA
@@ -533,7 +589,8 @@ func TestThePublisherServiceAccountNameIsReserved(t *testing.T) {
 }
 
 func TestTheReservedListNamesTheScopeBrokerVariables(t *testing.T) {
-	names := []string{"CREDENTIAL_PROXY_SCOPE_AUDIENCE", "CREDENTIAL_PROXY_SCOPE_CALLERS", "CREDENTIAL_PROXY_SCOPE_FILE"}
+	names := []string{"CREDENTIAL_PROXY_SCOPE_AUDIENCE", "CREDENTIAL_PROXY_SCOPE_CALLERS", "CREDENTIAL_PROXY_SCOPE_FILE",
+		"CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT"}
 	var extra []corev1.EnvVar
 	for _, name := range names {
 		extra = append(extra, corev1.EnvVar{Name: name, Value: "theirs"})

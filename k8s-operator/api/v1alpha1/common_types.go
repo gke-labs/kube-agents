@@ -537,6 +537,11 @@ type HarnessSpec struct {
 	// +optional
 	UniverseDomain string `json:"universeDomain,omitempty"`
 
+	// SessionWorker configures the session pods the gateway spawns for
+	// conversations.
+	// +optional
+	SessionWorker *SessionWorkerSpec `json:"sessionWorker,omitempty"`
+
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
 	Hermes *HermesSpec `json:"hermes,omitempty"`
@@ -1163,11 +1168,39 @@ type TuningSpec struct {
 	// and keeps its history, and on any bus a new value on the
 	// kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
 	// rendered width. On an existing install, until the operator has read the bus's
-	// width once, the provision Job waits. On `platform` none of this
-	// applies.
+	// width once, the provision Job waits. On the session route the session
+	// pods also get the read-only cluster view by default; the operator's
+	// A2A_SESSION_CLUSTER_VIEW overrides it ("false" keeps it off). On
+	// `platform` none of this applies.
 	// +kubebuilder:validation:Enum=session;platform
 	// +optional
 	DefaultRoute *string `json:"defaultRoute,omitempty"`
+
+	// WarmSessions is how many warm A2A session pods the gateway keeps ready
+	// on the session route, so a new conversation's first turn is handed a
+	// running pod instead of waiting for one to be scheduled and its image
+	// pulled. Unset means 1. Each warm pod holds one session pod's requests
+	// while it waits (sessionResources: 150m CPU and 320Mi by default, billed
+	// on Autopilot, where without Pod bursting the per-Pod minimum of 250m and
+	// 512Mi applies), so the default costs one session pod's requests per
+	// install; 0 turns the pool off.
+	//
+	// A warm pod becomes the conversation's session pod as it is, with exactly
+	// the identity and reach a freshly started one would have; one unclaimed
+	// for 25 minutes is replaced. The pool never takes the session cap's last
+	// slot: it keeps at most the effective cap less one (none below a cap of
+	// 2), and fewer while live conversations fill the cap. Each warm pod
+	// takes one TASKS consumer and one pod in the session ResourceQuota, and
+	// only consumers the session cap leaves spare: a TASKS stream with none
+	// spare runs without a warm pod (status.effectiveWarmSessions) rather
+	// than losing a session, and a new stream is created with room for
+	// them. On the platform route, which an unset defaultRoute means, no
+	// warm pod runs and nothing is rendered for one. A change rolls the
+	// gateway on the session route.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WarmSessions *int `json:"warmSessions,omitempty"`
 
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
@@ -1285,6 +1318,10 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultWarmSessions is spec.harness.tuning.warmSessions when it is absent:
+// one warm session pod.
+const DefaultWarmSessions = 1
 
 // DefaultBusReplicas is the NATS server count of a new bus when
 // spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
@@ -3075,6 +3112,36 @@ type AgentStatus struct {
 	// field means, a value an earlier opt-in left is cleared.
 	// +optional
 	EffectiveSessionCap *int `json:"effectiveSessionCap,omitempty"`
+
+	// EffectiveWarmSessions is how many warm session pods the operator
+	// renders on the session route: spec.harness.tuning.warmSessions,
+	// bounded by the effective session cap less one and by the TASKS
+	// consumers the cap leaves spare. Warm pods use only spare consumers,
+	// so a stream with none spare runs without one rather than losing a
+	// session. Written with effectiveSessionCap, from the same reading.
+	// Under a served CRD that drops this field no warm pod runs until the
+	// CRD is updated.
+	// +optional
+	EffectiveWarmSessions *int `json:"effectiveWarmSessions,omitempty"`
+	// InferenceKeys records the inference gateway key Secrets the operator
+	// created. Absent until it creates one, and while the served CRD predates
+	// the field, in which case the operator creates none.
+	// +optional
+	InferenceKeys *InferenceKeysStatus `json:"inferenceKeys,omitempty"`
+}
+
+// InferenceKeysStatus records the inference gateway caller-key Secrets, the
+// probe key Secret and the litellm-caller-keys map Secret the operator
+// created, by name and UID. Those names are reserved for the operator: it
+// uses a Secret at one of them only when its UID is the one recorded here,
+// and replaces any other Secret it finds there. It holds no key and no
+// digest.
+type InferenceKeysStatus struct {
+	// SecretUIDs maps each such Secret's name to the UID it was created with.
+	// A tier key's Secret is in the profile namespace; every other one is in
+	// the PlatformAgent's namespace.
+	// +optional
+	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was
@@ -3938,4 +4005,18 @@ type ManagedRepoEntry struct {
 	// docs/designs/version-control-support.md §6.
 	Type string `json:"type"`
 	URL  string `json:"url"`
+}
+
+// SessionWorkerSpec configures the session pods the A2A gateway spawns.
+type SessionWorkerSpec struct {
+	// Type is the harness the session worker image runs. Absent is
+	// claude-code. The operator passes it to the gateway as
+	// A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
+	// to each session pod as A2A_HARNESS, which the worker adapter's
+	// harness selector reads. It is pod configuration only: no route, bus
+	// subject or permission depends on it. claude-code is the only value
+	// accepted today.
+	// +kubebuilder:validation:Enum=claude-code
+	// +optional
+	Type string `json:"type,omitempty"`
 }

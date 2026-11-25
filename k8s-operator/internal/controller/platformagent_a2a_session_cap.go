@@ -19,11 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -83,6 +86,16 @@ import (
 // platform for that pass's render; only an echo that keeps the cap engages
 // the session route. A pass that can't read the bus doesn't probe, so it
 // can't widen anything.
+//
+// status.effectiveWarmSessions, the warm session pods the stream funds beside
+// the cap (a2aWarmSessionsFit), is written with the cap from the same reading.
+// A served CRD that keeps the cap but prunes the warm count (one from before
+// the warm pool) can't store it, and without a stored count the render would
+// fall back to what a new stream has room for, which an existing stream may
+// not fund. So an echo that drops the count renders no warm pod
+// (sessionWarmPruned): the session route and its cap are kept, and every
+// sessionCapPrunedReprobe a pass writes the count again; only an echo that
+// keeps it renders a warm pod.
 const (
 	// sessionCapFittedConditionType is written only while the cap is below
 	// maxSessions, the install fell back to platform, or the cap is waiting
@@ -97,7 +110,7 @@ const (
 	// conversations go to platform.
 	sessionCapNoRoomReason = "NoRoomForASession"
 	// sessionCapWaitingReason: the bus's width has not been read yet, so
-	// the provision Job waits and routing stays as it was.
+	// the provision Job waits and the session route renders at maxSessions.
 	sessionCapWaitingReason = "WaitingOnBusWidth"
 	// sessionCapPrunedReason: the served PlatformAgent CRD drops
 	// status.effectiveSessionCap, so the session route can't keep its cap,
@@ -156,11 +169,11 @@ type a2aTasksWidthReading struct {
 
 // a2aTasksLiveWidth is TASKS' max_consumers as the bus reports it. known is
 // false when the width can't be trusted from this pass: the read failed, a
-// migration is reshaping the bus, the report carried no config for TASKS,
-// or TASKS is missing from a bus that has been provisioned. present is
-// false on a known reading of a bus with no TASKS yet. With reuse set (a cap
-// is stored), a known reading younger than sessionCapReadingTTL answers
-// without reading the bus.
+// migration is reshaping the bus, or the report carried no config for TASKS.
+// present is false on a known reading of a bus that answers without TASKS,
+// provisioned or not; what that means on a provisioned bus is
+// fitA2ASessionCap's to decide. With reuse set (a cap is stored), a known
+// reading younger than sessionCapReadingTTL answers without reading the bus.
 func (r *PlatformAgentReconciler) a2aTasksLiveWidth(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reuse bool) (width int, present, known bool) {
 	if busMigrationHoldsProvision(agent) {
 		return 0, false, false
@@ -211,6 +224,7 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 		// dropped, so an install that opts back in reads the bus afresh.
 		r.sessionCapWarned.Delete(key)
 		r.sessionCapPruned.Delete(key)
+		r.sessionWarmPruned.Delete(key)
 		r.sessionCapReadings.Delete(key)
 		r.clearA2ASessionCap(ctx, agent, instance)
 		return
@@ -223,7 +237,7 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 	// a restart: this pass probes the CRD, and renders platform either way.
 	_, recorded := r.sessionCapPruned.Load(key)
 	probing := recorded || a2aSessionCapPrunedHeld(agent)
-	sessionCap, cond, event := r.fitA2ASessionCap(ctx, agent)
+	sessionCap, warm, cond, event := r.fitA2ASessionCap(ctx, agent)
 	if event == "" {
 		r.sessionCapWarned.Delete(key)
 	} else if warned, ok := r.sessionCapWarned.Load(key); !ok || warned.(string) != event {
@@ -241,16 +255,28 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 		}
 		r.sessionCapPruned.Delete(key)
 	}
-	if sessionCapCurrent(agent, sessionCap, cond) {
+	// A recent write whose echo dropped the warm count: the count is left
+	// out of the comparison and the write, and the render runs no warm pod.
+	warmPruned := r.sessionWarmStatusPruned(agent)
+	if sessionCapCurrent(agent, sessionCap, warm, cond, warmPruned) {
+		if warmPruned {
+			agent.Status.EffectiveWarmSessions = ptr.To(0)
+		}
 		return
 	}
 	original := agent.DeepCopy()
 	patch := client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
 	written := original.DeepCopy()
-	setSessionCap(written, sessionCap, cond)
+	setSessionCap(written, sessionCap, warm, cond)
+	if warmPruned {
+		written.Status.EffectiveWarmSessions = copyIntPtr(original.Status.EffectiveWarmSessions)
+	}
 	if err := r.Status().Patch(ctx, written, patch); err != nil {
 		// The render follows this pass's reading; the next pass writes it.
-		setSessionCap(agent, sessionCap, cond)
+		setSessionCap(agent, sessionCap, warm, cond)
+		if warmPruned {
+			agent.Status.EffectiveWarmSessions = ptr.To(0)
+		}
 		logf.FromContext(ctx).Error(err, "could not record the A2A session cap; the next pass records it")
 		return
 	}
@@ -260,20 +286,46 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 		// cap the store can't keep.
 		logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveSessionCap; plain conversations stay with platform until the CRD is updated")
 		r.sessionCapPruned.Store(key, time.Now())
-		// Only the version is carried: the render copy holds status the
-		// store doesn't (resolvedUniverseDomain), and holdSessionCapPruned
-		// sets the cap and the condition.
+		// Only the version and the two session counts the patch wrote are
+		// carried: the render copy holds status the store doesn't
+		// (resolvedUniverseDomain). The counts are carried so
+		// holdSessionCapPruned compares with what the store now holds: a
+		// warm count the echo kept is cleared in this pass, not in a later
+		// one within the reprobe.
 		agent.ResourceVersion = written.ResourceVersion
+		agent.Status.EffectiveSessionCap = copyIntPtr(written.Status.EffectiveSessionCap)
+		agent.Status.EffectiveWarmSessions = copyIntPtr(written.Status.EffectiveWarmSessions)
 		if instance != nil {
 			instance.ResourceVersion = written.ResourceVersion
+			instance.Status.EffectiveSessionCap = copyIntPtr(written.Status.EffectiveSessionCap)
+			instance.Status.EffectiveWarmSessions = copyIntPtr(written.Status.EffectiveWarmSessions)
 		}
 		r.holdSessionCapPruned(ctx, agent, instance)
 		return
 	}
-	setSessionCap(agent, sessionCap, cond)
+	if !warmPruned && warm != nil && written.Status.EffectiveWarmSessions == nil {
+		// The echo kept the cap and dropped the warm count: a CRD from
+		// before the warm pool. No warm pod renders until a reprobe's echo
+		// keeps the count, so the pool never runs on a count the store
+		// can't hold.
+		if _, seen := r.sessionWarmPruned.Load(key); !seen {
+			logf.FromContext(ctx).Info("the served PlatformAgent CRD drops status.effectiveWarmSessions; no warm session pod runs until the CRD is updated")
+		}
+		r.sessionWarmPruned.Store(key, time.Now())
+		warmPruned = true
+	} else if !warmPruned {
+		r.sessionWarmPruned.Delete(key)
+	}
+	// instance mirrors the store; agent, the render copy, runs no warm pod
+	// while the count can't be stored.
+	stored := written.Status.EffectiveWarmSessions
+	setSessionCap(agent, sessionCap, warm, cond)
+	if warmPruned {
+		agent.Status.EffectiveWarmSessions = ptr.To(0)
+	}
 	agent.ResourceVersion = written.ResourceVersion
 	if instance != nil {
-		setSessionCap(instance, sessionCap, cond)
+		setSessionCap(instance, sessionCap, stored, cond)
 		instance.ResourceVersion = written.ResourceVersion
 	}
 }
@@ -284,10 +336,10 @@ func (r *PlatformAgentReconciler) resolveA2ASessionCap(ctx context.Context, agen
 // The condition is written only when it changes.
 func (r *PlatformAgentReconciler) holdSessionCapPruned(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent) {
 	cond := sessionCapCondition(agent, metav1.ConditionTrue, sessionCapPrunedReason, sessionCapPrunedMessage)
-	if !sessionCapCurrent(agent, nil, cond) {
+	if !sessionCapCurrent(agent, nil, nil, cond, false) {
 		patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
 		written := agent.DeepCopy()
-		setSessionCap(written, nil, cond)
+		setSessionCap(written, nil, nil, cond)
 		if err := r.Status().Patch(ctx, written, patch); err != nil {
 			logf.FromContext(ctx).Error(err, "could not record that the session route is held on platform; the next pass records it")
 		} else {
@@ -297,9 +349,9 @@ func (r *PlatformAgentReconciler) holdSessionCapPruned(ctx context.Context, agen
 			}
 		}
 	}
-	setSessionCap(agent, nil, cond)
+	setSessionCap(agent, nil, nil, cond)
 	if instance != nil {
-		setSessionCap(instance, nil, cond)
+		setSessionCap(instance, nil, nil, cond)
 	}
 }
 
@@ -331,11 +383,12 @@ func (r *PlatformAgentReconciler) probeSessionCapStored(ctx context.Context, age
 // in, is not written. Nothing on the platform route reads either; they are
 // cleared so the status does not describe a route the install has left.
 func (r *PlatformAgentReconciler) clearA2ASessionCap(ctx context.Context, agent, instance *agentv1alpha1.PlatformAgent) {
-	if agent.Status.EffectiveSessionCap == nil && meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType) == nil {
+	if agent.Status.EffectiveSessionCap == nil && agent.Status.EffectiveWarmSessions == nil &&
+		meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType) == nil {
 		return
 	}
 	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
-	setSessionCap(agent, nil, nil)
+	setSessionCap(agent, nil, nil, nil)
 	written := agent.DeepCopy()
 	if err := r.Status().Patch(ctx, written, patch); err != nil {
 		logf.FromContext(ctx).Error(err, "could not clear the A2A session cap left from the session route; the next pass clears it")
@@ -343,7 +396,7 @@ func (r *PlatformAgentReconciler) clearA2ASessionCap(ctx context.Context, agent,
 	}
 	agent.ResourceVersion = written.ResourceVersion
 	if instance != nil {
-		setSessionCap(instance, nil, nil)
+		setSessionCap(instance, nil, nil, nil)
 		instance.ResourceVersion = written.ResourceVersion
 	}
 }
@@ -355,13 +408,27 @@ func (r *PlatformAgentReconciler) sessionCapStatusPruned(agent *agentv1alpha1.Pl
 	return ok && time.Since(at.(time.Time)) < sessionCapPrunedReprobe
 }
 
+// sessionWarmStatusPruned reports a recent write whose echo kept the cap and
+// dropped status.effectiveWarmSessions (resolveA2ASessionCap), reprobed every
+// sessionCapPrunedReprobe like the cap.
+func (r *PlatformAgentReconciler) sessionWarmStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	at, ok := r.sessionWarmPruned.Load(client.ObjectKeyFromObject(agent))
+	return ok && time.Since(at.(time.Time)) < sessionCapPrunedReprobe
+}
+
 // fitA2ASessionCap is resolveA2ASessionCap's decision: the cap to store, the
+// warm pod count the stream funds beside it (a2aWarmSessionsFit), the
 // condition to hold (nil for none; keep, from an unreadable pass with a cap,
 // is the stored one), and the Warning's text ("" for none). Only on the
 // session route: resolveA2ASessionCap does not call it on platform.
-func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*int, *metav1.Condition, string) {
+func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*int, *int, *metav1.Condition, string) {
 	stored := agent.Status.EffectiveSessionCap
+	storedWarm := agent.Status.EffectiveWarmSessions
 	configured := resolveA2AMaxSessions(agent)
+	asked := a2aFitWarmSessions(agentv1alpha1.DefaultRouteSession, agent)
+	// A stream this pass creates, or a bus never provisioned, is made with
+	// room for the warm pods beside maxSessions (a2aTasksMaxConsumers).
+	created := a2aWarmSessionsAt(asked, configured)
 	width, present, known := r.a2aTasksLiveWidth(ctx, agent, stored != nil)
 	// A provisioned bus that answers without TASKS keeps a stored cap: the
 	// server may not have recovered a stream that is there and narrower.
@@ -372,34 +439,45 @@ func (r *PlatformAgentReconciler) fitA2ASessionCap(ctx context.Context, agent *a
 	switch {
 	case (!known || absentOnExisting) && stored != nil:
 		kept := *stored
+		// With no stored count (a cap stored before warm pods, or a CRD that
+		// prunes the count), the count the gateway runs with now stands
+		// until a reading says what the stream funds: writing 0 here and the
+		// funded count a pass later would roll the gateway twice.
+		keptWarm := 0
+		if storedWarm != nil {
+			keptWarm = *storedWarm
+		} else {
+			keptWarm = r.renderedWarmSessions(ctx, agent)
+		}
 		var cond *metav1.Condition
 		if existing := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType); existing != nil {
 			c := *existing
 			c.ObservedGeneration = agent.Generation
 			cond = &c
 		}
-		return &kept, cond, ""
+		return &kept, &keptWarm, cond, ""
 	case !known && !a2aBusExisted(agent):
 		// A bus never provisioned: TASKS will be created at maxSessions' width.
-		return &configured, nil, ""
+		return &configured, &created, nil, ""
 	case !known:
-		return nil, sessionCapCondition(agent, metav1.ConditionUnknown, sessionCapWaitingReason, sessionCapWaitingMessage), ""
+		return nil, nil, sessionCapCondition(agent, metav1.ConditionUnknown, sessionCapWaitingReason, sessionCapWaitingMessage), ""
 	case !present:
-		return &configured, nil, ""
+		return &configured, &created, nil, ""
 	}
 	reserve := a2aTasksReserve(agent)
 	fit := a2aSessionsFit(width, reserve, a2aTasksConsumersPerSessionOnSessionRoute)
 	effective := max(min(configured, fit), 0)
+	warm := a2aWarmSessionsFit(width, reserve, a2aTasksConsumersPerSessionOnSessionRoute, effective, asked)
 	if effective >= configured {
-		return &effective, nil, ""
+		return &effective, &warm, nil, ""
 	}
 	event := fmt.Sprintf(sessionCapEventFormat, width, configured,
 		configured*a2aTasksConsumersPerSessionOnSessionRoute+reserve, a2aTasksConsumersPerSessionOnSessionRoute, reserve, effective)
 	if effective < 1 {
-		return &effective, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapNoRoomReason, sessionCapNoRoomMessage),
+		return &effective, &warm, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapNoRoomReason, sessionCapNoRoomMessage),
 			event + sessionCapNoRoomEventSuffix + sessionCapRemedy
 	}
-	return &effective, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapNarrowReason, sessionCapNarrowMessage),
+	return &effective, &warm, sessionCapCondition(agent, metav1.ConditionTrue, sessionCapNarrowReason, sessionCapNarrowMessage),
 		event + sessionCapRemedy
 }
 
@@ -414,12 +492,16 @@ func sessionCapCondition(agent *agentv1alpha1.PlatformAgent, status metav1.Condi
 	}
 }
 
-// sessionCapCurrent reports whether agent already holds cap and cond, the
-// condition compared on what the writers key on (status, reason, message)
-// and on the generation it observed, so a spec edit refreshes it.
-func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want *int, cond *metav1.Condition) bool {
-	have := agent.Status.EffectiveSessionCap
-	if (have == nil) != (want == nil) || (have != nil && *have != *want) {
+// sessionCapCurrent reports whether agent already holds cap, the warm count
+// and cond, the condition compared on what the writers key on (status,
+// reason, message) and on the generation it observed, so a spec edit
+// refreshes it. ignoreWarm leaves the warm count out, for a CRD that prunes
+// it (sessionWarmPruned).
+func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want, wantWarm *int, cond *metav1.Condition, ignoreWarm bool) bool {
+	if !sameIntPtr(agent.Status.EffectiveSessionCap, want) {
+		return false
+	}
+	if !ignoreWarm && !sameIntPtr(agent.Status.EffectiveWarmSessions, wantWarm) {
 		return false
 	}
 	existing := meta.FindStatusCondition(agent.Status.Conditions, sessionCapFittedConditionType)
@@ -430,13 +512,44 @@ func sessionCapCurrent(agent *agentv1alpha1.PlatformAgent, want *int, cond *meta
 		existing.ObservedGeneration == cond.ObservedGeneration
 }
 
-func setSessionCap(agent *agentv1alpha1.PlatformAgent, sessionCap *int, cond *metav1.Condition) {
-	if sessionCap == nil {
-		agent.Status.EffectiveSessionCap = nil
-	} else {
-		v := *sessionCap
-		agent.Status.EffectiveSessionCap = &v
+// renderedWarmSessions is the A2A_WARM_SESSIONS the live gateway Deployment
+// carries, or 0 when there is none to read (no gateway yet, one from before
+// the variable, or one on the platform route, which renders none).
+func (r *PlatformAgentReconciler) renderedWarmSessions(ctx context.Context, agent *agentv1alpha1.PlatformAgent) int {
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, dep); err != nil {
+		return 0
 	}
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name != a2aWarmSessionsEnvVar {
+				continue
+			}
+			if n, err := strconv.Atoi(e.Value); err == nil && n >= 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// copyIntPtr is a copy of an optional count, absent kept absent.
+func copyIntPtr(p *int) *int {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// sameIntPtr reports two optional counts equal, absent included.
+func sameIntPtr(a, b *int) bool {
+	return (a == nil) == (b == nil) && (a == nil || *a == *b)
+}
+
+func setSessionCap(agent *agentv1alpha1.PlatformAgent, sessionCap, warm *int, cond *metav1.Condition) {
+	agent.Status.EffectiveSessionCap = copyIntPtr(sessionCap)
+	agent.Status.EffectiveWarmSessions = copyIntPtr(warm)
 	if cond == nil {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, sessionCapFittedConditionType)
 		return

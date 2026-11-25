@@ -125,7 +125,7 @@ The agent pod already verifies every pull request a kanban worker opens: `vcs_cl
 one `kube-agents.event` line to stderr when the broker answers with a new proposal, the
 `pr_opened` hook sees that line in the worker's terminal output before the model does, checks it
 with the forge (the broker serves the pull request at that url, on a repository the install
-manages, open, created within the last fifteen minutes, authored by the broker's own account),
+manages, open or already merged, created within the last fifteen minutes, authored by the broker's own account),
 and only then records a `pr_opened` event on the card. That check is the trust anchor this
 design reuses: a line the model could type is not a proposal until the forge confirms the agent
 opened it.

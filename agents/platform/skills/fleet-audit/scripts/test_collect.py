@@ -7,6 +7,7 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import ast
 import base64
 import errno
 import hashlib
@@ -26,6 +27,7 @@ import types
 import unittest
 from contextlib import contextmanager, redirect_stderr
 from datetime import datetime, timedelta, timezone
+import argparse
 from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -4939,6 +4941,585 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
         )
 
 
+def cluster_node(name, pool="default-pool", taints=None, labels=None):
+    doc = {
+        "kind": "Node",
+        "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": pool, **(labels or {})}},
+        "spec": {},
+    }
+    if taints:
+        doc["spec"]["taints"] = taints
+    return doc
+
+
+def node_agent(
+    name="cni-shaped-agent",
+    ns="seeded-shapes",
+    *,
+    host_network=True,
+    host_paths=("/etc/cni/net.d",),
+    tolerations=None,
+    node_selector=None,
+    affinity=None,
+    labels=None,
+    annotations=None,
+    status=None,
+    capabilities=(),
+):
+    spec = {"containers": [{"name": "agent", "image": "registry.k8s.io/pause:3.10"}]}
+    if capabilities:
+        spec["containers"][0]["securityContext"] = {"capabilities": {"drop": ["ALL"], "add": list(capabilities)}}
+    if host_network:
+        spec["hostNetwork"] = True
+    if host_paths:
+        spec["volumes"] = [{"name": f"host-{i}", "hostPath": {"path": p}} for i, p in enumerate(host_paths)]
+    if tolerations is not None:
+        spec["tolerations"] = tolerations
+    if node_selector is not None:
+        spec["nodeSelector"] = node_selector
+    if affinity is not None:
+        spec["affinity"] = affinity
+    doc = {
+        "kind": "DaemonSet",
+        "metadata": {"namespace": ns, "name": name, "labels": labels or {}, "annotations": annotations or {}},
+        "spec": {"template": {"spec": spec}},
+    }
+    if status is not None:
+        doc["status"] = status
+    return doc
+
+
+# What GKE's documented ip-masq-agent manifest adds to its container.
+IP_MASQ_CAPABILITIES = ("NET_ADMIN", "NET_RAW")
+
+
+class TestNetworkDaemonsetMissingToleration(unittest.TestCase):
+    """§3.27 (`network-daemonset-missing-ccc-toleration`). A DaemonSet on the
+    node's network, or mounting a network plug-in directory, against the taints
+    of every node pool that has a node."""
+
+    IDLE = {"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}
+    PINNED = {"key": "seeded-role", "value": "pinned-inference", "effect": "NoSchedule"}
+
+    def fleet_nodes(self):
+        return [
+            cluster_node("default-1"),
+            cluster_node("default-2"),
+            cluster_node("default-3"),
+            cluster_node("idle-1", pool="idle-batch-pool", taints=[self.IDLE]),
+            cluster_node("pinned-1", pool="pinned-inference-pool", taints=[self.PINNED]),
+        ]
+
+    def hits(self, *items, nodes=None):
+        nodes = self.fleet_nodes() if nodes is None else nodes
+        return collect.check_network_daemonset_missing_toleration(context_of(dump_of(*items, *nodes)))
+
+    def test_the_fleet_shape_names_both_uncovered_pools_on_one_finding(self):
+        agent = node_agent(status={"desiredNumberScheduled": 3, "numberReady": 3})
+        hits = self.hits(agent)
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual((hit["namespace"], hit["object"]), ("seeded-shapes", "DaemonSet/cni-shaped-agent"))
+        self.assertEqual(
+            hit["excerpt"],
+            "DaemonSet (checked here because of: mounts /etc/cni/net.d from the node) "
+            "cannot be placed on 2 of the cluster's 5 nodes. "
+            "It reports 3 of 3 pods ready, which counts only the nodes it can be placed on. "
+            "It has no toleration for seeded-role=idle-batch:NoSchedule (node pool idle-batch-pool, 1 node); "
+            "seeded-role=pinned-inference:NoSchedule (node pool pinned-inference-pool, 1 node).",
+        )
+
+    def test_the_documented_ip_masq_agent_without_its_tolerations_is_flagged_in_kube_system(self):
+        # GKE's manifest: kube-system, hostNetwork, a ConfigMap volume and no host mount.
+        agent = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        hits = self.hits(agent)
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("kube-system", "DaemonSet/ip-masq-agent")])
+        self.assertIn("(checked here because of: hostNetwork: true with NET_ADMIN, NET_RAW)", hits[0]["excerpt"])
+
+    def test_kube_system_is_the_one_system_namespace_read(self):
+        """GKE's documented manifest is applied to `kube-system` by the owner.
+        The other system namespaces hold objects that are not the owner's to
+        edit, whether or not they carry the add-on label."""
+        for ns in ("gke-managed-system", "gmp-system", "gke-gmp-system", "config-management-system", "istio-system"):
+            with self.subTest(namespace=ns):
+                self.assertEqual(self.hits(node_agent("collector", ns)), [])
+        self.assertEqual(len(self.hits(node_agent("ip-masq-agent", "kube-system", capabilities=IP_MASQ_CAPABILITIES))), 1)
+
+    def test_the_host_network_alone_does_not_make_a_node_networking_agent(self):
+        """Log, metrics and security agents use the host network to reach the
+        node's ports. Without a network capability or a plug-in mount they are
+        not this check's subject, in any namespace and whatever the taint."""
+        gpu = {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+        evict = {"key": "dedicated", "value": "batch", "effect": "NoExecute"}
+        nodes = [cluster_node("n1"), cluster_node("g1", pool="gpu-pool", taints=[gpu]), cluster_node("e1", pool="evict-pool", taints=[evict])]
+        privileged = node_agent("security-agent", "security", host_paths=())
+        privileged["spec"]["template"]["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        for agent in (
+            node_agent("filebeat", "kube-system", host_paths=()),
+            node_agent("node-exporter", "monitoring", host_paths=(), tolerations=[{"effect": "NoSchedule", "operator": "Exists"}]),
+            node_agent("otel-agent", "observability", host_paths=(), capabilities=("SYS_PTRACE",)),
+            privileged,
+        ):
+            with self.subTest(agent=agent["metadata"]["name"]):
+                self.assertEqual(self.hits(agent, nodes=nodes), [])
+
+    def test_the_host_network_with_a_network_capability_is_flagged(self):
+        for capabilities in (("NET_ADMIN",), ("NET_RAW",), ("NET_ADMIN", "NET_RAW"), ("SYS_TIME", "NET_ADMIN")):
+            with self.subTest(capabilities=capabilities):
+                hits = self.hits(node_agent("snat-agent", "kube-system", host_paths=(), capabilities=capabilities))
+                self.assertEqual(len(hits), 1)
+                named = ", ".join(c for c in ("NET_ADMIN", "NET_RAW") if c in capabilities)
+                self.assertIn(f"(checked here because of: hostNetwork: true with {named})", hits[0]["excerpt"])
+        # The capability on an init container counts: it sets the rules before the agent starts.
+        agent = node_agent("snat-agent", "kube-system", host_paths=())
+        agent["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "rules", "securityContext": {"capabilities": {"add": ["NET_ADMIN"]}}}
+        ]
+        self.assertEqual(len(self.hits(agent)), 1)
+        # The capability without the host network is not the mark.
+        self.assertEqual(self.hits(node_agent("in-pod", "apps", host_network=False, host_paths=(), capabilities=("NET_ADMIN",))), [])
+
+    def test_a_network_plugin_mount_without_host_network_is_flagged(self):
+        for path in ("/etc/cni/net.d", "/opt/cni/bin", "/home/kubernetes/bin", "/etc/cni/net.d/"):
+            with self.subTest(path=path):
+                hits = self.hits(node_agent(host_network=False, host_paths=(path,)))
+                self.assertEqual(len(hits), 1)
+                self.assertIn(f"mounts {path} from the node", hits[0]["excerpt"])
+                self.assertNotIn("hostNetwork", hits[0]["excerpt"])
+
+    def test_a_compute_class_taint_is_named_as_any_other_taint(self):
+        taint = {"key": "cloud.google.com/compute-class", "value": "batch", "effect": "NoSchedule"}
+        hits = self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2", pool="batch-pool", taints=[taint])])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("cloud.google.com/compute-class=batch:NoSchedule (node pool batch-pool, 1 node)", hits[0]["excerpt"])
+
+    def test_a_no_execute_taint_and_a_valueless_taint_are_flagged(self):
+        nodes = [
+            cluster_node("n1", pool="evict-pool", taints=[{"key": "dedicated", "effect": "NoExecute"}]),
+            cluster_node("n2", pool="evict-pool", taints=[{"key": "dedicated", "effect": "NoExecute"}]),
+        ]
+        hits = self.hits(node_agent(), nodes=nodes)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("dedicated:NoExecute (node pool evict-pool, 2 nodes)", hits[0]["excerpt"])
+        self.assertIn("cannot be placed on 2 of the cluster's 2 nodes", hits[0]["excerpt"])
+
+    def test_a_partly_tolerating_agent_names_only_the_pool_it_misses(self):
+        tolerations = [{"key": "seeded-role", "operator": "Equal", "value": "idle-batch", "effect": "NoSchedule"}]
+        hits = self.hits(node_agent(tolerations=tolerations))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool pinned-inference-pool, 1 node)", hits[0]["excerpt"])
+        self.assertNotIn("idle-batch-pool", hits[0]["excerpt"])
+        self.assertIn("cannot be placed on 1 of the cluster's 5 nodes", hits[0]["excerpt"])
+
+    def test_a_blanket_or_matching_toleration_is_clean(self):
+        clean = [
+            [{"operator": "Exists"}],
+            [{"effect": "NoSchedule", "operator": "Exists"}, {"effect": "NoExecute", "operator": "Exists"}],
+            [{"key": "seeded-role", "operator": "Exists"}],
+            [
+                {"key": "seeded-role", "operator": "Equal", "value": "idle-batch", "effect": "NoSchedule"},
+                {"key": "seeded-role", "operator": "Equal", "value": "pinned-inference", "effect": "NoSchedule"},
+            ],
+        ]
+        for tolerations in clean:
+            with self.subTest(tolerations=tolerations):
+                self.assertEqual(self.hits(node_agent(tolerations=tolerations)), [])
+
+    def test_a_cluster_with_no_tainted_node_is_clean(self):
+        self.assertEqual(self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2")]), [])
+
+    def test_a_tainted_pool_with_no_node_cannot_appear(self):
+        # The pool exists in GKE but holds no Node object: nothing to cover.
+        self.assertEqual(self.hits(node_agent(), nodes=self.fleet_nodes()[:3]), [])
+
+    def test_a_daemonset_that_is_no_node_networking_agent_is_clean(self):
+        for host_paths in (
+            (),
+            ("/var/log",),
+            ("/etc/cni-backup",),
+            ("/etc/cni",),
+            ("/etc/cni/net.d-old",),
+            ("/opt/cni/binaries",),
+            ("/home/kubernetes/bin/nvidia",),
+        ):
+            with self.subTest(host_paths=host_paths):
+                self.assertEqual(self.hits(node_agent(host_network=False, host_paths=host_paths)), [])
+
+    def test_a_deployment_on_the_host_network_is_clean(self):
+        dep = deployment("host-net-api", ns="seeded-shapes")
+        dep["spec"]["template"]["spec"]["hostNetwork"] = True
+        dep["spec"]["template"]["spec"]["containers"][0]["securityContext"] = {"capabilities": {"add": list(IP_MASQ_CAPABILITIES)}}
+        self.assertEqual(self.hits(dep), [])
+
+    def test_a_pool_the_agents_own_selector_excludes_is_clean(self):
+        selector = {"cloud.google.com/gke-nodepool": "default-pool"}
+        self.assertEqual(self.hits(node_agent(node_selector=selector)), [])
+        affinity = {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "cloud.google.com/gke-nodepool",
+                                    "operator": "NotIn",
+                                    "values": ["idle-batch-pool", "pinned-inference-pool"],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+        self.assertEqual(self.hits(node_agent(affinity=affinity)), [])
+
+    def test_a_selector_on_a_node_label_reads_the_nodes_own_labels(self):
+        nodes = [
+            cluster_node("n1", labels={"sandbox.gke.io/runtime": "gvisor"}),
+            cluster_node("n2", pool="idle-batch-pool", taints=[self.IDLE]),
+        ]
+        selector = {"sandbox.gke.io/runtime": "gvisor"}
+        self.assertEqual(self.hits(node_agent(node_selector=selector), nodes=nodes), [])
+        nodes[1]["metadata"]["labels"]["sandbox.gke.io/runtime"] = "gvisor"
+        self.assertEqual(len(self.hits(node_agent(node_selector=selector), nodes=nodes)), 1)
+
+    def affinity_of(self, *terms):
+        return {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": list(terms)}}}
+
+    def test_a_node_name_field_in_the_affinity_decides_which_nodes_count(self):
+        only_idle = self.affinity_of({"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["idle-1"]}]})
+        hits = self.hits(node_agent(affinity=only_idle))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool idle-batch-pool, 1 node)", hits[0]["excerpt"])
+        self.assertNotIn("pinned-inference-pool", hits[0]["excerpt"])
+        not_tainted = self.affinity_of(
+            {"matchFields": [{"key": "metadata.name", "operator": "NotIn", "values": ["idle-1", "pinned-1"]}]}
+        )
+        self.assertEqual(self.hits(node_agent(affinity=not_tainted)), [])
+
+    def test_a_numeric_affinity_operator_is_decided_from_the_label(self):
+        nodes = [
+            cluster_node("old-1", pool="old-pool", taints=[self.IDLE], labels={"example.com/generation": "2"}),
+            cluster_node("new-1", pool="new-pool", taints=[self.PINNED], labels={"example.com/generation": "5"}),
+            cluster_node("plain-1", pool="plain-pool", taints=[self.IDLE]),
+        ]
+        newer = self.affinity_of({"matchExpressions": [{"key": "example.com/generation", "operator": "Gt", "values": ["3"]}]})
+        hits = self.hits(node_agent(affinity=newer), nodes=nodes)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool new-pool, 1 node)", hits[0]["excerpt"])
+        self.assertIn("cannot be placed on 1 of the cluster's 3 nodes", hits[0]["excerpt"])
+        older = self.affinity_of({"matchExpressions": [{"key": "example.com/generation", "operator": "Lt", "values": ["3"]}]})
+        self.assertIn("(node pool old-pool, 1 node)", self.hits(node_agent(affinity=older), nodes=nodes)[0]["excerpt"])
+
+    def test_each_affinity_operator_reads_a_present_and_an_absent_label(self):
+        """Per operator: which of three tainted nodes the affinity admits, where
+        one node carries the label with the wanted value, one with another
+        value, and one does not carry it at all."""
+        nodes = [
+            cluster_node("gpu-1", pool="gpu-pool", taints=[self.IDLE], labels={"example.com/tier": "7"}),
+            cluster_node("cpu-1", pool="cpu-pool", taints=[self.IDLE], labels={"example.com/tier": "2"}),
+            cluster_node("bare-1", pool="bare-pool", taints=[self.IDLE]),
+        ]
+        admitted = {
+            ("In", ("7",)): {"gpu-pool"},
+            ("NotIn", ("7",)): {"cpu-pool", "bare-pool"},
+            ("Exists", ()): {"gpu-pool", "cpu-pool"},
+            ("DoesNotExist", ()): {"bare-pool"},
+            ("Gt", ("5",)): {"gpu-pool"},
+            ("Lt", ("5",)): {"cpu-pool"},
+            ("In", ("",)): set(),
+            ("Gt", ("x",)): set(),
+        }
+        for (operator, values), pools in admitted.items():
+            with self.subTest(operator=operator, values=values):
+                expression = {"key": "example.com/tier", "operator": operator}
+                if values:
+                    expression["values"] = list(values)
+                hits = self.hits(node_agent(affinity=self.affinity_of({"matchExpressions": [expression]})), nodes=nodes)
+                named = set(re.findall(r"node pools? ([a-z, -]+?), \d+ node", hits[0]["excerpt"])[0].split(", ")) if hits else set()
+                self.assertEqual(named, pools)
+
+    def test_affinity_terms_are_alternatives_when_the_first_one_fails(self):
+        # The first term names a pool that does not exist; the second admits the tainted pool.
+        either = self.affinity_of(
+            {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["no-such-pool"]}]},
+            {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["idle-batch-pool"]}]},
+        )
+        hits = self.hits(node_agent(affinity=either))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool idle-batch-pool, 1 node)", hits[0]["excerpt"])
+        # Within one term every expression must hold.
+        both = self.affinity_of(
+            {
+                "matchExpressions": [
+                    {"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["idle-batch-pool"]},
+                    {"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["pinned-inference-pool"]},
+                ]
+            }
+        )
+        self.assertEqual(self.hits(node_agent(affinity=both)), [])
+
+    def test_the_marks_are_read_as_the_api_writes_them(self):
+        # GKE's binary directory with a trailing slash is still that directory.
+        hits = self.hits(node_agent(host_network=False, host_paths=("/home/kubernetes/bin/",)))
+        self.assertEqual(len(hits), 1)
+        # Two volumes of one path are one mark.
+        twice = self.hits(node_agent(host_network=False, host_paths=("/etc/cni/net.d", "/etc/cni/net.d")))
+        self.assertEqual(twice[0]["excerpt"].count("mounts /etc/cni/net.d from the node"), 1)
+        # `hostNetwork` is a boolean; a string is not the host network.
+        agent = node_agent(host_network=False, host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        agent["spec"]["template"]["spec"]["hostNetwork"] = "true"
+        self.assertEqual(self.hits(agent), [])
+
+    def test_a_long_list_of_plugin_mounts_is_cut_and_counted(self):
+        paths = tuple(f"/etc/cni/net.d/conf-{i}" for i in range(collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED + 3))
+        excerpt = self.hits(node_agent(host_paths=paths))[0]["excerpt"]
+        self.assertIn(f"mounts /etc/cni/net.d/conf-{collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED - 1} from the node; 3 more plug-in mounts) cannot be placed on", excerpt)
+        self.assertNotIn(f"conf-{collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED} ", excerpt)
+        one_more = self.hits(node_agent(host_paths=paths[: collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED + 1]))[0]["excerpt"]
+        self.assertIn("; 1 more plug-in mount) cannot be placed on", one_more)
+        self.assertEqual(collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED, 4)
+
+    def test_a_status_taint_of_the_autoscaler_is_a_finding(self):
+        # Unlike its start-up prefix, the status prefix marks a node that "should not be used to run pods for the time being".
+        taint = {"key": "status-taint.cluster-autoscaler.kubernetes.io/hold", "effect": "NoSchedule"}
+        self.assertEqual(len(self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2", pool="held", taints=[taint])])), 1)
+
+    def test_ten_node_pools_are_named_per_taint(self):
+        self.assertEqual(collect.NETWORK_DAEMONSET_MAX_POOLS_NAMED, 10)
+
+    def test_affinity_terms_are_alternatives_and_an_empty_or_unknown_one_admits_no_node(self):
+        for terms in ([{}], [{"matchExpressions": [{"key": "seeded-role", "operator": "Near", "values": ["x"]}]}]):
+            with self.subTest(terms=terms):
+                self.assertEqual(self.hits(node_agent(affinity=self.affinity_of(*terms))), [])
+        either = self.affinity_of(
+            {},
+            {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["pinned-inference-pool"]}]},
+        )
+        hits = self.hits(node_agent(affinity=either))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("cannot be placed on 1 of the cluster's 5 nodes", hits[0]["excerpt"])
+
+    def test_taints_the_daemonset_controller_tolerates_by_itself_are_ignored(self):
+        own = [
+            {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"},
+            {"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"},
+            {"key": "node.kubernetes.io/network-unavailable", "effect": "NoSchedule"},
+            {"key": "ToBeDeletedByClusterAutoscaler", "effect": "NoSchedule"},
+            {"key": "node.kubernetes.io/out-of-service", "effect": "NoExecute"},
+            {"key": "node.cloudprovider.kubernetes.io/shutdown", "effect": "NoSchedule"},
+            # Start-up taints a node sheds once it is ready.
+            {"key": "node.cilium.io/agent-not-ready", "value": "true", "effect": "NoExecute"},
+            {"key": "startup-taint.cluster-autoscaler.kubernetes.io/driver", "effect": "NoSchedule"},
+            {"key": "ignore-taint.cluster-autoscaler.kubernetes.io/driver", "effect": "NoSchedule"},
+        ]
+        nodes = [cluster_node("n1"), cluster_node("n2", taints=own)]
+        self.assertEqual(self.hits(node_agent(), nodes=nodes), [])
+
+    def test_a_node_tainted_for_another_platform_is_none_of_the_agents_nodes(self):
+        """GKE taints Windows Server and Arm nodes to keep software built for
+        another platform off them. An agent that does not tolerate that taint
+        is not reported there, whatever else the node carries: the toleration
+        would start an image the node cannot run."""
+        dedicated = {"key": "dedicated", "value": "batch", "effect": "NoSchedule"}
+        platforms = {
+            "windows-pool": {"key": "node.kubernetes.io/os", "value": "windows", "effect": "NoSchedule"},
+            "arm-pool": {"key": "kubernetes.io/arch", "value": "arm64", "effect": "NoSchedule"},
+        }
+        for pool, platform in platforms.items():
+            with self.subTest(pool=pool):
+                nodes = [cluster_node("plain-1"), cluster_node("other-1", pool=pool, taints=[platform, dedicated])]
+                self.assertEqual(self.hits(node_agent(), nodes=nodes), [])
+                # An agent built for that platform says so with the toleration;
+                # the pool's other taint then counts as on any pool.
+                built_for_it = [{"key": platform["key"], "operator": "Exists"}]
+                hits = self.hits(node_agent(tolerations=built_for_it), nodes=nodes)
+                self.assertEqual(len(hits), 1)
+                self.assertIn(f"dedicated=batch:NoSchedule (node pool {pool}, 1 node)", hits[0]["excerpt"])
+
+    def test_a_gpu_or_dedicated_pool_taint_is_a_finding(self):
+        # Taints that keep ordinary workloads off a pool, not node agents.
+        for taint in (
+            {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"},
+            {"key": "sandbox.gke.io/runtime", "value": "gvisor", "effect": "NoSchedule"},
+            {"key": "dedicated", "value": "payments", "effect": "NoSchedule"},
+        ):
+            with self.subTest(taint=taint["key"]):
+                nodes = [cluster_node("plain-1"), cluster_node("special-1", pool="special-pool", taints=[taint])]
+                self.assertEqual(len(self.hits(node_agent(), nodes=nodes)), 1)
+
+    def test_a_prefer_no_schedule_taint_is_ignored(self):
+        nodes = [cluster_node("n1", pool="soft-pool", taints=[{"key": "soft", "effect": "PreferNoSchedule"}])]
+        self.assertEqual(self.hits(node_agent(), nodes=nodes), [])
+
+    def test_gke_managed_and_opted_out_agents_are_skipped(self):
+        skipped = [
+            node_agent("netd", "kube-system", labels={"addonmanager.kubernetes.io/mode": "Reconcile"}),
+            node_agent(labels={"kubeagents.x-k8s.io/reliability-audit": "exempt"}),
+            node_agent(annotations={"kubeagents.x-k8s.io/reliability-audit": "exempt"}),
+            node_agent("anetd", "kube-system", annotations={"components.gke.io/component-name": "advanceddatapath"}),
+        ]
+        for agent in skipped:
+            with self.subTest(agent=agent["metadata"]):
+                self.assertEqual(self.hits(agent), [])
+
+    def test_the_excerpt_omits_the_ready_count_when_status_is_absent(self):
+        hits = self.hits(node_agent())
+        self.assertIn("cannot be placed on 2 of the cluster's 5 nodes. It has no toleration for ", hits[0]["excerpt"])
+        self.assertNotIn("pods ready", hits[0]["excerpt"])
+
+    def test_every_taint_is_named_however_many_pools_carry_it(self):
+        """The fix is one toleration per taint, so no taint may fall off the end
+        of a long pool list: the pools of one taint are cut and counted, the
+        taints are not."""
+        cap = collect.NETWORK_DAEMONSET_MAX_POOLS_NAMED
+        batch = {"key": "cloud.google.com/compute-class", "value": "batch", "effect": "NoSchedule"}
+        gpu = {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+        nodes = [cluster_node(f"n{i}", pool=f"nap-{i:02d}", taints=[batch]) for i in range(cap + 3)]
+        nodes.append(cluster_node("g1", pool="zz-gpu", taints=[gpu]))
+        hits = self.hits(node_agent(), nodes=nodes)
+        self.assertEqual(len(hits), 1)
+        excerpt = hits[0]["excerpt"]
+        self.assertIn(f"nap-{cap - 1:02d} and 3 more, {cap + 3} nodes); nvidia.com/gpu=present:NoSchedule (node pool zz-gpu, 1 node).", excerpt)
+        self.assertNotIn(f"nap-{cap:02d}", excerpt)
+        self.assertEqual(excerpt.count("cloud.google.com/compute-class=batch:NoSchedule"), 1)
+        self.assertIn(f"cannot be placed on {cap + 4} of the cluster's {cap + 4} nodes.", excerpt)
+
+    def test_a_node_with_two_untolerated_taints_is_one_node_under_each_taint(self):
+        both = [self.IDLE, {"key": "dedicated", "value": "batch", "effect": "NoExecute"}]
+        hits = self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2", pool="batch-pool", taints=both)])
+        self.assertIn(
+            "cannot be placed on 1 of the cluster's 2 nodes. "
+            "It has no toleration for dedicated=batch:NoExecute (node pool batch-pool, 1 node); "
+            "seeded-role=idle-batch:NoSchedule (node pool batch-pool, 1 node).",
+            hits[0]["excerpt"],
+        )
+
+    def test_the_counts_come_before_a_long_list_of_taints(self):
+        # The report cuts a long excerpt at its end; what it cuts must be taints, not the counts.
+        taints = [{"key": f"team-{i:02d}", "value": "x" * 60, "effect": "NoSchedule"} for i in range(25)]
+        nodes = [cluster_node("n0")] + [cluster_node(f"n{i + 1}", pool=f"pool-{i:02d}", taints=[taint]) for i, taint in enumerate(taints)]
+        excerpt = self.hits(node_agent(status={"desiredNumberScheduled": 1, "numberReady": 1}), nodes=nodes)[0]["excerpt"]
+        self.assertGreater(len(excerpt), audit_report.MAX_EXCERPT_CHARS)
+        self.assertLess(excerpt.index("pods ready"), excerpt.index("team-00"))
+        self.assertLess(excerpt.index("cannot be placed on 25 of the cluster's 26 nodes"), excerpt.index("team-00"))
+
+    def test_a_node_with_no_node_pool_label_is_named_as_such(self):
+        bare = cluster_node("bare-1", taints=[self.IDLE])
+        del bare["metadata"]["labels"]["cloud.google.com/gke-nodepool"]
+        hits = self.hits(node_agent(), nodes=[cluster_node("n1"), bare, cluster_node("idle-1", pool="idle-batch-pool", taints=[self.IDLE])])
+        self.assertEqual(len(hits), 1)
+        self.assertIn(
+            "seeded-role=idle-batch:NoSchedule (node pool idle-batch-pool and nodes with no node pool label, 2 nodes).",
+            hits[0]["excerpt"],
+        )
+        only_bare = self.hits(node_agent(), nodes=[bare])
+        self.assertIn("seeded-role=idle-batch:NoSchedule (nodes with no node pool label, 1 node).", only_bare[0]["excerpt"])
+
+    def test_the_finding_carries_what_reconciles_the_agent(self):
+        agent = node_agent(labels={"app.kubernetes.io/managed-by": "Helm"}, annotations={"meta.helm.sh/release-name": "cni"})
+        hit = self.hits(agent)[0]
+        self.assertEqual(hit["reconciler"], collect.reconciler_of(agent["metadata"]))
+        self.assertIsNotNone(hit["reconciler"])
+        # And the release that renders it, which is what finds the values file for the fix.
+        self.assertEqual(hit["release"], collect.release_of(agent["metadata"]))
+        self.assertIsNotNone(hit["release"])
+
+    def test_it_is_rostered_as_a_major_cluster_check(self):
+        spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "network-daemonset-missing-ccc-toleration")
+        self.assertEqual((spec.kind, spec.severity, spec.autopilot_severity), ("cluster", "major", None))
+        self.assertEqual(len(spec.run(context_of(dump_of(node_agent(), *self.fleet_nodes())))), 1)
+        self.assertNotIn("SNAT", spec.impact)
+
+    def test_the_plugin_directories_match_the_upgrade_readiness_table(self):
+        """`collect.py` ships standalone, so it copies the three directories of
+        `CNI_HOST_PATHS` in fleet-upgrade-verification's table; this holds the
+        copy to it."""
+        table = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts" / "upgrade_shape_tables.py"
+        declared = next(
+            ast.literal_eval(node.value)
+            for node in ast.parse(table.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "CNI_HOST_PATHS" for target in node.targets)
+        )
+        self.assertEqual(tuple(declared), (*collect.CNI_HOST_DIRECTORIES, collect.GKE_CNI_BINARY_DIRECTORY))
+
+    def test_collect_cluster_files_it_from_the_dump_alone_where_only_system_workloads_exist(self):
+        """The whole path, on a cluster whose only workload is the documented
+        agent in kube-system: no workload survives S1, so the workload checks
+        are inapplicable, and this check still runs, files the finding at
+        `major`, and records the dump as its command with no read of its own."""
+        agent = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:3] == ["kubectl", "get", "computeclasses"] or (
+                argv[:2] == ["kubectl", "get"] and argv[2] in collect.INGRESS_GATEWAY_CRD_RESOURCES
+            ):
+                return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "x"', 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(agent, *self.fleet_nodes())), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        slug = "network-daemonset-missing-ccc-toleration"
+        cluster = {"name": "c", "project": "acme", "location": "us-central1", "autopilot": False}
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path("acme", "c", "us-central1")
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        found = [c for c in result["candidates"] if c["check"] == slug]
+        self.assertEqual([(c["namespace"], c["object"], c["severity"]) for c in found], [("kube-system", "DaemonSet/ip-masq-agent", "major")])
+        self.assertEqual(found[0]["impact"], collect.IMPACT_NETWORK_DAEMONSET_MISSING_TOLERATION)
+        command = next(c["command"] for c in result["commands"] if c["check"] == slug)
+        self.assertEqual(command, collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig))
+        inapplicable = {e["check"] for e in result.get("checks_not_applicable", [])}
+        self.assertIn("no-requests", inapplicable)
+        self.assertNotIn(slug, inapplicable)
+        self.assertFalse([argv for argv in calls if "node-pools" in argv])
+
+        # Autopilot: S1 binds, so GKE's own kube-system is not read. With no
+        # workload in scope the check examined the same empty set as the
+        # workload checks, and says so with them.
+        cluster["autopilot"] = True
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertEqual([c for c in result["candidates"] if c["check"] == slug], [])
+        self.assertNotIn(slug, {c["check"] for c in result["commands"]})
+        reasons = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
+        self.assertEqual(reasons[slug], reasons["no-requests"])
+        self.assertNotIn(slug, {e["check"] for e in result.get("checks_unevaluated", [])})
+
+        # Autopilot with a workload in scope: the check ran, as on any cluster.
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(
+                cluster,
+                "obtainability-audit",
+                collect.OBTAINABILITY_CHECKS,
+                run=lambda argv, **kwargs: (
+                    Run(argv, 0, json.dumps(dump_of(agent, deployment("api"), *self.fleet_nodes())), "", 0.01)
+                    if argv[:2] == ["kubectl", "get"] and argv[2] not in collect.INGRESS_GATEWAY_CRD_RESOURCES and argv[2] != "computeclasses"
+                    else run(argv, **kwargs)
+                ),
+            )
+        self.assertIn(slug, {c["check"] for c in result["commands"]})
+        self.assertNotIn(slug, {e["check"] for e in result.get("checks_not_applicable", [])})
+
+    def test_on_autopilot_a_host_network_daemonset_in_a_user_namespace_is_still_filed(self):
+        """An allowlist can admit a host-network workload to an Autopilot
+        cluster. That one is its owner's, so it is read; the system namespaces,
+        which hold GKE's own agents there, are not."""
+        partner = node_agent("partner-agent", "monitoring")
+        gke_own = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        dump = dump_of(partner, gke_own, *self.fleet_nodes())
+        hits = collect.check_network_daemonset_missing_toleration(context_of(dump, autopilot=True))
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("monitoring", "DaemonSet/partner-agent")])
+        both = collect.check_network_daemonset_missing_toleration(context_of(dump, autopilot=False))
+        self.assertEqual({h["namespace"] for h in both}, {"monitoring", "kube-system"})
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -5699,7 +6280,8 @@ class TestCollectCluster(unittest.TestCase):
         # true of a cluster whose *workload* set is empty. 3.12, 3.15, 3.16 and
         # 3.17 in particular are only ever reachable this way -- neither a
         # CronJob nor a Service is a workload, so a cluster that holds nothing
-        # else still owes all four an answer.
+        # else still owes all four an answer. 3.27 reads DaemonSets in the
+        # system namespaces too, which S1 keeps out of the workload set.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"} - anchored
         self.assertEqual(
             cluster_slugs,
@@ -5710,6 +6292,7 @@ class TestCollectCluster(unittest.TestCase):
                 "service-selects-nothing",
                 "service-port-unresolved",
                 "ingress-gateway-healthcheck-mismatch",
+                "network-daemonset-missing-ccc-toleration",
             },
         )
         self.assertFalse(cluster_slugs & set(na))
@@ -16016,5 +16599,98 @@ class TestWebhookCaBundleExpired(unittest.TestCase):
         self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-ca-bundle-expired"], ("webhooks",))
 
 
+
+class TestOnlyCluster(unittest.TestCase):
+    """`--cluster <location>/<name>` (#5623): one cluster of --project, the rest
+    dropped before any read; and with no flag, the manifest is today's."""
+
+    LISTING = json.dumps(
+        [
+            {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+            {"name": "c2", "location": "us-east1", "status": "RUNNING"},
+            {"name": "c3", "location": "us-west1", "status": "PROVISIONING"},
+        ]
+    )
+    GOLDEN = Path(__file__).resolve().parent / "testdata" / "no_cluster_flag"
+
+    def setUp(self):
+        self.addCleanup(setattr, collect, "only_cluster", None)
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.calls = []
+
+    def run_fake(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+            return collect.Run(argv, 0, self.LISTING, "", 0.05)
+        if "get-credentials" in argv:
+            return collect.Run(argv, 0, "", "", 0.05)
+        if argv[:2] == ["kubectl", "get"]:
+            return collect.Run(argv, 0, json.dumps({"apiVersion": "v1", "kind": "List", "items": [], "metadata": {}}), "", 0.05)
+        return collect.Run(argv, 0, "", "", 0.01)
+
+    def manifest(self, audit):
+        kubeconfigs = Path(self.tmp.name)
+        # The real paged read, which the platform job runs: this module swaps in
+        # a shared double for its other tests (setUpModule).
+        with patch.object(collect, "KUBECONFIG_DIR", kubeconfigs), patch.object(
+            collect, "paged_dump", _PAGED_DUMP.temp_original
+        ):
+            m = collect.collect_fleet(audit, "acme", run=self.run_fake, max_workers=1)
+        # The fields that differ between any two runs of the same code: the
+        # collector's own digest, and the clock.
+        m["checks_revision"] = "<checks_revision>"
+        m["started_at"] = "<started_at>"
+        m["finished_at"] = "<finished_at>"
+        return json.dumps(m, indent=2, sort_keys=True).replace(str(kubeconfigs), "<kubeconfig_dir>") + "\n"
+
+    def test_with_no_flag_the_manifest_is_byte_identical_to_main_before_the_flag(self):
+        # testdata/no_cluster_flag holds each manifest as the collector made it
+        # before --cluster existed, on this fixture. The platform agent's own
+        # audit runs with no flag, so it must not change by a byte.
+        for audit in ("obtainability-audit", "compliance-audit"):
+            with self.subTest(audit=audit):
+                self.assertEqual(self.manifest(audit), (self.GOLDEN / f"{audit}.json").read_text())
+
+    def test_the_flag_reads_only_its_cluster_and_records_the_others_as_not_read(self):
+        collect.only_cluster = ("us-east1", "c2")
+        clusters, not_running, error = collect.enumerate_clusters("acme", run=self.run_fake)
+        self.assertEqual([c["target"] for c in clusters], ["acme/us-east1/c2"])
+        self.assertIsNone(error)
+        # c1 and c3 aren't read here, and the manifest says so: never a fix.
+        self.assertEqual(sorted(e["name"] for e in not_running), ["acme/us-central1/c1", "acme/us-west1/c3"])
+        self.assertTrue(all(e["outcome"] == collect.OUTCOME_UNREACHABLE for e in not_running))
+        self.assertTrue(any("--cluster" in e["error"] for e in not_running))
+
+    def test_a_cluster_the_project_doesnt_list_is_refused_and_nothing_is_read(self):
+        for wanted in (("us-east1", "nope"), ("europe-west1", "c2")):
+            with self.subTest(wanted=wanted):
+                collect.only_cluster = wanted
+                self.calls.clear()
+                with patch.object(collect, "KUBECONFIG_DIR", Path(self.tmp.name)):
+                    m = collect.collect_fleet("compliance-audit", "acme", run=self.run_fake, max_workers=1)
+                self.assertIn("--cluster", m.get("error") or "")
+                self.assertFalse(any("get-credentials" in c or c[:2] == ["kubectl", "get"] for c in self.calls), self.calls)
+
+    def test_a_cluster_the_scope_excludes_is_refused_too(self):
+        collect.declared_scope.set("acme", None, "acme/us-east1/c2")
+        self.addCleanup(collect.declared_scope.set, None, None)
+        collect.only_cluster = ("us-east1", "c2")
+        with mock.patch("sys.stderr"):
+            clusters, _, error = collect.enumerate_clusters("acme", run=self.run_fake)
+        self.assertEqual(clusters, [])
+        self.assertIn("--cluster", error)
+
+    def test_the_flag_is_shape_checked_and_needs_a_project(self):
+        for bad in ("c2", "us-east1/", "/c2", "US-EAST1/c2", "us-east1/C2", "us-east1/c2/x", "us-east1/" + "a" * 41):
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    collect.cluster_arg(bad)
+        self.assertEqual(collect.cluster_arg("us-east1/c2"), ("us-east1", "c2"))
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--cluster", "us-east1/c2"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -103,10 +103,12 @@ Many small commands are bounded by the kubectl admission instead. Its limits com
 sandbox's memory limit: at the default 2 GiB, 13 kubectl reads run at once and 13 more may wait
 (fewer under gVisor). A read that finds both full fails at once with a `capacity:` reason.
 
-The shell's kubectl admission refuses such a read before it starts, with a reason that names a
+The shell's kubectl admission, and the credential broker's for the kubectl it runs for profile workers, refuses such a read before it starts, with a reason that names a
 narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
 whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
-[`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
+the chart value `platformAgent.deployment.env`; [Applying it](#applying-it) shows the `install.env` line that carries such an entry. A hand edit of the CR's [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment) can be lost at the next chart apply.
+
+The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
 The operator passes the tier to the shell sandbox and, under the session cluster view, to the
 session Pods the A2A gateway starts. On the `default` tier at the default session memory limit
@@ -277,9 +279,9 @@ caveat beside it:
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
-the shell sandbox, where the audits run, sends `KUBEAGENTS_KUBECTL_COST_TIER` to the A2A gateway for
-its session Pods too, and passes every name it does not reserve to the
-credential proxy and `agent-api-auth` containers. The name in the example reaches the container
+the shell sandbox, where the audits run. `KUBEAGENTS_KUBECTL_COST_TIER` also goes to the A2A gateway
+for its session Pods and to the credential broker's stateful and exec tiers. Every name the operator
+does not reserve passes to the credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 
 A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values

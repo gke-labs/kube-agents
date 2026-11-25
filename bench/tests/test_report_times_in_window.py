@@ -413,3 +413,14 @@ def test_the_markers_match_the_in_pod_script():
     assert f'WITHHELD_READ_RESULT = "{worker_trajectory.WITHHELD_READ_RESULT}"' in script
     assert '" ...[clipped %d chars]"' in script
     assert verifiers._CLIPPED_RESULT.search("abc ...[clipped 12 chars]")
+
+
+def test_a_relayed_report_s_times_are_not_read() -> None:
+    """A card report relayed onto the conversation is a worker's own words,
+    as a kanban result is: a time in it is not one the agent read."""
+    from kube_agents_bench import verifiers
+    trajectory = [{"name": "inject.post", "args": {"messageId": "inj-2", "report": True},
+                   "result": "Timestamp of Observation: 2026-11-24 21:38:00 UTC"}]
+    read, _, _ = verifiers._read_minutes(trajectory, ["2026-11-24"])
+    assert read == set()
+

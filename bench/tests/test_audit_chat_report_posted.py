@@ -287,7 +287,7 @@ def test_fire_refuses_a_disabled_job(tmp_path):
     try:
         arm.fire(str(tmp_path), "python3", "compliance-audit")
     except SystemExit as exc:
-        assert "paused or disabled" in str(exc)
+        assert "disabled on this install and carries no pause" in str(exc)
     else:
         raise AssertionError("fire triggered a disabled job")
     assert not (tmp_path / arm.STATE_NAME).exists()

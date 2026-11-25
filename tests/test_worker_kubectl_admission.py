@@ -190,6 +190,23 @@ class WorkerWrapperTest(unittest.TestCase):
             self.assertLess(text.index(before), run.start(), before)
         self.assertIn(target, WRAPPER_SCRIPT.read_text(encoding="utf-8"))
 
+    def test_the_tables_directory_is_made_before_its_moded_copy_and_read_as_the_user(self):
+        # A COPY --chmod creates each missing directory on its destination path with the
+        # file's mode, 0644 here, which the image's non-root user can't enter (buildx).
+        # A mkdir -p first makes it 0755; a read as that user checks it in the build.
+        for path, user in [(DOCKERFILE, "node"), (ROOT / "deploy" / "sandbox" / "Dockerfile", "agent")]:
+            with self.subTest(dockerfile=path.name, user=user):
+                text = path.read_text(encoding="utf-8")
+                runtime = text[text.rindex("\nFROM "):] if path == DOCKERFILE else text
+                copy = runtime.index(f"deploy/sandbox/kubectl-costs.json {COSTS}\n")
+                mkdir = runtime.find("RUN mkdir -p /usr/local/share/kube-agents\n")
+                self.assertNotEqual(mkdir, -1, "no mkdir of the table's directory")
+                self.assertLess(mkdir, copy)
+                between = runtime[mkdir:copy]
+                self.assertNotRegex(between, r"chmod[^\n]*/usr/local/share", "a mode change between the mkdir and the copy")
+                check = runtime.find(f"RUN su {user} -s /bin/sh -c 'test -r {COSTS}")
+                self.assertGreater(check, copy, f"no read of the table as {user} after the copy")
+
     def test_the_session_pod_writes_no_limit_file(self):
         # The limit comes from the cgroup (guard.memory_limit) only while nothing writes this.
         self.assertNotIn("/tmp/kube-agents-session/memory-limit-bytes", DOCKERFILE.read_text(encoding="utf-8"))

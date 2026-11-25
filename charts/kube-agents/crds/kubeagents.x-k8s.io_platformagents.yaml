@@ -9903,6 +9903,24 @@ spec:
                           minimum: 90
                           type: integer
                       type: object
+                    sessionWorker:
+                      description: |-
+                        SessionWorker configures the session pods the gateway spawns for
+                        conversations.
+                      properties:
+                        type:
+                          description: |-
+                            Type is the harness the session worker image runs. Absent is
+                            claude-code. The operator passes it to the gateway as
+                            A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
+                            to each session pod as A2A_HARNESS, which the worker adapter's
+                            harness selector reads. It is pod configuration only: no route, bus
+                            subject or permission depends on it. claude-code is the only value
+                            accepted today.
+                          enum:
+                            - claude-code
+                          type: string
+                      type: object
                     stallWatch:
                       description: |-
                         StallWatch tunes the controller stall watch — the stall-watch cron job on the
@@ -10185,8 +10203,10 @@ spec:
                             and keeps its history, and on any bus a new value on the
                             kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
                             rendered width. On an existing install, until the operator has read the bus's
-                            width once, the provision Job waits. On `platform` none of this
-                            applies.
+                            width once, the provision Job waits. On the session route the session
+                            pods also get the read-only cluster view by default; the operator's
+                            A2A_SESSION_CLUSTER_VIEW overrides it ("false" keeps it off). On
+                            `platform` none of this applies.
                           enum:
                             - session
                             - platform
@@ -10535,6 +10555,32 @@ spec:
                                 || k == 'memory')"
                             - message: sessionResources may not set claims
                               rule: "!has(self.claims) || size(self.claims) == 0"
+                        warmSessions:
+                          description: |-
+                            WarmSessions is how many warm A2A session pods the gateway keeps ready
+                            on the session route, so a new conversation's first turn is handed a
+                            running pod instead of waiting for one to be scheduled and its image
+                            pulled. Unset means 1. Each warm pod holds one session pod's requests
+                            while it waits (sessionResources: 150m CPU and 320Mi by default, billed
+                            on Autopilot, where without Pod bursting the per-Pod minimum of 250m and
+                            512Mi applies), so the default costs one session pod's requests per
+                            install; 0 turns the pool off.
+
+                            A warm pod becomes the conversation's session pod as it is, with exactly
+                            the identity and reach a freshly started one would have; one unclaimed
+                            for 25 minutes is replaced. The pool never takes the session cap's last
+                            slot: it keeps at most the effective cap less one (none below a cap of
+                            2), and fewer while live conversations fill the cap. Each warm pod
+                            takes one TASKS consumer and one pod in the session ResourceQuota, and
+                            only consumers the session cap leaves spare: a TASKS stream with none
+                            spare runs without a warm pod (status.effectiveWarmSessions) rather
+                            than losing a session, and a new stream is created with room for
+                            them. On the platform route, which an unset defaultRoute means, no
+                            warm pod runs and nothing is rendered for one. A change rolls the
+                            gateway on the session route.
+                          maximum: 100
+                          minimum: 0
+                          type: integer
                       type: object
                       x-kubernetes-validations:
                         - message:
@@ -11682,8 +11728,14 @@ spec:
                             Kubernetes API, for every caller, the agents' own commands included: a
                             kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
                             MCP server's in-cluster tools. Spell entries by project ID: one spelled
-                            by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
-                            list, a cluster's describe), and these still cover it through them only:
+                            by project number refuses its location and name in any project. A GCP
+                            metadata read that names it is refused too (a cluster describe, a
+                            node-pool read, the gke MCP server's get_cluster, get_node_pool and
+                            list_node_pools), and a logging read leaves out its entries. A session's
+                            or profile task's gcloud container clusters list and operations list
+                            leave it out as well (by name, so a same-named cluster elsewhere too).
+                            Every other caller's project-wide reads stay allowed (the project's
+                            cluster list, for one), and these still cover it through them only:
                             the daily upgrade-readiness watch's version table (its in-cluster
                             readiness rules skip the cluster), the networking audit's subnet usage,
                             the GCE audit's instance listing, and the gke MCP server's list_clusters.
@@ -12802,6 +12854,17 @@ spec:
                     explicit profile it repeats that profile. Absent before the first pass
                     that resolved it.
                   type: string
+                effectiveWarmSessions:
+                  description: |-
+                    EffectiveWarmSessions is how many warm session pods the operator
+                    renders on the session route: spec.harness.tuning.warmSessions,
+                    bounded by the effective session cap less one and by the TASKS
+                    consumers the cap leaves spare. Warm pods use only spare consumers,
+                    so a stream with none spare runs without one rather than losing a
+                    session. Written with effectiveSessionCap, from the same reading.
+                    Under a served CRD that drops this field no warm pod runs until the
+                    CRD is updated.
+                  type: integer
                 inference:
                   description: |-
                     Inference reports the Platform Agent's default model, as the install's LiteLLM
@@ -12826,6 +12889,21 @@ spec:
                         whatever a hand-edited config says. Absent when the entry states none, so the
                         model thinks at its own default, and absent while the served CRD predates it.
                       type: string
+                  type: object
+                inferenceKeys:
+                  description: |-
+                    InferenceKeys records the inference gateway key Secrets the operator
+                    created. Absent until it creates one, and while the served CRD predates
+                    the field, in which case the operator creates none.
+                  properties:
+                    secretUIDs:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        SecretUIDs maps each such Secret's name to the UID it was created with.
+                        A tier key's Secret is in the profile namespace; every other one is in
+                        the PlatformAgent's namespace.
+                      type: object
                   type: object
                 lastReconcileTime:
                   description:

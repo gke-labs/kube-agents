@@ -60,8 +60,8 @@ const (
 
 	kanbanDispatcherReasonTicksFailing = "TicksFailing"
 	// kanbanDispatcherReasonTickStuck is the True reason while any board is
-	// stuck. Its own reason, so that the poller rewrites the message and its
-	// hint when the cause changes between a streak and a stuck board.
+	// stuck. Its own reason, so that a reader of the reason alone can tell a
+	// stuck board from a streak; the message and its hint follow it.
 	kanbanDispatcherReasonTickStuck = "TickStuck"
 	kanbanDispatcherReasonTicking   = "Ticking"
 
@@ -101,6 +101,22 @@ func kanbanDispatcherBoardFailing(f usageDispatcherFailure) bool {
 	return f.HasAge && f.Ticks >= kanbanDispatcherMinFailingTicks && f.Seconds >= int64(kanbanDispatcherFailingAge/time.Second)
 }
 
+// kanbanDispatcherWorseStreak reports whether the message names f before g:
+// the older streak. Streaks of one age are named by board, not by tick count:
+// two streaks that began in the same second, as on a full disk, differ by a
+// tick or so from poll to poll, and the condition is written when the board it
+// names changes. A plugin without the age family gives no age, and there the
+// tick count is the only measure.
+func kanbanDispatcherWorseStreak(f, g *usageDispatcherFailure) bool {
+	if f.Seconds != g.Seconds {
+		return f.Seconds > g.Seconds
+	}
+	if !(f.HasAge && g.HasAge) && f.Ticks != g.Ticks {
+		return f.Ticks > g.Ticks
+	}
+	return f.Board < g.Board
+}
+
 // kanbanDispatcherCondition is the condition a reading calls for, given the
 // one the CR carries. True while a board is stuck (reason TickStuck) or a
 // board's streak meets a streak rule (reason TicksFailing); False once no
@@ -115,8 +131,7 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 			continue
 		}
 		failing++
-		if worst == nil || f.Seconds > worst.Seconds || (f.Seconds == worst.Seconds && f.Ticks > worst.Ticks) ||
-			(f.Seconds == worst.Seconds && f.Ticks == worst.Ticks && f.Board < worst.Board) {
+		if worst == nil || kanbanDispatcherWorseStreak(f, worst) {
 			worst = f
 		}
 	}
@@ -142,8 +157,8 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 	// meets a streak rule too after about an hour, and its cause is still the
 	// lock, so it keeps the stuck message and hint.
 	if stuck != nil {
-		// No duration here: the message is written once per reason, and a
-		// duration would be out of date at the next poll.
+		// No duration here: the condition is written when its message changes,
+		// and a duration changes at every poll.
 		msg := fmt.Sprintf("A kanban dispatcher tick on board %q waited on its database (it ran past %s, or failed on a lock after a busy timeout), and no good tick has followed; the board may be locked.",
 			kanbanDispatcherLabel(stuck.Board), kanbanDispatcherStuckLimit)
 		if failing > 1 {
@@ -153,12 +168,12 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 		return cond
 	}
 	if worst != nil {
-		over := ""
-		if worst.HasAge {
-			over = " over " + (time.Duration(worst.Seconds) * time.Second).String()
-		}
-		msg := fmt.Sprintf("The kanban dispatcher failed %d ticks in a row%s on board %q (last error %s).",
-			worst.Ticks, over, kanbanDispatcherLabel(worst.Board), kanbanDispatcherLabel(worst.Error))
+		// The board and the error class, which change seldom, and the rule the
+		// streak met. Not the streak's tick count or age: each changes at every
+		// poll, and the condition is written when its message changes.
+		msg := fmt.Sprintf("The kanban dispatcher's ticks fail on board %q (last error %s): %d or more in a row, or %d or more in a streak at least %s old.",
+			kanbanDispatcherLabel(worst.Board), kanbanDispatcherLabel(worst.Error),
+			kanbanDispatcherFailingTicks, kanbanDispatcherMinFailingTicks, kanbanDispatcherFailingAge)
 		if failing > 1 {
 			msg += fmt.Sprintf(" %d boards are failing.", failing)
 		}
@@ -174,10 +189,13 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 	return cond
 }
 
-// projectKanbanDispatcher writes the condition when its status or reason
-// changed. The message is left as written while both hold, as the data
-// volume's is; a change of cause changes the reason, so the message follows it. The patch carries the resource version, because it replaces
-// the conditions list whole; a conflict is left for the next poll.
+// projectKanbanDispatcher writes the condition when its status, its reason or
+// its message changed, as the scope condition is written. The message holds
+// only what changes seldom (the board it names, the count of failing boards,
+// the error class), so a board that stays in one state is written once, and a
+// message on the CR names the board that fails now. The patch carries the
+// resource version, because it replaces the conditions list whole; a conflict
+// is left for the next poll.
 func (p *UsageCounterPoller) projectKanbanDispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reading *usageDispatcherReading) error {
 	if reading == nil {
 		return nil
@@ -187,7 +205,7 @@ func (p *UsageCounterPoller) projectKanbanDispatcher(ctx context.Context, agent 
 		return nil
 	}
 	if existing := meta.FindStatusCondition(agent.Status.Conditions, kanbanDispatcherFailingCondition); existing != nil &&
-		existing.Status == want.Status && existing.Reason == want.Reason {
+		existing.Status == want.Status && existing.Reason == want.Reason && existing.Message == want.Message {
 		return nil
 	}
 	base := agent.DeepCopy()

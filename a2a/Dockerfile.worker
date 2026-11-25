@@ -35,6 +35,10 @@ RUN go mod download
 COPY a2a/ .
 RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-w -s" -o /out/worker-adapter ./cmd/worker-adapter
+# The core-agent harness runner, which the worker adapter starts once per
+# turn when a pod selects the core-agent harness (A2A_HARNESS=core-agent).
+RUN CGO_ENABLED=0 GOOS=linux \
+    go build -trimpath -ldflags="-w -s" -o /out/core-agent-harness ./cmd/core-agent-harness
 # The session agent's Claude Code home: the persona as CLAUDE.md and the
 # cluster agent's read-only skills as skills/<name>/SKILL.md, adapted for a
 # session by cmd/session-persona. agents/cluster/skills stays the one source
@@ -57,9 +61,12 @@ COPY a2a/worker-harness/package.json a2a/worker-harness/package-lock.json ./
 RUN npm ci \
     && npm cache clean --force
 
-# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
+# The temporary cluster view (on by default on the session route, or the
+# operator flag A2A_SESSION_CLUSTER_VIEW): stock
 # kubectl at /usr/local/libexec/kubectl with a /usr/local/bin/kubectl wrapper
-# that routes through <agent>-kube-proxy when KUBE_PROXY_URL is set, and gcloud
+# (deploy/sandbox/session-kubectl.sh) that routes through <agent>-kube-proxy
+# when KUBE_PROXY_URL is set, recording a failed write attempt under a
+# read-only kube-proxy, and through the broker otherwise, and gcloud
 # on PATH as the credential broker's shim, which forwards an argv to the broker
 # and prints its refusal as `policy rule: <rule>`. The shim is Python, so
 # python3 is installed, with python3-yaml beside it: the shim parses the
@@ -92,6 +99,13 @@ COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexe
 # the pod can ever hold. No limit file is written, so the limit is the cgroup's memory.max.
 COPY --chmod=0644 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
 COPY --chmod=0644 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-memory-guard
+# The table's directory first, so it's 0755: a COPY --chmod creates every
+# missing directory on its destination path with the file's mode (BuildKit's
+# fsutil MkdirAll), and under buildx, which publishes the images, that left
+# /usr/local/share/kube-agents 0644. The worker's user couldn't read the table, and
+# the admission fails open on a table it can't read. A directory that exists
+# keeps its mode; the RUN after the table checks it as that user.
+RUN mkdir -p /usr/local/share/kube-agents
 COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq git \
@@ -119,6 +133,10 @@ RUN python3 -I -B /tmp/kubectl_session_fastpath.py /usr/local/libexec/kubectl-ad
     && chmod 0644 /usr/local/share/kube-agents/kubectl-session-fastpath \
     && test -s /usr/local/share/kube-agents/kubectl-session-fastpath \
     && rm /tmp/kubectl_session_fastpath.py
+# The worker's user reads both files: the admission's table, and the wrapper's
+# fast-path figures. Root reads through any mode, so only this check sees one
+# the user can't (the 0644 directory above).
+RUN su node -s /bin/sh -c 'test -r /usr/local/share/kube-agents/kubectl-costs.json && test -r /usr/local/share/kube-agents/kubectl-session-fastpath'
 # The kubectl wrapper: deploy/sandbox/session-kubectl.sh says what it does on
 # each kind of pod.
 COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl
@@ -127,7 +145,12 @@ COPY --chmod=0755 deploy/sandbox/session-kubectl.sh /usr/local/bin/kubectl
 # source at every brokered call (deploy/sandbox/Dockerfile says more).
 COPY --chmod=0755 deploy/shared/credential-proxy-exec.py /opt/credential-proxy/libexec/credential-proxy-exec
 COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
-RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py \
+# The command policy, beside the client, for the kubectl wrapper's write-attempt
+# record (credential_proxy_client.record_kubectl_write_attempt). Standard
+# library only; the import below fails the build if that stops being true.
+COPY --chmod=0644 agents/platform/scripts/command_policy.py /opt/credential-proxy/libexec/command_policy.py
+RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py /opt/credential-proxy/libexec/command_policy.py \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -I -c "import sys; sys.path.insert(0, '/opt/credential-proxy/libexec'); import command_policy" \
     && python3 -v /opt/credential-proxy/libexec/credential-proxy-exec --help 2>&1 \
        | grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
 # The version-control skill a profile persona carries (its scripts/vcs.py, a
@@ -146,7 +169,8 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # the others when the persona's skill runs `python3 /opt/kube-agents/scripts/fleet-audit/
 # audit_report.py`. They're the closure audit_report.py imports on its
 # `finish --dry-run` path (a live finish needs more, which the PR that runs one
-# adds); the RUN below fails the build if one no longer imports from here alone,
+# adds), and, from collect.py on, the compliance collector's (below); the RUN
+# below fails the build if one no longer imports from here alone,
 # and tests/test_worker_fleet_audit_scripts.py runs that finish on a document.
 # Every worker carries them; they act only with the task's own confined
 # credential, so a cluster or tse worker gains nothing it couldn't already do.
@@ -154,6 +178,13 @@ COPY --chmod=0644 agents/platform/scripts/vcs_client.py \
 # script row may name, root-owned and not worker-writable as script mode
 # requires. tests/test_worker_fleet_audit_scripts.py holds this list to its
 # sources, and the directory to that root.
+# The directories first, so they're 0755: a COPY --chmod creates every
+# missing directory on its destination path with the files' mode (BuildKit's
+# fsutil MkdirAll), and under buildx, which publishes the images, that left
+# /opt/kube-agents, the script root and this directory 0644, which the
+# worker's user can't enter. A directory that exists keeps its mode. mkdir
+# changes no mode test_script_root_ownership.py would have to vouch for.
+RUN mkdir -p /opt/kube-agents/scripts/fleet-audit
 COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
      agents/platform/skills/fleet-audit/scripts/report_status.py \
      agents/platform/skills/fleet-audit/scripts/manifest_delta.py \
@@ -162,10 +193,37 @@ COPY --chmod=0644 agents/platform/skills/fleet-audit/scripts/audit_report.py \
      agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/vcs_client.py \
+     agents/platform/skills/fleet-audit/scripts/collect.py \
+     agents/platform/skills/fleet-audit/scripts/kcc_health.py \
+     agents/platform/scripts/fleet_scope_args.py \
+     agents/platform/scripts/collector_run.py \
+     agents/platform/scripts/broker_admission.py \
      /opt/kube-agents/scripts/fleet-audit/
+# The compliance audit's collector (collect.py and its closure, #5623): each
+# fan-out child runs it for its one cluster (--project with --cluster),
+# read-only, on its confined
+# credential, so the canary is collected the way the platform job collects.
+# Its webhook check imports the fleet-upgrade-verification readiness modules
+# from parents[2]/fleet-upgrade-verification/scripts, relative to collect.py,
+# so they go there as in the skill's own layout. Same tests and drift check.
+COPY --chmod=0644 agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py \
+     agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_shape_tables.py \
+     agents/platform/skills/fleet-upgrade-verification/scripts/known_issues.json \
+     agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json \
+     /opt/kube-agents/fleet-upgrade-verification/scripts/
+# A directory copy takes no --chmod (it would set the directories' mode too,
+# and a 0644 directory can't be entered); the RUN makes it readable by all
+# and enterable (directories 0755), writable by root alone, and the last check imports it as the worker's own user.
+COPY agents/platform/skills/fleet-upgrade-verification/scripts/readiness_rules/ \
+     /opt/kube-agents/fleet-upgrade-verification/scripts/readiness_rules/
+# Its own RUN: a mode change beside a path under the helper script root is one
+# deploy/docker/test_script_root_ownership.py can't vouch for.
+RUN chmod -R u=rwX,go=rX /opt/kube-agents/fleet-upgrade-verification
 RUN cd /opt/kube-agents/scripts/fleet-audit \
-    && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report" \
-    && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run
+    && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = ['.']; import report_status, manifest_delta, gitops_workspace, repo_ref, gitops_preflight, credential_proxy_client, vcs_client, audit_report, collect; assert collect._upgrade_readiness() is not None" \
+    && PYTHONDONTWRITEBYTECODE=1 python3 audit_report.py finish --help | grep -q -- --dry-run \
+    && PYTHONDONTWRITEBYTECODE=1 python3 collect.py --help | grep -q -- compliance-audit \
+    && su node -s /bin/sh -c 'cd /opt/kube-agents/scripts/fleet-audit && PYTHONDONTWRITEBYTECODE=1 python3 -c "import sys; sys.path[:0] = [\".\"]; import collect; assert collect._upgrade_readiness() is not None"'
 # git for that skill's local half: the working copy `clone` unpacks from a
 # bundle, and `commit` and `publish` on it. It holds no credential; the profile
 # namespace's NetworkPolicy bounds the pod's egress. deploy/shared/worker-gitconfig,
@@ -229,6 +287,7 @@ RUN mkdir -p /opt/credential-proxy/bin \
 ENV PATH="/opt/credential-proxy/bin:${PATH}"
 
 COPY --from=build /out/worker-adapter /usr/local/bin/worker-adapter
+COPY --from=build /out/core-agent-harness /usr/local/bin/core-agent-harness
 
 # Non-root as the stock node user (UID 1000, matching the spawner's
 # runAsUser); the harness keeps its state under a writable HOME.

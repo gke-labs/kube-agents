@@ -281,7 +281,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      certReloadFailuresTotalName,
-			Help:      "Total changed TLS server certificate or key files kube-proxy could not load, each time keeping the previous certificate.",
+			Help:      "Total changed TLS server certificate or key files, or static upstream CA bundles, kube-proxy could not load, each time keeping the previous one.",
 		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
@@ -311,8 +311,8 @@ func (m *Metrics) Handler() http.Handler {
 	})
 }
 
-// RecordCertificateReloadFailure counts a changed server certificate or key that could
-// not be loaded, so the previous certificate is still served.
+// RecordCertificateReloadFailure counts a changed server certificate or key, or a changed
+// upstream CA bundle, that could not be loaded, so the previous one is still in use.
 func (m *Metrics) RecordCertificateReloadFailure() {
 	if m == nil {
 		return
