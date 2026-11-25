@@ -259,8 +259,9 @@ type TeamsAdapter struct {
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
 	countInterval time.Duration
-	// typing is the conversations a task is running in, each with the
-	// loop that keeps Teams's typing indicator on (teams_typing.go);
+	// typing is the conversations with a task running or an ask open,
+	// each with the loop that keeps Teams's typing indicator on while only
+	// the ask is (teams_typing.go);
 	// typingInterval and typingMax pace and bound it (tests shorten both).
 	typing         map[string]*teamsTyping
 	typingInterval time.Duration
