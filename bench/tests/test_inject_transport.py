@@ -2348,6 +2348,55 @@ def test_an_earlier_task_s_posts_are_not_this_task_s_answer() -> None:
     assert fold.deliverable == "the second answer"
 
 
+def test_a_relayed_report_is_never_this_task_s_answer() -> None:
+    """A card's report relayed over the inject notify route lands on the
+    conversation as a post the door marks `report`. Inside this task's window
+    it is still not the reply: the deliverable is the task's own post, and the
+    report is kept apart, edits included."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True, replyTo="inj-0"))
+    fold.apply(entry(4, inject.ENTRY_EDIT, text="card report, final", messageId="inj-2", report=True))
+
+    assert fold.deliverable == "the answer"
+    assert [p["messageId"] for p in fold.window_posts] == ["inj-1"]
+    assert [(r["kind"], r["text"]) for r in fold.reports] == [
+        (inject.ENTRY_POST, "card report"), (inject.ENTRY_EDIT, "card report, final")]
+    assert fold.reports[0]["replyTo"] == "inj-0"
+    assert "inj-2" not in fold.edited
+
+
+def test_a_window_with_only_a_report_does_not_fall_back_to_an_earlier_task() -> None:
+    """With this task's marker seen and only a relayed report in its window,
+    the answer is empty, not the earlier task's post."""
+    fold = inject.Fold("task-two")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="first answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_TASK, taskId="task-two"))
+    fold.apply(entry(4, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True))
+    assert fold.deliverable == ""
+    assert fold.window_posts == []
+
+
+def test_an_edit_marked_report_on_an_ordinary_post_still_rewrites_it() -> None:
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="Working on it...", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_EDIT, text="card report", messageId="inj-1", report=True))
+    fold.apply(entry(4, inject.ENTRY_POST, text="answer", messageId="inj-2"))
+    assert fold.deliverable == "answer"
+
+
+def test_a_post_marked_report_false_is_an_ordinary_post() -> None:
+    """Only a true `report` sets a post aside; anything else is read as before."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1", report=False))
+    assert fold.deliverable == "the answer"
+    assert fold.reports == []
+
+
 @pytest.mark.parametrize(
     ("text", "token"),
     [

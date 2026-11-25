@@ -182,6 +182,12 @@ ENTRY_POST = "post"
 ENTRY_EDIT = "edit"
 ENTRY_TASK = "task"
 ENTRY_TERMINAL = "terminal"
+# A post or edit the door marks `report`: a relayed report (a kanban card's,
+# delivered over the inject notify route), not the turn's reply. It is kept
+# apart (`Fold.reports`) and never read into the deliverable, so a card report
+# landing between one task's marker and the next is not graded as the answer.
+ENTRY_REPORT_FIELD = "report"
+ENTRY_REPLY_TO_FIELD = "replyTo"
 
 # Trajectory entry names this transport records. The relay never posts
 # `activity` artifacts to a conversation (they are debug and audit views), so
@@ -822,6 +828,8 @@ class Fold:
     task_id: str
     entries: list[dict[str, Any]] = field(default_factory=list)
     posts: list[dict[str, Any]] = field(default_factory=list)
+    # Relayed reports (ENTRY_REPORT_FIELD), in arrival order: never the reply.
+    reports: list[dict[str, Any]] = field(default_factory=list)
     edited: set[str] = field(default_factory=set)
     # The lifecycle and conversation entries, in the order they were folded.
     # :attr:`trajectory` is these plus the activity block.
@@ -1042,6 +1050,10 @@ class Fold:
         every post otherwise. A post a later edit rewrote (the status
         placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
+        # A window that held only relayed reports is still this task's
+        # window: falling back to every post would grade an earlier task's.
+        if not windowed and any(report["inWindow"] for report in self.reports):
+            return []
         return windowed or self.posts
 
     @property
@@ -1145,7 +1157,20 @@ class Fold:
         text = str(entry.get("text") or "")
         entry_message_id = str(entry.get("messageId") or "")
 
-        if kind == ENTRY_POST:
+        if kind == ENTRY_EDIT and entry.get(ENTRY_REPORT_FIELD) is True and any(
+            post["messageId"] == entry_message_id for post in self.posts
+        ):
+            # An edit marked report on an ordinary post still rewrites it.
+            if entry_message_id:
+                self.edited.add(entry_message_id)
+        if kind in (ENTRY_POST, ENTRY_EDIT) and entry.get(ENTRY_REPORT_FIELD) is True:
+            self.reports.append({
+                "kind": kind, "messageId": entry_message_id, "text": text,
+                "replyTo": str(entry.get(ENTRY_REPLY_TO_FIELD) or ""), "inWindow": self.in_window,
+            })
+            self._record(EVENT_ENTRY_POST if kind == ENTRY_POST else EVENT_ENTRY_EDIT,
+                         {"messageId": entry_message_id, ENTRY_REPORT_FIELD: True}, text)
+        elif kind == ENTRY_POST:
             self.posts.append(
                 {"messageId": entry_message_id, "text": text, "inWindow": self.in_window}
             )
@@ -1664,7 +1689,7 @@ class InjectTask:
                 if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int):
                     continue
                 seqs.append(entry["seq"])
-                if entry.get("kind") == ENTRY_POST and not notice:
+                if entry.get("kind") == ENTRY_POST and entry.get(ENTRY_REPORT_FIELD) is not True and not notice:
                     notice = str(entry.get("text") or "")
             # A retried POST the door deduped may carry no entries; the
             # first reply's reading stands then.
@@ -1814,7 +1839,8 @@ class InjectTask:
                         "inject: the queued turn on %s started task %s", self.conversation, self.task_id
                     )
                     return self.task_id
-                if kind == ENTRY_POST and text != self.queued_notice and QUEUED_NOTICE_MARK not in text:
+                if (kind == ENTRY_POST and entry.get(ENTRY_REPORT_FIELD) is not True
+                        and text != self.queued_notice and QUEUED_NOTICE_MARK not in text):
                     self.line_refusal = text
                     _log.warning(
                         "inject: the queued turn on %s was not started: %s",
