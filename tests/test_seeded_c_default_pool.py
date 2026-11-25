@@ -1,4 +1,9 @@
-"""seeded-c's default pool plants a kubelet key the reconcile can apply in place.
+"""seeded-c's default pool: its kubelet plant and the room its node keeps.
+
+The node is an e2-standard-2. On an e2-medium (940m allocatable, as every
+shared-core E2 size) the pool had about 60m of CPU to spare, and a node
+replacement could leave kube-dns at two replicas on the one node with the
+slot's fixture pods Pending for good.
 
 `bench/tf/fleet/main.tf`'s `seeded_c_default` is the pool-level drift outlier
 (fixture role `drift-pool-outlier`): a 50 GB boot disk and one kubelet key no
@@ -19,6 +24,8 @@ _MAIN_TF = (
 _POOL_HEAD = 'resource "google_container_node_pool" "seeded_c_default" {'
 # What bench/tf/fleet/fixtures.json's drift-pool-outlier role asserts.
 _PLANTED_PIDS_LIMIT = "4096"
+# What fixtures.json's untainted-compute-class-pool role asserts.
+_MACHINE_TYPE = '"e2-standard-2"'
 
 
 def _pool_block() -> str:
@@ -49,6 +56,14 @@ def _settings(block: str) -> dict[str, str]:
 
 
 class SeededCDefaultPoolTest(unittest.TestCase):
+    def test_the_node_is_a_dedicated_core_size_with_room_for_a_second_kube_dns(self):
+        node = _settings(_nested(_pool_block(), "node_config"))
+        self.assertEqual(
+            node.get("machine_type"),
+            _MACHINE_TYPE,
+            "every shared-core E2 size allocates 940m, which a second kube-dns replica fills after a node replacement; fixtures.json's untainted-compute-class-pool asserts this size",
+        )
+
     def test_the_kubelet_plant_is_an_integer_the_provider_sends_on_update(self):
         kubelet = _settings(
             _nested(_nested(_pool_block(), "node_config"), "kubelet_config")
