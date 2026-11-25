@@ -149,57 +149,66 @@ func canary(t *testing.T, name string, ran *atomic.Int32) adktool.Tool {
 // never run. A granted MCP tool, with or without arguments, does.
 func TestAToolOutsideTheGrantIsRefusedBeforeItRuns(t *testing.T) {
 	mcp := []coreagentwire.MCPServer{{Name: "srv", Tools: []string{"granted"}}}
-	for _, c := range []struct {
-		name    string
-		call    *genai.FunctionCall
-		wantRan bool
-	}{
-		{"registered but ungranted", &genai.FunctionCall{Name: "extra", Args: map[string]any{"x": 1}}, false},
-		{"registered but ungranted, nil args", &genai.FunctionCall{Name: "extra"}, false},
-		{"an MCP tool the grant doesn't name", &genai.FunctionCall{Name: "srv_other", Args: map[string]any{}}, false},
-		{"a granted MCP tool", &genai.FunctionCall{Name: "srv_granted", Args: map[string]any{"q": "x"}}, true},
-		{"a granted MCP tool, nil args", &genai.FunctionCall{Name: "srv_granted"}, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			_, opts, plugins, err := policySetup(coreagentwire.Policy{Tools: []string{"read_file"}}, mcp, "/scratch")
-			if err != nil {
-				t.Fatal(err)
-			}
-			var extra, other, granted atomic.Int32
-			llm := &fakeLLM{calls: []*genai.FunctionCall{c.call}}
-			a, err := agent.New(llm,
-				agent.WithMode(agent.ModeAutonomous),
-				agent.WithGate(permissions.New(opts)),
-				agent.WithTools([]adktool.Tool{canary(t, "extra", &extra), canary(t, "srv_other", &other), canary(t, "srv_granted", &granted)}),
-				agent.WithPlugins(plugins...))
-			if err != nil {
-				t.Fatal(err)
-			}
-			var refusal bool
-			for ev, err := range a.Run(context.Background(), "go") {
+	// The persona shell's policy, whose turn runs in the mode that doesn't
+	// refuse an unmatched call: the plugin still refuses an ungranted tool
+	// before it runs.
+	persona := coreagentwire.Policy{Tools: []string{"bash", "read_file"}, Allow: []string{"bash:*", "read_file:/scratch/*"}, AnyShellCommand: true}
+	for _, policy := range []coreagentwire.Policy{{Tools: []string{"read_file"}}, persona} {
+		for _, c := range []struct {
+			name    string
+			call    *genai.FunctionCall
+			wantRan bool
+		}{
+			{"registered but ungranted", &genai.FunctionCall{Name: "extra", Args: map[string]any{"x": 1}}, false},
+			{"registered but ungranted, nil args", &genai.FunctionCall{Name: "extra"}, false},
+			{"an MCP tool the grant doesn't name", &genai.FunctionCall{Name: "srv_other", Args: map[string]any{}}, false},
+			{"a granted MCP tool", &genai.FunctionCall{Name: "srv_granted", Args: map[string]any{"q": "x"}}, true},
+			{"a granted MCP tool, nil args", &genai.FunctionCall{Name: "srv_granted"}, true},
+		} {
+			t.Run(fmt.Sprintf("%s, any shell command %v", c.name, policy.AnyShellCommand), func(t *testing.T) {
+				_, opts, plugins, err := policySetup(policy, mcp, "/scratch")
 				if err != nil {
-					break
+					t.Fatal(err)
 				}
-				if ev == nil || ev.Content == nil {
-					continue
+				if policy.AnyShellCommand != (opts.Mode == permissions.ModeYolo) {
+					t.Fatalf("mode %q for any-shell-command %v", opts.Mode, policy.AnyShellCommand)
 				}
-				for _, p := range ev.Content.Parts {
-					if p.FunctionResponse != nil && strings.Contains(strings.ToLower(fmtAny(p.FunctionResponse.Response)), "not in this turn's grant") {
-						refusal = true
+				var extra, other, granted atomic.Int32
+				llm := &fakeLLM{calls: []*genai.FunctionCall{c.call}}
+				a, err := agent.New(llm,
+					agent.WithMode(agent.ModeAutonomous),
+					agent.WithGate(permissions.New(opts)),
+					agent.WithTools([]adktool.Tool{canary(t, "extra", &extra), canary(t, "srv_other", &other), canary(t, "srv_granted", &granted)}),
+					agent.WithPlugins(plugins...))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var refusal bool
+				for ev, err := range a.Run(context.Background(), "go") {
+					if err != nil {
+						break
+					}
+					if ev == nil || ev.Content == nil {
+						continue
+					}
+					for _, p := range ev.Content.Parts {
+						if p.FunctionResponse != nil && strings.Contains(strings.ToLower(fmtAny(p.FunctionResponse.Response)), "not in this turn's grant") {
+							refusal = true
+						}
 					}
 				}
-			}
-			ran := extra.Load() + other.Load() + granted.Load()
-			if c.wantRan && granted.Load() != 1 {
-				t.Errorf("the granted tool ran %d times, want 1", granted.Load())
-			}
-			if !c.wantRan && ran != 0 {
-				t.Errorf("an ungranted tool ran (extra %d, other %d, granted %d)", extra.Load(), other.Load(), granted.Load())
-			}
-			if !c.wantRan && !refusal {
-				t.Error("no refusal reached the model as the tool's result")
-			}
-		})
+				ran := extra.Load() + other.Load() + granted.Load()
+				if c.wantRan && granted.Load() != 1 {
+					t.Errorf("the granted tool ran %d times, want 1", granted.Load())
+				}
+				if !c.wantRan && ran != 0 {
+					t.Errorf("an ungranted tool ran (extra %d, other %d, granted %d)", extra.Load(), other.Load(), granted.Load())
+				}
+				if !c.wantRan && !refusal {
+					t.Error("no refusal reached the model as the tool's result")
+				}
+			})
+		}
 	}
 }
 

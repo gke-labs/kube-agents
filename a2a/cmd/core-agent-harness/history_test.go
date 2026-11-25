@@ -9,6 +9,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -263,10 +264,20 @@ func TestARefusedCallReachesTheHarnesssStderr(t *testing.T) {
 type replyModel struct {
 	callModel
 	responses []map[string]any
+	// offered are the function declarations of the first request.
+	offered []string
 }
 
 func (m *replyModel) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
 	m.mu.Lock()
+	if m.offered == nil && req.Config != nil {
+		m.offered = []string{}
+		for _, tl := range req.Config.Tools {
+			for _, fd := range tl.FunctionDeclarations {
+				m.offered = append(m.offered, fd.Name)
+			}
+		}
+	}
 	for _, c := range req.Contents {
 		for _, p := range c.Parts {
 			if p.FunctionResponse != nil {
@@ -336,6 +347,13 @@ func TestAPersonaTurnRunsACompoundCommand(t *testing.T) {
 			}
 			if _, ok := m.responses[0][c.want]; !ok {
 				t.Errorf("the model read %v, want a %s", m.responses[0], c.want)
+			}
+			// The mode changes only the gate's decisions: the model is
+			// offered the policy's tools and nothing the mode could add
+			// (spawn, background agents, other built-ins).
+			slices.Sort(m.offered)
+			if !slices.Equal(m.offered, []string{"bash"}) {
+				t.Errorf("the model was offered %q, want only bash", m.offered)
 			}
 			if c.want == "stdout" && m.responses[0]["stdout"] != "b\n2\n" {
 				t.Errorf("stdout %q, want the compound's output", m.responses[0]["stdout"])
