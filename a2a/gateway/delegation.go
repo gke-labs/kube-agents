@@ -1548,6 +1548,13 @@ func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionReco
 // held to one) the record carries one request a task, so it is one once that
 // request has ended (DelegationEnd) or minted its child or whole batch, and
 // none before. A batch cut short and being finished is still its first.
+//
+// It is right only while the most is one: it never counts past one, and the
+// checks that call it no longer hold a profile parent with an ended request
+// back on their own. Raising delegationRoundsSupportedMax needs a real per-task
+// round count on the record first, or a parent whose first request was refused
+// would mint on its second, and a request made while children run with rounds
+// left would be ignored without telling the parent.
 func profileRoundsUsed(parent TaskRef) int {
 	if parent.DelegationEnd != "" || (len(parent.Children) > 0 && parent.batchComplete()) {
 		return 1
