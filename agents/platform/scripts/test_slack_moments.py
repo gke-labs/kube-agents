@@ -65,6 +65,12 @@ class OpenedPrTest(unittest.TestCase):
     def test_a_negated_verb_is_not_an_opened_pr(self):
         for lead in ("I have not opened", "Never opened", "I haven't yet opened a PR:", "didn't create"):
             self.assertIsNone(m.opened_pr(f"{lead} {PR}"), lead)
+        # A join word after the negation reads as our own step, so only NEGATED_VERB refuses these.
+        for lead in (
+            "I have not and opened", "I have not tested and opened", "I never tested and opened",
+            "I haven't tested and opened", "I didn't rebase and opened",
+        ):
+            self.assertIsNone(m.opened_pr(f"{lead} {PR}"), lead)
 
     def test_someone_else_as_the_subject_is_not_ours(self):
         for lead in (
@@ -305,6 +311,12 @@ class OpenedMergeRequestTest(unittest.TestCase):
 
     def test_a_negated_verb_is_not_an_opened_merge_request(self):
         for lead in ("I have not opened", "Never opened", "I haven't yet opened an MR:", "didn't create"):
+            self.assertIsNone(m.opened_pr(f"{lead} {MR}"), lead)
+        # A join word after the negation reads as our own step, so only NEGATED_VERB refuses these.
+        for lead in (
+            "I have not and opened", "I have not tested and opened", "I never tested and opened",
+            "I haven't tested and opened", "I didn't rebase and opened",
+        ):
             self.assertIsNone(m.opened_pr(f"{lead} {MR}"), lead)
 
     def test_someone_else_as_the_subject_is_not_ours(self):

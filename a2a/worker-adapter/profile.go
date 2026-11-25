@@ -623,7 +623,10 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 			// setting sources) after the base argv, which carries none.
 			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
 			cfg.HarnessCommandNoDelegate = nil
-			cfg.HarnessEnv = append(cfg.HarnessEnv, cfg.driver().ConfigDirEnv(dir))
+			// A harness that reads no config dir names none.
+			if kv := cfg.driver().ConfigDirEnv(dir); kv != "" {
+				cfg.HarnessEnv = append(cfg.HarnessEnv, kv)
+			}
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)

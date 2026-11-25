@@ -24,7 +24,7 @@ import (
 // the next turn's envelope carries them back.
 type coreAgentDriver struct {
 	// Policy and MCP are the turn's tool policy and MCP servers, set from
-	// the persona grant (SEAM: tigerteam-dev-1, tigerteam-dev-3).
+	// the persona grant.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 

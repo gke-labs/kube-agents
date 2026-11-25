@@ -836,8 +836,15 @@ steered into that task. A profile task may delegate in turn, under the same chec
 turn except the incarnation's author set, since a warm worker is reset between tasks. Like a
 session turn, it delegates once: a second request from the same task is dropped as a repeat,
 because nothing yet tells a new request from a redelivered one. A session turn's one request may
-be a batch (above, the delegation primitive); a profile task's may not yet, since nothing lets a
-parent waiting open take several child results. A profile parent is also held to its own chain
+be a batch (above, the delegation primitive), and so may a profile task's. A profile parent's
+batch is minted as a session's is, the checks below applying to every entry and the batch whole
+or not run, and the parent keeps the conversation while its children run. It isn't woken at the
+last end: each child's end reaches it as its own `childResult`, naming the batch entry, as that
+child ends (`spec-a2a-payloads.md`, "Task parameters and child results"). While the batch runs,
+text in the conversation is refused, as during any fan-out, since which task it was meant for
+isn't the gateway's to guess; a stop reaches the parent and every child. The parent's own end
+gives the conversation up, even with children still running, and those children are cancelled,
+as a stop would cancel them. A profile parent is also held to its own chain
 and scope, checked at the child's mint because the child is a fresh root the verifier never
 compares with its parent. Each profile task records its scope and the profiles of the waiting
 profile tasks above it (its chain) when it's minted. The chain starts afresh at a top submission,
@@ -878,6 +885,15 @@ whether its card declares them or not.
 
 The session manager is the demo's chatops code generalized from one-shot workers to
 long-lived sessions. Four operations:
+
+The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
+operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
+to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
+the operator or the gateway doesn't know falls back to that default rather than stopping the shared
+gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
+error at start. Every session
+pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
+on the worker's isolation waiver.
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 150m/320Mi requests by default, set by

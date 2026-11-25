@@ -43,7 +43,7 @@ type Envelope struct {
 
 // Policy is a turn's tool policy: the tools the model is offered and the
 // rules a call is checked against before it runs. Its contents are filled
-// from the persona grant (SEAM: tigerteam-dev-1).
+// from the persona grant.
 type Policy struct {
 	// Tools names the built-in tools the model is offered; nothing else is.
 	Tools []string `json:"tools,omitempty"`
@@ -53,8 +53,8 @@ type Policy struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
-// MCPServer is one MCP server a turn may use (SEAM: tigerteam-dev-3 for the
-// lifecycle, tigerteam-dev-1 for which tools it offers).
+// MCPServer is one MCP server a turn may use; the harness runs it for the
+// turn, and the persona grant decides which of its tools are offered.
 type MCPServer struct {
 	Name    string            `json:"name"`
 	Command string            `json:"command,omitempty"`

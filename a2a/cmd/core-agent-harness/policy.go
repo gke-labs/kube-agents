@@ -15,7 +15,7 @@ import (
 // tools the model is offered, the permission gate's options, and the plugins
 // that see every tool call before it runs (allow, deny or rewrite its args).
 //
-// SEAM (tigerteam-dev-1): the before-tool plugin and the mapping from the
+// Still to come (#7158): the before-tool plugin and the mapping from the
 // persona grant. What is here is the floor: only the named built-ins, in
 // allow mode with the policy's patterns, so a call no pattern allows is
 // refused without a prompt; file tools reach only workdir, the turn's
