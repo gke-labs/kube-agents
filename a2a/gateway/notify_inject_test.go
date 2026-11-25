@@ -235,6 +235,9 @@ func TestEveryRelayedEntryIsMarkedAndNotATurnEntry(t *testing.T) {
 			t.Errorf("relayed entry %q not marked", e.Text)
 		}
 	}
+	if entries[0].Kept || !entries[1].Kept {
+		t.Errorf("kept marks %v %v, want only the settled report kept", entries[0].Kept, entries[1].Kept)
+	}
 	// A turn's own post still counts.
 	if _, err := door.PostMessage(conv, OutMessage{Text: "the reply"}); err != nil {
 		t.Fatal(err)

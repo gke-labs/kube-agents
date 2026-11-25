@@ -328,7 +328,12 @@ type InjectEntry struct {
 	// reply: a reader (the eval harness) sets these entries apart by it.
 	ReplyTo string `json:"replyTo,omitempty"`
 	Report  bool   `json:"report,omitempty"`
-	TS      string `json:"ts"`
+	// Kept is set on the one relayed post the gateway keeps under its root
+	// for the next human turn (the card's settled report, the request's
+	// `report`), never on a progress line: a reader waiting for that report
+	// waits on it.
+	Kept bool   `json:"kept,omitempty"`
+	TS   string `json:"ts"`
 }
 
 // injectRequest is the POST /inject body.
@@ -900,11 +905,10 @@ func (a *InjectAdapter) PostNotifyFrame(conversation, messageID, text, replyTo s
 	if edit {
 		kind = InjectEntryEdit
 	}
-	// Every relayed entry is marked, the settled report or not (`report`
-	// says which only for what the route keeps under a reply): none is the
-	// turn's reply, and a turn's own reply carries no mark.
-	_ = report
-	a.appendLocked(conv, InjectEntry{Kind: kind, Text: text, MessageID: messageID, ReplyTo: replyTo, Report: true})
+	// Every relayed entry is marked Report, the settled report or not: none
+	// is the turn's reply, and a turn's own reply carries no mark. Kept says
+	// which one is the settled report the gateway keeps (`report`).
+	a.appendLocked(conv, InjectEntry{Kind: kind, Text: text, MessageID: messageID, ReplyTo: replyTo, Report: true, Kept: report})
 	conv.relayed++
 	return messageID, nil
 }
