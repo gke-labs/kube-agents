@@ -188,6 +188,9 @@ ENTRY_TERMINAL = "terminal"
 # landing between one task's marker and the next is not graded as the answer.
 ENTRY_REPORT_FIELD = "report"
 ENTRY_REPLY_TO_FIELD = "replyTo"
+# On a relayed entry, the one post the gateway keeps under its root for the
+# next human turn: the card's settled report, not a progress line.
+ENTRY_KEPT_FIELD = "kept"
 
 # Trajectory entry names this transport records. The relay never posts
 # `activity` artifacts to a conversation (they are debug and audit views), so
@@ -1178,6 +1181,7 @@ class Fold:
             self.reports.append({
                 "kind": kind, "messageId": entry_message_id, "text": text,
                 "replyTo": str(entry.get(ENTRY_REPLY_TO_FIELD) or ""), "inWindow": self.in_window,
+                "kept": entry.get(ENTRY_KEPT_FIELD) is True,
                 "seq": entry["seq"],
             })
             self._record(EVENT_ENTRY_POST if kind == ENTRY_POST else EVENT_ENTRY_EDIT,
@@ -1753,7 +1757,7 @@ class InjectTask:
         after = 0
         while True:
             for report in fold.reports:
-                if report["kind"] == ENTRY_POST and report["replyTo"] == root:
+                if report["kind"] == ENTRY_POST and report["kept"] and report["replyTo"] == root:
                     return report
             remaining = deadline - time.monotonic()
             if remaining <= 0:

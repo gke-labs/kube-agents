@@ -389,8 +389,13 @@ class _StubDoor(ThreadingHTTPServer):
         self.context_ids[conversation] = self.sessions[turn]
         if turn == 0:
             for target, reply_to in self.relayed:
+                root = reply_to if reply_to is not None else task_id
+                # A card's progress line comes first on the same thread,
+                # relayed but not kept: it is not the report to wait for.
+                self._append(target, inject.ENTRY_POST, text="card started", messageId=f"inj-progress-{target}",
+                             replyTo=root, report=True)
                 self._append(target, inject.ENTRY_POST, text=REPORT, messageId=f"inj-relay-{target}",
-                             replyTo=reply_to if reply_to is not None else task_id, report=True)
+                             replyTo=root, report=True, kept=True)
         return {"conversation": conversation, "taskId": task_id, "accepted": True, "messageId": message_id,
                 "entries": [], "firstEventGraceSeconds": 1}
 
