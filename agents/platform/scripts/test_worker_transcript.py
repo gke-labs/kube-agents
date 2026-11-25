@@ -2035,6 +2035,26 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get pods -fdb=1.yaml -o yaml",
         "kubectl get pods -Rf=db.yaml -o yaml",
         "kubectl --unknown-global-flag=x get pods",
+        # a credential read from the metadata server: each host and address,
+        # each client, an account by its name, the path behind a variable, a
+        # brace list, another version of the tree, upper case, a command that
+        # only prints the read
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        "curl -s -H Metadata-Flavor:Google http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity?audience=x",
+        "wget -qO- --header Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://metadata.goog/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://metadata:80/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://169.254.169.252:988/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s 'http://[fd20:ce::254]/computeMetadata/v1/instance/service-accounts/default/token'",
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/{email,scopes,token}',
+        "curl -s http://metadata/computeMetadata/v1beta1/instance/service-accounts/default/token",
+        "CURL -S HTTP://METADATA.GOOGLE.INTERNAL/COMPUTEMETADATA/V1/INSTANCE/SERVICE-ACCOUNTS/DEFAULT/TOKEN",
+        'curl -s -H "metadata-flavor: google" "$MD/instance/service-accounts/builder@p.iam.gserviceaccount.com/token?scopes=x"',
+        'TOKEN=$(curl -s -H "Metadata-Flavor: Google" "$MD/instance/service-accounts/default/token" | jq -r .access_token)',
+        'kubectl exec p -- curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        "python3 -c \"import urllib.request as u; print(u.urlopen(u.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor': 'Google'})).read())\"",
+        "bash -c 'curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/identity'",
+        "echo curl -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -2113,6 +2133,25 @@ class TestSecretReadDetector(unittest.TestCase):
         "vault kv list secret/",
         "vault kv metadata get secret/db",
         "sops --version",
+        # the metadata server's paths that hold no credential, and a
+        # credential path with no sign of the metadata server
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/cluster-name',
+        "grep -rn instance/service-accounts/default/token docs/ | grep -v metadata/",
+        "grep -rn instance/service-accounts/default/token docs/metadata/",
+        "grep -rn instance/service-accounts/default/token docs/169-254-169-254.md",
+        # text that only looks like the credential path, with no sign and
+        # with one; the path with a host that only looks like a sign
+        "grep -rn service-accounts/default/token docs/",
+        "grep -rn service-accounts/default/token docs/ # metadata.goog",
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/tokens',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/xtoken',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ docs/token',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -o token',
+        "curl -s http://metadata2/computeMetadata/v1/instance/service-accounts/default/token",
     ]
 
     def test_covers_every_output_form(self):
@@ -2122,6 +2161,53 @@ class TestSecretReadDetector(unittest.TestCase):
         for cmd in self.SERVED_COMMANDS:
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_a_metadata_sign_counts_anywhere_on_the_line(self):
+        """The rule reads the whole text of the command: the sign of the
+        metadata server and the credential path can stand in two of its
+        simple commands, and on two of its lines."""
+        path = '"$MD/instance/service-accounts/default/token"'
+        for line in (
+            "MD=http://metadata.google.internal/computeMetadata/v1; curl -s " + path,
+            "MD=http://169.254.169.254/computeMetadata/v1 && curl -s " + path,
+            "H='Metadata-Flavor: Google'\ncurl -s -H \"$H\" " + path,
+            "curl -s " + path + " \\\n  -H 'Metadata-Flavor: Google'",
+            "curl -s " + path + " | jq . ; echo metadata.goog",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+        # Control: the same lines with no sign are served.
+        for line in ("MD=http://localhost:8080/v1; curl -s " + path, "curl -s " + path + " | jq ."):
+            with self.subTest(line=line):
+                self.assertFalse(worker_transcript.command_reads_a_secret(line))
+
+    def test_a_run_of_metadata_words_reads_in_linear_time(self):
+        # 390 KB or more of credential paths with no sign, of signs with no
+        # path, and of each part cut short. The path pattern starts from fixed
+        # text and reads to the next `/` or blank; the sign pattern is fixed
+        # text. One search of each needs at most 0.01 s of CPU time here. The
+        # bound is on the two searches of the rule, and on CPU time, as in the
+        # other linear-time tests of this file.
+        import time
+
+        for text, path, sign in (
+            ("instance/service-accounts/default/token " * 10000, True, False),
+            ("instance/service-accounts/" * 16000, False, False),
+            ("instance/service-accounts/" + "x" * 400000, False, False),
+            ("instance/service-accounts/default/toke " * 10000, False, False),
+            ("instance/service-accounts/default/" + "x" * 400000, False, False),
+            ("instance/service-accounts/default/{email,scopes} " * 8000, False, False),
+            ("Metadata-Flavor: Google http://metadata.google.internal/ " * 8000, False, True),
+            ("//metadata.x //metadata-x metadata.goo 169.254.169.25 " * 8000, False, False),
+        ):
+            with self.subTest(text=text[:40]):
+                start = time.process_time()
+                found = (
+                    bool(worker_transcript.METADATA_CREDENTIAL_PATH_RE.search(text)),
+                    bool(worker_transcript.METADATA_SERVER_SIGN_RE.search(text)),
+                )
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(found, (path, sign))
 
     # A command that prints a token or the environment (#5484).
     TOKEN_AND_ENVIRONMENT_PRINTS = [

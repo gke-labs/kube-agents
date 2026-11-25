@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -137,5 +138,63 @@ func TestASessionHarnessWarningIsRecordedOnceEvenWhenItsWriteConflicts(t *testin
 	}
 	if len(rec.Events) != 1 {
 		t.Errorf("%d Warning events, want one", len(rec.Events))
+	}
+}
+
+// TestTheReconcileWritesTheSessionHarnessConditionOnce: through Reconcile,
+// not the sync function alone, an unsupported session harness writes the
+// SessionHarness condition and one Warning event over several passes, also
+// after the generation moves while the value stays unsupported (only the
+// first-write guard keeps that to one event), and a supported value removes it.
+func TestTheReconcileWritesTheSessionHarnessConditionOnce(t *testing.T) {
+	agent := a2aTestAgent()
+	if agent.Spec.Harness == nil {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+	}
+	agent.Spec.Harness.SessionWorker = &agentv1alpha1.SessionWorkerSpec{Type: "antigravity"}
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(64)
+	r.Recorder = rec
+	ctx := context.Background()
+	reconcileTwice(t, ctx, r, req)
+
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatal(err)
+	}
+	c := meta.FindStatusCondition(got.Status.Conditions, sessionHarnessCondition)
+	if c == nil || c.Reason != sessionHarnessReasonNotSupported {
+		t.Fatalf("after Reconcile the condition is %+v, want %s", c, sessionHarnessReasonNotSupported)
+	}
+	// The generation moves (another spec edit, which the fake client
+	// doesn't bump on its own) while the value stays unsupported.
+	got.Generation++
+	if err := cl.Update(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileTwice(t, ctx, r, req)
+	warnings := 0
+	for _, e := range drainEvents(rec) {
+		if strings.Contains(e, sessionHarnessReasonNotSupported) {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Errorf("%d %s warnings over four passes and a generation change, want one", warnings, sessionHarnessReasonNotSupported)
+	}
+
+	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatal(err)
+	}
+	got.Spec.Harness.SessionWorker = &agentv1alpha1.SessionWorkerSpec{Type: "claude-code"}
+	if err := cl.Update(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileTwice(t, ctx, r, req)
+	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(got.Status.Conditions, sessionHarnessCondition); c != nil {
+		t.Errorf("claude-code left the condition: %+v", c)
 	}
 }

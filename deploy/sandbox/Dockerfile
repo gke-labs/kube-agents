@@ -533,7 +533,17 @@ COPY --chmod=0755 deploy/sandbox/shell-memory-guard.py /usr/local/libexec/shell-
 # it starts. The table is profiled ahead of time
 # (.agents/skills/update-kubectl-cost-table); nothing is estimated at run time.
 COPY --chmod=0755 deploy/sandbox/kubectl-admit.py /usr/local/libexec/kubectl-admit
+# The table's directory first, so it's 0755: a COPY --chmod creates every
+# missing directory on its destination path with the file's mode (BuildKit's
+# fsutil MkdirAll), and under buildx, which publishes the images, that left
+# /usr/local/share/kube-agents 0644. The agent user couldn't read the table, and
+# the admission fails open on a table it can't read. A directory that exists
+# keeps its mode; the RUN after the table checks it as that user.
+RUN mkdir -p /usr/local/share/kube-agents
 COPY --chmod=0644 deploy/sandbox/kubectl-costs.json /usr/local/share/kube-agents/kubectl-costs.json
+# Root reads through any mode, so only a read as the agent's login sees a table
+# that login can't read.
+RUN su agent -s /bin/sh -c 'test -r /usr/local/share/kube-agents/kubectl-costs.json'
 
 # What the agent's shell actually reads and runs, staged at /opt/defaults for the
 # entrypoint to copy onto the volume (step 1a). Same two-part arrangement as the

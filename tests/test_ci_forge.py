@@ -123,16 +123,19 @@ STUB_CURL = textwrap.dedent(
 
 
 # openssl: the CA:TRUE gate reads basicConstraints; a PEM file passes. `rand
-# -hex N` mints the tokens: N bytes of a fixed pattern.
+# -hex N` mints the tokens: N bytes of a fixed pattern. `version` names a
+# made-up build, which the CA:TRUE error text repeats.
+STUB_OPENSSL_VERSION = "StubSSL 9.9.9"
 STUB_OPENSSL = textwrap.dedent(
     """\
     #!/usr/bin/env bash
     if [ "$1" = "rand" ]; then printf 'ab%.0s' $(seq 1 "$3"); exit 0; fi
+    if [ "$1" = "version" ]; then echo "@VERSION@"; exit 0; fi
     f="${@: -1}"
     grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null || { echo "unable to load certificate" >&2; exit 1; }
     if grep -q "NOT-A-CA" "$f"; then printf 'X509v3 Basic Constraints: critical\\n    CA:FALSE\\n'; else printf 'X509v3 Basic Constraints: critical\\n    CA:TRUE\\n'; fi
     """
-)
+).replace("@VERSION@", STUB_OPENSSL_VERSION)
 
 # make-certs.sh: the real helper's contract (host, out-dir it creates, days),
 # writing CA-shaped files; MAKE_CERTS_LEAF_ONLY=1 writes a CA without CA:TRUE.
@@ -352,7 +355,10 @@ class ForgeScriptTest(unittest.TestCase):
         self.provision()
         proc = self.run_forge("up", MAKE_CERTS_LEAF_ONLY="1")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("is not a CA certificate; make-certs.sh needs OpenSSL (Linux)", proc.stderr)
+        # The text names the openssl that made the certificate. It does not say which openssl the helper needs:
+        # the helper makes a CA with LibreSSL 3.3.6 too.
+        self.assertIn(f"is not a CA certificate (its basicConstraints lack CA:TRUE); make-certs.sh made it with {STUB_OPENSSL_VERSION} (kube-agents#3682)", proc.stderr)
+        self.assertNotIn("needs OpenSSL", proc.stderr)
         self.assertFalse(self.calls_of("builds submit") or self.calls_of("instances create"))
 
     def test_up_bounds_the_image_build_on_the_client(self):

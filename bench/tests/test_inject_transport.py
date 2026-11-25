@@ -40,7 +40,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -2348,6 +2348,55 @@ def test_an_earlier_task_s_posts_are_not_this_task_s_answer() -> None:
     assert fold.deliverable == "the second answer"
 
 
+def test_a_relayed_report_is_never_this_task_s_answer() -> None:
+    """A card's report relayed over the inject notify route lands on the
+    conversation as a post the door marks `report`. Inside this task's window
+    it is still not the reply: the deliverable is the task's own post, and the
+    report is kept apart, edits included."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True, replyTo="inj-0"))
+    fold.apply(entry(4, inject.ENTRY_EDIT, text="card report, final", messageId="inj-2", report=True))
+
+    assert fold.deliverable == "the answer"
+    assert [p["messageId"] for p in fold.window_posts] == ["inj-1"]
+    assert [(r["kind"], r["text"]) for r in fold.reports] == [
+        (inject.ENTRY_POST, "card report"), (inject.ENTRY_EDIT, "card report, final")]
+    assert fold.reports[0]["replyTo"] == "inj-0"
+    assert "inj-2" not in fold.edited
+
+
+def test_a_window_with_only_a_report_does_not_fall_back_to_an_earlier_task() -> None:
+    """With this task's marker seen and only a relayed report in its window,
+    the answer is empty, not the earlier task's post."""
+    fold = inject.Fold("task-two")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="first answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_TASK, taskId="task-two"))
+    fold.apply(entry(4, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True))
+    assert fold.deliverable == ""
+    assert fold.window_posts == []
+
+
+def test_an_edit_marked_report_on_an_ordinary_post_still_rewrites_it() -> None:
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="Working on it...", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_EDIT, text="card report", messageId="inj-1", report=True))
+    fold.apply(entry(4, inject.ENTRY_POST, text="answer", messageId="inj-2"))
+    assert fold.deliverable == "answer"
+
+
+def test_a_post_marked_report_false_is_an_ordinary_post() -> None:
+    """Only a true `report` sets a post aside; anything else is read as before."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1", report=False))
+    assert fold.deliverable == "the answer"
+    assert fold.reports == []
+
+
 @pytest.mark.parametrize(
     ("text", "token"),
     [
@@ -4256,13 +4305,176 @@ def test_the_front_doors_usage_fills_the_top_level_buckets(stub_gateway: _StubGa
 
 def test_a_door_that_reports_no_usage_leaves_the_buckets_null(stub_gateway: _StubGatewayServer) -> None:
     """A gateway older than the field: no ``usage`` key, every bucket null,
-    and the note on the result says what the nulls mean."""
+    and the note on the result says what the nulls mean. The stub's answer
+    to the usage read does not name the task, and the note's cause says that."""
     stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
 
     result = KubeAgentsHarness().run("watch it")
 
     assert all(v is None for v in result.tokens.values())
-    assert result.metadata["tokens_note"] == harness._INJECT_TOKENS_NOTE
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_UNANSWERED)
+
+
+def null_note(how: str) -> str:
+    """The note on a record with no front door usage, by how the read went."""
+    return (
+        harness._INJECT_TOKENS_NOTE
+        + harness._INJECT_TOKENS_CAUSE_PREFIX
+        + harness._INJECT_TOKENS_CAUSE_NOTES[how]
+    )
+
+
+def usage_read_fold(
+    monkeypatch: pytest.MonkeyPatch, answer: Callable[..., dict[str, Any]], *, budget: float = 30
+) -> inject.Fold:
+    """The fold of a wait whose relay posted the terminal, the usage read
+    after it answered by ``answer``."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed"},
+    })
+    monkeypatch.setattr(inject, "_request", answer)
+    return task.await_terminal("task-1", deadline=time.monotonic() + budget).fold
+
+
+def test_every_way_the_usage_read_can_go_has_a_cause_text() -> None:
+    """The states live in the transport and the texts in the harness: a state
+    with no text would lose the result to a ``KeyError``."""
+    states = {
+        value for name, value in vars(inject).items()
+        if name.startswith("USAGE_READ_") and isinstance(value, str)
+    }
+    assert states == set(harness._INJECT_TOKENS_CAUSE_NOTES)
+    assert inject.Fold("task-1").usage_read in states
+
+
+def test_the_note_says_the_gateway_reported_none_when_the_read_was_answered(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """A door that answers the usage read about the task and sends no usage:
+    the buckets are null because the gateway reported none."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
+    stub_gateway.probe_child_addressees = []
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.tokens["total"] is None
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_ANSWERED)
+
+
+def test_the_note_gives_the_cause_when_the_usage_has_no_readable_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A usage object whose counts cannot be read leaves the buckets null, so
+    the note gives the cause there too. A fold with a count gets no cause."""
+    fold = usage_read_fold(monkeypatch, lambda *a, **k: probe_body(usage={"durationMs": 9000}))
+
+    assert fold.usage == {"input": None, "output": None}
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_ANSWERED)
+
+    fold = usage_read_fold(monkeypatch, lambda *a, **k: probe_body(usage=USAGE))
+    assert harness._inject_tokens_note(fold) == harness._INJECT_TOKENS_NOTE
+
+
+def test_the_note_says_the_read_was_skipped_past_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminal that arrives with the wait's deadline already passed gets
+    no usage read, and the note says the read was skipped."""
+    asked: list[str] = []
+    fold = usage_read_fold(monkeypatch, lambda url, *a, **k: asked.append(url) or {}, budget=0)
+
+    assert asked == [] and fold.usage is None
+    assert fold.usage_read == inject.USAGE_READ_SKIPPED
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_SKIPPED)
+
+
+def test_the_note_says_the_read_failed_when_it_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usage read the door did not answer leaves the buckets null, and the
+    note says the read failed and not that the gateway reported none."""
+    def refused(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    fold = usage_read_fold(monkeypatch, refused)
+
+    assert fold.usage is None
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_FAILED)
+
+
+def test_the_note_says_the_answer_did_not_cover_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An answer about another task says nothing of this one's usage."""
+    fold = usage_read_fold(monkeypatch, lambda *a, **k: probe_body(taskId="task-2", usage=USAGE))
+
+    assert fold.usage is None
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_UNANSWERED)
+
+
+def test_a_failed_second_read_does_not_replace_the_doors_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A partial answer with no front door usage is read once more. When
+    that read fails, the cause stays the door's answer: it reported none."""
+    replies = [probe_body(childUsage={"inputTokens": 900, "outputTokens": 90}, usagePartial=True)]
+
+    def once(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if not replies:
+            raise inject.InjectUnavailable("the door is restarting")
+        return replies.pop(0)
+
+    fold = usage_read_fold(monkeypatch, once)
+
+    assert fold.usage is None and fold.usage_partial
+    assert harness._inject_tokens_note(fold) == (
+        null_note(inject.USAGE_READ_ANSWERED) + harness._INJECT_TOKENS_PARTIAL_NOTE
+    )
+
+
+def test_the_note_says_the_cancel_was_not_confirmed_on_a_graded_timeout(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graded timeout whose cancel no terminal confirmed inside the settle
+    has no terminal to read usage after, and the note says so."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+    monkeypatch.setattr(inject, "CANCEL_SETTLE_SECONDS", 0.5)
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert result.metadata["terminal_state"] is None
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_CANCEL_UNCONFIRMED)
+
+
+def test_the_note_takes_the_settles_cause_when_the_cancel_was_confirmed(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A confirmed cancel is followed by a usage read; when the door answers
+    it with no usage, that is the cause, not the cancel."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.on_cancel = [
+        entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="canceled",
+              source=inject.TERMINAL_SOURCE_EXECUTOR, reason="reason: canceled-by-request"),
+    ]
+    stub_gateway.probe_child_addressees = []
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert result.metadata["terminal_state"] == "canceled"
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_ANSWERED)
+
+
+def test_the_note_says_no_read_was_made_when_the_wait_had_no_terminal(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout with a stop already pending sends no cancel, so nothing
+    settles and no usage read is made."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.probe_detached = True
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert not stub_gateway.cancels
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_NOT_MADE)
 
 
 def test_usage_with_no_readable_count_leaves_the_buckets_null() -> None:
