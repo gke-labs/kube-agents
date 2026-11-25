@@ -635,9 +635,8 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
 line on the record's errors, and nothing is graded for it. A card created before the run started
-was not filed by this run, so the repetition is not independent: its dropped line says so, and
-every such card, settled or dropped, is listed in the harness result's `delegated_cards_adopted`
-metadata, which devops-bench does not persist; marking a settled one in the record would change
+was not filed by this run, so the repetition is not independent: the wait logs a warning for it,
+and its dropped line, if it is dropped, says so; marking a settled one in the record would change
 grading. Then it reads `tasks.result` and the
 newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
 newest block's kind and reason. No status turn is sent, because

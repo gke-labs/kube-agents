@@ -5873,8 +5873,7 @@ class KubeAgentsHarness(AgentHarness):
         :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
         wait with a line on ``errors`` (:func:`_vanished_card_error`), and
         nothing is graded for it. A card filed before the run started
-        (:func:`_predates_run`), settled or dropped, is listed in
-        ``metadata["delegated_cards_adopted"]``.
+        (:func:`_predates_run`) is logged as a warning when first read.
 
         Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
         running. Returns ``False``, having changed nothing else, when the store
@@ -5953,14 +5952,13 @@ class KubeAgentsHarness(AgentHarness):
         awaited: list[str] = []
         capped = False
         # Each awaited card's ``created_at`` from the last read that had its row,
-        # and the awaited cards filed before the run started (_predates_run): this
-        # run did not file them, so it is not independent whether they settle or
-        # leave the board mid-wait (#4794). Recorded in metadata, not errors,
-        # which the scorer reads: what such a run counts for is #4658's call.
-        # devops-bench drops metadata from results.json, so this is in-process
-        # only; a dropped one also gets its errors line.
+        # and the awaited cards already logged as filed before the run started
+        # (_predates_run): this run did not file them, so it is not independent
+        # whether they settle or leave the board mid-wait (#4794). Logged, not put
+        # on errors, which the scorer reads: what such a run counts for is
+        # #4658's call. A dropped one also gets its errors line.
         created: dict[str, int | None] = {}
-        adopted: list[str] = []
+        predating: set[str] = set()
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(
@@ -5998,8 +5996,12 @@ class KubeAgentsHarness(AgentHarness):
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
                 if t in read.cards:
                     created[t] = read.cards[t].get("created_at")
-                    if t not in adopted and _predates_run(created[t], self._pod_floor):
-                        adopted.append(t)
+                    if t not in predating and _predates_run(created[t], self._pod_floor):
+                        predating.add(t)
+                        _log.warning(
+                            "awaited card %s was filed before this run started, so this run did not "
+                            "file it and this repetition is not independent", t,
+                        )
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
                 result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
@@ -6046,8 +6048,6 @@ class KubeAgentsHarness(AgentHarness):
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if missing:
             result.metadata["delegated_cards_missing"] = list(missing)
-        if adopted:
-            result.metadata["delegated_cards_adopted"] = list(adopted)
         if timed_out:
             _record_ceiling(
                 result,
