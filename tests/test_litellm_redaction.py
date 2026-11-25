@@ -296,6 +296,31 @@ class TestCallback(unittest.TestCase):
         call = self._run(data)["messages"][0]["tool_calls"][0]
         self.assertEqual(call["function"]["arguments"], {"api_key": "[REDACTED_SECRET]"})
 
+    def test_tool_call_arguments_that_are_a_json_string_are_decoded(self) -> None:
+        # Arguments that encode a JSON string are walked decoded, so a value
+        # after an escaped line break or tab is redacted as on main; clean
+        # string arguments keep their exact bytes.
+        cases = [json.dumps("kubectl get pods\n10.9.8.7"), json.dumps("hosts:\t10.9.8.7")]
+        clean = json.dumps("kubectl get pods\n-n shop")
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": str(i), "type": "function", "function": {"name": "t", "arguments": a}}
+                        for i, a in enumerate(cases + [clean])
+                    ],
+                }
+            ]
+        }
+        calls = self._run(data)["messages"][0]["tool_calls"]
+        for call in calls[:2]:
+            decoded = json.loads(call["function"]["arguments"])
+            self.assertNotIn("10.9.8.7", decoded)
+            self.assertRegex(decoded, r"\[ip:[0-9a-f]{12}\]$")
+        self.assertEqual(calls[2]["function"]["arguments"], clean)
+
     def test_tool_call_arguments_that_are_not_json_are_redacted_as_text(self) -> None:
         data = {
             "messages": [

@@ -464,8 +464,8 @@ class KubeAgentsRedactionCallback(CustomLogger):
         """(path from the request, string, decoded document) for each tool
         call's arguments held as JSON in a string: a chat tool call's and a
         legacy function call's `arguments`, and an Anthropic tool input sent
-        as a string. Arguments that are not a JSON object or array stay a
-        string, walked as text."""
+        as a string. Arguments that are not a JSON object, array or string
+        stay a string, walked as text."""
         found: List[tuple] = []
 
         def take(path: tuple, value: Any) -> None:
@@ -483,7 +483,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 document = json.loads(value, object_pairs_hook=pairs)
             except ValueError:
                 return
-            if isinstance(document, (dict, list)):
+            # A JSON string is walked decoded too, so a rule that needs a word
+            # boundary sees a value after an escaped line break or tab.
+            if isinstance(document, (dict, list, str)):
                 # A repeated key: the decoder kept one value and the walk never
                 # sees the other, so the string is re-encoded from the document
                 # rather than sent as it came.
