@@ -880,8 +880,10 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	// (#6832), and later on session pods (#6716). Elsewhere only the pod
 	// spec or the image's ENV can set it; a profile with no type gets
 	// neither variable, by design, since its image is already trusted code.
-	// core-agent likewise, until its end-of-turn sweep lands (#6710).
-	if (driver.Harness() == persona.Antigravity || driver.Harness() == persona.CoreAgent) && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
+	// core-agent needs no waiver: it runs one turn per process, behind the
+	// turn-boundary check, with the adapter non-dumpable and its tool
+	// children's environment allowlisted (#6710).
+	if driver.Harness() == persona.Antigravity && getenv(lib.EnvHarnessUnisolated) != lib.HarnessUnisolatedAllow {
 		return "", nil, nil, fmt.Errorf("harness %q runs without its isolation until #6710 lands; set %s=%s to run it anyway",
 			driver.Harness(), lib.EnvHarnessUnisolated, lib.HarnessUnisolatedAllow)
 	}
