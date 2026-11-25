@@ -816,8 +816,8 @@ so an absent or `0` round reads as one. It is at most 16 (`lib.DelegateRoundsCei
 `round` is negative, past that, or not a number isn't a child result, so a forged end can't put an arbitrary
 round into a parent's dedupe. Nothing sends a round past one yet. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
 gateway's heal next reads the conversation, which also finds a child whose terminal the relay
-missed. If its text passes the ask's retention (`A2A_ASK_TTL`) before that, the end that goes is
-`failed`, saying the result was dropped, with none of the child's text. A withdrawn batch's ends
+missed. If its text passes the ask's retention (`A2A_ASK_TTL`) before that, the end is dropped, since nothing
+could send it then (the same bound clears what a send needs), and the parent's deadline bounds its wait. A withdrawn batch's ends
 are tried a few times on the spot instead, since the withdrawal leaves nothing for the heal to find;
 one that still fails is lost. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
 writes to, so the parent's own deadline is what bounds its wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
@@ -839,6 +839,12 @@ Every request the gateway handles for a task uses a round, minted or refused, so
 has used its rounds (`roundsMax`, one by default) is refused with the next round, which is `2` today: the
 earlier request's children, if it minted any, are still the task's to wait for, and a waiting parent keeps
 waiting on them. The gateway mints nothing for that request, records nothing, and posts nothing to the room.
+With rounds left (`roundsMax` above one, which this gateway doesn't take yet), a task's next request waits
+for its current round to settle: every child ended and no child still running (a batch child that asked is
+cancelled, and counts until that lands), every end sent to the task, and for a single child, the task
+holding the conversation again. A request before that is ignored as busy. The next round's children carry its
+number, their entries start again at 1, and the earlier rounds' children stay on the record for a stop to
+reach.
 `round` is a JSON number from 0 to 16 (`lib.DelegateRoundsCeiling`); a part whose `round` is another type or
 out of that range isn't a refusal.
 

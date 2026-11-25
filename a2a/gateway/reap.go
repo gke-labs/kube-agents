@@ -56,6 +56,8 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 	g.mu.Lock()
 	cursor := g.reapCursor
+	// A fresh waiting-children count for this pass (noticeChildWaiting).
+	g.waitingPass = map[string]int{}
 	g.mu.Unlock()
 
 	nextCursor, done, err := g.reg.ScanSessions(ctx, cursor, func(rec *SessionRecord) (bool, error) {
@@ -80,6 +82,7 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	g.boundAskCopy(ctx, rec)
+	g.noticeChildWaiting(ctx, rec)
 	g.noticeNoFirstEvent(ctx, rec)
 
 	// Prune records older than SessionTTL whose pod has been reaped (or never
@@ -235,11 +238,17 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	// copy too, from the child's terminal on the stream: bounded from the
 	// child's start, which is never later than that terminal, so the copy
 	// never outlives the stream's. The end itself stays, so the batch still
-	// counts the child ended.
+	// counts the child ended. A profile parent's end that was never sent
+	// (Unsent) can't be sent past this bound either, since the loop above
+	// clears the parent's attribution, so it is dropped with its text.
 	var batchTextIDs []string
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]
 		if g.batchTextPast(*ref, now) {
+			if ref.BatchEnd.Unsent {
+				g.log.Warn("a batch child's end was never sent to its profile parent and is dropped at the ask bound; the parent's deadline bounds its wait",
+					"session", fresh.Key, "child", ref.ID, "parent", ref.ParentTaskID, "entry", ref.BatchIndex)
+			}
 			ref.clearBatchText()
 			batchTextIDs = append(batchTextIDs, ref.ID)
 			changed = true
@@ -270,7 +279,9 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 // batchTextPast reports a fan-out child's entry holding result text
 // (BatchEnd.Text) past AskTTL from its start.
 func (g *Gateway) batchTextPast(ref TaskRef, now time.Time) bool {
-	return ref.BatchEnd != nil && ref.BatchEnd.Text != "" && !ref.StartedAt.IsZero() &&
+	// An unsent end counts with no text too (a failure with no message):
+	// past the bound it can't be sent, and clearBatchText drops it.
+	return ref.BatchEnd != nil && (ref.BatchEnd.Text != "" || ref.BatchEnd.Unsent) && !ref.StartedAt.IsZero() &&
 		now.Sub(ref.StartedAt) >= g.cfg.AskTTL
 }
 
@@ -727,5 +738,10 @@ func (g *Gateway) noticeNoFirstEvent(ctx context.Context, rec *SessionRecord) {
 	g.log.Info("no first event inside the grace; told the conversation",
 		"taskId", active.TaskID, "conversation", fresh.Key, "addressee", fresh.AddresseeFor(active.TaskID),
 		"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
+	// A child whose line says it's waiting gets that line closed instead,
+	// so no ⏳ is left on it (closeWaitingLine); otherwise the post.
+	if g.closeWaitingLine(fresh) {
+		return
+	}
 	g.post(fresh.Key, fmt.Sprintf(noFirstEventNotice, active.TaskID, g.cfg.FirstEventGrace))
 }

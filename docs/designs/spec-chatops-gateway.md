@@ -360,6 +360,38 @@ no worker has as running, and the inject door hands every edit to the eval harne
 fallback post would be worse again, since both read every unedited post of a task as its
 output.
 
+**The waiting notice.** A delegated child's line gets the same kind of notice from the reap
+scan, since a child is minted by the session and no turn is there to count for it. It is for a
+single child of an AgentProfile (one with a tier) that holds the conversation's active task:
+a fan-out child doesn't hold the active task (a status ask lists it as `waiting to start`), and a platform child has no profile queue to
+wait in. A child whose line is still at submitted between 30 seconds after its submission and
+the first-event grace, with nothing on its stream (probeTask, the never-started test), has its
+own line edited to "⏳ **waiting** — the cluster agent hasn't started on this yet", with "; N
+other requests sent through me are waiting for it too" when there are others. The scan runs
+every minute, so the notice lands 30 to 90 seconds in. It claims no cause: busy workers, a
+dispatcher queue, a cold pod and a dispatcher that is down all look the same from the gateway,
+which sees only an empty stream. The line leaves out the "(delegated to …)" note the relay
+renders, since it names the profile already; the relay's first render past submitted puts it
+back. N is this gateway's other children for the same profile and tier, single or fan-out,
+not cancelled or ended, inside their own grace (`A2A_FIRST_EVENT_GRACE`, or the fan-out
+queue allowance below), with empty streams. The grace filter matters: past it an empty
+stream is a child that never started and was released, or one whose events aged out of the
+stream, and session records keep both for a week. It is counted once per profile and tier per
+reap pass from the session records and the stream, not from relay state. The record is marked
+(`waitingNoticeAt`, with the count) before the edit, and the line is edited again only when the
+count or the line changes. The edit is made under the conversation's session lock and only
+while the line is still submitted, and sets the relay's `busyShown` so its own submitted render
+doesn't replace it; its first edit past submitted does. A restart drops the relay's render
+state; since the stream was just read empty, a child with none is taken as still submitted
+and given fresh state as the relay would give it, so the notice and the close below survive a
+rollout. Doors that read the line as data (`busyNoticeBackend`, by the delegating turn's
+backend) get none. At the first-event grace, a line that carries the notice is closed in place
+to "⚠️ **didn't start** — the cluster agent didn't start on this in 10 minutes; ask again to
+start a new request" instead of the grace's separate post, so no
+⏳ is left on a line nothing will move. A child first seen past the grace, after an outage, gets
+no notice and the grace's post as before. The grace itself, its marker and its release are
+unchanged, and nothing is published.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
@@ -767,11 +799,45 @@ in the KV only) and its pseudonymized attribution, so a child minted later and t
 it run under the turn that asked. Working
 state richer than the transcript primer rehydrate builds today - what the session has
 discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
-conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
-paid.
+conversation is a resumed agent.
+
+A new conversation's first turn takes a warm pod when one is ready, so it skips scheduling and
+the image pull; every later turn pays the harness start as before. On the session route the
+leader gateway keeps `A2A_WARM_SESSIONS` warm pods (`spec.harness.tuning.warmSessions`, default 1,
+0 off; the operator renders the variable only where the install resolves to the session route,
+so on platform no warm pod runs), at most
+the cap less one and fewer while live sessions fill the cap (`a2a/gateway/warm_pool.go`). A warm
+pod is the session pod `Spawn` builds, created through the same CREATE-only path and admission
+policy, with no task or conversation annotation and an `a2a.kubeagents.dev/warm` mark. It has a
+freshly minted name, never one `TASKS` holds anything for (a minted name can repeat an earlier
+pod's within the stream's retention, so the pool mints again), and its adapter starts without
+`TASK_ID` (`A2A_SESSION_WARM`), opens its task watcher on its own `…in` subjects reading only
+what is published from then on, and reports Ready once the watcher's consumer exists,
+from a loopback endpoint that keeps answering for the pod's life. It carries a digest of the
+spec it was made with (`a2a.kubeagents.dev/warm-shape`), so after a release or a config change
+the old pods are never claimed and the pool replaces them. A
+session pod's bus identity is its name, so the gateway claims a warm pod by setting the
+record's bus session and addressee to the pod's name instead of minting one. Nothing is
+re-bound: the capability names the pod, and its grants are what a fresh spawn under that
+name gets, so an unclaimed pod can run nothing. Only a session-routed conversation with no
+earlier turn claims one (a warm pod has no primer, which is read once at start), never a
+one-shot Delegate, and with none ready the turn spawns cold. A pod `TASKS` holds anything for
+on its subjects (anything published within the stream's retention) is never claimed, whatever
+the claim index says, and counts as a live session. The gateway cannot patch the
+pod, so the claim goes in the session-state bucket (`warm.<pod>` naming the conversation),
+and the cap count, the cap eviction and both sweeps read the claim in place of the
+annotations; an unclaimed warm pod holds no cap slot and is no stranded orphan. The pool
+replaces an unclaimed pod at 25 minutes; its adapter exits unclaimed at 30, which is what
+frees it under a gateway that predates the pool, whose sweep deletes an ended pod with no
+task annotations. A claimed pod has no such bound there: it lasts until its conversation is
+reaped or its deadline, and that gateway's cap counts it but its eviction can't choose it, since
+the pod carries no session key and the gateway can't patch one on. A warm pod's deadline is
+that 30 minutes plus a reused pod's lifetime, and a claimed pod takes turns only as long as one
+spawned at the claim would (`podClaimedAt` on the record). Each warm pod takes one `TASKS` consumer and one pod in the session quota, and warm pods use only consumers the session cap leaves spare (`status.effectiveWarmSessions`): the cap is fitted as before, and a stream with none spare runs without a warm pod rather than losing a session. A new `TASKS` is created with room for them. Recycling is quiet: the readiness probe waits out the adapter's start rather than failing during it, and the pool and the sweep log at info and record no Event. On Autopilot without Pod bursting a warm pod is billed at the per-Pod minimum of 250m and 512Mi.
 
 What this costs is pods: one per live conversation, bounded by the session cap and the
-idle TTL. That is the figure to measure before the default flips.
+idle TTL, and the warm pods, one session pod's requests each. That is the figure to measure
+before the default flips.
 
 ## Routing to AgentProfiles (added 10/28)
 
@@ -1020,7 +1086,8 @@ evidence, a first event that is merely late could still arrive, and no superviso
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
 posts one line once the grace has passed with nothing on the stream, naming the task and
-saying the next message starts a new task. It marks the active-task record before it
+saying the next message starts a new task (a delegated child's line that carries the waiting
+notice above is closed in place instead). It marks the active-task record before it
 posts, so the line goes out at most once per task, across gateway restarts, and it
 releases nothing; the release stays with the next turn, which reads the stream again
 first. The line is for a placeholder somebody may still be watching, so it has a ceiling:

@@ -1058,3 +1058,52 @@ func (m noMetadataMsg) Subject() string { return m.subject }
 func (m noMetadataMsg) Metadata() (*jetstream.MsgMetadata, error) {
 	return nil, errors.New("not a JetStream message")
 }
+
+// completedOnlyDriver is Claude Code's driver for a harness whose
+// conversation keeps a turn only when it completes, as core-agent's does.
+type completedOnlyDriver struct{ claudeDriver }
+
+func (completedOnlyDriver) KeepsOnlyCompletedTurns() {}
+
+// For a harness that keeps only completed turns, a first turn that reports
+// its session and then fails added nothing, so the next run starts fresh
+// with the primer instead of resuming an empty conversation. Once a turn
+// completes, later runs resume it without the primer.
+func TestAFailedFirstTurnKeepsThePrimerWhenOnlyCompletedTurnsAreKept(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-wren-p9q1"
+	dir := t.TempDir()
+	submit(t, c, session, "task-p-1", "first question")
+
+	// Run 1 reports its session, reads the prompt and dies without a result.
+	harness := recordingStub(t, dir, `
+if [ "$n" = 1 ]; then read first; printf '%s' "$first" > "$dir/prompt.$n"; exit 1; fi`)
+	cfg := reuseConfig(url, "task-p-1", session, harness)
+	cfg.Driver = completedOnlyDriver{}
+	cfg.Primer = "EARLIER-TURNS"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+
+	waitState(t, c, session, "task-p-1", lib.StateFailed)
+	submit(t, c, session, "task-p-2", "second question")
+	waitState(t, c, session, "task-p-2", lib.StateCompleted)
+	submit(t, c, session, "task-p-3", "third question")
+	waitState(t, c, session, "task-p-3", lib.StateCompleted)
+
+	if a := readRun(t, dir, "argv", 2); strings.Contains(a, harnessResumeFlag) {
+		t.Errorf("run 2 resumed the failed turn's session: %q", a)
+	}
+	if p := readRun(t, dir, "prompt", 2); !strings.Contains(p, "EARLIER-TURNS") || !strings.Contains(p, "second question") {
+		t.Errorf("run 2's prompt lacks the primer or its question: %q", p)
+	}
+	if a := readRun(t, dir, "argv", 3); !strings.HasSuffix(strings.TrimSpace(a), harnessResumeFlag+" sess-2") {
+		t.Errorf("run 3 argv = %q, want it to resume the completed sess-2", a)
+	}
+	if p := readRun(t, dir, "prompt", 3); strings.Contains(p, "EARLIER-TURNS") {
+		t.Errorf("run 3 read the primer again: %q", p)
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}

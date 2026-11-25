@@ -123,6 +123,33 @@ type harnessProc struct {
 	killTimers []*time.Timer
 }
 
+// oneTurnPerProcess is implemented by a driver whose harness process runs a
+// single turn and reads stdin once (core-agent). A later user message would
+// sit in the pipe unread: the write succeeds, the adapter counts a turn that
+// never runs, and the finished turn's result is dropped with it.
+type oneTurnPerProcess interface {
+	OneTurnPerProcess()
+}
+
+// errOneTurnPerProcess refuses a user message after a one-turn process's
+// first, so the adapter answers it as a steer that arrived too late.
+var errOneTurnPerProcess = errors.New("this harness runs one turn per process")
+
+// processEncoder is d's encoder for one process: EncodeUser, or for a
+// one-turn driver EncodeUser for the first message only.
+func processEncoder(d Driver) func(string) ([]byte, error) {
+	if _, ok := d.(oneTurnPerProcess); !ok {
+		return d.EncodeUser
+	}
+	var sent atomic.Bool
+	return func(text string) ([]byte, error) {
+		if sent.Swap(true) {
+			return nil, errOneTurnPerProcess
+		}
+		return d.EncodeUser(text)
+	}
+}
+
 // startHarness is startHarnessWith for Claude Code.
 func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	return startHarnessWith(claudeDriver{}, argv, env, prompt, reapBound, log)
@@ -176,7 +203,7 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		cmd:      cmd,
 		stdin:    stdin,
 		events:   events,
-		encode:   d.EncodeUser,
+		encode:   processEncoder(d),
 		scanDone: scanDone,
 		scanErr: func() error {
 			scanMu.Lock()

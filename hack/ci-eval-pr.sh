@@ -4977,7 +4977,7 @@ unit_cost_hint() {
     # The same full drift audit as consistency-drift-outlier, graded on
     # another finding of the same ledger. Priced with it, not measured on a
     # lane yet.
-    consistency-boot-disk-pool-outlier) echo 600 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 600 ;;
     # On the blocking roster since 2026-11-02 (#4095), the presubmit's one
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
@@ -5271,7 +5271,7 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
-    consistency-boot-disk-pool-outlier) echo 3000 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
