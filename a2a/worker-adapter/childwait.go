@@ -61,6 +61,10 @@ const (
 	// round starts only after their results are delivered, which this
 	// worker doesn't do yet.
 	refuseWhileWaiting = "this task is still waiting on the tasks it delegated; their results arrive as your next turn"
+	// refuseAfterDelivery is the tool's answer to any call once the
+	// children's results have been delivered: they are in the conversation
+	// already, so the answer says so instead of promising them again.
+	refuseAfterDelivery = "this task's delegated results were already delivered to you above, and it can't delegate again; write the report from them"
 	// waitingNote is the non-final working status a turn that ends during
 	// the wait publishes; %d and %s are the count still out and its noun.
 	waitingNote = "waiting on %d delegated %s"
@@ -153,14 +157,17 @@ func (w *childWait) refusalEnds(r lib.DelegationRefusal) bool {
 	return roundOf(r.Round) == w.round
 }
 
-// add counts c, reporting false for an end it doesn't count: a duplicate, or
-// an entry the request never asked for. A batch entry's end is keyed on its
-// round and entry, 0 reading as round one. An end with no entry (a single
-// delegation, or an older gateway's) is keyed on its child and so reads as a
-// single delegation's.
+// add counts c, reporting false for an end it doesn't count: one for another
+// round than the wait's (a stale or a later request's child, never one of
+// this round's entries), a duplicate, or an entry the request never asked
+// for. A batch entry's end is keyed on its round and entry, 0 reading as
+// round one. An end with no entry (a single delegation, or an older
+// gateway's) is keyed on its child and so reads as a single delegation's.
 func (w *childWait) add(c lib.ChildResult) bool {
 	key := roundEntry{roundOf(c.Round), c.Entry}
 	switch {
+	case key.round != w.round:
+		return false
 	case c.Entry > len(w.asked):
 		return false
 	case c.Entry >= 1 && w.entries[key]:
@@ -306,12 +313,17 @@ func plainState(s lib.TaskState) string {
 
 // quote puts "> " in front of every line of text, so nothing in it can pass
 // for the wrapper's own lines. Empty text is childNoText.
+// quoteBreaks maps every other line break to \n for quote.
+var quoteBreaks = strings.NewReplacer("\r", "\n", "\u0085", "\n", "\u2028", "\n", "\u2029", "\n")
+
 func quote(text string) string {
 	text = strings.TrimRight(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	if strings.TrimSpace(text) == "" {
 		text = childNoText
 	}
-	lines := strings.Split(strings.ReplaceAll(text, "\r", "\n"), "\n")
+	// Every line break a reader might honour starts a quoted line, not only
+	// \n and \r: NEL and the Unicode line and paragraph separators too.
+	lines := strings.Split(quoteBreaks.Replace(text), "\n")
 	for i, l := range lines {
 		lines[i] = quotePrefix + l
 	}

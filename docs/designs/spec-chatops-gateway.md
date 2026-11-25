@@ -909,17 +909,15 @@ whether its card declares them or not.
 without it. The tool is an `a2a` MCP server rendered beside the persona's own, and a persona that
 declares a server named `a2a` is refused at render. The delegate call publishes the `delegate`
 artifact and doesn't end the task: no deliverable, no final status, and the harness keeps running.
-The tool's reply tells the model its children's results arrive as its next turn. A result the
-harness writes meanwhile isn't the deliverable; the worker publishes a non-final `working` status
+The tool's reply tells the model its children's results arrive as its next turn. A result the harness writes meanwhile isn't the deliverable (a failed one still ends the task); the worker publishes a non-final `working` status
 saying how many delegated tasks it waits on. A delegate call past the rounds the submission's
 `delegateTargets` part advertises (`roundsMax`, one when absent) is refused at the tool, so at one
 a second call is refused, and a call with rounds left while the last round's children run is refused
-too, since a next round after their delivery isn't built yet. The worker reads each `childResult` on
+too, since a next round after their delivery isn't built yet. Once the results are delivered, every refusal says so instead of promising them as the next turn. The worker reads each `childResult` on
 the task's `.in`, deduping on `round` and `entry` when `entry` is set and on `childTaskId` otherwise
 (an absent `round` reads as one, and an older gateway's ends carry no `entry` and read as a single
-delegation's), and counts them to the entries it asked for. When every entry has its end, or a
-`delegationRefused` for the round the wait is on arrives, it writes them to the same harness as one
-user turn. A refusal for a lower round (stale) or a higher one (a later request's) is logged and
+delegation's), and counts its own round's ends to the entries it asked for: an end for another round isn't counted, so it can't complete the wait or hide a missing entry. When every entry has its end, or a
+`delegationRefused` for the round the wait is on arrives, it writes them to the same harness as one user turn. Under a driver that holds steers, ends that arrive mid-turn are held for that turn's result; if a cancel or the deadline comes first, the delivery isn't written, and the stop decides the task's end. A refusal for a lower round (stale) or a higher one (a later request's) is logged and
 dropped: the wait goes on for the children already running. At the task's
 deadline less a reserve, the larger of two minutes and 15% of the task's budget but at most half of
 it, it delivers what has arrived and names the entries that sent nothing, so the parent still

@@ -791,10 +791,11 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 }
 
 // A batch entry's end is keyed on its round and entry, an absent round
-// reading as one: the same entry in another round is another end (forged
-// here: no gateway sends a round past one yet), and a duplicate within a
-// round, absent and explicit round one alike, is deduped. A single
-// delegation's end is still keyed on its child.
+// reading as one: a duplicate within the round, absent and explicit round one
+// alike, is deduped, and an end for another round (forged here: no gateway
+// sends a round past one yet) isn't counted toward this round's entries, so
+// it can't complete the wait or hide a missing entry. A single delegation's
+// end is still keyed on its child.
 func TestChildWaitDedupesOnRoundAndEntry(t *testing.T) {
 	w := newChildWait(lib.DelegateRequest{Tasks: []lib.DelegateTask{clusterEntry("a"), clusterEntry("b"), clusterEntry("c")}}, 1)
 	for _, tc := range []struct {
@@ -804,7 +805,7 @@ func TestChildWaitDedupesOnRoundAndEntry(t *testing.T) {
 		{lib.ChildResult{ChildTaskID: "a", State: lib.StateCompleted, Entry: 1}, true},
 		{lib.ChildResult{ChildTaskID: "a", State: lib.StateCompleted, Entry: 1, Round: 1}, false},
 		{lib.ChildResult{ChildTaskID: "a-again", State: lib.StateCompleted, Entry: 1}, false},
-		{lib.ChildResult{ChildTaskID: "a-r2", State: lib.StateCompleted, Entry: 1, Round: 2}, true},
+		{lib.ChildResult{ChildTaskID: "a-r2", State: lib.StateCompleted, Entry: 1, Round: 2}, false},
 		{lib.ChildResult{ChildTaskID: "a-r2", State: lib.StateCompleted, Entry: 1, Round: 2}, false},
 		{lib.ChildResult{ChildTaskID: "a-r2-again", State: lib.StateCompleted, Entry: 1, Round: 2}, false},
 	} {
@@ -812,8 +813,8 @@ func TestChildWaitDedupesOnRoundAndEntry(t *testing.T) {
 			t.Errorf("add(%+v) = %v, want %v", tc.c, got, tc.want)
 		}
 	}
-	if len(w.got) != 2 || w.outstanding() != 1 {
-		t.Fatalf("counted %d ends, %d outstanding; want 2 and 1", len(w.got), w.outstanding())
+	if len(w.got) != 1 || w.outstanding() != 2 || w.complete() {
+		t.Fatalf("counted %d ends, %d outstanding, complete %v; want 1, 2 and not complete", len(w.got), w.outstanding(), w.complete())
 	}
 	// The wait names its own round's missing entries.
 	if missing := w.missing(); missing != fmt.Sprintf(childMissingBatch, "entry 2 (to cluster), entry 3 (to cluster)") {
@@ -979,5 +980,137 @@ func TestDelegateRoundsOf(t *testing.T) {
 		if got := delegateRoundsOf(tc.origin); got != tc.want {
 			t.Errorf("%s: rounds = %d, want %d", tc.name, got, tc.want)
 		}
+	}
+}
+
+// Under a driver that holds steers, a child's end that arrives mid-turn is
+// held for the hand-off turn's result. If the task is cancelled before that
+// result, the delivery turn never runs, and the hand-off turn's own text
+// ("handed it out") must not become the deliverable: the task ends canceled.
+func TestAHeldDeliveryIsDroppedWhenTheTaskIsCancelledFirst(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	addressee, taskID := "auditor-toy", "task-wait-toy-cancel"
+	origin := submit(t, c, addressee, taskID, "audit prod")
+	dir, err := os.MkdirTemp("", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	argv := stub(t, `
+dir='`+dir+`'
+echo 'S toy-parent'
+read -r first || exit 1
+trap 'echo "OK handed the audit out"; exit 0' TERM
+touch "$dir/armed"
+while true; do sleep 0.05; done
+`)
+	cfg := adapterConfig(url, taskID, addressee, argv)
+	cfg.DelegateSocket = filepath.Join(dir, "d.sock")
+	cfg.TaskDeadline = 2 * time.Minute
+	cfg.KillGrace = 10 * time.Second
+	cfg.Driver = &toyDriver{hold: true}
+	done := runDispatched(context.Background(), cfg)
+	waitPath(t, filepath.Join(dir, "armed"), "the parent stub never started")
+
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("delegate reply = %+v", reply)
+	}
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes."}))
+	time.Sleep(childWaitPause)
+
+	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, origin.ContextID, origin.CorrelationID,
+		lib.WithTo(lib.Party{Session: addressee}))
+	if err != nil {
+		t.Fatalf("cancel envelope: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Publish(ctx, lib.TaskInSubject(addressee, taskID), env); err != nil {
+		t.Fatalf("publish cancel: %v", err)
+	}
+
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.res.State != lib.StateCanceled {
+		t.Fatalf("run: state=%q err=%v, want canceled", out.res.State, out.err)
+	}
+	if r := artifactText(foldTask(t, c, addressee, taskID), lib.ArtifactResult); r != "" {
+		t.Fatalf("result %q: the hand-off turn's text became the deliverable", r)
+	}
+}
+
+// A delegate call made once the children's results are delivered is refused
+// with an answer that says they were delivered, not one promising them as
+// the next turn, which would leave the model waiting for what it has.
+func TestADelegateCallAfterTheDeliveryIsToldTheResultsAreDelivered(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	addressee, taskID := "auditor-toy", "task-wait-toy-after"
+	submit(t, c, addressee, taskID, "audit prod")
+	dir, err := os.MkdirTemp("", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	argv := stub(t, `
+dir='`+dir+`'
+echo 'S toy-parent'
+read -r first || exit 1
+touch "$dir/armed"
+i=0
+while [ ! -f "$dir/asked" ] && [ "$i" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+echo 'OK handed the audit out'
+read -r -t 60 delivery || exit 1
+touch "$dir/delivered"
+i=0
+while [ ! -f "$dir/go" ] && [ "$i" -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+echo 'OK the report'
+cat > /dev/null
+`)
+	cfg := adapterConfig(url, taskID, addressee, argv)
+	cfg.DelegateSocket = filepath.Join(dir, "d.sock")
+	cfg.TaskDeadline = 2 * time.Minute
+	cfg.Driver = &toyDriver{}
+	done := runDispatched(context.Background(), cfg)
+	waitPath(t, filepath.Join(dir, "armed"), "the parent stub never started")
+
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("delegate reply = %+v", reply)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "asked"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitWorkingNote(t, url, addressee, taskID, "waiting on 1 delegated task")
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes."}))
+	waitPath(t, filepath.Join(dir, "delivered"), "the delivery turn was never written")
+
+	reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod again"})
+	if reply.OK || reply.Message != refuseAfterDelivery {
+		t.Fatalf("delegate after the delivery = %+v, want %q", reply, refuseAfterDelivery)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	if r := artifactText(foldTask(t, c, addressee, taskID), lib.ArtifactResult); r != "the report" {
+		t.Fatalf("result %q, want the delivery turn's report", r)
+	}
+}
+
+// Every line break a reader might honour starts a quoted line: a child's text
+// can't put an unquoted line in the delivery with NEL or a Unicode line or
+// paragraph separator.
+func TestQuotePrefixesEveryLineBreak(t *testing.T) {
+	got := quote("one\u0085two three four\rfive\r\nsix")
+	for _, l := range strings.Split(got, "\n") {
+		if !strings.HasPrefix(l, quotePrefix) {
+			t.Fatalf("line %q of %q isn't quoted", l, got)
+		}
+	}
+	if n := strings.Count(got, "\n") + 1; n != 6 {
+		t.Fatalf("%d quoted lines in %q, want 6", n, got)
 	}
 }

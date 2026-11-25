@@ -1289,7 +1289,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						pendingTurns = 0
 						log.Info("turn result absorbed; waiting on delegated tasks",
 							"task", a.taskID, "outstanding", wait.outstanding())
-						a.publishWorkingNote(waitingText(wait.outstanding()))
+						// Not after a stop: the task isn't waiting any more.
+						if !canceled && !deadlineHit {
+							a.publishWorkingNote(waitingText(wait.outstanding()))
+						}
 						continue
 					} else if pendingTurns <= 0 && heldDelivery != "" && !canceled && !deadlineHit {
 						// The children's ends arrived mid-turn under a driver
@@ -1298,6 +1301,16 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						text := heldDelivery
 						heldDelivery = ""
 						writeDelivery(text)
+						continue
+					} else if pendingTurns <= 0 && heldDelivery != "" {
+						// Cancel or the deadline came while the children's
+						// ends were held: the delivery turn won't run, and
+						// this result was written before they reported, so
+						// it isn't the deliverable. The stop decides the end.
+						heldDelivery = ""
+						log.Info("held delivery dropped: the task was stopped first", "task", a.taskID,
+							"canceled", canceled, "deadline", deadlineHit)
+						proc.closeStdin()
 						continue
 					} else if pendingTurns <= 0 {
 						sawResult = true
@@ -1360,16 +1373,26 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// call with rounds left while the last round's children run
 			// is refused too: a next round, after their delivery, isn't
 			// built yet.
+			// Once the children's results are delivered, every refusal says
+			// so: promising them as the next turn would send the model
+			// waiting for something it already has.
 			if a.dispatched && roundsUsed >= max(a.delegateRounds, 1) {
 				msg := refuseSecondDelegation
 				if a.delegateRounds > 1 {
 					msg = fmt.Sprintf(refuseRoundsUsed, a.delegateRounds)
 				}
+				if wait != nil && wait.delivered {
+					msg = refuseAfterDelivery
+				}
 				ask.reply <- delegateReply{Message: msg}
 				continue
 			}
 			if wait != nil {
-				ask.reply <- delegateReply{Message: refuseWhileWaiting}
+				msg := refuseWhileWaiting
+				if wait.delivered {
+					msg = refuseAfterDelivery
+				}
+				ask.reply <- delegateReply{Message: msg}
 				continue
 			}
 			// Cancel and the deadline end the turn when they fire, not when
