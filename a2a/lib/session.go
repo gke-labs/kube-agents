@@ -75,11 +75,21 @@ const (
 	// worker alike (persona.ClaudeCode or persona.Antigravity): its driver,
 	// its argv and env, and a profile worker's persona adapter. Unset is
 	// Claude Code; a value the worker doesn't know refuses to start.
+	// Antigravity also needs EnvHarnessUnisolated and A2A_HARNESS_PATH
+	// (cmd/worker-adapter's selectHarness).
 	EnvHarness = "A2A_HARNESS"
 	// EnvProfileHarness is EnvHarness's older name, read only by a profile
 	// worker and only when EnvHarness is unset. It once picked the persona
 	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
+	// EnvHarnessUnisolated must be HarnessUnisolatedAllow for a worker to
+	// select persona.Antigravity, which runs without its per-task HOME
+	// locking and workspace scrub until #6710 lands; #6710 removes it.
+	// Nothing in the operator or chart sets it to allow; the operator
+	// renders it empty beside A2A_HARNESS on a profile that names
+	// spec.harness.type.
+	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
+	HarnessUnisolatedAllow = "allow"
 	// EnvPersonaIntegrity sets whether a profile worker requires its persona
 	// to carry a build-time content manifest (persona.IntegrityManifestFile).
 	// PersonaIntegrityRequired refuses a persona without one; unset loads it

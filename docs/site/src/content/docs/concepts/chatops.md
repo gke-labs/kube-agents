@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The interactive channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled. An experimental **Microsoft Teams** Bot Framework outbound relay (`spec.integration.teams`, [below](#microsoft-teams)) also ships for outbound activity delivery and in-pod event queue scaffolding, but does not yet include external webhook ingress. Proactive alerts and reports reach a Teams home only with the gateway's Teams backend armed.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The interactive channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled. An experimental **Microsoft Teams** Bot Framework outbound relay (`spec.integration.teams`, [below](#microsoft-teams)) also ships: it delivers the agent's replies and posts, and an inbound receiver, off by default, takes the messages people type in Teams ([Microsoft Teams app setup](/kube-agents/install/teams-app/)). Proactive alerts and reports reach a Teams home only with the gateway's Teams backend armed.
 
 Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand). It files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails.
 
@@ -141,7 +141,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
 
-To turn the flag off, set `KAGE_SLACK_UX=false` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`); an install that never set it has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
+To turn the flag off, add `KAGE_SLACK_UX=false` to the chart value `platformAgent.deployment.env`; [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the `install.env` line. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply. An install that never set the flag has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
 #### What the reaction means
 
@@ -432,7 +432,9 @@ The agent answers a fixed number of tasks at once: the Hermes bridge's worker co
 
 By default every conversation's tasks go to the `platform` route above. `/session` moves the conversation to the session route, where the conversation gets a session pod of its own, started from the `chat` profile. The same pod takes each of the conversation's tasks in turn, so each one carries on from the last. The pod is deleted 30 minutes after your last message in the conversation, and at most 4 hours after it started. Your next message after that starts a new pod, which reads the conversation so far.
 
-An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`). When a conversation needs a new pod at that cap, the pod that has been idle longest is deleted to make room, and its conversation is told `⏸️ this session was paused to make room for another conversation; your next message here starts it fresh with the conversation so far`. If every other conversation with a pod still has a task in progress, the new task is refused instead, with `🚦 not started: 10 session workers are already running (cap 10). …`. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
+An install runs at most 10 session pods at once (`spec.harness.tuning.maxSessions`). When a conversation needs a new pod at that cap, the pod that has been idle longest is deleted to make room, and its conversation is told `⏸️ this session was paused to make room for another conversation; your next message here starts it fresh with the conversation so far`. If every other conversation with a pod still has a task in progress, the new task waits in line instead, with one message that moves as the line does: `⏳ queued — every session worker is busy and you're next in line; I'll start if one frees up in the next few minutes` (or how many conversations are ahead). It starts when a slot frees, oldest first; `stop` takes it out of the line, and later messages in the conversation wait behind it.
+
+After five minutes in line, wherever it is in the line, it is taken out with `🚦 not started: every session worker stayed busy while this waited …`, which also names any later messages dropped with it. When 20 conversations are already waiting, it is refused at once with `🚦 not started: 10 session workers are already running (cap 10). …`. Messages from a chat app, the console and the eval harness's inject door wait this way. A task sent through the A2A door is refused at the cap rather than queued, because an A2A caller is a program that reads that answer as nothing started. A follow-up to a task on the session route gets `✏️ steering sent — the worker picks it up at its next turn boundary if the task is still running`.
 
 On Slack, start the message with the bot's mention, `@bot /session`, because Slack takes a bare leading `/` as one of its own slash commands. In a Google Chat space, mention the app as with any message.
 
@@ -607,11 +609,11 @@ An experimental Microsoft Teams Bot Framework relay (`spec.integration.teams`) c
 
 The in-pod event queue (`/v1/chat/teams/events`, `/ack`, `/nack`) is wired between the Hermes gateway and credential broker, and the gateway adapter, not the broker, applies the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`). List users by Entra ID Object ID (`from.aadObjectId`) or `from.id`: an inbound Teams activity carries no UPN or email, so such entries match no one, and display names are never matched.
 
-Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack; a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
+Proactive alerts and the default scheduled reports ([below](#proactive-alerts-both-channels)) go to Google Chat and Slack, and to the Teams home channel once the gateway's Teams backend is armed. Without that backend, a cron job whose `deliver` names `teams` posts its report to the Teams home channel (`TEAMS_HOME_CHANNEL`, rendered from `homeChannel`).
 
 When the operator runs with `A2A_TEAMS_BACKEND=true`, the A2A chat gateway consumes that queue instead of the Hermes adapter (`a2a/gateway/teams.go`, the `A2A_TEAMS_*` env), the broker admits the gateway pod as a caller, and the Hermes Teams platform is not rendered.
 
-What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; the setup guide walks through it.
+What this means for an evaluator: enabling `spec.integration.teams` alone gives you the outbound half. A cron job whose `deliver` names `teams` posts its report to the Teams home channel, as an Adaptive Card by default. A message typed in Teams reaches the agent only with the inbound receiver on (`spec.integration.teams.inbound.enabled`, with `tenantId`). The operator then runs a pod that accepts the requests Microsoft delivers for the bot, verifies Microsoft's signature on each one, and hands the message to the install. You expose its Service with your own Ingress and TLS certificate and register that address as the bot's messaging endpoint; [Microsoft Teams app setup](/kube-agents/install/teams-app/) walks through it.
 
 ## Proactive alerts (both channels)
 
@@ -752,7 +754,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in the chart value `platformAgent.deployment.env`, or in `spec.deployment.env` on an install that no chart manages:
 
 ```yaml
 platformAgent:

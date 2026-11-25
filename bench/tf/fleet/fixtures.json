@@ -365,7 +365,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.podPidsLimit 4096, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
+      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.podPidsLimit 4096, where every other pool in the fleet runs a 20 GB disk and no kubelet block; the drift SOP's boot-disk facet reads the disk; the kubelet block is planted ahead of the kubelet-config facet, which the SOP does not read yet",
       "state": [
         {
           "subject": "cluster",
@@ -974,6 +974,172 @@
           "op": "eq",
           "value": "reindex",
           "why": "the label is the one mark of the parent the members share; without it only the name shape joins them, and a finding that names the template's labels has nothing to name"
+        }
+      ]
+    },
+    "long-name-replaced-pod": {
+      "cluster_slot": "a",
+      "namespace": "seeded-long-name",
+      "probes": [
+        "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+        "configmap/long-name-pod-cycle",
+        "serviceaccount/long-name-pod-cycle",
+        "role/long-name-pod-cycle",
+        "rolebinding/long-name-pod-cycle"
+      ],
+      "fixture": "settlement-batch-reconciliation-exporter-for-partner-feeds, one Deployment whose name has 58 characters, so Kubernetes cuts the names of its pods (the name and 5 generated characters, with no hash and no hyphen between them). Its one pod is idle until 18:00 UTC, then uses its CPU limit and holds 64Mi for 11 minutes, and at 18:11 UTC deletes itself through the API with the Role long-name-pod-cycle (delete on pods, in this namespace only). The ReplicaSet makes a new pod, so the live pod is idle and the pod of the day before is a replaced pod with a peak above the 20% bar of the waste audit's overrequest check. An audit that reads only the live pod files the Deployment; one that finds the replaced pod behind its cut name files nothing. The Deployment has no verdict from 18:00 to about 19:11 UTC (the live pod is the busy pod, and then a pod under an hour old), and none before the first replacement, up to one day after the plant. A case must not grade it in those times. The audit cuts a finding id at 100 characters, so on a pool project the id of this Deployment ends with seeded-long-name.deployment-settlement-batch-reco- and 6 generated characters: a case names the Deployment by a text that is in the cut id, such as seeded-long-name.deployment-settlement-batch",
+      "state": [
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.replicas",
+          "op": "eq",
+          "value": 1,
+          "why": "one replica is the design: two pods of one template delete themselves in the same minute, and a second pod is a second live pod in the audit's read"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the script runs in one ready pod. A pod that never runs (a pull that fails, a script that does not start) has no series and no busy period, the audit then files nothing, and each case passes on each build. This count is not 1 for some seconds of the daily replacement at 18:11 UTC; one scan in those seconds reads as drift, and the next scan does not"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "200m",
+          "why": "the busy pod uses the CPU up to this limit, two times the request; with a limit under 20% of the request the busy peak is under the audit's bar, and the replaced pod no longer clears the Deployment"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.serviceAccountName",
+          "op": "eq",
+          "value": "long-name-pod-cycle",
+          "why": "the pod's own delete call needs this account's Role; with another account the call is refused, no pod is replaced, and the busy pod stays the live pod"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "100m",
+          "why": "the request is on the CPU floor of the overrequest check; below it the check reads the Deployment on memory only"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "the request is on the memory floor of the overrequest check, and the busy period holds half of it; a smaller request moves the 20% bar under the idle pod's use"
+        },
+        {
+          "subject": "role/long-name-pod-cycle",
+          "path": "rules[0].verbs[*]",
+          "op": "eq",
+          "value": "delete",
+          "why": "the one grant of the fixture, and the one verb of its rule: without it the delete call is refused and no pod is replaced, and a second verb is a wider Role"
+        },
+        {
+          "subject": "role/long-name-pod-cycle",
+          "path": "rules[0].resources[*]",
+          "op": "eq",
+          "value": "pods",
+          "why": "the rule names pods and no other resource; a wider Role is a compliance finding that no case expects"
+        }
+      ]
+    },
+    "cpu-burst-and-flat": {
+      "cluster_slot": "a",
+      "namespace": "seeded-cpu-cycle",
+      "probes": [
+        "deployment/cpu-flat",
+        "deployment/cpu-burst",
+        "configmap/cpu-cycle"
+      ],
+      "fixture": "cpu-flat and cpu-burst, two Deployments of one replica whose real CPU use is in the manifest. cpu-flat uses the CPU all the time, held by its limit at 100% of its 100m request: the control, which no audit files. cpu-burst uses the CPU for 45 seconds at the start of each 10 minutes of the clock, held by its limit at its 200m request, and is idle for the rest: in a bucket of 300 seconds the burst reads as 15% of the request, under the 20% bar of the waste audit's overrequest check, and in a bucket of 60 seconds as 37% or more. The memory request of each is 64Mi, on the floor of the check's resize, so only the CPU can give a finding, and the memory limit is above the request, so neither pod is Guaranteed",
+      "state": [
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the loop runs in one pod; a pod that is not ready has no CPU series, and the audit then reads nothing for the Deployment"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "100m",
+          "why": "the audit's verdict is the peak as a part of this request; another request moves each ratio that the cases were written against"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "100m",
+          "why": "the limit is what holds the use at the request, so the real use is known from the manifest; without it the loop takes a whole core"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "64Mi",
+          "why": "64Mi is the floor of the check's resize, so memory gives no finding; a larger request adds a memory half to the finding"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.limits.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a memory limit above the request keeps the pod out of the Guaranteed class; on a Guaranteed pod the over-request finding has another form (the guaranteed-qos marker, and from day 14 it can be an idle-workload finding)"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].env[?(@.name=='CPU_MODE')].value",
+          "op": "eq",
+          "value": "flat",
+          "why": "the mode is the shape: flat is the control and burst is the 45 seconds in each 10 minutes; with the two swapped each case reads the wrong Deployment"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the loop runs in one pod; a pod that is not ready has no CPU series, and the audit then reads nothing for the Deployment"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "200m",
+          "why": "the audit's verdict is the peak as a part of this request; another request moves each ratio that the cases were written against"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "200m",
+          "why": "the limit is what holds the use at the request, so the real use is known from the manifest; without it the loop takes a whole core"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "64Mi",
+          "why": "64Mi is the floor of the check's resize, so memory gives no finding; a larger request adds a memory half to the finding"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.limits.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a memory limit above the request keeps the pod out of the Guaranteed class; on a Guaranteed pod the over-request finding has another form (the guaranteed-qos marker, and from day 14 it can be an idle-workload finding)"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].env[?(@.name=='CPU_MODE')].value",
+          "op": "eq",
+          "value": "burst",
+          "why": "the mode is the shape: flat is the control and burst is the 45 seconds in each 10 minutes; with the two swapped each case reads the wrong Deployment"
         }
       ]
     },

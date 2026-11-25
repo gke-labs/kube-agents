@@ -28,7 +28,7 @@ import ChatDemo from "../../components/ChatDemo.astro";
 
 ## What it is
 
-`kube-agents` runs autonomous agents inside your Kubernetes cluster: a **Planning Agent** front door that listens on Google Chat (and optionally Slack) and turns what you ask for into work, a **Platform Agent** specialist it delegates that work to over a shared kanban board, and read-only per-cluster **Cluster Agents** the Platform Agent creates for the clusters it manages. The Platform Agent executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet and propose the mergeable fixes as GitHub pull requests you review.
+`kube-agents` runs autonomous agents inside your Kubernetes cluster: a **Planning Agent** front door that listens on Google Chat (and optionally Slack or Microsoft Teams) and turns what you ask for into work, a **Platform Agent** specialist it delegates that work to over a shared kanban board, and read-only per-cluster **Cluster Agents** the Platform Agent creates for the clusters it manages. The Platform Agent executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet and propose the mergeable fixes as GitHub pull requests you review.
 
 It ships as a small set of components:
 
@@ -54,7 +54,7 @@ It ships as a small set of components:
   />
   <LinkCard
     title="ChatOps interface"
-    description="Ask the agent things in Google Chat or Slack. The Planning Agent works out what your request needs and hands it to the Platform Agent, which runs skills, inspects clusters through the Kubernetes MCP server, and reports back."
+    description="Ask the agent things in Google Chat, Slack or Microsoft Teams. The Planning Agent works out what your request needs and hands it to the Platform Agent, which runs skills, inspects clusters through the Kubernetes MCP server, and reports back."
     href="/kube-agents/concepts/chatops/"
   />
 </CardGrid>

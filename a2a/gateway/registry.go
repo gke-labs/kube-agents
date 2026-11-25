@@ -676,8 +676,20 @@ func (rec *SessionRecord) clearBatchText(parentID string) {
 func (ref *TaskRef) clearBatchText() {
 	end := *ref.BatchEnd
 	end.Text = ""
+	if end.Unsent {
+		// Not sent yet: the heal would send what is left, and an empty
+		// completed end (or a canceled one with no question) reads as a
+		// result. The parent is sent a failure that says the text was
+		// dropped instead, with no content of the child's.
+		end.State, end.Text = lib.StateFailed, unsentEndExpired
+	}
 	ref.BatchEnd = &end
 }
+
+// unsentEndExpired is the end a profile parent is sent for a batch child
+// whose end couldn't be sent before its text passed AskTTL
+// (TaskRef.clearBatchText).
+const unsentEndExpired = "the delegated task ended, but its result couldn't be sent before the gateway's retention for it ran out, so it was dropped"
 
 // markCardsPending marks a console chain's root (CardsPending).
 func (rec *SessionRecord) markCardsPending(rootID string) {
@@ -927,14 +939,20 @@ func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
 // chainLast follows a delegation chain from the turn that started it to its
 // last task: down each turn's last child to the wake that child started, until
 // a turn that did not delegate (the wake that ends the chain) or a child no
-// wake followed. false when root did not delegate, or a link has fallen off
-// the history cap.
+// wake followed. false when root did not delegate, is a profile task (its
+// own end, as observedAs has it), or a link has fallen off the history cap.
 //
 // A fan-out turn's children share one wake, started by whichever ended last,
 // so its step is that wake; with none yet, the child carrying the chain's
 // end (observeChainEnd) when the chain ended without one, or else a child
 // still running.
 func (rec *SessionRecord) chainLast(root TaskRef) (TaskRef, bool) {
+	// A profile task is the end of its own chain, children or not
+	// (observedAs): it waits open for them and ends after them, so its own
+	// stream is the chain's end, and nothing below it wakes it.
+	if root.Tier != "" {
+		return TaskRef{}, false
+	}
 	cur := root
 	for steps := 0; len(cur.Children) > 0 && steps <= taskHistoryCap; steps++ {
 		if cur.fanOut() {

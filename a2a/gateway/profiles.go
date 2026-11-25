@@ -839,7 +839,7 @@ func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionReco
 			// withdrawal drops the child from the record, so the heal
 			// would never find it again.
 			if k.BatchEnd.Unsent {
-				g.sendChildResult(ctx, rec, parent, k, profileBatchEndState(*k.BatchEnd), k.BatchEnd.Text, k.BatchEnd.Text)
+				g.sendWithdrawnEnd(ctx, rec, parent, k, profileBatchEndState(*k.BatchEnd), k.BatchEnd.Text, k.BatchEnd.Text)
 			}
 			continue
 		}
@@ -847,9 +847,29 @@ func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionReco
 		if !ok {
 			child = TaskRef{BatchIndex: i}
 		}
-		g.sendChildResult(ctx, rec, parent, child, lib.StateFailed, "", why)
+		g.sendWithdrawnEnd(ctx, rec, parent, child, lib.StateFailed, "", why)
 	}
 }
+
+// sendWithdrawnEnd sends one of a withdrawn batch's ends with a few tries
+// (withRetry), since nothing sends it again: the withdrawal leaves no child
+// for the heal to find, and the parent's mark (DelegationEnd) holds back any
+// later end. One that still fails is logged and lost; the parent's own
+// deadline bounds its wait, as for an end a restart drops.
+func (g *Gateway) sendWithdrawnEnd(ctx context.Context, rec *SessionRecord, parent, child TaskRef, state lib.TaskState, result, reason string) {
+	err := withRetry(kvRetryAttempts, func() error {
+		if g.sendChildResult(ctx, rec, parent, child, state, result, reason) {
+			return nil
+		}
+		return errWithdrawnEndUnsent
+	})
+	if err != nil {
+		g.log.Error("a withdrawn batch's end was not delivered after retries; the parent's deadline bounds its wait",
+			"parent", parent.ID, "entry", child.BatchIndex, "child", child.ID)
+	}
+}
+
+var errWithdrawnEndUnsent = errors.New("withdrawn batch end not sent")
 
 // parentEnded reports whether a task's index entry is gone, which the relay
 // does on the task's terminal. A failed read reports false: the delivery
@@ -871,6 +891,9 @@ func (g *Gateway) publishChildResult(ctx context.Context, rec *SessionRecord, pa
 	}
 	if len(text) > lib.ChildResultTextCap {
 		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
+	}
+	if g.childResultFails != nil && g.childResultFails() {
+		return errors.New("publish: failed by the test hook")
 	}
 	part, err := lib.ChildResultPart(lib.ChildResult{ChildTaskID: child.ID, Addressee: child.Addressee, State: state, Text: text,
 		Entry: child.BatchIndex})

@@ -829,7 +829,9 @@ turn, or an A2A door task cancelled while its turn holds for its cards,
 graded on the question a delegated card paused on, which the board read folds into the reply,
 and the reply-under-pushed-report replays (a report stored for the conversation after the
 opening turn, then the reply sent as a second message on it,
-[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
+[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)),
+and the reply-after-idle replays (the reply sent after an idle wait, on a rehydrated session pod,
+[`bench/kube_agents_bench/idle_reply.py`](../bench/kube_agents_bench/idle_reply.py)).
 A stopped ask runs in the second phase with
 the cases that request a pull request, as does a case that declares `writes_alone: true`,
 with its window marked exclusive like theirs, so a stop
@@ -919,8 +921,9 @@ The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
 project's GitLab repository instead of its GitHub one, in a run of its own beside the GitHub
 presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 `presubmit-cases.txt`: registered cases that grade the forge, a `pull_request_opened` or
-`pull_request_diff_contains` check (a merge request) or a `ledger_issue_contains` check (a ledger
-issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
+`pull_request_diff_contains` check (a merge request), a `ledger_issue_contains` check (a ledger
+issue) or a `forge_issue_state` check (the issue the reply names), since a chat probe passes the
+same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
 (`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode weekly job, around the

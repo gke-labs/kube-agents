@@ -1608,3 +1608,46 @@ func TestAnInteractiveProfileParentsChildIsUntouchedByTheScheduleRules(t *testin
 		})
 	}
 }
+
+// TestAScheduledRunsBatchChildrenCarryTheScheduledMark: each child of a
+// scheduled run's batch carries the mark a single child does, so its own
+// delegation is held to the unattended card check as a single child's is.
+func TestAScheduledRunsBatchChildrenCarryTheScheduledMark(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	tr.g.cfg.DelegationWidthMax = 10
+	ctx := context.Background()
+	reply := tr.submit(t, "schedule", goodScheduleSubmit())
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	var kids []TaskRef
+	waitFor(t, "both children's entries", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		if rec == nil {
+			return false
+		}
+		kids = rec.batchChildren(origin.TaskID)
+		return len(kids) == 2
+	})
+	for _, k := range kids {
+		if k.Tier != string(capability.TierRead) || !k.Scheduled || !k.belowSchedule() {
+			t.Fatalf("batch child %d = tier %q scheduled %v, want read and marked", k.BatchIndex, k.Tier, k.Scheduled)
+		}
+	}
+}

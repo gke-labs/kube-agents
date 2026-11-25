@@ -537,6 +537,11 @@ type HarnessSpec struct {
 	// +optional
 	UniverseDomain string `json:"universeDomain,omitempty"`
 
+	// SessionWorker configures the session pods the gateway spawns for
+	// conversations.
+	// +optional
+	SessionWorker *SessionWorkerSpec `json:"sessionWorker,omitempty"`
+
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
 	Hermes *HermesSpec `json:"hermes,omitempty"`
@@ -3075,6 +3080,25 @@ type AgentStatus struct {
 	// field means, a value an earlier opt-in left is cleared.
 	// +optional
 	EffectiveSessionCap *int `json:"effectiveSessionCap,omitempty"`
+	// InferenceKeys records the inference gateway key Secrets the operator
+	// created. Absent until it creates one, and while the served CRD predates
+	// the field, in which case the operator creates none.
+	// +optional
+	InferenceKeys *InferenceKeysStatus `json:"inferenceKeys,omitempty"`
+}
+
+// InferenceKeysStatus records the inference gateway caller-key Secrets, the
+// probe key Secret and the litellm-caller-keys map Secret the operator
+// created, by name and UID. Those names are reserved for the operator: it
+// uses a Secret at one of them only when its UID is the one recorded here,
+// and replaces any other Secret it finds there. It holds no key and no
+// digest.
+type InferenceKeysStatus struct {
+	// SecretUIDs maps each such Secret's name to the UID it was created with.
+	// A tier key's Secret is in the profile namespace; every other one is in
+	// the PlatformAgent's namespace.
+	// +optional
+	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was
@@ -3938,4 +3962,18 @@ type ManagedRepoEntry struct {
 	// docs/designs/version-control-support.md §6.
 	Type string `json:"type"`
 	URL  string `json:"url"`
+}
+
+// SessionWorkerSpec configures the session pods the A2A gateway spawns.
+type SessionWorkerSpec struct {
+	// Type is the harness the session worker image runs. Absent is
+	// claude-code. The operator passes it to the gateway as
+	// A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
+	// to each session pod as A2A_HARNESS, which the worker adapter's
+	// harness selector reads. It is pod configuration only: no route, bus
+	// subject or permission depends on it. claude-code is the only value
+	// accepted today.
+	// +kubebuilder:validation:Enum=claude-code
+	// +optional
+	Type string `json:"type,omitempty"`
 }

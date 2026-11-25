@@ -50,8 +50,9 @@ terraform {
 
 locals {
   # The apply's waits, as literals. scripts/test_ci_eval_fanout.py holds every
-  # infra-lock-exempt stack's own_wait plus chain_wait under STATE_LOCK_HOLD_SECONDS
-  # (hack/ci-eval-pr.sh), so these two carry those names. This case takes no state lock,
+  # infra-lock-exempt stack's two waits under STATE_LOCK_HOLD_SECONDS
+  # (hack/ci-eval-pr.sh), and reads them as own_wait and chain_wait locals unless it
+  # names others for a case, so these two carry those names. This case takes no state lock,
   # so that bound does not govern it. The rollout comes first; own_wait is the card
   # appearing once the daemon accepts the event, and chain_wait is that card finishing.
   rollout_wait = 180

@@ -30,7 +30,14 @@
 #      forwards TERM, INT and HUP to it; either way its exit code is kubectl's.
 #      On a session pod it never refuses a command for being busy
 #      (KUBECTL_ADMIT_ON_BUSY=run); it refuses only a read larger than the pod
-#      could ever hold. No step follows kubectl in this script.
+#      could ever hold;
+#   3. when the gateway has said kube-proxy is read-only (KUBE_PROXY_MODE) and the
+#      adapter has named a record file (CREDENTIAL_PROXY_REFUSAL_FILE), step 2's
+#      command runs as a child instead of being exec'd, on either path, and after a
+#      non-zero exit the broker client records a write attempt if the argv tried a
+#      change (credential_proxy_client.record_kubectl_write_attempt). It reads the
+#      argv and the exit code, never kubectl's output. Otherwise nothing follows
+#      kubectl.
 # The wrapper exits with kubectl's code.
 #
 # Without KUBE_PROXY_URL, a broker URL sends kubectl to the broker (a profile
@@ -182,6 +189,35 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
   *)
     if [ ! -f "${HOME}/.kube/config" ]; then
       PYTHONDONTWRITEBYTECODE=1 python3 -I "$CLIENT" --ensure-kubectl-context "$@" 2>/dev/null || true
+    fi
+    ;;
+  esac
+  # The write-attempt record (#6816): only when the gateway has said kube-proxy
+  # is read-only (KUBE_PROXY_MODE) and the adapter has named a record file does
+  # kubectl run as a child, on either path below, so its exit code can be read.
+  # The child runs in the foreground: a background job's stdin would be
+  # /dev/null, and `kubectl apply -f -` reads stdin. A stop reaches it anyway,
+  # through the harness's process group, and the admission forwards signals to
+  # a kubectl it runs. After a non-zero exit, the broker client records a write
+  # attempt if the argv tried a change
+  # (credential_proxy_client.record_kubectl_write_attempt). It reads the argv
+  # and the exit code, never kubectl's output. A call that exits 0 starts no
+  # Python here. Otherwise the paths below exec, unchanged.
+  case "${KUBE_PROXY_MODE:-}" in
+  read-only | read-only-dry-run)
+    if [ -n "${CREDENTIAL_PROXY_REFUSAL_FILE:-}" ]; then
+      if all_fast || uncharged "$@"; then
+        "$REAL_KUBECTL" "$@"
+        rc=$?
+      else
+        KUBECTL_ADMIT_RUN_DIR=/tmp/kube-agents-session KUBECTL_ADMIT_GUARD_PATH=/usr/local/libexec/shell-memory-guard KUBECTL_ADMIT_ON_BUSY=run \
+          python3 -I /usr/local/libexec/kubectl-admit "$@"
+        rc=$?
+      fi
+      if [ "$rc" -ne 0 ]; then
+        PYTHONDONTWRITEBYTECODE=1 python3 -I "$CLIENT" --record-kubectl-write-attempt "$rc" "$@" </dev/null || true
+      fi
+      exit "$rc"
     fi
     ;;
   esac

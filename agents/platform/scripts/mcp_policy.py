@@ -101,16 +101,39 @@ GKE_READ_TOOLS = frozenset(
 )
 
 # The gke tools that reach a cluster's Kubernetes API rather than the GKE
-# control plane: the ones spec.scope.exclude.clusters holds the broker to
-# (`k8s_tool_clusters`). The others read the project's clusters, node pools and
-# operations, which an exclusion leaves readable.
+# control plane (`k8s_tool_clusters`).
 GKE_K8S_TOOLS = frozenset(tool for tool in GKE_READ_TOOLS if "_k8s_" in tool)
+# The gke control-plane tools that read one named cluster or its node pools
+# (`metadata_tool_clusters`). spec.scope.exclude.clusters holds these too; a
+# spec.hold, which pauses the agents' reach into a cluster, doesn't. The project-wide ones (list_clusters, the operations) name no
+# cluster and are left as they were.
+GKE_CLUSTER_METADATA_TOOLS = frozenset({"get_cluster", "get_node_pool", "list_node_pools"})
 
 # A cluster's resource name, as the gke server's in-cluster tools take it in
 # `parent` (or `name`), matched whole. A `-` location is every location, not
 # one cluster. RESOURCE_LIKE is what makes a string argument one that has to
 # match it: any spelling of a resource path segment, or a percent escape.
 RESOURCE_LIKE = re.compile(r"(?i)projects|locations|zones|clusters|%")
+# A node pool's resource name, matched whole: a cluster's, then
+# /nodePools/<pool>. get_node_pool takes this; the other cluster-metadata tools
+# take a cluster's (CLUSTER_RESOURCE).
+NODE_POOL_RESOURCE = re.compile(
+    r"projects/(?P<project>(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
+    r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)/nodePools/[a-z0-9][a-z0-9-]*"
+)
+NODE_POOL_TOOL = "get_node_pool"
+# The gke project-wide listing tools whose replies drop excluded clusters
+# (`filter_listing_reply`, #7031), and the list each reply carries.
+GKE_LISTING_TOOLS = {"list_clusters": "clusters", "list_operations": "operations"}
+# Where a listed cluster or operation names its cluster: a cluster's selfLink,
+# an operation's targetLink (a node pool's link names its cluster too).
+LISTING_LINK_KEYS = {"clusters": "selfLink", "operations": "targetLink"}
+LINKED_CLUSTER = re.compile(
+    r"/projects/(?P<project>[^/]+)/(?:locations|zones)/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)(?:/|\Z)"
+)
+# The arguments a cluster-metadata tool names its resource in: get_cluster and
+# get_node_pool take `name`, list_node_pools `parent`.
+METADATA_NAME_ARGUMENTS = ("name", "parent")
 CLUSTER_RESOURCE = re.compile(
     r"projects/(?P<project>(?:[a-z][a-z0-9-]{0,15}:)?[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)"
@@ -443,3 +466,105 @@ def filter_tools_list(server_name: str, body: bytes, allowed: frozenset[str] | N
     ]
     result.pop("nextCursor", None)
     return json.dumps(reply, separators=(",", ":")).encode("utf-8")
+
+
+def metadata_tool_clusters(server_name: str, message: dict[str, Any] | None) -> list[tuple[str, str, str]] | None:
+    """The cluster a gke cluster-metadata tool call names, or None when it isn't one.
+
+    Read from the arguments that carry the resource name (METADATA_NAME_ARGUMENTS),
+    each held whole to its grammar (a node pool's for get_node_pool), so a field
+    mask that names `locations` is left alone. At least one has to be there and
+    every one present has to match; otherwise the list is empty, a call the
+    broker can't tie to a cluster, which the caller refuses while any cluster is
+    excluded. So is a `-` location.
+    """
+    if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict) or params.get("name") not in GKE_CLUSTER_METADATA_TOOLS:
+        return None
+    arguments = params.get("arguments")
+    arguments = arguments if isinstance(arguments, dict) else {}
+    grammar = NODE_POOL_RESOURCE if params.get("name") == NODE_POOL_TOOL else CLUSTER_RESOURCE
+    clusters = []
+    for key in METADATA_NAME_ARGUMENTS:
+        if key not in arguments:
+            continue
+        value = arguments[key]
+        match = grammar.fullmatch(value) if isinstance(value, str) else None
+        if match is None or match["location"] == "-":
+            return []
+        clusters.append((match["project"], match["location"], match["cluster"]))
+    return clusters
+
+
+def filter_listing_reply(tool: str, body: bytes, excluded) -> bytes | None:
+    """A gke listing tool's JSON-RPC reply less the clusters (or the operations on
+    clusters) for which excluded(project, location, cluster) is true, or None
+    when the reply isn't a shape the broker can read, which the caller refuses.
+
+    The server answers in two places, `content[].text` (a JSON document) and
+    `structuredContent`, each holding the list, whose items are JSON objects or
+    JSON strings encoding one. Each is filtered and written back in the form it
+    came in. Every item has to name its cluster through its link; one that
+    doesn't makes the whole reply unreadable. So does a reply with neither
+    carrier, or a carrier without the list: that fails closed, including an empty
+    listing whose server leaves the empty list out.
+    """
+    key = GKE_LISTING_TOOLS.get(tool)
+    if key is None:
+        return body
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return None
+    result = message.get("result") if isinstance(message, dict) else None
+    if not isinstance(result, dict) or result.get("isError"):
+        return body
+
+    def keep(items):
+        if not isinstance(items, list):
+            return None
+        kept = []
+        for item in items:
+            obj = item
+            if isinstance(item, str):
+                try:
+                    obj = json.loads(item)
+                except ValueError:
+                    return None
+            link = obj.get(LISTING_LINK_KEYS[key]) if isinstance(obj, dict) else None
+            match = LINKED_CLUSTER.search(link) if isinstance(link, str) else None
+            if match is None:
+                return None
+            if not excluded(match["project"], match["location"], match["cluster"]):
+                kept.append(item)
+        return kept
+
+    carriers = 0
+    for entry in result.get("content") or []:
+        if not isinstance(entry, dict) or entry.get("type") != "text":
+            return None
+        try:
+            document = json.loads(entry.get("text", ""))
+        except ValueError:
+            return None
+        if not isinstance(document, dict) or key not in document:
+            return None
+        kept = keep(document[key])
+        if kept is None:
+            return None
+        entry["text"] = json.dumps({**document, key: kept}, separators=(",", ":"))
+        carriers += 1
+    structured = result.get("structuredContent")
+    if structured is not None:
+        if not isinstance(structured, dict) or key not in structured:
+            return None
+        kept = keep(structured[key])
+        if kept is None:
+            return None
+        result["structuredContent"] = {**structured, key: kept}
+        carriers += 1
+    if not carriers:
+        return None
+    return json.dumps(message, separators=(",", ":")).encode()

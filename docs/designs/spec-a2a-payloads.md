@@ -816,7 +816,10 @@ so an absent or `0` round reads as one. It is at most 16 (`lib.DelegateRoundsCei
 `round` is negative, past that, or not a number isn't a child result, so a forged end can't put an arbitrary
 round into a parent's dedupe. Nothing sends a round past one yet. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
 gateway's heal next reads the conversation, which also finds a child whose terminal the relay
-missed. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
+missed. If its text passes the ask's retention (`A2A_ASK_TTL`) before that, the end that goes is
+`failed`, saying the result was dropped, with none of the child's text. A withdrawn batch's ends
+are tried a few times on the spot instead, since the withdrawal leaves nothing for the heal to find;
+one that still fails is lost. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
 writes to, so the parent's own deadline is what bounds its wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
 gateway cancels its live children, each with its stop record, since nothing reads their results. A batch child that reaches `input-required` is cancelled and ends
 `canceled`, with its question as `text`. A batch withdrawn whole (cut short, or a child that
@@ -873,8 +876,9 @@ below a scheduled run it lists only profiles that run at `read` and list `unatte
 delegation holds it to; a parent the delegation refuses outright (at the depth cap, or with no scope
 on its record) gets an empty list. A scheduled run of a delegating profile carries the part too, built
 the same way when the trigger ingress submits it, so a run can fan out to what it lists. The
-checks that read a cluster the worker will choose for a target-taking profile (in scope, pinned
-profiles' tiers) wait for the delegation. Every other profile submission carries no part and is
+checks that read a cluster the worker will choose for a target-taking profile (in scope, and a
+profile pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the
+delegation. Every other profile submission carries no part and is
 unchanged, and a worker that predates the part ignores it.
 
 - A name is an addressee (a subject token). A description is one line of at most 200 bytes, cut by
