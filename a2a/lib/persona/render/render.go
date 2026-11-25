@@ -23,7 +23,7 @@ func For(h persona.Harness) (persona.Adapter, error) {
 	switch h {
 	case persona.ClaudeCode:
 		return claudecode.Adapter{}, nil
-	case persona.Antigravity, persona.CoreAgent:
+	case persona.Antigravity:
 		return nil, fmt.Errorf("harness %q has no persona adapter yet", h)
 	case persona.CoreAgent:
 		return coreagent.Adapter{}, nil
