@@ -54,6 +54,7 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	refusalLog = stderr
 	// Non-dumpable before anything else: a same-UID command the turn runs
 	// can then neither read this process's memory or environ nor open its
 	// /proc/<pid>/fd. That covers this end of the stdout pipe only; the
