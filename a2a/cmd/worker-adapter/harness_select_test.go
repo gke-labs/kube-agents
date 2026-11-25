@@ -25,14 +25,14 @@ func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 		want    persona.Harness
 		wantErr string
 	}{
-		{"unset", nil, "", "no harness is available in this worker image"},
+		{"unset is core-agent", nil, persona.CoreAgent, ""},
 		{"claude on a session pod", map[string]string{lib.EnvHarness: "claude-code"}, "", "the claude-code harness was removed"},
 		{"claude on a profile worker", map[string]string{lib.EnvHarness: "claude-code", lib.EnvProfileWorker: "true"}, "", "the claude-code harness was removed"},
 		{"the older name on a profile worker", map[string]string{lib.EnvProfileHarness: "claude-code", lib.EnvProfileWorker: "true"}, "", "the claude-code harness was removed"},
-		{"the older name on a session pod is not read", map[string]string{lib.EnvProfileHarness: "antigravity"}, "", "no harness is available in this worker image"},
+		{"the older name on a session pod is not read", map[string]string{lib.EnvProfileHarness: "antigravity"}, persona.CoreAgent, ""},
 		{"the new name wins over the older", map[string]string{lib.EnvHarness: "claude-code", lib.EnvProfileHarness: "antigravity", lib.EnvProfileWorker: "true"}, "", "the claude-code harness was removed"},
 		{"a whole-argv override doesn't bring claude back", map[string]string{lib.EnvHarness: "claude-code", "A2A_HARNESS_CMD": "stub"}, "", "the claude-code harness was removed"},
-		{"a whole-argv override doesn't stand in for a harness", map[string]string{"A2A_HARNESS_CMD": "stub"}, "", "no harness is available in this worker image"},
+		{"a whole-argv override doesn't change the harness", map[string]string{"A2A_HARNESS_CMD": "stub"}, persona.CoreAgent, ""},
 		{"antigravity without the isolation waiver", map[string]string{lib.EnvHarness: "antigravity", "A2A_HARNESS_PATH": "/bin/agy"}, "", `harness "antigravity" runs without its isolation until #6710`},
 		{"antigravity through the older name without the waiver", map[string]string{lib.EnvProfileHarness: "antigravity", lib.EnvProfileWorker: "true", "A2A_HARNESS_PATH": "/bin/agy"}, "", `harness "antigravity" runs without its isolation until #6710`},
 		{"the waiver is the literal allow", map[string]string{lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: "true", "A2A_HARNESS_PATH": "/bin/agy"}, "", `A2A_HARNESS_UNISOLATED=allow`},
@@ -99,11 +99,9 @@ func TestAWorkerWhoseHarnessItCantRunRefusesToStart(t *testing.T) {
 
 	was := activeHarness
 	t.Cleanup(func() { activeHarness = was })
-	for _, h := range []string{"", "claude-code"} {
-		t.Setenv(lib.EnvHarness, h)
-		if _, ok := configFromEnv(log); ok {
-			t.Errorf("configFromEnv started with %s=%q; the worker image carries no harness for it", lib.EnvHarness, h)
-		}
+	t.Setenv(lib.EnvHarness, "claude-code")
+	if _, ok := configFromEnv(log); ok {
+		t.Errorf("configFromEnv started with %s=claude-code; the worker image no longer carries it", lib.EnvHarness)
 	}
 }
 
