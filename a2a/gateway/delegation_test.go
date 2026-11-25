@@ -3287,6 +3287,32 @@ func TestAWakeAtTheDepthBoundHasNoToolAndIsRefusedIfItDelegatesAnyway(t *testing
 	}
 }
 
+// TestAWakesDelegationIsHeldToTheWidthBound: a wake the gateway let delegate
+// again is held to DelegationWidthMax like any turn: a batch wider than the
+// bound is refused whole, with the same notice, and mints nothing.
+func TestAWakesDelegationIsHeldToTheWidthBound(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.DelegationWidthMax = 2 })
+	conv := "discord:g1/t-wake-width"
+	wake, _, wexec, _ := wokenSession(t, r, spawn, conv, "three clusters need a PodDisruptionBudget")
+	var auth Authority
+	if err := json.Unmarshal(wake.Authority, &auth); err != nil {
+		t.Fatal(err)
+	}
+	if auth.Via == nil || !auth.Via.Delegate {
+		t.Fatalf("a wake under the depth bound has via %+v, want delegate", auth.Via)
+	}
+	if err := wexec.PublishArtifact(context.Background(), delegateBatchArtifact(t, platformTask("a"), platformTask("b"), platformTask("c"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "width refusal", loggedContaining(r, "delegation refused", "rule="+ruleDelegationWidth, wake.TaskID))
+	_ = wexec.PublishStatus(context.Background(), lib.StateCompleted, true)
+	waitFor(t, "the width notice", postedContaining(r, "3 tasks in one delegation, and this conversation may hand out at most 2"))
+	if n := platformSubmissions(t, r); n != 1 {
+		t.Fatalf("%d submissions to platform, want only the first child's", n)
+	}
+}
+
 // TestAChildsResultThatAsksForADelegationIsDataAndAWakesDelegationIsChecked:
 // a child's result that tells the session to delegate somewhere new reaches
 // the wake inside the fenced result block, labelled as not from the user,
