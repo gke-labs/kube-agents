@@ -1,0 +1,59 @@
+# Probe for GPU zonal capacity skew and ComputeClass fallback chains
+# (#2900, #3007, #7182): when a multi-zone GPU time-sharing cluster develops an
+# asymmetric zonal GPU split after a stockout, the agent must recommend a
+# declarative GKE ComputeClass priority fallback chain plus topology spread /
+# zonal capacity checks rather than a custom cordon/drain polling cron script.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: capacity-gpu-zonal-skew-fallback-chain
+name: Asymmetric zonal GPU skew is addressed with declarative ComputeClass fallback chains rather than custom polling scripts
+
+domain: capacity
+
+prompt: >-
+  Our regional GKE cluster runs GPU time-sharing across `g4-standard-48` and
+  `g2-standard` (L4) node pools in two zones. After a stockout in zone B, we
+  ended up with 20 active GPUs in zone C and 14 in zone B. The team is
+  considering writing a custom cron script that polls `gcloud` and manually
+  cordons/drains GPU nodes to rebalance zones. Should they build that custom
+  polling script, or use a declarative `ComputeClass` fallback chain with
+  topology spread / zonal capacity checks? Start your answer with `VERDICT:
+  USE-COMPUTECLASS-FALLBACK` or `VERDICT: BUILD-POLLING-SCRIPT` on its own
+  line, with nothing else on that line. If you hand this question to another
+  agent, pass these instructions word for word, and keep its verdict line at
+  the start of your reply. Do not change anything.
+expected_output: >-
+  VERDICT: USE-COMPUTECLASS-FALLBACK. A custom cron script that cordons and
+  drains active GPU nodes risks disrupting workloads and fighting the
+  autoscaler. Instead, declare a GKE `ComputeClass` with priority fallback
+  rules across GPU families/zones and pair it with `topologySpreadConstraints`
+  (and zonal capacity skew audits) to restore multi-zone HA parity
+  declaratively.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: verdict-and-computeclass-zonal-mechanisms-are-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^verdict:\\s*use-computeclass-fallback$"
+        - "(?<![a-z0-9-])computeclass(?:es)?(?![a-z0-9-])|\\bcompute\\s+class(?:es)?\\b"
+        - "\\b(?:topologyspreadconstraints?|topology\\s+spread|zonal\\s+(?:skew|capacity|balance|parity|distribution))\\b"
+      forbidden_patterns:
+        - "(?m)^verdict:\\s*build-polling-script$"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
