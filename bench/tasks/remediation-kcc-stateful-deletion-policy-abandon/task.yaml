@@ -56,9 +56,10 @@ verification_spec:
         - "(?m)^verdict:\\s*missing-safeguards$"
         - "cnrm\\.cloud\\.google\\.com/deletion-policy"
         - "(?<![a-z0-9-])abandon(?![a-z0-9-])"
-        - "ipv4enabled\\s*:\\s*false|\\bprivate\\s+(?:ip|network)\\b|\\bdisable\\s+(?:public\\s+)?ipv4\\b"
+        - '["'']?ipv4enabled["'']?\s*:\s*["'']?false["'']?|\bprivatenetworkref\b|\bprivate\s+(?:(?:vpc|sql)\s+)?(?:ipv4|ip|network(?:ing)?)\b|\bdisabl(?:e|ing)\s+(?:public\s+)?ipv4\b'
       forbidden_patterns:
         - "(?m)^verdict:\\s*safe-to-merge$"
+        - "\\bprivate\\s+(?:ip|network(?:ing)?)\\s+(?:is\\s+)?not\\s+(?:needed|required)\\b"
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic

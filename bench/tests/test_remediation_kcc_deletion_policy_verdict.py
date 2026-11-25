@@ -57,3 +57,21 @@ def test_rejects_missing_abandon_annotation():
         "Set `ipv4Enabled: false` for private networking."
     )
     assert not _passes(report)
+
+
+def test_accepts_private_network_ref_and_vpc_prose():
+    report = (
+        "VERDICT: MISSING-SAFEGUARDS\n\n"
+        "Add `cnrm.cloud.google.com/deletion-policy: abandon` and configure "
+        "`privateNetworkRef` on a private VPC network while disabling public IPv4."
+    )
+    assert _passes(report)
+
+
+def test_rejects_dismissed_private_ip():
+    report = (
+        "VERDICT: MISSING-SAFEGUARDS\n\n"
+        "Add `cnrm.cloud.google.com/deletion-policy: abandon`. "
+        "A private IP is not needed here; `ipv4Enabled: true` is fine."
+    )
+    assert not _passes(report)
