@@ -131,16 +131,29 @@ func loadCleanCopy(dir string, rels []string) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
+	// Both sides through os.Root, so a listed path can't leave either tree.
+	src, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenRoot(tmp)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
 	for _, rel := range rels {
-		data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+		name := filepath.FromSlash(rel)
+		data, err := src.ReadFile(name)
 		if err != nil {
 			return err
 		}
-		dst := filepath.Join(tmp, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
+		if parent := filepath.Dir(name); parent != "." {
+			if err := dst.MkdirAll(parent, 0o700); err != nil {
+				return err
+			}
 		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
+		if err := dst.WriteFile(name, data, 0o600); err != nil {
 			return err
 		}
 	}

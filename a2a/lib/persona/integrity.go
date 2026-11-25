@@ -374,7 +374,7 @@ func WriteIntegrityManifestOf(dir string, rels []string) error {
 			return err
 		}
 		data, err := readRegular(f)
-		f.Close()
+		_ = f.Close() // read-only; readRegular's error is the one that matters
 		if err != nil {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
@@ -405,7 +405,7 @@ func writeManifestFile(dir string, files map[string][]byte) error {
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(FormatIntegrityManifest(files)); err != nil {
-		tmp.Close()
+		_ = tmp.Close() // the write error is the one to report; the temp file is removed either way
 		return err
 	}
 	if err := tmp.Close(); err != nil {
