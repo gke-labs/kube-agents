@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Fifty-eight fixtures: fifty-one across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Fifty-nine fixtures: fifty-two across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the sixteen seeded namespaces `seeded-debug`,
@@ -181,6 +181,7 @@ its roles are never published.
 | `multi-process-container`           | a       | 0   | `deployment/multi-process-worker` in `seeded-shapes`, two forked workers under one 32Mi limit                                                                                                                                                                                                                                                 |
 | `node-image-coupled-agent`          | a       | 0   | `daemonset/cni-shaped-agent` in `seeded-shapes`, host networking plus `/etc/cni/net.d` mounted read-only                                                                                                                                                                                                                                      |
 | `cuda-pinned-gpu-job`               | a       | 0   | `cronjob/cuda-pinned-trainer` in `seeded-shapes`, suspended, one `nvidia.com/gpu` on an `nvidia-l4` selector with a CUDA 12.2 image                                                                                                                                                                                                           |
+| `state-sync-controller`             | a       | 0   | `deployment/state-sync-controller` in `seeded-shapes`, one replica passing `--qps=0`, `--burst=0` and `--sync-period=100ms` to an inert sleep process                                                                                                                                                                                         |
 | `scaled-zero-gateway`               | a       | 0   | `deployment/storefront` and its Gateway's proxy Deployment in `seeded-scaled-zero` at replicas 0, Gateway `storefront-edge` reporting Programmed=False (NoResources), no controller                                                                                                                                                           |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
@@ -302,13 +303,13 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` (or, for a finished Job, on `status.completionTime`) returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-six of the fifty-one are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Forty-seven of the fifty-two are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `cpu-burst-and-flat`, `declared-single-zone-pool`, `missing-reservation-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
-`cuda-pinned-gpu-job`), `default-pool-headroom`, `config-connector-namespaced`, `scaled-zero-gateway` and the eight roles of the ComputeClass fixtures on slot `c` (`untargeted-compute-class-workload`, `compute-class-affinity-workload`, `compute-class-toleration-workload`, `untainted-compute-class-pool`, `manual-pools-compute-class`, `missing-reservation-compute-class`, `no-nodelocal-dnscache`, `no-ephemeral-limit-workload`), covering
+`cuda-pinned-gpu-job`), `state-sync-controller`, `default-pool-headroom`, `config-connector-namespaced`, `scaled-zero-gateway` and the eight roles of the ComputeClass fixtures on slot `c` (`untargeted-compute-class-workload`, `compute-class-affinity-workload`, `compute-class-toleration-workload`, `untainted-compute-class-pool`, `manual-pools-compute-class`, `missing-reservation-compute-class`, `no-nodelocal-dnscache`, `no-ephemeral-limit-workload`), covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
 API deprecation, zonal skew, the upgrade-failure shapes and the stall watch between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail

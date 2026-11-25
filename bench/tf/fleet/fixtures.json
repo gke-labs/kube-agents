@@ -1595,6 +1595,48 @@
         }
       ]
     },
+    "state-sync-controller": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/state-sync-controller"],
+      "fixture": "state-sync-controller Deployment (one replica) in seeded-shapes whose container startup arguments pass --qps=0, --burst=0 and --sync-period=100ms to an inert sleep process, planting the controller client rate-limit bypass and sub-second ConfigMap/Lease sync shape for apiserver-configmap-lease-write-storm without generating API server write load",
+      "state": [
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the fixture is a running controller Deployment; a scaled-down or unscheduled pod is not an active controller shape"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready while the new pod waits; the controller omits unavailableReplicas when every replica is available"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "spec.template.spec.containers[*].args[*]",
+          "op": "any_eq",
+          "value": "--qps=0",
+          "why": "--qps=0 disables client-side Kubernetes API rate limiting, the primary flag apiserver-configmap-lease-write-storm inspects"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "spec.template.spec.containers[*].args[*]",
+          "op": "any_eq",
+          "value": "--burst=0",
+          "why": "--burst=0 pairs with --qps=0 in the planted rate-limit bypass shape"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "spec.template.spec.containers[*].args[*]",
+          "op": "any_eq",
+          "value": "--sync-period=100ms",
+          "why": "--sync-period=100ms plants the sub-second ConfigMap/Lease sync loop without executing live API writes"
+        }
+      ]
+    },
     "scaled-zero-gateway": {
       "cluster_slot": "a",
       "namespace": "seeded-scaled-zero",
