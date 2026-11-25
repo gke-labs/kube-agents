@@ -74,7 +74,7 @@ func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
 	if len(b) > coreagentwire.MaxEnvelopeBytes {
 		return nil, fmt.Errorf("the conversation's history is over %d bytes", coreagentwire.MaxEnvelopeBytes)
 	}
-	return append(b, '\n'), nil
+	return b, nil
 }
 
 func (d coreAgentDriver) NewDecoder() Decoder { return &coreAgentDecoder{conv: d.conv} }
@@ -101,9 +101,18 @@ func (coreAgentDriver) ConfiguresMCP([]string) bool { return false }
 // ConfigDirEnv is empty: the harness reads no config directory.
 func (coreAgentDriver) ConfigDirEnv(string) string { return "" }
 
-// PrepareTurn checks nothing yet (SEAM: tigerteam-dev-3 and dev-2: the
-// persona directory check before each spawn).
-func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return nil }
+// PrepareTurn runs before every core-agent process starts, the first
+// included: the adapter is the container's init and nothing an earlier turn
+// started is still alive (checkTurnBoundary). Each process exits at its
+// turn's end and killLeftovers ends whatever it left, so a process still
+// alive here is one that kill could not reach.
+func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return checkTurnBoundary() }
+
+// RestartsPerTurn is true: core-agent runs one user turn per process. A
+// steer held during a turn starts a fresh process that resumes the
+// conversation from the history the adapter holds, after the last process
+// and everything it started are gone.
+func (coreAgentDriver) RestartsPerTurn() bool { return true }
 
 // HoldsSteers: a steer waits for the turn to end; core-agent has no way in
 // mid-turn short of interrupting it.
@@ -115,6 +124,11 @@ type coreAgentDecoder struct {
 	conv    *coreAgentConversations
 	model   string
 	session string
+	// inited and ended bound the turn: one init, then events, then one
+	// result. A line outside that order (a second init, an event before
+	// init or after the result) is ignored, so nothing written into the
+	// stream out of order reaches the conversation's history.
+	inited, ended bool
 }
 
 func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
@@ -124,10 +138,14 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	}
 	switch ln.Type {
 	case coreagentwire.TypeInit:
+		if d.inited {
+			return nil, nil
+		}
+		d.inited = true
 		d.model, d.session = ln.Model, ln.Session
 		return []Event{{Kind: EventInit, Session: ln.Session, Model: ln.Model}}, nil
 	case coreagentwire.TypeEvent:
-		if d.conv != nil && d.session != "" && len(ln.Event) > 0 {
+		if d.inited && !d.ended && d.conv != nil && d.session != "" && len(ln.Event) > 0 {
 			d.conv.mu.Lock()
 			d.conv.history[d.session] = append(d.conv.history[d.session], ln.Event)
 			d.conv.mu.Unlock()
@@ -142,6 +160,10 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	case coreagentwire.TypeToolResult:
 		return []Event{{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}}, nil
 	case coreagentwire.TypeResult:
+		if d.ended {
+			return nil, nil
+		}
+		d.ended = true
 		ev := Event{Kind: EventResult, Text: ln.Text, Telemetry: resultTelemetry{usage: lib.Usage{Model: d.model}}}
 		if ln.Usage != nil {
 			ev.Telemetry.usage.InputTokens = int64(ln.Usage.Input)
