@@ -29,11 +29,11 @@ var (
 		"LC_",               // locale
 		"CREDENTIAL_PROXY_", // the broker-routed tools (see above)
 	}
-	// Each name past KUBECONFIG is one a tool wrapper in the image reads,
+	// Each name past KUBECONFIG is one a tool file in the image reads,
 	// listed by name rather than by prefix, so a variable added later under
-	// the same prefix is withheld until someone reviews it
-	// (TestToolChildrenGetWhatTheToolWrappersRead ties the list to the
-	// wrappers' source).
+	// the same prefix is withheld until someone reviews it.
+	// TestEveryVariableAToolFileReadsReachesToolChildren scans those files
+	// and fails on a name that is neither here nor withheld with a reason.
 	toolChildAllowedNames = []string{
 		"PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "HOSTNAME",
 		"LANG", "LANGUAGE", "TERM", "TZ",
@@ -47,8 +47,16 @@ var (
 		"SANDBOX_MEMORY_LIMIT_BYTES",
 		// the VCS tools (vcs_client.py)
 		"KUBE_AGENTS_LOCAL_GIT", "KUBE_AGENTS_VCS_AUTHOR_NAME", "KUBE_AGENTS_VCS_ROOT", "KUBE_AGENTS_VCS_TTL_HOURS",
-		// read by credential_proxy_client.py
-		"HERMES_HOME",
+		// read by credential_proxy_client.py: the Google universe domain the
+		// broker-routed gcloud and API calls use, and the session ids it
+		// attributes a call to
+		"GOOGLE_CLOUD_UNIVERSE_DOMAIN", "CLOUDSDK_CORE_UNIVERSE_DOMAIN",
+		"HERMES_HOME", "HERMES_CRON_RUN", "HERMES_KANBAN_TASK", "HERMES_SESSION_ID",
+		// read by vcs_readings.py: the commit author and the forge app id
+		"KUBE_AGENTS_VCS_AUTHOR_EMAIL", "GITHUB_APP_ID",
+		// read by the fleet-audit skill's audit_report.py
+		"FLEET_AUDIT_GITOPS_ROOT", "FLEET_AUDIT_LEDGER_SCOPE", "FLEET_AUDIT_REPORTS_DIR", "FLEET_AUDIT_SCRATCH_DIR",
+		"GKE_PROJECT_ID", "GKE_CLUSTER_NAME", "GKE_LOCATION", "KUBEAGENTS_AUDIT_AUTO_PROMOTE",
 	}
 )
 
