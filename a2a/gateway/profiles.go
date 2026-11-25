@@ -106,7 +106,7 @@ const (
 	noticeDelegationRefusedFor = "⚠️ delegation refused: "
 	// noticeDelegationNotStarted begins a profile parent's word that its
 	// request was accepted but started no child (#4860).
-	noticeDelegationNotStarted = "⚠️ delegation not started: "
+	noticeDelegationNotStarted = "⚠️ delegation didn't start: "
 	// noticeProfileDoesNotDelegate refuses a task of a profile whose card
 	// doesn't say it delegates (AgentProfile spec.delegates, #6789).
 	noticeProfileDoesNotDelegate = "%s isn't set up to hand tasks on"
