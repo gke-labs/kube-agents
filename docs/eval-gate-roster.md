@@ -829,7 +829,9 @@ turn, or an A2A door task cancelled while its turn holds for its cards,
 graded on the question a delegated card paused on, which the board read folds into the reply,
 and the reply-under-pushed-report replays (a report stored for the conversation after the
 opening turn, then the reply sent as a second message on it,
-[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
+[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)),
+and the reply-after-idle replays (the reply sent after an idle wait, on a rehydrated session pod,
+[`bench/kube_agents_bench/idle_reply.py`](../bench/kube_agents_bench/idle_reply.py)).
 A stopped ask runs in the second phase with
 the cases that request a pull request, as does a case that declares `writes_alone: true`,
 with its window marked exclusive like theirs, so a stop

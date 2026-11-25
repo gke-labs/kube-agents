@@ -611,5 +611,264 @@ class BrokerStartUniverseCheckTest(EnvironmentRestoredTestCase):
         self.assertIn("googleapis.com", last["exception"])
 
 
+class EndOfTest(BaseException):
+    """Ends the recheck loop from a test's `sleep`. Not an `Exception`: the loop logs those and continues."""
+
+
+class BrokerUniverseRecheckTest(EnvironmentRestoredTestCase):
+    """A broker that started with the value unchecked asks the metadata server again
+    until it answers, and stops when the answer differs."""
+
+    def start_check(self, answers) -> bool:
+        with mock.patch.object(credential_proxy, "probe_gce_universe_domain_answer", side_effect=list(answers)):
+            return credential_proxy.check_universe_domain_against_metadata(CUSTOM_UNIVERSE, sleep=lambda _s: None)
+
+    def recheck(self, answers, pauses_allowed=None, stopped=None):
+        """Run the loop with the metadata server giving `answers` in turn (an exception
+        instance is raised); return (the texts `stop` got, the pauses slept). A test that
+        ends the loop from its `sleep` gives `stopped` and reads it after."""
+        pending = list(answers)
+        stopped = [] if stopped is None else stopped
+        pauses = []
+        # One pause goes before each try, so a loop that pauses again after the last
+        # answer did not end where it must.
+        limit = len(pending) if pauses_allowed is None else pauses_allowed
+
+        def probe(*_args, **_kwargs):
+            answer = pending.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        def sleep(seconds):
+            if len(pauses) >= limit:
+                raise EndOfTest
+            pauses.append(seconds)
+
+        with mock.patch.object(credential_proxy, "probe_gce_universe_domain_answer", side_effect=probe):
+            credential_proxy.recheck_universe_domain(CUSTOM_UNIVERSE, sleep=sleep, stop=stopped.append)
+        self.assertEqual([], pending, "the loop ended before it read each answer")
+        return stopped, pauses
+
+    def test_the_start_check_says_if_the_metadata_server_answered(self) -> None:
+        silent = [(None, False)] * credential_proxy.UNIVERSE_CHECK_ATTEMPTS
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertIs(False, self.start_check(silent))
+            # No universe route is an answer: nothing is left to ask again.
+            self.assertIs(True, self.start_check([(None, True)]))
+        self.assertIs(True, self.start_check([(CUSTOM_UNIVERSE, True)]))
+
+    def test_a_later_answer_that_differs_stops_the_broker_with_the_error_of_the_start(self) -> None:
+        with self.assertRaises(RuntimeError) as at_start:
+            self.start_check([("googleapis.com", True)])
+        stopped, pauses = self.recheck([(None, False), (None, False), ("googleapis.com", True)])
+        self.assertEqual([str(at_start.exception)], stopped)
+        self.assertIn(repr(CUSTOM_UNIVERSE), stopped[0])
+        self.assertIn(repr("googleapis.com"), stopped[0])
+        self.assertIn("GOOGLE_CLOUD_UNIVERSE_DOMAIN", stopped[0])
+        self.assertEqual([credential_proxy.UNIVERSE_RECHECK_PAUSE_SECONDS] * 3, pauses)
+
+    def test_a_later_answer_that_agrees_ends_the_loop_and_stops_nothing(self) -> None:
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            stopped, pauses = self.recheck([(None, False), (CUSTOM_UNIVERSE, True)])
+        self.assertEqual(([], 2), (stopped, len(pauses)))
+        self.assertEqual(["INFO"], [record.levelname for record in logs.records])
+        self.assertIn(CUSTOM_UNIVERSE, logs.records[0].getMessage())
+
+    def test_a_later_answer_with_no_universe_route_ends_the_loop_and_says_the_value_was_not_checked(self) -> None:
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            stopped, pauses = self.recheck([(None, False), (None, True)])
+        self.assertEqual(([], 2), (stopped, len(pauses)))
+        self.assertEqual(1, len(logs.records))
+        self.assertIn("not checked", logs.records[0].getMessage())
+
+    def test_a_host_with_no_metadata_server_is_asked_again_at_each_pause_and_never_stops(self) -> None:
+        tries = 25
+        stopped: list[str] = []
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"), self.assertRaises(EndOfTest):
+            self.recheck([(None, False)] * tries, pauses_allowed=tries, stopped=stopped)
+        self.assertEqual([], stopped)
+
+    def test_a_fault_in_one_try_is_logged_and_the_loop_asks_again(self) -> None:
+        """Only an answer that differs stops the broker: a fault in the probe is not one."""
+        with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+            stopped, pauses = self.recheck([RuntimeError("a fault"), (None, False), ("googleapis.com", True)])
+        self.assertEqual(1, len(stopped))
+        self.assertEqual(3, len(pauses))
+        self.assertEqual(1, len([record for record in logs.records if record.levelname == "ERROR"]))
+
+    def test_the_stop_writes_the_error_and_ends_the_process_at_once(self) -> None:
+        """In a new interpreter: one CRITICAL record with the text, exit code 1, and no
+        drain: the SIGTERM handler and the exit hooks do not run."""
+        launcher = (
+            "import atexit, signal, sys, credential_proxy\n"
+            "credential_proxy.configure_logging()\n"
+            "signal.signal(signal.SIGTERM, lambda *_: print('a drain started', flush=True))\n"
+            "atexit.register(lambda: print('an exit hook ran', flush=True))\n"
+            "credential_proxy.end_broker_for_universe_contradiction('the error with both values')\n"
+            "print('the process continued', flush=True)\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", launcher],
+            env={"PATH": os.environ.get("PATH", "")}, cwd=str(Path(credential_proxy.__file__).parent),
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stderr)
+        lines = completed.stdout.splitlines()
+        self.assertEqual(1, len(lines), completed.stdout)
+        record = json.loads(lines[0])
+        self.assertEqual("CRITICAL", record["severity"])
+        self.assertIn("the error with both values", record["message"])
+
+    def test_the_stop_flushes_a_handler_that_holds_its_records(self) -> None:
+        """The process ends with no exit hook, so the stop itself flushes: a handler that
+        writes a record only at its flush still gets the error out."""
+        launcher = (
+            "import logging, logging.handlers, sys, credential_proxy\n"
+            "target = logging.StreamHandler(sys.stdout)\n"
+            "holds = logging.handlers.MemoryHandler(1000, flushLevel=logging.CRITICAL + 1, target=target)\n"
+            "credential_proxy.LOGGER.addHandler(holds)\n"
+            "credential_proxy.end_broker_for_universe_contradiction('the error with both values')\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", launcher],
+            env={"PATH": os.environ.get("PATH", "")}, cwd=str(Path(credential_proxy.__file__).parent),
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stderr)
+        self.assertIn("the error with both values", completed.stdout)
+
+    def test_the_stop_ends_the_process_when_the_record_cannot_be_written(self) -> None:
+        """A flush that raises, and a log write that does not return because another
+        thread holds the handler's lock: the process still ends with the status of a
+        start that failed, and does not go on."""
+        # The stop runs on a thread, as in the broker, and its timer is out of reach: a
+        # raise that ended only the thread would let the process go on.
+        raises = (
+            "import logging, sys, threading, credential_proxy\n"
+            "credential_proxy.UNIVERSE_STOP_LOG_SECONDS = 600\n"
+            "class Raises(logging.Handler):\n"
+            "    def emit(self, record):\n"
+            "        pass\n"
+            "    def flush(self):\n"
+            "        raise RuntimeError('the flush failed')\n"
+            "credential_proxy.LOGGER.addHandler(Raises())\n"
+            "stop = credential_proxy.end_broker_for_universe_contradiction\n"
+            "thread = threading.Thread(target=stop, args=('the error',), daemon=True)\n"
+            "thread.start()\n"
+            "thread.join(10)\n"
+            "print('the process continued', flush=True)\n"
+        )
+        held = (
+            "import logging, sys, threading, credential_proxy\n"
+            "credential_proxy.UNIVERSE_STOP_LOG_SECONDS = 0.2\n"
+            "handler = logging.StreamHandler(sys.stdout)\n"
+            "credential_proxy.LOGGER.addHandler(handler)\n"
+            "taken = threading.Event()\n"
+            "def hold():\n"
+            "    handler.acquire()\n"
+            "    taken.set()\n"
+            "    threading.Event().wait()\n"
+            "threading.Thread(target=hold, daemon=True).start()\n"
+            "taken.wait()\n"
+            "credential_proxy.end_broker_for_universe_contradiction('the error')\n"
+            "print('the process continued', flush=True)\n"
+        )
+        for name, launcher in (("a flush that raises", raises), ("a lock that another thread holds", held)):
+            with self.subTest(log=name):
+                completed = subprocess.run(
+                    [sys.executable, "-c", launcher],
+                    env={"PATH": os.environ.get("PATH", "")}, cwd=str(Path(credential_proxy.__file__).parent),
+                    capture_output=True, text=True, timeout=60, check=False,
+                )
+                self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stderr)
+                self.assertNotIn("the process continued", completed.stdout)
+
+    def start_broker(self, launcher: str, universe_domain: str = "clients6.google.com") -> subprocess.CompletedProcess:
+        """The real entry point in a new interpreter, with `launcher` as its stand-ins.
+        Each launcher takes the start over right after the universe check, so the broker
+        opens no listener."""
+        with tempfile.TemporaryDirectory() as temp:
+            policy = Path(temp) / "policy.json"
+            policy.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+            environment = {"PATH": os.environ.get("PATH", ""), "GOOGLE_CLOUD_UNIVERSE_DOMAIN": universe_domain}
+            return subprocess.run(
+                [sys.executable, "-c", launcher, "--policy", str(policy), "--unix-socket", str(Path(temp) / "broker.sock"),
+                 "--state-dir", str(Path(temp) / "state")],
+                env=environment, cwd=str(Path(credential_proxy.__file__).parent),
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+
+    def test_the_start_runs_the_loop_only_after_a_start_with_no_answer(self) -> None:
+        """`serve` calls `resolve_universe_domain` right after the check. The stand-in for
+        it says if the loop's thread runs, and ends the start."""
+        launcher = (
+            "import json, sys, threading, credential_proxy\n"
+            "credential_proxy.UNIVERSE_CHECK_PAUSE_SECONDS = 0\n"
+            "credential_proxy.probe_gce_universe_domain_answer = lambda *a, **k: ANSWER\n"
+            "def after_the_check(**_):\n"
+            "    names = [thread.name for thread in threading.enumerate()]\n"
+            "    print(json.dumps({'loop': credential_proxy.UNIVERSE_RECHECK_THREAD_NAME in names}), flush=True)\n"
+            "    raise SystemExit(0)\n"
+            "credential_proxy.resolve_universe_domain = after_the_check\n"
+            "sys.exit(credential_proxy.main())\n"
+        )
+        cases = (
+            ("no answer", "(None, False)", True),
+            ("the same value", "('clients6.google.com', True)", False),
+            ("no universe route", "(None, True)", False),
+        )
+        for name, answer, loop in cases:
+            with self.subTest(answer=name):
+                completed = self.start_broker(launcher.replace("ANSWER", answer))
+                self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+                self.assertEqual({"loop": loop}, json.loads(completed.stdout.splitlines()[-1]))
+
+    def test_the_start_gives_the_loop_the_value_as_the_start_check_read_it(self) -> None:
+        """The loop compares with the metadata server's answer, which is in lower case
+        with no dot at its end. The variable here is not; the loop gets the value in that form."""
+        launcher = (
+            "import json, sys, credential_proxy\n"
+            "credential_proxy.UNIVERSE_CHECK_PAUSE_SECONDS = 0\n"
+            "credential_proxy.probe_gce_universe_domain_answer = lambda *a, **k: (None, False)\n"
+            "credential_proxy.start_universe_recheck = lambda configured: print(json.dumps({'loop': configured}), flush=True)\n"
+            "def after_the_check(**_):\n"
+            "    raise SystemExit(0)\n"
+            "credential_proxy.resolve_universe_domain = after_the_check\n"
+            "sys.exit(credential_proxy.main())\n"
+        )
+        completed = self.start_broker(launcher, universe_domain="Clients6.Google.COM.")
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        self.assertEqual({"loop": "clients6.google.com"}, json.loads(completed.stdout.splitlines()[-1]))
+
+    def test_a_broker_that_started_unchecked_stops_when_the_answer_differs(self) -> None:
+        """The metadata server gives no answer during the start check, and then the
+        commercial domain. The main thread waits in the stand-in for the next step of the
+        start, so only the loop can end the process."""
+        launcher = (
+            "import sys, threading, credential_proxy\n"
+            "credential_proxy.UNIVERSE_CHECK_PAUSE_SECONDS = 0\n"
+            "credential_proxy.UNIVERSE_RECHECK_PAUSE_SECONDS = 0.05\n"
+            "asked = []\n"
+            "def answer(*a, **k):\n"
+            "    asked.append(1)\n"
+            "    silent = len(asked) <= credential_proxy.UNIVERSE_CHECK_ATTEMPTS\n"
+            "    return (None, False) if silent else ('googleapis.com', True)\n"
+            "credential_proxy.probe_gce_universe_domain_answer = answer\n"
+            "def after_the_check(**_):\n"
+            "    threading.Event().wait(30)\n"
+            "    raise SystemExit(0)\n"
+            "credential_proxy.resolve_universe_domain = after_the_check\n"
+            "sys.exit(credential_proxy.main())\n"
+        )
+        completed = self.start_broker(launcher)
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stdout + completed.stderr)
+        records = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual("CRITICAL", records[-1]["severity"], completed.stdout)
+        self.assertIn("clients6.google.com", records[-1]["message"])
+        self.assertIn("googleapis.com", records[-1]["message"])
+        self.assertTrue(any("was not checked" in record["message"] for record in records), completed.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

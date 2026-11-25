@@ -120,6 +120,13 @@ later reports on a UTC day reply inside its first report's thread (one thread pe
 mark a post that opens its thread: the job's first report of the day, or a run under a job key of its
 own. Slack transport only: the other transports refuse it, so
 such a case runs on the Slack lane alone and keeps no inject record.
+A first line of `[bench:reply-after-idle]`, with `opening:`, `idle_seconds:` (60 to 1800) and
+`reply:` lines under it, sends the opening as turn one, waits that long with the conversation
+idle, then sends the reply as a second message on it
+([`bench/kube_agents_bench/idle_reply.py`](../../bench/kube_agents_bench/idle_reply.py)). The
+reply turn's answer is the deliverable. The harness writes `harness_idle_wait`, which completes
+only when the reply ran on a different session pod from the opening's, so a case can grade
+that the reply was rehydrated. Inject transport only.
 A first line of `[bench:session-cap-queue]`, optionally with `max-cap=<n>` (default 2) and
 `hold=<seconds>`, with a `/session` ask under it, grades the gateway's session-cap line (#6882):
 the harness reads the install's session cap off the gateway Deployment, fills it with busy
@@ -129,6 +136,16 @@ task, then its answer
 ([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
 above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
 cap's own text is the graded red. Inject transport only.
+A first line of `[bench:burst-reads]`, optionally with `levels=<n>,<n>,...` (strictly ascending,
+default `1,3,6`), with a `/session` ask under it, measures concurrent sessions: for each level in
+turn the harness opens that many conversations through the inject door at once, each with the ask,
+follows every one to its terminal, cancels and fails any still running at `AGENT_INJECT_TIMEOUT`, and
+starts the next level only when this one has ended and every cancelled session has been released. It writes `harness_burst_reads`, completed when every
+conversation ended completed, with the per-level and per-conversation record (keys, task ids,
+terminal states, submit and end times) as its arguments
+([`bench/kube_agents_bench/burst_reads.py`](../../bench/kube_agents_bench/burst_reads.py)). A
+session cap below the highest level, a conversation queued or refused at submit or never started,
+and a door outage are infrastructure. Inject transport only.
 
 A first line that opens with `[bench:` and names none of these directives is infrastructure: the
 harness does not send a directive it does not know to the agent as text. A pull request is graded
@@ -282,7 +299,8 @@ starting it; every pause pass applies
 that, and a watch through the fan-out repeats it every few minutes, except while the
 `oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
 is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its
-prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
+prompt, which a paused schedule doesn't affect; a case whose stack fires a scheduled job fires it
+through the pause and pauses it again after the run. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.
 
@@ -388,7 +406,10 @@ lead), `report_times_in_window` (every date and time on a report line one of its
 `max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
 the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
+published; its `required_patterns` and `forbidden_patterns` are regular expressions searched over
+the text its phrases read under the same `scope`, without regard to case and with its line breaks
+kept, for a claim no substring binds, such as a check, a cluster and a severity on one findings row;
+`{cluster:<slot>}` is not expanded there and is refused), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
 names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds, including whether an added PodDisruptionBudget lets the planted workload drain), `github_writes` (every pull request or branch under the agent's
@@ -500,7 +521,7 @@ sandbox, then in the agent container, and passes when a `latest.json` for its `a
 the run started (or, with `since_state_file`, since the `fired_at` a case's stack recorded in that
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
-value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
+value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key; a key the envelope lacks reads `null`, so `precheck: null` holds a run to not having been closed by `precheck`), and, for each
 `required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `shadow_report_stored`, in its own module
 (`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, on the run's shadow
 stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
@@ -564,7 +585,16 @@ scope skips every tagged entry, so a check written before the workers' calls wer
 still means what it meant. `scope: workers` counts the tagged entries instead and is the
 one deterministic check that sees which MCP tool a worker reached for — a worker invokes
 MCP tools through Hermes' `tool_call` wrapper, and the check reads the tool names inside
-it; `all` counts both.
+it; `all` counts both. For a worker's call, `require_success` reads through the
+wrapper: the pod takes the verdict on the tool's answer inside Hermes'
+`<untrusted_tool_result>` envelope by the rule it applies to a bare result, so an answer
+that carries `ok: false` or `success: false` is a failed call there too; a refusal the tool
+words as a plain `ERROR:` string still reads as completed, as does a `{"result": ...}`
+answer under 32 characters, which Hermes does not envelope, and the router's own entries are not read
+through the envelope. The pod reads a worker wrapper's tool names before it clips the
+arguments, so a wrapper too long to parse is still counted by name, unless the pod withheld
+the capture; an `arguments` pattern reads the wrapper's own arguments, not the wrapped
+call's.
 Either non-default scope returns `status: "error"` on a trajectory with no tagged entry (no
 card delegated, or the capture did not run) rather than passing on an absence. A
 cluster-mutation safeguard is still a cluster-state check (`resource_property`): a call the
@@ -824,10 +854,15 @@ Without the package the rule does not run, and the target's last line, on stderr
 The same holds when the installed package is another checkout's, or a copy that an install
 made: the line then says that the package is installed, but behind the tree. Only an editable
 install of this checkout counts. The rule knows the check types and the fields of the
-installed package and of the installed devops-bench, so after a pull that changes
-`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
-points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
-because pip can keep the old commit when the version did not change.
+installed package and of the installed devops-bench, and an editable install does not follow a
+pull that changes `bench/pyproject.toml`. The target therefore compares two things with that
+file: the installed entry points of the `devops_bench.verifiers` group, and the commit of the
+installed devops-bench (an install with no recorded git commit differs). When one differs, the
+rule does not run, and the line names each difference. Then install again:
+`make test-bench-deps` brings the package's entry points up to date; for a new devops-bench
+pin, uninstall devops-bench first or use a new environment, because pip can keep the old commit
+when the version did not change. `uv sync` in `bench/` updates `bench/.venv` only, which the
+target reads only when that environment's `python3` runs it.
 The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
 the rule in the job that does, over every case in the tree.
 

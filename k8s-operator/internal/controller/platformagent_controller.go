@@ -1240,6 +1240,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	defer func() {
 		exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, true, busCredsMapVersion))
 		exitWrite(dispatcherCeilingCondition, r.syncDispatcherCeiling(ctx, instance, dispatcherCeiling))
+		exitWrite(sessionHarnessCondition, r.syncSessionHarness(ctx, instance))
 		exitWrite(inferenceKeysServedCondition, r.syncInferenceKeysServed(ctx, instance, inferenceKeysServed))
 		// Last, so it outlives every status writer of its pass
 		// (TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass).
