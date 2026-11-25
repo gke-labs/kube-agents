@@ -112,7 +112,7 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	if err != nil {
 		return fmt.Errorf("workspace: %w", err)
 	}
-	builtins, permOpts, plugins, err := policySetup(env.Policy, workdir)
+	builtins, permOpts, plugins, err := policySetup(env.Policy, env.MCP, workdir)
 	if err != nil {
 		return fmt.Errorf("tool policy: %w", err)
 	}
