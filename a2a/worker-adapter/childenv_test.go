@@ -1,7 +1,9 @@
 package workeradapter
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -90,5 +92,58 @@ func TestTheAllowlistHoldsNoCredentialUnnoticed(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// toolWrapperVars is every variable the image's tool wrappers read, by the
+// file that reads it: a tool child must see each one, or the wrapper takes
+// another path (a session pod's kubectl falls back to the broker, which
+// refuses the session caller).
+var toolWrapperVars = map[string][]string{
+	"deploy/sandbox/session-kubectl.sh":                        {"CREDENTIAL_PROXY_EXEC_URL", "CREDENTIAL_PROXY_REFUSAL_FILE", "CREDENTIAL_PROXY_URL", "HOME", "KUBE_PROXY_MODE", "KUBE_PROXY_URL", "KUBEAGENTS_KUBECTL_COST_TIER", "SANDBOX_MEMORY_LIMIT_BYTES"},
+	"deploy/sandbox/kubectl_context_registered.sh":             {"CREDENTIAL_PROXY_TOKEN_FILE", "HOME", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_URL", "KUBECONFIG"},
+	"agents/platform/scripts/credential_proxy_client.py":       {"CREDENTIAL_PROXY_TOKEN_FILE", "CREDENTIAL_PROXY_URL", "HERMES_HOME", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT", "KUBE_PROXY_URL", "KUBECONFIG"},
+	"deploy/sandbox/kubectl-admit.py":                          {"KUBEAGENTS_KUBECTL_COST_TIER", "KUBECTL_ADMIT_ON_BUSY", "KUBECTL_ADMIT_GUARD_PATH", "KUBECTL_ADMIT_RUN_DIR"},
+	"deploy/sandbox/shell-memory-guard.py":                     {"SANDBOX_MEMORY_LIMIT_BYTES"},
+	"agents/platform/scripts/vcs_client.py":                    {"KUBE_AGENTS_LOCAL_GIT", "KUBE_AGENTS_VCS_AUTHOR_NAME", "KUBE_AGENTS_VCS_ROOT", "KUBE_AGENTS_VCS_TTL_HOURS"},
+	"a2a/worker-adapter/refusal.go (the write-refusal record)": {"CREDENTIAL_PROXY_REFUSAL_FILE", "CREDENTIAL_PROXY_REFUSAL_TASK"},
+}
+
+// TestToolChildrenGetWhatTheToolWrappersRead: every variable the image's
+// tool wrappers read reaches a tool child, and each wrapper file still
+// mentions the variables listed for it, so a rename there fails here. And
+// every allowlisted name past the basics is one a wrapper reads, so the
+// allowlist doesn't grow past the reviewed set unnoticed.
+func TestToolChildrenGetWhatTheToolWrappersRead(t *testing.T) {
+	for file, vars := range toolWrapperVars {
+		path, _, _ := strings.Cut(file, " ")
+		src, err := os.ReadFile(filepath.Join("..", "..", path))
+		if err != nil {
+			t.Errorf("%s: %v", path, err)
+			continue
+		}
+		for _, v := range vars {
+			if !strings.Contains(string(src), v) {
+				t.Errorf("%s no longer mentions %s: update toolWrapperVars", path, v)
+			}
+			if Withheld(v) {
+				t.Errorf("%s (read by %s) is withheld from tool children", v, path)
+			}
+		}
+	}
+	read := map[string]bool{}
+	for _, vars := range toolWrapperVars {
+		for _, v := range vars {
+			read[v] = true
+		}
+	}
+	basics := []string{"PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "HOSTNAME", "LANG", "LANGUAGE", "TERM", "TZ", "KUBECONFIG"}
+	for _, n := range toolChildAllowedNames {
+		if !read[n] && !slices.Contains(basics, n) {
+			t.Errorf("allowlisted %s is not read by any wrapper in toolWrapperVars", n)
+		}
+	}
+	if want := []string{"LC_", "CREDENTIAL_PROXY_"}; !slices.Equal(toolChildAllowedPrefixes, want) {
+		t.Errorf("allowlisted prefixes %q; widening past %q needs a review here", toolChildAllowedPrefixes, want)
 	}
 }
