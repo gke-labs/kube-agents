@@ -1884,10 +1884,35 @@ def label_proposal_risk(
     return forge("proposal-risk-label", payload, repository)
 
 
+def _format_reason_loc(item: dict) -> str:
+    """Format file, structured ResourceRef dict, and field_path for a reason entry."""
+    parts: list[str] = []
+    file_path = item.get("file")
+    if isinstance(file_path, str) and file_path:
+        parts.append(file_path)
+    res = item.get("resource")
+    if isinstance(res, dict):
+        group = str(res.get("group") or "")
+        kind = str(res.get("kind") or "")
+        ns = str(res.get("namespace") or "")
+        name = str(res.get("name") or "")
+        gvk = f"{group}/{kind}" if (group and kind) else (kind or group)
+        target = f"{ns}/{name}" if (ns and name) else (name or ns)
+        res_str = f"{gvk} {target}".strip() if (gvk and target) else (gvk or target)
+        if res_str:
+            parts.append(res_str)
+    elif isinstance(res, str) and res:
+        parts.append(res)
+    field_path = item.get("field_path")
+    if isinstance(field_path, str) and field_path:
+        parts.append(field_path)
+    return " | ".join(parts)
+
+
 def _format_risk_summary(result: dict) -> str:
     """Format a concise multi-line 4-axis summary for operators and agents."""
     number = result.get("number", "?")
-    repo = result.get("repo") or "unknown-repo"
+    repo = result.get("repo") or result.get("repository") or "unknown-repo"
     rev = str(result.get("sourceRevision") or "")
     rev_short = rev[:12] if rev else "unknown"
     risk_level = result.get("risk_level", "unknown")
@@ -1934,7 +1959,7 @@ def _format_risk_summary(result: dict) -> str:
             code = item.get("code", "REASON")
             sev = item.get("severity", "")
             msg = item.get("message", "")
-            loc = item.get("resource") or item.get("file") or ""
+            loc = _format_reason_loc(item)
             loc_suffix = f" [{loc}]" if loc else ""
             sev_prefix = f"[{sev}] " if sev else ""
             lines.append(f"    - {sev_prefix}{code}: {msg}{loc_suffix}")

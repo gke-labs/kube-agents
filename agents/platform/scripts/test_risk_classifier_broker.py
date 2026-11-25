@@ -701,6 +701,12 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
 
     def test_publish_and_proposal_create_return_4_axis_risk_summary_and_reconcile_push(self) -> None:
         """`proposal_create` and `publish` attach 4-axis `risk` summaries and revoke auto-merge on destructive push."""
+        pvc_yaml = (
+            "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n"
+            "  name: web-data\n  namespace: shop\nspec:\n"
+            "  accessModes: [ReadWriteOnce]\n  resources:\n    requests:\n      storage: 10Gi\n"
+        )
+        self._push_branch("main", {"clusters/dev-c1/data-pvc.yaml": pvc_yaml}, base="main")
         broker = self._make_broker(switch="on", auto_label_risk=True)
 
         # Build a valid git bundle for round 1 (low-risk replica bump 3 -> 4)
@@ -744,10 +750,10 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         self.assertTrue(created["risk"]["labelled"])
         self.assertEqual(sorted(created["proposal"]["labels"]), ["kube-agents:auto-merge", "risk:low"])
 
-        # Round 2: push a destructive commit deleting the Deployment onto the same open PR!
-        (clone_dir / "clusters" / "dev-c1" / "web.yaml").unlink()
+        # Round 2: push a destructive commit deleting a stateful PersistentVolumeClaim onto the same open PR!
+        (clone_dir / "clusters" / "dev-c1" / "data-pvc.yaml").unlink()
         subprocess.run(["git", "add", "-A"], cwd=clone_dir, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "delete deployment"], cwd=clone_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "delete stateful pvc"], cwd=clone_dir, check=True)
         tip2 = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=clone_dir, text=True).strip()
         b2 = self.root / "r2.bundle"
         subprocess.run(

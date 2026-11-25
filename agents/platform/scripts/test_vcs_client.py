@@ -1728,7 +1728,14 @@ class RiskClassificationClientTest(unittest.TestCase):
                 "severity": "low",
                 "message": "scales Deployment 'web' replicas 3 -> 4",
                 "file": "clusters/staging-c1/web.yaml",
-                "resource": "Deployment/shop/web",
+                "field_path": "spec.replicas",
+                "resource": {
+                    "group": "apps",
+                    "version": "v1",
+                    "kind": "Deployment",
+                    "namespace": "shop",
+                    "name": "web",
+                },
             }
         ],
         "automerge": {
@@ -1800,6 +1807,48 @@ class RiskClassificationClientTest(unittest.TestCase):
         self.assertIn("disruptiveness: non_disruptive", summary)
         self.assertIn("eligible=True (kube-agents:auto-merge)", summary)
         self.assertIn("REPLICA_SCALE_UP_BOUNDED", summary)
+        self.assertIn("clusters/staging-c1/web.yaml | apps/Deployment shop/web | spec.replicas", summary)
+        self.assertNotIn("{'group':", summary)
+
+        # Also verify `repository` fallback when `repo` key is absent and cluster-scoped core/RBAC resource formatting
+        alt_summary = vcs_client._format_risk_summary({
+            "repository": "acme/fallback-repo",
+            "number": 42,
+            "sourceRevision": "1234567890abcdef",
+            "risk_level": "critical",
+            "risk_label": "risk:critical",
+            "blast_radius": "critical",
+            "revertability": "easy",
+            "disruptiveness": "non_disruptive",
+            "supported": True,
+            "effective_changes": True,
+            "stale_base": False,
+            "labelled": False,
+            "label": None,
+            "reason": "risk level exceeds max_risk",
+            "reasons": [
+                {
+                    "code": "CLUSTER_ADMIN_BINDING",
+                    "severity": "critical",
+                    "message": "binds cluster-admin",
+                    "file": "clusters/prod/rbac.yaml",
+                    "field_path": "roleRef",
+                    "resource": {
+                        "group": "rbac.authorization.k8s.io",
+                        "version": "v1",
+                        "kind": "ClusterRoleBinding",
+                        "namespace": "",
+                        "name": "pwn-admin",
+                    },
+                }
+            ],
+        })
+        self.assertIn("Proposal #42 (acme/fallback-repo @ 1234567890ab)", alt_summary)
+        self.assertIn(
+            "clusters/prod/rbac.yaml | rbac.authorization.k8s.io/ClusterRoleBinding pwn-admin | roleRef",
+            alt_summary,
+        )
+        self.assertNotIn("{'group':", alt_summary)
 
         json_buf = io.StringIO()
         with mock.patch.object(vcs_client, "call", return_value=dict(self.SAMPLE_CLASSIFICATION)), contextlib.redirect_stdout(json_buf):
