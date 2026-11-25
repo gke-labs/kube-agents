@@ -85,3 +85,14 @@ func TestAnErroringStepYieldsOneFailedResult(t *testing.T) {
 		t.Errorf("%d tool results, want 1: %+v", n, got)
 	}
 }
+
+// A final message in several text parts is the result's whole text.
+func TestTheResultJoinsTheFinalTextParts(t *testing.T) {
+	var got []coreagentwire.Event
+	m := newMapper(func(e coreagentwire.Event) { got = append(got, e) })
+	m.observe(ev(false, &genai.Part{Text: "one, "}, &genai.Part{Text: "two"}))
+	m.finish(nil)
+	if r := got[len(got)-1]; r.Text != "one, two" {
+		t.Errorf("result text %q", r.Text)
+	}
+}
