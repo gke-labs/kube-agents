@@ -41,5 +41,3 @@ first-install-hello-filed
 # Added with the case (#5880), a full drift audit priced at 900s: the
 # shortest chain then.
 fleet-audit-remediation-right-and-not-stale
-# Added 2026-11-25 when the case joined the nightly (#6861): the shortest chain then.
-session-wake-ignores-a-delegation-asked-for-in-a-result
