@@ -2587,7 +2587,9 @@ CALLER_ROLE_MCP = "mcp"
 CALLER_ROLE_PROFILE = "profile"
 # The scope publisher Job. The exec route only, gcloud only, and within it the
 # five lookups scope_policy names, each on an argument scope.json declares or an
-# earlier lookup returned.
+# earlier lookup returned; `clusters list` also on the management project
+# (CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT) and a declared project no
+# exclude.projects entry matches.
 # An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
 # window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
@@ -16186,7 +16188,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     self._refuse_excluded_cluster(exc, request_id, audit, count)
                     return
         # The scope role's whole surface: five lookups, each on an argument
-        # scope.json declares or an earlier lookup returned (scope_policy).
+        # scope.json declares or an earlier lookup returned, and the clusters
+        # list also on the management project (scope_policy).
         scope_admitted = None
         if principal.role == CALLER_ROLE_SCOPE:
             scope_refusal, scope_admitted = scope_policy.check(
@@ -16194,6 +16197,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 extras=stdin is not None or cwd is not None or kubeconfig_context is not None or wants_kubeconfig,
                 scope_file=os.getenv(scope_policy.SCOPE_FILE_ENV, ""),
                 window=self.scope_window,
+                management_project=os.getenv(scope_policy.MANAGEMENT_PROJECT_ENV, "").strip(),
             )
             if scope_refusal is not None:
                 LOGGER.warning(

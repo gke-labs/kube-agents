@@ -2894,7 +2894,9 @@ its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its 
 `CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
 `ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
 for token, each on an argument the `scope.json` at `CREDENTIAL_PROXY_SCOPE_FILE` declares or
-that an earlier lookup returned to the role within five hours. That record of returned members is
+that an earlier lookup returned to the role within five hours. The `clusters list` lookup also
+takes the install's management project (`CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT`) and a project
+`scope.json` declares that no `exclude.projects` entry matches. That record of returned members is
 memory in the one broker process, so the role stays on the single broker pod
 ([credential-proxy-single-pod.md](credential-proxy-single-pod.md#2-state-that-lives-in-the-pod)).
 
