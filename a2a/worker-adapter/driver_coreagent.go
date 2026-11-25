@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -64,6 +65,30 @@ func (d coreAgentDriver) WithMCP(servers []coreagentwire.MCPServer) Driver {
 
 // WithInstructions is d with the worker's system-prompt lines for core-agent,
 // which reads them from each turn's envelope; any other driver is returned as
+// WithAllow is the driver with patterns added to its policy's allow rules,
+// each once. The receiver's policy is not modified.
+func (d coreAgentDriver) WithAllow(patterns []string) Driver {
+	allow := slices.Clone(d.Policy.Allow)
+	for _, p := range patterns {
+		if !slices.Contains(allow, p) {
+			allow = append(allow, p)
+		}
+	}
+	d.Policy.Allow = allow
+	return d
+}
+
+// withTurnInstructions is d with lines added after its system-prompt lines,
+// for one turn (a core-agent driver), else d unchanged. The receiver's lines
+// are not modified.
+func withTurnInstructions(d Driver, lines []string) Driver {
+	if c, ok := d.(coreAgentDriver); ok && len(lines) > 0 {
+		c.Instructions = append(slices.Clone(c.Instructions), lines...)
+		return c
+	}
+	return d
+}
+
 // it is (Claude Code gets the same lines on its argv).
 func WithInstructions(d Driver, lines []string) Driver {
 	if c, ok := d.(coreAgentDriver); ok {
