@@ -576,6 +576,89 @@ type TaskRef struct {
 	BatchIndex int       `json:"batchIndex,omitempty"`
 	Target     string    `json:"target,omitempty"`
 	BatchEnd   *BatchEnd `json:"batchEnd,omitempty"`
+	// BatchRound is, on a profile parent's child (single or batch), the
+	// delegation round whose request minted it, from 1; 0 is read as 1 and
+	// is all a record holds while DelegationRoundsMax is one. Its ends carry
+	// it (lib.ChildResult.Round), and batchChildren reads a parent's current
+	// round's children by it.
+	BatchRound int `json:"batchRound,omitempty"`
+	// DelegationRound is, on a profile parent, the round of the latest
+	// delegate request the gateway handled for it, from 1: every request
+	// that passes the round checks uses one, minted or refused
+	// (handleDelegateRequest). 0 on a task that hasn't delegated, and on a
+	// record written before rounds, whose count roundsUsed reads from the
+	// request's marks instead. A refusal for having used every round stores
+	// nothing, so repeated asks past the cap don't grow it.
+	//
+	// Children, BatchSize, DelegationEnd and the fan-out spot check mean the
+	// current round; a new round moves Children to EarlierChildren and
+	// clears the rest (startDelegationRound), so every batch path reads one
+	// round. EarlierChildren holds the finished rounds' children, at most
+	// DelegationRoundsMax x DelegationWidthMax ids, for the stop walks
+	// (taskChildren). While the cap is one, no record gets either field
+	// past its first request, so a rollback to a gateway before rounds
+	// loses nothing.
+	DelegationRound int      `json:"delegationRound,omitempty"`
+	EarlierChildren []string `json:"earlierChildren,omitempty"`
+}
+
+// roundOf is a round as the record holds it: 0 (unset) is round one.
+func roundOf(r int) int {
+	if r < 1 {
+		return 1
+	}
+	return r
+}
+
+// roundsUsed is how many delegation rounds a profile parent has used. The
+// stored count when there is one (DelegationRound); otherwise, on a record
+// written before rounds, one once its request ended (DelegationEnd) or minted
+// its child or whole batch, and none before. A batch cut short and being
+// finished is still its round.
+func roundsUsed(parent TaskRef) int {
+	if parent.DelegationRound > 0 {
+		return parent.DelegationRound
+	}
+	if parent.DelegationEnd != "" || (len(parent.Children) > 0 && parent.batchComplete()) {
+		return 1
+	}
+	return 0
+}
+
+// currentRoundOf is the delegation round a parent on the record is in: its
+// DelegationRound, read as one when unset or when the parent isn't on the
+// record.
+func currentRoundOf(rec *SessionRecord, parentID string) int {
+	if parent, ok := rec.TaskRefFor(parentID); ok {
+		return roundOf(parent.DelegationRound)
+	}
+	return 1
+}
+
+// taskChildren is every child a task has minted, every round's: the stop
+// walks reach a finished round's children too.
+func (ref TaskRef) taskChildren() []string {
+	if len(ref.EarlierChildren) == 0 {
+		return ref.Children
+	}
+	return append(slices.Clone(ref.EarlierChildren), ref.Children...)
+}
+
+// startDelegationRound begins a profile parent's next delegation round:
+// round is the round number it now holds. The finished round's children move
+// to EarlierChildren, and the round-scoped fields (BatchSize, DelegationEnd)
+// clear, so the batch paths read the new round alone.
+func (rec *SessionRecord) startDelegationRound(taskID string, round int) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID != taskID {
+			continue
+		}
+		t := &rec.Tasks[i]
+		t.EarlierChildren = append(t.EarlierChildren, t.Children...)
+		t.Children, t.BatchSize, t.DelegationEnd = nil, 0, ""
+		t.DelegationRound = round
+		return
+	}
 }
 
 // BatchEnd is how a fan-out child ended, kept on its entry until the wake
@@ -613,9 +696,12 @@ func (ref TaskRef) fanOut() bool {
 // batchChildren is the record's entries for the children of a fan-out
 // parent, in the order they are on the record.
 func (rec *SessionRecord) batchChildren(parentID string) []TaskRef {
+	// The parent's current round only: an earlier round's children are
+	// that round's, ended before this one began.
+	round := currentRoundOf(rec, parentID)
 	var out []TaskRef
 	for _, ref := range rec.Tasks {
-		if ref.Role == taskRoleChild && ref.ParentTaskID == parentID && ref.BatchIndex > 0 {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == parentID && ref.BatchIndex > 0 && roundOf(ref.BatchRound) == round {
 			out = append(out, ref)
 		}
 	}

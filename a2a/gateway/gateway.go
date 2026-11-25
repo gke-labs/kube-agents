@@ -3404,6 +3404,9 @@ type taskStart struct {
 	// for a child of a batch of two or more only.
 	BatchIndex int
 	Target     string
+	// BatchRound is the delegation round a profile parent's child is minted
+	// in (TaskRef.BatchRound), 0 for round one.
+	BatchRound int
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -3673,7 +3676,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if ts.KeepActive {
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
-	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
+	ref.BatchIndex, ref.Target, ref.BatchRound = ts.BatchIndex, ts.Target, ts.BatchRound
 	ref.Lineless = lineless
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
