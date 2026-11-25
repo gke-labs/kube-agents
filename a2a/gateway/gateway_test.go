@@ -26,11 +26,39 @@ import (
 )
 
 const (
-	serverReadyTimeout = 30 * time.Second
-	jetStreamOpTimeout = 15 * time.Second
-	pollUntilTimeout   = 30 * time.Second
-	pollUntilInterval  = 20 * time.Millisecond
+	serverReadyTimeout    = 30 * time.Second
+	jetStreamOpTimeout    = 15 * time.Second
+	pollUntilTimeout      = 30 * time.Second
+	pollUntilInterval     = 20 * time.Millisecond
+	envPollUntilTimeout   = "A2A_TEST_POLL_TIMEOUT"
+	connectTestAttempts   = 3
+	connectTestRetryDelay = 100 * time.Millisecond
 )
+
+// pollUntilTimeoutFor returns the polling deadline for pollUntil, reading an
+// optional positive duration from A2A_TEST_POLL_TIMEOUT so heavily loaded
+// parallel runs can widen the wait without changing the 30s default.
+func pollUntilTimeoutFor() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(envPollUntilTimeout)); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return pollUntilTimeout
+}
+
+// isTransientDialTimeout reports whether err is a transient loopback dial or
+// handshake timeout when hundreds of embedded NATS servers start in parallel.
+func isTransientDialTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, nats.ErrTimeout) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "operation timed out") || strings.Contains(msg, "i/o timeout")
+}
 
 // ---- harness ----------------------------------------------------------
 
@@ -57,11 +85,48 @@ func startServer(t *testing.T) *natsserver.Server {
 }
 
 // connectTest dials a test's own nats-server with the product's dial bound
-// (lib.DialTimeout) rather than nats.go's 2s default: the package's tests run
-// in parallel under -race, where a loopback dial can take longer than that,
-// and a test that fails on a slow dial is a flake, not a finding.
+// (lib.DialTimeout) rather than nats.go's 2s default, and retries transient
+// loopback dial timeouts: the package's tests run in parallel under -race,
+// where a loopback dial can time out transiently when hundreds of servers
+// start at once, and a test that fails on a slow dial is a flake, not a
+// finding.
 func connectTest(url string, opts ...nats.Option) (*nats.Conn, error) {
-	return nats.Connect(url, append([]nats.Option{nats.Timeout(lib.DialTimeout)}, opts...)...)
+	dialOpts := append([]nats.Option{nats.Timeout(lib.DialTimeout)}, opts...)
+	var lastErr error
+	for attempt := 0; attempt < connectTestAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(connectTestRetryDelay)
+		}
+		nc, err := nats.Connect(url, dialOpts...)
+		if err == nil {
+			return nc, nil
+		}
+		lastErr = err
+		if !isTransientDialTimeout(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// connectClientTest wraps lib.Connect with the same transient dial-timeout
+// retry as connectTest for test rig setup.
+func connectClientTest(ctx context.Context, url string, opts ...lib.ClientOption) (*lib.Client, error) {
+	var lastErr error
+	for attempt := 0; attempt < connectTestAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(connectTestRetryDelay)
+		}
+		client, err := lib.Connect(ctx, url, opts...)
+		if err == nil {
+			return client, nil
+		}
+		lastErr = err
+		if !isTransientDialTimeout(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
 }
 
 // provision creates the TASKS stream and the session-state and cap buckets
@@ -549,12 +614,12 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}
@@ -581,9 +646,9 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
 
-// pollUntil retries cond for up to pollUntilTimeout and reports whether it held.
+// pollUntil retries cond for up to pollUntilTimeoutFor() and reports whether it held.
 func pollUntil(cond func() bool) bool {
-	deadline := time.Now().Add(pollUntilTimeout)
+	deadline := time.Now().Add(pollUntilTimeoutFor())
 	for time.Now().Before(deadline) {
 		if cond() {
 			return true
@@ -1566,12 +1631,12 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}
@@ -1646,7 +1711,7 @@ func restartRigWith(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, opts 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	client, err := lib.Connect(ctx, r.url, lib.WithName("gateway-test-2"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	client, err := connectClientTest(ctx, r.url, lib.WithName("gateway-test-2"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
@@ -3857,5 +3922,24 @@ func TestFeedbackWithTextWhileATaskRunsIsASteer(t *testing.T) {
 	}
 	if postedContaining(r, chattext.FeedbackFormURL)() {
 		t.Fatal("the links notice was posted for a /feedback follow-up")
+	}
+}
+
+func TestPollUntilTimeoutForReadsEnvOverride(t *testing.T) {
+	t.Setenv(envPollUntilTimeout, "")
+	if got := pollUntilTimeoutFor(); got != pollUntilTimeout {
+		t.Fatalf("default pollUntilTimeoutFor() = %v, want %v", got, pollUntilTimeout)
+	}
+
+	t.Setenv(envPollUntilTimeout, "45s")
+	if got := pollUntilTimeoutFor(); got != 45*time.Second {
+		t.Fatalf("override pollUntilTimeoutFor() = %v, want 45s", got)
+	}
+
+	for _, bad := range []string{"not-a-duration", "0s", "-5s"} {
+		t.Setenv(envPollUntilTimeout, bad)
+		if got := pollUntilTimeoutFor(); got != pollUntilTimeout {
+			t.Fatalf("pollUntilTimeoutFor() with %q = %v, want default %v", bad, got, pollUntilTimeout)
+		}
 	}
 }
