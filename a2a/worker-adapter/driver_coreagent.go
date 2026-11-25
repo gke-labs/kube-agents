@@ -93,9 +93,18 @@ func (coreAgentDriver) ConfiguresMCP([]string) bool { return false }
 // ConfigDirEnv is empty: the harness reads no config directory.
 func (coreAgentDriver) ConfigDirEnv(string) string { return "" }
 
-// PrepareTurn checks nothing yet; the persona directory check before each
-// spawn comes with the persona render (#6713).
-func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return nil }
+// PrepareTurn runs before every core-agent process starts, the first
+// included: the adapter is the container's init and nothing an earlier turn
+// started is still alive (checkTurnBoundary). Each process exits at its
+// turn's end and killLeftovers ends whatever it left, so a process still
+// alive here is one that kill could not reach.
+func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return checkTurnBoundary() }
+
+// RestartsPerTurn is true: core-agent runs one user turn per process. A
+// steer held during a turn starts a fresh process that resumes the
+// conversation from the history the adapter holds, after the last process
+// and everything it started are gone.
+func (coreAgentDriver) RestartsPerTurn() bool { return true }
 
 // HoldsSteers: a steer waits for the turn to end; core-agent has no way in
 // mid-turn short of interrupting it.

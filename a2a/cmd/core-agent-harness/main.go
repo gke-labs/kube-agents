@@ -35,6 +35,7 @@ import (
 	"github.com/go-steer/core-agent/v3/pkg/tools"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
+	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
 // userID is the session log's user for every conversation: one worker pod
@@ -63,6 +64,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintln(stderr, "core-agent-harness: protect:", err)
 		return 1
 	}
+	withholdFromToolChildren(os.Environ())
 	fs := flag.NewFlagSet("core-agent-harness", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var o options
@@ -218,4 +220,14 @@ func emitAdded(ctx context.Context, svc session.Service, id string, seeded int, 
 		i++
 	}
 	return nil
+}
+
+// withholdFromToolChildren withholds, from every process a turn starts (the
+// shell tool, an MCP stdio server), each variable in env off the worker's
+// tool-child allowlist (workeradapter.WithheldFromToolChildren): the model,
+// provider, bus and chat credentials this process carries, whatever their
+// names. This process keeps them. An MCP server still gets its own entry's
+// env on top.
+func withholdFromToolChildren(env []string) {
+	childenv.Withhold(workeradapter.WithheldFromToolChildren(env)...)
 }
