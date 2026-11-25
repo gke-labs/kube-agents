@@ -191,7 +191,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, relayed_report, session_cap, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -2927,7 +2927,170 @@ _KNOWN_DIRECTIVES = (
     slack.HOME_POST_DIRECTIVE,
     session_cap.DIRECTIVE,
     burst_reads.DIRECTIVE,
+    relayed_report.DIRECTIVE,
 )
+
+
+def _relay_transport(
+    harness: KubeAgentsHarness, run_id: str, case_id: str, repetition: str
+) -> relayed_report.RelayTransport | None:
+    """The transport a relayed-report case runs on (:mod:`relayed_report`,
+    #6870), chosen off ``AGENT_TRANSPORT``, or ``None`` for a lane none
+    serves.
+
+    The inject door is the one today: with the gateway's inject notify route
+    armed (``chat.notify.inject``, an eval install only), a card filed from
+    an inject turn reports back into its conversation as a transcript entry
+    the door marks ``report``, and the gateway keeps it for the next human
+    turn there (:class:`_InjectRelayTransport`).
+    """
+    if os.environ.get("AGENT_TRANSPORT", TRANSPORT_API) == TRANSPORT_INJECT:
+        return _InjectRelayTransport(harness, run_id, case_id, repetition)
+    return None
+
+
+def _inject_door_access() -> tuple[str, str, Callable[..., None]]:
+    """The inject door's base URL, its bearer token, and a respawn for the
+    tunnel to it, as :meth:`KubeAgentsHarness._execute_inject` resolves them:
+    ``AGENT_INJECT_URL`` given outright is somebody else's tunnel, with
+    nothing to respawn; otherwise the loopback port this process forwards.
+
+    Raises:
+        relayed_report.RelayUnavailable: ``AGENT_INJECT_TOKEN`` is unset.
+    """
+    token = os.environ.get("AGENT_INJECT_TOKEN", "").strip()
+    if not token:
+        raise relayed_report.RelayUnavailable("AGENT_INJECT_TOKEN is unset and the inject door authenticates every read")
+    base_url = os.environ.get("AGENT_INJECT_URL")
+    if base_url:
+        return base_url, token, lambda **_: None
+    local_port = int(os.environ.get("AGENT_INJECT_LOCAL_PORT") or _INJECT_DEFAULT_LOCAL_PORT)
+    agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+    service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
+
+    def _respawn(*, reset: bool, after_standby: bool = False) -> None:
+        _forward_inject_door(local_port, agent_service, service, reset=reset, after_standby=after_standby)
+
+    return f"http://127.0.0.1:{local_port}", token, _respawn
+
+
+class _InjectRelayTransport:
+    """:class:`relayed_report.RelayTransport` on the inject door (#6870).
+
+    Every turn is an ordinary inject turn on the one conversation the run's
+    key names, sent and followed to its answer by
+    :meth:`KubeAgentsHarness._execute_inject` as a further message (no
+    directive read, no delegation wait, no status turn: any other human turn
+    on the conversation would take the kept report before the first reply
+    does). The opening carries the run's own message id; each reply its
+    suffix (:data:`relayed_report.REPLY_SUFFIX` and its number), sent again
+    under a fresh id when the door absorbs it as a steer
+    (:meth:`KubeAgentsHarness._send_reply_turn`).
+
+    The report is the first transcript entry that is a post the door marks
+    ``report`` with ``replyTo`` naming the opening turn's task: what the
+    gateway's inject notify route appends (``InjectAdapter.PostNotifyFrame``)
+    for a card filed from that turn, and the root the gateway keeps the
+    report by (:meth:`inject_transport.InjectTask.await_relayed_report`).
+
+    A turn's session is the conversation's contextId as the door's read
+    reported it at the turn's end, the session record the bridge runs the
+    conversation's turns in; ``""`` when the door reported none.
+    """
+
+    name = TRANSPORT_INJECT
+
+    def __init__(
+        self,
+        harness: KubeAgentsHarness,
+        run_id: str,
+        case_id: str,
+        repetition: str,
+        *,
+        retry_seconds: float = _PUSHED_REPLY_RETRY_SECONDS,
+    ) -> None:
+        self._harness = harness
+        self._identity = (run_id, case_id, repetition)
+        self._retry_seconds = retry_seconds
+        self._opening: AgentResult | None = None
+        # The door's spelling of the conversation (it prefixes the key) and
+        # the opening turn's task, once the opening has run.
+        self._conversation = ""
+        self._root = ""
+        self._replies = 0
+
+    @staticmethod
+    def _turn(result: AgentResult, conversation: str) -> relayed_report.RelayTurn:
+        return relayed_report.RelayTurn(
+            result=result,
+            conversation=str(result.metadata.get("conversation") or conversation),
+            task_id=str(result.metadata.get("task_id") or ""),
+            session=str(result.metadata.get("context_id") or ""),
+        )
+
+    def open_turn(self, conversation: str, text: str) -> relayed_report.RelayTurn:
+        run_id, case_id, repetition = self._identity
+        result = self._harness._execute_inject(
+            text,
+            follow_up=_InjectFollowUp(
+                conversation=conversation, run_id=run_id, case_id=case_id, repetition=repetition, suffix=""
+            ),
+        )
+        if result.metadata.get("infra_failure") is not None:
+            raise relayed_report.RelayUnavailable(str(result.metadata["infra_failure"]))
+        if result.metadata.get("outcome") == inject.OUTCOME_NOT_ACCEPTED:
+            raise relayed_report.RelayUnavailable("; ".join(result.errors) or "the door refused the opening turn")
+        turn = self._turn(result, conversation)
+        if not turn.task_id:
+            raise relayed_report.RelayUnavailable(f"the door started no task for the opening turn on {turn.conversation}")
+        self._opening, self._conversation, self._root = result, turn.conversation, turn.task_id
+        return turn
+
+    def wait_for_report_post(self, conversation: str, timeout: float) -> relayed_report.ReportPost | None:
+        if not self._root:
+            raise relayed_report.RelayUnavailable("no opening turn ran on the conversation to wait under")
+        base_url, token, respawn = _inject_door_access()
+        reader = inject.InjectTask(base_url=base_url, conversation=self._conversation, prompt="", token=token)
+        deadline = time.monotonic() + timeout
+        try:
+            report = _transport_retrying(
+                lambda: reader.await_relayed_report(self._root, deadline),
+                what=f"report wait on {self._conversation}",
+                respawn=respawn,
+            )
+        except inject.InjectUnavailable as exc:
+            raise relayed_report.RelayUnavailable(str(exc)) from exc
+        if report is None:
+            return None
+        return relayed_report.ReportPost(
+            conversation=self._conversation,
+            text=str(report["text"]),
+            position=str(report["seq"]),
+            evidence=(
+                f"inject transcript entry {report['seq']}: a post marked {inject.ENTRY_REPORT_FIELD} with "
+                f"{inject.ENTRY_REPLY_TO_FIELD} {self._root}, the opening turn's task"
+            ),
+        )
+
+    def reply(self, conversation: str, text: str) -> relayed_report.RelayTurn:
+        if self._opening is None:
+            raise relayed_report.RelayUnavailable("no opening turn ran on the conversation to reply on")
+        self._replies += 1
+        opened = inject.Exchange(inject.Fold(self._root), inject.OUTCOME_TERMINAL, self._conversation, self._root)
+        result, failure = self._harness._send_reply_turn(
+            self._opening,
+            opened,
+            text,
+            relayed_report.DIRECTIVE,
+            f"{relayed_report.REPLY_SUFFIX}{self._replies}",
+            self._retry_seconds,
+        )
+        if failure is not None:
+            raise relayed_report.RelayUnavailable(
+                str(failure.metadata.get("infra_failure") or "; ".join(failure.errors) or "the reply failed")
+            )
+        assert result is not None
+        return self._turn(result, conversation)
 
 
 def _unknown_directive(prompt: str) -> str:
@@ -3389,6 +3552,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
+            # The conversation's session record as the door's last read
+            # reported it (its contextId), or None.
+            "context_id": (exchange.probe.context_id if exchange.probe else "") or None,
             "outcome": exchange.outcome,
             **identity,
             "terminal_state": fold.terminal or None,
@@ -3774,6 +3940,8 @@ class KubeAgentsHarness(AgentHarness):
                 "commit's bench/, hack/ci-eval-pr.sh pin_grader), so the harness change has to land "
                 "on main before the case can be graded"
             )
+        if relayed_report.is_reply_under_relayed_report(prompt):
+            return self._execute_relayed_report(prompt)
         if stop_hook.is_card_wait(prompt):
             # Through the A2A door whatever the lane's transport: the door's
             # turns hold for their cards, which is what the case stops.
@@ -3826,6 +3994,30 @@ class KubeAgentsHarness(AgentHarness):
         if transport == TRANSPORT_SLACK:
             return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
+
+    def _execute_relayed_report(self, prompt: str) -> AgentResult:
+        """A relayed-report case (:mod:`relayed_report`, #6870): open the
+        conversation, wait for the report the notify route posts into it,
+        then reply twice, on whatever :func:`_relay_transport` returns. On a
+        lane no transport serves the run is infrastructure, before anything
+        is sent."""
+        try:
+            relayed = relayed_report.parse(prompt)
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+        assert relayed is not None
+        run_id, case_id, repetition = _inject_identity()
+        transport = _relay_transport(self, run_id, case_id, repetition)
+        if transport is None:
+            return _infra_failure(
+                f"{relayed_report.DIRECTIVE}: no relay transport serves "
+                f"AGENT_TRANSPORT={os.environ.get('AGENT_TRANSPORT', TRANSPORT_API)!r}; it runs on {TRANSPORT_INJECT!r}"
+            )
+        _write_eval_run(_eval_run_record(run_id, case_id, repetition))
+        try:
+            return relayed_report.run(transport, relayed, inject.conversation_key(run_id, case_id, repetition))
+        except relayed_report.RelayInfrastructure as exc:
+            return _infra_failure(str(exc))
 
     def _execute_session_cap(self, prompt: str) -> AgentResult:
         """A session-cap ask (:mod:`session_cap`, #6882): fill the install's

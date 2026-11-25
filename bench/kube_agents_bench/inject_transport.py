@@ -1178,6 +1178,7 @@ class Fold:
             self.reports.append({
                 "kind": kind, "messageId": entry_message_id, "text": text,
                 "replyTo": str(entry.get(ENTRY_REPLY_TO_FIELD) or ""), "inWindow": self.in_window,
+                "seq": entry["seq"],
             })
             self._record(EVENT_ENTRY_POST if kind == ENTRY_POST else EVENT_ENTRY_EDIT,
                          {"messageId": entry_message_id, ENTRY_REPORT_FIELD: True}, text)
@@ -1728,6 +1729,39 @@ class InjectTask:
                 self.note,
             )
         return self.task_id
+
+    def await_relayed_report(self, root: str, deadline: float) -> dict[str, Any] | None:
+        """Read the conversation until a relayed report post about ``root`` lands.
+
+        A post the door marks ``report`` (:data:`ENTRY_REPORT_FIELD`, kept
+        apart in :attr:`Fold.reports`) whose ``replyTo`` names ``root``: the
+        task whose turn filed the work, which is the root the gateway keeps
+        the report by for the next human turn on the conversation. An edit
+        is not one (it rewrites a post already relayed), and neither is a
+        relayed post about another task or a post on another conversation:
+        the read route serves this conversation's transcript alone.
+
+        Returns that report (:attr:`Fold.reports`' shape, with its ``seq``),
+        or ``None`` when none landed by ``deadline`` (``time.monotonic()``).
+        The reads are unprobed and name no task, so they start nothing and
+        ask the record nothing; the transcript is read from its start.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached or was lost.
+        """
+        fold = Fold(self.task_id)
+        after = 0
+        while True:
+            for report in fold.reports:
+                if report["kind"] == ENTRY_POST and report["replyTo"] == root:
+                    return report
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            body = self._poll("", after, remaining, probe=False)
+            after, fresh = self._absorb(fold, body, after)
+            if not fresh:
+                time.sleep(min(POLL_PAUSE_SECONDS, max(0.0, deadline - time.monotonic())))
 
     def leave_line(self) -> bool:
         """Take a turn the gateway queued at the session cap out of its line.
