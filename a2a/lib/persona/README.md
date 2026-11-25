@@ -155,6 +155,19 @@ worker refuses `antigravity`, which has no persona adapter yet.
     grant takes the server's `include` list.
   - Tools pass through as the manifest names them, for the harness's tool
     grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+  - A profile worker's core-agent tool grant is read from this rendering
+    (`workeradapter.PersonaToolPolicy`) and grants what the Claude Code
+    rendering does: `read_file` the read tools, `shell` any single simple
+    command, `web_search` Gemini's server-side Google Search, and each MCP
+    server's listed tools; no file-write tool. Core-agent's read tools stay
+    inside the workspace, which Claude Code's don't. The shell is in effect
+    unrestricted on both: core-agent's gate refuses top-level pipes, chains,
+    redirections and expansions, but passes `bash -c` and interpreters, so
+    its boundary is the sandbox and the broker, as on Claude Code. A granted
+    shell can read and write anywhere it can reach. Search is server-side and
+    not gated per call, as WebSearch is on Claude Code, and works only where
+    the model endpoint offers it beside function calls (Gemini 3 or later,
+    by model name).
   - Each `SKILL.md` frontmatter is written back with only the keys the
     harness reads, read as exactly one YAML document between exact `---`
     lines.

@@ -281,6 +281,54 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 	}
 }
 
+// TestAPersonaShellIsInEffectUnrestricted: a persona's shell grant
+// (toolgrant.Policy.Shell, which Claude Code grants as an unrestricted Bash)
+// through core-agent's real gate. Top-level composition is refused and the
+// verb checks hold, but a single command may be an interpreter that
+// composes anything (`bash -c`, `python3 -c`), and passes: the grant is in
+// effect an unrestricted shell, as on Claude Code, bounded by the sandbox
+// and the broker. Pinned both ways so neither is misread.
+func TestAPersonaShellIsInEffectUnrestricted(t *testing.T) {
+	g, err := toolgrant.Policy{Shell: true}.CoreAgent("/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(g.Builtins, "bash") {
+		t.Fatalf("builtins %q: a shell grant registers bash", g.Builtins)
+	}
+	_, opts, _, err := policySetup(coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := permissions.New(opts)
+	for cmd, want := range map[string]bool{
+		"kubectl get pods -n x":                                                       true,
+		"gcloud container clusters describe c --zone z":                               true,
+		"/var/lib/agent-persona/skills/stall/scripts/stall_report.py --ns x":          true,
+		"python3 /var/lib/agent-persona/skills/version-control/scripts/vcs.py status": true,
+		"jq -r .items /scratch/pods.json":                                             true,
+		"git status":                                                                  true,
+		"bash -c 'kubectl get pods | jq . > /scratch/o; id'":                          true,
+		"python3 -c 'import os; os.system(\"id\")'":                                   true,
+		"cat /etc/passwd":                                                             true,
+		"kubectl get pods | jq .":                                                     false,
+		"kubectl get pods; id":                                                        false,
+		"kubectl get pods && id":                                                      false,
+		"kubectl get pods > /scratch/out":                                             false,
+		"kubectl get pods 2>&1":                                                       false,
+		"kubectl $(id)":                                                               false,
+		"kubectl `id`":                                                                false,
+		"echo $HOME":                                                                  false,
+		"(id)":                                                                        false,
+		"find / -exec id ;":                                                           false,
+		"git -c core.pager=id log":                                                    false,
+	} {
+		if got := gate.CheckBash(context.Background(), cmd) == nil; got != want {
+			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
+		}
+	}
+}
+
 // TestAGrantedMCPToolPassesTheGateAndNoOtherDoes: through core-agent's real
 // gate in allow mode, as it checks an MCP call (namespace "mcp", key
 // "<server>_<tool>" plus a space and its JSON arguments), a granted MCP tool
