@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/genai"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 )
@@ -82,7 +83,10 @@ func (m *mapper) observe(ev *session.Event) {
 			}
 		}
 	}
-	if len(whole) > 0 {
+	// The result is the model's last whole response: one with no text (a
+	// tool call alone, or an empty stop) clears an earlier preamble rather
+	// than leave it standing as the answer.
+	if !ev.Partial && ev.Content.Role == genai.RoleModel {
 		m.final = strings.Join(whole, "")
 	}
 	if !ev.Partial {
