@@ -72,7 +72,8 @@ type InboundMessage struct {
 	Parameters map[string]string
 	// ReplyTo, when set, is the task whose stored report this message
 	// answers, carried on the submission as a replyTo part
-	// (lib.ReplyToPart). The console door sets it from its frame's replyTo.
+	// (lib.ReplyToPart). The console door sets it from its frame's replyTo,
+	// the inject door from its request's.
 	ReplyTo string
 
 	// Intent, when set, is a control action the backend expressed directly

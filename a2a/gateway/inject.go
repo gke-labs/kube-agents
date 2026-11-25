@@ -372,6 +372,19 @@ type injectRequest struct {
 	// location and cluster, and any the profile declares), checked where the
 	// turn is routed (resolveProfile). Only with Profile: platform takes none.
 	Parameters map[string]string `json:"parameters,omitempty"`
+	// ReplyTo, when set, names the task a relayed report was on (the
+	// transcript entry's ReplyTo, the root the gateway kept the report
+	// under): this turn answers that report, as the console frame's replyTo
+	// does (ConsoleInFrame.ReplyTo), and the gateway puts the task and the
+	// report it kept under that root on the submission. An inject
+	// conversation is not thread-keyed, so a turn naming no task carries no
+	// kept report. The report is looked up in this conversation's own kept
+	// reports alone (pushedReports.byRoot, keyed by the conversation), so a
+	// root kept under another conversation attaches nothing. Held to a task
+	// id's shape here, the one check the console's replyTo meets on its way
+	// out (lib.ReplyToPart); a malformed one is refused rather than dropped,
+	// as the door refuses a malformed profile.
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
 // injectResponse is the POST /inject reply.
@@ -1472,7 +1485,9 @@ func (a *InjectAdapter) waitCh() <-chan struct{} {
 	return a.notify
 }
 
-// handleInject is POST /inject: one inbound chat message.
+// handleInject is POST /inject: one inbound chat message. A turn answering a
+// report relayed onto its conversation names that report's task in replyTo
+// (injectRequest.ReplyTo); with none, it carries no kept report.
 func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	// First, before the method and before the body: an unauthenticated
 	// caller learns nothing from this door, not which methods it takes and
@@ -1530,6 +1545,10 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Profile == "" && len(req.Parameters) > 0 {
 		injectError(w, http.StatusBadRequest, "parameters go with a profile; platform takes none")
+		return
+	}
+	if req.ReplyTo != "" && !lib.ValidSubjectToken(req.ReplyTo) {
+		injectError(w, http.StatusBadRequest, "replyTo is not a task id")
 		return
 	}
 
@@ -1605,6 +1624,7 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		Intent:       req.Intent,
 		Profile:      req.Profile,
 		Parameters:   req.Parameters,
+		ReplyTo:      req.ReplyTo,
 		// Stamped rather than inferred: this door can be armed beside a real
 		// backend, and the authority block has to name the door the message
 		// came through rather than the backend the process was configured

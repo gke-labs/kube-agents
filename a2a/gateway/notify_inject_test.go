@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -247,5 +248,98 @@ func TestEveryRelayedEntryIsMarkedAndNotATurnEntry(t *testing.T) {
 	door.mu.Unlock()
 	if own.entries != after.entries+1 {
 		t.Fatalf("the turn's own post not counted: %d -> %d", after.entries, own.entries)
+	}
+}
+
+// injectTurnParts POSTs one inject turn and returns the parts of the
+// submission it started on platform.
+func injectTurnParts(t *testing.T, r *injectRig, req injectRequest) []lib.Part {
+	t.Helper()
+	status, out := r.postInject(t, req)
+	if status != http.StatusOK || !out.Accepted || out.TaskID == "" {
+		t.Fatalf("POST = %d %+v, want an accepted turn", status, out)
+	}
+	origin := r.awaitTask(t, "platform")
+	if origin.TaskID != out.TaskID {
+		t.Fatalf("submission task %q, POST answered %q", origin.TaskID, out.TaskID)
+	}
+	return messageParts(t, origin)
+}
+
+// An inject turn whose replyTo names the root a report was kept under, on
+// its own conversation, carries that report and the replyTo part, as a
+// console reply does: an inject key is not thread-keyed, so replyTo is the
+// only way a turn on this door is under a report.
+func TestAnInjectReplyNamingTheRootCarriesTheKeptReport(t *testing.T) {
+	t.Parallel()
+	r := startInjectRig(t)
+	const report = "card report: np-quartz-7 is at 92%"
+	r.g.reports.put(injectKeyPrefix+"eval-reply-1", "task-root", report)
+	parts := injectTurnParts(t, r, injectRequest{Conversation: "eval-reply-1", Author: injectTestAuthor,
+		Text: "and the other pool?", ReplyTo: "task-root"})
+	got, found, err := lib.PushedReportOf(parts)
+	if err != nil || !found || got != (lib.PushedReport{TaskID: "task-root", Text: report}) {
+		t.Fatalf("pushedReport part = %+v found=%v err=%v, want the kept report", got, found, err)
+	}
+	if rt, found, _ := lib.ReplyToOf(parts); !found || rt.TaskID != "task-root" {
+		t.Fatalf("replyTo part = %+v found=%v, want task-root", rt, found)
+	}
+}
+
+// Without replyTo, an inject turn on a conversation holding a kept report
+// carries neither part.
+func TestAnInjectTurnWithoutReplyToCarriesNoKeptReport(t *testing.T) {
+	t.Parallel()
+	r := startInjectRig(t)
+	r.g.reports.put(injectKeyPrefix+"eval-reply-2", "task-root", "card report")
+	parts := injectTurnParts(t, r, injectRequest{Conversation: "eval-reply-2", Author: injectTestAuthor, Text: "and the other pool?"})
+	if _, found, _ := lib.PushedReportOf(parts); found {
+		t.Fatal("a turn naming no task carried the kept report")
+	}
+	if _, found, _ := lib.ReplyToOf(parts); found {
+		t.Fatal("a turn naming no task carried a replyTo part")
+	}
+}
+
+// A replyTo that is not a task id's shape is refused at the door with a
+// 400, as a malformed profile is, and nothing is submitted.
+func TestTheInjectDoorRefusesAMalformedReplyTo(t *testing.T) {
+	t.Parallel()
+	r := startInjectRig(t)
+	r.g.reports.put(injectKeyPrefix+"eval-reply-3", "task-root", "card report")
+	for _, bad := range []string{"task.>", "Task-Root", "task root", strings.Repeat("t", 64)} {
+		status, _ := r.postInject(t, injectRequest{Conversation: "eval-reply-3", Author: injectTestAuthor, Text: "x", ReplyTo: bad})
+		if status != http.StatusBadRequest {
+			t.Errorf("replyTo %q: status %d, want 400", bad, status)
+		}
+	}
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+">"); len(envs) != 0 {
+		t.Fatalf("%d submission(s) after refused POSTs", len(envs))
+	}
+}
+
+// A turn on conversation A naming a root whose report was kept under
+// conversation B carries nothing of B's: kept reports are looked up under
+// the posting turn's own key (relayedReport passes rec.Key to byRoot), so
+// holding the door's token is not a way to read another conversation's
+// report by guessing its root.
+func TestAnInjectReplyCannotReachAnotherConversationsKeptReport(t *testing.T) {
+	t.Parallel()
+	r := startInjectRig(t)
+	const secret = "conversation B's report: the token is in vault-7"
+	r.g.reports.put(injectKeyPrefix+"eval-conv-b", "task-b", secret)
+	parts := injectTurnParts(t, r, injectRequest{Conversation: "eval-conv-a", Author: injectTestAuthor,
+		Text: "what did the card say?", ReplyTo: "task-b"})
+	if got, found, _ := lib.PushedReportOf(parts); found {
+		t.Fatalf("A's turn carried a report kept under B: %+v", got)
+	}
+	for _, p := range parts {
+		if strings.Contains(p.Text, secret) || strings.Contains(string(p.Data), secret) {
+			t.Fatalf("A's submission holds B's report text in part %+v", p)
+		}
+	}
+	// B's report is still kept for B.
+	if got, ok := r.g.reports.byRoot(injectKeyPrefix+"eval-conv-b", "task-b"); !ok || got != secret {
+		t.Fatalf("B's kept report = %q (%v)", got, ok)
 	}
 }

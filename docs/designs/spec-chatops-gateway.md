@@ -1493,7 +1493,14 @@ not be silent about it.
   `parameters` without a `profile` (platform takes none), each with a 400. Everything else goes
   down the one profile path every door takes: the profile resolved (a generic one yields to the one
   pinned to the target), its card, tier, parameters and target scope checked, and a refusal posted
-  to the conversation. It reaches nothing the same eval identity can't already reach by asking a session to delegate to the profile: the same tier (read) and the same profile checks. Neither path checks the target's allowed-users list for a profile today, since only `platform` renders one (#5947). The adapter prefixes the key
+  to the conversation. It reaches nothing the same eval identity can't already reach by asking a session to delegate to the profile: the same tier (read) and the same profile checks. Neither path checks the target's allowed-users list for a profile today, since only `platform` renders one (#5947). The body may
+  also carry a `replyTo` (added 11/25): the task a relayed report on this conversation was on (the
+  transcript entry's `replyTo`, the root the report was kept under), when the turn answers that
+  report, as the console frame's `replyTo` does. It goes on the submission as a `replyTo` part, with
+  the report kept under that root in this same conversation; a root kept under any other
+  conversation attaches nothing, since kept reports are looked up by the posting turn's own key. An
+  inject conversation is not thread-keyed, so a turn without `replyTo` carries no kept report. The
+  door refuses a `replyTo` that isn't a task id's shape with a 400. The adapter prefixes the key
   with `inject:` and delivers an `InboundMessage`; from there a typed turn is indistinguishable from
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
@@ -2292,7 +2299,7 @@ conversations (`pushedReportsConversationsMax`) and 32 MiB of text in all
 (`pushedReportsBytesMax`); past either bound the conversation least recently posted a report to is
 forgotten whole, so the cache holds at most 32 MiB or one conversation (the per-conversation bounds
 alone would allow 1024 × 8 × 64 KiB). A human turn, on any route, that names a task (the console
-frame's `replyTo`, read as its chain's root) carries the newest report kept on that root, as often
+frame's `replyTo`, or the inject door's, read as its chain's root) carries the newest report kept on that root, as often
 as a turn names it; a human turn that opens a task in a chat thread names no task and carries the
 newest report kept for the thread's key, and once that turn's submission is on the bus the gateway
 forgets the reports the turn read (one kept during the publish stays for the next turn); a message
