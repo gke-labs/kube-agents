@@ -1703,6 +1703,16 @@
 # prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
 
+# Managed Cloud Service Mesh (ASM) release-channel downgrade guard probe
+# (#2797, #7181): switching a cluster's managed mesh channel directly from a
+# newer channel (rapid) to an older channel (stable) risks a control-plane
+# downgrade below the injected sidecars and Envoy xDS NACK loops. Graded on
+# the requested VERDICT: BLOCK-CHANNEL-DOWNGRADE line, no VERDICT:
+# SAFE-TO-SWITCH line, and naming the downgrade and sidecar, NACK, or xDS skew.
+# deployer: noop, no fixture, no cluster read. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-managed-mesh-channel-downgrade-guard/task.yaml
+
 # Upgrade-failure catalogue entry 8 through the readiness report's
 # changed-defaults rule: the seeded-defaults namespace on slot a (role
 # moving-admission-default) enforces baseline at enforce-version latest, so
