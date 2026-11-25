@@ -1,8 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"slices"
+	"strconv"
+	"strings"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/plugin"
@@ -72,25 +77,45 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("path scope: %w", err)
 	}
-	pl, err := toolPolicyPlugin(permitted)
+	pl, err := toolPolicyPlugin(permitted, refusalLog)
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, err
 	}
 	return b, permissions.Options{Mode: permissions.ModeAllow, Policy: policy, Scope: scope}, []*plugin.Plugin{pl}, nil
 }
 
+// refusalLog is where each refused tool call is logged, one line each
+// (logRefusal); run points it at the process's stderr, which the worker
+// writes to its pod log.
+var refusalLog io.Writer = os.Stderr
+
+// RefusalLogPrefix starts every refused-call line.
+const RefusalLogPrefix = coreagentwire.RefusalLogPrefix
+
 // toolPolicyPlugin refuses, before it runs, any tool call outside
-// permitted. It doesn't rewrite arguments; a call with nil arguments is
-// checked by name like any other.
-func toolPolicyPlugin(permitted map[string]bool) (*plugin.Plugin, error) {
+// permitted, and logs every refused call to log, whichever layer refused
+// it. It doesn't rewrite arguments; a call with nil arguments is checked by
+// name like any other.
+func toolPolicyPlugin(permitted map[string]bool, log io.Writer) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: toolPolicyPluginName,
+		// Every tool error passes through here, the plugin's own refusal
+		// included. Returning nothing leaves the error as the tool's
+		// result.
+		OnToolErrorCallback: func(_ agent.Context, t adktool.Tool, _ map[string]any, err error) (map[string]any, error) {
+			name := ""
+			if t != nil {
+				name = t.Name()
+			}
+			logRefusal(log, name, err)
+			return nil, nil
+		},
 		BeforeToolCallback: func(_ agent.Context, t adktool.Tool, _ map[string]any) (map[string]any, error) {
 			if t == nil {
 				return nil, fmt.Errorf("a tool call without a tool")
 			}
 			if !permitted[t.Name()] {
-				return nil, fmt.Errorf("tool %q is not in this turn's grant", t.Name())
+				return nil, fmt.Errorf("tool %q %s", t.Name(), notInGrant)
 			}
 			return nil, nil
 		},
@@ -141,4 +166,49 @@ func builtinSwitch(b *tools.BuiltinTools, name string) *bool {
 		"record_plan":       &b.RecordPlan,
 		"sciontool_status":  &b.SciontoolStatus,
 	}[name]
+}
+
+// notInGrant ends the plugin's own refusal.
+const notInGrant = "is not in this turn's grant"
+
+// refusalReasons are the refusals logRefusal names, each by a phrase of
+// its error: the plugin's, then core-agent's gate in allow mode. The
+// phrases are core-agent's error texts; one it changes falls through to
+// unlogged, never to a wrong reason.
+var refusalReasons = []struct{ phrase, reason string }{
+	{notInGrant, "not in the turn's grant"},
+	{"requires an allowlist entry in 'allow' mode", "no allow rule matches"},
+	{"denied by config policy", "a deny rule matches"},
+	{"is outside scope", "outside the workspace"},
+	{"bash refused", "the gate's command checks"},
+	// ADK's, for a call to a tool that isn't registered.
+	{"' not found.", "no such tool"},
+}
+
+// logRefusal writes one line for a refused call: the prefix, the tool's
+// name and why, never its arguments (core-agent's error texts quote the
+// command or path, so they aren't logged). An error that isn't a refusal,
+// a missing file say, writes nothing.
+func logRefusal(w io.Writer, tool string, err error) {
+	if w == nil || err == nil {
+		return
+	}
+	reason := ""
+	switch {
+	case errors.Is(err, permissions.ErrNoPrompter), errors.Is(err, permissions.ErrEscalationRefused):
+		reason = "needs an approval no one can give"
+	case errors.Is(err, permissions.ErrSandboxDenied), errors.Is(err, permissions.ErrCredentialFile):
+		reason = "the sandbox"
+	default:
+		for _, r := range refusalReasons {
+			if strings.Contains(err.Error(), r.phrase) {
+				reason = r.reason
+				break
+			}
+		}
+	}
+	if reason == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "%s%s (%s)\n", RefusalLogPrefix, strconv.Quote(tool), reason)
 }

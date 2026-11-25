@@ -19,18 +19,21 @@ var newModel = buildModel
 const placeholderKey = "gateway-proxy-owns-the-key"
 
 // buildModel is the turn's model: Gemini, at the base URL the adapter put in
-// GOOGLE_GEMINI_BASE_URL (the loopback gateway proxy), with every
-// server-side built-in tool off, so every tool the model can call is one
-// the policy offers.
+// GOOGLE_GEMINI_BASE_URL (the loopback gateway proxy), with URL context and
+// code execution always off and Google Search on only when the turn's
+// policy grants web search, so every other tool the model can call is one
+// the policy offers. Search runs server-side, not gated per call, as
+// WebSearch does on Claude Code; it works only where the endpoint behind
+// the proxy offers it.
 //
 // The base URL and its proxy wiring come with the model-routing change (#7158).
-func buildModel(ctx context.Context, name string) (adkmodel.LLM, error) {
+func buildModel(ctx context.Context, name string, webSearch bool) (adkmodel.LLM, error) {
 	cfg := config.DefaultConfig()
 	cfg.Model.Provider = config.ProviderGemini
 	cfg.Model.Name = name
 	cfg.Model.APIKey = placeholderKey
-	off := false
-	cfg.Model.BuiltinTools = &config.BuiltinToolsConfig{WebSearch: &off, URLContext: &off, CodeExecution: &off}
+	off, search := false, webSearch
+	cfg.Model.BuiltinTools = &config.BuiltinToolsConfig{WebSearch: &search, URLContext: &off, CodeExecution: &off}
 	p, err := models.Resolve(cfg)
 	if err != nil {
 		return nil, err

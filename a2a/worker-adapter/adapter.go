@@ -936,7 +936,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	if b, ok := drv.(turnBudgeter); ok {
 		firstArgv = b.WithTurnBudget(argv, cfg.TaskDeadline-cfg.KillGrace)
 	}
-	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log)
+	// The harness's own log lines (stdout chatter, refused tool calls) name
+	// the task.
+	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -969,7 +971,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			if b, ok := drv.(turnBudgeter); ok {
 				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
 			}
-			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log)
+			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 		}
 	}
 

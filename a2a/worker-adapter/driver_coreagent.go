@@ -24,8 +24,9 @@ import (
 // the next turn's envelope carries them back.
 type coreAgentDriver struct {
 	// Policy and MCP are the turn's tool policy and MCP servers, set by
-	// NewCoreAgentDriver from the worker's grant (the session allowlist
-	// today; MCP is none until the delegate server is wired).
+	// NewCoreAgentDriver from the worker's grant: the session allowlist on a
+	// session pod, the persona's on a profile worker (WithPolicy). MCP is
+	// none until the persona's servers are wired.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 
@@ -48,6 +49,13 @@ func newCoreAgentDriver() coreAgentDriver {
 const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure reason token, not a credential
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
+
+// WithPolicy is the driver with p in its envelopes; the conversation history
+// it holds is shared.
+func (d coreAgentDriver) WithPolicy(p coreagentwire.Policy) Driver {
+	d.Policy = p
+	return d
+}
 
 // EncodeUser is the turn's envelope: the message, the policy and MCP
 // servers, and the history of the conversation WithResume named.

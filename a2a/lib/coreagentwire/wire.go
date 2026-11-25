@@ -54,6 +54,10 @@ type Policy struct {
 	// A call no Allow pattern matches is refused, never prompted.
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
+	// WebSearch turns on the model's server-side Google Search, the one
+	// server-side built-in a policy may turn on. The model provider runs
+	// it, so no gate or plugin sees its calls.
+	WebSearch bool `json:"web_search,omitempty"`
 }
 
 // MCPServer is one MCP server a turn may use; the harness runs it for the
@@ -112,3 +116,9 @@ type Usage struct {
 	Cached   int32 `json:"cached,omitempty"`
 	Thoughts int32 `json:"thoughts,omitempty"`
 }
+
+// RefusalLogPrefix starts the one line the harness writes to its stderr for
+// each refused tool call: the prefix, the tool's name as a Go-quoted
+// string, and the reason in parentheses, never the call's arguments. The
+// worker forwards only such lines to its own log.
+const RefusalLogPrefix = "tool refused: "
