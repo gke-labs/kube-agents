@@ -2,7 +2,7 @@
   {
     "expected": 0,
     "carrier": "notify",
-    "text": "**Security & RBAC Posture Audit: 2 critical findings**\n\n- `critical` seeded-b and -c admit privileged pods · _new_\n- `critical` default service account is cluster-admin on seeded-c\n\n5 more (1 major, 4 minor) are in the ledger issue.",
+    "text": "**Security & RBAC Posture Audit: 2 critical findings**\n\n- **critical** seeded-b and -c admit privileged pods · _new_\n- **critical** default service account is cluster-admin on seeded-c\n\n5 more (1 major, 4 minor) are in the ledger issue.",
     "actions": [
       {
         "data": {

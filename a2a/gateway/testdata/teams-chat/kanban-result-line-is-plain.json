@@ -2,7 +2,7 @@
   {
     "expected": 0,
     "carrier": "notify",
-    "text": "✅ Both pods are up\n   ✓ reading pods",
+    "text": "✅ Both pods are up\n⠀⠀✓ reading pods",
     "actions": []
   }
 ]

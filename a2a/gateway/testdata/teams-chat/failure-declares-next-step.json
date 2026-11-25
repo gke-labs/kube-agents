@@ -9,6 +9,7 @@
           "choice": 0,
           "kageAction": "choice",
           "label": "check seeded-a",
+          "next": true,
           "reply": "check seeded-a"
         },
         "title": "check seeded-a",

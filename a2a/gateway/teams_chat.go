@@ -39,15 +39,23 @@ const (
 	teamsPressReplyKey     = "reply"
 	teamsPressChoiceKey    = "choice"
 	teamsPressLabelKey     = "label"
+	// teamsPressNextKey marks a next step's button: its press answers no
+	// question, so nothing is posted for one the adapter cannot draw
+	// again (teams_clicks.go).
+	teamsPressNextKey = "next"
 
 	teamsChatBold         = "**"
-	teamsChatCode         = "`"
 	teamsChatRowBullet    = "- "
 	teamsChatRowDetailSep = " · "
 	teamsChatSectionGap   = "\n\n"
-	// teamsChatIndent sets a plan's steps in from its title: no-break
-	// spaces, since a text block drops leading plain ones.
-	teamsChatIndent   = "   "
+	// teamsChatHeading opens a markdown heading line, which the card
+	// builder would draw larger than the bold headline; the renderer
+	// draws it as a bold line, as Google Chat does.
+	teamsChatHeading = "#"
+	// teamsChatIndent sets a plan's steps in from its title: braille
+	// blanks, which draw as space and are not the Unicode white space the
+	// card builder trims from each line.
+	teamsChatIndent   = "\u2800\u2800"
 	teamsChatStepDone = "✓"
 	teamsChatStepOpen = "◌"
 	// teamsChatCellPipe stands in for a pipe inside a table cell, which
@@ -86,7 +94,7 @@ func renderTeamsChat(m *chatmsg.Message) (teamsChatLayout, error) {
 		}
 	}
 	add(teamsChatHead(m))
-	add(m.Detail)
+	add(teamsChatFlat(m.Detail))
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(teamsChatPlan(m.Plan))
 	} else {
@@ -128,8 +136,34 @@ func teamsBoldLine(text string) string {
 	return teamsChatBold + text + teamsChatBold
 }
 
-// teamsChatRows is one bullet per row: its severity as code, its text, and
-// its detail after a separator.
+// teamsChatFlat is text with each markdown heading line outside a code
+// fence drawn as a bold line.
+func teamsChatFlat(text string) string {
+	lines := strings.Split(text, "\n")
+	fence := 0
+	for i, line := range lines {
+		stripped := strings.TrimSpace(line)
+		if fence > 0 {
+			if teamsClosesFence(stripped, fence) {
+				fence = 0
+			}
+			continue
+		}
+		if n := teamsOpensFence(stripped); n > 0 {
+			fence = n
+			continue
+		}
+		title := strings.TrimLeft(stripped, teamsChatHeading)
+		if title == stripped || !strings.HasPrefix(title, " ") || strings.TrimSpace(title) == "" {
+			continue
+		}
+		lines[i] = teamsBoldLine(strings.TrimSpace(title))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// teamsChatRows is one bullet per row: its severity in bold (a card's text
+// has no inline code), its text, and its detail after a separator.
 func teamsChatRows(rows []chatmsg.Row) string {
 	var lines []string
 	for _, r := range rows {
@@ -139,7 +173,7 @@ func teamsChatRows(rows []chatmsg.Row) string {
 		}
 		line := teamsChatRowBullet
 		if r.Severity != "" {
-			line += teamsChatCode + r.Severity + teamsChatCode + " "
+			line += teamsBoldLine(r.Severity) + " "
 		}
 		line += text
 		if detail := gchatOneLine(r.Detail); detail != "" {
@@ -155,7 +189,7 @@ func teamsChatAfter(after []string) string {
 	var lines []string
 	for _, line := range after {
 		if strings.TrimSpace(line) != "" {
-			lines = append(lines, line)
+			lines = append(lines, teamsChatFlat(line))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -174,7 +208,7 @@ func teamsChatFold(f *chatmsg.Fold) string {
 	}
 	parts := []string{teamsBoldLine(title)}
 	if strings.TrimSpace(f.Text) != "" {
-		parts = append(parts, strings.TrimRight(f.Text, "\n"))
+		parts = append(parts, strings.TrimRight(teamsChatFlat(f.Text), "\n"))
 	}
 	if hasTable {
 		separator := make([]string, len(f.Table.Columns))
@@ -253,6 +287,9 @@ func teamsChoiceActions(choices []chatmsg.Choice) []map[string]any {
 		if c.Primary {
 			action[teamsActionStyleKey] = teamsActionPositive
 		}
+		if c.Next {
+			action["data"].(map[string]any)[teamsPressNextKey] = true
+		}
 		actions = append(actions, action)
 	}
 	return actions
@@ -325,14 +362,13 @@ func (a *TeamsAdapter) postChat(conversation string, m OutMessage) (string, erro
 	return id, nil
 }
 
-// editChat edits messageID to m's chat message as a card.
+// editChat edits messageID to m's chat message as a card, under the lock
+// that orders a message's edits (EditMessage).
 func (a *TeamsAdapter) editChat(conversation, messageID string, m OutMessage) error {
 	card, err := a.chatCard(messageID, m)
 	if err != nil {
 		return err
 	}
-	a.rateMu.Lock()
-	defer a.rateMu.Unlock()
 	if err := a.edit(conversation, messageID, card.text, card.actions()); err != nil {
 		return err
 	}

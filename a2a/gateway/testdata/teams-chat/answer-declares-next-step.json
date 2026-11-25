@@ -9,6 +9,7 @@
           "choice": 0,
           "kageAction": "choice",
           "label": "upgrade plan for seeded-c",
+          "next": true,
           "reply": "upgrade plan for seeded-c"
         },
         "title": "upgrade plan for seeded-c",

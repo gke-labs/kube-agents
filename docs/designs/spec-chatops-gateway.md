@@ -2872,8 +2872,8 @@ nothing out. A result recovered by replaying the stream after a restart arrives 
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
-them posts exactly what it posted before chat messages existed; Slack and Google Chat lay the
-message out ("Chat messages on Google Chat" under the Google Chat adapter). The relay never hands the
+them posts exactly what it posted before chat messages existed; Slack, Google Chat and Teams lay the
+message out ("Chat messages on Google Chat" under the Google Chat adapter, "Chat messages on Teams" under the Teams adapter), and Teams with its cards off answers `ErrTextOnly` too. The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
 refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
 the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
@@ -3289,7 +3289,7 @@ names a post (`postKindOf`), so an alert its triage edits stays as it was.
 same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the
 schema's order as the markdown the card builder reads (headline in bold with the note, detail,
 the plan with a status mark per item and a tick or an open mark per step, or the rows as
-bullets with the severity as code, the `after` lines, and the fold drawn open with its table as
+bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
 the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
 carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
 line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn. A
@@ -3308,8 +3308,8 @@ in the conversation of an open question answers it the same way, unless it is a 
 next step takes no typed reply. The line stays through a later edit that lays out no choices,
 and an edit that lays choices out asks anew. An update replaces the whole card and a press
 carries none of it, so a question the adapter no longer remembers (posted before a restart, or
-past its 512 remembered cards) is answered by a post of the line in the conversation, named by
-the label the button carried; the same post follows an edit that fails or a card the line
+past its `uxCap` remembered cards) is answered by a post of the line in the conversation, named by
+the label the button carried, unless the button is a next step's, which answered no question; the same post follows an edit that fails or a card the line
 would push past the budget.
 
 While card work is open in a conversation with nothing on screen that shows it, the adapter

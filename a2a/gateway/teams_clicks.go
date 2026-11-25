@@ -25,6 +25,14 @@ import (
 // remembers (posted before a restart) cannot be drawn again: its answer is
 // taken, and the line is posted in the conversation instead.
 
+const (
+	// teamsLinkJoin joins a markdown link's text to its target, and
+	// teamsLinkApart is the same two marks with a space between, which
+	// draws as text.
+	teamsLinkJoin  = "]("
+	teamsLinkApart = "] ("
+)
+
 // teamsQuestion is a laid-out message with choices: the conversation it
 // was posted in, whether it asks (a choice that is not a next step), and
 // its choices' labels.
@@ -35,12 +43,14 @@ type teamsQuestion struct {
 }
 
 // teamsPendingAnswer is a press, or a typed reply to an open question,
-// waiting for the gateway's verdict on its sender.
+// waiting for the gateway's verdict on its sender. asks is false for a
+// next step's press, which answers no question.
 type teamsPendingAnswer struct {
 	message string
 	clicker string
 	label   string
 	click   bool
+	asks    bool
 }
 
 // teamsUX is the adapter's record of its laid-out messages, under the
@@ -183,12 +193,12 @@ func (a *TeamsAdapter) noteTypedAnswer(conversation, turn, text, name string) {
 	if _, ok := ux.questions[id]; id == "" || !ok {
 		return
 	}
-	ux.pending[turn] = teamsPendingAnswer{message: id, clicker: teamsClicker(name), label: slackTypedWords(text)}
+	ux.pending[turn] = teamsPendingAnswer{message: id, clicker: teamsClicker(name), label: teamsLineWords(text), asks: true}
 }
 
 // teamsClicker is the name an answered line shows for name.
 func teamsClicker(name string) string {
-	if name = gchatOneLine(name); name != "" {
+	if name = teamsLineWords(name); name != "" {
 		return name
 	}
 	return namelessClicker
@@ -220,24 +230,50 @@ func (a *TeamsAdapter) choicePress(act *teamsActivity, press teamsPress, convers
 		a.mu.Unlock()
 		return InboundMessage{}, "a press on the question is already waiting (" + pressed + ")"
 	}
-	label := strings.TrimSpace(press.Label)
-	if q, ok := ux.questions[pressed]; ok && press.Choice != nil && *press.Choice >= 0 && *press.Choice < len(q.choices) {
-		label = q.choices[*press.Choice]
-	}
-	if label == "" {
-		label = reply
-	}
-	ux.pending[turn] = teamsPendingAnswer{message: pressed, clicker: teamsClicker(act.From.Name), label: gchatOneLine(label), click: true}
-	ux.waiting[pressed] = true
-	a.mu.Unlock()
-	return InboundMessage{
+	turnOf := InboundMessage{
 		Conversation: teamsConversationID(conversation),
 		Kind:         kind,
 		AuthorID:     author,
 		MessageID:    turn,
 		Text:         reply,
 		Click:        true,
-	}, ""
+	}
+	label := press.Label
+	q, asked := ux.questions[pressed]
+	_, drawn := ux.cards[pressed]
+	switch {
+	case asked && q.conversation != turnOf.Conversation:
+		// The press names a question of another conversation: its card
+		// could not be drawn again from here, and it would stay answered
+		// with nothing to show for it.
+		a.mu.Unlock()
+		return InboundMessage{}, "choice press names a question of another conversation"
+	case asked && (press.Choice == nil || *press.Choice < 0 || *press.Choice >= len(q.choices)):
+		a.mu.Unlock()
+		return InboundMessage{}, "choice press names no choice of its question"
+	case asked:
+		label = q.choices[*press.Choice]
+	case drawn:
+		// The message was drawn again without choices: a late press on
+		// buttons a client still shows is its turn, and writes nothing
+		// on the card.
+		a.mu.Unlock()
+		return turnOf, ""
+	}
+	if strings.TrimSpace(label) == "" {
+		label = reply
+	}
+	ux.pending[turn] = teamsPendingAnswer{message: pressed, clicker: teamsClicker(act.From.Name), label: teamsLineWords(label), click: true, asks: !press.Next}
+	ux.waiting[pressed] = true
+	a.mu.Unlock()
+	return turnOf, ""
+}
+
+// teamsLineWords is words as the answered line shows them: one line, cut
+// as a typed answer is, and with a markdown link taken apart so the line
+// draws no link of the answerer's making.
+func teamsLineWords(words string) string {
+	return strings.ReplaceAll(slackTypedWords(words), teamsLinkJoin, teamsLinkApart)
 }
 
 // InboundVerified learns whether a press, or a typed reply to an open
@@ -269,7 +305,7 @@ func (a *TeamsAdapter) InboundVerified(conversation, messageID string, verified 
 	a.rewrites.Add(1)
 	go func() {
 		defer a.rewrites.Done()
-		a.rewriteAnswered(conversation, p.message, line)
+		a.rewriteAnswered(conversation, p.message, line, p.asks)
 	}()
 }
 
@@ -277,8 +313,9 @@ func (a *TeamsAdapter) InboundVerified(conversation, messageID string, verified 
 // under it, its choices gone, its other buttons kept. A question the
 // adapter has no card for, one whose card would no longer fit, or one the
 // edit fails on, gets the line as a post in its conversation instead, so
-// the answer is on record where the question is.
-func (a *TeamsAdapter) rewriteAnswered(conversation, id, line string) {
+// the answer is on record where the question is; a next step's press
+// (asks false) answered no question, so nothing is posted for it.
+func (a *TeamsAdapter) rewriteAnswered(conversation, id, line string, asks bool) {
 	a.rateMu.Lock()
 	defer a.rateMu.Unlock()
 	a.mu.Lock()
@@ -306,6 +343,9 @@ func (a *TeamsAdapter) rewriteAnswered(conversation, id, line string) {
 			}
 			a.log.Warn("teams: drawing an answered question again failed; posting the answer in its conversation", "conversation", conversation, "err", err)
 		}
+	}
+	if !asks {
+		return
 	}
 	if _, err := a.Post(conversation, line); err != nil {
 		a.log.Warn("teams: posting an answered line failed", "conversation", conversation, "err", err)

@@ -885,22 +885,36 @@ func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, e
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	// One edit of a message at a time, in step with the redraws a rating
+	// and an answered question cause (teams_feedback.go, teams_clicks.go):
+	// each reads what the message shows and writes it back, and two of
+	// them interleaved would leave the older text or lose the answered
+	// line.
+	a.rateMu.Lock()
+	defer a.rateMu.Unlock()
 	if m.Chat != nil && a.adaptiveCards {
 		return a.editChat(conversation, messageID, m)
 	}
-	if m.Chat == nil {
-		// The message is text from here: it asks nothing any more, and an
-		// answered question keeps its line (teams_clicks.go).
-		m.Text = a.withAnsweredLine(messageID, m.Text)
+	if m.Chat != nil {
+		return ErrTextOnly
+	}
+	// The message is text from here: an answered question keeps its line,
+	// and once the edit has landed it asks nothing any more
+	// (teams_clicks.go).
+	m.Text = a.withAnsweredLine(messageID, m.Text)
+	var err error
+	switch {
+	case m.Stop != "":
+		err = a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		err = a.editRated(conversation, messageID, m)
+	default:
+		err = a.Edit(conversation, messageID, m.Text)
+	}
+	if err == nil {
 		a.trackQuestion(messageID, conversation, nil, nil)
 	}
-	switch {
-	case m.Chat == nil && m.Stop != "":
-		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
-	case a.rates(m):
-		return a.editRated(conversation, messageID, m)
-	}
-	return editTextOnly(a.Edit, conversation, messageID, m)
+	return err
 }
 
 // EditNotifyMessage is EditMessage for the chat.notify route's home posts

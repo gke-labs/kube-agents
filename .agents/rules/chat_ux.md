@@ -8,6 +8,7 @@ paths:
   - "agents/platform/scripts/*_presenter.py"
   - "a2a/gateway/slack_*.go"
   - "a2a/gateway/gchat*.go"
+  - "a2a/gateway/teams*.go"
   - "a2a/gateway/*chat*.go"
   - "a2a/gateway/relay*.go"
   - "a2a/gateway/busy.go"

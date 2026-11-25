@@ -60,7 +60,7 @@ func TestTeamsPostMessageLaysOutAChatMessage(t *testing.T) {
 		t.Fatalf("post: %v %q", err, id)
 	}
 	text := teamsCallText(t, relay, 0)
-	for _, want := range []string{"**Restart checkout-gateway?** It is crash-looping.", "• `high` 3 of 3 pods restarting"} {
+	for _, want := range []string{"**Restart checkout-gateway?** It is crash-looping.", "• **high** 3 of 3 pods restarting"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the card's text lacks %q:\n%s", want, text)
 		}
@@ -303,6 +303,51 @@ func TestTeamsEditWithoutChoicesClosesTheQuestion(t *testing.T) {
 	if n := teamsCallCount(relay); n != 2 {
 		t.Fatalf("a typed message after the question closed wrote on it: %d calls", n)
 	}
+	settled := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Restarted checkout-gateway."}
+	if err := a.EditMessage(conversation, testTeamsPosted, OutMessage{Text: "fallback", Chat: settled}); err != nil {
+		t.Fatal(err)
+	}
+	late, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:41", testTeamsPosted, teamsChoice("yes, restart it", 0, "Yes"))))
+	if reason != "" || late.Text != "yes, restart it" {
+		t.Fatalf("a late press was not its turn: %+v %s", late, reason)
+	}
+	a.InboundVerified(late.Conversation, late.MessageID, true)
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != 3 {
+		t.Fatalf("a late press on a closed question wrote on its card: %d calls", n)
+	}
+}
+
+// A press that names a question of another conversation, or no choice of
+// its question, is no turn and leaves the question open.
+func TestTeamsRefusesAPressThatDoesNotFitItsQuestion(t *testing.T) {
+	a, _ := askedTeamsAdapter(t)
+	elsewhere := testTeamsPress("f:30", testTeamsPosted, teamsChoice("yes, restart it", 0, "Yes"))
+	elsewhere["conversation"] = map[string]any{"id": testTeamsDM, "conversationType": "personal", "tenantId": testTeamsTenant}
+	if _, reason := a.classify(decodeTeamsActivity(t, elsewhere)); !strings.Contains(reason, "another conversation") {
+		t.Errorf("a press from another conversation: %q", reason)
+	}
+	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:31", testTeamsPosted, teamsChoice("anything", 7, "Forged")))); !strings.Contains(reason, "no choice") {
+		t.Errorf("a press with an index out of range: %q", reason)
+	}
+	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:32", testTeamsPosted, teamsChoice("No", 1, "No")))); reason != "" {
+		t.Fatalf("the question did not stay open: %s", reason)
+	}
+}
+
+// The answered line shows the answerer's words as text: a markdown link in
+// a typed reply draws no link.
+func TestTeamsAnsweredLineDrawsNoLinkOfTheAnswerers(t *testing.T) {
+	a, relay := askedTeamsAdapter(t)
+	typed, reason := a.classify(decodeTeamsActivity(t, testTeamsActivity("f:40", "<at>Kage</at> see [this](https://evil.example)")))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(typed.Conversation, typed.MessageID, true)
+	a.rewrites.Wait()
+	if text := teamsCallText(t, relay, 1); strings.Contains(text, "](") || !strings.Contains(text, "✓ hangdng: see [this] (https://evil.example)") {
+		t.Errorf("the answered line:\n%s", text)
+	}
 }
 
 // A laid-out answer marked for feedback carries the rating controls after
@@ -333,5 +378,56 @@ func TestTeamsRatedChatAnswerKeepsItsButtons(t *testing.T) {
 	}
 	if got := teamsActionTitles(teamsCallActions(t, relay, 1)); got != "Open the dashboard,"+teamsRatingUpTitle+","+teamsRatingDownTitle {
 		t.Errorf("the rated card's buttons %q", got)
+	}
+}
+
+// A next step's press on a card the adapter does not remember is its turn
+// and posts nothing: it answered no question.
+func TestTeamsNextStepPressOnAnUnrememberedCardPostsNothing(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	next := teamsChoice("fix the first one", 0, "Fix the first one")
+	next[teamsPressNextKey] = true
+	msg, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:30", "1794603000000", next)))
+	if reason != "" || msg.Text != "fix the first one" {
+		t.Fatalf("press: %+v %s", msg, reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != 0 {
+		t.Fatalf("%d calls for a next step's press, want none", n)
+	}
+}
+
+// The card's text is what the card builder keeps: a plan's steps stay set
+// in from their titles, a row's severity is bold, and a heading in the
+// detail or the fold is a bold line of the body's size.
+func TestTeamsChatTextSurvivesTheCardBuilder(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	plan := &chatmsg.Message{Schema: chatmsg.Schema, Plan: &chatmsg.Plan{Items: []chatmsg.PlanItem{
+		{ID: "t_1", Title: "seeded-a", Status: chatmsg.StatusInProgress, Steps: []string{"listed nodes", "reading versions"}},
+	}}}
+	if _, err := a.PostMessage("teams:"+testTeamsChannel, OutMessage{Text: "fallback", Chat: plan}); err != nil {
+		t.Fatal(err)
+	}
+	if text := teamsCallText(t, relay, 0); !strings.Contains(text, teamsChatIndent+"✓ listed nodes") || !strings.Contains(text, teamsChatIndent+"◌ reading versions") {
+		t.Errorf("the plan's steps lost their indent:\n%q", text)
+	}
+	report := &chatmsg.Message{
+		Schema: chatmsg.Schema, Headline: "Found one thing.", Detail: "## What is wrong\nA pod restarts.",
+		Fold: &chatmsg.Fold{Text: "### Evidence\n```\n# not a heading\n```"},
+	}
+	if _, err := a.PostMessage("teams:"+testTeamsChannel, OutMessage{Text: "fallback", Chat: report}); err != nil {
+		t.Fatal(err)
+	}
+	text := teamsCallText(t, relay, 1)
+	for _, want := range []string{"**What is wrong**", "**Evidence**", "# not a heading"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the card's text lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "## ") {
+		t.Errorf("a heading outside a fence was left as a heading:\n%s", text)
 	}
 }

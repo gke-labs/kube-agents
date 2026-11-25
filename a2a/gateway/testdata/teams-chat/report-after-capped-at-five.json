@@ -2,7 +2,7 @@
   {
     "expected": 0,
     "carrier": "result",
-    "text": "**Security & RBAC audit: 7 findings, 2 critical.** 2 are new since the last run.\n\n- `critical` seeded-b and -c admit privileged pods\n- `critical` default SA is `cluster-admin` on seeded-c\n\nAlso found: finding 1.\nAlso found: finding 2.\nAlso found: finding 3.\nAlso found: finding 4.\nAlso found: finding 5.",
+    "text": "**Security & RBAC audit: 7 findings, 2 critical.** 2 are new since the last run.\n\n- **critical** seeded-b and -c admit privileged pods\n- **critical** default SA is `cluster-admin` on seeded-c\n\nAlso found: finding 1.\nAlso found: finding 2.\nAlso found: finding 3.\nAlso found: finding 4.\nAlso found: finding 5.",
     "actions": [
       {
         "data": {
