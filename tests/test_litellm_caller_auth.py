@@ -78,7 +78,7 @@ _CALLER_ROUTES = {
     "/v1/model/info",
     "/health",
 }
-# The Antigravity CLI's Gemini-format generation calls (the agy harness): the
+# The core-agent worker harness's Gemini-format generation calls: the
 # hook admits the three methods exactly, and the token's allowed_routes carries
 # the wildcard LiteLLM's own route check matches.
 _GEMINI_ROUTE_TEMPLATES = {"/v1beta/models/*"}

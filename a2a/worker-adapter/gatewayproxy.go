@@ -82,10 +82,13 @@ var gatewayProxyPath = regexp.MustCompile(`^` + regexp.QuoteMeta(gatewayProxyPat
 // the proxy speaks for the worker (#6706). An allowlist, because the
 // credential headers a gateway might honour are not a list this file can
 // keep complete.
+//
+// Accept-Encoding is not among them: the proxy watches each answer as it
+// passes (gatewayproxy_answercheck.go), so its transport asks for gzip
+// itself and decompresses, and the harness gets the answer plain.
 var gatewayProxyForwardedHeaders = map[string]bool{
 	"Content-Type":      true,
 	"Accept":            true,
-	"Accept-Encoding":   true,
 	"User-Agent":        true,
 	"X-Goog-Api-Client": true,
 }
@@ -154,6 +157,9 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 		FlushInterval: -1, // stream each chunk as it comes: the answers are SSE
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Body = &cappedBody{r: resp.Body, left: gatewayProxyMaxResponseBytes}
+			// An answer cut short or carrying an error breaks the
+			// connection rather than ending it (gatewayproxy_answercheck.go).
+			checkAnswer(resp)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

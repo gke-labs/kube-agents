@@ -30,14 +30,22 @@ const coreAgentGatewayURLEnv = "GOOGLE_GEMINI_BASE_URL"
 //     GOOGLE_GENAI_USE_VERTEXAI, so nothing can select a Vertex backend and
 //     its Application Default Credentials.
 //
-// By prefix, as the tool-child list (#7140) withholds them, because the
-// library adds providers: a new provider's variable under one of these is
-// dropped without a change here.
+// By prefix, as the tool-child allowlist (#7140) will withhold them,
+// because the library adds providers: a new provider's variable under one
+// of these is dropped without a change here.
 var coreAgentWithheldPrefixes = []string{
 	"GOOGLE_", "GEMINI_", "CLOUD_ML_", "ANTHROPIC_", "OPENAI_", "XAI_", "GROQ_", "AICORE_", "GW_",
 }
 
+// coreAgentKeptEnv are names under those prefixes that carry no model route
+// or credential and stay: the universe domain, which the gateway sets on
+// cluster-view session pods for the Google client libraries a tool runs.
+var coreAgentKeptEnv = map[string]bool{"GOOGLE_CLOUD_UNIVERSE_DOMAIN": true}
+
 func coreAgentWithheld(key string) bool {
+	if coreAgentKeptEnv[key] {
+		return false
+	}
 	for _, p := range coreAgentWithheldPrefixes {
 		if strings.HasPrefix(key, p) {
 			return true

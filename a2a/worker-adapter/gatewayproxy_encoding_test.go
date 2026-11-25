@@ -29,23 +29,23 @@ func gzipSSEGateway(release <-chan struct{}) http.Handler {
 			}
 			w.(http.Flusher).Flush()
 		}
-		_, _ = io.WriteString(out, "data: {\"n\":1}\n\n")
+		_, _ = io.WriteString(out, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"1\"}]}}]}\n\n")
 		flush()
-		_, _ = io.WriteString(out, "data: {\"n\":2}\n\n")
+		_, _ = io.WriteString(out, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"2\"}]}}]}\n\n")
 		flush()
 		<-release
-		_, _ = io.WriteString(out, "data: {\"n\":3,\"finishReason\":\"STOP\"}\n\n")
+		_, _ = io.WriteString(out, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"3\"}]},\"finishReason\":\"STOP\"}]}\n\n")
 		if zw != nil {
 			_ = zw.Close()
 		}
 	})
 }
 
-// TestACompressedAnswerStreamsThroughTheProxy: a harness on Go's default
-// transport (core-agent's genai client) asks for gzip implicitly. The proxy
-// forwards Accept-Encoding and passes Content-Encoding back, so the client
-// decompresses, and each chunk arrives as the gateway flushes it, before
-// the answer ends: the proxy streams, it doesn't hold.
+// TestACompressedAnswerStreamsThroughTheProxy: the gateway compresses when
+// asked. The proxy's own transport asks and decompresses (it watches each
+// answer as it passes), and the harness on Go's default transport (the
+// genai client) gets each chunk plain, as the gateway flushes it, before the
+// answer ends: the proxy streams, it doesn't hold.
 func TestACompressedAnswerStreamsThroughTheProxy(t *testing.T) {
 	release := make(chan struct{})
 	up := httptest.NewServer(gzipSSEGateway(release))
@@ -58,8 +58,8 @@ func TestACompressedAnswerStreamsThroughTheProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if !resp.Uncompressed {
-		t.Errorf("the client got the answer still compressed (Content-Encoding %q); want its transport to have decompressed it", resp.Header.Get("Content-Encoding"))
+	if resp.Header.Get("Content-Encoding") != "" {
+		t.Errorf("the answer reached the harness with Content-Encoding %q; want it plain", resp.Header.Get("Content-Encoding"))
 	}
 	lines := make(chan string, 8)
 	go func() {
@@ -71,7 +71,7 @@ func TestACompressedAnswerStreamsThroughTheProxy(t *testing.T) {
 		}
 		close(lines)
 	}()
-	for _, want := range []string{`data: {"n":1}`, `data: {"n":2}`} {
+	for _, want := range []string{`data: {"candidates":[{"content":{"parts":[{"text":"1"}]}}]}`, `data: {"candidates":[{"content":{"parts":[{"text":"2"}]}}]}`} {
 		select {
 		case got := <-lines:
 			if got != want {
@@ -84,15 +84,15 @@ func TestACompressedAnswerStreamsThroughTheProxy(t *testing.T) {
 	}
 	close(release)
 	got, ok := <-lines
-	if !ok || got != `data: {"n":3,"finishReason":"STOP"}` {
+	if !ok || got != `data: {"candidates":[{"content":{"parts":[{"text":"3"}]},"finishReason":"STOP"}]}` {
 		t.Errorf("last chunk %q (ok %v)", got, ok)
 	}
 }
 
-// TestAnExplicitGzipCallerGetsTheGatewaysEncoding: a caller that sets
-// Accept-Encoding itself, and so decompresses itself, gets the gzip body
-// with its Content-Encoding, intact.
-func TestAnExplicitGzipCallerGetsTheGatewaysEncoding(t *testing.T) {
+// TestAnExplicitGzipCallerGetsTheAnswerPlain: a caller that asks for gzip
+// itself, and would decompress itself, still gets the answer plain and
+// whole: the proxy doesn't pass Accept-Encoding on.
+func TestAnExplicitGzipCallerGetsTheAnswerPlain(t *testing.T) {
 	release := make(chan struct{})
 	close(release)
 	up := httptest.NewServer(gzipSSEGateway(release))
@@ -105,15 +105,8 @@ func TestAnExplicitGzipCallerGetsTheGatewaysEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.Header.Get("Content-Encoding") != "gzip" {
-		t.Fatalf("Content-Encoding %q, want gzip passed back", resp.Header.Get("Content-Encoding"))
-	}
-	zr, err := gzip.NewReader(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := io.ReadAll(zr)
-	if err != nil || !strings.HasSuffix(string(b), "data: {\"n\":3,\"finishReason\":\"STOP\"}\n\n") {
-		t.Errorf("decoded %q, err %v", b, err)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil || resp.Header.Get("Content-Encoding") != "" || !strings.HasSuffix(string(b), "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"3\"}]},\"finishReason\":\"STOP\"}]}\n\n") {
+		t.Errorf("Content-Encoding %q body %q err %v; want the whole answer plain", resp.Header.Get("Content-Encoding"), b, err)
 	}
 }

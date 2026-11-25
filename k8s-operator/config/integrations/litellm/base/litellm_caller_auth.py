@@ -99,7 +99,8 @@ CALLER_ROUTES = (
 )
 # The Gemini-format generation routes LiteLLM serves (route_checks.py's Google
 # routes): one model name, then the method. Matched whole, so nothing else under
-# /v1beta reaches the gateway. The Antigravity CLI calls these.
+# /v1beta reaches the gateway. The core-agent worker harness calls these,
+# through the worker adapter's loopback gateway proxy.
 GEMINI_CALLER_ROUTE = re.compile(r"/v1beta/models/[^/:]+:(generateContent|streamGenerateContent|countTokens)")
 # What the token's allowed_routes carries for them. LiteLLM checks a token's
 # allowed_routes on every request (route_checks.should_call_route), matching an

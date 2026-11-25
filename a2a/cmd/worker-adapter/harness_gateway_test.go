@@ -184,14 +184,14 @@ func TestACoreAgentWorkerCallsTheGatewayThroughOneProxy(t *testing.T) {
 }
 
 // TestCoreAgentsEnvWithholdsEveryModelRoute: the builder drops every
-// variable under the withheld prefixes and keeps the rest, near misses
-// included.
+// variable under the withheld prefixes and keeps the rest, near misses and
+// the universe domain included.
 func TestCoreAgentsEnvWithholdsEveryModelRoute(t *testing.T) {
 	base := []string{"HOME=/h", "A2A_MODEL=m", "GOOGLE_API_KEY=k", "GOOGLE_GEMINI_BASE_URL=http://x", "GEMINI_API_KEY=g",
 		"GOOGLE_GENAI_USE_VERTEXAI=1", "CLOUD_ML_REGION=r", "ANTHROPIC_BASE_URL=http://g", "AICORE_CLIENT_SECRET=s",
-		"NOT_GOOGLE_X=kept", "GOOGLEX=kept", "PATH=/bin"}
+		"NOT_GOOGLE_X=kept", "GOOGLEX=kept", "GOOGLE_CLOUD_UNIVERSE_DOMAIN=example.com", "PATH=/bin"}
 	got := coreAgentBuilder{}.env(slices.Clone(base), nil)
-	want := []string{"HOME=/h", "A2A_MODEL=m", "NOT_GOOGLE_X=kept", "GOOGLEX=kept", "PATH=/bin"}
+	want := []string{"HOME=/h", "A2A_MODEL=m", "NOT_GOOGLE_X=kept", "GOOGLEX=kept", "GOOGLE_CLOUD_UNIVERSE_DOMAIN=example.com", "PATH=/bin"}
 	if !slices.Equal(got, want) {
 		t.Errorf("env %q, want %q", got, want)
 	}
