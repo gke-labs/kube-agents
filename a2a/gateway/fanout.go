@@ -456,7 +456,7 @@ func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, pare
 			if streamErr != nil {
 				continue
 			}
-			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID, g.profileRead(rec, fresh.ID, fresh.Addressee))
+			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID)
 			if err != nil {
 				g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", fresh.ID, "err", err)
 				continue
