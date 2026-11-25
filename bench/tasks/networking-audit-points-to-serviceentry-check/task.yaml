@@ -37,16 +37,18 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The negation has to be about the networking audit, in one sentence: a
-      # "not" elsewhere ("not installed ... declares the check") once matched an
-      # answer that said yes. An affirmative answer about the networking audit
-      # fails outright.
+      # The negation has to be about the networking audit, in either order:
+      # "networking ... does not check" or "not checked by ... networking", or
+      # the skill's own "not in this audit". An affirmative about the networking
+      # audit and ServiceEntries or collisions fails, in any tense, as does a
+      # "yes" on the same line as "networking" even across a full stop. Plain
+      # "the networking audit checks VPC subnets" is not an affirmative here.
       forbidden_patterns:
-        - "\\byes\\b[^\n.]{0,60}networking"
-        - "networking[^\n.]{0,40}\\b(does|do) (check|cover|detect)"
+        - "\\byes\\b[^\n]{0,80}networking"
+        - "networking[^\n.]{0,60}\\b(covers|checks|detects|flags|catches|includes|does check|does cover|do check|do cover)\\b[^\n.]{0,60}(serviceentr|collision)"
       required_patterns:
         - "compliance[ _-]?audit"
-        - "networking[^\n.]{0,80}\\b(does not|doesn.t|do not|don.t|is not|isn.t|not|never)\\b[^\n.]{0,40}(check|cover|detect|include|read)|\\bno\\b[^\n.]{0,20}networking"
+        - "networking[^\n.]{0,80}\\b(does not|doesn.t|do not|don.t|is not|isn.t|not|never)\\b[^\n.]{0,40}(check|cover|detect|include|read|flag)|\\b(not|never)\\b[^\n.]{0,40}(checked|covered|detected|flagged|included|part of)[^\n.]{0,40}networking|\\bnot in (this|the networking)|\\bno\\b[^\n]{0,30}networking"
       any_of_patterns:
         - "(^|[^0-9.])2\\.19([^0-9]|$)"
         - "serviceentry-host-collision"
