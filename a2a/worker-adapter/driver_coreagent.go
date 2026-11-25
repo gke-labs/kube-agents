@@ -27,6 +27,10 @@ type coreAgentDriver struct {
 	// the persona grant.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
+	// Instructions are the session pod's system-prompt lines, sent in each
+	// turn's envelope (WithInstructions). A profile worker has none: its
+	// persona is its instruction layer.
+	Instructions []string
 
 	conv *coreAgentConversations
 }
@@ -48,10 +52,21 @@ const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
 
+// WithInstructions is d with the worker's system-prompt lines for core-agent,
+// which reads them from each turn's envelope; any other driver is returned as
+// it is (Claude Code gets the same lines on its argv).
+func WithInstructions(d Driver, lines []string) Driver {
+	if c, ok := d.(coreAgentDriver); ok {
+		c.Instructions = append([]string(nil), lines...)
+		return c
+	}
+	return d
+}
+
 // EncodeUser is the turn's envelope: the message, the policy and MCP
 // servers, and the history of the conversation WithResume named.
 func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
-	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP}
+	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP, Instructions: d.Instructions}
 	if d.conv != nil {
 		d.conv.mu.Lock()
 		env.Session = d.conv.resume
