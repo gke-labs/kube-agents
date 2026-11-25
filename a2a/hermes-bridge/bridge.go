@@ -188,9 +188,11 @@ type Config struct {
 	// requests (default 2, the platform profile's concurrency in the
 	// profiles spec).
 	Concurrency int
-	// TaskDeadline is the task's wall-clock ceiling, counted from its first
-	// turn and spanning every follow-up turn after it (default 7200s,
-	// matching the platform profile's activeDeadlineSeconds).
+	// TaskDeadline is the task's wall-clock ceiling, spanning every
+	// follow-up turn (default 7200s, matching the platform profile's
+	// activeDeadlineSeconds). The cli executor counts it from the
+	// subprocess's spawn; the API executor from when a worker takes the
+	// task, before its wait for the session's previous turn.
 	TaskDeadline time.Duration
 	// KillGrace is SIGTERM-to-SIGKILL grace on cancel/deadline (default 10s).
 	KillGrace time.Duration
@@ -768,7 +770,10 @@ func (b *Bridge) shutdownTasks() {
 		r.mu.Lock()
 		if r.state == stateRunning && r.answerHeld {
 			// A finished answer is in the worker's hands; it sees closing
-			// and ends the task with that answer, and Run waits for it.
+			// and ends the task itself, and Run waits for it: completed
+			// with that answer or, once the answer is out as a turn
+			// artifact, failed bridge-shutdown with a copy of it as the
+			// result (finalizeTurnNotSent).
 			r.mu.Unlock()
 			continue
 		}
@@ -1046,12 +1051,12 @@ func rememberSteerLocked(run *taskRun, id string, queued bool) {
 }
 
 // refuseQueued closes the run's turns and refuses every follow-up still
-// queued, for reason, oldest first. The caller holds run.noticeMu and NOT
+// queued task-ended, oldest first. The caller holds run.noticeMu and NOT
 // run.mu: the queue is taken under mu and the refusals publish without it.
 // After it returns nothing more can be queued on the run (turnsClosed); a
 // later follow-up is refused task-ending by queueSteer, unless the run is
 // done by the time it gets noticeMu, when it is dropped.
-func (b *Bridge) refuseQueued(ctx context.Context, run *taskRun, reason string) {
+func (b *Bridge) refuseQueued(ctx context.Context, run *taskRun) {
 	run.mu.Lock()
 	run.turnsClosed = true
 	queued := run.steers
@@ -1059,7 +1064,7 @@ func (b *Bridge) refuseQueued(ctx context.Context, run *taskRun, reason string) 
 	run.mu.Unlock()
 	ns := make([]lib.SteerNotice, 0, len(queued))
 	for _, s := range queued {
-		ns = append(ns, lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: s.EnvelopeID, Reason: reason})
+		ns = append(ns, lib.SteerNotice{Steer: lib.SteerRefused, EnvelopeID: s.EnvelopeID, Reason: lib.SteerReasonTaskEnded})
 	}
 	b.publishSteerNotices(ctx, run, ns)
 }
@@ -1170,19 +1175,6 @@ func (v boundaryVerdicts) refusal(ctx context.Context, b *Bridge, env *lib.Envel
 	reason := b.capabilityRefusal(ctx, env)
 	v[ref] = reason
 	return reason
-}
-
-// closeTurns closes the queue and refuses what it holds, for reason. A no-op
-// once the task is final: its finalize refused the queue already.
-func (b *Bridge) closeTurns(run *taskRun, reason string) {
-	run.noticeMu.Lock()
-	defer run.noticeMu.Unlock()
-	run.mu.Lock()
-	done := run.state == stateDone
-	run.mu.Unlock()
-	if !done {
-		b.refuseQueued(context.Background(), run, reason)
-	}
 }
 
 // publishTurnAnswer ships a finished turn's answer as a turn artifact,
@@ -1980,7 +1972,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// stalled bus cannot hold a cancel's kill. turnsClosed keeps the queue
 	// empty from here; nothing but finalize sets stateDone, and finalize is
 	// serialized on noticeMu, so the state is still not done below.
-	b.refuseQueued(context.Background(), run, lib.SteerReasonTaskEnded)
+	b.refuseQueued(context.Background(), run)
 	run.mu.Lock()
 	// The trace first, while the state still admits it: any call still
 	// open, and the budget marker if calls were cut, go out ahead of the

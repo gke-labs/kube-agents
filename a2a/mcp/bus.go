@@ -116,6 +116,9 @@ type NATSBus struct {
 	// (maxTaskReaders); reapDelay is how long a released slot stays taken.
 	readers   chan struct{}
 	reapDelay time.Duration
+	// createAttemptTimeout bounds one attempt to create a read consumer;
+	// zero is lib.EphemeralCreateAttemptTimeout. Tests shorten it.
+	createAttemptTimeout time.Duration
 
 	// events listens to the console conversations this server knows and
 	// keeps their reports and results.
@@ -324,13 +327,15 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 	if s.CachedInfo().State.Msgs == 0 {
 		return cards, nil
 	}
-	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
+	// Not a reader slot's read, as before; the create is bounded and retried
+	// like one (lib.CreateEphemeralConsumer).
+	cons, _, err := lib.CreateEphemeralConsumer(ctx, s, jetstream.ConsumerConfig{
 		FilterSubject:     directorySubjects,
 		DeliverPolicy:     jetstream.DeliverLastPerSubjectPolicy,
 		AckPolicy:         jetstream.AckNonePolicy,
 		MemoryStorage:     true,
 		InactiveThreshold: directoryConsumerIdle,
-	})
+	}, lib.EphemeralCreateOptions{Logger: b.logger(), Stream: streamDirectory})
 	if err != nil {
 		return nil, err
 	}
