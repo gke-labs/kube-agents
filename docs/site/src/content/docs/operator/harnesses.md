@@ -35,17 +35,8 @@ A value the operator or gateway doesn't recognise isn't guessed at:
 
 ### Shell commands
 
-A shell grant names commands. It allows each one exactly, or with arguments, only when the whole line is one simple command whose words are all literal text. Plain single or double quotes around literal text are fine (`find . -name '*.go'`). Refused:
-
-- chaining or composition: `;`, `&&`, `||`, pipes, a background `&`, subshells, command groups and negation;
-- redirections of any kind: `>`, `>>`, `<`, `2>&1`, heredocs, and process substitution as a redirect target;
-- words that aren't literal: parameter expansion (`$VAR`), command substitution (`$(...)` and backticks), arithmetic expansion, process substitution, brace expansion and `$'...'` quoting;
-- an environment-variable prefix (`FOO=1 cmd`);
-- an interpreter in front of a script (`python3 script.py`): a persona's script runs by its absolute path;
-- a path that leaves the granted script's directory (`..`), a sibling script, or a command whose name only starts with a granted one;
-- anything the shell parser rejects.
-
-These rules are a second line of defence. The boundary for what a shell command can reach stays the sandbox and the credential broker's verb allowlist.
+- **Profile workers.** A profile whose persona grants the shell can run any command. What such a command can reach is bounded by the worker sandbox and the credential broker, not by the shell grant.
+- **Session pods.** A session runs only the command prefixes it is granted: with the cluster view, `kubectl` and `gcloud`.
 
 ## Skills and MCP servers
 
