@@ -70,6 +70,9 @@ class FakeCluster:
         self.stdins: list[str] = []
         self.fail_delete = 0
         self.fail_create = False
+        #: The server stores the profile, then the create fails (a timeout)
+        #: or is cut short (a signal), as a real create can.
+        self.create_stored_then: str | None = None
 
     def __call__(self, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
         self.calls.append(args)
@@ -83,6 +86,10 @@ class FakeCluster:
             name = obj["metadata"]["name"]
             self.profiles[name] = obj
             self.pools[name] = {f"agentprofile-{name}-{t}" for t in obj["spec"].get("allowedTiers") or ["read"]}
+            if self.create_stored_then == "timeout":
+                return _done(rc=1, stderr="context deadline exceeded")
+            if self.create_stored_then == "interrupted":
+                raise delegating_profile.Interrupted("signal 15")
             return _done(f"agentprofile.kubeagents.x-k8s.io/{name} created")
         if verb == "delete":
             if self.fail_delete:
@@ -503,3 +510,47 @@ def test_a_case_on_the_slack_lane_is_refused(validator: Any, tmp_path: Path, mon
     problems = _problems(validator, {"prompt": PROMPT, "delegating_profile": True})
     assert any("on the Slack lane" in p for p in problems)
     assert _problems(validator, {"prompt": PROMPT, "delegating_profile": True}, name="another-case") == []
+
+
+# -- review fixes -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["timeout", "interrupted"])
+def test_a_create_that_fails_after_the_server_stored_it_is_torn_down(how: str) -> None:
+    cluster = FakeCluster(pools_linger=0)
+    cluster.create_stored_then = how
+    raised = DelegatingProfileError if how == "timeout" else delegating_profile.Interrupted
+    with pytest.raises(raised):
+        delegating_profile.setup(cluster, NS, token="c0", sleep=lambda _s: None, log=_quiet)
+    assert set(cluster.profiles) == {"cluster"}, "the profile the server stored was left behind"
+    assert any(c[0] == "delete" and "--ignore-not-found" in c for c in cluster.calls)
+
+
+def test_sweep_tries_every_leftover_and_reports_the_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    cluster = FakeCluster(pools_linger=0)
+    first, second = _made(cluster, "aaa1"), _made(cluster, "bbb2")
+    for p in (first, second):
+        cluster.profiles[p.name]["metadata"]["creationTimestamp"] = "2026-11-24T01:00:00Z"
+    real = delegating_profile.teardown
+    tried: list[str] = []
+
+    def teardown(kubectl: Any, profile: Profile, **kw: Any) -> None:
+        tried.append(profile.name)
+        if profile.name == first.name:
+            raise DelegatingProfileError(f"{profile.name} stuck")
+        real(kubectl, profile, **kw)
+
+    monkeypatch.setattr(delegating_profile, "teardown", teardown)
+    now = datetime.datetime(2026, 11, 24, 12, tzinfo=datetime.timezone.utc)
+    with pytest.raises(DelegatingProfileError, match=f"{first.name} stuck"):
+        delegating_profile.sweep(cluster, NS, now=now, sleep=lambda _s: None, log=_quiet)
+    assert sorted(tried) == sorted([first.name, second.name])
+    assert second.name not in cluster.profiles
+
+
+def test_a_second_stop_cannot_abort_a_teardown_and_the_handlers_are_put_back() -> None:
+    before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    with delegating_profile.signals_ignored():
+        signal.raise_signal(signal.SIGTERM)
+        signal.raise_signal(signal.SIGINT)
+    assert {sig: signal.getsignal(sig) for sig in before} == before

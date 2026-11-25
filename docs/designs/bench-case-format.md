@@ -299,7 +299,8 @@ pool are gone. A setup or teardown it can't complete is recorded as infrastructu
 whose AgentProfile CRD has no `spec.delegates` the copy has no delegate tool and the case runs as it
 is, graded: that is its red. The access is the harness's own on the install (the same context and
 namespace as its other `kubectl` calls). `python -m kube_agents_bench.delegating_profile sweep`
-deletes labelled leftovers older than six hours, for a run killed before its `finally`. The
+deletes labelled leftovers older than six hours, for a run killed before its `finally`; nothing runs it
+yet, so it is a manual step until the lease preflight calls it. The
 validator refuses the placeholder without the key, the key without the placeholder as the
 directive's name, a literal throwaway name, and a case on the Slack lane, which can't address a
 profile. devops-bench ignores the key (`bench/kube_agents_bench/delegating_profile.py`).

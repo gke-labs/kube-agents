@@ -51,7 +51,9 @@ eval-driven loop.
 
 A run killed outright (SIGKILL) runs no ``finally``. Its profile carries LABEL,
 and ``sweep`` deletes every labelled profile older than ``--min-age``; the name
-is unique, so a leftover never answers a later case's ask.
+is unique, so a leftover never answers a later case's ask. Nothing runs the
+sweep yet: it is a manual step until the lease preflight calls it (a hack/
+change), so a leftover keeps its warm pool and card until someone sweeps.
 
 The kubectl calls use the context and namespace every other harness kubectl
 call uses; nothing here reads a Secret, and the manifest goes to kubectl on
@@ -294,12 +296,15 @@ def setup(
         )
     manifest = build_manifest(source, name, delegates=delegates)
     manifest["metadata"]["namespace"] = namespace
-    created = kubectl("create", "-n", namespace, "-f", "-", stdin=json.dumps(manifest))
-    if created.returncode != 0:
-        raise DelegatingProfileError(f"kubectl create {RESOURCE}/{name}: {created.stderr.strip() or 'failed'}")
     profile = Profile(name=name, namespace=namespace, tiers=tiers_of(manifest["spec"]), delegates=delegates)
-    log(f"Delegating profile: created {RESOURCE}/{name} in {namespace} from {RESOURCE}/{SOURCE_PROFILE}")
+    # The create is inside the try: one cut short by a signal, or one that
+    # timed out or failed after the server stored it, may have made the
+    # profile, and the teardown (an ignore-not-found delete) covers that too.
     try:
+        created = kubectl("create", "-n", namespace, "-f", "-", stdin=json.dumps(manifest))
+        if created.returncode != 0:
+            raise DelegatingProfileError(f"kubectl create {RESOURCE}/{name}: {created.stderr.strip() or 'failed'}")
+        log(f"Delegating profile: created {RESOURCE}/{name} in {namespace} from {RESOURCE}/{SOURCE_PROFILE}")
         deadline = clock() + READY_SECONDS
         while True:
             try:
@@ -366,8 +371,18 @@ def teardown(
     Raises:
         DelegatingProfileError: Something is left after TEARDOWN_SECONDS.
     """
-    sleep = sleep or time.sleep
-    clock = clock or time.monotonic
+    with signals_ignored():
+        _teardown(kubectl, profile, sleep=sleep or time.sleep, clock=clock or time.monotonic, log=log)
+
+
+def _teardown(
+    kubectl: Kubectl,
+    profile: Profile,
+    *,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    log: Callable[[str], None],
+) -> None:
     deadline = clock() + TEARDOWN_SECONDS
     deleted = False
     left = ""
@@ -388,6 +403,23 @@ def teardown(
         if clock() >= deadline:
             raise DelegatingProfileError(f"{RESOURCE}/{profile.name} not torn down after {TEARDOWN_SECONDS}s: {left}")
         sleep(POLL_SECONDS)
+
+
+@contextlib.contextmanager
+def signals_ignored() -> Iterator[None]:
+    """SIGTERM and SIGINT are ignored for the duration, so a second stop
+    can't abort a teardown half done (a teardown is bounded by
+    TEARDOWN_SECONDS). Only the main thread can set a handler; elsewhere this
+    does nothing."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 @contextlib.contextmanager
@@ -436,14 +468,22 @@ def sweep(
     now = now or datetime.datetime.now(datetime.timezone.utc)
     listed = _get_json(kubectl, RESOURCE, "-n", namespace, "-l", f"{LABEL}={LABEL_VALUE}")
     swept: list[str] = []
+    failed: list[str] = []
     for item in listed.get("items") or []:
         name = (item.get("metadata") or {}).get("name") or ""
         age = _age_seconds(item, now)
         if not is_throwaway_name(name) or age is None or age < min_age_seconds:
             continue
         profile = Profile(name=name, namespace=namespace, tiers=tiers_of(item.get("spec") or {}), delegates=False)
-        teardown(kubectl, profile, sleep=sleep, clock=clock, log=log)
+        try:
+            teardown(kubectl, profile, sleep=sleep, clock=clock, log=log)
+        except DelegatingProfileError as exc:
+            failed.append(str(exc))
+            continue
         swept.append(name)
+    if failed:
+        # Every other leftover was still tried; the failures are reported together.
+        raise DelegatingProfileError("; ".join(failed))
     return swept
 
 
