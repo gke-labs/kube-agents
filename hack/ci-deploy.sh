@@ -1503,7 +1503,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
   # A CA, not any certificate: the grader verifies strictly, so a leaf or a
   # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
   if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null)"; then
-    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh (kube-agents#3682)." >&2
     exit 1
   fi
 elif [ -s "${FORGE_CA_FILE}" ]; then
