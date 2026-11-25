@@ -33899,6 +33899,24 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(len(latest["document"]["findings"]), 4)
         self.assertEqual(self.recorder.calls, [])
 
+    def test_the_stored_envelope_carries_the_summary_as_its_chat_report(self):
+        """#5618: the A2A gateway posts the envelope's report, the words the chat record holds."""
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+        report = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual(report["schema"], "kube-agents.report/v1")
+        self.assertEqual(report["text"], out["summary"])
+        self.assertFalse(report["silent"])
+        # No card until its builder reaches the sandbox (#6162).
+        self.assertNotIn("card", report)
+
+    def test_a_lone_surrogate_in_the_findings_still_stores_the_run(self):
+        """A broken emoji escape (`"\\ud83d"`) survives json.loads; the report must not fail `finish`."""
+        out = self.finish(make_doc(findings=[make_finding(fid="s", title="Namespace \ud83d has no NetworkPolicy", obj="crit-\ud83d")]))
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["status"], audit_report.NO_FORGE_STATUS)
+        self.assertNotIn("\ud83d", latest[audit_report.ENVELOPE_REPORT_KEY]["text"])
+        self.assertTrue(out["summary"])
+
     def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
         """#4268: `finish` reads its run's start before its checks. A later
         `start` that rewrites the run record as soon as `findings_predate_run`
@@ -34440,6 +34458,39 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(lines[-1], "Ledger: https://github.com/acme/fleet/issues/7")
         self.assertNotIn("chat_report", self.stdout_json())
 
+    def test_the_stored_envelope_carries_the_ledger_report_as_its_chat_report(self):
+        """#5618: the A2A gateway posts the envelope's report in place of the run's final message."""
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        [(_, text)] = self.entries()
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        report = latest[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual(
+            (report["schema"], report["text"], report["silent"]), ("kube-agents.report/v1", text, False)
+        )
+        self.assertNotIn("card", report)
+
+    def test_a_chat_text_that_fails_to_render_still_lands_the_store_write(self):
+        """The render fails before the write too, but only after it does the run fail, as before the report."""
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("render failed")
+
+        self.patch_attr("render_chat_report", boom)
+        self.assertNotEqual(self.run_finish(make_doc()), 0)
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["issue_number"], 7)
+        self.assertNotIn(audit_report.ENVELOPE_REPORT_KEY, latest)
+
     def test_detail_lines_sit_between_the_audit_line_and_the_ledger_url(self):
         payload = {"status": "UPDATED", "issue_url": "https://github.com/acme/fleet/issues/7",
                    "new": 2, "resolved": 1, "prs_opened": ["https://github.com/acme/fleet/pull/9"],
@@ -34551,6 +34602,10 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(repo, "acme/fleet")
         self.assertTrue(text.splitlines()[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
         self.assertTrue(text.splitlines()[-1].startswith("Ledger: "))
+        # #5618: the stored envelope carries the same words for the A2A gateway.
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        report = latest[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual((report["text"], report["silent"]), (text, bool(self.stdout_json()["silent_ok"])))
 
     def test_a_finish_with_no_start_does_not_join_a_stale_record(self):
         audit_report.open_chat_report(AUDIT, "acme/a", NOW)
@@ -36343,6 +36398,17 @@ class TestStoreLedger(HarnessTestCase):
         own = self.a_later_start_lands_after_the_staleness_check()
         self.assertEqual(self.finish(make_doc()), 0, self.err)
         self.assert_the_envelope_keeps_its_runs_start(self.latest(), own)
+
+    def test_the_store_ledger_envelope_carries_the_summary_as_its_chat_report(self):
+        """#5618: as stored, the envelope's report is the summary the chat record holds."""
+        self.start()
+        self.touch(self.NETPOL)
+        self.assertEqual(self.finish(make_doc()), 0, self.err)
+        out = self.stdout_json()
+        report = self.latest()[audit_report.ENVELOPE_REPORT_KEY]
+        self.assertEqual(report["schema"], "kube-agents.report/v1")
+        self.assertEqual(report["text"], out["summary"])
+        self.assertEqual(report["silent"], bool(out["silent_ok"]))
 
     # -- the decision ----------------------------------------------------------
 
@@ -39770,6 +39836,41 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
         manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
         self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
+
+
+class TestEnvelopeChatReport(unittest.TestCase):
+    """#5618: the envelope's `report` object, bounded and redacted."""
+
+    def test_the_text_is_cut_to_its_cap_as_written(self):
+        """Measured as `write_report` writes it: a non-ASCII or control character costs its escape."""
+        for char in ("é", "\x01", "a"):
+            with self.subTest(char=repr(char)):
+                text = char * audit_report.ENVELOPE_REPORT_TEXT_MAX
+                cut = audit_report.envelope_chat_report(text, False)["text"]
+                self.assertLessEqual(len(json.dumps(cut)) - 2, audit_report.ENVELOPE_REPORT_TEXT_MAX)
+                self.assertGreater(len(json.dumps(cut + char)) - 2, audit_report.ENVELOPE_REPORT_TEXT_MAX)
+                self.assertTrue(text.startswith(cut))
+
+    def test_the_text_gets_the_bodys_redaction_backstop(self):
+        secret = "ghp_" + "a" * 36
+        report = audit_report.envelope_chat_report(f"Token {secret} leaked.", True)
+        self.assertNotIn(secret, report["text"])
+        self.assertTrue(report["silent"])
+
+    def test_a_lone_surrogate_does_not_fail_the_report(self):
+        """A broken emoji escape in the findings has no UTF-8 form: it becomes "?"."""
+        report = audit_report.envelope_chat_report("Payments \ud83d namespace.", False)
+        self.assertEqual(report["text"], "Payments ? namespace.")
+
+    def test_a_report_that_cannot_build_leaves_the_envelope_without_one(self):
+        envelope = {"audit_id": "x"}
+
+        def boom():
+            raise RuntimeError("render failed")
+
+        self.assertIsNone(audit_report.attach_chat_report(envelope, boom, False))
+        self.assertEqual(envelope, {"audit_id": "x"})
+
 
 
 if __name__ == "__main__":

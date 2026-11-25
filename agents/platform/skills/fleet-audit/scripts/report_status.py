@@ -125,9 +125,11 @@ def stream_is_shadow(stream: dict) -> bool:
 # and runs to megabytes; `ledger_body` is the rendered issue body, which is
 # `finish`'s memory and not a status; the three id lists are summarised as
 # `new`/`resolved`/`current`, and the reader that wants the ids themselves
-# reads the envelope through `load_latest` instead.
+# reads the envelope through `load_latest` instead. `report` is the chat report
+# the A2A gateway posts for a scheduled run (#5618): the same words the chat
+# relay posted, and its `silent` is not the run's `silent_ok`.
 _NEVER_PROJECTED = frozenset(
-    {"document", "ledger_document", "ledger_body", "new_ids", "resolved_ids", "current_ids"}
+    {"document", "ledger_document", "ledger_body", "new_ids", "resolved_ids", "current_ids", "report"}
 )
 
 
