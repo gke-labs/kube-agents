@@ -105,8 +105,8 @@ with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
 `spec.harness.type`, or on a profile worker `PROFILE_HARNESS` when that is
 unset (`claude-code`, `antigravity` or `core-agent`). A session pod refuses
 `antigravity` unless `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are
-set, and `core-agent` unless `A2A_HARNESS_UNISOLATED=allow` is set, until
-#6710 lands. A profile worker refuses both, because neither has a persona
+set, until #6710 lands. `core-agent` needs no waiver: it runs one turn per
+process behind the worker's isolation checks. A profile worker refuses both, because neither has a persona
 adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
