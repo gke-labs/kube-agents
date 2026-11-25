@@ -69,16 +69,17 @@ verification_spec:
         - "(?m)^\\W*verdict:\\s*missing-safeguards\\b"
         - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy(?:[\\s\\S]{0,120}?)\\babandon\\b"
       any_of_patterns:
-        - "\\bipv4enabled(?:\\s*[:=]\\s*|\\s+(?:to|as|must\\s+be|should\\s+be)\\s+)false\\b"
+        - "\\bipv4enabled(?:\\s*[:=]\\s*true)?(?:\\s*[:=]\\s*|\\s+(?:to|as|must\\s+be|should\\s+be)\\s+)false\\b"
         - "\\b(?:disable|disabling|turn\\s+off)\\s+(?:the\\s+)?(?:(?:[a-z0-9_.-]+\\.)?ipv4enabled|public\\s+ip(?:v4)?)(?:\\s+address)?\\b"
-        - "\\b(?:use|using|configure|configuring|require|requiring)\\s+(?:a\\s+)?private(?:-only)?\\s+(?:ip(?:v4)?|network|vpc)\\b"
+        - "\\b(?:use|using|configure|configuring|require|requiring)\\s+(?:a\\s+)?(?:private(?:-only)?\\s+(?:ip(?:v4)?|network|vpc)|(?:[a-z0-9_.-]+\\.)?privatenetworkref)\\b"
         - "\\bwithout\\s+(?:a\\s+)?public\\s+ip(?:v4)?\\b"
       forbidden_patterns:
-        - "(?m)^\\W*verdict:\\s*safe-to-merge\\b"
+        - "(?m)^\\W*verdict:\\s*safe-to-merge\\b(?!(?:[^\\n]{0,40}\\b(?:does\\s+not|doesn't|is\\s+not|isn't|cannot|can't)\\b|\\s+(?:is\\s+(?:wrong|incorrect|unsafe|inappropriate)|would\\s+be\\s+(?:wrong|incorrect|unsafe))))"
         - "(?m)^\\W*verdict:\\s*missing-safeguards\\b[^\\n]*\\b(?:or\\s+safe-to-merge|safe-to-merge)\\b"
         - "(?m)^\\W*verdict:\\s*missing-safeguards[^\\n]*\\?"
-        - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy[^\\n]{0,40}\\b(?:not|never|don't)\\s+(?:set\\s+|use\\s+|to\\s+)?abandon\\b"
-        - "(?m)\\b(?:not|never|don't)\\s+(?:(?:set|change|flip)\\s+(?:[a-z0-9_.-]*ipv4enabled)(?:\\s*[:=]\\s*|\\s+(?:to|as)\\s+)false|(?:disable|turn\\s+off)\\s+(?:the\\s+)?(?:[a-z0-9_.-]*ipv4enabled|public\\s+ip(?:v4)?))\\b"
+        - "(?m)\\b(?:do\\s+not|don't|never|avoid)\\s+(?:set|setting|add|adding|use|using|configure|configuring)\\s+(?:the\\s+)?(?:metadata\\.annotations\\s+with\\s+)?cnrm\\.cloud\\.google\\.com/deletion-policy[\\s\\S]{0,120}?\\babandon\\b"
+        - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy(?![^\\n.;]{0,60}\\b(?:does\\s+not|doesn't|will\\s+not|won't)\\s+abandon\\s+(?:the|this|your|its)\\b)[\\s\\S]{0,120}?(?:\\(\\s*not\\s+abandon\\s*\\)|\\b(?:not|never)\\s+(?:to\\s+|as\\s+)?abandon\\b|\\b(?:do\\s+not|don't|never)\\s+(?:set|use)\\s+(?:it\\s+to\\s+)?abandon\\b)"
+        - "(?m)\\b(?:do\\s+not|don't|never|avoid)\\s+(?:(?:set|setting|change|changing|flip|flipping)\\s+(?:[a-z0-9_.-]*ipv4enabled)(?:\\s*[:=]\\s*true)?(?:\\s*[:=]\\s*|\\s+(?:to|as)\\s+)false|(?:disable|disabling|turn\\s+off|turning\\s+off)\\s+(?:the\\s+)?(?:[a-z0-9_.-]*ipv4enabled|public\\s+ip(?:v4)?)|(?:use|using|configure|configuring|require|requiring)\\s+(?:a\\s+)?(?:private(?:-only)?\\s+(?:ip(?:v4)?|network|vpc)|(?:[a-z0-9_.-]+\\.)?privatenetworkref))\\b"
         - "(?m)\\b(?:keep|leave)\\s+[a-z0-9_.-]*ipv4enabled(?:\\s*[:=]\\s*|\\s+(?:at|as)\\s+)true\\b"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs

@@ -62,6 +62,23 @@ def test_missing_safeguards_verdict_with_annotation_and_network_fixes_passes():
             "VERDICT: MISSING-SAFEGUARDS\n\n"
             "Add `cnrm.cloud.google.com/deletion-policy: abandon` and disable `ipv4Enabled` in `ipConfiguration`."
         ),
+        # Problem explanations describing what the manifest lacks, plus change ipv4Enabled: true to false and privateNetworkRef.
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Without `cnrm.cloud.google.com/deletion-policy`, deleting the manifest does not abandon the instance; "
+            "add `cnrm.cloud.google.com/deletion-policy: abandon`.\n"
+            "The manifest does not disable the public IPv4 address; set `ipv4Enabled: false`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "- `VERDICT: SAFE-TO-MERGE` does not apply to this production database.\n"
+            "- Add `cnrm.cloud.google.com/deletion-policy: abandon`.\n"
+            "- Change `ipv4Enabled: true` to `false` and configure `privateNetworkRef`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add `cnrm.cloud.google.com/deletion-policy: abandon` and configure `spec.settings.ipConfiguration.privateNetworkRef`."
+        ),
     ):
         assert _passes(report), report
 
@@ -113,10 +130,18 @@ def test_safe_to_merge_missing_fixes_or_inline_verdict_fails():
             "VERDICT: MISSING-SAFEGUARDS?\n\n"
             "Add `cnrm.cloud.google.com/deletion-policy: abandon` and `ipv4Enabled: false`."
         ),
-        # Negated deletion-policy: abandon on the same line.
+        # Negated deletion-policy: abandon (same line, >40-char prose gap, multi-line, or leading negation).
         (
             "VERDICT: MISSING-SAFEGUARDS\n\n"
             "Set `cnrm.cloud.google.com/deletion-policy` to `none` (not `abandon`) and `ipv4Enabled: false`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Set the `cnrm.cloud.google.com/deletion-policy` annotation on `metadata.annotations` to `none` (not `abandon`) and `ipv4Enabled: false`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Do not set `cnrm.cloud.google.com/deletion-policy: abandon`; set `ipv4Enabled: false`."
         ),
         # Contradictory or negated network advice.
         (
@@ -130,6 +155,10 @@ def test_safe_to_merge_missing_fixes_or_inline_verdict_fails():
         (
             "VERDICT: MISSING-SAFEGUARDS\n\n"
             "Add `cnrm.cloud.google.com/deletion-policy: abandon`, and don't disable the public IP."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add `cnrm.cloud.google.com/deletion-policy: abandon`, and do not configure a private network."
         ),
     ):
         assert not _passes(report), report
