@@ -191,7 +191,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -3637,6 +3637,51 @@ class KubeAgentsHarness(AgentHarness):
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
+        if delegating_profile.PLACEHOLDER in prompt:
+            return self._run_with_delegating_profile(prompt, workspace_path, started_at)
+        return self._run_expanded(prompt, workspace_path, started_at)
+
+    def _run_with_delegating_profile(self, prompt: str, workspace_path: Path | None, started_at: float) -> AgentResult:
+        """:meth:`run` for a prompt naming the throwaway delegating profile
+        (:mod:`delegating_profile`, #6789): make the profile, run the ask
+        against it, and tear it down whatever the run did.
+
+        A setup that fails is infrastructure and sends nothing. The teardown
+        is in a ``finally`` (SIGTERM raises for its duration, so a stopped
+        run reaches it too); one it cannot confirm turns the run into an
+        infrastructure failure, whatever the agent answered.
+        """
+        transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
+        if transport != TRANSPORT_INJECT:
+            # Only the inject door addresses a profile ([bench:profile ...]).
+            transcript.set("", [], prompt=prompt, started_at=started_at)
+            return AgentResult.errored(
+                f"{delegating_profile.PLACEHOLDER} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
+        kubectl, namespace = delegating_profile.from_env()
+        with delegating_profile.signals_raise():
+            try:
+                profile = delegating_profile.setup(kubectl, namespace, log=_log.info)
+            except delegating_profile.DelegatingProfileError as exc:
+                transcript.set("", [], prompt=prompt, started_at=started_at)
+                return _infra_failure(f"the throwaway delegating profile could not be set up: {exc}")
+            result: AgentResult | None = None
+            try:
+                result = self._run_expanded(
+                    prompt.replace(delegating_profile.PLACEHOLDER, profile.name), workspace_path, started_at
+                )
+            finally:
+                try:
+                    delegating_profile.teardown(kubectl, profile, log=_log.info)
+                except delegating_profile.DelegatingProfileError as exc:
+                    _log.error("the throwaway delegating profile was not torn down: %s", exc)
+                    if result is not None:
+                        result = _infra_failure(f"the throwaway delegating profile was not torn down: {exc}")
+        assert result is not None
+        return result
+
+    def _run_expanded(self, prompt: str, workspace_path: Path | None, started_at: float) -> AgentResult:
+        """The rest of :meth:`run`, on a prompt with every placeholder written in."""
         # The GitOps wait uses it as a lower bound on PR creation time: a rerun
         # that reuses a cluster name reuses the run branch, and the previous
         # run's merged PR is still listed against it.

@@ -263,6 +263,13 @@ PlatformAgent's `spec.hold` for its repetitions alone; for a local run, apply an
 with `python -m kube_agents_bench.scope_hold`; see
 [bench-case-format.md](../docs/designs/bench-case-format.md).
 
+A task that grades delegation from a profile task (`spec.delegates`, #6789) declares
+`delegating_profile: true` and opens its prompt with
+`[bench:profile name={{BENCH_DELEGATING_PROFILE}} ...]`. For each run, the harness copies the
+install's `cluster` AgentProfile into a `delegating-<hex>` profile that delegates, sends the ask
+to it, and deletes it afterwards. The case needs the inject transport; see
+[`kube_agents_bench/delegating_profile.py`](kube_agents_bench/delegating_profile.py).
+
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
 eval-driven-development marker for a gap whose fix is not yours to make — land the case red and
