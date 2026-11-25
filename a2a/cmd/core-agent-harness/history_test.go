@@ -141,14 +141,20 @@ func TestATurnWritesNoSessionFile(t *testing.T) {
 // An envelope over the cap fails the turn rather than being read.
 func TestAnOversizedEnvelopeFailsTheTurn(t *testing.T) {
 	withModel(t, &echoModel{})
-	big := coreagentwire.Envelope{Message: strings.Repeat("x", coreagentwire.MaxEnvelopeBytes)}
-	in, _ := json.Marshal(big)
+	// A valid, newline-terminated envelope one byte over the cap: without
+	// the cap check it would parse and run.
+	in, _ := json.Marshal(coreagentwire.Envelope{Message: ""})
+	pad := coreagentwire.MaxEnvelopeBytes + 1 - len(in)
+	in, _ = json.Marshal(coreagentwire.Envelope{Message: strings.Repeat("x", pad)})
+	if len(in) != coreagentwire.MaxEnvelopeBytes+1 {
+		t.Fatalf("envelope is %d bytes, want the cap plus one", len(in))
+	}
 	var out, errOut bytes.Buffer
-	if code := run(context.Background(), []string{"--model", "m"}, bytes.NewReader(in), &out, &errOut); code == 0 {
+	if code := run(context.Background(), []string{"--model", "m"}, bytes.NewReader(append(in, '\n')), &out, &errOut); code == 0 {
 		t.Fatalf("an oversized envelope ran: %s", out.String())
 	}
-	if !strings.Contains(out.String(), `"failed":true`) {
-		t.Errorf("no failed result: %s", out.String())
+	if !strings.Contains(out.String(), `"failed":true`) || !strings.Contains(out.String(), "over ") {
+		t.Errorf("no failed result naming the cap: %s", out.String())
 	}
 }
 
