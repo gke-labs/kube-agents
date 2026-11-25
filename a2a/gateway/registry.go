@@ -437,6 +437,13 @@ type TaskRef struct {
 	// from the stream), so a queued or redelivered relayTerminal does not
 	// double-count in task_terminals_total.
 	TerminalObserved bool `json:"terminalObserved,omitempty"`
+	// endedUnread marks, for one heal pass and never in the store (it is
+	// unexported, so JSON skips it), a profile parent whose own terminal the
+	// heal found on its stream before handling it (healActiveTask): its
+	// batch's ends are booked but none is sent to it (profileParentListens).
+	// TerminalObserved isn't used for that, since its delivery path reads
+	// the mark as "observed earlier".
+	endedUnread bool
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -593,7 +600,8 @@ type BatchEnd struct {
 	Cards    bool           `json:"cards,omitempty"`
 	// Unsent marks a profile parent's batch child whose end couldn't be
 	// published to the parent: Text is kept, and the heal sends it again
-	// (healProfileBatch) and clears this.
+	// (healProfileBatch) and clears this, or the ask bound drops the end
+	// with its text past AskTTL (TaskRef.clearBatchText).
 	Unsent bool `json:"unsent,omitempty"`
 }
 
@@ -692,20 +700,13 @@ func (rec *SessionRecord) clearBatchText(parentID string) {
 func (ref *TaskRef) clearBatchText() {
 	end := *ref.BatchEnd
 	end.Text = ""
-	if end.Unsent {
-		// Not sent yet: the heal would send what is left, and an empty
-		// completed end (or a canceled one with no question) reads as a
-		// result. The parent is sent a failure that says the text was
-		// dropped instead, with no content of the child's.
-		end.State, end.Text = lib.StateFailed, unsentEndExpired
-	}
+	// An end not sent yet is dropped with its text: past AskTTL it can't be
+	// sent any more (the same bound clears the parent's attribution, which a
+	// send needs), and a resend of what is left would read as a result. The
+	// parent's own deadline bounds its wait, as for an end a restart drops.
+	end.Unsent = false
 	ref.BatchEnd = &end
 }
-
-// unsentEndExpired is the end a profile parent is sent for a batch child
-// whose end couldn't be sent before its text passed AskTTL
-// (TaskRef.clearBatchText).
-const unsentEndExpired = "the delegated task ended, but its result couldn't be sent before the gateway's retention for it ran out, so it was dropped"
 
 // markCardsPending marks a console chain's root (CardsPending).
 func (rec *SessionRecord) markCardsPending(rootID string) {
@@ -895,6 +896,16 @@ func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].TerminalObserved = true
+			return
+		}
+	}
+}
+
+// setEndedUnread sets the task entry's endedUnread mark (TaskRef).
+func (rec *SessionRecord) setEndedUnread(taskID string, ended bool) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].endedUnread = ended
 			return
 		}
 	}

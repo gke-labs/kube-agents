@@ -1965,13 +1965,6 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// conversation for its children: they are what is healed, not its own
 	// hand-off line (healFanOut). A batch cut short heals below, where its
 	// request is read back from the stream and finished (delegationHandled).
-	// A profile parent waiting on its batch has its children healed first,
-	// an end the relay missed or couldn't send going to it now
-	// (healProfileBatch), and is then healed below as any task is: its own
-	// terminal is its end.
-	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
-		g.healProfileBatch(ctx, rec, ref)
-	}
 	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier == "" && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
 		g.healFanOut(ctx, rec, active, ref)
 		return
@@ -1983,6 +1976,27 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
 	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
+	// A profile parent still waiting on its batch has its children healed
+	// first, an end the relay missed or couldn't send going to it now
+	// (healProfileBatch), and is then healed below as any task is: its own
+	// terminal is its end. One whose own terminal is already on the stream
+	// (the relay missed it) has ended: its children's ends are still booked
+	// (a child that completed is recorded completed, not cancelled as live
+	// below), but none is sent to it: for that pass it is marked endedUnread,
+	// in memory only, which profileParentListens reads. Its own terminal is
+	// then handled below as always (TerminalObserved, its result's delivery).
+	// A read that failed leaves it unmarked, and the batch heal sends as
+	// before.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
+		ended := err == nil && task.Final
+		if ended {
+			rec.setEndedUnread(active.TaskID, true)
+		}
+		g.healProfileBatch(ctx, rec, ref)
+		if ended {
+			rec.setEndedUnread(active.TaskID, false)
+		}
+	}
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only

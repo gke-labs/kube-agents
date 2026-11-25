@@ -238,11 +238,17 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	// copy too, from the child's terminal on the stream: bounded from the
 	// child's start, which is never later than that terminal, so the copy
 	// never outlives the stream's. The end itself stays, so the batch still
-	// counts the child ended.
+	// counts the child ended. A profile parent's end that was never sent
+	// (Unsent) can't be sent past this bound either, since the loop above
+	// clears the parent's attribution, so it is dropped with its text.
 	var batchTextIDs []string
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]
 		if g.batchTextPast(*ref, now) {
+			if ref.BatchEnd.Unsent {
+				g.log.Warn("a batch child's end was never sent to its profile parent and is dropped at the ask bound; the parent's deadline bounds its wait",
+					"session", fresh.Key, "child", ref.ID, "parent", ref.ParentTaskID, "entry", ref.BatchIndex)
+			}
 			ref.clearBatchText()
 			batchTextIDs = append(batchTextIDs, ref.ID)
 			changed = true
@@ -273,7 +279,9 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 // batchTextPast reports a fan-out child's entry holding result text
 // (BatchEnd.Text) past AskTTL from its start.
 func (g *Gateway) batchTextPast(ref TaskRef, now time.Time) bool {
-	return ref.BatchEnd != nil && ref.BatchEnd.Text != "" && !ref.StartedAt.IsZero() &&
+	// An unsent end counts with no text too (a failure with no message):
+	// past the bound it can't be sent, and clearBatchText drops it.
+	return ref.BatchEnd != nil && (ref.BatchEnd.Text != "" || ref.BatchEnd.Unsent) && !ref.StartedAt.IsZero() &&
 		now.Sub(ref.StartedAt) >= g.cfg.AskTTL
 }
 
