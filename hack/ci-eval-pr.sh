@@ -5008,6 +5008,9 @@ unit_cost_hint() {
     # case above, over compliance-rbac-overgrant's requested run, so it
     # launches early.
     fleet-audit-scheduled-run-files-the-finding) echo 1200 ;;
+    # The stack of fleet-audit-unchanged-finding-keeps-wording and the same
+    # full drift audit, with another plant state. Unmeasured on the lane.
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 900 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that
@@ -5270,6 +5273,7 @@ unit_delegation_timeout() {
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
     consistency-boot-disk-pool-outlier) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
@@ -5444,7 +5448,9 @@ fi
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label,
-#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unchanged-finding-keeps-wording,
+#                 fleet-audit-remediation-right-and-not-stale,
+#                 fleet-audit-wrong-kept-remediation-gives-way, and
 #                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
