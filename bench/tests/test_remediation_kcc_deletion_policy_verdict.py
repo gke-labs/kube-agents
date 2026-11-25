@@ -75,3 +75,22 @@ def test_rejects_dismissed_private_ip():
         "A private IP is not needed here; `ipv4Enabled: true` is fine."
     )
     assert not _passes(report)
+
+
+def test_rejects_dismissed_deletion_policy_and_optional_network():
+    for dismissed in [
+        "VERDICT: MISSING-SAFEGUARDS\nSet `ipv4Enabled: false`.\n`cnrm.cloud.google.com/deletion-policy: abandon` is not needed here.",
+        "VERDICT: MISSING-SAFEGUARDS\nAdd `cnrm.cloud.google.com/deletion-policy: abandon`.\n`ipv4Enabled: false` is not needed.",
+        "VERDICT: MISSING-SAFEGUARDS\nAdd `cnrm.cloud.google.com/deletion-policy: abandon`.\n`privateNetworkRef` is not required.",
+        "VERDICT: MISSING-SAFEGUARDS\nAdd `cnrm.cloud.google.com/deletion-policy: abandon`.\nA private IP is optional.",
+    ]:
+        assert not _passes(dismissed), dismissed
+
+
+def test_accepts_disable_public_ip_and_private_cloud_sql():
+    report = (
+        "VERDICT: MISSING-SAFEGUARDS\n\n"
+        "Add `cnrm.cloud.google.com/deletion-policy: abandon` and disable public IP "
+        "to make it a private Cloud SQL instance."
+    )
+    assert _passes(report)

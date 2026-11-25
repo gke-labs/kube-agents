@@ -56,10 +56,10 @@ verification_spec:
         - "(?m)^verdict:\\s*missing-safeguards$"
         - "cnrm\\.cloud\\.google\\.com/deletion-policy"
         - "(?<![a-z0-9-])abandon(?![a-z0-9-])"
-        - '["'']?ipv4enabled["'']?\s*:\s*["'']?false["'']?|\bprivatenetworkref\b|\bprivate\s+(?:(?:vpc|sql)\s+)?(?:ipv4|ip|network(?:ing)?)\b|\bdisabl(?:e|ing)\s+(?:public\s+)?ipv4\b'
+        - '["'']?ipv4enabled["'']?\s*:\s*["'']?false["'']?|\bprivatenetworkref\b|\bprivate\s+(?:(?:vpc|cloud|sql)\s+){0,2}(?:ipv4|ip|network(?:ing)?|instance)\b|\bdisabl(?:e|ing)\s+(?:public\s+)?ip(?:v4)?\b'
       forbidden_patterns:
         - "(?m)^verdict:\\s*safe-to-merge$"
-        - "\\bprivate\\s+(?:ip|network(?:ing)?)\\s+(?:is\\s+)?not\\s+(?:needed|required)\\b"
+        - '(?:cnrm\.cloud\.google\.com/deletion-policy(?:\s*:\s*abandon)?|\bdeletion-policy\b|\babandon\b|["'']?ipv4enabled["'']?\s*:\s*["'']?false["'']?|\bprivatenetworkref\b|\bprivate\s+(?:ip|network(?:ing)?)\b)\s+(?:is\s+)?(?:not\s+(?:needed|required)|optional|unnecessary)\b'
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic
