@@ -1,10 +1,12 @@
-# Probe for grouping completed generated-name Jobs into one cost finding
-# (#2900, #3005, #6955, #7098): `seeded-family` on `seeded-a` carries three
-# finished Jobs (`reindex-<uuid>`, role `generated-name-job-family`) sharing
-# `app.kubernetes.io/part-of=reindex` with no `ttlSecondsAfterFinished`.
+# Executable gate for grouping completed generated-name Jobs into one cost
+# finding (#2900, #3005, #6955, #7098): `seeded-family` on `seeded-a` carries
+# three finished Jobs (`reindex-<uuid>`, role `generated-name-job-family`)
+# sharing `app.kubernetes.io/part-of=reindex` with no `ttlSecondsAfterFinished`.
 # Until #6955 lands, `fleet_waste.py` groups only Deployments in
-# `_generated_families` and emits finished Jobs individually under check 3.9.
-# Marked `expected_fail: true` until #6955 closes the gap and flips the marker.
+# `_generated_families` and check 3.9 emits each finished Job individually
+# (`job-reindex-8daede4e`, `job-reindex-1657c63c`, `job-reindex-55fe5b6f`).
+# Marked `expected_fail: true` until #6955 collapses them into one family
+# finding (`seeded-family.job-reindex`) and flips the marker.
 #
 # Planted defect required: `generated-name-job-family` role in
 # `bench/tf/fleet/fixtures.json` (`seeded-family` on `seeded-a`).
@@ -12,23 +14,20 @@
 # Isolation class: read-only.
 # Tier: nightly (hack/eval/nightly-cases.txt).
 id: cost-finished-job-family-grouped
-name: Cost audit groups completed generated-name Jobs into one family finding and prescribes template TTL cleanup
+name: Waste audit files completed generated-name Jobs as one family finding on the cost ledger
 
 domain: cost
 expected_fail: true
 
 prompt: >-
-  Audit the `seeded-family` namespace across the fleet for completed batch Jobs
-  left behind without cleanup. Report the cluster they live on, whether those
-  finished `reindex-*` Jobs belong to a single generated-name Job family rather
-  than unrelated workloads, and recommend a single parent-template / TTL fix
-  instead of per-Job edits. Do not delete or modify any cluster objects.
+  Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
 expected_output: >-
-  A grounded cost-audit report naming the slot-a cluster, grouping the three
-  completed `reindex-<uuid>` Jobs in `seeded-family` (`app.kubernetes.io/part-of=reindex`)
-  into one generated-name Job family finding, and recommending adding
-  `spec.ttlSecondsAfterFinished` (or CronJob/spawner template cleanup) in the
-  parent template rather than per-Job edits or cluster deletions.
+  The audit runs to its ledger. The three finished `reindex-<uuid>` Jobs in
+  `seeded-family` (`app.kubernetes.io/part-of=reindex`) are filed as one
+  generated-name Job family finding (`seeded-family.job-reindex`) recommending
+  parent-template / `ttlSecondsAfterFinished` cleanup, and no finding names an
+  individual `reindex-<uuid>` member. No cluster objects are deleted or
+  modified.
 infrastructure:
   deployer: noop
 validated: false
@@ -37,22 +36,19 @@ fixtures:
   - generated-name-job-family
 
 verification_spec:
-  - name: report-groups-reindex-job-family-and-names-ttl-fix
+  - name: finished-jobs-are-filed-as-one-family-finding
     role: objective
     mode: assert
     check:
-      type: report_contains
-      fold_decoration: true
-      fixture_roles:
-        - generated-name-job-family
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
       required_phrases:
-        - "seeded-family"
-        - "reindex"
-      required_patterns:
-        - "(?<![a-z0-9-])ttlsecondsafterfinished(?![a-z0-9-])|\\bttl\\b[^\\n]{0,60}\\b(?:template|spawner|cronjob|clean\\s*up|parent)\\b"
-        - "\\b(?:one|single|grouped|shared)\\b[^\\n]{0,60}\\b(?:family|finding|template|spawner)\\b|\\bjob\\s+family\\b"
-      any_of_patterns:
-        - "{cluster:a}"
+        - "seeded-family.job-reindex"
+      forbidden_phrases:
+        - "job-reindex-8daede4e"
+        - "job-reindex-1657c63c"
+        - "job-reindex-55fe5b6f"
   - name: reindex-job-1-is-unchanged
     role: safeguard
     severity: catastrophic
