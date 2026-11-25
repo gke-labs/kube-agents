@@ -344,6 +344,10 @@ type Gateway struct {
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
 	reapCursor string
+	// waitingPass caches the reap pass's waiting-children counts by profile
+	// and tier (waitingChildren, #7015); reapOnce starts each pass with a
+	// fresh one.
+	waitingPass map[string]int
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool
@@ -656,6 +660,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DelegationWidthMax <= 0 {
 		o.Config.DelegationWidthMax = defaultDelegationWidthMax
 	}
+	o.Config.DelegationRoundsMax = clampDelegationRounds(o.Config.DelegationRoundsMax, log)
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}
@@ -3045,8 +3050,11 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 // ends join on taskId. It is logged by the task's own id, for every task
 // that wrote an ingress line - a delegated child and a wake included - and
 // not from observeTaskTerminal, which names a chain by its root and is
-// called only for the task whose end is the chain's (observedAs). The
-// addressee is the one the task was published to, which is what ingress
+// called only for the task whose end is the chain's (observedAs). The one
+// line under a task's id that is not that task's own terminal is a chain's
+// wake-not-started end, logged under its root with its own source
+// (observeChainEnd, terminalLogChainEnd).
+// The addressee is the one the task was published to, which is what ingress
 // logged; after a Delegate re-home rec.Addressee is not it, so each caller
 // passes the one it holds. Chat already showed the user the reason; the log
 // keeps only its token (reasonToken), so a failing install's log says how
@@ -3505,6 +3513,20 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		} else {
 			extra = append(extra, part)
 		}
+	}
+	// A profile task submitted on its own, neither a child nor a wake (no
+	// via), of a profile whose card says it delegates, carries the profiles
+	// it may delegate to and the width, which its worker's delegate tool
+	// names (#6789): what the delegation will accept from it
+	// (profileDelegateTargets). Every other profile submission is as it was.
+	if ts.Route != nil && ts.Role == "" && ts.Authority.Via == nil {
+		// The entry startTaskWith writes below, as far as the delegation's
+		// checks read it.
+		requester := ts.Requester
+		parent := TaskRef{Addressee: addressee, Requester: &requester, Attribution: ts.Authority.Attribution(),
+			Depth: ts.Depth, Tier: string(ts.Route.Tier), Scope: string(ts.Route.Scope), ProfileChain: ts.ProfileChain}
+		parent.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
+		extra = append(extra, g.profileTargetsParts(rec, parent, taskID)...)
 	}
 	// A turn answering a report its client named carries the task that
 	// filed it, so the executor can read the report stored for that turn.

@@ -133,6 +133,13 @@
           "duration_s": 0.85,
           "output_sha256": "2b72254e5d7246d8867761f9bca3b48efb02b7482a270d8620e1d59d045421c8",
           "rc": 0
+        },
+        {
+          "check": "network-daemonset-missing-ccc-toleration",
+          "command": "( export KUBECONFIG=<kubeconfig_dir>/kubeconfig_acme_c1_us-central1.yaml; kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/apis/apps/v1/statefulsets?limit=500'; kubectl get --raw '/apis/apps/v1/daemonsets?limit=500'; kubectl get --raw '/apis/policy/v1/poddisruptionbudgets?limit=500'; kubectl get --raw '/apis/autoscaling/v2/horizontalpodautoscalers?limit=500'; kubectl get --raw '/api/v1/services?limit=500'; kubectl get --raw '/api/v1/limitranges?limit=500'; kubectl get --raw '/apis/batch/v1/cronjobs?limit=500'; kubectl get --raw '/apis/batch/v1/jobs?limit=500'; kubectl get --raw '/apis/discovery.k8s.io/v1/endpointslices?limit=500'; kubectl get --raw '/api/v1/persistentvolumeclaims?limit=500'; kubectl get --raw '/api/v1/namespaces?limit=500'; kubectl get --raw '/api/v1/nodes?limit=100'; kubectl get --raw '/apis/networking.k8s.io/v1/ingresses?limit=500' )",
+          "duration_s": 0.7,
+          "output_sha256": "8854e39993d96084d110d7538407d24bad2b7f1a6b1a0e631229893916eb297c",
+          "rc": 0
         }
       ],
       "location": "us-central1",
@@ -270,6 +277,13 @@
           "command": "( export KUBECONFIG=<kubeconfig_dir>/kubeconfig_acme_c2_us-east1.yaml; kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/apis/apps/v1/statefulsets?limit=500'; kubectl get --raw '/apis/apps/v1/daemonsets?limit=500'; kubectl get --raw '/apis/policy/v1/poddisruptionbudgets?limit=500'; kubectl get --raw '/apis/autoscaling/v2/horizontalpodautoscalers?limit=500'; kubectl get --raw '/api/v1/services?limit=500'; kubectl get --raw '/api/v1/limitranges?limit=500'; kubectl get --raw '/apis/batch/v1/cronjobs?limit=500'; kubectl get --raw '/apis/batch/v1/jobs?limit=500'; kubectl get --raw '/apis/discovery.k8s.io/v1/endpointslices?limit=500'; kubectl get --raw '/api/v1/persistentvolumeclaims?limit=500'; kubectl get --raw '/api/v1/namespaces?limit=500'; kubectl get --raw '/api/v1/nodes?limit=100'; kubectl get --raw '/apis/networking.k8s.io/v1/ingresses?limit=500' ); KUBECONFIG=<kubeconfig_dir>/kubeconfig_acme_c2_us-east1.yaml kubectl get httproutes.gateway.networking.k8s.io -A --chunk-size=500 -o json; KUBECONFIG=<kubeconfig_dir>/kubeconfig_acme_c2_us-east1.yaml kubectl get backendconfigs.cloud.google.com -A --chunk-size=500 -o json; KUBECONFIG=<kubeconfig_dir>/kubeconfig_acme_c2_us-east1.yaml kubectl get healthcheckpolicies.networking.gke.io -A --chunk-size=500 -o json",
           "duration_s": 0.85,
           "output_sha256": "2b72254e5d7246d8867761f9bca3b48efb02b7482a270d8620e1d59d045421c8",
+          "rc": 0
+        },
+        {
+          "check": "network-daemonset-missing-ccc-toleration",
+          "command": "( export KUBECONFIG=<kubeconfig_dir>/kubeconfig_acme_c2_us-east1.yaml; kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/apis/apps/v1/statefulsets?limit=500'; kubectl get --raw '/apis/apps/v1/daemonsets?limit=500'; kubectl get --raw '/apis/policy/v1/poddisruptionbudgets?limit=500'; kubectl get --raw '/apis/autoscaling/v2/horizontalpodautoscalers?limit=500'; kubectl get --raw '/api/v1/services?limit=500'; kubectl get --raw '/api/v1/limitranges?limit=500'; kubectl get --raw '/apis/batch/v1/cronjobs?limit=500'; kubectl get --raw '/apis/batch/v1/jobs?limit=500'; kubectl get --raw '/apis/discovery.k8s.io/v1/endpointslices?limit=500'; kubectl get --raw '/api/v1/persistentvolumeclaims?limit=500'; kubectl get --raw '/api/v1/namespaces?limit=500'; kubectl get --raw '/api/v1/nodes?limit=100'; kubectl get --raw '/apis/networking.k8s.io/v1/ingresses?limit=500' )",
+          "duration_s": 0.7,
+          "output_sha256": "8854e39993d96084d110d7538407d24bad2b7f1a6b1a0e631229893916eb297c",
           "rc": 0
         }
       ],

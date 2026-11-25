@@ -360,6 +360,38 @@ no worker has as running, and the inject door hands every edit to the eval harne
 fallback post would be worse again, since both read every unedited post of a task as its
 output.
 
+**The waiting notice.** A delegated child's line gets the same kind of notice from the reap
+scan, since a child is minted by the session and no turn is there to count for it. It is for a
+single child of an AgentProfile (one with a tier) that holds the conversation's active task:
+a fan-out child doesn't hold the active task (a status ask lists it as `waiting to start`), and a platform child has no profile queue to
+wait in. A child whose line is still at submitted between 30 seconds after its submission and
+the first-event grace, with nothing on its stream (probeTask, the never-started test), has its
+own line edited to "⏳ **waiting** — the cluster agent hasn't started on this yet", with "; N
+other requests sent through me are waiting for it too" when there are others. The scan runs
+every minute, so the notice lands 30 to 90 seconds in. It claims no cause: busy workers, a
+dispatcher queue, a cold pod and a dispatcher that is down all look the same from the gateway,
+which sees only an empty stream. The line leaves out the "(delegated to …)" note the relay
+renders, since it names the profile already; the relay's first render past submitted puts it
+back. N is this gateway's other children for the same profile and tier, single or fan-out,
+not cancelled or ended, inside their own grace (`A2A_FIRST_EVENT_GRACE`, or the fan-out
+queue allowance below), with empty streams. The grace filter matters: past it an empty
+stream is a child that never started and was released, or one whose events aged out of the
+stream, and session records keep both for a week. It is counted once per profile and tier per
+reap pass from the session records and the stream, not from relay state. The record is marked
+(`waitingNoticeAt`, with the count) before the edit, and the line is edited again only when the
+count or the line changes. The edit is made under the conversation's session lock and only
+while the line is still submitted, and sets the relay's `busyShown` so its own submitted render
+doesn't replace it; its first edit past submitted does. A restart drops the relay's render
+state; since the stream was just read empty, a child with none is taken as still submitted
+and given fresh state as the relay would give it, so the notice and the close below survive a
+rollout. Doors that read the line as data (`busyNoticeBackend`, by the delegating turn's
+backend) get none. At the first-event grace, a line that carries the notice is closed in place
+to "⚠️ **didn't start** — the cluster agent didn't start on this in 10 minutes; ask again to
+start a new request" instead of the grace's separate post, so no
+⏳ is left on a line nothing will move. A child first seen past the grace, after an outage, gets
+no notice and the grace's post as before. The grace itself, its marker and its release are
+unchanged, and nothing is published.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
@@ -717,7 +749,9 @@ entry of the chain), and never names the child or the wake: no start, accept, de
 terminal under either id. The turn that delegated ends quietly, and the root's one deliverable and
 terminal come at the chain's end - the wake's result, then the wake's terminal, in that order; when
 no wake runs, the root ends `canceled` for a requester's `stop` and `failed` with
-`reason: wake-not-started - …` otherwise, with nothing delivered. The hand-off line
+`reason: wake-not-started - …` otherwise, with nothing delivered. The gateway logs the
+wake-not-started end as a second `task terminal` line under the root's id: its `state` is `failed`
+and its `source` is `gateway-chain-end`, a source only the log carries. The hand-off line
 (`delegated to <addressee>`) is never a deliverable: a session turn whose stream carries a delegate
 request and which minted no child ends the root `failed`, with nothing delivered -
 `reason: delegation-refused - <the room's notice>` when the gateway refused it, and
@@ -856,14 +890,24 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent's profile doesn't delegate
+(`delegation.profile-not-delegating`: its card lacks `delegates`, from AgentProfile `spec.delegates`, so an operator's card
+from before the field fails closed). A parent that runs at `unattended`
 (a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
 parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
 trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
 (`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
 child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
-end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
-reads while it waits open, and the parent holds the conversation again, so a stop or a steer
+end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
+`delegationRefused` one (#4860), which the parent reads while it waits open. Every request the gateway handles
+for a profile task uses one of its delegation rounds, minted or refused, and a request once the task has used
+them is refused (`delegation.rounds`), with a notice that says how many it used, on its `.in` with `round` set
+to the round it would have been. It mints nothing, records nothing, and ends none of the wait on the earlier
+request's children. The rounds are `A2A_DELEGATION_ROUNDS_MAX`, 1 by default and 1 at most for now: the
+gateway clamps anything above 1 to 1 at startup and logs a warning naming the variable, saying rounds above 1
+are not supported yet, until a profile task's later rounds ship. The operator renders it onto the gateway
+explicitly at 1, and refuses any other value it carries, in its startup log; the chart's
+`operator.delegation.roundsMax` takes only 1. At the default, the parent's second request is the one refused. The parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
 chain's end, delegated or not. A stop while the child runs cancels the child and every profile
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
@@ -875,7 +919,19 @@ queued runs when a slot frees, or is refused at its queue timeout. The cards are
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
-cards, for the delegate tool the worker adapter serves to name in its addressee description. The
+cards, for the delegate tool the worker adapter serves to name in its addressee description. So
+does a delegating profile's own task (#6789): a submission to a profile whose card says it
+delegates, that is neither a child nor a wake, carries the profiles the delegation would accept from
+it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under), and the rounds
+(`roundsMax`, from `A2A_DELEGATION_ROUNDS_MAX`) when they are over one. The list
+runs the delegation's own checks on each profile, so it doesn't offer one the delegation refuses
+whatever cluster it is given: not `platform`, not a profile outside a cluster-scoped parent's
+cluster, only profiles that run at `read` and list `unattended` for a parent below a scheduled run,
+and nobody for a parent refused outright, such as one at the depth cap. The checks that depend on
+the cluster the worker picks for a profile that takes a target (that it is in scope, and a profile
+pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the delegation, which
+still refuses there. A scheduled run of a delegating profile carries the list too, built
+the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
@@ -886,15 +942,6 @@ whether its card declares them or not.
 
 The session manager is the demo's chatops code generalized from one-shot workers to
 long-lived sessions. Four operations:
-
-The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
-operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
-to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
-the operator or the gateway doesn't know falls back to that default rather than stopping the shared
-gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
-error at start. Every session
-pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
-on the worker's isolation waiver.
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 150m/320Mi requests by default, set by
@@ -925,6 +972,15 @@ one-shot Delegate's off the session route), a stopped task is still finishing on
 never started, its lifetime has no room left for a whole task, or the read that checks all this
 fails. The old pod is retired as before. `A2A_SESSION_REUSE=false` on the gateway turns reuse off,
 for running pods too, and every turn spawns.
+
+The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
+operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
+to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
+the operator or the gateway doesn't know falls back to that default rather than stopping the shared
+gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
+error at start. Every session
+pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
+on the worker's isolation waiver.
 
 **Stream.** The shim consumes envelopes addressed to its session, feeds them to the
 harness, and maps the stream-json output to `status-update` and `artifact-update` events.
@@ -1003,7 +1059,8 @@ evidence, a first event that is merely late could still arrive, and no superviso
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
 posts one line once the grace has passed with nothing on the stream, naming the task and
-saying the next message starts a new task. It marks the active-task record before it
+saying the next message starts a new task (a delegated child's line that carries the waiting
+notice above is closed in place instead). It marks the active-task record before it
 posts, so the line goes out at most once per task, across gateway restarts, and it
 releases nothing; the release stays with the next turn, which reads the stream again
 first. The line is for a placeholder somebody may still be watching, so it has a ceiling:

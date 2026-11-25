@@ -535,6 +535,18 @@ const (
 	// control, rendered at the gateway's default (a2aCardStopTimeout).
 	a2aCardStopEnvVar        = "A2A_CARD_STOP"
 	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aDelegationRoundsMaxEnvVar is a controller-read setting rendered onto
+	// the gateway under the same name: how many delegate requests one
+	// profile task may make (the gateway's delegation.rounds rule, #6789).
+	// The chart sets it from operator.delegation.roundsMax. Rendered
+	// explicitly at 1, the only value supported until a profile task's later
+	// rounds land: the operator refuses any other value, logging why at
+	// startup (ValidateA2ADelegationRoundsMax) and rendering 1, and the
+	// gateway clamps one over 1 the same way.
+	a2aDelegationRoundsMaxEnvVar = "A2A_DELEGATION_ROUNDS_MAX"
+	// a2aDelegationRoundsSupported is the one value a2aDelegationRoundsMax
+	// renders until rounds past the first are supported.
+	a2aDelegationRoundsSupported = 1
 	// a2aCardStopTimeout is the gateway's default wait for a card-stop
 	// control, rendered explicitly: above the bridge's worst case for one
 	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
@@ -1581,6 +1593,36 @@ func a2aCardStop() string {
 		return "true"
 	}
 	return "false"
+}
+
+// a2aDelegationRoundsMax renders the gateway's A2A_DELEGATION_ROUNDS_MAX: the
+// operator's own setting when it is the supported value, and that value
+// otherwise. Unset, malformed and over the supported value all render 1;
+// ValidateA2ADelegationRoundsMax says why at startup.
+func a2aDelegationRoundsMax() string {
+	return strconv.Itoa(a2aDelegationRoundsSupported)
+}
+
+// ValidateA2ADelegationRoundsMax refuses an A2A_DELEGATION_ROUNDS_MAX on the
+// operator other than unset or 1, naming the variable and the reason. The
+// operator logs it at startup and renders 1 (a2aDelegationRoundsMax), rather
+// than stopping every install's reconcile over a setting the gateway would
+// clamp anyway.
+func ValidateA2ADelegationRoundsMax() error {
+	v := strings.TrimSpace(os.Getenv(a2aDelegationRoundsMaxEnvVar))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return fmt.Errorf("%s %q refused: need an integer, and only %d is supported; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	if n > a2aDelegationRoundsSupported {
+		return fmt.Errorf("%s %q refused: rounds above %d are not supported yet; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	return nil
 }
 
 // renderA2ANATSDebug is the bus's debug line, present only while the
@@ -7581,6 +7623,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// bound beside the switch.
 		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
 		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
+		// The delegation rounds a profile task may use,
+		// rendered explicitly at the one value supported
+		// (a2aDelegationRoundsMax), so a reader of the live
+		// Deployment sees the bound, and lifting it is an
+		// edit to a value already there.
+		{Name: a2aDelegationRoundsMaxEnvVar, Value: a2aDelegationRoundsMax()},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS
@@ -7809,6 +7857,13 @@ type a2aProvisionState struct {
 	// such a rollout, and the status writers carry it as
 	// a2aCalloutStalledConditionType so the wedged rollout is visible.
 	calloutStalled string
+	// provisionRetrying is the A2AProvisionRetrying message while the
+	// current provision Job has failed pods and has neither completed nor
+	// given up, "" otherwise. The Job retries up to its backoffLimit before
+	// JobFailed (and A2AProvisionFailed) appears, which can take over an
+	// hour; this makes the retries visible meanwhile without touching
+	// BusProvisioned, Ready or the phase (#7100).
+	provisionRetrying string
 	// calloutMap is what the callout pods' /status said about the identity
 	// map this pass rendered (A2AIdentityMapApplied, #4487); nil on a pass
 	// that did not get as far as rendering one.
@@ -8622,6 +8677,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				}
 			}
 		}
+		// Neither finished nor about to be, with failed pods: the Job is
+		// retrying. The status writers carry it, and record its Warning
+		// event once the write lands, so a pass that errors first doesn't
+		// repeat it.
+		if !state.done && !state.failed && !a2aProvisionJobFinishing(existing) && existing.Status.Failed > 0 {
+			state.provisionRetrying = a2aProvisionRetryingMessage(existing.Name, existing.Namespace, existing.Status.Failed)
+		}
 	}
 
 	// Superseded generations go now, not by TTL. A Job whose name the render
@@ -9393,6 +9455,69 @@ func setA2ACalloutStalledCondition(agent *agentv1alpha1.PlatformAgent, callout s
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	})
+}
+
+const (
+	// a2aProvisionRetryingConditionType is present, True, while the current
+	// provision Job has failed pods and is still retrying, and absent
+	// otherwise. Informational: it changes neither BusProvisioned, Ready nor
+	// the phase, so a retry that clears by itself (NATS briefly unreachable)
+	// does not flip a Ready install or fail `helm upgrade --wait`, which
+	// waits on this CR's status.
+	a2aProvisionRetryingConditionType = "A2AProvisionRetrying"
+	a2aProvisionRetryingReason        = "ProvisionJobPodsFailing"
+)
+
+// a2aProvisionJobFinishing reports the Job controller's interim verdicts
+// (FailureTarget, SuccessCriteriaMet), set while its pods terminate and
+// before Failed or Complete: such a Job is no longer retrying.
+func a2aProvisionJobFinishing(job *batchv1.Job) bool {
+	for _, cond := range job.Status.Conditions {
+		if cond.Status == corev1.ConditionTrue && (cond.Type == batchv1.JobFailureTarget || cond.Type == batchv1.JobSuccessCriteriaMet) {
+			return true
+		}
+	}
+	return false
+}
+
+func a2aProvisionRetryingMessage(job, namespace string, failed int32) string {
+	return fmt.Sprintf("A2A provision Job %s has %d failed pod(s) and is retrying; `kubectl logs -n %s job/%s` shows why. If it stops retrying it is reported as A2AProvisionFailed",
+		job, failed, namespace, job)
+}
+
+// a2aProvisionRetryingConditionCurrent and setA2AProvisionRetryingCondition
+// carry a2aProvisionRetryingConditionType on the A2ACalloutRolloutStalled
+// pattern: present while a2aProvisionState.provisionRetrying holds a
+// message, and written by both status writers.
+func a2aProvisionRetryingConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aProvisionRetryingConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aProvisionRetryingReason && existing.Message == msg
+}
+
+// setA2AProvisionRetryingCondition reports whether it set a message the CR
+// did not already carry: the failed-pod count rose, or a Job began retrying.
+// The caller records the Warning event after its status write succeeds.
+func setA2AProvisionRetryingCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) bool {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aProvisionRetryingConditionType)
+		return false
+	}
+	if a2aProvisionRetryingConditionCurrent(agent, msg) {
+		return false
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aProvisionRetryingConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aProvisionRetryingReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+	return true
 }
 
 // a2aBusHoldSkippedReason is the Warning event's reason when the bus moves to
