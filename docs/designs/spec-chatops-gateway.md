@@ -360,6 +360,38 @@ no worker has as running, and the inject door hands every edit to the eval harne
 fallback post would be worse again, since both read every unedited post of a task as its
 output.
 
+**The waiting notice.** A delegated child's line gets the same kind of notice from the reap
+scan, since a child is minted by the session and no turn is there to count for it. It is for a
+single child of an AgentProfile (one with a tier) that holds the conversation's active task:
+a fan-out child doesn't hold the active task (a status ask lists it as `waiting to start`), and a platform child has no profile queue to
+wait in. A child whose line is still at submitted between 30 seconds after its submission and
+the first-event grace, with nothing on its stream (probeTask, the never-started test), has its
+own line edited to "⏳ **waiting** — the cluster agent hasn't started on this yet", with "; N
+other requests sent through me are waiting for it too" when there are others. The scan runs
+every minute, so the notice lands 30 to 90 seconds in. It claims no cause: busy workers, a
+dispatcher queue, a cold pod and a dispatcher that is down all look the same from the gateway,
+which sees only an empty stream. The line leaves out the "(delegated to …)" note the relay
+renders, since it names the profile already; the relay's first render past submitted puts it
+back. N is this gateway's other children for the same profile and tier, single or fan-out,
+not cancelled or ended, inside their own grace (`A2A_FIRST_EVENT_GRACE`, or the fan-out
+queue allowance below), with empty streams. The grace filter matters: past it an empty
+stream is a child that never started and was released, or one whose events aged out of the
+stream, and session records keep both for a week. It is counted once per profile and tier per
+reap pass from the session records and the stream, not from relay state. The record is marked
+(`waitingNoticeAt`, with the count) before the edit, and the line is edited again only when the
+count or the line changes. The edit is made under the conversation's session lock and only
+while the line is still submitted, and sets the relay's `busyShown` so its own submitted render
+doesn't replace it; its first edit past submitted does. A restart drops the relay's render
+state; since the stream was just read empty, a child with none is taken as still submitted
+and given fresh state as the relay would give it, so the notice and the close below survive a
+rollout. Doors that read the line as data (`busyNoticeBackend`, by the delegating turn's
+backend) get none. At the first-event grace, a line that carries the notice is closed in place
+to "⚠️ **didn't start** — the cluster agent didn't start on this in 10 minutes; ask again to
+start a new request" instead of the grace's separate post, so no
+⏳ is left on a line nothing will move. A child first seen past the grace, after an outage, gets
+no notice and the grace's post as before. The grace itself, its marker and its release are
+unchanged, and nothing is published.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
@@ -1027,7 +1059,8 @@ evidence, a first event that is merely late could still arrive, and no superviso
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
 posts one line once the grace has passed with nothing on the stream, naming the task and
-saying the next message starts a new task. It marks the active-task record before it
+saying the next message starts a new task (a delegated child's line that carries the waiting
+notice above is closed in place instead). It marks the active-task record before it
 posts, so the line goes out at most once per task, across gateway restarts, and it
 releases nothing; the release stays with the next turn, which reads the stream again
 first. The line is for a placeholder somebody may still be watching, so it has a ceiling:
