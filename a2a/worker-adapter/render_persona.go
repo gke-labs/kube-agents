@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,11 +35,15 @@ const (
 // It renders into a new directory beside out and renames it into place, so
 // out is either the whole sealed rendering or absent, and a rerun in the same
 // pod (an init container started again) replaces what an earlier run left.
-func RenderPersonaTo(in, out string, h persona.Harness, relay persona.Relay, requireIntegrity bool) error {
+// It logs whether the persona's files matched its build-time manifest.
+func RenderPersonaTo(in, out string, h persona.Harness, relay persona.Relay, requireIntegrity bool, log *slog.Logger) error {
 	p, err := persona.LoadWithOptions(in, persona.Options{RequireIntegrity: requireIntegrity})
 	if err != nil {
 		return fmt.Errorf("the persona at %s: %w", in, err)
 	}
+	// The same line the profile worker logs for a persona it loads itself,
+	// so a rendered persona's source says verified or unverified too.
+	logPersonaIntegrity(log, in, p)
 	adapter, err := render.For(h)
 	if err != nil {
 		return err

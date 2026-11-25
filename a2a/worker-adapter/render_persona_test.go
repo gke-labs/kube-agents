@@ -1,7 +1,10 @@
 package workeradapter
 
 import (
+	"bytes"
+	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +14,8 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
 )
 
+var discardLog = slog.New(slog.NewTextHandler(io.Discard, nil))
+
 var renderRelay = persona.Relay{URL: "http://broker:8080/v1/mcp", Command: "/usr/local/bin/worker-adapter", Args: []string{MCPRelayCommand, "{url}"}}
 
 // The cluster persona renders for core-agent into a sealed directory that
@@ -19,7 +24,7 @@ var renderRelay = persona.Relay{URL: "http://broker:8080/v1/mcp", Command: "/usr
 func TestARenderedPersonaIsSealedAndReadable(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "persona")
 	t.Cleanup(func() { unseal(t, out) })
-	if err := RenderPersonaTo("../../agents/cluster/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+	if err := RenderPersonaTo("../../agents/cluster/persona", out, persona.CoreAgent, renderRelay, false, discardLog); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	err := filepath.WalkDir(out, func(p string, d fs.DirEntry, err error) error {
@@ -64,7 +69,7 @@ func TestARenderThatCantCompleteWritesNothing(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := filepath.Join(t.TempDir(), "persona")
-			err := RenderPersonaTo("../../agents/cluster/persona", out, tc.h, tc.relay, false)
+			err := RenderPersonaTo("../../agents/cluster/persona", out, tc.h, tc.relay, false, discardLog)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
@@ -77,15 +82,86 @@ func TestARenderThatCantCompleteWritesNothing(t *testing.T) {
 
 // A persona that differs from its build-time manifest is refused, as the
 // worker refuses it.
-func TestARenderRefusesATamperedPersona(t *testing.T) {
+// A persona that carries its build-time manifest renders with its source
+// logged as verified, and a file changed after the manifest was written is
+// refused even with integrity not required: the manifest alone catches it.
+func TestARenderChecksThePersonasBuildTimeManifest(t *testing.T) {
+	manifested := func(t *testing.T) string {
+		in := filepath.Join(t.TempDir(), "persona")
+		copyTree(t, "../../agents/cluster/persona", in)
+		_ = os.Remove(filepath.Join(in, persona.IntegrityManifestFile))
+		writeManifest(t, in)
+		return in
+	}
+	t.Run("verified", func(t *testing.T) {
+		var buf bytes.Buffer
+		out := filepath.Join(t.TempDir(), "out")
+		t.Cleanup(func() { unseal(t, filepath.Dir(out)) })
+		if err := RenderPersonaTo(manifested(t), out, persona.CoreAgent, renderRelay, false, slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(buf.String(), `level=INFO msg="persona files match their build-time manifest"`) {
+			t.Errorf("log = %q, want the persona logged as verified", buf.String())
+		}
+	})
+	t.Run("unverified", func(t *testing.T) {
+		in := filepath.Join(t.TempDir(), "persona")
+		copyTree(t, "../../agents/cluster/persona", in)
+		_ = os.Remove(filepath.Join(in, persona.IntegrityManifestFile))
+		var buf bytes.Buffer
+		out := filepath.Join(t.TempDir(), "out")
+		t.Cleanup(func() { unseal(t, filepath.Dir(out)) })
+		if err := RenderPersonaTo(in, out, persona.CoreAgent, renderRelay, false, slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(buf.String(), `level=WARN msg="persona integrity unverified`) {
+			t.Errorf("log = %q, want the persona logged as unverified", buf.String())
+		}
+	})
+	t.Run("tampered", func(t *testing.T) {
+		in := manifested(t)
+		if err := os.WriteFile(filepath.Join(in, "instructions.md"), []byte("changed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := filepath.Join(t.TempDir(), "out")
+		err := RenderPersonaTo(in, out, persona.CoreAgent, renderRelay, false, discardLog)
+		if err == nil || !strings.Contains(err.Error(), "instructions.md") {
+			t.Fatalf("a tampered persona: err = %v, want instructions.md named", err)
+		}
+		if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+			t.Errorf("a refused render left %s behind: %v", out, statErr)
+		}
+	})
+}
+
+// With integrity required, a persona without a manifest is refused.
+func TestARenderRequiringIntegrityRefusesAPersonaWithoutAManifest(t *testing.T) {
 	in := filepath.Join(t.TempDir(), "persona")
-	copyTree(t, "../../agents/fleet-audit/persona", in)
-	f := filepath.Join(in, "instructions.md")
-	if err := os.WriteFile(f, []byte("changed\n"), 0o644); err != nil {
+	copyTree(t, "../../agents/cluster/persona", in)
+	_ = os.Remove(filepath.Join(in, persona.IntegrityManifestFile))
+	if err := RenderPersonaTo(in, filepath.Join(t.TempDir(), "out"), persona.CoreAgent, renderRelay, true, discardLog); err == nil {
+		t.Fatal("a persona without a manifest rendered with integrity required")
+	}
+}
+
+// writeManifest writes dir's build-time manifest over every file in it.
+func writeManifest(t *testing.T, dir string) {
+	t.Helper()
+	files := map[string][]byte{}
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		data, err := os.ReadFile(p)
+		files[filepath.ToSlash(rel)] = data
+		return err
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := RenderPersonaTo(in, filepath.Join(t.TempDir(), "out"), persona.CoreAgent, renderRelay, true); err == nil {
-		t.Fatal("a tampered persona rendered")
+	if err := os.WriteFile(filepath.Join(dir, persona.IntegrityManifestFile), persona.FormatIntegrityManifest(files), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -127,10 +203,10 @@ func TestARenderRerunReplacesWhatAnEarlierRunLeft(t *testing.T) {
 	parent := t.TempDir()
 	out := filepath.Join(parent, "persona")
 	t.Cleanup(func() { unseal(t, parent) })
-	if err := RenderPersonaTo("../../agents/fleet-audit/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+	if err := RenderPersonaTo("../../agents/fleet-audit/persona", out, persona.CoreAgent, renderRelay, false, discardLog); err != nil {
 		t.Fatal(err)
 	}
-	if err := RenderPersonaTo("../../agents/cluster/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+	if err := RenderPersonaTo("../../agents/cluster/persona", out, persona.CoreAgent, renderRelay, false, discardLog); err != nil {
 		t.Fatalf("a rerun over a sealed rendering: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(out, "skills", "gke-stall-detection")); err != nil {
@@ -141,7 +217,7 @@ func TestARenderRerunReplacesWhatAnEarlierRunLeft(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(out, "stray"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := RenderPersonaTo("../../agents/fleet-audit/persona", out, persona.CoreAgent, renderRelay, false); err != nil {
+	if err := RenderPersonaTo("../../agents/fleet-audit/persona", out, persona.CoreAgent, renderRelay, false, discardLog); err != nil {
 		t.Fatalf("a rerun over a partial rendering: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(out, "stray")); !os.IsNotExist(err) {

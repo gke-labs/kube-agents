@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -34,7 +35,7 @@ func renderPersonaMain(args []string, getenv func(string) string) int {
 		return 2
 	}
 	relay := workeradapter.ProfileRelay(selfPath(), getenv)
-	if err := workeradapter.RenderPersonaTo(*in, *out, persona.Harness(*harness), relay, require); err != nil {
+	if err := workeradapter.RenderPersonaTo(*in, *out, persona.Harness(*harness), relay, require, slog.New(slog.NewJSONHandler(os.Stderr, nil))); err != nil {
 		fmt.Fprintln(os.Stderr, "render-persona:", err)
 		return 1
 	}
