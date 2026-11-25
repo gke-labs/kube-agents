@@ -4,8 +4,9 @@ import "strings"
 
 // A harness starts the processes a turn's tools run, such as a shell command
 // or an MCP stdio server, as the adapter's user. Those children get an
-// allowlisted environment: the basics a command needs, KUBECONFIG, and the
-// broker-routed tools' variables. Everything else is withheld, so a model,
+// allowlisted environment: the basics a command needs, KUBECONFIG, and what
+// the image's tool wrappers read (the broker-routed tools, the session
+// kube-proxy path, kubectl admission, the shell memory guard, the VCS tools). Everything else is withheld, so a model,
 // provider, bus or chat credential the pod carries never reaches them,
 // whatever its name. Withheld names what must not reach them;
 // WithheldFromToolChildren lists those present in an environment, for a
@@ -28,10 +29,34 @@ var (
 		"LC_",               // locale
 		"CREDENTIAL_PROXY_", // the broker-routed tools (see above)
 	}
+	// Each name past KUBECONFIG is one a tool file in the image reads,
+	// listed by name rather than by prefix, so a variable added later under
+	// the same prefix is withheld until someone reviews it.
+	// TestEveryVariableAToolFileReadsReachesToolChildren scans those files
+	// and fails on a name that is neither here nor withheld with a reason.
 	toolChildAllowedNames = []string{
 		"PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "HOSTNAME",
 		"LANG", "LANGUAGE", "TERM", "TZ",
 		"KUBECONFIG",
+		// a session pod's kubectl through its kube-proxy (session-kubectl.sh,
+		// kubectl-context-registered, credential_proxy_client.py)
+		"KUBE_PROXY_URL", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT", "KUBE_PROXY_MODE",
+		// kubectl admission (kubectl-admit)
+		"KUBEAGENTS_KUBECTL_COST_TIER", "KUBECTL_ADMIT_ON_BUSY", "KUBECTL_ADMIT_GUARD_PATH", "KUBECTL_ADMIT_RUN_DIR",
+		// the shell memory guard
+		"SANDBOX_MEMORY_LIMIT_BYTES",
+		// the VCS tools (vcs_client.py)
+		"KUBE_AGENTS_LOCAL_GIT", "KUBE_AGENTS_VCS_AUTHOR_NAME", "KUBE_AGENTS_VCS_ROOT", "KUBE_AGENTS_VCS_TTL_HOURS",
+		// read by credential_proxy_client.py: the Google universe domain the
+		// broker-routed gcloud and API calls use, and the session ids it
+		// attributes a call to
+		"GOOGLE_CLOUD_UNIVERSE_DOMAIN", "CLOUDSDK_CORE_UNIVERSE_DOMAIN",
+		"HERMES_HOME", "HERMES_CRON_RUN", "HERMES_KANBAN_TASK", "HERMES_SESSION_ID",
+		// read by vcs_readings.py: the commit author and the forge app id
+		"KUBE_AGENTS_VCS_AUTHOR_EMAIL", "GITHUB_APP_ID",
+		// read by the fleet-audit skill's audit_report.py
+		"FLEET_AUDIT_GITOPS_ROOT", "FLEET_AUDIT_LEDGER_SCOPE", "FLEET_AUDIT_REPORTS_DIR", "FLEET_AUDIT_SCRATCH_DIR",
+		"GKE_PROJECT_ID", "GKE_CLUSTER_NAME", "GKE_LOCATION", "KUBEAGENTS_AUDIT_AUTO_PROMOTE",
 	}
 )
 

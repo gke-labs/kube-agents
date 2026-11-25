@@ -37,6 +37,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -204,6 +205,12 @@ echo planted
 		"CANARY_UNLISTED_SECRET="+canarySecret,
 		"CREDENTIAL_PROXY_CANARY="+canaryVisible,
 	)
+	// Every variable the image's tool wrappers read, with a marker value: a
+	// session pod's kubectl, kubectl admission, the memory guard and the VCS
+	// tools need each one in the tool child's environment.
+	for _, v := range canaryWrapperVars() {
+		cfg.HarnessEnv = append(cfg.HarnessEnv, v+"=canary-wrapper-"+v)
+	}
 	if !guarded {
 		prevKill := killEveryoneButMe
 		killEveryoneButMe = func() {}
@@ -295,6 +302,11 @@ func TestTheCoreAgentHarnessIsolationCanary(t *testing.T) {
 		if !strings.Contains(l.env, "CREDENTIAL_PROXY_CANARY="+canaryVisible) {
 			t.Error("the saved environment lacks the allowlisted value, so it isn't the tool child's")
 		}
+		for _, v := range canaryWrapperVars() {
+			if !strings.Contains(l.env, v+"=canary-wrapper-"+v) {
+				t.Errorf("the tool child lacks %s, which a tool wrapper reads", v)
+			}
+		}
 	}
 
 	t.Run("control", func(t *testing.T) {
@@ -335,4 +347,21 @@ func firstLine(s string) string {
 		s = s[:120]
 	}
 	return s
+}
+
+// canaryWrapperVars is every variable the image's tool wrappers read
+// (toolWrapperVars), once each, sorted, minus HOME, which the run sets.
+func canaryWrapperVars() []string {
+	seen := map[string]bool{"HOME": true}
+	var out []string
+	for _, vars := range toolWrapperVars {
+		for _, v := range vars {
+			if !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
