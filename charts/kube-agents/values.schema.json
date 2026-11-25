@@ -1844,10 +1844,6 @@
                 }
               }
             },
-            "scopedServiceAccounts": {
-              "type": "array",
-              "maxItems": 0
-            },
             "workloadIdentityFederation": {
               "type": "object",
               "additionalProperties": false,
