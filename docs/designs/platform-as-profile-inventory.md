@@ -595,6 +595,10 @@ To move this group, needed: the default session becomes the front door (#6526, D
 
 To move this group, needed: the dial and post-merge state somewhere other than the agent pod; a non-chat principal allowed to report the dial; the post-merge verbs for whichever profile runs the follow-ups; and a replacement for the `pr_opened` record hook.
 
+## Designs for the Blockers
+
+- Blocker 15 ([#6674](https://github.com/gke-labs/kube-agents/issues/6674)): [`profile-pod-telemetry.md`](profile-pod-telemetry.md) proposes a counterpart, or "not needed" with a reason, for each signal that the platform agent's pod ships: log lines, records of tool calls and messages, traces and metrics.
+
 ## Counts
 
 Blockers: 15. Open questions: 17.
