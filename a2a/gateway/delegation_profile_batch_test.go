@@ -960,7 +960,7 @@ func TestAWithdrawnProfileBatchRetriesAnEndThatFailsToSend(t *testing.T) {
 		return armed.Load() == 1 && failed.Add(1) == 1
 	}
 	r.g.cfg.DelegationWidthMax = 10
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
 	ctx := context.Background()
 	conv := "console:tab-profile-batch-withdrawn-retry"
