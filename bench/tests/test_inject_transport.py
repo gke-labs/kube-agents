@@ -4024,6 +4024,57 @@ def test_a_card_the_board_does_not_know_is_dropped_not_waited_on_to_the_ceiling(
     assert result.metadata["delegated_cards_missing"] == [CARD_A]
 
 
+
+def _adopted_card_run(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, created_at: int, floor: int):
+    """CARD_A is on the board at the first read, running, then gone: a purge owing it deleted it."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_A, "running")
+    set_card(tmp_path, CARD_B, "done", result="fleet report")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, CARD_A))
+
+    def purge_after_first_read(n: int) -> None:
+        if n == 2:
+            with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+                conn.execute("DELETE FROM tasks WHERE id = ?", (CARD_A,))
+
+    real = local_shell(tmp_path, monkeypatch, purge_after_first_read)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    return KubeAgentsHarness().run("check the fleet")
+
+
+def test_an_earlier_runs_card_deleted_mid_wait_is_named_as_adopted_not_lost(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4794: this run's create was handed an earlier repetition's card by its key, and that card's
+    owed purge deleted it before the wait read it settled. The record says the run was not independent."""
+    floor = 1_700_000_000
+    result = _adopted_card_run(tmp_path, monkeypatch, created_at=floor - 60, floor=floor)
+
+    (error,) = result.errors
+    assert error.startswith(f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait")
+    assert "filed before this run started" in error
+    assert "this repetition is not independent" in error
+    assert result.metadata["delegated_cards_missing"] == [CARD_A]
+
+
+def test_a_card_of_this_runs_own_that_vanishes_keeps_the_plain_message(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    floor = 1_700_000_000
+    result = _adopted_card_run(tmp_path, monkeypatch, created_at=floor + 5, floor=floor)
+
+    assert result.errors == [
+        f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait, "
+        "nothing graded for it"
+    ]
+
 def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

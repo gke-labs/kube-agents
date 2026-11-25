@@ -1299,6 +1299,29 @@ _MAX_AWAITED_TASKS = 32
 # same case after _MAX_SILENT_TURNS turns that report nothing for it.
 _MAX_UNKNOWN_CARD_READS = 3
 
+
+def _vanished_card_error(task_id: str, created_at: int | None, floor: int | None) -> str:
+    """The error for an awaited card the board stopped having a row for.
+
+    A card filed before the run started (``created_at`` under the pod-clock
+    ``floor``) is an earlier repetition's that this run's create was handed by
+    its idempotency key, and the purge owing it deletes it once it stops
+    running, possibly before this wait reads it settled (#4794). Saying so
+    keeps the record honest: the repetition adopted another run's card, which
+    makes it not independent, rather than losing a card of its own.
+    """
+    message = (
+        f"card {task_id} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+        "dropped from the delegation wait, nothing graded for it"
+    )
+    if created_at is not None and floor is not None and created_at < floor:
+        message += (
+            "; it was filed before this run started, so this run's create was handed an earlier "
+            "repetition's card by its idempotency key, and the purge owing that card deleted it: "
+            "this repetition is not independent"
+        )
+    return message
+
 # Consecutive status turns that may report nothing before the wait is
 # abandoned. One off-turn is cheap to absorb; a run of them means the agent will
 # not read the board.
@@ -5918,6 +5941,11 @@ class KubeAgentsHarness(AgentHarness):
         missing: list[str] = []
         awaited: list[str] = []
         capped = False
+        # Each awaited card's ``created_at`` from the last read that had its row,
+        # so a card that leaves the board can still be told apart: one filed
+        # before the run started is an earlier run's, handed back by its
+        # idempotency key, which a purge owing it may delete mid-wait (#4794).
+        created: dict[str, int | None] = {}
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(
@@ -5953,12 +5981,11 @@ class KubeAgentsHarness(AgentHarness):
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
+                if t in read.cards:
+                    created[t] = read.cards[t].get("created_at")
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
-                result.errors.append(
-                    f"card {t} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
-                    "dropped from the delegation wait, nothing graded for it"
-                )
+                result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
             missing.extend(gone)
             awaited = [t for t in awaited if t not in gone]
             return [t for t in awaited if not _is_terminal(t)]
