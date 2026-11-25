@@ -1703,6 +1703,11 @@
 # prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
 
+# Managed Cloud Service Mesh (ASM) channel-downgrade guard (#2599, #2797, #7181):
+# switching rapid (1.24) to stable (1.22) risks control-plane downgrade, sidecar
+# skew, and Envoy xDS NACK loops. deployer: noop, no fixture.
+./tasks/upgrades-managed-mesh-channel-downgrade-guard/task.yaml
+
 # Upgrade-failure catalogue entry 8 through the readiness report's
 # changed-defaults rule: the seeded-defaults namespace on slot a (role
 # moving-admission-default) enforces baseline at enforce-version latest, so
