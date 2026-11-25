@@ -1,8 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"slices"
+	"strconv"
+	"strings"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/plugin"
@@ -72,25 +77,63 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("path scope: %w", err)
 	}
-	pl, err := toolPolicyPlugin(permitted)
+	pl, err := toolPolicyPlugin(permitted, refusalLog, shellCommands(p.Allow))
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, err
 	}
 	return b, permissions.Options{Mode: permissions.ModeAllow, Policy: policy, Scope: scope}, []*plugin.Plugin{pl}, nil
 }
 
+// refusalLog is where each refused tool call is logged, one line each
+// (logRefusal); run points it at the process's stderr, which the worker
+// writes to its pod log.
+var refusalLog io.Writer = os.Stderr
+
+// RefusalLogPrefix starts every refused-call line.
+const RefusalLogPrefix = coreagentwire.RefusalLogPrefix
+
 // toolPolicyPlugin refuses, before it runs, any tool call outside
-// permitted. It doesn't rewrite arguments; a call with nil arguments is
-// checked by name like any other.
-func toolPolicyPlugin(permitted map[string]bool) (*plugin.Plugin, error) {
+// permitted, and logs every refused call to log, whichever layer refused
+// it. It doesn't rewrite arguments; a call with nil arguments is checked by
+// name like any other.
+//
+// A shell call the gate refused for want of an allow rule gets a refusal the
+// model can act on (shellRefusalHint), in place of the gate's bare one;
+// shell lists the commands the grant's shell rules name, "*" for any.
+func toolPolicyPlugin(permitted map[string]bool, log io.Writer, shell []string) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: toolPolicyPluginName,
+		// Every tool error passes through here, the plugin's own refusal
+		// included. Returning nothing leaves the error as the tool's
+		// result.
+		OnToolErrorCallback: func(ctx agent.Context, t adktool.Tool, args map[string]any, err error) (map[string]any, error) {
+			name := ""
+			if t != nil {
+				name = t.Name()
+			}
+			callID := ""
+			if ctx != nil {
+				// The tool context's call id, the one the turn's tool_call
+				// event carries, so a refusal maps to its call.
+				callID = ctx.FunctionCallID()
+			}
+			logRefusal(log, name, callID, err)
+			if name == "bash" && err != nil && strings.Contains(err.Error(), noAllowRule) {
+				command, _ := args["command"].(string)
+				if hint := shellRefusalHint(command, shell); hint != "" {
+					// Returned as the call's result, which is what the
+					// model reads; ADK words an error result the same way.
+					return map[string]any{"error": err.Error() + ". " + hint}, nil
+				}
+			}
+			return nil, nil
+		},
 		BeforeToolCallback: func(_ agent.Context, t adktool.Tool, _ map[string]any) (map[string]any, error) {
 			if t == nil {
 				return nil, fmt.Errorf("a tool call without a tool")
 			}
 			if !permitted[t.Name()] {
-				return nil, fmt.Errorf("tool %q is not in this turn's grant", t.Name())
+				return nil, fmt.Errorf("tool %q %s", t.Name(), notInGrant)
 			}
 			return nil, nil
 		},
@@ -141,4 +184,93 @@ func builtinSwitch(b *tools.BuiltinTools, name string) *bool {
 		"record_plan":       &b.RecordPlan,
 		"sciontool_status":  &b.SciontoolStatus,
 	}[name]
+}
+
+// notInGrant ends the plugin's own refusal.
+const notInGrant = "is not in this turn's grant"
+
+// refusalReasons are the refusals logRefusal names, each by a phrase of
+// its error: the plugin's, then core-agent's gate in allow mode. The
+// phrases are core-agent's error texts; one it changes falls through to
+// unlogged, never to a wrong reason.
+var refusalReasons = []struct{ phrase, reason string }{
+	{notInGrant, "not in the turn's grant"},
+	{noAllowRule, "no allow rule matches"},
+	{"denied by config policy", "a deny rule matches"},
+	{"is outside scope", "outside the workspace"},
+	{"bash refused", "the gate's command checks"},
+	// ADK's, for a call to a tool that isn't registered.
+	{"' not found.", "no such tool"},
+}
+
+// logRefusal writes one line for a refused call: the prefix, the tool's
+// name and why, then the call's id when there is one, never its arguments (core-agent's error texts quote the
+// command or path, so they aren't logged). An error that isn't a refusal,
+// a missing file say, writes nothing.
+func logRefusal(w io.Writer, tool, callID string, err error) {
+	if w == nil || err == nil {
+		return
+	}
+	reason := ""
+	switch {
+	case errors.Is(err, permissions.ErrNoPrompter), errors.Is(err, permissions.ErrEscalationRefused):
+		reason = "needs an approval no one can give"
+	case errors.Is(err, permissions.ErrSandboxDenied), errors.Is(err, permissions.ErrCredentialFile):
+		reason = "the sandbox"
+	default:
+		for _, r := range refusalReasons {
+			if strings.Contains(err.Error(), r.phrase) {
+				reason = r.reason
+				break
+			}
+		}
+	}
+	if reason == "" {
+		return
+	}
+	line := fmt.Sprintf("%s%s (%s)", RefusalLogPrefix, strconv.Quote(tool), reason)
+	if callID != "" {
+		line += " call " + strconv.Quote(callID)
+	}
+	_, _ = fmt.Fprintln(w, line)
+}
+
+// noAllowRule is core-agent's gate refusing, in allow mode, a call no allow
+// rule matches.
+const noAllowRule = "requires an allowlist entry in 'allow' mode"
+
+// shellCommands are the commands a grant's shell allow rules name ("bash:<cmd>",
+// beside "bash:<cmd> *"), sorted; "*" stands for any command.
+func shellCommands(allow []string) []string {
+	var out []string
+	for _, a := range allow {
+		cmd, ok := strings.CutPrefix(a, "bash:")
+		if !ok || (strings.HasSuffix(cmd, " *") && cmd != "*") {
+			continue
+		}
+		out = append(out, cmd)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// shellRefusalHint tells the model why a shell command no allow rule matched
+// was refused, and what to do instead: when it starts with a command the
+// grant names (or the grant names any), its shape was the problem, a pipe,
+// redirection, chain or expansion; otherwise the command itself isn't
+// granted. "" when the grant has no shell rules, as the refusal is then
+// the plugin's or a deny's business.
+func shellRefusalHint(command string, shell []string) string {
+	if len(shell) == 0 {
+		return ""
+	}
+	const shape = "The shell here runs one plain command at a time: pipes (|), redirections (>, 2>&1), chains (;, &&, ||), subshells and $ or backtick expansion are refused. Run a single command and shape its output with the command's own flags (for kubectl, -o json, -o jsonpath=... or -o custom-columns=...), then read the output yourself"
+	fields := strings.Fields(command)
+	for _, c := range shell {
+		cf := strings.Fields(c)
+		if c == "*" || (len(cf) > 0 && len(fields) >= len(cf) && slices.Equal(fields[:len(cf)], cf)) {
+			return shape
+		}
+	}
+	return "Only these commands may run here, each as one plain command: " + strings.Join(shell, ", ")
 }
