@@ -204,14 +204,50 @@ func TestChildResultRoundTrip(t *testing.T) {
 	}
 }
 
+// A batch entry that never got a child ends with its entry and no task id,
+// failed, and reads back the same.
+func TestChildResultForAnEntryThatNeverStarted(t *testing.T) {
+	in := ChildResult{Entry: 3, Addressee: "cluster", State: StateFailed, Text: "not started"}
+	part, err := ChildResultPart(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ChildResultOf([]Part{part}); !ok || got != in {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, in)
+	}
+	withID := ChildResult{ChildTaskID: "task-7", Entry: 2, State: StateCanceled}
+	part, err = ChildResultPart(withID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ChildResultOf([]Part{part}); !ok || got != withID {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, withID)
+	}
+}
+
+// A single delegation's result carries no entry on the wire, so a reader
+// built before entries reads it unchanged.
+func TestASingleChildResultCarriesNoEntry(t *testing.T) {
+	part, err := ChildResultPart(ChildResult{ChildTaskID: "task-7", Addressee: "cluster", State: StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(part.Data), "entry") {
+		t.Fatalf("wire = %s", part.Data)
+	}
+}
+
 // A child result names a finished task: no id, a non-terminal state or text
 // past the cap is refused on the way out and skipped on the way in.
 func TestChildResultRefusesWhatIsNotAnEnd(t *testing.T) {
 	for name, c := range map[string]ChildResult{
-		"no task id":           {State: StateCompleted},
-		"a task id with a dot": {ChildTaskID: "task.7", State: StateCompleted},
-		"a working state":      {ChildTaskID: "task-7", State: StateWorking},
-		"text past the cap":    {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
+		"no task id":                  {State: StateCompleted},
+		"no task id, completed entry": {Entry: 1, State: StateCompleted},
+		"a negative entry":            {ChildTaskID: "task-7", Entry: -1, State: StateCompleted},
+		"an entry past the batch cap": {Entry: DelegateBatchMax + 1, State: StateFailed},
+		"a task id with a dot":        {ChildTaskID: "task.7", State: StateCompleted},
+		"a working state":             {ChildTaskID: "task-7", State: StateWorking},
+		"text past the cap":           {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ChildResultPart(c); err == nil {
@@ -617,6 +653,154 @@ func TestDelegateTargetsCarryTheWidth(t *testing.T) {
 	for _, w := range []int{-1, DelegateBatchMax + 1} {
 		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, WidthMax: w}); err == nil {
 			t.Errorf("width %d accepted", w)
+		}
+	}
+}
+
+// TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText: the
+// parent's model reads the text, so it must be there and within the cap.
+func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing.T) {
+	p, err := DelegationRefusalPart(DelegationRefusal{Text: "⚠️ delegation refused: out of scope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := DelegationRefusalOf([]Part{{Kind: "text", Text: "x"}, p})
+	if !ok || got.Text != "⚠️ delegation refused: out of scope" {
+		t.Fatalf("round trip = %+v, %v", got, ok)
+	}
+	if _, ok := ChildResultOf([]Part{p}); ok {
+		t.Fatal("a refusal read as a child result")
+	}
+	for _, text := range []string{"", strings.Repeat("a", ChildResultTextCap+1)} {
+		if _, err := DelegationRefusalPart(DelegationRefusal{Text: text}); err == nil {
+			t.Fatalf("a refusal with %d bytes of text was built", len(text))
+		}
+	}
+	bad := Part{Kind: "data", Data: []byte(`{"delegationRefused":{"text":""}}`)}
+	if _, ok := DelegationRefusalOf([]Part{bad}); ok {
+		t.Fatal("an empty refusal was read")
+	}
+}
+
+// TestDelegationRefusalRoundRoundTripsAndIsStrict: a round-one refusal goes
+// out with no round field, as it did before the field, and a later round
+// round-trips. A round that isn't a JSON number, or is out of bounds, makes
+// the part no refusal, rather than a round-one refusal that would end the
+// parent's wait; a later-round refusal is held to the same text bounds.
+func TestDelegationRefusalRoundRoundTripsAndIsStrict(t *testing.T) {
+	first, err := DelegationRefusalPart(DelegationRefusal{Text: "no"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(first.Data), "round") {
+		t.Fatalf("a round-one refusal carries the round field: %s", first.Data)
+	}
+	if got, ok := DelegationRefusalOf([]Part{first}); !ok || got.Round != 0 {
+		t.Fatalf("round-one refusal read back = %+v, %v; want no round", got, ok)
+	}
+	rep, err := DelegationRefusalPart(DelegationRefusal{Text: "again", Round: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"delegationRefused":{"text":"again","round":2}}`; string(rep.Data) != want {
+		t.Fatalf("round-two refusal = %s, want %s", rep.Data, want)
+	}
+	if got, ok := DelegationRefusalOf([]Part{rep}); !ok || got.Round != 2 || got.Text != "again" {
+		t.Fatalf("round-two refusal read back = %+v, %v", got, ok)
+	}
+	if _, err := DelegationRefusalPart(DelegationRefusal{Text: "x", Round: DelegateRoundsCeiling}); err != nil {
+		t.Fatalf("a refusal at the ceiling round was refused: %v", err)
+	}
+	for _, raw := range []string{
+		`{"delegationRefused":{"text":"x","round":"2"}}`,
+		`{"delegationRefused":{"text":"x","round":true}}`,
+		`{"delegationRefused":{"text":"x","round":{}}}`,
+		`{"delegationRefused":{"text":"x","round":-1}}`,
+		`{"delegationRefused":{"text":"x","round":17}}`,
+		`{"delegationRefused":{"text":"x","round":1000000}}`,
+		`{"delegationRefused":{"text":"","round":2}}`,
+	} {
+		if got, ok := DelegationRefusalOf([]Part{{Kind: "data", Data: []byte(raw)}}); ok {
+			t.Errorf("%s read as %+v", raw, got)
+		}
+	}
+	for _, r := range []DelegationRefusal{
+		{Text: "", Round: 2},
+		{Text: strings.Repeat("a", ChildResultTextCap+1), Round: 2},
+		{Text: "x", Round: -1},
+		{Text: "x", Round: DelegateRoundsCeiling + 1},
+	} {
+		if _, err := DelegationRefusalPart(r); err == nil {
+			t.Errorf("a refusal with %d bytes of text, round %d, was built", len(r.Text), r.Round)
+		}
+	}
+}
+
+// TestChildResultCarriesItsRound: a round-one end carries no round on the
+// wire, a later round round-trips, and a round out of bounds is refused on
+// the way out and skipped on the way in.
+func TestChildResultCarriesItsRound(t *testing.T) {
+	one, err := ChildResultPart(ChildResult{ChildTaskID: "task-7", Entry: 1, State: StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(one.Data), "round") {
+		t.Fatalf("a round-one end carries the round field: %s", one.Data)
+	}
+	for _, round := range []int{2, DelegateRoundsCeiling} {
+		in := ChildResult{ChildTaskID: "task-7", Entry: 1, State: StateCompleted, Round: round}
+		part, err := ChildResultPart(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := ChildResultOf([]Part{part}); !ok || got != in {
+			t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, in)
+		}
+	}
+	for _, round := range []int{-1, DelegateRoundsCeiling + 1} {
+		c := ChildResult{ChildTaskID: "task-7", Entry: 1, State: StateCompleted, Round: round}
+		if _, err := ChildResultPart(c); err == nil {
+			t.Errorf("round %d built", round)
+		}
+		data, _ := json.Marshal(map[string]ChildResult{"childResult": c})
+		if _, ok := ChildResultOf([]Part{{Kind: "data", Data: data}}); ok {
+			t.Errorf("round %d read", round)
+		}
+	}
+	str := Part{Kind: "data", Data: []byte(`{"childResult":{"childTaskId":"task-7","state":"completed","round":"2"}}`)}
+	if _, ok := ChildResultOf([]Part{str}); ok {
+		t.Error("a string round was read")
+	}
+}
+
+// TestDelegateTargetsCarryTheRounds: an unset RoundsMax is off the wire and
+// reads as one; a set one round-trips; one out of bounds is refused.
+func TestDelegateTargetsCarryTheRounds(t *testing.T) {
+	plain, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.Data), "roundsMax") {
+		t.Fatalf("an unset rounds max is on the wire: %s", plain.Data)
+	}
+	if r := (DelegateTargets{}).Rounds(); r != 1 {
+		t.Fatalf("absent rounds = %d, want 1", r)
+	}
+	part, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}, RoundsMax: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := DelegateTargetsOf([]Part{part})
+	if err != nil || !ok || got.RoundsMax != 3 || got.Rounds() != 3 {
+		t.Fatalf("got %+v ok=%v err=%v", got, ok, err)
+	}
+	for _, r := range []int{-1, DelegateRoundsCeiling + 1} {
+		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, RoundsMax: r}); err == nil {
+			t.Errorf("rounds %d accepted", r)
+		}
+		raw := []byte(fmt.Sprintf(`{"delegateTargets":{"targets":[],"roundsMax":%d}}`, r))
+		if _, _, err := DelegateTargetsOf([]Part{{Kind: "data", Data: raw}}); err == nil {
+			t.Errorf("rounds %d read", r)
 		}
 	}
 }

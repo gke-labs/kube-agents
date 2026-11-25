@@ -261,6 +261,10 @@ operator.profileDispatcher.
 - name: A2A_CARD_STOP
   value: "true"
 {{- end -}}
+{{- $rounds := (.Values.operator.delegation | default dict).roundsMax -}}
+{{- if and (not (kindIs "invalid" $rounds)) (ne (int $rounds) 1) -}}
+{{- fail (printf "operator.delegation.roundsMax is %v: delegation rounds above 1 are not supported yet; set it to 1" $rounds) -}}
+{{- end -}}
 {{- with (.Values.operator.slackTestUsers | default list) }}
 {{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
 - name: A2A_SLACK_TEST_USERS

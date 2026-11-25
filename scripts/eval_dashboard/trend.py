@@ -119,6 +119,12 @@ LATENCY_SERIES = {"turn1": nightly.REP_TURN1_S, "agent": nightly.REP_AGENT_S}
 LATENCY_SLOW_PCT = {"turn1": nightly.TURN1_TARGET_PCT, "agent": nightly.SLOW_PCT}
 MEDIAN_PCT = 50
 UTC = datetime.timezone.utc
+# How far apart the builds of one night start, for a build the collector's
+# runs lack (night_anchors). The parts are periodics on one cron, so their
+# starts differ by scheduling delay alone; the tolerance nightly.py dates a
+# build's start with bounds that delay too. A name of its own: the dating
+# grace and this spread answer different questions and may move apart.
+NIGHT_START_SPREAD = nightly.NIGHT_START_GRACE
 
 
 # --------------------------------------------------------------------------
@@ -231,14 +237,83 @@ def usable_records(store: dict | None) -> list[dict]:
 def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
     laptop run, a name outside the layout) stands alone under its stamp.
-    ``anchors`` (nightly.night_builds) puts the builds of a night split
-    across jobs (the main shards and the writers thirds) under the one build the report files
-    that night by, so the night is one night here too, and a domain's point
+    ``anchors`` (``night_anchors``) puts the builds of a night split
+    across jobs (the main shards and the writers thirds) under one build,
+    the one the report files that night by when the collector has the
+    night, so the night is one night here too, and a domain's point
     that night pools the cases of all its parts."""
     build = record.get("build")
     if isinstance(build, str) and build and anchors:
         build = anchors.get(build, build)
     return f"build:{build}" if isinstance(build, str) and build else f"at:{record['recorded_at']}"
+
+
+def record_build_start(record: dict) -> datetime.datetime | None:
+    """When the build that wrote ``record`` started, read from its snowflake
+    id (``nightly.snowflake_start``), or None when the id does not date it:
+    no build, an id of another shape, or a start the record contradicts
+    (``night_anchors`` dates a build by any of its records that agrees). A
+    job stamps its records when it grades them, before it ends, so the
+    start is at or before ``recorded_at`` and within
+    ``nightly.RUNNING_MAX_AGE`` of it (the longest part's budget and the
+    minutes a job cut there takes to end)."""
+    build = record.get("build")
+    recorded = nightly.parse_iso(record.get("recorded_at"))
+    if not isinstance(build, str) or len(build) != nightly.PROW_BUILD_ID_DIGITS or not build.isdecimal() or recorded is None:
+        return None
+    started = nightly.snowflake_start(build)
+    return started if started <= recorded <= started + nightly.RUNNING_MAX_AGE else None
+
+
+def night_anchors(records: list[dict], data: dict) -> dict[str, str]:
+    """``{build id: the build its night is drawn under}``:
+    ``nightly.night_builds(data)``, plus the builds of ``records`` it lacks.
+    ``data.json`` can hold fewer nights than the store: a refresh without a
+    usable prior document sweeps a bounded span (collect.py,
+    DEGRADED_SINCE_DAYS), and the store reads further back (store.py); a
+    part still running, or not collected yet, is also a build it lacks. A
+    record carries its build and not its job, so such a build is filed by
+    its start alone: the parts of one night start together, so the builds
+    of one night date (``nightly.night_day``) that started within
+    ``NIGHT_START_SPREAD`` of the first of them are one group. A build of
+    the group that ``data`` lacks goes under the build ``data`` files the
+    group's nearest known start under (the newer on a tie, as
+    ``nightly.filed_nights`` picks a part's night), else, when ``data``
+    knows none of the group, under the first to start. A build that started
+    later that date, past the spread, begins a group of its own, so a
+    re-run stays apart from the cron night, as ``nightly.filed_nights``
+    keeps a main re-run; a
+    re-run of another part, which the collector's runs would fold into its
+    night, also stays apart here, because nothing in the store says which
+    part it ran. A build whose id does not date it (``record_build_start``)
+    stands alone. The limits, both inside the spread and both gone once the
+    collector has every build: a re-run that ``data`` lacks and that started
+    within the spread of the cron builds, before or after them, is drawn in
+    their night, where the collector's runs file a main re-run as a night
+    of its own; and cron builds that ``data`` lacks are drawn in the night
+    of such a re-run when it is the only build of the group ``data`` knows."""
+    anchors = nightly.night_builds(data)
+    starts: dict[str, datetime.datetime] = {}
+    for record in records:
+        build = record.get("build")
+        started = record_build_start(record) if isinstance(build, str) and build not in starts else None
+        if started:
+            starts[build] = started
+    groups: list[list[str]] = []
+    for build in sorted(starts, key=lambda b: (starts[b], b)):
+        first = starts[groups[-1][0]] if groups else None
+        if first is None or nightly.night_day(first) != nightly.night_day(starts[build]) or starts[build] - first > NIGHT_START_SPREAD:
+            groups.append([])
+        groups[-1].append(build)
+    out = dict(anchors)
+    for group in groups:
+        known = [build for build in group if build in anchors]
+        for build in group:
+            if build in anchors:
+                continue
+            nearest = min(reversed(known), key=lambda k: abs(starts[k] - starts[build])) if known else None
+            out[build] = anchors[nearest] if nearest else group[0]
+    return out
 
 
 def nightly_runs_by_build(data: dict) -> dict[str, dict]:
@@ -249,15 +324,19 @@ def nightly_runs_by_build(data: dict) -> dict[str, dict]:
     }
 
 
-def night_documents(records: list[dict], data: dict) -> list[dict]:
+def night_documents(records: list[dict], data: dict, anchors: dict[str, str] | None = None) -> list[dict]:
     """``nights[]``, oldest first: each night the store holds a record for,
     with the collector's start time and Spyglass link when its build is a
     nightly run on record. The page dates every night by ``at`` (the newest
     ``recorded_at`` of the night), the same stamp its points are placed by;
     ``started`` and ``log_url`` only serve the link to the report. A split
-    night's records are one night, under the build the report files it by."""
+    night's records are one night, under the build ``anchors`` gives it
+    (``night_anchors`` over ``records`` unless the caller built it over
+    more of them): the build the report files the night by when the
+    collector has it."""
     runs = nightly_runs_by_build(data)
-    anchors = nightly.night_builds(data)
+    if anchors is None:
+        anchors = night_anchors(records, data)
     nights: dict[str, dict] = {}
     for record in records:
         nid = night_id(record, anchors)
@@ -611,7 +690,8 @@ def _series(every: list[dict], data: dict, older_paths: dict[str, dict[str, int]
     keys, nights, cases, domains}``, the shape the top level carries."""
     records = [r for r in every if in_window(at_ms({"at": r["recorded_at"]}))]
     domain_of = nightly.domains(data)
-    anchors = nightly.night_builds(data)
+    # Over the lead-in too, so a point and its night carry one id.
+    anchors = night_anchors(every, data)
     keys: dict[str, dict] = {}
     by_case: dict[str, list[dict]] = {}
     metrics: set[str] = set()
@@ -648,7 +728,7 @@ def _series(every: list[dict], data: dict, older_paths: dict[str, dict[str, int]
         "metrics": metric_list,
         "default_metric": DEFAULT_METRIC if DEFAULT_METRIC in metrics else (metric_list[0] if metric_list else None),
         "keys": keys,
-        "nights": night_documents(records, data),
+        "nights": night_documents(records, data, anchors),
         "cases": cases,
         "domains": domains,
     }

@@ -1,0 +1,71 @@
+# Probe for burst-aware P95/P99 and GPU duty-cycle right-sizing via GitOps PRs
+# (#2900, #3005, #6492, #7180): when a latency-sensitive 3D rendering workload
+# on L4 GPUs shows low 7-day average CPU utilization (8%) but spikes to 92% CPU
+# and 95% GPU duty cycle during daily bursts, an average-based live patch would
+# cause throttling/drift against GitOps reconcilers. The agent must reject the
+# average-based live patch and recommend sizing from P95/P99 burst windows and
+# GPU duty-cycle telemetry via a peer-reviewed GitOps pull request.
+#
+# The objective is an anchored verdict line (`VERDICT: REJECT-AVERAGE-LIVE-PATCH`)
+# under `fold_decoration: true`, forbidding `VERDICT: APPLY-AVERAGE-LIVE-PATCH`,
+# plus three mechanism patterns (P95/P99 windowing, GPU duty-cycle/utilization,
+# and GitOps pull request). `bench/tests/test_cost_p95_burst_gpu_duty_cycle_verdict.py`
+# pins both sides.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: cost-p95-burst-gpu-duty-cycle-rightsizing
+name: Burst-sensitive GPU workloads reject average-based live patches in favour of P95/P99 and GPU duty-cycle GitOps PRs
+
+domain: cost
+expected_fail: true
+
+prompt: >-
+  A latency-sensitive 3D rendering Deployment on GKE uses L4 GPUs with 8%
+  average CPU utilization over 7 days, but spikes to 92% CPU and 95% GPU duty
+  cycle during 10-minute bursts twice a day. An automated rightsizing tool
+  proposes cutting its CPU requests by 80% based on the 7-day average and
+  patching the live Deployment directly. Should we apply that average-based
+  live patch, or size from P95/P99 burst windows and GPU duty-cycle metrics via
+  a GitOps pull request? Start your answer with `VERDICT:
+  REJECT-AVERAGE-LIVE-PATCH` or `VERDICT: APPLY-AVERAGE-LIVE-PATCH` on its own
+  line, with nothing else on that line. If you hand this question to another
+  agent, pass these instructions word for word, and keep its verdict line at
+  the start of your reply. Do not change anything.
+expected_output: >-
+  VERDICT: REJECT-AVERAGE-LIVE-PATCH. Downsizing a burst-sensitive GPU
+  rendering Deployment by 80% from 7-day average CPU utilization will throttle
+  or destabilize it during its 92% CPU / 95% GPU duty-cycle bursts, and
+  patching the live Deployment directly causes out-of-band drift against GitOps
+  reconcilers. Instead, right-size using P95/P99 peak burst windows alongside
+  GPU duty-cycle telemetry, and deliver any request adjustment through a
+  peer-reviewed GitOps pull request.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: verdict-and-burst-gpu-gitops-mechanisms-are-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^verdict:\\s*reject-average-live-patch$"
+        - "(?<![a-z0-9-])p9[59](?![a-z0-9-])|\\b9[59](?:th)?\\s+percentile\\b"
+        - "(?<![a-z0-9-])duty[\\s-]+cycle(?![a-z0-9-])|\\bgpu\\s+(?:utilization|utilisation|duty)\\b"
+        - "(?<![a-z0-9-])gitops(?![a-z0-9-])|\\bpull[\\s-]+requests?\\b"
+      forbidden_patterns:
+        - "(?m)^verdict:\\s*apply-average-live-patch$"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
