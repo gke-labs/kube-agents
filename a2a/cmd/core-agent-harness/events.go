@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/genai"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 )
@@ -37,10 +38,10 @@ func (m *mapper) observe(ev *session.Event) {
 		return
 	}
 	if u := ev.UsageMetadata; u != nil && !ev.Partial {
-		m.usage.Input += u.PromptTokenCount
-		m.usage.Output += u.CandidatesTokenCount
-		m.usage.Cached += u.CachedContentTokenCount
-		m.usage.Thoughts += u.ThoughtsTokenCount
+		m.usage.Input += int64(u.PromptTokenCount)
+		m.usage.Output += int64(u.CandidatesTokenCount)
+		m.usage.Cached += int64(u.CachedContentTokenCount)
+		m.usage.Thoughts += int64(u.ThoughtsTokenCount)
 	}
 	if ev.Content == nil {
 		return
@@ -82,7 +83,10 @@ func (m *mapper) observe(ev *session.Event) {
 			}
 		}
 	}
-	if len(whole) > 0 {
+	// The result is the model's last whole response: one with no text (a
+	// tool call alone, or an empty stop) clears an earlier preamble rather
+	// than leave it standing as the answer.
+	if !ev.Partial && ev.Content.Role == genai.RoleModel {
 		m.final = strings.Join(whole, "")
 	}
 	if !ev.Partial {
