@@ -1335,10 +1335,19 @@ spec:
   `gcloud logging read` or the broker's Logging relay, leaves out the cluster's entries. The broker
   adds one clause to the filter that matches the cluster's name, in any project and location, so a
   cluster that shares an excluded cluster's name loses its entries too. It refuses a
-  filter it can't add one to safely. The project-wide reads stay allowed, such as the project's
-  cluster list. Exclusion keeps the agents out of a cluster's API, workloads, metadata and logs, not
-  out of the project's cluster list. These still cover an excluded cluster, through project-wide
-  reads only:
+  filter it can't add one to safely.
+
+  A session's or profile task's `gcloud container clusters list` and `gcloud container operations
+list` leave an excluded cluster out too. The broker adds a `--filter` clause that matches its name,
+  in any project and location, so a cluster that shares the name loses its row too. It refuses a
+  `--filter` it can't add the clause to safely, and lists nothing while it can't read the scope.
+
+  Other
+  project-wide reads, such as an asset search or the instance list, aren't filtered, and every other
+  caller's project-wide reads stay allowed, such as the project's cluster list. Exclusion keeps the
+  agents out of a cluster's API, workloads, metadata and logs, not out of every caller's view of the
+  project's cluster list. These still cover an excluded
+  cluster, through project-wide reads only:
   - the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, which
     grade its versions and skip their in-cluster readiness rules;
   - the networking audit's subnet usage, since its pods still hold their IPs;

@@ -154,5 +154,53 @@ class ProfileMetadataScopeRouteTest(_RouteHarness):
         self.assertEqual(ran, kwargs["confined"].argv)
 
 
+
+class ListingRouteTest(_RouteHarness):
+    """#7031: a session's and a profile task's project-wide listings drop excluded
+    clusters; the platform agent's own shell keeps the full list."""
+
+    def setUp(self):
+        _RouteHarness.setUp(self)
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        scope_file = Path(directory.name) / "scope.json"
+        scope_file.write_text(json.dumps({"exclude": {"projects": [], "clusters": [
+            {"projectId": TARGET.project, "location": TARGET.location, "clusterName": OTHER}]}}), encoding="utf-8")
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: str(scope_file), holds=scope_exclude.Holds(path=lambda: ""),
+        )
+
+    def as_role(self, role):
+        principal = credential_proxy.Principal(workload=SHELL_SA, uid="sa-uid", role=role, pod=POD, pod_uid=POD_UID)
+        CredentialProxyHandler.authenticator = _StubAuthenticator(principal)
+
+    def test_a_profile_listing_carries_the_filter_through_confinement(self):
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
+        self.assertEqual(200, status, body)
+        (ran, kwargs), = self.executor.calls
+        self.assertIn(f'--filter=NOT name~"^({OTHER})$"', ran)
+        self.assertEqual(ran, kwargs["confined"].argv)
+
+    def test_a_session_listing_carries_the_filter(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SESSION)
+        argv = ["gcloud", "container", "clusters", "list", f"--project={TARGET.project}"]
+        status, body = self.post({"argv": argv}, token=None)
+        self.assertEqual(200, status, body)
+        (ran, _), = self.executor.calls
+        self.assertEqual([*argv, f'--filter=NOT name~"^({OTHER})$"'], ran)
+
+    def test_the_platform_shell_keeps_the_full_listing(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        argv = ["gcloud", "container", "clusters", "list", f"--project={TARGET.project}"]
+        status, body = self.post({"argv": argv}, token=None)
+        self.assertEqual(200, status, body)
+        (ran, _), = self.executor.calls
+        self.assertEqual(argv, ran)
+
+
 if __name__ == "__main__":
     unittest.main()
