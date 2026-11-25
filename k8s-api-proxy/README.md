@@ -9,7 +9,8 @@ caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), imp
 the cluster's API server through `pkg/upstream` with credentials the sandbox never holds, and emits
 structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
-`cmd/k8s-api-proxy` builds the production server binary.
+`cmd/k8s-api-proxy` builds the production server binary from `pkg/proxyserver`, which holds its
+flags, environment variables and lifecycle.
 
 `tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
@@ -183,6 +184,30 @@ still read them. An entry that is not an HTTP header name, or is `Host`, `Conten
 `Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets
 neither option.
 
+A program that needs only those two options on top of the binary does not rebuild the server from
+the packages: its `main` calls `proxyserver.Run` (`pkg/proxyserver`), which is what
+`cmd/k8s-api-proxy` calls.
+
+```go
+func main() {
+	err := proxyserver.Run(context.Background(), os.Args[1:], proxyserver.Options{
+		Version:            version,
+		Authorize:          authorize,
+		ExtraCallerHeaders: []string{"X-Example-Credential"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`Options.Authorize` and `Options.ExtraCallerHeaders` become the `Config` fields of the same names,
+and `Options.Version` is what `--version` and the startup log report after the name
+`k8s-api-proxy`. Everything else is the binary's: the same flags, environment variables and
+defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
+the binary exits on, and `nil` after `--version` or a drained shutdown. It registers the flags on
+`flag.CommandLine`, so a process calls it once; a flag that does not parse exits the process there.
+
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
 archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
@@ -293,7 +318,7 @@ the manifests cover the serving certificate, the Service name the certificate, t
 the gateway rule share, and the NetworkPolicy that admits the gateway's pods. In
 [`examples/local-bridge/`](examples/local-bridge/), one process per sandbox listens on loopback
 with `--auth-mode=none` and forwards to a local `--upstream-url`.
-`cmd/k8s-api-proxy/examples_test.go` builds the binary's handler from the container `args` in the
+`pkg/proxyserver/examples_test.go` builds the binary's handler from the container `args` in the
 manifests and from the fenced flag blocks in the two example READMEs, so an unknown flag or a
 refused combination there fails the module's tests; flags named in prose are not checked.
 
@@ -316,7 +341,7 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 ```
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
-`AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore` and
-`AuditEvent` may change in any release. The version moves with every
+`AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
+`AuditEvent` and `proxyserver.Options` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

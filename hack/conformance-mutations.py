@@ -3122,7 +3122,7 @@ Mutation(
     ),
     Mutation(
         "C1-session-audience-env-renamed-in-kube-proxy",
-        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        "k8s-api-proxy/pkg/proxyserver/server.go",
         ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
          'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
         "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
