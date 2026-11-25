@@ -3046,8 +3046,11 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 // ends join on taskId. It is logged by the task's own id, for every task
 // that wrote an ingress line - a delegated child and a wake included - and
 // not from observeTaskTerminal, which names a chain by its root and is
-// called only for the task whose end is the chain's (observedAs). The
-// addressee is the one the task was published to, which is what ingress
+// called only for the task whose end is the chain's (observedAs). The one
+// line under a task's id that is not that task's own terminal is a chain's
+// wake-not-started end, logged under its root with its own source
+// (observeChainEnd, terminalLogChainEnd).
+// The addressee is the one the task was published to, which is what ingress
 // logged; after a Delegate re-home rec.Addressee is not it, so each caller
 // passes the one it holds. Chat already showed the user the reason; the log
 // keeps only its token (reasonToken), so a failing install's log says how
