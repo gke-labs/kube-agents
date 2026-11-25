@@ -359,6 +359,134 @@ class ParserStrictYAMLAndJSONAdversarialTests(unittest.TestCase):
                 self.assertFalse(r.supported, label)
                 self.assertIn("CRITICAL_PRIVILEGED_RBAC", {x.code for x in r.reasons})
 
+    def test_single_doc_bidi_anchor_and_duplicate_key_anti_masking_recovery(self) -> None:
+        crb_json_str = json.dumps(
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRoleBinding",
+                "metadata": {"name": "pwn-admin"},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin"},
+                "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "shop"}],
+            }
+        )
+        cases = [
+            (
+                "yaml escaped bidi in single-doc CRB",
+                False,
+                "HOSTILE_UNICODE",
+                CLUSTER_ADMIN_CRB.replace("  name: pwn-admin\n", '  name: pwn-admin\n  annotations:\n    description: "\\u202eharmless"\n'),
+            ),
+            (
+                "json escaped bidi in single-doc CRB",
+                True,
+                "HOSTILE_UNICODE",
+                '{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding",'
+                '"metadata":{"name":"pwn-admin","annotations":{"description":"\\u202eharmless"}},'
+                '"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-admin"},'
+                '"subjects":[{"kind":"ServiceAccount","name":"default","namespace":"shop"}]}',
+            ),
+            (
+                "yaml anchor/alias in single-doc CRB",
+                False,
+                "YAML_ANCHOR_OR_ALIAS",
+                "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: &n pwn-admin\n"
+                "  labels:\n    mirror: *n\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n"
+                "  name: cluster-admin\nsubjects:\n  - kind: ServiceAccount\n    name: default\n    namespace: shop\n",
+            ),
+            (
+                "yaml anchor/alias in privileged Pod",
+                False,
+                "YAML_ANCHOR_OR_ALIAS",
+                "apiVersion: v1\nkind: Pod\nmetadata:\n  name: pwn-pod\n  namespace: shop\nspec:\n"
+                "  hostNetwork: &flag true\n  containers:\n    - name: c\n      image: gcr.io/a/b:v1.0.0\n"
+                "      securityContext:\n        privileged: *flag\n",
+            ),
+            (
+                "yaml merge key in single-doc CRB",
+                False,
+                "YAML_MERGE_KEY",
+                "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: pwn-admin\n"
+                "  annotations:\n    <<: {note: merged}\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n"
+                "  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n  - kind: ServiceAccount\n    name: default\n    namespace: shop\n",
+            ),
+            (
+                "yaml duplicate key in single-doc CRB",
+                False,
+                "YAML_DUPLICATE_KEY",
+                CLUSTER_ADMIN_CRB.replace("  name: pwn-admin\n", "  name: decoy\n  name: pwn-admin\n"),
+            ),
+            (
+                "json duplicate key in single-doc CRB",
+                True,
+                "JSON_DUPLICATE_KEY",
+                '{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding",'
+                '"metadata":{"name":"decoy","name":"pwn-admin"},'
+                '"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"cluster-admin"},'
+                '"subjects":[{"kind":"ServiceAccount","name":"default","namespace":"shop"}]}',
+            ),
+            (
+                "json List with duplicate key in item 1 + critical CRB in item 2",
+                True,
+                "JSON_DUPLICATE_KEY",
+                '{"apiVersion":"v1","kind":"List","items":['
+                '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"c","namespace":"shop"},"data":{"k":"1","k":"2"}},'
+                + crb_json_str
+                + "]}",
+            ),
+        ]
+        for label, is_json, expected_code, payload in cases:
+            with self.subTest(label=label):
+                out = parse_manifest_bytes(payload.encode("utf-8"), is_json=is_json)
+                self.assertEqual(out.error_code, expected_code, label)
+                self.assertGreaterEqual(len(out.resources), 1, label)
+                ext = ".json" if is_json else ".yaml"
+                verdict = classify_changes(
+                    [FileChange(path=f"clusters/dev/sneak{ext}", change_type=CHANGE_ADDED, after=payload.encode("utf-8"), after_mode="100644")]
+                )
+                self.assertEqual(verdict.risk_level, RISK_CRITICAL, label)
+                self.assertFalse(verdict.supported, label)
+
+        # Billion Laughs (both <=64 aliases expanding past MAX_NODES_PER_FILE and >64 aliases) + cycle stay blocked fast
+        laughs_64 = (
+            "a0: &a0 [1, 1, 1, 1, 1, 1, 1, 1]\n"
+            + "".join(f"a{i}: &a{i} [" + ", ".join([f"*a{i-1}"] * 8) + "]\n" for i in range(1, 9))
+        )
+        laughs_81 = (
+            "b0: &b0 [1, 1, 1, 1, 1, 1, 1, 1, 1]\n"
+            + "".join(f"b{i}: &b{i} [" + ", ".join([f"*b{i-1}"] * 9) + "]\n" for i in range(1, 10))
+        )
+        cycle_yaml = "a: &self\n  b: *self\n"
+        t0 = time.monotonic()
+        for bomb in (laughs_64, laughs_81, cycle_yaml):
+            b_out = parse_manifest_bytes(bomb.encode("utf-8"))
+            self.assertEqual(b_out.error_code, "YAML_ANCHOR_OR_ALIAS")
+            self.assertEqual(b_out.resources, ())
+        self.assertLess(time.monotonic() - t0, 0.25)
+
+    def test_yaml_comments_with_helm_and_envsubst_examples_do_not_false_positive(self) -> None:
+        commented_cm = (
+            "# Example: {{ .Values.foo }}\n"
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: app-cfg # see ${DOCS} and {{ .Chart.Name }}\n"
+            "  namespace: shop\n"
+            "data:\n"
+            '  cmd: "echo $${ESCAPED_FLUX_VAR}" # inline ${COMMENT_VAR}\n'
+            "  tag_with_hash: v1#not-a-comment\n"
+        )
+        self.assertFalse(has_template_syntax(commented_cm))
+        out = parse_manifest_bytes(commented_cm.encode("utf-8"))
+        self.assertEqual(out.error_code, "")
+        self.assertFalse(out.is_template)
+        self.assertTrue(out.is_k8s_manifest)
+        res = classify_changes(
+            [FileChange(path="clusters/dev/cm.yaml", change_type=CHANGE_ADDED, after=commented_cm.encode("utf-8"), after_mode="100644")]
+        )
+        self.assertEqual(res.risk_level, RISK_LOW)
+        self.assertTrue(res.supported)
+        self.assertNotIn("UNRENDERED_TEMPLATE", {r.code for r in res.reasons})
+
     def test_generatename_only_bogus_core_apiversion_crd_list_name_and_secretlist(self) -> None:
         # Replacing metadata.name with metadata.generateName cannot pass as low risk!
         gen_only = SAFE_CM.replace("  name: app-cfg\n", "  generateName: app-cfg-\n")

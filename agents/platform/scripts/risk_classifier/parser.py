@@ -21,6 +21,7 @@ MAX_DOCS_PER_FILE = 200
 MAX_NESTING_DEPTH = 32
 MAX_NODES_PER_FILE = 25_000
 MAX_INT_BITS = 1024
+MAX_RECOVERY_ALIASES = 64
 
 # Unicode BiDi / Trojan-Source overrides, zero-width characters, and YAML 1.1/1.2 line-break splitters
 _HOSTILE_UNICODE = frozenset(
@@ -130,35 +131,34 @@ class FieldDiff:
         return ".".join(self.tokens)
 
 
-def _check_string_safety(text: str, *, context: str = "manifest") -> None:
-    """Reject NUL, C0/C1 controls, DEL, UTF-16 surrogates, BOM, and BiDi/zero-width chars."""
+def _find_string_safety_violation(text: str, *, context: str = "manifest") -> tuple[str, str] | None:
+    """Return `(message, code)` for the first disallowed character in `text`, or `None`."""
     for idx, ch in enumerate(text):
         codepoint = ord(ch)
         if codepoint == 0:
-            raise ManifestParseError(
-                f"{context} contains NUL character at offset {idx}",
-                code="BINARY_OR_CONTROL_CHAR",
-            )
+            return f"{context} contains NUL character at offset {idx}", "BINARY_OR_CONTROL_CHAR"
         if codepoint < 0x20 and ch not in ("\t", "\n", "\r"):
-            raise ManifestParseError(
-                f"{context} contains C0 control character U+{codepoint:04X} at offset {idx}",
-                code="CONTROL_CHARACTER",
-            )
+            return f"{context} contains C0 control character U+{codepoint:04X} at offset {idx}", "CONTROL_CHARACTER"
         if 0x7F <= codepoint <= 0x9F:
-            raise ManifestParseError(
+            return (
                 f"{context} contains DEL/C1 control character U+{codepoint:04X} at offset {idx}",
-                code="CONTROL_CHARACTER",
+                "CONTROL_CHARACTER",
             )
         if 0xD800 <= codepoint <= 0xDFFF:
-            raise ManifestParseError(
-                f"{context} contains lone UTF-16 surrogate U+{codepoint:04X} at offset {idx}",
-                code="INVALID_UTF8",
-            )
+            return f"{context} contains lone UTF-16 surrogate U+{codepoint:04X} at offset {idx}", "INVALID_UTF8"
         if ch == "\ufeff" or ch in _HOSTILE_UNICODE:
-            raise ManifestParseError(
+            return (
                 f"{context} contains disallowed Unicode control/BiDi character U+{codepoint:04X} at offset {idx}",
-                code="HOSTILE_UNICODE",
+                "HOSTILE_UNICODE",
             )
+    return None
+
+
+def _check_string_safety(text: str, *, context: str = "manifest") -> None:
+    """Reject NUL, C0/C1 controls, DEL, UTF-16 surrogates, BOM, and BiDi/zero-width chars."""
+    violation = _find_string_safety_violation(text, context=context)
+    if violation is not None:
+        raise ManifestParseError(violation[0], code=violation[1])
 
 
 def _decode_raw_utf8(raw: bytes) -> str:
@@ -216,7 +216,6 @@ def _has_unescaped_envsubst(s: str) -> bool:
             dollars += 1
             scan -= 1
         if dollars % 2 == 1:
-            # If no closing `}` exists anywhere after `brace + 3`, none exists later either.
             return s.find("}", brace + 3) != -1
         idx = brace + 2
 
@@ -225,27 +224,64 @@ def _string_has_template_syntax(s: str) -> bool:
     return _has_helm_delimiters(s) or _has_unescaped_envsubst(s)
 
 
+def _strip_unquoted_yaml_comment(line: str) -> str:
+    """Strip an unquoted `# ...` YAML comment from a single line.
+
+    In YAML 1.2, `#` starts a comment only when outside quotes and at start-of-line
+    or preceded by whitespace (` ` or `\\t`).
+    """
+    in_single = False
+    in_double = False
+    idx = 0
+    n = len(line)
+    while idx < n:
+        ch = line[idx]
+        if in_single:
+            if ch == "'":
+                if idx + 1 < n and line[idx + 1] == "'":
+                    idx += 2
+                    continue
+                in_single = False
+        elif in_double:
+            if ch == "\\":
+                idx += 2
+                continue
+            if ch == '"':
+                in_double = False
+        else:
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == "#" and (idx == 0 or line[idx - 1] in (" ", "\t")):
+                return line[:idx]
+        idx += 1
+    return line
+
+
 def has_template_syntax(text: str) -> bool:
-    """Return True if text contains unrendered Helm/Go templates or unescaped envsubst markers."""
-    if _has_helm_delimiters(text):
-        return True
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            continue
-        if _has_unescaped_envsubst(stripped):
-            return True
-    return False
+    """Return True if non-comment text contains Helm/Go templates or unescaped envsubst markers."""
+    uncommented = "\n".join(_strip_unquoted_yaml_comment(line) for line in text.splitlines())
+    return _has_helm_delimiters(uncommented) or _has_unescaped_envsubst(uncommented)
 
 
-def _inspect_decoded_value(value: Any) -> bool:
-    """Validate decoded scalars (strings, int bit-width, float finiteness) and detect templates."""
+def _inspect_decoded_value(value: Any) -> tuple[bool, str, str]:
+    """Validate decoded scalars and strings without discarding valid resource dicts on string errors.
+
+    Returns `(saw_template, first_string_err_msg, first_string_err_code)` and raises
+    `ManifestParseError` on structural/numeric range violations.
+    """
     templated = False
+    first_err = ""
+    first_code = ""
     stack: list[Any] = [value]
     while stack:
         cur = stack.pop()
         if isinstance(cur, str):
-            _check_string_safety(cur, context="decoded manifest string")
+            if not first_err:
+                violation = _find_string_safety_violation(cur, context="decoded manifest string")
+                if violation is not None:
+                    first_err, first_code = violation
             if not templated and _string_has_template_syntax(cur):
                 templated = True
         elif isinstance(cur, bool) or cur is None:
@@ -269,7 +305,10 @@ def _inspect_decoded_value(value: Any) -> bool:
                         f"mapping key {k!r} ({type(k).__name__}) must be a string",
                         code="YAML_NON_STRING_KEY",
                     )
-                _check_string_safety(k, context="decoded mapping key")
+                if not first_err:
+                    violation = _find_string_safety_violation(k, context="decoded mapping key")
+                    if violation is not None:
+                        first_err, first_code = violation
                 if not templated and _string_has_template_syntax(k):
                     templated = True
                 stack.append(v)
@@ -280,7 +319,7 @@ def _inspect_decoded_value(value: Any) -> bool:
                 f"unsupported decoded manifest value type {type(cur).__name__}",
                 code="UNSUPPORTED_SCALAR_TYPE",
             )
-    return templated
+    return templated, first_err, first_code
 
 
 _BaseYAMLLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
@@ -290,57 +329,75 @@ class _StrictYAMLLoader(_BaseYAMLLoader):
     """YAML 1.2-strict SafeLoader rejecting duplicate keys, merge keys, non-string keys, and YAML 1.1 traps."""
 
 
-# Remove YAML 1.1 boolean / sexagesimal / legacy-octal / timestamp resolvers so parsing
-# matches YAML 1.2 Core Schema (only true/false are booleans; Off/NO/dates stay strings).
-_StrictYAMLLoader.yaml_implicit_resolvers = {
-    k: [
-        (tag, regexp)
-        for tag, regexp in v
-        if tag
-        not in (
-            "tag:yaml.org,2002:null",
-            "tag:yaml.org,2002:bool",
-            "tag:yaml.org,2002:int",
-            "tag:yaml.org,2002:float",
-            "tag:yaml.org,2002:timestamp",
+class _RecoveryYAMLLoader(_BaseYAMLLoader):
+    """Bounded anti-masking YAML 1.2 loader used only AFTER strict validation records an error.
+
+    Expands bounded anchors/aliases (`<= MAX_RECOVERY_ALIASES`) and resolves duplicate
+    string keys with Kubernetes/Go last-key-wins semantics so an attacker can never mask
+    a `high`/`critical` resource behind `&anchor`, `<<`, or duplicate keys.
+    """
+
+
+def _configure_yaml12_resolvers(loader_cls: type, *, allow_merge: bool = False) -> None:
+    loader_cls.yaml_implicit_resolvers = {
+        k: [
+            (tag, regexp)
+            for tag, regexp in v
+            if tag
+            not in (
+                "tag:yaml.org,2002:null",
+                "tag:yaml.org,2002:bool",
+                "tag:yaml.org,2002:int",
+                "tag:yaml.org,2002:float",
+                "tag:yaml.org,2002:timestamp",
+                "tag:yaml.org,2002:merge",
+                "tag:yaml.org,2002:value",
+            )
+        ]
+        for k, v in _BaseYAMLLoader.yaml_implicit_resolvers.items()
+    }
+    loader_cls.add_implicit_resolver(
+        "tag:yaml.org,2002:null",
+        re.compile(r"^(?:|null|Null|NULL|~)$"),
+        ["", "n", "N", "~"],
+    )
+    loader_cls.add_implicit_resolver(
+        "tag:yaml.org,2002:bool",
+        re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+        list("tTfF"),
+    )
+    loader_cls.add_implicit_resolver(
+        "tag:yaml.org,2002:int",
+        re.compile(r"^(?:[-+]?[0-9]+|[-+]?0o[0-7]+|[-+]?0x[0-9a-fA-F]+)$"),
+        list("-+0123456789"),
+    )
+    loader_cls.add_implicit_resolver(
+        "tag:yaml.org,2002:float",
+        _YAML12_FLOAT_RE,
+        list("-+0123456789."),
+    )
+    if allow_merge:
+        loader_cls.add_implicit_resolver(
             "tag:yaml.org,2002:merge",
-            "tag:yaml.org,2002:value",
+            re.compile(r"^<<$"),
+            ["<"],
         )
-    ]
-    for k, v in _BaseYAMLLoader.yaml_implicit_resolvers.items()
-}
-_StrictYAMLLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:null",
-    re.compile(r"^(?:|null|Null|NULL|~)$"),
-    ["", "n", "N", "~"],
-)
-_StrictYAMLLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:bool",
-    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
-    list("tTfF"),
-)
-_StrictYAMLLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:int",
-    re.compile(r"^(?:[-+]?[0-9]+|[-+]?0o[0-7]+|[-+]?0x[0-9a-fA-F]+)$"),
-    list("-+0123456789"),
-)
-_StrictYAMLLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:float",
-    _YAML12_FLOAT_RE,
-    list("-+0123456789."),
-)
 
 
-def _construct_strict_null(loader: _StrictYAMLLoader, node: yaml.Node) -> None:
+_configure_yaml12_resolvers(_StrictYAMLLoader, allow_merge=False)
+_configure_yaml12_resolvers(_RecoveryYAMLLoader, allow_merge=True)
+
+
+def _construct_strict_null(loader: Any, node: yaml.Node) -> None:
     if not isinstance(node, yaml.ScalarNode) or node.value not in _YAML12_NULL_TOKENS:
         raise ManifestParseError(
-            f"line {node.start_mark.line + 1}: invalid YAML 1.2 null literal { getattr(node, 'value', node)!r}",
+            f"line {node.start_mark.line + 1}: invalid YAML 1.2 null literal {getattr(node, 'value', node)!r}",
             code="YAML_SYNTAX_ERROR",
         )
     return None
 
 
-def _construct_strict_bool(loader: _StrictYAMLLoader, node: yaml.Node) -> bool:
+def _construct_strict_bool(loader: Any, node: yaml.Node) -> bool:
     if not isinstance(node, yaml.ScalarNode):
         raise ManifestParseError(f"line {node.start_mark.line + 1}: expected scalar boolean", code="YAML_SYNTAX_ERROR")
     if node.value in _YAML12_TRUE_TOKENS:
@@ -354,7 +411,6 @@ def _construct_strict_bool(loader: _StrictYAMLLoader, node: yaml.Node) -> bool:
 
 
 def _parse_limited_int(raw_val: str, base: int, line_no: int) -> int:
-    # Fast upper-bound check before conversion to avoid Python int_max_str_digits ValueError
     digits = raw_val.lstrip("+-")
     if base in (8, 16):
         digits = digits[2:]
@@ -373,7 +429,7 @@ def _parse_limited_int(raw_val: str, base: int, line_no: int) -> int:
     return val
 
 
-def _construct_strict_int(loader: _StrictYAMLLoader, node: yaml.Node) -> int:
+def _construct_strict_int(loader: Any, node: yaml.Node) -> int:
     if not isinstance(node, yaml.ScalarNode):
         raise ManifestParseError(f"line {node.start_mark.line + 1}: expected scalar integer", code="YAML_SYNTAX_ERROR")
     raw = node.value
@@ -399,7 +455,7 @@ def _construct_strict_int(loader: _StrictYAMLLoader, node: yaml.Node) -> int:
     )
 
 
-def _construct_strict_float(loader: _StrictYAMLLoader, node: yaml.Node) -> float:
+def _construct_strict_float(loader: Any, node: yaml.Node) -> float:
     if not isinstance(node, yaml.ScalarNode):
         raise ManifestParseError(f"line {node.start_mark.line + 1}: expected scalar float", code="YAML_SYNTAX_ERROR")
     raw = node.value
@@ -470,13 +526,47 @@ def _construct_strict_mapping(loader: _StrictYAMLLoader, node: yaml.Node, deep: 
     return result
 
 
-_StrictYAMLLoader.add_constructor("tag:yaml.org,2002:null", _construct_strict_null)
-_StrictYAMLLoader.add_constructor("tag:yaml.org,2002:bool", _construct_strict_bool)
-_StrictYAMLLoader.add_constructor("tag:yaml.org,2002:int", _construct_strict_int)
-_StrictYAMLLoader.add_constructor("tag:yaml.org,2002:float", _construct_strict_float)
+def _construct_recovery_mapping(loader: _RecoveryYAMLLoader, node: yaml.Node, deep: bool = False) -> dict[str, Any]:
+    if not isinstance(node, yaml.MappingNode):
+        raise ManifestParseError("expected YAML mapping node")
+    loader.flatten_mapping(node)
+    if len(node.value) > MAX_NODES_PER_FILE:
+        raise ManifestParseError(
+            f"manifest exceeds maximum node count ({MAX_NODES_PER_FILE})",
+            code="YAML_TOO_MANY_NODES",
+        )
+    result: dict[str, Any] = {}
+    for key_node, value_node in node.value:
+        line_no = key_node.start_mark.line + 1
+        if not isinstance(key_node, yaml.ScalarNode):
+            raise ManifestParseError(
+                f"line {line_no}: non-scalar YAML mapping key",
+                code="YAML_COMPLEX_KEY",
+            )
+        key = loader.construct_object(key_node, deep=True)
+        if not isinstance(key, str):
+            raise ManifestParseError(
+                f"line {line_no}: non-string YAML mapping key {key!r} ({type(key).__name__})",
+                code="YAML_NON_STRING_KEY",
+            )
+        # Last-key-wins matches Go `sigs.k8s.io/yaml` / `encoding/json` unmarshaling
+        result[key] = loader.construct_object(value_node, deep=True)
+    return result
+
+
+for _cls in (_StrictYAMLLoader, _RecoveryYAMLLoader):
+    _cls.add_constructor("tag:yaml.org,2002:null", _construct_strict_null)
+    _cls.add_constructor("tag:yaml.org,2002:bool", _construct_strict_bool)
+    _cls.add_constructor("tag:yaml.org,2002:int", _construct_strict_int)
+    _cls.add_constructor("tag:yaml.org,2002:float", _construct_strict_float)
+
 _StrictYAMLLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
     _construct_strict_mapping,
+)
+_RecoveryYAMLLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_recovery_mapping,
 )
 
 
@@ -491,11 +581,13 @@ _ALLOWED_YAML_EXPLICIT_TAGS = frozenset(
         "tag:yaml.org,2002:map",
     }
 )
+_ALLOWED_RECOVERY_YAML_TAGS = _ALLOWED_YAML_EXPLICIT_TAGS | frozenset({"tag:yaml.org,2002:merge"})
 
 
-def _check_yaml_tag(ev: Any) -> None:
+def _check_yaml_tag(ev: Any, *, allow_merge: bool = False) -> None:
     tag = getattr(ev, "tag", None)
-    if tag and tag not in _ALLOWED_YAML_EXPLICIT_TAGS:
+    allowed = _ALLOWED_RECOVERY_YAML_TAGS if allow_merge else _ALLOWED_YAML_EXPLICIT_TAGS
+    if tag and tag not in allowed:
         raise ManifestParseError(
             f"line {ev.start_mark.line + 1}: unsupported YAML tag {tag!r}",
             code="YAML_UNSUPPORTED_TAG",
@@ -577,17 +669,115 @@ def _scan_yaml_events(
     return nodes, docs
 
 
-def _recover_valid_yaml_docs(text: str) -> tuple[list[Any], bool]:
-    """Best-effort per-document recovery when one doc in a multi-doc YAML stream fails.
+def _scan_yaml_events_recovery(
+    text: str,
+    *,
+    max_docs: int = MAX_DOCS_PER_FILE,
+    max_nodes: int = MAX_NODES_PER_FILE,
+    max_aliases: int = MAX_RECOVERY_ALIASES,
+) -> tuple[int, int]:
+    """Bounded recovery pre-scan allowing `<= max_aliases` aliases before `_RecoveryYAMLLoader`."""
+    depth = 0
+    nodes = 0
+    docs = 0
+    aliases = 0
+    for ev in yaml.parse(text, Loader=_RecoveryYAMLLoader):
+        if isinstance(ev, yaml.DocumentStartEvent):
+            if ev.tags:
+                raise ManifestParseError(
+                    f"line {ev.start_mark.line + 1}: custom %TAG directives are not supported",
+                    code="YAML_UNSUPPORTED_DIRECTIVE",
+                )
+            docs += 1
+            if docs > max_docs:
+                raise ManifestParseError(
+                    f"manifest exceeds maximum of {MAX_DOCS_PER_FILE} documents",
+                    code="TOO_MANY_DOCUMENTS",
+                )
+        elif isinstance(ev, yaml.AliasEvent):
+            aliases += 1
+            nodes += 1
+            if aliases > max_aliases:
+                raise ManifestParseError(
+                    f"manifest exceeds maximum recovery alias count ({max_aliases})",
+                    code="YAML_ANCHOR_OR_ALIAS",
+                )
+            if nodes > max_nodes:
+                raise ManifestParseError(
+                    f"manifest exceeds maximum node count ({MAX_NODES_PER_FILE})",
+                    code="YAML_TOO_MANY_NODES",
+                )
+        elif isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+            _check_yaml_tag(ev, allow_merge=True)
+            depth += 1
+            nodes += 1
+            if depth > MAX_NESTING_DEPTH:
+                raise ManifestParseError(
+                    f"manifest exceeds maximum nesting depth ({MAX_NESTING_DEPTH})",
+                    code="YAML_NESTING_TOO_DEEP",
+                )
+            if nodes > max_nodes:
+                raise ManifestParseError(
+                    f"manifest exceeds maximum node count ({MAX_NODES_PER_FILE})",
+                    code="YAML_TOO_MANY_NODES",
+                )
+        elif isinstance(ev, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            depth = max(0, depth - 1)
+        elif isinstance(ev, yaml.ScalarEvent):
+            _check_yaml_tag(ev, allow_merge=True)
+            nodes += 1
+            if nodes > max_nodes:
+                raise ManifestParseError(
+                    f"manifest exceeds maximum node count ({MAX_NODES_PER_FILE})",
+                    code="YAML_TOO_MANY_NODES",
+                )
+    return nodes, docs
 
-    Ensures a broken, anchored, or templated sibling document can never blind the
-    classifier to a valid `high`/`critical` Kubernetes resource in another document.
-    Every recovered document still passes full `_check_string_safety`, `_scan_yaml_events`,
-    `_StrictYAMLLoader`, and `_inspect_decoded_value` checks.
+
+def _check_expanded_limits(
+    value: Any,
+    *,
+    too_many_code: str = "JSON_TOO_MANY_NODES",
+    too_deep_code: str = "JSON_NESTING_TOO_DEEP",
+    max_nodes: int = MAX_NODES_PER_FILE,
+) -> int:
+    """Enforce tree-expanded node and depth bounds (blocks alias DAG / Billion Laughs bombs)."""
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes:
+            raise ManifestParseError(
+                f"manifest exceeds maximum node count ({MAX_NODES_PER_FILE})",
+                code=too_many_code,
+            )
+        if depth > MAX_NESTING_DEPTH:
+            raise ManifestParseError(
+                f"manifest exceeds maximum nesting depth ({MAX_NESTING_DEPTH})",
+                code=too_deep_code,
+            )
+        if isinstance(cur, dict):
+            for v in cur.values():
+                stack.append((v, depth + 1))
+        elif isinstance(cur, list):
+            for item in cur:
+                stack.append((item, depth + 1))
+    return nodes
+
+
+def _recover_valid_yaml_docs(text: str) -> tuple[list[Any], bool]:
+    """Bounded anti-masking YAML recovery across single-doc and multi-doc streams.
+
+    Runs only after strict validation has already set `first_error` / `first_error_code`,
+    recovering valid Kubernetes documents across BiDi/control characters, bounded anchors/aliases
+    (`<= MAX_RECOVERY_ALIASES` + expanded `MAX_NODES_PER_FILE` cap so Billion Laughs stays blocked),
+    merge keys, duplicate string keys, or broken sibling `---` documents.
     """
-    chunks = _YAML_DOC_SPLIT_RE.split(text)
-    if len(chunks) <= 1 or len(chunks) > MAX_DOCS_PER_FILE + 1:
+    raw_chunks = _YAML_DOC_SPLIT_RE.split(text)
+    if len(raw_chunks) > MAX_DOCS_PER_FILE + 1:
         return [], False
+    chunks = raw_chunks if len(raw_chunks) > 1 else [text]
     recovered: list[Any] = []
     used_nodes = 0
     used_docs = 0
@@ -595,20 +785,29 @@ def _recover_valid_yaml_docs(text: str) -> tuple[list[Any], bool]:
     for chunk in chunks:
         if not chunk or not chunk.strip():
             continue
+        if used_docs >= MAX_DOCS_PER_FILE or used_nodes >= MAX_NODES_PER_FILE:
+            break
         try:
-            _check_string_safety(chunk, context="manifest")
-            c_nodes, c_docs = _scan_yaml_events(
+            _, c_docs = _scan_yaml_events_recovery(
                 chunk,
                 max_docs=MAX_DOCS_PER_FILE - used_docs,
                 max_nodes=MAX_NODES_PER_FILE - used_nodes,
             )
-            loaded_docs = list(yaml.load_all(chunk, Loader=_StrictYAMLLoader))
+            loaded_docs = list(yaml.load_all(chunk, Loader=_RecoveryYAMLLoader))
+            expanded_chunk_nodes = 0
             for doc in loaded_docs:
-                if _inspect_decoded_value(doc):
+                expanded_chunk_nodes += _check_expanded_limits(
+                    doc,
+                    too_many_code="YAML_TOO_MANY_NODES",
+                    too_deep_code="YAML_NESTING_TOO_DEEP",
+                    max_nodes=MAX_NODES_PER_FILE - used_nodes - expanded_chunk_nodes,
+                )
+                doc_tmpl, _, _ = _inspect_decoded_value(doc)
+                if doc_tmpl:
                     saw_decoded_template = True
         except (ManifestParseError, yaml.YAMLError, RecursionError, ValueError, TypeError):
             continue
-        used_nodes += c_nodes
+        used_nodes += expanded_chunk_nodes
         used_docs += c_docs
         recovered.extend(loaded_docs)
     return recovered, saw_decoded_template
@@ -670,13 +869,32 @@ def _is_list_envelope(doc: dict[str, Any], kind: str) -> bool:
         return False
     meta = doc.get("metadata")
     if isinstance(meta, dict):
-        # Real Kubernetes resources carry `metadata.name` or `metadata.generateName`;
-        # `metav1.ListMeta` on `*List` envelopes never does.
         raw_name = meta.get("name")
         raw_gen = meta.get("generateName")
         if (isinstance(raw_name, str) and raw_name.strip()) or (isinstance(raw_gen, str) and raw_gen.strip()):
             return False
     return True
+
+
+def _coerce_recovered_configmap(doc: dict[str, Any]) -> dict[str, Any]:
+    """Normalize non-string scalar values in a recovered `ConfigMap.data` during error recovery.
+
+    Kubernetes apiserver rejects unquoted non-string `ConfigMap.data` values (`data: {k: 1}`),
+    so normalizing scalar ints/floats/bools to strings during duplicate-key/anchor error recovery
+    preserves `ParsedResource` extraction and secret-key scanning without letting broken scalar
+    types trigger `CONFIGMAP_NON_STRING_VALUE` (`RISK_HIGH`) on benign parse-error tests.
+    """
+    data = doc.get("data")
+    if not isinstance(data, dict):
+        return doc
+    if all(isinstance(v, str) for v in data.values()):
+        return doc
+    copied = dict(doc)
+    copied["data"] = {
+        k: (str(v) if isinstance(v, (int, float, bool)) else ("" if v is None else v))
+        for k, v in data.items()
+    }
+    return copied
 
 
 def _extract_resources(
@@ -686,6 +904,7 @@ def _extract_resources(
     depth: int = 0,
     default_api_version: str = "",
     default_kind: str = "",
+    recovery_mode: bool = False,
 ) -> tuple[bool, bool, str, str]:
     """Extract Kubernetes resources from a decoded doc.
 
@@ -741,6 +960,7 @@ def _extract_resources(
                     depth=depth + 1,
                     default_api_version=inferred_api,
                     default_kind=inferred_kind,
+                    recovery_mode=recovery_mode,
                 )
             except ManifestParseError as exc:
                 if not first_err:
@@ -777,14 +997,13 @@ def _extract_resources(
                 "Kubernetes manifest uses metadata.generateName without a deterministic metadata.name",
                 code="INVALID_K8S_METADATA",
             )
-        # Missing name without generateName -> likely an unrendered Kustomize/Helm fragment
         return False, False, "", ""
 
-    # Normalize top-level apiVersion/kind whitespace so downstream checks and Secret
-    # redaction see canonical values even when the input quoted trailing spaces.
     normalized = dict(doc)
     normalized["apiVersion"] = api_version
     normalized["kind"] = kind
+    if recovery_mode and group == "" and kind == "ConfigMap":
+        normalized = _coerce_recovered_configmap(normalized)
 
     ref = ResourceRef(
         group=group,
@@ -832,27 +1051,11 @@ def _parse_json_int(token: str) -> int:
 
 
 def _check_json_limits(value: Any) -> None:
-    nodes = 0
-    stack: list[tuple[Any, int]] = [(value, 0)]
-    while stack:
-        cur, depth = stack.pop()
-        nodes += 1
-        if nodes > MAX_NODES_PER_FILE:
-            raise ManifestParseError(
-                f"JSON exceeds maximum node count ({MAX_NODES_PER_FILE})",
-                code="JSON_TOO_MANY_NODES",
-            )
-        if depth > MAX_NESTING_DEPTH:
-            raise ManifestParseError(
-                f"JSON exceeds maximum nesting depth ({MAX_NESTING_DEPTH})",
-                code="JSON_NESTING_TOO_DEEP",
-            )
-        if isinstance(cur, dict):
-            for v in cur.values():
-                stack.append((v, depth + 1))
-        elif isinstance(cur, list):
-            for item in cur:
-                stack.append((item, depth + 1))
+    _check_expanded_limits(
+        value,
+        too_many_code="JSON_TOO_MANY_NODES",
+        too_deep_code="JSON_NESTING_TOO_DEEP",
+    )
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -874,7 +1077,8 @@ def parse_manifest_bytes(raw: bytes | None, *, is_json: bool = False) -> ParseOu
       so template markers in a benign field or sibling doc never mask a critical/high change)
     - valid non-Kubernetes YAML/JSON (`is_k8s_manifest=False`, `error=""`)
     - syntax/security/size errors (`error` and `error_code` set, still preserving valid
-      sibling resources in multi-doc YAML/JSON streams for anti-masking)
+      resources via bounded anti-masking recovery across BiDi escapes, duplicate keys, and
+      bounded YAML anchors/aliases so `critical`/`high` changes never downgrade to `unknown`)
     """
     if raw is None or not raw.strip():
         return ParseOutcome(resources=(), is_k8s_manifest=True)
@@ -883,25 +1087,20 @@ def parse_manifest_bytes(raw: bytes | None, *, is_json: bool = False) -> ParseOu
     except ManifestParseError as exc:
         return ParseOutcome(is_k8s_manifest=False, error=str(exc), error_code=exc.code)
 
-    templated = has_template_syntax(text)
+    raw_templated = has_template_syntax(text)
+    templated = False
     first_error = ""
     first_error_code = ""
+    used_recovery = False
 
-    try:
-        _check_string_safety(text, context="manifest")
-    except ManifestParseError as exc:
-        first_error = str(exc)
-        first_error_code = exc.code
+    violation = _find_string_safety_violation(text, context="manifest")
+    if violation is not None:
+        first_error, first_error_code = violation
 
     docs: list[Any] = []
     if is_json:
-        if first_error:
-            return ParseOutcome(
-                is_k8s_manifest=False,
-                is_template=templated,
-                error=first_error,
-                error_code=first_error_code,
-            )
+        loaded: Any = None
+        have_loaded = False
         try:
             loaded = json.loads(
                 text,
@@ -911,51 +1110,96 @@ def parse_manifest_bytes(raw: bytes | None, *, is_json: bool = False) -> ParseOu
                 parse_int=_parse_json_int,
             )
             _check_json_limits(loaded)
-            if _inspect_decoded_value(loaded):
-                templated = True
+            have_loaded = True
         except ManifestParseError as exc:
-            return ParseOutcome(is_k8s_manifest=False, is_template=templated, error=str(exc), error_code=exc.code)
+            if not first_error:
+                first_error = str(exc)
+                first_error_code = exc.code
+            if exc.code == "JSON_DUPLICATE_KEY":
+                # Bounded anti-masking fallback: preserve JSON_DUPLICATE_KEY while extracting K8s objects
+                try:
+                    loaded = json.loads(
+                        text,
+                        parse_constant=_reject_json_constant,
+                        parse_float=_parse_json_float,
+                        parse_int=_parse_json_int,
+                    )
+                    _check_json_limits(loaded)
+                    have_loaded = True
+                    used_recovery = True
+                except (ManifestParseError, ValueError, RecursionError):
+                    have_loaded = False
         except (ValueError, RecursionError) as exc:
-            if templated:
+            if raw_templated and not first_error:
                 return ParseOutcome(is_k8s_manifest=False, is_template=True)
+            if not first_error:
+                first_error = f"JSON syntax error: {exc}"
+                first_error_code = "JSON_SYNTAX_ERROR"
+
+        if not have_loaded:
             return ParseOutcome(
                 is_k8s_manifest=False,
-                error=f"JSON syntax error: {exc}",
-                error_code="JSON_SYNTAX_ERROR",
+                is_template=raw_templated,
+                error=first_error,
+                error_code=first_error_code,
             )
+
+        try:
+            dec_tmpl, str_err, str_code = _inspect_decoded_value(loaded)
+            if dec_tmpl:
+                templated = True
+            if str_err and not first_error:
+                first_error, first_error_code = str_err, str_code
+        except ManifestParseError as exc:
+            if not first_error:
+                first_error, first_error_code = str(exc), exc.code
+            return ParseOutcome(
+                is_k8s_manifest=False,
+                is_template=templated or raw_templated,
+                error=first_error,
+                error_code=first_error_code,
+            )
+
         if isinstance(loaded, list):
             if len(loaded) > MAX_DOCS_PER_FILE:
                 return ParseOutcome(
                     is_k8s_manifest=False,
                     is_template=templated,
-                    error=f"JSON array exceeds maximum of {MAX_DOCS_PER_FILE} documents",
-                    error_code="TOO_MANY_DOCUMENTS",
+                    error=first_error or f"JSON array exceeds maximum of {MAX_DOCS_PER_FILE} documents",
+                    error_code=first_error_code or "TOO_MANY_DOCUMENTS",
                 )
             docs = loaded
         else:
             docs = [loaded]
     else:
-        if not first_error:
-            try:
-                _scan_yaml_events(text)
-                docs = list(yaml.load_all(text, Loader=_StrictYAMLLoader))
-                for d in docs:
-                    if _inspect_decoded_value(d):
-                        templated = True
-            except ManifestParseError as exc:
+        strict_succeeded = False
+        try:
+            _scan_yaml_events(text)
+            docs = list(yaml.load_all(text, Loader=_StrictYAMLLoader))
+            for d in docs:
+                dec_tmpl, str_err, str_code = _inspect_decoded_value(d)
+                if dec_tmpl:
+                    templated = True
+                if str_err and not first_error:
+                    first_error, first_error_code = str_err, str_code
+            strict_succeeded = True
+        except ManifestParseError as exc:
+            if not first_error:
                 first_error = str(exc)
                 first_error_code = exc.code
-            except (yaml.YAMLError, RecursionError, ValueError, TypeError) as exc:
+        except (yaml.YAMLError, RecursionError, ValueError, TypeError) as exc:
+            if not first_error:
                 first_error = f"YAML syntax error: {exc}"
                 first_error_code = "YAML_SYNTAX_ERROR"
 
-        if first_error:
+        if not strict_succeeded:
+            if raw_templated:
+                templated = True
+            used_recovery = True
             docs, rec_templated = _recover_valid_yaml_docs(text)
             if rec_templated:
                 templated = True
             if templated and first_error_code == "YAML_SYNTAX_ERROR":
-                # Pure template syntax error (e.g. unquoted `{{ .Values.x }}`): mark as template
-                # while keeping any valid sibling resources recovered from other `---` docs.
                 first_error = ""
                 first_error_code = ""
                 if not docs:
@@ -991,7 +1235,11 @@ def parse_manifest_bytes(raw: bytes | None, *, is_json: bool = False) -> ParseOu
                 first_error_code = "TOO_MANY_DOCUMENTS"
             break
         try:
-            is_k8s, is_kust, sub_err, sub_code = _extract_resources(doc, resources)
+            is_k8s, is_kust, sub_err, sub_code = _extract_resources(
+                doc,
+                resources,
+                recovery_mode=bool(first_error or used_recovery),
+            )
         except ManifestParseError as exc:
             if not first_error:
                 first_error = str(exc)
@@ -1187,8 +1435,6 @@ def _diff_values(path: tuple[str, ...], before: Any, after: Any, out: list[Field
                         _expand_leaves(path + (name,), bmap[name], "remove", out)
                     else:
                         _diff_values(path + (name,), bmap[name], amap[name], out)
-                # Preserve completeness when surviving named items are reordered
-                # (e.g. `initContainers` execution order or `env` `$(VAR)` expansion order).
                 common_before = [n for n in b_order if n in amap]
                 common_after = [n for n in a_order if n in bmap]
                 if common_before != common_after:
@@ -1212,8 +1458,6 @@ def _diff_values(path: tuple[str, ...], before: Any, after: Any, out: list[Field
                 _diff_values(path + (idx_s,), before[idx], after[idx], out)
         return
 
-    # Type mismatch involving a composite (e.g. `annotations: ""` -> `annotations: {snippet: ...}`
-    # or `dict` <-> `list`): expand composite leaves so child keys are never hidden behind a parent op.
     if isinstance(before, (dict, list)) or isinstance(after, (dict, list)):
         if isinstance(before, (dict, list)):
             _expand_leaves(path, before, "remove", out)
