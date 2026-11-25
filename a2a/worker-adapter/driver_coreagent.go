@@ -28,6 +28,10 @@ type coreAgentDriver struct {
 	// the persona grant.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
+	// Instructions are the session pod's system-prompt lines, sent in each
+	// turn's envelope (WithInstructions). A profile worker has none: its
+	// persona is its instruction layer.
+	Instructions []string
 
 	conv *coreAgentConversations
 }
@@ -49,10 +53,21 @@ const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
 
+// WithInstructions is d with the worker's system-prompt lines for core-agent,
+// which reads them from each turn's envelope; any other driver is returned as
+// it is (Claude Code gets the same lines on its argv).
+func WithInstructions(d Driver, lines []string) Driver {
+	if c, ok := d.(coreAgentDriver); ok {
+		c.Instructions = append([]string(nil), lines...)
+		return c
+	}
+	return d
+}
+
 // EncodeUser is the turn's envelope: the message, the policy and MCP
 // servers, and the history of the conversation WithResume named.
 func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
-	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP}
+	env := coreagentwire.Envelope{Message: text, Policy: d.Policy, MCP: d.MCP, Instructions: d.Instructions}
 	if d.conv != nil {
 		d.conv.mu.Lock()
 		env.Session = d.conv.resume
@@ -72,11 +87,19 @@ func (d coreAgentDriver) EncodeUser(text string) ([]byte, error) {
 func (d coreAgentDriver) NewDecoder() Decoder { return &coreAgentDecoder{conv: d.conv} }
 
 // WithResume names the conversation the next turn resumes; its history goes
-// in the envelope, not the argv.
+// in the envelope, not the argv. It is the only history kept: every other
+// conversation's is dropped, since a turn that resumes none (a profile
+// worker's every task) or another one will never send it, and a long-lived
+// worker would otherwise hold every task's history it ever ran.
 func (d coreAgentDriver) WithResume(argv []string, id string) []string {
 	if d.conv != nil {
 		d.conv.mu.Lock()
 		d.conv.resume = id
+		for k := range d.conv.history {
+			if k != id {
+				delete(d.conv.history, k)
+			}
+		}
 		d.conv.mu.Unlock()
 	}
 	return argv
@@ -101,6 +124,12 @@ func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return nil
 // mid-turn short of interrupting it.
 func (coreAgentDriver) HoldsSteers() bool { return true }
 
+// OneTurnPerProcess: the harness reads one envelope and ends with its turn,
+// so a held steer written at the turn boundary is refused rather than left
+// unread in the pipe (processEncoder). The per-turn restart work runs held
+// steers in a fresh process.
+func (coreAgentDriver) OneTurnPerProcess() {}
+
 // coreAgentDecoder maps the harness's event lines onto Events: one
 // EventToolResult per tool call, an erroring step included.
 type coreAgentDecoder struct {
@@ -114,6 +143,11 @@ type coreAgentDecoder struct {
 	// nothing written into the stream out of order reaches the adapter or
 	// the conversation's history.
 	inited, ended bool
+	// pending is the turn's event lines, kept until its result: a turn's
+	// events join the conversation's history only when it completes, so a
+	// turn that was stopped (no result) or failed (perhaps a call with no
+	// answer) leaves the history as it was.
+	pending []json.RawMessage
 }
 
 func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
@@ -138,15 +172,8 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	}
 	switch ln.Type {
 	case coreagentwire.TypeEvent:
-		if d.conv != nil && d.session != "" && len(ln.Event) > 0 {
-			d.conv.mu.Lock()
-			if coreagentwire.IsHistoryBoundary(ln.Event) {
-				// A compaction summary: core-agent starts its next request
-				// from it, so nothing before it is sent again.
-				d.conv.history[d.session] = nil
-			}
-			d.conv.history[d.session] = append(d.conv.history[d.session], ln.Event)
-			d.conv.mu.Unlock()
+		if len(ln.Event) > 0 {
+			d.pending = append(d.pending, ln.Event)
 		}
 		return nil, nil
 	case coreagentwire.TypeThinking:
@@ -159,6 +186,21 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 		return []Event{{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}}, nil
 	case coreagentwire.TypeResult:
 		d.ended = true
+		if !ln.Failed && d.conv != nil && d.session != "" {
+			d.conv.mu.Lock()
+			h := d.conv.history[d.session]
+			for _, e := range d.pending {
+				if coreagentwire.IsHistoryBoundary(e) {
+					// A compaction summary: core-agent starts its next
+					// request from it, so nothing before it is sent again.
+					h = nil
+				}
+				h = append(h, e)
+			}
+			d.conv.history[d.session] = h
+			d.conv.mu.Unlock()
+		}
+		d.pending = nil
 		ev := Event{Kind: EventResult, Text: ln.Text, Telemetry: resultTelemetry{usage: lib.Usage{Model: d.model}}}
 		if ln.Usage != nil {
 			// Each count passes lib.UsageFigure, as the other drivers'
