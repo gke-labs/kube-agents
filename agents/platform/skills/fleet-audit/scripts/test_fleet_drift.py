@@ -2832,21 +2832,46 @@ class KubeletConfigPoolVoteTest(unittest.TestCase):
 
     def test_each_key_is_named_in_the_token(self):
         for block, token in (
-            ({"cpuCfsQuota": True}, "cpuCfsQuota=true"),
             ({"cpuCfsQuota": False}, "cpuCfsQuota=false"),
             ({"cpuManagerPolicy": "static"}, "cpuManagerPolicy=static"),
             ({"containerLogMaxSize": "50Mi"}, "containerLogMaxSize=50Mi"),
-            ({"containerLogMaxFiles": 5}, "containerLogMaxFiles=5"),
+            ({"containerLogMaxFiles": 3}, "containerLogMaxFiles=3"),
             ({"podPidsLimit": "4096"}, "podPidsLimit=4096"),
         ):
             with self.subTest(block=block):
                 self.assertEqual(fd.pool_kubelet_config(pool("p", kubelet=block)), token)
 
+    def test_a_key_set_to_the_kubelets_default_is_unset(self):
+        """A pool whose file spells out a default runs the same kubelet as a
+        pool that leaves the key alone, so the two hold one token and neither
+        is filed against the other."""
+        for block in (
+            {"cpuCfsQuota": True},
+            {"cpuManagerPolicy": "none"},
+            {"containerLogMaxSize": "10Mi"},
+            {"containerLogMaxFiles": 5},
+            {"containerLogMaxFiles": "5"},
+            {"cpuCfsQuota": True, "cpuManagerPolicy": "none", "containerLogMaxSize": "10Mi", "containerLogMaxFiles": 5},
+        ):
+            with self.subTest(block=block):
+                self.assertEqual(fd.pool_kubelet_config(pool("p", kubelet=block)), fd.KUBELET_CONFIG_UNSET_TOKEN)
+
+    def test_a_default_beside_a_real_setting_leaves_only_the_setting(self):
+        block = {"cpuManagerPolicy": "none", "podPidsLimit": "4096"}
+        self.assertEqual(fd.pool_kubelet_config(pool("p", kubelet=block)), "podPidsLimit=4096")
+
+    def test_a_pool_that_spells_out_defaults_is_not_an_outlier(self):
+        fleet = self.seeded_fleet()
+        fleet[1]["nodePools"][0]["config"]["kubeletConfig"] = {"cpuManagerPolicy": "none", "cpuCfsQuota": True}
+        _, candidates = fd.compute_drift(fleet, now=NOW)
+        self.assertEqual(self.kubelet(candidates, "b"), [])
+        self.assertEqual(len(self.kubelet(candidates, "c")), 1)
+
     def test_the_token_sorts_its_keys(self):
-        block = {"podPidsLimit": "4096", "cpuManagerPolicy": "static", "containerLogMaxFiles": 5}
+        block = {"podPidsLimit": "4096", "cpuManagerPolicy": "static", "containerLogMaxFiles": 3}
         self.assertEqual(
             fd.pool_kubelet_config(pool("p", kubelet=block)),
-            "containerLogMaxFiles=5,cpuManagerPolicy=static,podPidsLimit=4096",
+            "containerLogMaxFiles=3,cpuManagerPolicy=static,podPidsLimit=4096",
         )
 
     def test_nothing_set_is_one_token_however_gke_spelled_it(self):

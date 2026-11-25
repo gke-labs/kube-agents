@@ -379,7 +379,7 @@
           "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit",
           "op": "eq",
           "value": 4096,
-          "why": "the kubelet-config half. GKE sets no pod PID limit unless asked, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed by hand reads here as drift and as a 4/4 agreement to the facet, and one changed to another value as drift alone. An integer on purpose: the pinned provider sends a non-zero integer on an update as on a create, where the explicit false this half first asserted (cpuCfsQuota) was sent only at pool creation and never reached a pool that already existed. `observed nothing` means the key is not set; a re-apply restores it in place"
+          "why": "the kubelet-config half. GKE sets no pod PID limit unless asked, and the kubelet-config facet reads an absent key as unset, so this pool differs from the stack's other pools; a key removed by hand reads here as drift and gives the facet nothing to find on slot c, and one changed to another value reads as drift alone. An integer on purpose: the pinned provider sends a non-zero integer on an update as on a create, where the explicit false this half first asserted (cpuCfsQuota) was sent only at pool creation and never reached a pool that already existed. `observed nothing` means the key is not set; a re-apply restores it in place"
         }
       ]
     },

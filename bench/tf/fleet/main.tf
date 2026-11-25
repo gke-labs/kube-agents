@@ -881,8 +881,8 @@ resource "google_container_cluster" "seeded_c" {
 # disk of the default type with no kubelet block; this one runs 50 GB (type
 # unchanged: size alone differed in the incident behind the facets) and
 # sets one kubelet key, pod_pids_limit, to 4096. GKE sets no pod PID limit
-# unless asked, so the facet reads a difference whether it treats an absent
-# key as unset or as the default, and a PID cap on a node whose only
+# unless asked, and the kubelet-config facet reads an absent key as unset,
+# so this pool differs from the others, and a PID cap on a node whose only
 # workload pods are the pause containers defects-c.tf plants changes
 # nothing anyone measures. An integer and not the cpu_cfs_quota = false
 # this block first carried: the pinned provider (8.4.0) force-sends an
@@ -891,7 +891,8 @@ resource "google_container_cluster" "seeded_c" {
 # existed; the key never reached a project older than the block. A
 # non-zero integer is sent on create and on update alike. A pool created
 # with the earlier key may keep it beside this one: the update request
-# leaves it out, and no assertion reads it. Both fields update in place:
+# leaves it out, and no assertion reads it. The facet does read it, as
+# part of the pool's token, and the pool is the outlier either way. Both fields update in place:
 # GKE recreates the pool's one node, the pool keeps its identity, and the
 # cluster's createTime does not move, so the drift SOP's 24-hour cohort
 # gate is untouched and no reconcile-allow entry is needed. The fixture

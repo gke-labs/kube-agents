@@ -246,6 +246,17 @@ KUBELET_CONFIG_UNSET_TOKEN = "UNSET"
 # What GKE serializes for a numeric key nobody set, where it serializes the
 # key at all: int64 fields arrive as strings.
 KUBELET_CONFIG_ZERO = "0"
+# What the kubelet runs for a key nobody set, as GKE's node system
+# configuration documents it and as the token prints a value. A pool whose
+# file spells one of these out runs the same kubelet as a pool that leaves the
+# key alone, so the two are one token. `podPidsLimit` has no entry: GKE sets
+# no pod PID limit unless asked.
+KUBELET_CONFIG_DEFAULTS = {
+    KUBELET_CONFIG_CFS_QUOTA_KEY: "true",
+    "cpuManagerPolicy": "none",
+    "containerLogMaxSize": "10Mi",
+    "containerLogMaxFiles": "5",
+}
 
 # The one check here that is not a facet. Every `Facet` is comparative and so
 # runs only inside a cohort that reached `COHORT_FLOOR`; this one asks why a
@@ -795,6 +806,8 @@ def _kubelet_value(key: str, value: object) -> str | None:
     """One kubelet key's value as the token prints it, or `None` where the key
     is unset. Absent, null, empty and a numeric zero are one value (§4.0):
     proto3 drops them, and a serializer that keeps one must not make a finding.
+    So is a key set to the default the kubelet runs anyway
+    (`KUBELET_CONFIG_DEFAULTS`): the two pools enforce the same limits.
     `cpuCfsQuota` is the exception to "false is unset": GKE omits it until
     someone sends it, so a `false` it returns is a quota somebody turned off."""
     if value is None or value == "":
@@ -802,9 +815,12 @@ def _kubelet_value(key: str, value: object) -> str | None:
     if isinstance(value, bool):
         if key != KUBELET_CONFIG_CFS_QUOTA_KEY and not value:
             return None
-        return str(value).lower()
-    text = str(value)
-    return None if text == KUBELET_CONFIG_ZERO else text
+        text = str(value).lower()
+    else:
+        text = str(value)
+    if text == KUBELET_CONFIG_ZERO or text == KUBELET_CONFIG_DEFAULTS.get(key):
+        return None
+    return text
 
 
 def pool_kubelet_config(p: dict) -> str | None:
