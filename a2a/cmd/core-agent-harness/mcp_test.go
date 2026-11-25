@@ -25,8 +25,9 @@ import (
 
 // The test binary doubles as a fake stdio MCP server, chosen by env:
 // FAKE_MCP_TOOLS lists the tools it offers (comma-separated), FAKE_MCP_EXIT
-// makes it exit at once, FAKE_MCP_PIDFILE gets its pid, and FAKE_MCP_CALLS
-// gets a line per tool call.
+// makes it exit at once, FAKE_MCP_PIDFILE gets its pid, FAKE_MCP_CALLS
+// gets a line per tool call, and on each call FAKE_MCP_SAW gets what the
+// directory FAKE_MCP_WATCH held at that moment.
 func TestMain(m *testing.M) {
 	if pf := os.Getenv("FAKE_MCP_PIDFILE"); pf != "" {
 		_ = os.WriteFile(pf, []byte(strconv.Itoa(os.Getpid())), 0o600)
@@ -39,6 +40,14 @@ func TestMain(m *testing.M) {
 		for _, name := range strings.Split(tools, ",") {
 			s.AddTool(&mcp.Tool{Name: name, InputSchema: map[string]any{"type": "object"}},
 				func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					if w, f := os.Getenv("FAKE_MCP_WATCH"), os.Getenv("FAKE_MCP_SAW"); w != "" && f != "" {
+						ents, err := os.ReadDir(w)
+						names := []string{}
+						for _, e := range ents {
+							names = append(names, e.Name())
+						}
+						_ = os.WriteFile(f, []byte(fmt.Sprintf("entries=%q err=%v", names, err)), 0o600)
+					}
 					if f := os.Getenv("FAKE_MCP_CALLS"); f != "" {
 						if fh, err := os.OpenFile(f, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
 							fmt.Fprintln(fh, name)
@@ -226,6 +235,13 @@ func TestAGrantedMCPToolRunsThroughThePolicy(t *testing.T) {
 			srv, _ := fakeServer(t, "fake", "a,b,c", "a", "b")
 			calls := filepath.Join(t.TempDir(), "calls")
 			srv.Env["FAKE_MCP_CALLS"] = calls
+			// Where buildMCP makes its config directory, which the tool
+			// lists when it runs: it must find nothing there.
+			watch, saw := t.TempDir(), filepath.Join(t.TempDir(), "saw")
+			prev := mcpConfigParent
+			mcpConfigParent = watch
+			t.Cleanup(func() { mcpConfigParent = prev })
+			srv.Env["FAKE_MCP_WATCH"], srv.Env["FAKE_MCP_SAW"] = watch, saw
 			servers := []coreagentwire.MCPServer{srv}
 			// The policy as the adapter renders it from the persona's grant.
 			ws := t.TempDir()
@@ -268,6 +284,11 @@ func TestAGrantedMCPToolRunsThroughThePolicy(t *testing.T) {
 			b, _ := os.ReadFile(calls)
 			if got := strings.TrimSpace(string(b)); got != c.wantRan {
 				t.Errorf("the server ran %q; want %q", got, c.wantRan)
+			}
+			if c.wantRan != "" {
+				if got, _ := os.ReadFile(saw); string(got) != `entries=[] err=<nil>` {
+					t.Errorf("when the tool ran, the MCP config directory's parent held %s; want nothing", got)
+				}
 			}
 		})
 	}

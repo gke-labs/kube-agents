@@ -432,6 +432,27 @@ func sessionWriteRefusalDir(session, workdir string) string {
 	return filepath.Join(workdir, writeRefusalSubdir)
 }
 
+// sessionToolLists is a session pod's tool allowlist and denylist, whether
+// it has the cluster view, and whether that view's Bash is allowed. The view
+// is only on when Bash is actually allowed: an override that leaves it out
+// keeps Bash disallowed and gets no prompt telling the model to use it.
+func sessionToolLists(getenv func(string) string) (allowed, disallowed string, clusterView, bashView bool) {
+	allowed = getenv("A2A_ALLOWED_TOOLS")
+	disallowed = defaultDisallowedTools
+	clusterView = getenv(lib.EnvClusterView) == "true"
+	if allowed == "" {
+		allowed = defaultAllowedTools
+		if clusterView {
+			allowed = clusterViewAllowedTools
+		}
+	}
+	bashView = clusterView && allowsBash(allowed)
+	if bashView {
+		disallowed = clusterViewDisallowed
+	}
+	return allowed, disallowed, clusterView, bashView
+}
+
 // sessionPrompts is a session pod's system-prompt lines for its cluster
 // access, before the delegate line, which goes only with the delegate tool.
 // The no-cluster line keys on the view, not on Bash: a view pod whose
@@ -565,30 +586,6 @@ func delegateToolEnabled() bool {
 // assembled. configFromEnv runs once, before anything else is started, so
 // nothing reads it concurrently.
 var delegateToolSuppressed bool
-
-// harnessCommand builds the harness argv: the native binary driven over the
-// headless stream-json contract. A2A_HARNESS_CMD overrides the whole argv
-// (tests, stubs); A2A_HARNESS_EXTRA_ARGS appends without replacing.
-// sessionToolLists is a session pod's tool allowlist and denylist, whether
-// it has the cluster view, and whether that view's Bash is allowed. The view
-// is only on when Bash is actually allowed: an override that leaves it out
-// keeps Bash disallowed and gets no prompt telling the model to use it.
-func sessionToolLists(getenv func(string) string) (allowed, disallowed string, clusterView, bashView bool) {
-	allowed = getenv("A2A_ALLOWED_TOOLS")
-	disallowed = defaultDisallowedTools
-	clusterView = getenv(lib.EnvClusterView) == "true"
-	if allowed == "" {
-		allowed = defaultAllowedTools
-		if clusterView {
-			allowed = clusterViewAllowedTools
-		}
-	}
-	bashView = clusterView && allowsBash(allowed)
-	if bashView {
-		disallowed = clusterViewDisallowed
-	}
-	return allowed, disallowed, clusterView, bashView
-}
 
 // harnessCommandWithoutDelegate is harnessCommand as it would be under
 // A2A_DELEGATE_TOOL=off: no delegate tool on the allowlist, no MCP config, no
