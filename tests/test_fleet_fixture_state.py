@@ -2752,11 +2752,14 @@ class FinishedJobFamilyRoleTest(_Harness):
             spec.loader.exec_module(collector)
         now = datetime.now(timezone.utc)
         name = _FAMILY_JOBS[0].split("/", 1)[1]
+        # The audit files a Job with a generated name under its family's stem:
+        # `reindex-<uuid>` is the finding `Job/reindex`.
+        stem = name.split("-", 1)[0]
 
         def filed(hours: float) -> bool:
             job = {"metadata": {"name": name, "namespace": "seeded-family"}, "spec": {}, "status": {"succeeded": 1, "completionTime": (now - timedelta(hours=hours)).isoformat()}}
             hits = collector.check_terminal_pods({"pods": [], "jobs": [job], "cronjobs": []}, now=now)
-            return any(hit["object"] == f"Job/{name}" for hit in hits)
+            return any(hit["object"] == f"Job/{stem}" for hit in hits)
 
         entries = [e for e in self.catalog["roles"][self.ROLE]["state"] if e["op"] == "ready_after_hours"]
         assert sorted(e["subject"] for e in entries) == sorted(_FAMILY_JOBS), entries
