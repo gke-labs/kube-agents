@@ -38,9 +38,10 @@ settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, or anything at a
 payload position that is not binary base64, answered with 400 since the same
-request is refused every time. Two payload positions are not carved and are
-forwarded as they came: a Responses `input` item's content parts and the parts
-inside a Gemini function response. Responses are not touched; the limitation is documented
+request is refused every time. Two payload positions are not carved: a
+Responses `input` item's content parts and the parts inside a Gemini function
+response. The text rules still run over a base64 payload there and can rewrite
+it (a known gap). Responses are not touched; the limitation is documented
 on the site's inference-gateway page.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
