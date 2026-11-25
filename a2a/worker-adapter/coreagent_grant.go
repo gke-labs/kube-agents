@@ -17,7 +17,7 @@ func CoreAgentWirePolicy(p toolgrant.Policy, workdir string) (coreagentwire.Poli
 	if err != nil {
 		return coreagentwire.Policy{}, err
 	}
-	return coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny, WebSearch: g.GeminiGoogleSearch}, nil
+	return coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny, WebSearch: g.GeminiGoogleSearch, AnyShellCommand: g.AnyShellCommand}, nil
 }
 
 // PersonaToolPolicy is a profile worker's tool grant, read from its
@@ -25,12 +25,12 @@ func CoreAgentWirePolicy(p toolgrant.Policy, workdir string) (coreagentwire.Poli
 // as Output.Allowed passes them, and Output.MCPServers for the tools each
 // server may expose. It grants what the Claude Code rendering of the same
 // persona grants, mapped to core-agent, and nothing wider:
-//   - read_file: the read tools, inside the workspace (Claude Code's Read
-//     isn't scoped; core-agent's read tools are, by its path scope; the
-//     shell, where granted, still reads anywhere it can);
-//   - shell: in effect an unrestricted shell, as on Claude Code (the gate
-//     refuses top-level composition, but `bash -c` and interpreters pass,
-//     toolgrant.Policy.Shell);
+//   - read_file: the read tools; inside the workspace unless the persona
+//     also grants the shell, whose turn runs in a mode that drops the path
+//     scope (Claude Code's Read isn't scoped, and the shell reads anywhere
+//     it can reach anyway);
+//   - shell: any command, compound ones included, as Claude Code's Bash
+//     (toolgrant.Policy.Shell, coreagentwire.Policy.AnyShellCommand);
 //   - web_search: Gemini's server-side Google Search, as WebSearch is
 //     server-side on Claude Code;
 //   - an MCP server or one of its tools: the tools its MCPServers entry

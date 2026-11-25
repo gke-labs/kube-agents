@@ -142,6 +142,12 @@ func coreAgentGrant(t *testing.T, p coreagentwire.Policy, workdir string) grantS
 			t.Errorf("deny rule %q isn't a broad deny of an unregistered file or shell tool", d)
 		}
 	}
+	// A persona's shell runs any command, compound ones included, as
+	// Claude Code's Bash does (AnyShellCommand); a shell never comes
+	// without it here, nor it without a shell.
+	if g.Shell != p.AnyShellCommand {
+		t.Errorf("shell %v but any-command %v: a persona's shell runs any command", g.Shell, p.AnyShellCommand)
+	}
 	if g.Shell && !slices.Equal(bash, []string{"bash:*"}) {
 		t.Errorf("shell rules %q, want only bash:*", bash)
 	}
@@ -155,9 +161,8 @@ func coreAgentGrant(t *testing.T, p coreagentwire.Policy, workdir string) grantS
 // TestEveryShippedPersonaGrantsCoreAgentWhatItGrantsClaudeCode: for each
 // persona under agents/, its core-agent grant equals its Claude Code
 // grant: reads, writes, the shell, web search and every MCP tool. The
-// shell and reads keep core-agent's narrowings (pinned in coreAgentGrant):
-// a shell of simple commands only where Claude Code's Bash is
-// unrestricted, and reads confined to the workspace.
+// shell runs any command, compound ones included, as Claude Code's Bash
+// does (pinned in coreAgentGrant).
 func TestEveryShippedPersonaGrantsCoreAgentWhatItGrantsClaudeCode(t *testing.T) {
 	dirs, err := filepath.Glob("../../agents/*/persona")
 	if err != nil {
@@ -324,7 +329,7 @@ echo '{"type":"result","text":"ok"}'
 		t.Fatalf("envelope %q: %v", raw, err)
 	}
 	p := env.Policy
-	if !slices.Contains(p.Tools, "bash") || slices.Contains(p.Tools, "write_file") || !p.WebSearch ||
+	if !slices.Contains(p.Tools, "bash") || slices.Contains(p.Tools, "write_file") || !p.WebSearch || !p.AnyShellCommand ||
 		!slices.Contains(p.Allow, "bash:*") || !slices.Contains(p.Allow, "mcp:developer_knowledge_search_documents") ||
 		!slices.Contains(p.Allow, "mcp:developer_knowledge_get_documents") || !slices.Contains(p.Allow, "read_file:/scratch/*") {
 		t.Errorf("the turn's policy %+v, want the cluster persona's grant", p)

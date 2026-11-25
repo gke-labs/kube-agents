@@ -557,3 +557,69 @@ func TestShellCommandsReadsEitherRuleForm(t *testing.T) {
 		}
 	}
 }
+
+// TestAPersonaShellRunsAnyCommand: a persona's shell grant
+// (Policy.AnyShellCommand) runs any command, compound ones included, as
+// Claude Code's Bash does, through core-agent's real gate: the decision
+// run's refused commands among them (a skill script whose --body quotes
+// markdown backticks, a multi-line python3 -c). Deny rules and core-agent's
+// built-in denylist still refuse what they match (a deny rule matches the
+// whole command, so it narrows rather than bounds), and the registered
+// tools stay the policy's.
+func TestAPersonaShellRunsAnyCommand(t *testing.T) {
+	g, err := toolgrant.Policy{ReadFiles: true, Shell: true}.CoreAgent("/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.AnyShellCommand {
+		t.Fatal("a persona's shell grant doesn't ask for any command")
+	}
+	p := coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: append(slices.Clone(g.Deny), "bash:kubectl delete*"), AnyShellCommand: g.AnyShellCommand}
+	b, opts, _, err := policySetup(p, nil, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.WriteFile || b.EditFile || b.FetchURL || !b.Bash {
+		t.Errorf("registered built-ins %+v, want the policy's only", b)
+	}
+	gate := permissions.New(opts)
+	const vcs = "python3 /var/run/kube-agents/harness-config/config-task-0016b23ba04607c7-1159668367/skills/version-control/scripts/vcs.py"
+	for cmd, want := range map[string]bool{
+		vcs + " proposal create --repo gke-agentic/kube-agents-evals-3-infra --title \"Add PodDisruptionBudget for checkout-gateway in seeded-reliability\" --body \"Adds a policy/v1 PodDisruptionBudget (`checkout-gateway-pdb`) in `clusters/seeded-a/seeded-reliability/checkout-gateway-pdb.yaml` selecting pods with `app: checkout-gateway` and setting `maxUnavailable: 1` so at least one of the two `checkout-gateway` replicas remains available during voluntary disruptions.\"": true,
+		vcs + " proposal create --repo r --title t --body \"line one\nline two with $VAR\"":                             true,
+		"python3 -c \"\nimport sys\nsys.path.insert(0, '/var/run/x/scripts')\nimport vcs_client\nprint(vcs_client)\n\"": true,
+		"kubectl get deployment d -o yaml && kubectl get pdb -A && kubectl get pods -n x":                               true,
+		"kubectl get pods -A | grep -v Running > /scratch/out 2>&1":                                                     true,
+		"kubectl delete pod p": false,
+		// A deny rule matches the command as a whole, so a compound that
+		// starts with something else passes it: deny rules narrow, they are
+		// not this shell's boundary (the sandbox and the broker are).
+		"echo x; kubectl delete pod p": true,
+		"rm -rf /":                     false,
+	} {
+		if got := gate.CheckBash(context.Background(), cmd) == nil; got != want {
+			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
+		}
+	}
+}
+
+// TestAnyShellCommandNeedsTheShellAndNoWrite: a policy that runs any shell
+// command must grant the shell, and may not grant a file write, whose
+// workspace scope that mode drops.
+func TestAnyShellCommandNeedsTheShellAndNoWrite(t *testing.T) {
+	for name, p := range map[string]coreagentwire.Policy{
+		"no shell": {Tools: []string{"read_file"}, AnyShellCommand: true},
+		"a write":  {Tools: []string{"bash", "write_file"}, Allow: []string{"bash:*", "write_file:/scratch/*"}, AnyShellCommand: true},
+	} {
+		if _, _, _, err := policySetup(p, nil, "/scratch"); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	_, opts, _, err := policySetup(coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:kubectl", "bash:kubectl *"}}, nil, "/scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Mode != permissions.ModeAllow {
+		t.Errorf("a prefix-limited shell runs in mode %q, want allow", opts.Mode)
+	}
+}

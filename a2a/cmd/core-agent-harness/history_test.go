@@ -313,3 +313,33 @@ func TestARefusedShellCommandTellsTheModelWhatToDo(t *testing.T) {
 		})
 	}
 }
+
+// TestAPersonaTurnRunsACompoundCommand: through the harness's own turn, a
+// persona's shell runs a compound command, where a prefix grant refuses it.
+func TestAPersonaTurnRunsACompoundCommand(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		policy coreagentwire.Policy
+		want   string
+	}{
+		{"persona shell", coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:*"}, AnyShellCommand: true}, "stdout"},
+		{"prefix grant", coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:echo", "bash:echo *"}}, "error"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": "echo a | tr a b && echo $((1+1))"}}}}
+			withModel(t, m)
+			runTurn(t, t.TempDir(), coreagentwire.Envelope{Message: "go", Policy: c.policy})
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if len(m.responses) != 1 {
+				t.Fatalf("responses %v", m.responses)
+			}
+			if _, ok := m.responses[0][c.want]; !ok {
+				t.Errorf("the model read %v, want a %s", m.responses[0], c.want)
+			}
+			if c.want == "stdout" && m.responses[0]["stdout"] != "b\n2\n" {
+				t.Errorf("stdout %q, want the compound's output", m.responses[0]["stdout"])
+			}
+		})
+	}
+}

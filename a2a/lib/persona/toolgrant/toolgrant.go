@@ -39,14 +39,13 @@ type Policy struct {
 	// WebSearch: search the web. Fetching an arbitrary URL is a separate
 	// grant no worker has, so URL fetch stays off.
 	WebSearch bool
-	// Shell: the shell may run any command (a persona's `shell`, which
-	// Claude Code grants as an unrestricted Bash). core-agent's gate refuses
-	// top-level composition (chaining, pipes, redirections, expansions,
-	// substitutions) and applies its verb checks, but a single command may
-	// be an interpreter (`bash -c '…'`, `python3 -c '…'`) that composes
-	// anything, so this is in effect an unrestricted shell. Its boundary is
-	// the sandbox and the credential broker, as on Claude Code; the gate
-	// only shapes how the model writes commands.
+	// Shell: the shell may run any command, compound ones included (a
+	// persona's `shell`, which Claude Code grants as an unrestricted Bash):
+	// the harness skips core-agent's single-command check for it
+	// (CoreAgentGrant.AnyShellCommand), keeping deny rules and core-agent's
+	// built-in denylist. Its boundary is the sandbox and the credential
+	// broker, as on Claude Code. A session's shell is ShellPrefixes, never
+	// this.
 	Shell bool
 	// ShellPrefixes are the only commands the shell may run, each a binary
 	// with optional subcommands ("kubectl", "gh pr list"). Empty, with no
@@ -137,6 +136,12 @@ func CoreAgentRegistrable(name string) bool {
 	return ok && c != classNever
 }
 
+// CoreAgentWrites reports whether a core-agent built-in writes files (the
+// table's write class).
+func CoreAgentWrites(name string) bool {
+	return coreAgentBuiltins[name] == classWrite
+}
+
 // CoreAgentBuiltinNames is every built-in name the table classifies,
 // sorted.
 func CoreAgentBuiltinNames() []string {
@@ -161,6 +166,9 @@ type CoreAgentGrant struct {
 	// so not gated per call, as WebSearch is on Claude Code. URL context and
 	// code execution are never on.
 	GeminiGoogleSearch bool
+	// AnyShellCommand is Policy.Shell as the harness runs it: any command,
+	// compound ones included (coreagentwire.Policy.AnyShellCommand).
+	AnyShellCommand bool
 }
 
 var (
@@ -190,7 +198,7 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 	// An open-prefix allow rule matches inside the prefix only, after
 	// cleaning and symlink resolution (core-agent's globMatchAllow).
 	inWorkspace := workspace + "/*"
-	g := CoreAgentGrant{MCP: map[string][]string{}, GeminiGoogleSearch: p.WebSearch}
+	g := CoreAgentGrant{MCP: map[string][]string{}, GeminiGoogleSearch: p.WebSearch, AnyShellCommand: p.Shell}
 	for _, name := range CoreAgentBuiltinNames() {
 		switch c := coreAgentBuiltins[name]; {
 		case c == classRead && p.ReadFiles, c == classWrite && p.WriteFiles:
