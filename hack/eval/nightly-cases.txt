@@ -1542,6 +1542,13 @@
 # runs, with profiles.cluster, from #5394.
 ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
 
+# #6789: a profile task that delegates (spec.delegates) hands a cluster read to
+# the cluster profile, waits open, and answers from the child's result, graded
+# by delegated_to. The harness makes a throwaway delegating copy of the cluster
+# profile per run (delegating_profile, #7191). Needs the inject door and the
+# AgentProfile dispatcher with profiles.cluster, as above.
+./tasks/profile-delegates-a-read-and-uses-it/task.yaml
+
 # #6882: at the session cap, a new conversation gets the queued notice, then
 # its answer (the session-cap directive, bench/kube_agents_bench/session_cap.py).
 # It needs a session cap of at most 2, which the nightly install does not
