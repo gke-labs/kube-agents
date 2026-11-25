@@ -681,8 +681,9 @@ applies, so the postsubmit on that merge creates both in every pool project with
 ([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). `seeded-b`'s default
 pool runs a second e2-small so that GKE's own `kube-system` pods have room beside the tainted
 no-surge node, which adds about $14 per month (the node and its 20 GB balanced disk), for
-roughly $554; the reconcile applies that resize in place. Four of the first
-seven nodes are e2-small; `seeded-a`'s default pool is three e2-standard-2s. The pool moved
+roughly $554; the reconcile applies that resize in place. Three of the first
+seven nodes are e2-small and four are e2-standard-2: `seeded-a`'s default pool of three and
+`seeded-c`'s one node. `seeded-a`'s pool moved
 from e2-medium to e2-standard-2 because GKE's system pods claim 700-860m of an e2-medium's
 940m allocatable CPU and the planted fixtures' pods went Pending, first on a single node and
 then, as fixtures accrued, on the busier of two (the comment on `seeded_a_default` in
@@ -692,7 +693,7 @@ which requests about 1,020m CPU at all times (`cnrm-webhook-manager` 2 × 250m,
 20m), 100m more for each namespaced controller while a ConfigConnectorContext exists, and
 the `configconnector-operator` pod, measured on a dev cluster that runs the add-on. That is
 more than the two nodes had spare; the third node costs about $49 per month for each project.
-`seeded-c`'s one node is an e2-standard-2 as well, about $24 per month more than the e2-medium
-it replaced: after a node replacement that node's 940m could be fully requested by a second
-`kube-dns` replica, with the fixture pods left Pending (the comment on `seeded_c_default` in
-`main.tf` has the sequence).
+`seeded-c`'s node is an e2-standard-2 for a related reason, at about $24 per month more than
+the e2-medium it replaced: an e2-medium's 940m could be fully requested once a node replacement
+left a second `kube-dns` replica on it, with the fixture pods left Pending (the comment on
+`seeded_c_default` in `main.tf` has the sequence).

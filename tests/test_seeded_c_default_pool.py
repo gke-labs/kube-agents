@@ -14,6 +14,7 @@ pool creation: on a pool that already existed the provider planned nothing,
 and the role read drifted on every project older than the block.
 """
 
+import json
 import pathlib
 import re
 import unittest
@@ -24,8 +25,9 @@ _MAIN_TF = (
 _POOL_HEAD = 'resource "google_container_node_pool" "seeded_c_default" {'
 # What bench/tf/fleet/fixtures.json's drift-pool-outlier role asserts.
 _PLANTED_PIDS_LIMIT = "4096"
-# What fixtures.json's untainted-compute-class-pool role asserts.
-_MACHINE_TYPE = '"e2-standard-2"'
+_FIXTURES = _MAIN_TF.with_name("fixtures.json")
+_POOL_ROLE = "untainted-compute-class-pool"
+_MACHINE_TYPE_PATH = "nodePools[?(@.name=='default-pool')].config.machineType"
 
 
 def _pool_block() -> str:
@@ -51,6 +53,15 @@ def _nested(block: str, name: str) -> str:
     return match.group(2)
 
 
+def _catalog_machine_type() -> str:
+    """The machine type fixtures.json's pool role asserts on slot c's default pool."""
+    catalog = json.loads(_FIXTURES.read_text(encoding="utf-8"))
+    for entry in catalog["roles"][_POOL_ROLE]["state"]:
+        if entry.get("path") == _MACHINE_TYPE_PATH:
+            return entry["value"]
+    raise AssertionError(f"{_POOL_ROLE} asserts no machine type")
+
+
 def _settings(block: str) -> dict[str, str]:
     return dict(re.findall(r"^\s*(\w+)\s*=\s*(\S+)", block, re.MULTILINE))
 
@@ -60,9 +71,15 @@ class SeededCDefaultPoolTest(unittest.TestCase):
         node = _settings(_nested(_pool_block(), "node_config"))
         self.assertEqual(
             node.get("machine_type"),
-            _MACHINE_TYPE,
-            "every shared-core E2 size allocates 940m, which a second kube-dns replica fills after a node replacement; fixtures.json's untainted-compute-class-pool asserts this size",
+            '"e2-standard-2"',
+            "every shared-core E2 size allocates 940m, which a second kube-dns replica fills after a node replacement",
         )
+
+    def test_the_catalog_asserts_the_size_the_stack_declares(self):
+        # One size in two files: a resize that changes main.tf alone would read
+        # every pool project drifted on a role no re-apply heals.
+        node = _settings(_nested(_pool_block(), "node_config"))
+        self.assertEqual(node.get("machine_type"), json.dumps(_catalog_machine_type()))
 
     def test_the_kubelet_plant_is_an_integer_the_provider_sends_on_update(self):
         kubelet = _settings(

@@ -35,8 +35,8 @@
 # The pods run on the class-labelled node: the checks read the manifests, the
 # ComputeClass and the pool configuration, never the pod phase. Requests are
 # the smallest the fleet uses, and the pool is an e2-standard-2: main.tf's
-# seeded_c_default says why neither an e2-small nor an e2-medium held these
-# five pods.
+# seeded_c_default says why an e2-small could not hold these five pods and
+# why an e2-medium did not keep them through a node replacement.
 
 provider "kubernetes" {
   alias                  = "seeded_c"
