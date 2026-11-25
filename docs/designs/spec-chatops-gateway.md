@@ -856,14 +856,24 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent's profile doesn't delegate
+(`delegation.profile-not-delegating`: its card lacks `delegates`, from AgentProfile `spec.delegates`, so an operator's card
+from before the field fails closed). A parent that runs at `unattended`
 (a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
 parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
 trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
 (`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
 child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
-end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
-reads while it waits open, and the parent holds the conversation again, so a stop or a steer
+end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
+`delegationRefused` one (#4860), which the parent reads while it waits open. Every request the gateway handles
+for a profile task uses one of its delegation rounds, minted or refused, and a request once the task has used
+them is refused (`delegation.rounds`), with a notice that says how many it used, on its `.in` with `round` set
+to the round it would have been. It mints nothing, records nothing, and ends none of the wait on the earlier
+request's children. The rounds are `A2A_DELEGATION_ROUNDS_MAX`, 1 by default and 1 at most for now: the
+gateway clamps anything above 1 to 1 at startup and logs a warning naming the variable, saying rounds above 1
+are not supported yet, until a profile task's later rounds ship. The operator renders it onto the gateway
+explicitly at 1, and refuses any other value it carries, in its startup log; the chart's
+`operator.delegation.roundsMax` takes only 1. At the default, the parent's second request is the one refused. The parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
 chain's end, delegated or not. A stop while the child runs cancels the child and every profile
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
@@ -875,7 +885,19 @@ queued runs when a slot frees, or is refused at its queue timeout. The cards are
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
-cards, for the delegate tool the worker adapter serves to name in its addressee description. The
+cards, for the delegate tool the worker adapter serves to name in its addressee description. So
+does a delegating profile's own task (#6789): a submission to a profile whose card says it
+delegates, that is neither a child nor a wake, carries the profiles the delegation would accept from
+it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under), and the rounds
+(`roundsMax`, from `A2A_DELEGATION_ROUNDS_MAX`) when they are over one. The list
+runs the delegation's own checks on each profile, so it doesn't offer one the delegation refuses
+whatever cluster it is given: not `platform`, not a profile outside a cluster-scoped parent's
+cluster, only profiles that run at `read` and list `unattended` for a parent below a scheduled run,
+and nobody for a parent refused outright, such as one at the depth cap. The checks that depend on
+the cluster the worker picks for a profile that takes a target (that it is in scope, and a profile
+pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the delegation, which
+still refuses there. A scheduled run of a delegating profile carries the list too, built
+the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
