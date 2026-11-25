@@ -140,6 +140,9 @@ def run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProces
     )
 
 
+_DOCKER_HUB_MIRROR = yaml.safe_load(text(_CLOUDBUILD))["substitutions"]["_DOCKER_HUB_MIRROR"]
+
+
 def build_step(step_id: str) -> dict:
     for step in yaml.safe_load(text(_CLOUDBUILD))["steps"]:
         if step.get("id") == step_id:
@@ -149,6 +152,9 @@ def build_step(step_id: str) -> dict:
 
 def run_build_step(step_id: str, subs: dict[str, str], docker_stub: str) -> subprocess.CompletedProcess:
     script = build_step(step_id)["args"][1].replace("$$", "$")
+    # The Docker Hub mirror takes its declared default unless a test passes it,
+    # as Cloud Build fills an unset substitution (#7033).
+    subs = {"_DOCKER_HUB_MIRROR": _DOCKER_HUB_MIRROR, **subs}
     for name, value in subs.items():
         script = script.replace(f"${name}", value)
     return run_bash(f"{docker_stub}\n{script}")
@@ -171,7 +177,8 @@ class CloudBuildStepTest(unittest.TestCase):
         self.assertEqual(
             result.stdout.splitlines(),
             [
-                f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.web-console a2a",
+                f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.web-console"
+                f" --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang a2a",
                 f"docker push {uri}",
             ],
         )
