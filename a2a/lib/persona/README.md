@@ -72,7 +72,7 @@ checked; `Options.RequireIntegrity` refuses it instead. A profile worker
 sets that from `A2A_PERSONA_INTEGRITY=required`, and logs whether its
 persona loaded verified or unverified. Neither the operator nor the chart
 sets that variable, and an AgentProfile has no field for it: it is a
-worker-level setting, off by default.
+worker-level setting, off by default. The shipped personas don't need it: a build-contract test keeps their manifest present, and a manifest that is present is checked either way.
 
 The check shows that the persona's files are the ones its build recorded:
 it catches a bad build, a corrupted layer or a staging copy that went
@@ -90,6 +90,13 @@ session worker uses it on its Claude Code home, where only `CLAUDE.md` and
 Paths outside the scope are not entered, and a manifest entry outside it is
 refused.
 
+The personas this repository ships commit their manifest beside them, since
+a persona image's Dockerfile is only `FROM` and `COPY`:
+`make persona-manifests` (part of `make docs-generate`) writes them with
+`persona manifest --git --in <dir>` (`a2a/cmd/persona`), which covers only
+the files a clean checkout holds and fails if that copy doesn't load. That
+package's tests fail while a shipped persona's manifest doesn't match it.
+
 A worker that predates this check refuses `skills_manifest.sha256` as a
 top-level file the format does not define. A persona image must not carry
 one until every worker it can run under accepts the name.
@@ -102,9 +109,13 @@ the relay's address, the worker passes in as a `Target`. What a harness
 cannot express comes back as a warning, never an error.
 `render.For(harness)` picks the adapter by the harness the worker is started
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
-`spec.harness.type`, or on a profile worker `PROFILE_HARNESS` when that is
-unset (`claude-code` or `antigravity`; a worker refuses `antigravity` until it
-has a driver for it).
+`spec.harness.type` (and the gateway sets on session pods from the
+PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
+`PROFILE_HARNESS` when that is unset (`claude-code`, `antigravity` or
+`core-agent`). A session pod refuses `antigravity` unless
+`A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
+unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
+worker refuses both, because neither has a persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
@@ -127,6 +138,8 @@ has a driver for it).
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
+- **`core-agent`**: not written yet (it comes with core-agent's persona
+  render, #6713); `render.For` refuses it by name.
 
 ## An example
 

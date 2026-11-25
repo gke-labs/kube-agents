@@ -493,6 +493,7 @@ SOURCES: dict[str, Source] = {
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ),
     ),
     # The platform agent's allowlists as the gateway reads them: the per-target

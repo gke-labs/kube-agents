@@ -142,7 +142,8 @@ var errTopicReadsBusy = fmt.Errorf("this server is already reading %d topics; tr
 // what keeps a caller polling fast from filling the topic streams' and
 // DIRECTORY's consumer caps, which the web console shares. With it, a window costs at
 // most two consumers per distinct answer: the list, the cards, and each
-// spelling of each provisioned topic. A failed read is not kept; an answer
+// spelling of each provisioned topic (up to lib.EphemeralCreateMaxAttempts
+// times that when creates time out). A failed read is not kept; an answer
 // that reports problems is, since the read is not the caller's (below), so a
 // problem is the bus's and the next caller would only meet it again.
 //

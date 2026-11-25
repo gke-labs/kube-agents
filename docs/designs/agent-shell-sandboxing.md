@@ -2803,8 +2803,7 @@ unidentified caller gets an undifferentiated `401` rather than a reason. `CREDEN
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
 the same listener, on every install the A2A gateway's, the A2A MCP server's own
-ServiceAccount unless `A2A_MCP_DOOR=false` (and while this `PlatformAgent` controls it), under
-the operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
+ServiceAccount unless `A2A_MCP_DOOR=false` (and while this `PlatformAgent` controls it), under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it) the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2827,7 +2826,7 @@ design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that calle
 apart from the legacy chat one. It is bound to its caller as the session role is, below:
 `CREDENTIAL_PROXY_A2A_CHAT_CALLERS` names the A2A gateway's own ServiceAccount, which may present
 only the a2a-chat audience, or the a2a-reports audience when `CREDENTIAL_PROXY_A2A_REPORTS_CALLERS` names it too, and no other caller may present that audience; with the list empty,
-as from an operator that doesn't render it, the audience alone decides. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
+as from an operator that doesn't render it, the audience alone decides. Under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it) there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
 (the `profile` and `scope` roles, below, reach it too), and
@@ -2895,7 +2894,9 @@ its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its 
 `CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
 `ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
 for token, each on an argument the `scope.json` at `CREDENTIAL_PROXY_SCOPE_FILE` declares or
-that an earlier lookup returned to the role within five hours. That record of returned members is
+that an earlier lookup returned to the role within five hours. The `clusters list` lookup also
+takes the install's management project (`CREDENTIAL_PROXY_SCOPE_MANAGEMENT_PROJECT`) and a project
+`scope.json` declares that no `exclude.projects` entry matches. That record of returned members is
 memory in the one broker process, so the role stays on the single broker pod
 ([credential-proxy-single-pod.md](credential-proxy-single-pod.md#2-state-that-lives-in-the-pod)).
 

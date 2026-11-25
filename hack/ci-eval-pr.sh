@@ -59,8 +59,9 @@ readonly VALIDATED_CAPABILITIES_PART_KEY='suite_part'
 readonly VALIDATED_CAPABILITIES_PART_LINE_RE="^${VALIDATED_CAPABILITIES_PART_KEY}: [1-9][0-9]*$"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
-# (#3384, #4238): a stack-bearing case on no list runs in main-a, which
-# otherwise holds only the onboarding cases' chain (unit_state_lock).
+# (#3384, #4238): a stack-bearing case that takes the infra lock and is on
+# no list runs in main-a, which otherwise holds only the onboarding cases'
+# chain (unit_state_lock).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
 readonly EVAL_NIGHTLY_MAIN_C_FILE="eval/nightly-main-c.txt"
 readonly EVAL_NIGHTLY_MAIN_D_FILE="eval/nightly-main-d.txt"
@@ -270,6 +271,7 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 # long enough for a slow API server, short against the 5m grace period.
 readonly EVAL_CANCEL_CUTS_MODEL_JOB_TYPES="presubmit batch"
 readonly EVAL_CANCEL_SCALE_REQUEST_TIMEOUT="30s"
+readonly EVAL_CANCEL_MARKER="cancelled"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -357,6 +359,8 @@ readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
+# A first-run audit's pause comes after one more read of the roster and the
+# runs' ledger, bounded at 10s by the ledger's busy timeout.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
@@ -669,7 +673,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
     exit 1
   fi
   if ! openssl x509 -noout -text -in "${EVAL_FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
-    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh (kube-agents#3682)." >&2
     exit 1
   fi
 fi
@@ -1055,6 +1059,9 @@ stop_model_calls_on_cancel() {
   done
   [ -n "${cuts}" ] || return 0
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cancelled (JOB_TYPE=${JOB_TYPE}): stopping the fan-out and the model gateway before collecting artifacts ==="
+  if [ -n "${STATE_DIR:-}" ] && [ -d "${STATE_DIR}" ]; then
+    : > "${STATE_DIR}/${EVAL_CANCEL_MARKER}"
+  fi
   # Only the units still in this shell's job table: a finished unit's PID may
   # since belong to some other process.
   local pid frozen="" running
@@ -4248,7 +4255,17 @@ infra_lock_exempt() { # <task-name>
     # on the host cluster, through a kubeconfig of its own. In the install it
     # writes one daemon session, with the ledger row and card that its event
     # produces, which no other stack rewrites, so it needs no state lock.
-    oobe-first-run-audits | autoops-warning-event-no-action-triage) return 0 ;;
+    # fleet-audit-scheduled-run-files-the-finding waits out one full scheduled
+    # audit inside its stack's apply, for up to its run_wait, which is past
+    # INFRA_LOCK_LONGEST_HOLD_SECONDS. In the install its stack moves one
+    # stream's stored report and digest record aside and puts them back, which
+    # its stream lock (audit_streams) keeps to one unit at a time, and it
+    # writes that stream's entry in the Platform Agent's cron roster.
+    # oobe-first-run-audits' and unchanged-manifest-digest's stacks write
+    # that roster too: the nightly's main part runs their cases in other
+    # shards, on other installs (scripts/test_ci_eval_nightly.py holds that),
+    # and a run of every case on one install has no lock between them.
+    oobe-first-run-audits | autoops-warning-event-no-action-triage | fleet-audit-scheduled-run-files-the-finding) return 0 ;;
   esac
   return 1
 }
@@ -4256,7 +4273,11 @@ infra_lock_exempt() { # <task-name>
 # rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
 # markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
 # Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
-# from the others, so this lock does.
+# from the others, so this lock does. One state has no lock: the Platform
+# Agent's cron roster, which the stacks infra_lock_exempt's comment names
+# each write an entry of. Their cases run in different shards of the
+# nightly's main part instead (scripts/test_ci_eval_nightly.py), and a run
+# of every case on one install has no lock between them.
 unit_state_lock() { # <task-name>
   case "$1" in
     oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-discovery-capped | bootstrap-inventory-ranking-delivery | bootstrap-inventory-posture-scope) echo "onboarding" ;;
@@ -4953,6 +4974,10 @@ unit_cost_hint() {
     # early, and the presubmit wall estimate in
     # scripts/eval_rosters.py (#3987) is priced from these hints.
     consistency-drift-outlier) echo 600 ;;
+    # The same full drift audit as consistency-drift-outlier, graded on
+    # another finding of the same ledger. Priced with it, not measured on a
+    # lane yet.
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 600 ;;
     # On the blocking roster since 2026-11-02 (#4095), the presubmit's one
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
@@ -4975,6 +5000,17 @@ unit_cost_hint() {
     # waits out: a full audit on an image without the gate, a collector and a
     # precheck with it. Unmeasured; priced at the band plus the plant.
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
+    # One real scheduled compliance audit the stack fires and waits out, with
+    # the stream's stored report and digest record moved aside, so a full
+    # audit every time. The fired run took 11 to 13 minutes on two dev
+    # installs; unmeasured on a lane. Off the infra lock (infra_lock_exempt),
+    # so it is in none of the stack chains this hint prices; priced as the
+    # case above, over compliance-rbac-overgrant's requested run, so it
+    # launches early.
+    fleet-audit-scheduled-run-files-the-finding) echo 1200 ;;
+    # The stack of fleet-audit-unchanged-finding-keeps-wording and the same
+    # full drift audit, with another plant state. Unmeasured on the lane.
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 900 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that
@@ -5235,7 +5271,9 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
@@ -5346,6 +5384,7 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # verification wholesale (evalharness/default.py, "skipped_no_infra") and
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
+export STATE_DIR
 
 # The units the card fence could not run before (fence_live_cards): one reason
 # file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
@@ -5398,7 +5437,9 @@ fi
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
 #   per state  -- cases whose stacks rewrite the same agent-install state
-#                 (unit_state_lock) never overlap. A unit off the infra lock
+#                 (unit_state_lock) never overlap; the cron roster is the
+#                 state with no such lock (unit_state_lock's comment). A unit
+#                 off the infra lock
 #                 takes it after its streams and wait_platform_runs; a
 #                 stack-bearing unit takes it only while it holds the infra
 #                 lock, in one try, giving the infra lock back when it is
@@ -5407,7 +5448,9 @@ fi
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label,
-#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unchanged-finding-keeps-wording,
+#                 fleet-audit-remediation-right-and-not-stale,
+#                 fleet-audit-wrong-kept-remediation-gives-way, and
 #                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
@@ -6456,6 +6499,12 @@ report_github_leftovers() {
     echo "WARNING: ${forge} leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
+  # A unit's token file is exported for that unit alone and unset at its stop
+  # (stop_ledger_token_renewal), so a BENCH_GITHUB_TOKEN_FILE set here is the
+  # caller's shell's, and the listing would read it in preference to
+  # BENCH_GITHUB_TOKEN: the token minted above, or the mounted one when there
+  # is no App key. The units drop it the same way (start_ledger_token_renewal).
+  unset BENCH_GITHUB_TOKEN_FILE
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
     echo "WARNING: ${forge} leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."

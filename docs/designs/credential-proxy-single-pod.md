@@ -39,7 +39,9 @@ keep state in the process or in the pod's emptyDir:
   its `projects describe` are admitted only for a value an earlier lookup by the same role
   returned, and `scope_policy.MemberWindow` records those values in the process that ran the
   lookup. A probe that reaches another pod finds an empty window and is refused, so the
-  publisher's run fails closed.
+  publisher's run fails closed. The probe of the management project or of a project `scope.json`
+  names in `projects` needs no window, since the broker reads both from its own environment and
+  file.
 
 - The Google Chat relay. A pull keeps its `receipt → ack_id` map in the process that pulled.
 - The Slack relay. Each pod opens its own Socket Mode connection, and Slack spreads events

@@ -493,15 +493,16 @@ SOURCE_PROFILES_WALK = "profiles-walk"
 # One project's status in that answer. LISTED: `clusters` holds the clusters
 # the source knows (possibly none). LIST_LIVE: the source does not list this
 # project and the caller lists it itself, as it did before (the management
-# project and the explicit projects, which the publisher never probes).
+# project and the explicit projects: the publisher's `clusters` map may hold
+# them too, but a reader lists them live, as before).
 # UNREAD: nothing listed it and nothing should be invented; `reason` says why.
 # `clusters` is None for both of the last two, so a caller that iterates it
 # without checking the status fails rather than reading "no clusters".
 STATUS_LISTED = "listed"
 STATUS_LIST_LIVE = "list-live"
 STATUS_UNREAD = "unread"
-LIVE_MANAGEMENT_REASON = "the management project: the scope publisher never lists it; list it live"
-LIVE_EXPLICIT_REASON = "an explicit spec.scope project: the scope publisher never lists it; list it live"
+LIVE_MANAGEMENT_REASON = "the management project: list it live"
+LIVE_EXPLICIT_REASON = "an explicit spec.scope project: list it live"
 NO_ENTRY_REASON = "the resolved scope has no cluster list for this member project yet (row outcome {outcome})"
 DOCUMENT_UNREAD_REASON = "the resolved scope at {path} {problem}, so no member project's clusters are known"
 
