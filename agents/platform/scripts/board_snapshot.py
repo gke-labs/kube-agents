@@ -217,7 +217,8 @@ def live_projects(scope: fleet_scope_targets.ScopeClusters) -> set[str]:
 def live_identities(scope: fleet_scope_targets.ScopeClusters, profiles_dir: Path | None) -> dict[str, tuple[str, str]]:
     """Profile name -> (project, cluster) for the clusters of the projects listed live.
 
-    The scope publisher never lists those projects and the board runs no
+    The board reads no cluster list for them here (the helper scripts list
+    these projects live, whatever the scope publisher's map holds) and runs no
     ``gcloud``, so their Cluster Agent profiles (which exist under next until
     they retire, #3658 4d) name their clusters, as outside next. The walk is
     filtered to those projects: a member project's clusters come from the

@@ -18,8 +18,9 @@
 # runs kubectl with no Skill call and the-session-loads-a-gke-skill fails.
 # With the view off the case cannot tell main from this PR (below).
 #
-# VIEW ON OR OFF: nothing in an inject record says which. The view is the
-# operator's A2A_SESSION_CLUSTER_VIEW, rendered onto the gateway and the
+# VIEW ON OR OFF: nothing in an inject record says which. The view is on by
+# default on the session route, or with the operator's A2A_SESSION_CLUSTER_VIEW,
+# rendered onto the gateway and the
 # session pod's A2A_CLUSTER_VIEW; the probe carries no field for it, the
 # clusterViewPrompt is in the harness's argv and never in the trace, and the
 # trace is only the tool calls (inject_transport.EVENT_ENTRY_ACTIVITY). The

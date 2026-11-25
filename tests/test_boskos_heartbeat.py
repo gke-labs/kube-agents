@@ -9,9 +9,10 @@ not stop the loop, and the stop summary then carries one WARNING naming the
 lost lease; beats resume after a hang; missing env disables the daemon with
 one line; a caller that dies without its EXIT trap (SIGKILL) takes the daemon
 with it at the next beat, so it never holds the job's log pipe open; detail
-lines carry a well-formed UTC stamp. One check is static: the script holds no
-command substitution, because bash 5.2 can run the TERM trap from inside the
-parser (the script's header says how).
+lines carry a well-formed UTC stamp; a TERM that lands in the interval sleep
+stops the daemon at once and leaves no sleep on the job's pipe. One check is
+static: the script holds no command substitution, because bash 5.2 can run
+the TERM trap from inside the parser (the script's header says how).
 """
 
 import os
@@ -36,6 +37,10 @@ TEST_INTERVAL_SECONDS = "0.2"
 # Ceiling for any wait_until: far above worst-case scheduling noise, never
 # slept in full on a healthy run.
 WAIT_DEADLINE_SECONDS = 30.0
+# An interval no wait in this file outlasts: a daemon that sits out its sleep
+# before it answers a TERM, or leaves the sleep behind, runs into
+# WAIT_DEADLINE_SECONDS first.
+SLEEP_OUTLASTING_EVERY_WAIT_SECONDS = "600"
 # Production ratio, asserted as arithmetic only: 30s beats against the ~5m
 # Boskos reaper window leave a 10-beat budget.
 PRODUCTION_INTERVAL_SECONDS = 30
@@ -138,7 +143,7 @@ class BoskosHeartbeatTest(unittest.TestCase):
         """Run a bash caller that starts the daemon itself, same env as _spawn."""
         return self._popen(["bash", "-c", script], env_overrides)
 
-    def _popen(self, argv, env_overrides):
+    def _popen(self, argv, env_overrides, **popen_kwargs):
         env = {
             **os.environ,
             "BOSKOS_HOST": self.host,
@@ -155,6 +160,7 @@ class BoskosHeartbeatTest(unittest.TestCase):
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
+            **popen_kwargs,
         )
 
     def _stop(self, proc):
@@ -289,6 +295,54 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: _has_exited(daemon_pid)),
                         "the daemon is still running after its caller died")
 
+    def test_a_term_during_the_sleep_stops_the_daemon_at_once(self):
+        # The caller's EXIT trap TERMs the daemon, almost always while it
+        # sleeps out the interval. bash runs a trap only after a foreground
+        # child returns, so a foreground sleep held the TERM, and the job's
+        # stdout pipe that Prow's entrypoint waits on, for up to the interval.
+        # Its own session, so a failing run can remove the daemon and its
+        # sleep together.
+        proc = self._popen(
+            ["bash", str(HEARTBEAT_SCRIPT)],
+            {"BOSKOS_HEARTBEAT_INTERVAL_SECONDS": SLEEP_OUTLASTING_EVERY_WAIT_SECONDS},
+            start_new_session=True,
+        )
+        self.addCleanup(self._kill_session, proc)
+        # The TERM goes out only once the sleep is running: one that lands
+        # before the fork stops any daemon at once and proves nothing.
+        self.assertTrue(wait_until(lambda: self._sleeping_child(proc.pid)),
+                        "the daemon never reached its interval sleep")
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=WAIT_DEADLINE_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.fail("the daemon sat out its sleep before it ran the TERM trap")
+        self.assertEqual(proc.returncode, 0)
+        # EOF arrives only when the last holder of the pipe has closed it: a
+        # sleep the daemon left behind hangs here, as it would hang the job.
+        try:
+            stdout = proc.communicate(timeout=WAIT_DEADLINE_SECONDS)[0]
+        except subprocess.TimeoutExpired:
+            self.fail("the daemon left its sleep holding the job's stdout pipe")
+        self.assertIn("stopping for", stdout)
+        self.assertEqual(len(_FakeBoskos.updates), 1, "the TERM landed in the first sleep")
+
+    @staticmethod
+    def _sleeping_child(pid):
+        """True while pid has a child named sleep."""
+        return subprocess.run(
+            ["pgrep", "-P", str(pid), "sleep"], capture_output=True,
+        ).returncode == 0
+
+    @staticmethod
+    def _kill_session(proc):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        proc.stdout.close()
+
     def test_no_command_substitution_while_the_trap_is_armed(self):
         # bash 5.2 runs a pending trap from inside the parser when a signal
         # lands while it re-parses a $(...) or <(...) for expansion; the
@@ -316,9 +370,9 @@ class BoskosHeartbeatTest(unittest.TestCase):
 
     def test_a_daemons_stop_leaves_another_daemons_capture_file_alone(self):
         # Steps hand off within seconds and share one log, and a stopped
-        # daemon runs its summary up to one interval later. Its cleanup must
-        # remove only its own capture file: removing the next daemon's mid-curl
-        # makes that beat read as a false 000.
+        # daemon runs its summary only once the beat under way returns. Its
+        # cleanup must remove only its own capture file: removing the next
+        # daemon's mid-curl makes that beat read as a false 000.
         other = Path(f"{self.beat_log}.capture")
         other.write_text("200")
         proc = self._spawn()
