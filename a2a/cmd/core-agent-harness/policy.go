@@ -106,12 +106,18 @@ func toolPolicyPlugin(permitted map[string]bool, log io.Writer, shell []string) 
 		// Every tool error passes through here, the plugin's own refusal
 		// included. Returning nothing leaves the error as the tool's
 		// result.
-		OnToolErrorCallback: func(_ agent.Context, t adktool.Tool, args map[string]any, err error) (map[string]any, error) {
+		OnToolErrorCallback: func(ctx agent.Context, t adktool.Tool, args map[string]any, err error) (map[string]any, error) {
 			name := ""
 			if t != nil {
 				name = t.Name()
 			}
-			logRefusal(log, name, err)
+			callID := ""
+			if ctx != nil {
+				// The tool context's call id, the one the turn's tool_call
+				// event carries, so a refusal maps to its call.
+				callID = ctx.FunctionCallID()
+			}
+			logRefusal(log, name, callID, err)
 			if name == "bash" && err != nil && strings.Contains(err.Error(), noAllowRule) {
 				command, _ := args["command"].(string)
 				if hint := shellRefusalHint(command, shell); hint != "" {
@@ -198,10 +204,10 @@ var refusalReasons = []struct{ phrase, reason string }{
 }
 
 // logRefusal writes one line for a refused call: the prefix, the tool's
-// name and why, never its arguments (core-agent's error texts quote the
+// name and why, then the call's id when there is one, never its arguments (core-agent's error texts quote the
 // command or path, so they aren't logged). An error that isn't a refusal,
 // a missing file say, writes nothing.
-func logRefusal(w io.Writer, tool string, err error) {
+func logRefusal(w io.Writer, tool, callID string, err error) {
 	if w == nil || err == nil {
 		return
 	}
@@ -222,7 +228,11 @@ func logRefusal(w io.Writer, tool string, err error) {
 	if reason == "" {
 		return
 	}
-	_, _ = fmt.Fprintf(w, "%s%s (%s)\n", RefusalLogPrefix, strconv.Quote(tool), reason)
+	line := fmt.Sprintf("%s%s (%s)", RefusalLogPrefix, strconv.Quote(tool), reason)
+	if callID != "" {
+		line += " call " + strconv.Quote(callID)
+	}
+	_, _ = fmt.Fprintln(w, line)
 }
 
 // noAllowRule is core-agent's gate refusing, in allow mode, a call no allow
