@@ -80,7 +80,14 @@ func (a *TeamsAdapter) feedbackRecorder() FeedbackRecorder {
 // names a post the agent made on its own (an alert its triage edits, a
 // report) draws none: Teams rates answers only.
 func (a *TeamsAdapter) rates(m OutMessage) bool {
-	return m.Chat == nil && m.Feedback != "" && postKindOf(m.Feedback) == "" && a.feedbackRecorder() != nil
+	return m.Chat == nil && a.ratesTask(m.Feedback)
+}
+
+// ratesTask reports whether a message marked for feedback under task
+// carries the rating controls: an answer's task, with the recorder handed
+// over. A laid-out answer carries them too (teams_chat.go).
+func (a *TeamsAdapter) ratesTask(task string) bool {
+	return task != "" && postKindOf(task) == "" && a.feedbackRecorder() != nil
 }
 
 // teamsRatingActions is the rating controls for the message rated under
@@ -218,10 +225,26 @@ func (a *TeamsAdapter) rate(recorder FeedbackRecorder, r FeedbackRating, note st
 	}
 	text := rated.text + "\n\n" + teamsRatingRecordedLine
 	actions := teamsRatingActions(rated.task, recorder.KeptDays())
+	// A laid-out answer keeps its own buttons, the rating controls among
+	// them (teams_chat.go).
+	a.mu.Lock()
+	card, laidOut := a.uxLocked().cards[r.MessageID]
+	a.mu.Unlock()
+	if laidOut {
+		text, actions = teamsWithLine(card.text, teamsRatingRecordedLine), card.actions()
+	}
 	if teamsFitsCard(text, actions) {
 		if err := a.edit(r.Conversation, r.MessageID, text, actions); err != nil {
 			a.log.Warn("teams rated card was not redrawn", "conversation", r.Conversation, "err", err)
 			return
+		}
+		if laidOut {
+			a.mu.Lock()
+			if now, still := a.uxLocked().cards[r.MessageID]; still {
+				now.text = text
+				a.uxLocked().cards[r.MessageID] = now
+			}
+			a.mu.Unlock()
 		}
 	}
 	a.mu.Lock()

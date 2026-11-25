@@ -255,6 +255,12 @@ type TeamsAdapter struct {
 	rateMu sync.Mutex
 	// rating counts the ratings in flight, for a test to wait on.
 	rating sync.WaitGroup
+	// ux is the adapter's record of its laid-out messages: the questions
+	// open, the answers waiting on the gateway's verdict, and what each
+	// card shows (teams_clicks.go). rewrites counts the answered
+	// questions being drawn again, for a test to wait on.
+	ux       *teamsUX
+	rewrites sync.WaitGroup
 
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
@@ -419,6 +425,7 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + act.ID
 	}
+	a.noteTypedAnswer(teamsConversationID(conversation), act.ID, text, act.From.Name)
 	return InboundMessage{
 		Conversation: teamsConversationID(conversation),
 		Kind:         kind,
@@ -857,14 +864,18 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	return nil
 }
 
-// PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
+// PostMessage and EditMessage lay a chat message out as an Adaptive Card
+// with its buttons (teams_chat.go), or refuse the layout (ErrLayoutRefused)
+// so the gateway posts its text; with cards off a chat message falls back
+// to its text (ErrTextOnly). Text is rendered as a card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
 // (teams_press.go); an edit that names no task removes it. An answer marked
 // for feedback (m.Feedback) carries the rating controls on its card, once
 // the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
 	switch {
+	case m.Chat != nil && a.adaptiveCards:
+		return a.postChat(conversation, m)
 	case m.Chat == nil && m.Stop != "":
 		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
 	case a.rates(m):
@@ -874,6 +885,15 @@ func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, e
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	if m.Chat != nil && a.adaptiveCards {
+		return a.editChat(conversation, messageID, m)
+	}
+	if m.Chat == nil {
+		// The message is text from here: it asks nothing any more, and an
+		// answered question keeps its line (teams_clicks.go).
+		m.Text = a.withAnsweredLine(messageID, m.Text)
+		a.trackQuestion(messageID, conversation, nil, nil)
+	}
 	switch {
 	case m.Chat == nil && m.Stop != "":
 		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
