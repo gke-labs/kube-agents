@@ -10,6 +10,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/claudecode"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
 )
 
 // For returns the adapter for h, the harness value the worker is started
@@ -22,8 +23,10 @@ func For(h persona.Harness) (persona.Adapter, error) {
 	switch h {
 	case persona.ClaudeCode:
 		return claudecode.Adapter{}, nil
-	case persona.Antigravity, persona.CoreAgent:
+	case persona.Antigravity:
 		return nil, fmt.Errorf("harness %q has no persona adapter yet", h)
+	case persona.CoreAgent:
+		return coreagent.Adapter{}, nil
 	}
 	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
 }
