@@ -3,8 +3,9 @@
 The broker refuses an excluded cluster on every path to its Kubernetes
 API (scope_exclude). A gcloud read about a cluster through the GKE or Logging
 API is a separate path, and before this it was held to the install's scope only
-by a profile task's single-cluster confinement. Here it is held for every
-caller. spec.hold is not consulted: a hold pauses the agents' reach into a
+by a profile task's single-cluster confinement. Here the reads that name a
+cluster are held for every caller, and the project-wide listings for sessions
+and profile tasks. spec.hold is not consulted: a hold pauses the agents' reach into a
 cluster and leaves its metadata readable (scope_exclude.Exclusions.check's
 include_holds).
 
@@ -22,12 +23,20 @@ include_holds).
     any of which could swallow the clause) is refused while anything is
     excluded.
 
+  - `container clusters list` and `container operations list`, for the callers
+    credential_proxy.LISTING_FILTERED_ROLES names (sessions and profile tasks),
+    get a `--filter` clause that drops excluded clusters by name, in any
+    project and location (scoped_listing_argv). A filter the clause can't be
+    ANDed onto safely is refused. The relay's cluster list has a matching hook
+    (filtered_cluster_list), unused while the shell isn't a filtered caller.
+
 Every other command, and every command on an install that excludes
 nothing, is returned unchanged.
 """
 
 from __future__ import annotations
 
+import json
 import os
 
 import command_policy
@@ -50,6 +59,19 @@ CLUSTERS_DESCRIBE = ("container", "clusters", "describe")
 NODE_POOL_COMMANDS = frozenset({("container", "node-pools", "list"), ("container", "node-pools", "describe")})
 _NODE_POOL_WORDS = 3
 LOGGING_READ = ("logging", "read")
+CLUSTERS_LIST = ("container", "clusters", "list")
+OPERATIONS_LIST = ("container", "operations", "list")
+FILTER_FLAG = "--filter"
+# A projected clusters.list answer's keys (api_policy.project_gke_cluster_list).
+_CLUSTER_LIST_KEY = "clusters"
+_ROW_NAME = "name"
+_ROW_LOCATION = "location"
+# The gcloud filter terms that drop excluded clusters from a project-wide
+# listing, around scope_exclude.Exclusions.excluded_names_pattern: a cluster by
+# its name, an operation by the cluster its target link names.
+LISTING_NAME_CLAUSE = 'NOT name~"{pattern}"'
+LISTING_OPERATION_CLAUSE = 'NOT targetLink~"/clusters/({names})(/|$)"'
+LISTING_FILTER_JOIN = " AND "
 
 # A cluster's full resource name, which gcloud also takes in place of a bare
 # name: projects/P/locations/L/clusters/C (zones/ for the zonal form).
@@ -80,6 +102,10 @@ UNREADABLE_FILTER = (
     "this install excludes clusters, and the broker can't add its exclusion to this"
     " logging filter safely (an open string, a single quote, a -- comment or unbalanced parentheses);"
     " fix the filter"
+)
+UNREADABLE_LISTING_FILTER = (
+    "this install excludes clusters, and the broker can't add its exclusion to this listing's --filter"
+    " safely (an open string or unbalanced parentheses); fix the filter"
 )
 UNREADABLE_COMMAND = (
     "this install excludes clusters, and the broker can't read this command's flags"
@@ -200,6 +226,35 @@ def filter_is_appendable(text: str) -> bool:
             if depth < 0:
                 return False
     return not in_string and depth == 0
+
+
+def gcloud_filter_is_appendable(text: str) -> bool:
+    """Whether a gcloud `--filter` is safe to wrap in parentheses and AND onto:
+    every string closed (gcloud takes double and single quotes alike) and
+    parentheses outside strings balanced and never closing below zero. gcloud's
+    filter language has no comments, so `--` (as in a cluster name) is
+    ordinary text here."""
+    depth = 0
+    quote = ""
+    escaped = False
+    for char in text:
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == _ESCAPE:
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in (_QUOTE, _SINGLE_QUOTE):
+            quote = char
+        elif char == _OPEN:
+            depth += 1
+        elif char == _CLOSE:
+            depth -= 1
+            if depth < 0:
+                return False
+    return not quote and depth == 0
 
 
 def _combine(text: str, clause: str) -> str:
@@ -328,3 +383,71 @@ def _anything_excluded(exclusions: scope_exclude.Exclusions) -> bool:
         return exclusions.log_exclusion_clause() is not None
     except scope_exclude.ExcludedCluster:
         return True
+
+
+def scoped_listing_argv(argv: list[str], exclusions: scope_exclude.Exclusions) -> list[str]:
+    """argv with a project-wide cluster listing's `--filter` scoped to the
+    install's exclusions: `container clusters list` drops excluded clusters by
+    name, and `container operations list` drops operations on them. gcloud
+    applies `--filter` before any `--format`, so every output format is covered.
+    The names match in any project and location, more than the exclusion,
+    never less. A caller's filter the clause can't be ANDed onto safely is
+    refused while any cluster is excluded; a repeated `--filter` keeps its last
+    value, as gcloud reads it. Returns argv itself when nothing applies.
+    """
+    walked = _gcloud_walk(argv)
+    if walked is None:
+        return argv
+    flags, _, words = walked
+    if _is_help(flags):
+        return argv
+    if words[:len(CLUSTERS_LIST)] == CLUSTERS_LIST:
+        template = LISTING_NAME_CLAUSE
+    elif words[:len(OPERATIONS_LIST)] == OPERATIONS_LIST:
+        template = LISTING_OPERATION_CLAUSE
+    else:
+        return argv
+    pattern = exclusions.excluded_names_pattern()
+    if pattern is None:
+        return argv
+    names = pattern[len(scope_exclude.LOG_REGEX_OPEN):-len(scope_exclude.LOG_REGEX_CLOSE)]
+    clause = template.format(pattern=pattern, names=names)
+    caller_filter = flags.get(FILTER_FLAG, "")
+    if caller_filter.strip() and not gcloud_filter_is_appendable(caller_filter):
+        raise scope_exclude.ExcludedCluster(scope_exclude.RULE_EXCLUDED_CLUSTER, UNREADABLE_LISTING_FILTER)
+    combined = f"({caller_filter}){LISTING_FILTER_JOIN}{clause}" if caller_filter.strip() else clause
+    return [*_without_flag(argv, FILTER_FLAG), f"{FILTER_FLAG}={combined}"]
+
+
+def _without_flag(argv: list[str], name: str) -> list[str]:
+    """argv less every `name=value` and `name value` occurrence."""
+    out: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token == name:
+            skip = True
+            continue
+        if token.startswith(name + "="):
+            continue
+        out.append(token)
+    return out
+
+
+def filtered_cluster_list(body: bytes, project: str, exclusions: scope_exclude.Exclusions) -> bytes:
+    """A projected `clusters.list` answer (api_policy.project_gke_cluster_list)
+    less the clusters the install excludes, judged by their own project, location
+    and name. Raises ExcludedCluster when the scope file can't be read."""
+    answer = json.loads(body)
+    kept = []
+    for row in answer.get(_CLUSTER_LIST_KEY, []):
+        try:
+            exclusions.check(project, row.get(_ROW_LOCATION, ""), row.get(_ROW_NAME, ""), include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            if exc.rule == scope_exclude.RULE_EXCLUDE_UNREADABLE:
+                raise
+            continue
+        kept.append(row)
+    return json.dumps({**answer, _CLUSTER_LIST_KEY: kept}, separators=(",", ":")).encode()

@@ -265,3 +265,10 @@ func TestMarkerTextInContentDoesNotResetTheHistory(t *testing.T) {
 		t.Errorf("history has %d events, want all 3: %s", len(env.History), b)
 	}
 }
+
+// core-agent reads no config dir, so it names none for the harness env.
+func TestCoreAgentNamesNoConfigDir(t *testing.T) {
+	if kv := newCoreAgentDriver().ConfigDirEnv("/x"); kv != "" {
+		t.Errorf("ConfigDirEnv = %q, want empty", kv)
+	}
+}
