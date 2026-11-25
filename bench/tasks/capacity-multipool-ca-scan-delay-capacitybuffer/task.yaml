@@ -1,0 +1,80 @@
+# Probe for multi-pool Cluster Autoscaler scan delays on dynamic workloads
+# (#2900, #3008, #7096): when a cluster runs 28 specialized/tainted GPU node
+# pools and a controller spawns short-lived `render-<uuid>` Deployments without
+# a nodeSelector or ComputeClass selector, Cluster Autoscaler must evaluate
+# predicates across every pool on each scan, delaying scale-up by 10-14+
+# minutes. Per-Deployment GitOps PRs are not viable for UUID-suffixed
+# workloads; durable remediation uses namespace-level
+# `cloud.google.com/default-compute-class` plus `CapacityBuffer`
+# (`capacitybuffers.autoscaling.x-k8s.io/v1beta1`) for warm headroom.
+#
+# The objective is a verdict line the prompt asks for plus both required
+# mechanisms (`cloud.google.com/default-compute-class` and `CapacityBuffer`).
+# Each verdict line pattern is anchored at both ends (`^...$`) under
+# `fold_decoration: true` so a hedged verdict line fails and a bulleted or
+# sentence-opening explanation of why `VERDICT: USE-PER-DEPLOYMENT-PR` does not
+# apply passes. `bench/tests/test_capacity_multipool_ca_scan_delay_verdict.py`
+# pins both sides.
+#
+# The prompt's sentence about a hand-off is for the Planning Agent, so a
+# delegated card keeps the verdict-line instruction.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: capacity-multipool-ca-scan-delay-capacitybuffer
+name: Multi-pool CA scan delays on dynamic UUID workloads are fixed by namespace default ComputeClass and CapacityBuffer
+
+domain: capacity
+
+prompt: >-
+  Our GKE cluster has 28 specialized and tainted GPU node pools. A controller
+  spawns short-lived Deployments named `render-<uuid>` in namespace
+  `imaging-jobs` with no `nodeSelector` or ComputeClass selector. During
+  traffic bursts, Cluster Autoscaler takes 12 minutes to trigger a scale-up
+  even though quota is available. Per-Deployment GitOps PRs are not viable
+  because names include a random UUID. What causes the delay, and what two
+  Kubernetes/GKE mechanisms give durable targeting and warm headroom? Start
+  your answer with `VERDICT: USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER` or
+  `VERDICT: USE-PER-DEPLOYMENT-PR` on its own line, with nothing else on that
+  line. If you hand this question to another agent, pass these instructions
+  word for word, and keep its verdict line at the start of your reply. Do not
+  change anything.
+expected_output: >-
+  VERDICT: USE-NAMESPACE-DEFAULT-AND-CAPACITYBUFFER. Untargeted pods force
+  Cluster Autoscaler to evaluate scheduling predicates across all 28
+  specialized/tainted node pools on each scan loop, delaying scale-up by
+  10-14+ minutes. Because the controller creates ephemeral `render-<uuid>`
+  Deployments, per-Deployment GitOps PRs cannot keep up; fix it durably by
+  (1) setting the namespace label `cloud.google.com/default-compute-class` on
+  `imaging-jobs` so untargeted pods automatically inherit ComputeClass
+  targeting, and (2) provisioning a `CapacityBuffer`
+  (`capacitybuffers.autoscaling.x-k8s.io/v1beta1`) to maintain warm spare
+  headroom during bursts.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: verdict-and-both-targeting-headroom-mechanisms-are-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^verdict:\\s*use-namespace-default-and-capacitybuffer$"
+        - "(?m)^(?!verdict:).*\\bcloud\\.google\\.com/default-compute-class(?![a-z0-9-])"
+        - "(?m)^(?!verdict:).*\\b(?:capacitybuffers?|capacity[\\s-]+buffers?)\\b"
+      forbidden_patterns:
+        - "(?m)^verdict:\\s*use-per-deployment-pr$"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
