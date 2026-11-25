@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -148,6 +149,11 @@ func TestADelegatingProfileRootListsWhatTheDelegationAccepts(t *testing.T) {
 		if got.WidthMax != r.g.cfg.DelegationWidthMax || got.Truncated {
 			t.Fatalf("%s's width = %d (truncated %v), want %d", tc.parent, got.WidthMax, got.Truncated, r.g.cfg.DelegationWidthMax)
 		}
+		// At the one round there is by default the part carries no
+		// rounds, as a worker built before rounds reads it.
+		if got.RoundsMax != 0 || got.Rounds() != 1 {
+			t.Fatalf("%s's rounds = %d, want none advertised at the default of 1", tc.parent, got.RoundsMax)
+		}
 		for _, e := range tc.listed {
 			conv := "console:tab-listed-" + tc.parent + "-" + e.name
 			if minted, _, _ := delegateFrom(t, r, conv, tc.parent, lib.DelegateTask{Addressee: e.name, Text: "look", Parameters: e.params}); !minted {
@@ -188,6 +194,38 @@ func TestAProfileParentTheDelegationRefusesOutrightListsNobody(t *testing.T) {
 	}
 }
 
+// TestAProfileParentsListAdvertisesRoundsOverOne: the part carries the
+// delegation rounds only over one, so at the default it is the shape a worker
+// built before rounds reads, with no roundsMax on the wire. Over one is set
+// on the config directly here: New clamps it to 1 until later rounds land.
+func TestAProfileParentsListAdvertisesRoundsOverOne(t *testing.T) {
+	t.Parallel()
+	r := startDelegateTargetsRig(t)
+	rec := &SessionRecord{Key: "console:tab-rounds"}
+	requester := TaskRequester{Backend: consoleBackend, Subject: "hmac:00"}
+	parent := TaskRef{Addressee: "chat", Tier: string(capability.TierRead), Scope: installScope, Requester: &requester}
+	if r.g.cfg.DelegationRoundsMax != 1 {
+		t.Fatalf("the rig's rounds = %d, want New's default of 1", r.g.cfg.DelegationRoundsMax)
+	}
+	part, err := lib.DelegateTargetsPart(r.g.profileDelegateTargets(rec, parent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(part.Data), "roundsMax") {
+		t.Fatalf("the part at one round carries roundsMax: %s", part.Data)
+	}
+	g := &Gateway{cfg: &Config{DelegationRoundsMax: 3}}
+	if got := g.advertisedRounds(); got != 3 {
+		t.Fatalf("advertised rounds at 3 = %d, want 3", got)
+	}
+	for _, n := range []int{0, 1} {
+		g.cfg.DelegationRoundsMax = n
+		if got := g.advertisedRounds(); got != 0 {
+			t.Fatalf("advertised rounds at %d = %d, want none", n, got)
+		}
+	}
+}
+
 // TestAProfileSubmissionWithoutAListIsAsBefore: a profile whose card doesn't
 // delegate, and a child of one that does, are submitted byte for byte as
 // they were before the list (#6789): no delegateTargets part, nothing else
@@ -195,6 +233,9 @@ func TestAProfileParentTheDelegationRefusesOutrightListsNobody(t *testing.T) {
 func TestAProfileSubmissionWithoutAListIsAsBefore(t *testing.T) {
 	t.Parallel()
 	r := startDelegateTargetsRig(t)
+	// Rounds over one, set past New's clamp, move nothing either: they ride
+	// only the list.
+	r.g.cfg.DelegationRoundsMax = 3
 	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	asBefore := func(what string, env *lib.Envelope, params map[string]string, tier capability.Tier, kind string) {
@@ -352,6 +393,7 @@ func TestAScheduledRunListsWhatItsDelegationAccepts(t *testing.T) {
 func TestAScheduledRunOfANonDelegatingProfileIsAsBefore(t *testing.T) {
 	t.Parallel()
 	tr := startTriggerRig(t, func(c *Config) { c.DelegationWidthMax = 4 })
+	tr.g.cfg.DelegationRoundsMax = 4 // past New's clamp; it rides only the list
 	tr.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}})
 	origin, _ := startScheduledParent(t, tr)
 	parts := messageParts(t, &origin)

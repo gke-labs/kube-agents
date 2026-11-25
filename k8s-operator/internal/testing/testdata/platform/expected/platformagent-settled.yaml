@@ -6299,6 +6299,8 @@ spec:
               value: "false"
             - name: A2A_CARD_STOP_TIMEOUT
               value: 75s
+            - name: A2A_DELEGATION_ROUNDS_MAX
+              value: "1"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

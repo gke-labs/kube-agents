@@ -307,9 +307,17 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
-	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
-	a2aImagePullRefsSep    = ","
+	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	// a2aSessionHarnessEnvVar carries spec.harness.sessionWorker.type to
+	// the gateway (a2a/gateway/config.go reads it).
+	a2aSessionHarnessEnvVar = "A2A_SESSION_HARNESS"
+	// sessionHarnessCondition is False (reason sessionHarnessReasonNotSupported)
+	// while spec.harness.sessionWorker.type names a harness this operator
+	// doesn't render, and absent otherwise.
+	sessionHarnessCondition          = "SessionHarness"
+	sessionHarnessReasonNotSupported = "SessionHarnessNotSupported"
+	a2aImagePullRefsEnvVar           = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep              = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -525,6 +533,18 @@ const (
 	// control, rendered at the gateway's default (a2aCardStopTimeout).
 	a2aCardStopEnvVar        = "A2A_CARD_STOP"
 	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aDelegationRoundsMaxEnvVar is a controller-read setting rendered onto
+	// the gateway under the same name: how many delegate requests one
+	// profile task may make (the gateway's delegation.rounds rule, #6789).
+	// The chart sets it from operator.delegation.roundsMax. Rendered
+	// explicitly at 1, the only value supported until a profile task's later
+	// rounds land: the operator refuses any other value, logging why at
+	// startup (ValidateA2ADelegationRoundsMax) and rendering 1, and the
+	// gateway clamps one over 1 the same way.
+	a2aDelegationRoundsMaxEnvVar = "A2A_DELEGATION_ROUNDS_MAX"
+	// a2aDelegationRoundsSupported is the one value a2aDelegationRoundsMax
+	// renders until rounds past the first are supported.
+	a2aDelegationRoundsSupported = 1
 	// a2aCardStopTimeout is the gateway's default wait for a card-stop
 	// control, rendered explicitly: above the bridge's worst case for one
 	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
@@ -1571,6 +1591,36 @@ func a2aCardStop() string {
 		return "true"
 	}
 	return "false"
+}
+
+// a2aDelegationRoundsMax renders the gateway's A2A_DELEGATION_ROUNDS_MAX: the
+// operator's own setting when it is the supported value, and that value
+// otherwise. Unset, malformed and over the supported value all render 1;
+// ValidateA2ADelegationRoundsMax says why at startup.
+func a2aDelegationRoundsMax() string {
+	return strconv.Itoa(a2aDelegationRoundsSupported)
+}
+
+// ValidateA2ADelegationRoundsMax refuses an A2A_DELEGATION_ROUNDS_MAX on the
+// operator other than unset or 1, naming the variable and the reason. The
+// operator logs it at startup and renders 1 (a2aDelegationRoundsMax), rather
+// than stopping every install's reconcile over a setting the gateway would
+// clamp anyway.
+func ValidateA2ADelegationRoundsMax() error {
+	v := strings.TrimSpace(os.Getenv(a2aDelegationRoundsMaxEnvVar))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return fmt.Errorf("%s %q refused: need an integer, and only %d is supported; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	if n > a2aDelegationRoundsSupported {
+		return fmt.Errorf("%s %q refused: rounds above %d are not supported yet; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	return nil
 }
 
 // renderA2ANATSDebug is the bus's debug line, present only while the
@@ -5486,10 +5536,12 @@ func a2aSpecDefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
 // (which the hermes-bridge sidecar copies) all come from here, so the two
 // cannot disagree.
 func resolveA2ADefaultRoute(agent *agentv1alpha1.PlatformAgent) string {
-	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't hold
-	// the route off: since 2026-11-20 the view is on by default for the
-	// session route (gke-labs/kube-agents#6538), so an explicit `session`
-	// routes to session with the view on or off.
+	// The session pods' cluster view (A2A_SESSION_CLUSTER_VIEW) doesn't
+	// change the route: an explicit `session` routes to session with the
+	// view on or off. The view is on only where that flag is `true`
+	// (a2aSessionClusterViewEnabled); nothing sets it from defaultRoute, and
+	// making it the session route's default is a later step of
+	// gke-labs/kube-agents#6538.
 	// A CRD that prunes status.effectiveSessionCap can't keep the cap the
 	// session route renders from, so that install stays on platform.
 	if a2aSpecDefaultRoute(agent) != agentv1alpha1.DefaultRouteSession ||
@@ -7281,6 +7333,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
+			{Name: "A2A_KUBE_PROXY_MODE", Value: kubeProxyMode},
 		}
 		// The kubectl admission's tier, normalised as for the shell sandbox;
 		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
@@ -7556,6 +7609,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// bound beside the switch.
 		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
 		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
+		// The delegation rounds a profile task may use,
+		// rendered explicitly at the one value supported
+		// (a2aDelegationRoundsMax), so a reader of the live
+		// Deployment sees the bound, and lifting it is an
+		// edit to a value already there.
+		{Name: a2aDelegationRoundsMaxEnvVar, Value: a2aDelegationRoundsMax()},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS
@@ -7613,6 +7672,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, a2aTierMembershipEnv(agent)...)
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
+	}
+	// The session worker's harness (spec.harness.sessionWorker.type), only
+	// when set: an install that leaves it out renders the gateway it had,
+	// so an operator upgrade doesn't roll the gateway for it. The gateway
+	// reads unset as Claude Code.
+	if t := a2aSessionHarness(agent); t != "" {
+		env = append(env, corev1.EnvVar{Name: a2aSessionHarnessEnvVar, Value: t})
 	}
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
@@ -9789,4 +9855,66 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionHarnessSpec is spec.harness.sessionWorker.type as written, ""
+// when unset.
+func a2aSessionHarnessSpec(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.SessionWorker == nil {
+		return ""
+	}
+	return agent.Spec.Harness.SessionWorker.Type
+}
+
+// a2aSessionHarnessSupported is whether the operator renders a session
+// harness: claude-code. Antigravity joins when its worker isolation lands.
+func a2aSessionHarnessSupported(t string) bool {
+	return t == agentv1alpha1.AgentProfileHarnessClaudeCode
+}
+
+// a2aSessionHarness is the session harness the gateway is given: the
+// spec's value when this operator supports it, else "". An unsupported
+// value (a CRD that admitted more than this operator knows) is not
+// rendered, so the shared gateway keeps serving and session pods run the
+// default harness; syncSessionHarness says so on the SessionHarness
+// condition and in a Warning event. A refused AgentProfile only loses its
+// own pool, so it is refused instead (HarnessNotSupported).
+func a2aSessionHarness(agent *agentv1alpha1.PlatformAgent) string {
+	if t := a2aSessionHarnessSpec(agent); a2aSessionHarnessSupported(t) {
+		return t
+	}
+	return ""
+}
+
+// syncSessionHarness writes the SessionHarness condition: False with
+// reason SessionHarnessNotSupported, and a Warning event once it is first
+// stored, while the spec names a session harness this operator doesn't
+// render; removed once the value is supported or unset.
+func (r *PlatformAgentReconciler) syncSessionHarness(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	t := a2aSessionHarnessSpec(agent)
+	if t == "" || a2aSessionHarnessSupported(t) {
+		if meta.RemoveStatusCondition(&agent.Status.Conditions, sessionHarnessCondition) {
+			return r.Status().Update(ctx, agent)
+		}
+		return nil
+	}
+	msg := fmt.Sprintf("spec.harness.sessionWorker.type %q is not a harness this operator renders (supported: %s); session pods run the default harness, %s", t, agentv1alpha1.AgentProfileHarnessClaudeCode, agentv1alpha1.AgentProfileHarnessClaudeCode)
+	prior := meta.FindStatusCondition(agent.Status.Conditions, sessionHarnessCondition)
+	first := prior == nil || prior.Reason != sessionHarnessReasonNotSupported || prior.Message != msg
+	if !meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: sessionHarnessCondition, Status: metav1.ConditionFalse, Reason: sessionHarnessReasonNotSupported,
+		Message: msg, ObservedGeneration: agent.Generation,
+	}) {
+		return nil
+	}
+	// The event only once the condition is stored: a write that conflicts
+	// leaves the condition unstored, so the next pass would read it as
+	// first and warn again.
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	if first {
+		r.recordEvent(agent, "Warning", sessionHarnessReasonNotSupported, msg)
+	}
+	return nil
 }

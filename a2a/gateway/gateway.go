@@ -291,6 +291,9 @@ type Gateway struct {
 	// minted, with the entry's index; true stops the mint there, as a
 	// gateway that died partway through a batch would (tests only).
 	beforeBatchChild func(i int) bool
+	// childResultFails, when set, runs before each childResult publish;
+	// true fails that publish, as a bus fault would (tests only).
+	childResultFails func() bool
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -321,6 +324,22 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
+	// capQueue, guarded by capMu, is the line of turns waiting at the cap
+	// (session_cap_queue.go), oldest first; capTicket numbers the head's tries.
+	// capKick nudges the line's loop when a slot may have freed.
+	// capAdmitted, guarded by capMu, holds an admitted waiter's follow-ups
+	// by its try's id until that turn ends and replays them (capRetryDone).
+	// capWaitOverride and capPollOverride, when positive, stand in for
+	// sessionCapWaitMax and sessionCapQueuePoll (tests only).
+	capQueue  []*capWaiter
+	capTicket uint64
+	// capStopped, guarded by capMu, is set once the stop has refused the
+	// line (refuseParkedAtStop); no turn parks after it.
+	capStopped      bool
+	capAdmitted     map[uint64][]InboundMessage
+	capKick         chan struct{}
+	capWaitOverride atomic.Int64
+	capPollOverride atomic.Int64
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
@@ -637,6 +656,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DelegationWidthMax <= 0 {
 		o.Config.DelegationWidthMax = defaultDelegationWidthMax
 	}
+	o.Config.DelegationRoundsMax = clampDelegationRounds(o.Config.DelegationRoundsMax, log)
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}
@@ -1004,6 +1024,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		if errors.Is(context.Cause(ctx), ErrTermBusLost) {
 			drain = min(drain, lostLeaseRelayDrain)
 		}
+		// The turns waiting at the session cap are memory; each is told it
+		// was not started while the adapter can still post.
+		g.refuseParkedAtStop()
 		g.relayInFlight.drain(drain)
 		if sub != nil {
 			sub.Stop()
@@ -1016,6 +1039,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
+		go g.capQueueLoop(ctx)
 	}
 
 	// The adapter's delivery goroutines only enqueue (or refuse a console
@@ -1212,6 +1236,11 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// a program say "the gateway answered without starting a task" as a fact
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
+	// The head of the session-cap line trying again: however this turn
+	// ends, the line must not stall behind it (capRetryDone).
+	if msg.capRetry != 0 {
+		defer g.capRetryDone(msg)
+	}
 
 	if g.droppedAtStop(msg) {
 		return
@@ -1221,7 +1250,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// counts the Hermes-side ingress before its allowlist, so the two halves
 	// of chatMessagesInboundTotal mean the same thing: a message a person
 	// sent, whether or not the gateway went on to answer it.
-	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok && !msg.capReplay {
 		g.metrics.messageInbound(platform)
 	}
 
@@ -1391,6 +1420,11 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 // route the message. The caller holds the conversation's session lock and
 // owns the context's clock.
 func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, principal string) {
+	// The turn as it arrived, for the session-cap line to park and deliver
+	// again whole (session_cap_queue.go), before anything below rewrites it.
+	if g.spawner != nil && parksAtCap(backend) && !g.unpostableTrigger(msg.Conversation) {
+		ctx = withParkableTurn(ctx, msg)
+	}
 	rec, err := g.reg.Get(ctx, msg.Conversation)
 	if err != nil {
 		g.log.Error("session lookup failed", "conversation", msg.Conversation, "err", err)
@@ -1464,7 +1498,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// (probeConversation) reports the same facts and heals nothing: the
 	// heal writes the record under this conversation's lock, and a read
 	// that also wrote would be a second writer racing the next turn.
-	g.healActiveTask(ctx, rec)
+	// A wake the heal starts checks the cap for itself, never parking this
+	// turn: the turn meets the cap on its own route below.
+	g.healActiveTask(withoutParking(ctx), rec)
 	// A card-stop control past its bound whose timer this process never
 	// held (it started before a restart) is given up here, before the stop
 	// switch reads it as in flight.
@@ -1539,7 +1575,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.cfg.CardStop && g.cardStopRoute(rec) {
 		msg.TaskID = ""
 	}
+	// A conversation with a turn waiting at the session cap: what a later
+	// message does waits behind that turn, but a stop or a status ask is
+	// answered now (routeParked).
+	parked := g.routeParked(rec, msg, backend, stopping)
 	switch {
+	case parked:
 	case msg.Intent == "" && bareFeedback:
 		// Answered without touching the record's task state: not a steer,
 		// not a stop, not a new task.
@@ -2582,6 +2623,7 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 		if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
 			g.log.Warn(why+": incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
 		}
+		g.kickCapQueue()
 	}
 	rec.PodName = ""
 	return true
@@ -2825,7 +2867,21 @@ func conversationIsOwnThread(backend, conversation string) bool {
 // clock would hold a true the registry had already withdrawn). For a
 // running task there is no bound to hand over, so it is now + IdleTTL: the
 // adapter asks again then, and a task still running is answered again.
+//
+// A conversation whose turn waits in the session-cap line is a session too,
+// though nothing has started in it yet: its stop, its status ask and its
+// later messages are what routeParked answers, and an adapter that dropped
+// them as replies to a thread the gateway is not in would leave the person
+// unable to reach their place in line. The line is memory, not the
+// registry, so it is read first, under capMu alone, and its true comes with
+// an until of now: the adapter asks again on the next reply, so a thread
+// whose turn has left the line (stopped, refused, or started, when
+// TaskStarted marks it anyway) carries no unmentioned reply on the line's
+// word after that.
 func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, time.Time, error) {
+	if g.parkedAtCap(conversation) {
+		return true, time.Now(), nil
+	}
 	rec, err := g.reg.Get(ctx, conversation)
 	if err != nil || rec == nil {
 		return false, time.Time{}, err
@@ -2923,6 +2979,11 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // the task its turn started, without reading TASKS.
 func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
+	// The task's pod is idle now, so the cap can evict it, or it is
+	// exiting: a slot for the session-cap line, maybe.
+	if g.spawner != nil {
+		g.kickCapQueue()
+	}
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(rec.Key, taskID, state, source, reason)
 	}

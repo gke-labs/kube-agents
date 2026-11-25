@@ -106,6 +106,13 @@ const (
 	// noticeProfileDoesNotDelegate refuses a task of a profile whose card
 	// doesn't say it delegates (AgentProfile spec.delegates, #6789).
 	noticeProfileDoesNotDelegate = "%s isn't set up to hand tasks on"
+	// noticeDelegationRounds refuses a profile parent's request made once
+	// its task has used its delegation rounds (delegation.rounds), with
+	// the count.
+	noticeDelegationRounds = "this task has used its %d delegation round%s"
+	// noticeDelegationRoundsChildren follows noticeDelegationRounds when
+	// the rounds used minted children: they still report back.
+	noticeDelegationRoundsChildren = "; the tasks it started will still report back"
 )
 
 // How noticeParamUndeclared and noticeParamMissing spell a profile's
@@ -784,17 +791,25 @@ func (g *Gateway) sendChildResult(ctx context.Context, rec *SessionRecord, paren
 // parent that no longer reads. It reports false only for a send that
 // failed, which the caller records Unsent for the heal to send again
 // (healProfileBatch).
-func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord, parent, child TaskRef, end BatchEnd, reason string) bool {
+func (g *Gateway) profileBatchChildEnded(ctx context.Context, rec *SessionRecord, parent, child TaskRef, end BatchEnd) bool {
 	if parent.DelegationEnd != "" || !g.profileParentListens(ctx, &parent, child.ID) {
 		return true
 	}
-	state, text := end.State, end.Text
-	if state == lib.StateInputRequired {
-		// A batch child that asks is cancelled (batchChildAsks), and its
-		// question is its result: the parent decides whether to ask.
-		state = lib.StateCanceled
+	state := profileBatchEndState(end)
+	return g.sendChildResult(ctx, rec, parent, child, state, end.Text, end.Text)
+}
+
+// profileBatchEndState is the state a profile parent is sent for a batch
+// child's recorded end, by every path that sends one (as it ends, the
+// heal's resend, a withdrawal's): a child that asked ends input-required on
+// the record, but a batch child that asks is cancelled (batchChildAsks), and
+// its question is its result, so the parent is sent canceled and decides
+// whether to ask. lib.ChildResultPart refuses a state that isn't terminal.
+func profileBatchEndState(end BatchEnd) lib.TaskState {
+	if end.State == lib.StateInputRequired {
+		return lib.StateCanceled
 	}
-	return g.sendChildResult(ctx, rec, parent, child, state, text, text)
+	return end.State
 }
 
 // endWithdrawnProfileBatch ends each entry of a profile parent's batch that
@@ -824,7 +839,7 @@ func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionReco
 			// withdrawal drops the child from the record, so the heal
 			// would never find it again.
 			if k.BatchEnd.Unsent {
-				g.sendChildResult(ctx, rec, parent, k, k.BatchEnd.State, k.BatchEnd.Text, k.BatchEnd.Text)
+				g.sendWithdrawnEnd(ctx, rec, parent, k, profileBatchEndState(*k.BatchEnd), k.BatchEnd.Text, k.BatchEnd.Text)
 			}
 			continue
 		}
@@ -832,9 +847,29 @@ func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionReco
 		if !ok {
 			child = TaskRef{BatchIndex: i}
 		}
-		g.sendChildResult(ctx, rec, parent, child, lib.StateFailed, "", why)
+		g.sendWithdrawnEnd(ctx, rec, parent, child, lib.StateFailed, "", why)
 	}
 }
+
+// sendWithdrawnEnd sends one of a withdrawn batch's ends with a few tries
+// (withRetry), since nothing sends it again: the withdrawal leaves no child
+// for the heal to find, and the parent's mark (DelegationEnd) holds back any
+// later end. One that still fails is logged and lost; the parent's own
+// deadline bounds its wait, as for an end a restart drops.
+func (g *Gateway) sendWithdrawnEnd(ctx context.Context, rec *SessionRecord, parent, child TaskRef, state lib.TaskState, result, reason string) {
+	err := withRetry(kvRetryAttempts, func() error {
+		if g.sendChildResult(ctx, rec, parent, child, state, result, reason) {
+			return nil
+		}
+		return errWithdrawnEndUnsent
+	})
+	if err != nil {
+		g.log.Error("a withdrawn batch's end was not delivered after retries; the parent's deadline bounds its wait",
+			"parent", parent.ID, "entry", child.BatchIndex, "child", child.ID)
+	}
+}
+
+var errWithdrawnEndUnsent = errors.New("withdrawn batch end not sent")
 
 // parentEnded reports whether a task's index entry is gone, which the relay
 // does on the task's terminal. A failed read reports false: the delivery
@@ -856,6 +891,9 @@ func (g *Gateway) publishChildResult(ctx context.Context, rec *SessionRecord, pa
 	}
 	if len(text) > lib.ChildResultTextCap {
 		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
+	}
+	if g.childResultFails != nil && g.childResultFails() {
+		return errors.New("publish: failed by the test hook")
 	}
 	part, err := lib.ChildResultPart(lib.ChildResult{ChildTaskID: child.ID, Addressee: child.Addressee, State: state, Text: text,
 		Entry: child.BatchIndex})

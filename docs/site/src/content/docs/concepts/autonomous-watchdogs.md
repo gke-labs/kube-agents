@@ -217,7 +217,9 @@ The value is written in the profile's time zone (`HERMES_TIMEZONE`, else the pro
 
 A chat message ends the hold within about ten minutes: the operator reads the counter every five, and the dispatcher caches the field for five. Each held job then moves to its next natural occurrence rather than to now, so a returning operator gets the roster back on its schedule rather than every audit at once. A held slot that has already arrived stays and fires on that tick, since it is the job's own occurrence. A job someone ran by hand meanwhile is left where Hermes put it.
 
-Two environment variables on the agent container tune it, through `spec.deployment.env`: `CRON_IDLE_THROTTLE_DAYS` (default 7) and `CRON_IDLE_HIBERNATE_DAYS` (default 14). `0` disables that stage, `0` on the throttle disables both, and an unparsable value means the default. The two are independent: raising the throttle alone leaves hibernation at its own threshold. Turning the policy off releases whatever it held.
+Two environment variables on the agent container tune it: `CRON_IDLE_THROTTLE_DAYS` (default 7) and `CRON_IDLE_HIBERNATE_DAYS` (default 14). `0` disables that stage, `0` on the throttle disables both, and an unparsable value means the default. The two are independent: raising the throttle alone leaves hibernation at its own threshold. Turning the policy off releases whatever it held.
+
+Set the two through the chart value `platformAgent.deployment.env`. On an `install.sh` install, that is a `TF_VAR_extra_helm_values` line in `install.env`. [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the line for `KAGE_SLACK_UX`, names the run that applies the line, and shows how to merge the entry into a line that is already there. On a hand-driven Terraform apply, it is `extra_helm_values` in `terraform.tfvars`. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply.
 
 The field counts every chat message the gateway accepts, the agent API's included. Turns through the A2A inject door do not count, so an install driven only through that door, an evaluation install for instance, idles like one nobody uses; set `CRON_IDLE_THROTTLE_DAYS=0` there.
 
@@ -238,7 +240,7 @@ A deferred job is held at its next slot until its turn, because Hermes re-anchor
 
 At its turn the job is decided afresh. If the ticker stopped again while it waited and its missed slot is now a whole period old, it is skipped like any other stale catch-up. Two turns that fall on one tick are spaced again. A record the store no longer matches, because someone ran the job or Hermes moved it, is dropped; a record that is lost leaves the job to run at the slot it is held at. The dispatcher's run output names each skip, deferral and release.
 
-`CRON_CATCH_UP_STAGGER_MINUTES` on the agent container, through `spec.deployment.env`, sets the step (default 30). `0` turns the policy off and releases whatever it holds; an unparsable or negative value means the default. The policy runs after the idle hold above, so a job that hold has moved is not a catch-up.
+`CRON_CATCH_UP_STAGGER_MINUTES` on the agent container sets the step (default 30); set it through the chart value `platformAgent.deployment.env`, the same way as the two idle variables above. `0` turns the policy off and releases whatever it holds; an unparsable or negative value means the default. The policy runs after the idle hold above, so a job that hold has moved is not a catch-up.
 
 ## Job shape
 

@@ -60,7 +60,15 @@ endpoint by rules 1, 2 and 4 of
 endpoint of rule 3 is not chosen yet). A resolved endpoint is reused for ten minutes and a failed
 resolution for ten seconds; an endpoint that cannot be dialled is described again after ten
 seconds. An IP endpoint is verified against the cluster's own CA and never the system roots, an
-`http://` endpoint and a redirect are refused, and a `kind-` cluster has no upstream.
+`http://` endpoint and a redirect are refused, and a `kind-` cluster has no upstream. Neither
+the binary nor an embedder needs Google credentials to start, so a proxy on any Kubernetes cluster
+serves `in-cluster` with its ServiceAccount alone and only a `gke_` request fails, naming the
+missing credentials. The binary passes `Config.TokenSource` a source of its own that looks them up
+on first use; an embedder that passes no `Config.TokenSource` gets Application Default Credentials
+looked up when a `gke_` cluster is first requested. A failed lookup is tried again, and
+finds a credentials file written since, once the failure cached for that cluster expires after ten
+seconds; a metadata server is probed once per
+process.
 
 The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
 ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller (with its partition and the authenticator that admitted it, when the
@@ -124,7 +132,8 @@ without a restart (`pkg/certreload`): at most once a second, a TLS handshake che
 modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
 seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
 not load, such as one read mid-rotation, is logged, counted in
-`kubeagents_kube_proxy_certificate_reload_failures_total`, and the last good certificate keeps
+`kubeagents_kube_proxy_certificate_reload_failures_total` (which also counts a changed
+`--upstream-ca-file` that does not load), and the last good certificate keeps
 being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
 `Transport` verifies each new connection against the current bundle, with hostname and IP SAN
 checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
@@ -154,7 +163,8 @@ and rejects `--allowed-callers`, `CREDENTIAL_PROXY_SESSION_AUDIENCE`, and
 (`KUBE_PROXY_LISTEN_ADDR`) to be set explicitly, for example `127.0.0.1:8443` on a host loopback
 bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
 `in-cluster` requests to one static `http://` or `https://` endpoint through `upstream.NewStatic`
-(`StaticConfig`, `StaticTransport`) without cloud credentials. It rejects `--host-cluster-id`,
+(`StaticConfig`, `StaticTransport`); with it and an `--auth-mode` without `token-review`, the binary
+reads no host cluster ServiceAccount file and looks up no cloud credentials. It rejects `--host-cluster-id`,
 `--container-api-url`, `--scope-file`, `--hold-file`, `--exclude-host-cluster-id`, and
 `CREDENTIAL_PROXY_SCOPED_SA_POOL`, and sets `Config.DefaultClusterID` to `in-cluster` so bare
 `/api/...` and `/clusters/in-cluster/...` paths both work (`SplitClusterPathWithDefault`).
@@ -162,11 +172,48 @@ bridge. `--upstream-url=<url>` (`KUBE_PROXY_UPSTREAM_URL`) forwards
 `log` `follow` streams (`ReasonStreamingBlocked`), and protocol upgrades with `403 Forbidden`, and
 rejects `--allow-upgrade-subresources`.
 
+Two more flags let the static upstream be an API server the proxy authenticates to itself, on any
+conformant Kubernetes cluster. Both need `--upstream-url` with an `https://` URL and stop the proxy
+at startup otherwise.
+
+| Flag                    | Environment variable             | Meaning                                                                                    |
+| ----------------------- | -------------------------------- | ------------------------------------------------------------------------------------------ |
+| `--upstream-token-file` | `KUBE_PROXY_UPSTREAM_TOKEN_FILE` | File holding the bearer token sent upstream (`StaticConfig.BearerTokenFile`).              |
+| `--upstream-ca-file`    | `KUBE_PROXY_UPSTREAM_CA_FILE`    | PEM bundle of the roots the upstream's server is verified against (`StaticConfig.CAFile`). |
+
+The token replaces the caller's `Authorization` header, which is never forwarded. `https://` is
+required with it even for a loopback address, so the token never crosses a cleartext connection.
+Surrounding whitespace is trimmed, and the file is read again at most once a second, so a rotated
+token (a projected ServiceAccount token, for one) is sent without a restart. A file that is
+missing, unreadable, empty, over 64 KiB or not a single header-safe token stops the proxy at
+startup, as does a path that is not a regular file. Later, while the file is in that state, a
+request that reaches the upstream fails with `502`, with the cause in the audit record's `error`,
+rather than being sent with an earlier token. Three things outlast a withdrawn or changed token:
+the earlier one can still be sent for up to a second, until the file is read again; a request
+already in flight (a watch, a log follow or an exec opened with it) keeps streaming; and the
+response cache is not emptied, so an answer fetched with it, a discovery document by default, is
+served until its TTL ends (`--cache-max-bytes=0` turns the cache off). Rotate the file
+atomically (a rename, or a projected volume's symlink swap) so no read sees it half written. The
+token is never logged. With `--auth-mode=none` every peer that can reach the listener acts with
+the token's identity, and the proxy logs a warning at startup: bind `--listen-addr` to loopback or
+otherwise restrict who can reach it.
+
+The CA bundle replaces the system roots for the upstream and is reloaded like `--jwt-ca-file`
+(`certreload.CAPool`): a rotated CA is trusted from the next connection, a changed bundle that does
+not load is logged, counted in `kubeagents_kube_proxy_certificate_reload_failures_total`
+and the previous one kept, and the hostname or IP SAN check is unchanged. A bundle file that is
+removed or stays unreadable is reported once, and the roots loaded before it keep being trusted
+until the proxy restarts: to withdraw trust from a CA, replace the bundle's contents instead of
+deleting the file. With `--upstream-ca-file` the upstream connection ignores `HTTPS_PROXY` and the
+other environment proxy settings (with a token file alone it still uses them) and still offers
+HTTP/2. For an embedder, `StaticConfig.OnCAReloadError` receives the failed reloads, and neither
+`StaticConfig.BearerTokenFile` nor `StaticConfig.CAFile` can be combined with a `TLSClientConfig`
+that sets `InsecureSkipVerify`.
+
 `--auth-mode` also takes `jwt`, alone or in a comma-separated list with `token-review`
 (`token-review,jwt`); `none` cannot be combined. `jwt` verifies callers with `pkg/jwtauth`, configured by
 the flags below, each defaulting to its environment variable. `--allowed-callers` is required only
-when `token-review` is listed, so `--auth-mode=jwt` with `--upstream-url` needs no host cluster
-ServiceAccount files. The binary sets no `Allow` func: it admits every token the issuer signs for
+when `token-review` is listed. The binary sets no `Allow` func: it admits every token the issuer signs for
 one of the audiences, narrowed only by `--jwt-required-sub-prefix` and `--jwt-allowed-partitions`.
 A flag of an authenticator that is not listed (`--jwt-*` without `jwt`; `--allowed-callers` or the
 session variables without `token-review`) stops the proxy at startup instead of being ignored.

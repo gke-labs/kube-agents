@@ -801,7 +801,7 @@ credential-proxy token.
   would change what runs.
 
 **Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
-carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?}}`. The parent's per-task
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?, "round"?}}`. The parent's per-task
 reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
 when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
 `result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
@@ -809,10 +809,16 @@ when it completed and its reason otherwise, at most 64 KiB and cut by the gatewa
 A profile parent's batch gets one end per entry. `entry` is the entry's 1-based index in the
 batch, on every end of a batch, and absent for a single delegation. A `tasks` list of one entry is
 a single delegation, so its end has no `entry`. An end can arrive twice, so a parent waiting on a
-batch dedupes its ends on `entry` and counts them to the batch's size, and a single delegation's
-on `childTaskId`. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
+batch dedupes its ends on `round` and `entry` and counts them to the batch's size, and a single delegation's
+on `childTaskId`. `round` is the 1-based delegation round whose request minted the child, absent for round one,
+so an absent or `0` round reads as one. It is at most 16 (`lib.DelegateRoundsCeiling`), and a part whose
+`round` is negative, past that, or not a number isn't a child result, so a forged end can't put an arbitrary
+round into a parent's dedupe. Nothing sends a round past one yet. An end can also be late or lost. A send that fails is recorded unsent and sent again when the
 gateway's heal next reads the conversation, which also finds a child whose terminal the relay
-missed. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
+missed. If its text passes the ask's retention (`A2A_ASK_TTL`) before that, the end that goes is
+`failed`, saying the result was dropped, with none of the child's text. A withdrawn batch's ends
+are tried a few times on the spot instead, since the withdrawal leaves nothing for the heal to find;
+one that still fails is lost. A gateway restart at the wrong moment can drop one. Nothing heals a conversation no one
 writes to, so the parent's own deadline is what bounds its wait. A parent that ends, at its deadline or otherwise, gives the conversation up, and the
 gateway cancels its live children, each with its stop record, since nothing reads their results. A batch child that reaches `input-required` is cancelled and ends
 `canceled`, with its question as `text`. A batch withdrawn whole (cut short, or a child that
@@ -825,7 +831,15 @@ nothing.
 refused it or nothing started, gets a `message` on its `…in` carrying `{"delegationRefused": {"text"}}`
 (#4860), so it stops waiting for a child that won't exist. `text` is the notice the room sees, at most
 64 KiB. A waiting parent reads it as the end of the whole wait. A refusal that fails to publish is logged and not sent again, so the parent's own deadline still bounds its wait. A batch whose plan was written gets
-its per-entry ends instead, and a stopped or ended parent gets nothing.
+its per-entry ends instead, and a stopped or ended parent gets nothing. `round` beside `text` is the 1-based
+delegation round the refused request would have been, absent for round one. A parent ends its wait only on a
+refusal for the round it waits on; one for a lower round is stale, and one for a higher round ends nothing.
+Every request the gateway handles for a task uses a round, minted or refused, so a request made once the task
+has used its rounds (`roundsMax`, one by default) is refused with the next round, which is `2` today: the
+earlier request's children, if it minted any, are still the task's to wait for, and a waiting parent keeps
+waiting on them. The gateway mints nothing for that request, records nothing, and posts nothing to the room.
+`round` is a JSON number from 0 to 16 (`lib.DelegateRoundsCeiling`); a part whose `round` is another type or
+out of that range isn't a refusal.
 
 This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
 profile parent that has already ended gets no child result; the gateway drops it and logs it. A
@@ -841,7 +855,7 @@ stop record for a profile task, and nothing a canceled task writes afterwards re
 (`spec-chatops-gateway.md`, "Stop").
 
 **Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
-`{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?}}`: the
+`{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?, "roundsMax"?}}`: the
 agents that turn's requester may delegate to, `platform` first and then each AgentProfile whose card
 admits them, by the same checks a delegation meets (the target's list and the A2A door's own-list
 rule, for the requester and everyone else whose text reached the session, and the card's tiers). A
@@ -876,6 +890,10 @@ unchanged, and a worker that predates the part ignores it.
   it accepts no wider setting. It is at most 16
   (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the
   single shape's 16 KiB cap.
+- `roundsMax` is how many `delegate` requests a profile task may make, the gateway's
+  `A2A_DELEGATION_ROUNDS_MAX`. Only a profile task's list carries it, and only when it is over one;
+  absent means one. It is at most 16 (`lib.DelegateRoundsCeiling`). The gateway holds the setting to
+  one until a profile task's later rounds ship, so no list carries it yet.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 
