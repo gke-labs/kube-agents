@@ -1186,6 +1186,13 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# #2800: the drift audit's kubelet-config facet, the second voted by node
+# pool. seeded-c's default-pool sets podPidsLimit where the stack's other
+# pools set no kubelet key the facet reads; graded on the ledger's
+# kubelet-config finding and the pool it names. The same full audit and band
+# as consistency-drift-outlier.
+./tasks/consistency-kubelet-config-pool-outlier/task.yaml
+
 # gke-labs#2610: a request to propose a fix, delegated to a platform card, is
 # answered in the card's result with the PodDisruptionBudget manifest, and no
 # worker runs submit_suggestion.py, during its run or after kanban_complete.

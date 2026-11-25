@@ -5,7 +5,7 @@ Audit (`fleet-consistency-drift`).
 See docs/designs/fleet-audit-collector-manifest.md for the manifest this
 emits and governance/fleet_consistency_drift_sop.md for the checks.
 
-This stream's own collector: every one of its twenty-one checks -- twenty
+This stream's own collector: every one of its twenty-two checks -- twenty-one
 comparative facets and §4.14's cohort-independent `no-environment-label` --
 reads GKE control-plane and node-pool metadata through `gcloud container`, no
 `kubectl` and no kubeconfig, so the checks need no per-cluster credential fetch —
@@ -210,8 +210,8 @@ GKE_MANAGED_TAINT_KEYS = (
 RELEASE_CHANNEL_SLUG = "release-channel"
 IMAGE_TYPE_RUNTIME_SUFFIX = "_CONTAINERD"
 WINDOWS_IMAGE_PREFIX = "WINDOWS"
-# §4.15: the one facet whose voters are node pools, and the words its excerpt
-# and its candidates use in place of a cluster facet's.
+# §4.15 and §4.16: the two facets whose voters are node pools, and the words
+# their excerpts and their candidates use in place of a cluster facet's.
 BOOT_DISK_SLUG = "boot-disk"
 BOOT_DISK_FIELD_PATH = ".nodePools[].config.diskType / .nodePools[].config.diskSizeGb"
 CLUSTER_VOTERS = "clusters"
@@ -222,6 +222,30 @@ POOL_OBJECT_KIND = "NodePool"
 # without a name is keyed by this prefix and its index in the listing.
 BOOT_DISK_TOKEN_SEPARATOR = "/"
 UNNAMED_POOL_PREFIX = "#"
+# §4.16: the kubelet settings a pool is compared on, and no others. GKE
+# returns `insecureKubeletReadonlyPortEnabled` and `maxParallelImagePulls` on
+# every pool whether or not anyone set them, and a token that carried every
+# key would move whenever GKE started returning another default.
+KUBELET_CONFIG_SLUG = "kubelet-config"
+KUBELET_CONFIG_FIELD_PATH = ".nodePools[].config.kubeletConfig"
+KUBELET_CONFIG_CFS_QUOTA_KEY = "cpuCfsQuota"
+KUBELET_CONFIG_KEYS = (
+    KUBELET_CONFIG_CFS_QUOTA_KEY,
+    "cpuManagerPolicy",
+    "containerLogMaxSize",
+    "containerLogMaxFiles",
+    "podPidsLimit",
+)
+# One pool's token is its set keys as `key=value`, sorted and joined by the
+# separator; a pool with none of the five set holds the second token and still
+# votes, because "nothing set" is what most pools run and is the baseline an
+# outlier is measured against.
+KUBELET_CONFIG_KEY_VALUE_SEPARATOR = "="
+KUBELET_CONFIG_TOKEN_SEPARATOR = ","
+KUBELET_CONFIG_UNSET_TOKEN = "UNSET"
+# What GKE serializes for a numeric key nobody set, where it serializes the
+# key at all: int64 fields arrive as strings.
+KUBELET_CONFIG_ZERO = "0"
 
 # The one check here that is not a facet. Every `Facet` is comparative and so
 # runs only inside a cohort that reached `COHORT_FLOOR`; this one asks why a
@@ -524,7 +548,7 @@ def cohort_key(c: dict, strategy: str, env: str, *, standard_only: bool) -> tupl
     """§2.3's key, which is not the same key for every facet.
 
     `standard_only` is the facet class, not a property of the cluster. Mode
-    belongs in the key only for the twelve facets Autopilot leaves nothing to
+    belongs in the key only for the thirteen facets Autopilot leaves nothing to
     compare -- there, an Autopilot cluster and a Standard one genuinely are not
     peers. For the other eight the setting is configurable on both modes, so
     keying on mode buys nothing and costs the comparison: it strands every
@@ -740,8 +764,8 @@ def pool_boot_disk(p: dict) -> str | None:
 
 def _is_autoprovisioned_pool(p: dict) -> bool:
     """A pool node auto-provisioning created. GKE names it, deletes it and
-    makes another under a new name as load moves, and its disk comes from the
-    cluster's auto-provisioning defaults, so a finding on it changes identity
+    makes another under a new name as load moves, and its disk and kubelet
+    settings come from the cluster's auto-provisioning defaults, so a finding on it changes identity
     between runs and `node-pools update` on it fixes nothing that lasts."""
     return bool((p.get("autoscaling") or {}).get("autoprovisioned"))
 
@@ -749,8 +773,9 @@ def _is_autoprovisioned_pool(p: dict) -> bool:
 def votable_pools(c: dict) -> list[tuple[str, dict]]:
     """The pools a pool-voted facet reads on this cluster, each with the name
     its vote is keyed by. Windows pools are left out, as §4.12 leaves them out
-    of `image-type`: their disk is sized for a different image. So are
-    auto-provisioned pools (`_is_autoprovisioned_pool`)."""
+    of `image-type`: their disk is sized for a different image, and their
+    kubelet takes a different set of options. So are auto-provisioned pools
+    (`_is_autoprovisioned_pool`)."""
     return [
         (str(p.get("name") or f"{UNNAMED_POOL_PREFIX}{index}"), p)
         for index, p in enumerate(c.get("nodePools") or [])
@@ -764,6 +789,56 @@ def norm_boot_disk(c: dict) -> str | None:
     (`facet_tokens`); `None` is a cluster with no pool that could cast one."""
     tokens = {token for _, p in votable_pools(c) if (token := pool_boot_disk(p)) is not None}
     return ",".join(sorted(tokens)) if tokens else None
+
+
+def _kubelet_value(key: str, value: object) -> str | None:
+    """One kubelet key's value as the token prints it, or `None` where the key
+    is unset. Absent, null, empty and a numeric zero are one value (§4.0):
+    proto3 drops them, and a serializer that keeps one must not make a finding.
+    `cpuCfsQuota` is the exception to "false is unset": GKE omits it until
+    someone sends it, so a `false` it returns is a quota somebody turned off."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        if key != KUBELET_CONFIG_CFS_QUOTA_KEY and not value:
+            return None
+        return str(value).lower()
+    text = str(value)
+    return None if text == KUBELET_CONFIG_ZERO else text
+
+
+def pool_kubelet_config(p: dict) -> str | None:
+    """§4.16's token for one pool: the `KUBELET_CONFIG_KEYS` it sets, as sorted
+    `key=value` pairs, or `KUBELET_CONFIG_UNSET_TOKEN` where it sets none.
+
+    A pool with no `config`, no `kubeletConfig` or an empty one holds the
+    unset token and votes: GKE omits a block nobody filled, so the absence is
+    the value. `None`, which is unreadable and casts no vote, is kept for a
+    `config` or `kubeletConfig` that is present and is not an object, where
+    nothing can be said about what the kubelet runs."""
+    config = p.get("config")
+    if config is None:
+        return KUBELET_CONFIG_UNSET_TOKEN
+    if not isinstance(config, dict):
+        return None
+    kubelet = config.get("kubeletConfig")
+    if kubelet is None:
+        return KUBELET_CONFIG_UNSET_TOKEN
+    if not isinstance(kubelet, dict):
+        return None
+    pairs = [
+        f"{key}{KUBELET_CONFIG_KEY_VALUE_SEPARATOR}{value}"
+        for key in sorted(KUBELET_CONFIG_KEYS)
+        if (value := _kubelet_value(key, kubelet.get(key))) is not None
+    ]
+    return KUBELET_CONFIG_TOKEN_SEPARATOR.join(pairs) if pairs else KUBELET_CONFIG_UNSET_TOKEN
+
+
+def norm_kubelet_config(c: dict) -> str | None:
+    """As `norm_boot_disk`: the cluster's distinct pool tokens for the
+    accounting, `None` where no pool could cast a vote."""
+    tokens = {token for _, p in votable_pools(c) if (token := pool_kubelet_config(p)) is not None}
+    return KUBELET_CONFIG_TOKEN_SEPARATOR.join(sorted(tokens)) if tokens else None
 
 
 def norm_database_encryption(c: dict) -> str:
@@ -836,7 +911,7 @@ class Facet(NamedTuple):
     slug: str
     field_path: str
     base_severity: str | Callable[[str], str]
-    # Node-level or Google-fixed on Autopilot: #1226's eleven and §4.15's `boot-disk`. Two things
+    # Node-level or Google-fixed on Autopilot: #1226's eleven, §4.15's `boot-disk` and §4.16's `kubelet-config`. Two things
     # follow from the one flag, and they have to travel together. The facet is
     # not computed on an Autopilot cluster and is declared
     # `checks_not_applicable` there instead; and it is the only class of facet
@@ -876,6 +951,7 @@ FACETS: tuple[Facet, ...] = (
     Facet("image-type", ".nodePools[].config.imageType", "minor", True, norm_image_type, _flag_not_superset),
     Facet("database-encryption", ".databaseEncryption.state", "critical", False, norm_database_encryption, _flag_off_only),
     Facet(BOOT_DISK_SLUG, BOOT_DISK_FIELD_PATH, "major", True, norm_boot_disk, _flag_ne, pool_boot_disk),
+    Facet(KUBELET_CONFIG_SLUG, KUBELET_CONFIG_FIELD_PATH, "major", True, norm_kubelet_config, _flag_ne, pool_kubelet_config),
 )
 FACETS_BY_SLUG = {f.slug: f for f in FACETS}
 
@@ -1059,6 +1135,7 @@ IMPACT = {
     "image-type": "This cluster's nodes carry a different patch cadence and hardening baseline than its peers.",
     "database-encryption": "Secrets in this cluster's etcd are not wrapped with the customer-managed key every peer uses.",
     BOOT_DISK_SLUG: "This pool's nodes have different disk space and disk throughput for images, logs and ephemeral storage than its peers' nodes.",
+    KUBELET_CONFIG_SLUG: "This pool's kubelet enforces different CPU, PID or log-rotation limits than its peers' pools.",
     UNCOHORTED_SLUG: "This cluster diverges from its cohort on so many facets that its cohort labelling, not each facet, is likely wrong.",
 }
 
@@ -1168,7 +1245,7 @@ def ckey(c: dict) -> tuple[str, str, str]:
 class Layout(NamedTuple):
     """§1's eligibility and §2's cohorting, keyed by `ckey` where per-cluster.
 
-    Two cohortings, not one, because §2.3 keys the twelve node-level facets on
+    Two cohortings, not one, because §2.3 keys the thirteen node-level facets on
     mode and the other eight across it. `cohorts_for` is how a caller picks;
     reaching for the wrong member is the whole failure mode this type exists to
     make visible, so nothing here is called `cohorts`.
@@ -1236,17 +1313,17 @@ def cohort_limitations(clusters: list[dict], *, now: datetime) -> dict[tuple, st
     A cluster whose cohort reached the floor and then lost individual facets
     is `unvoted_facets`' business rather than this one's: the sentence here is
     "nothing compared this cluster", and a cluster compared on fifteen facets
-    out of twenty needs the four named instead.
+    out of twenty-one needs the four named instead.
 
     §2.3 gives a cluster two cohorts, so there are two sentences. An undersized
     *cluster-level* cohort is the one above: no facet of either class compared
     it. An undersized *node-level* cohort on a cluster whose cluster-level
     cohort is fine is the narrower case #1226 names -- the eight configurable
-    facets ran and the twelve node-level ones did not -- and it is a
+    facets ran and the thirteen node-level ones did not -- and it is a
     `limitations` string rather than a `checks_not_applicable` entry because
-    those twelve could have been compared and were not.
+    those thirteen could have been compared and were not.
 
-    An Autopilot cluster never earns the narrow sentence. Its twelve are
+    An Autopilot cluster never earns the narrow sentence. Its thirteen are
     already declared inapplicable by `autopilot_not_applicable`, so an
     undersized Autopilot node cohort leaves nothing uncompared and saying it
     did would put a gap in the denominator that the mode, not the fleet's
@@ -1313,7 +1390,7 @@ def joinable_environments(
 
     Passed a mode, it reads the node-level cohorts, whose keys are
     `(mode, environment)`, and counts only peers at that mode -- because the
-    twelve facets those cohorts carry are compared within a mode and a label
+    thirteen facets those cohorts carry are compared within a mode and a label
     that reaches the floor across both modes closes nothing for them. The two
     answers differ on any fleet whose unlabelled clusters straddle the split,
     and a cluster can need a value that satisfies both.
@@ -1335,7 +1412,7 @@ def joinable_for_cluster(layout: Layout, c: dict, *, cluster_short: bool, node_s
     short that is an intersection, and the intersection can be empty while
     either axis alone offers a value. Prescribing a label off one axis is a
     remedy that closes half the gap: the eight configurable facets start
-    comparing and the twelve node-level ones still do not, and the operator who
+    comparing and the thirteen node-level ones still do not, and the operator who
     applied it sees the same coverage gap on the next run.
 
     Shared by §4.14's finding and by `_unlabelled_cause`'s remedy clause for the
@@ -1396,7 +1473,7 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, layout: Layout, c: 
     whose cluster-level cohort floored out has a `(standard, unknown)` cohort
     that floored out underneath it -- the node-level cohort is a subset -- so a
     value read off the cluster-level cohorts alone can be one that starts the
-    eight configurable facets comparing and leaves the twelve node-level ones
+    eight configurable facets comparing and leaves the thirteen node-level ones
     exactly as they were. §4.14's finding already intersects the two through
     `joinable_for_cluster`; this clause calls the same function, so the
     `limitations` sentence cannot name a value the finding beside it withheld.
@@ -1405,7 +1482,7 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, layout: Layout, c: 
         return ""
     # Reached from the cluster-level loop, so that cohort is short by
     # construction. The node-level one is asked on its own terms: on Autopilot
-    # its twelve facets are inapplicable, so its floor withholds nothing and no
+    # its thirteen facets are inapplicable, so its floor withholds nothing and no
     # label is being asked to close it.
     mode = cluster_mode(c)
     node_short = mode != "autopilot" and len(layout.cohort_of(c, True)) < COHORT_FLOOR
@@ -1425,7 +1502,7 @@ def _unlabelled_cause(key: tuple, labelled: int, total: int, layout: Layout, c: 
         # only "no value reaches the floor" would be read against the cohort the
         # sentence just named and look false, so the clause names the half that
         # works and the half that does not -- an operator who applies it anyway
-        # gets the eight and should know the twelve stay where they are.
+        # gets the eight and should know the thirteen stay where they are.
         named = " or ".join(
             f"`environment={v}`" for v, _ in joinable_environments(layout.cluster_cohorts)
         )
@@ -1457,12 +1534,12 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
     Every `Facet` is comparative, so `compute_drift` only evaluates one inside
     a cohort that reached `COHORT_FLOOR`, and under the `environment` strategy
     neither of §2.3's two keys -- `(environment)` for the eight configurable
-    facets, `(mode, environment)` for the twelve node-level ones -- is one an
+    facets, `(mode, environment)` for the thirteen node-level ones -- is one an
     unlabelled cluster can match, because §2.3 keeps `unknown` out of every
     named cohort. The cluster
     with the fleet's one divergent label set is therefore the one cluster
     `label-keys` structurally cannot see, and the same holds for the other
-    nineteen facets. `cohort_limitations` already says so in a sentence, and a
+    twenty facets. `cohort_limitations` already says so in a sentence, and a
     sentence in `limitations` opens no pull request; this publishes the same
     conclusion as a finding with the label to set in it.
 
@@ -1484,9 +1561,9 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
       either short. Enough unlabelled clusters pile into `(unknown)` to reach
       three and they compare each other on the eight, which is coverage this
       finding would otherwise be claiming is missing -- but `(mode, unknown)`
-      can still be short underneath it, and the twelve it carries compare
+      can still be short underneath it, and the thirteen it carries compare
       nothing. On an Autopilot cluster the node-level cohort is not asked:
-      those twelve are `checks_not_applicable` there, so its floor withholds
+      those thirteen are `checks_not_applicable` there, so its floor withholds
       nothing.
 
     And it publishes only where `joinable_environments` names a value that
@@ -1531,14 +1608,14 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         # split reaches the floor there and compares the eight configurable
         # facets against a bag of clusters that have nothing in common but the
         # absent label -- while the node-level cohort, keyed `(mode, unknown)`,
-        # is still short and the other twelve compare nothing. Reading only the
+        # is still short and the other thirteen compare nothing. Reading only the
         # cluster-level cohort made the check silent on exactly that fleet,
         # which is the larger half of the gap and the one a label still closes.
         node_short = mode != "autopilot" and len(layout.cohort_of(c, True)) < COHORT_FLOOR
         cluster_short = len(layout.cohort_of(c, False)) < COHORT_FLOOR
         if not (node_short or cluster_short):
             continue
-        # An Autopilot cluster's twelve are `checks_not_applicable`, so its
+        # An Autopilot cluster's thirteen are `checks_not_applicable`, so its
         # node-level cohort being short is not a gap and no label would be
         # closing one; `node_short` is false for it above rather than here, so
         # the value search below never has to satisfy a constraint that does
@@ -1589,7 +1666,7 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
         abstaining = sum(1 for f in FACETS if not (f.standard_only and mode == "autopilot"))
         # Which gap this is, in the excerpt's own words. Under §2.3 a cluster
         # short on the node-level cohort alone is still compared on the eight,
-        # so "all twenty abstain" would be false of it -- and the eight it
+        # so "all twenty-one abstain" would be false of it -- and the eight it
         # does get are drawn from the `unknown` cohort, which is not a peer
         # group so much as the set of clusters that share the same omission.
         # Saying so is what stops the finding from reading as the smaller
@@ -1631,7 +1708,7 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     """§6's `checks_not_applicable` for the facets `compute_drift` refuses to
     compute on Autopilot.
 
-    Twelve facets carry `standard_only` — #1226's list and §4.15's `boot-disk` — and `compute_drift`
+    Thirteen facets carry `standard_only` — #1226's list, §4.15's `boot-disk` and §4.16's `kubelet-config` — and `compute_drift`
     drops each of them for an Autopilot cohort. Dropping them is right: every
     one reads a field under `.nodePools[]`, or names a node-management or
     dataplane setting Google owns on Autopilot and no operator can diverge on.
@@ -1644,16 +1721,16 @@ def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     This is also the half of §2.3 that keeps an Autopilot minority from pinning
     the ledger. The eight facets that are configurable on both modes compare
     across them, so a lone Autopilot cluster is never in an undersized cohort
-    for those; the twelve it cannot be compared on are declared here and leave
+    for those; the thirteen it cannot be compared on are declared here and leave
     the denominator. Neither half works without the other: declare fewer than
-    twelve while keying every cohort on mode, and the difference becomes a
+    thirteen while keying every cohort on mode, and the difference becomes a
     `limitations` string that makes every run `partial`.
 
     Keyed off the cluster's own mode rather than its cohort's. The two agree
     wherever `compute_drift` drops them — an Autopilot cohort's members are all Autopilot —
     but the roster arithmetic in §6 is per-cluster, so an Autopilot cluster
-    whose cohort floored out has the same twelve inapplicable checks and should
-    have the same twelve in its `checks_not_applicable`. Its `limitations`
+    whose cohort floored out has the same thirteen inapplicable checks and should
+    have the same thirteen in its `checks_not_applicable`. Its `limitations`
     sentence then accounts for the checks that remain instead of overstating
     the full roster.
     """
@@ -1714,7 +1791,7 @@ def unvoted_facets(
 
     Clusters `cohort_limitations` already covers -- ineligible ones and those
     whose cohort floored out -- are skipped here: their sentence is that
-    nothing compared them, and naming twenty facets under it adds nothing.
+    nothing compared them, and naming twenty-one facets under it adds nothing.
     """
     not_applicable: dict[tuple, list[dict]] = {}
     limitations: dict[tuple, str] = {}
@@ -2077,8 +2154,8 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     # Merged rather than returned by `compute_drift`, because this check is the
     # one that has to run *outside* the cohort loop -- see
     # `unlabelled_environment_candidates`. Extending both dicts is what turns a
-    # cluster no facet reached from "0 of 20 applicable checks ran", which §6
-    # reads as a total coverage gap, into "1 of 21", which is the truth.
+    # cluster no facet reached from "0 of 21 applicable checks ran", which §6
+    # reads as a total coverage gap, into "1 of 22", which is the truth.
     unlabelled_run, unlabelled_candidates, unlabelled_na = unlabelled_environment_candidates(all_clusters, now=now)
     for cluster_key, slugs in unlabelled_run.items():
         checks_run.setdefault(cluster_key, []).extend(slugs)
