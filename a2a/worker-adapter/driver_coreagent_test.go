@@ -212,3 +212,10 @@ func TestTheCoreAgentDecoderKeepsOnlyTheTurnsOrder(t *testing.T) {
 		t.Errorf("a forged init re-pointed the history: %v", h)
 	}
 }
+
+// core-agent reads no config dir, so it names none for the harness env.
+func TestCoreAgentNamesNoConfigDir(t *testing.T) {
+	if kv := newCoreAgentDriver().ConfigDirEnv("/x"); kv != "" {
+		t.Errorf("ConfigDirEnv = %q, want empty", kv)
+	}
+}
