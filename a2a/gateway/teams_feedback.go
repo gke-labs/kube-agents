@@ -223,14 +223,20 @@ func (a *TeamsAdapter) rate(recorder FeedbackRecorder, r FeedbackRating, note st
 	if !held || rated.task != r.TaskID || rated.recorded {
 		return
 	}
+	// The message's text is read again under its edit lock: an edit that
+	// landed while the rating was being kept is what the redraw adds to.
+	defer a.lockEdit(r.MessageID)()
+	a.mu.Lock()
+	rated, held = a.rated[r.MessageID]
+	card, laidOut := a.uxLocked().cards[r.MessageID]
+	a.mu.Unlock()
+	if !held || rated.task != r.TaskID || rated.recorded {
+		return
+	}
 	text := rated.text + "\n\n" + teamsRatingRecordedLine
 	actions := teamsRatingActions(rated.task, recorder.KeptDays())
 	// A laid-out answer keeps its own buttons, the rating controls among
 	// them (teams_chat.go).
-	defer a.lockEdit(r.MessageID)()
-	a.mu.Lock()
-	card, laidOut := a.uxLocked().cards[r.MessageID]
-	a.mu.Unlock()
 	laidOut = laidOut && !card.closed
 	if laidOut {
 		text, actions = teamsWithLine(card.text, teamsRatingRecordedLine), card.actions()

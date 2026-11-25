@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
@@ -460,6 +461,47 @@ func TestTeamsReAskBeforeTheRedrawKeepsItsChoices(t *testing.T) {
 	}
 	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:31", testTeamsPosted, teamsChoice("No", 1, "No")))); reason != "" {
 		t.Fatalf("the re-asked question does not take a press: %s", reason)
+	}
+}
+
+// One message's edit lock holds up no other message's edit, holds up a
+// second edit of its own message, and leaves no entry behind.
+func TestTeamsEditLockIsPerMessage(t *testing.T) {
+	a, _ := askedTeamsAdapter(t)
+	const wait, settle = 2 * time.Second, 50 * time.Millisecond
+	release := a.lockEdit("m1")
+	other := make(chan struct{})
+	go func() { a.lockEdit("m2")(); close(other) }()
+	select {
+	case <-other:
+	case <-time.After(wait):
+		t.Fatal("an edit of another message waited on this one's lock")
+	}
+	same := make(chan struct{})
+	go func() { defer a.lockEdit("m1")(); close(same) }()
+	select {
+	case <-same:
+		t.Fatal("a second edit of the message ran while the first held its lock")
+	case <-time.After(settle):
+	}
+	release()
+	select {
+	case <-same:
+	case <-time.After(wait):
+		t.Fatal("the waiting edit never got the lock")
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		a.mu.Lock()
+		left := len(a.editing)
+		a.mu.Unlock()
+		if left == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d edit locks left behind", left)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
