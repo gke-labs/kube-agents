@@ -32,7 +32,9 @@ prompt: >-
   explain why setting `cpuCfsQuota=false` on a node pool (including when
   declared via Config Connector `ContainerNodePool` manifests) is dangerous for
   workloads with CPU limits, and recommend how to align the configuration via
-  GitOps. Do not change anything.
+  GitOps. Do not change anything. End your answer with one line in exactly this
+  form, no other words on the line:
+  "cpuCfsQuota=false container CPU limits: <enforced|unenforced>".
 expected_output: >-
   A grounded consistency comparison identifying the slot-c cluster (seeded-c,
   default-pool) as the node-pool outlier on boot-disk size (50 GB vs. the 20 GB
@@ -41,8 +43,9 @@ expected_output: >-
   `cpuCfsQuota: false` (in GKE node-pool config or a Config Connector
   `ContainerNodePool` manifest) disables CFS quota enforcement so container CPU
   limits are not enforced (no CPU throttling at the declared limit, allowing
-  noisy-neighbor CPU starvation), and recommending a GitOps pull request to
-  align the declaration without mutating any live cluster.
+  noisy-neighbor CPU starvation), recommending a GitOps pull request to align
+  the declaration without mutating any live cluster, and closing with the
+  declared line "cpuCfsQuota=false container CPU limits: unenforced".
 infrastructure:
   deployer: noop
 validated: false
@@ -91,27 +94,29 @@ verification_spec:
   # Why `cpuCfsQuota=false` is dangerous for workloads with CPU limits: the
   # kubelet disables CFS bandwidth quota enforcement / CPU throttling, leaving
   # container CPU limits unenforced so workloads can burst past their limits.
-  # Uses clause-anchored `any_of_patterns` (without report-wide
-  # `forbidden_patterns` that would fail a correct report when it also states
-  # the `cpuCfsQuota=true` baseline or a `do not disable / without disabling`
-  # GitOps recommendation elsewhere): each alternative starts at a clause
-  # boundary, allows no negation or inverting token before its trigger within
-  # that clause, and bounds its gap with `[():]`, `\bwithout\b`, `\benforced\b`,
-  # conjunctions, and negation tokens so parenthetical or contrastive clauses
-  # cannot bridge across.
+  # Graded on the declared closing line (`fold_decoration: true`, anchored at
+  # both ends of the line) rather than by a regex negation grammar over free
+  # prose, which across five review rounds either rejected valid explanations
+  # (parentheticals, unpunctuated introductory conditions, `while`/`but`/`so`
+  # clauses, `is:` colons) or matched negated statements (`cpuCfsQuota: false`
+  # colons, `does not, ...,` parenthetical commas, gerund subjects followed by
+  # `: not possible` or `is impossible`/`is prevented`, and `fails to ignore`).
+  # The declared line has a two-word vocabulary (`enforced` vs. `unenforced`)
+  # with no room for negation or hedging (`fold_decoration` strips bullets,
+  # quotes, emphasis, and trailing periods while keeping `?`, `!`, and negating
+  # marks on the line), and `forbidden_patterns` rejects any declared line whose
+  # value slot is anything other than `unenforced`. Free-prose reasoning is
+  # scored by the judge against `expected_output`.
   - name: the-answer-explains-unenforced-cpu-limits
     role: objective
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
       any_of_patterns:
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|keeps?|kept|keeping|blocks?|blocked|blocking|prohibits?|prohibited|prohibiting|restricts?|restricted|restricting|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\bcpu\s+limits?\b(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w)|\n(?!\n))){0,80}?\b(?:not|never|no\s+longer)\s+(?:be\s+|being\s+)?enforced\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|keeps?|kept|keeping|blocks?|blocked|blocking|prohibits?|prohibited|prohibiting|restricts?|restricted|restricting|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\bcpu\s+limits?\b(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w))){0,80}?\b(?:unenforced|ignored|ineffective|unthrottled)\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\b(?:stops?|stopping|disables?|disabling|prevents?|preventing|without)\s+(?:kubelet\s+|the\s+kubelet\s+from\s+|from\s+)?|(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|disables?|disabled|disabling|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\b(?:not|never|no\s+longer)\s+(?:be\s+|being\s+)?)enforc(?:e|ing)\b(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w))){0,60}?\bcpu\s+limits?\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|keeps?|kept|keeping|blocks?|blocked|blocking|prohibits?|prohibited|prohibiting|restricts?|restricted|restricting|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\b(?:unenforced|ignores?|ignoring)\b(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w))){0,40}?\bcpu\s+limits?\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\b(?:disables?|disabling|stops?|stopping|prevents?|preventing|without)\b(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w))){0,50}?|(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|keeps?|kept|keeping|blocks?|blocked|blocking|prohibits?|prohibited|prohibiting|restricts?|restricted|restricting|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\bno\s+)\b(?:cpu|cfs)\s+(?:(?:quota|limit|bandwidth)\s+)?(?:enforcement|throttling)\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|keeps?|kept|keeping|blocks?|blocked|blocking|prohibits?|prohibited|prohibiting|restricts?|restricted|restricting|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?\b(?:cpu|cfs)\s+(?:(?:quota|limit|bandwidth)\s+)?(?:enforcement|throttling)\b(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w))){0,50}?\b(?:disabled|off|not\s+enforced|unenforced)\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
-        - '(?:^|[\n,;?!]|\.(?=\s|$)|(?<!\bnot)(?<!n''t)(?<!\bnever)(?<!\bcannot)(?<!\bto)(?<!\bthat)(?<!\bis)(?<!\bare):|\bwhereas\b)(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|active|enabled|prevents?|prevented|preventing|stops?|stopped|stopping|keeps?|kept|keeping|blocks?|blocked|blocking|prohibits?|prohibited|prohibiting|restricts?|restricted|restricting|rather\s+than|instead\s+of|avoids?|avoiding|forbids?|forbidding|disallows?|disallowing)\b|\w+n''t\b))(?:[^\n,.;?!:]|\.(?=\w))){0,120}?(?:\bnot\s+(?:prevented|stopped|kept|blocked|prohibited|restricted)\s+from\s+(?:exceeding|bursting\s+(?:past|beyond|above)|consuming\s+more\s+cpu\s+than)\b|\b(?:exceed(?:s|ing)?|burst(?:s|ing)?\s+(?:past|beyond|above)|consum(?:e|es|ing)\s+more\s+cpu\s+than)\b)(?:(?!(?:\b(?:not|never|cannot|no|neither|nor|without|enforced|unenforced|active|enabled|disabling|stopping|preventing|and|or|because|since|so|whereas|while|but|although|though|however|yet|rather\s+than|instead\s+of|pod\s*pids?\s*limit|podpidslimit|memory\s+limits?|pid\s+limits?|authorized\s+networks?)\b|\w+n''t\b))(?:[^\n,.;?!():]|\.(?=\w))){0,40}?\bcpu\s+limits?\b(?!(?:\s+(?:is|are|was|were|be|does|do|did|can|could|will|would|should|may|might))?\s+(?:not\b|never\b|cannot\b|\w+n''t\b)(?!\s+(?:enforced|throttled)\b))'
+        - "(?m)^cpucfsquota=false container cpu limits: unenforced$"
+      forbidden_patterns:
+        - '(?m)^cpucfsquota=false container cpu limits: (?!unenforced$)[^\n]+$'
   # A chat probe opens no ledger run, graded as an objective as in
   # drift-chat-request-runs-collector so a ledger write fails
   # VerificationCorrectness directly.

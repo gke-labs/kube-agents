@@ -70,7 +70,8 @@ COMPLIANT_REPORT = (
     "manifest) disables Linux CFS bandwidth quota enforcement in the kubelet, so container CPU "
     "limits are not enforced and pods are not throttled at their declared CPU limits.\n"
     "- **GitOps alignment:** Update the node-pool declaration in Git to match the fleet baseline "
-    "(20 GB boot disk, no custom `podPidsLimit`, and `cpuCfsQuota: true`) via a pull request."
+    "(20 GB boot disk, no custom `podPidsLimit`, and `cpuCfsQuota: true`) via a pull request.\n\n"
+    "cpuCfsQuota=false container CPU limits: unenforced"
 )
 
 
@@ -222,32 +223,41 @@ def test_quota_objective_rejects_report_naming_only_pod_pids_limit_or_boot_disk(
 @pytest.mark.parametrize(
     "explanation",
     [
-        "When cpuCfsQuota is false, CPU limits are not enforced by the kubelet.",
-        "Setting cpuCfsQuota: false leaves container CPU limits unenforced.",
-        "With cpuCfsQuota=false, workload CPU limits are no longer enforced on the node pool.",
-        "Disabling cpuCfsQuota disables CPU throttling for containers that declare CPU limits.",
-        "When cpuCfsQuota is disabled in ContainerNodePool, CPU quota enforcement is disabled.",
-        "CFS quota enforcement is disabled, so containers can burst beyond their CPU limits.",
-        "The kubelet stops enforcing container CPU limits when cpuCfsQuota is false.",
-        "Setting cpu_cfs_quota=false prevents the kubelet from enforcing CPU limits.",
-        "Containers can exceed their declared CPU limits and starve neighboring pods.",
-        "CPU limits in Pod specs\nare not enforced when cpuCfsQuota is false.",
-        "When cpuCfsQuota=false, containers are not prevented from exceeding their declared CPU limits.",
+        "cpuCfsQuota=false container CPU limits: unenforced",
+        "**cpuCfsQuota=false container CPU limits: unenforced**",
+        "`cpuCfsQuota=false container CPU limits: unenforced`",
+        "- cpuCfsQuota=false container CPU limits: unenforced.",
+        "> cpuCfsQuota=false container CPU limits: unenforced",
+        "1. cpuCfsQuota=false container CPU limits: unenforced",
+        (
+            "Setting cpuCfsQuota=false (which is not the GKE default) leaves container CPU limits unenforced.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
+        ),
+        (
+            "When cpuCfsQuota is not enabled on a node pool container CPU limits are not enforced.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
+        ),
+        (
+            "With no CFS quota configured on the node pool container CPU limits are not enforced.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
+        ),
+        (
+            "CPU requests are still enforced at scheduling time but container CPU limits are not enforced at runtime.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
+        ),
+        (
+            "The risk of cpuCfsQuota=false is: container CPU limits are not enforced.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
+        ),
         (
             "When cpuCfsQuota is false, CPU limits are not enforced by the kubelet. "
-            "On peer pools where cpuCfsQuota is true, containers cannot exceed their declared CPU limits."
+            "On peer pools where cpuCfsQuota is true, containers cannot exceed their declared CPU limits.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
         ),
         (
             "Setting cpuCfsQuota: false leaves container CPU limits unenforced. "
-            "In GitOps, do not disable CFS quota enforcement in the ContainerNodePool manifest."
-        ),
-        (
-            "Disabling cpuCfsQuota disables CPU throttling for containers that declare CPU limits. "
-            "Align the declaration in GitOps without disabling CFS quota enforcement."
-        ),
-        (
-            "When cpuCfsQuota=false, containers are not prevented from exceeding their declared CPU limits, "
-            "because CFS quota enforcement is disabled."
+            "In GitOps, do not disable CFS quota enforcement in the ContainerNodePool manifest.\n"
+            "cpuCfsQuota=false container CPU limits: unenforced"
         ),
     ],
 )
@@ -260,42 +270,36 @@ def test_unenforced_cpu_limits_objective_accepts_valid_explanations(
 @pytest.mark.parametrize(
     "non_explanation",
     [
+        "cpuCfsQuota=false container CPU limits: enforced",
+        "**cpuCfsQuota=false container CPU limits: enforced**",
+        "cpuCfsQuota=false container CPU limits: unenforced?",
+        "cpuCfsQuota=false container CPU limits: unenforced \u26a0\ufe0f",
+        "cpuCfsQuota=false container CPU limits: unenforced \u274c",
+        "cpuCfsQuota=false container CPU limits: unenforced or enforced",
+        "cpuCfsQuota=false container CPU limits: not unenforced",
+        (
+            "cpuCfsQuota=false container CPU limits: unenforced\n"
+            "cpuCfsQuota=false container CPU limits: enforced"
+        ),
         "Workloads on seeded-c set CPU limits and memory limits in their Pod specs.",
         "CPU limits are enforced by default on GKE Standard node pools.",
         "CPU limits are enforced. Master authorized networks are not enforced on seeded-c.",
-        "CPU limits are enforced. Memory limits are not enforced on seeded-c.",
-        "CPU limits are enforced on all pools, whereas podPidsLimit is not enforced on peer pools.",
-        "CPU limits are enforced on all pools while memory limits are not enforced.",
-        "PID limits are not enforced when podPidsLimit is unset.",
+        "seeded-c does not set cpuCfsQuota: false or leave container CPU limits unenforced.",
+        "The kubelet does not, on any node pool in the fleet, leave container CPU limits unenforced.",
+        "Containers cannot, when cpuCfsQuota is true, exceed their declared CPU limits.",
+        "Containers are unable to exceed their declared CPU limits.",
+        "cpuCfsQuota=true protects workloads against unenforced CPU limits.",
+        "Exceeding CPU limits: not possible when cpuCfsQuota is true.",
+        "Disabling CFS quota enforcement — not possible on this pool.",
+        "Ignoring CPU limits is impossible when cpuCfsQuota is enabled.",
+        "Exceeding declared CPU limits is prevented by the kubelet.",
+        "Disabling CFS quota enforcement is avoided on peer pools.",
+        "On peer pools, the kubelet fails to ignore CPU limits.",
         "When cpuCfsQuota is true, CPU limits are not unenforced and the kubelet does not disable CPU throttling.",
         "When cpuCfsQuota is true, CFS quota enforcement is not disabled.",
         "When cpuCfsQuota is true, containers cannot exceed their declared CPU limits.",
-        "On peer pools where cpuCfsQuota is true, containers cannot exceed their declared CPU limits.",
-        "When cpuCfsQuota is true, containers cannot burst beyond their CPU limits.",
-        "When cpuCfsQuota is true, the kubelet never disables CPU throttling.",
-        "When cpuCfsQuota is true, it does not leave CPU limits unenforced.",
-        "When cpuCfsQuota is true, it does not leave container CPU limits unenforced.",
-        "When cpuCfsQuota is true, it does not leave the CPU limits unenforced.",
-        "When cpuCfsQuota is true, the kubelet does not stop enforcing CPU limits.",
-        "When cpuCfsQuota is true, it does not prevent the kubelet from enforcing CPU limits.",
-        "When cpuCfsQuota is true, CPU limits aren't unenforced.",
-        "When cpuCfsQuota is true, it doesn't leave CPU limits unenforced.",
-        "When cpuCfsQuota is true, the kubelet doesn't stop enforcing CPU limits.",
-        "When cpuCfsQuota is true, CFS quota enforcement isn't disabled.",
-        "When cpuCfsQuota is true, containers don't exceed their declared CPU limits.",
-        "Containers are not allowed to exceed their declared CPU limits.",
-        "Pods are configured not to exceed their CPU limits.",
-        "The kubelet does not ever stop enforcing CPU limits.",
-        "cpuCfsQuota=true does not actually disable CPU quota enforcement.",
-        "Containers do not ever exceed their declared CPU limits.",
-        "CPU limits are enforced rather than unenforced.",
-        "CPU limits are enforced instead of unenforced.",
-        "The kubelet runs without disabling CPU quota enforcement.",
         "In GitOps, do not disable CFS quota enforcement in the ContainerNodePool manifest.",
         "Align the declaration in GitOps without disabling CFS quota enforcement.",
-        "CPU limits are enforced on all pools and podPidsLimit is not enforced on peer pools.",
-        "CFS quota enforcement is active on all pools and podPidsLimit is disabled on the peers.",
-        "There is no drift on seeded-a where CPU quota enforcement is active.",
         "seeded-c runs a 50 GB boot disk and podPidsLimit 4096.",
         "the kubelet is configured not to ignore container cpu limits",
         "cpu limits are enforced (podpidslimit is not enforced on peer pools)",
