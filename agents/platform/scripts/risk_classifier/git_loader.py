@@ -32,6 +32,7 @@ MAX_CHANGED_FILES = 500
 MAX_SIZED_CANDIDATES = 2_000
 MAX_LOCAL_DIR_ENTRIES = 10_000
 DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
+_GIT_ARCHIVE_CHUNK_SIZE = 200
 
 _SPECIAL_MODES = frozenset({"120000", "160000"})
 _MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
@@ -235,9 +236,8 @@ def _read_blobs_via_archive(
     archive_oversized: set[str] = set()
     seen_members: set[str] = set()
     try:
-        chunk_size = 200
-        for start in range(0, len(paths), chunk_size):
-            chunk = [p for p in paths[start : start + chunk_size] if p]
+        for start in range(0, len(paths), _GIT_ARCHIVE_CHUNK_SIZE):
+            chunk = [p for p in paths[start : start + _GIT_ARCHIVE_CHUNK_SIZE] if p]
             if not chunk:
                 continue
             _run_git(

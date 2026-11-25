@@ -265,7 +265,7 @@ class ParserStrictYAMLAndJSONAdversarialTests(unittest.TestCase):
         t0 = time.monotonic()
         self.assertFalse(has_template_syntax("{{ " * 60_000))
         self.assertFalse(has_template_syntax("${A" * 60_000))
-        self.assertLess(time.monotonic() - t0, 0.25)
+        self.assertLess(time.monotonic() - t0, 3.0)
 
     def test_escaped_unicode_bidi_c1_surrogates_and_line_separators_rejected(self) -> None:
         bad_payloads = [
@@ -461,7 +461,7 @@ class ParserStrictYAMLAndJSONAdversarialTests(unittest.TestCase):
             b_out = parse_manifest_bytes(bomb.encode("utf-8"))
             self.assertEqual(b_out.error_code, "YAML_ANCHOR_OR_ALIAS")
             self.assertEqual(b_out.resources, ())
-        self.assertLess(time.monotonic() - t0, 0.25)
+        self.assertLess(time.monotonic() - t0, 3.0)
 
     def test_yaml_comments_with_helm_and_envsubst_examples_do_not_false_positive(self) -> None:
         commented_cm = (

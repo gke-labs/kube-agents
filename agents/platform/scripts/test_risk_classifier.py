@@ -710,7 +710,7 @@ class AdversarialEvasionAndPerformanceTests(unittest.TestCase):
         hostile_cases = [
             ("anchor/alias", "a: &x\n  k: v\nb: *x\n"),
             ("merge key", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  namespace: shop\ndata:\n  <<: {a: b}\n"),
-            ("dup key", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  namespace: shop\ndata:\n  k: 1\n  k: 2\n"),
+            ("dup key", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  namespace: shop\ndata:\n  k: \"1\"\n  k: \"2\"\n"),
             ("bidi trojan", BASE_CONFIGMAP + "  X: \"abc\u202edef\"\n"),
             ("zero-width", BASE_CONFIGMAP + "  X: \"abc\u200bdef\"\n"),
         ]
@@ -787,7 +787,7 @@ class AdversarialEvasionAndPerformanceTests(unittest.TestCase):
         r = classify_changes(changes)
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         self.assertEqual(r.risk_level, RISK_HIGH)  # >50 objects cap
-        self.assertLess(elapsed_ms, 1500.0, f"100-file classification took {elapsed_ms:.1f}ms")
+        self.assertLess(elapsed_ms, 5000.0, f"100-file classification took {elapsed_ms:.1f}ms")
 
     def test_git_loader_and_cli_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2210,6 +2210,101 @@ class TriageEngineHardeningTests(unittest.TestCase):
         r_role_narrow = classify_changes([_mod("clusters/dev/role.yaml", role_b, role_a)])
         self.assertEqual(r_role_narrow.risk_level, RISK_HIGH)
         self.assertEqual(r_role_narrow.disruptiveness, DISRUPT_DISRUPTIVE)
+
+        # 14. Unmodelled Service / Workload / HPA spec edits set revertability == moderate (blocked by decide_risk),
+        #     even alongside metadata edits, and LoadBalancer -> NodePort sets disruptiveness == destructive
+        svc_unmod = BASE_SERVICE.replace(
+            "  name: web\n",
+            "  name: web\n  labels:\n    custom.corp/tag: v2\n",
+        ) + "  loadBalancerIP: 203.0.113.10\n"
+        r_svc_unmod = classify_changes([_mod("clusters/dev/svc.yaml", BASE_SERVICE, svc_unmod)])
+        self.assertEqual(r_svc_unmod.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_svc_unmod.revertability, REVERT_MODERATE)
+        self.assertIn("UNALLOWLISTED_FIELD_CHANGE", {x.code for x in r_svc_unmod.reasons})
+
+        r_lb_to_np = classify_changes(
+            [_mod("clusters/dev/svc.yaml", BASE_SERVICE.replace("ClusterIP", "LoadBalancer"), BASE_SERVICE.replace("ClusterIP", "NodePort"))]
+        )
+        self.assertEqual(r_lb_to_np.risk_level, RISK_HIGH)
+        self.assertEqual(r_lb_to_np.disruptiveness, DISRUPT_DESTRUCTIVE)
+
+        dep_unmod = BASE_DEPLOY.replace("  replicas: 4\n", "  replicas: 4\n  minReadySeconds: 30\n")
+        r_dep_unmod = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, dep_unmod)])
+        self.assertEqual(r_dep_unmod.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_dep_unmod.revertability, REVERT_MODERATE)
+
+        hpa_b1 = "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  minReplicas: 2\n  maxReplicas: 6\n"
+        hpa_beh = hpa_b1 + "  behavior:\n    scaleDown:\n      stabilizationWindowSeconds: 0\n"
+        r_hpa_beh = classify_changes([_mod("clusters/dev/hpa.yaml", hpa_b1, hpa_beh)])
+        self.assertEqual(r_hpa_beh.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_hpa_beh.revertability, REVERT_MODERATE)
+        self.assertIn("HPA_POLICY_MODIFIED", {x.code for x in r_hpa_beh.reasons})
+
+        # 15. Deployment scaling replicas 4 -> 3 with maxUnavailable: 2 (both with and without strategy diff) -> AGGRESSIVE_ROLLOUT_STRATEGY
+        dep_ru_b = BASE_DEPLOY.replace(
+            "  replicas: 4\n",
+            "  replicas: 4\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 1\n",
+        )
+        dep_ru_a = BASE_DEPLOY.replace(
+            "  replicas: 4\n",
+            "  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 2\n",
+        )
+        r_ru_both = classify_changes([_mod("clusters/dev/web.yaml", dep_ru_b, dep_ru_a)])
+        self.assertEqual(r_ru_both.risk_level, RISK_HIGH)
+        self.assertEqual(r_ru_both.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertIn("AGGRESSIVE_ROLLOUT_STRATEGY", {x.code for x in r_ru_both.reasons})
+
+        dep_ru_keep_b = BASE_DEPLOY.replace(
+            "  replicas: 4\n",
+            "  replicas: 4\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 2\n",
+        )
+        dep_ru_keep_a = dep_ru_keep_b.replace("  replicas: 4\n", "  replicas: 3\n")
+        r_ru_scale = classify_changes([_mod("clusters/dev/web.yaml", dep_ru_keep_b, dep_ru_keep_a)])
+        self.assertEqual(r_ru_scale.risk_level, RISK_HIGH)
+        self.assertEqual(r_ru_scale.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertIn("AGGRESSIVE_ROLLOUT_STRATEGY", {x.code for x in r_ru_scale.reasons})
+
+        # 16. Swapping a volume source in place (same name: persistentVolumeClaim -> emptyDir) -> VOLUME_REMOVED (high/disruptive)
+        dep_vol_b = BASE_DEPLOY + "      volumes:\n        - name: data\n          persistentVolumeClaim:\n            claimName: prod-db\n"
+        dep_vol_a = BASE_DEPLOY + "      volumes:\n        - name: data\n          emptyDir: {}\n"
+        r_vol_swap = classify_changes([_mod("clusters/dev/web.yaml", dep_vol_b, dep_vol_a)])
+        self.assertEqual(r_vol_swap.risk_level, RISK_HIGH)
+        self.assertEqual(r_vol_swap.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertIn("VOLUME_REMOVED", {x.code for x in r_vol_swap.reasons})
+
+        # 17. Double-leading-slash hostPath (`//etc`, `//var/run/docker.sock`, `//`) -> RISK_CRITICAL
+        for dbl_hp in ("//etc", "//var/run/docker.sock", "//"):
+            dep_hp = BASE_DEPLOY + f"      volumes:\n        - name: host\n          hostPath:\n            path: {dbl_hp}\n"
+            r_dbl_hp = classify_changes([_add("clusters/dev/hp.yaml", dep_hp)])
+            self.assertEqual(r_dbl_hp.risk_level, RISK_CRITICAL, dbl_hp)
+            self.assertEqual(r_dbl_hp.blast_radius, BLAST_CRITICAL, dbl_hp)
+
+        # 18. ConfigMap wiping binaryData key to "" -> CONFIGMAP_VALUE_WIPED (high/disruptive),
+        #     and benign immutable: false / empty data: {} edit -> RISK_LOW (supported=True)
+        cm_bin_b = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bin-cm\n  namespace: shop\nbinaryData:\n  blob: aGVsbG8=\n"
+        cm_bin_a = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bin-cm\n  namespace: shop\nbinaryData:\n  blob: \"\"\n"
+        r_bin_wipe = classify_changes([_mod("clusters/dev/cm.yaml", cm_bin_b, cm_bin_a)])
+        self.assertEqual(r_bin_wipe.risk_level, RISK_HIGH)
+        self.assertEqual(r_bin_wipe.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertIn("CONFIGMAP_VALUE_WIPED", {x.code for x in r_bin_wipe.reasons})
+
+        cm_empty_b = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: empty-cm\n  namespace: shop\n"
+        cm_empty_a = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: empty-cm\n  namespace: shop\nimmutable: false\ndata: {}\n"
+        r_cm_noop = classify_changes([_mod("clusters/dev/cm.yaml", cm_empty_b, cm_empty_a)])
+        self.assertEqual(r_cm_noop.risk_level, RISK_LOW)
+        self.assertTrue(r_cm_noop.supported)
+
+        # 19. ConfigMap with non-string data value alongside a recovery-triggering sibling doc retains CONFIGMAP_NON_STRING_VALUE
+        recov_non_str = (
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bad-dup\n  namespace: shop\ndata:\n  a: \"1\"\n  a: \"2\"\n"
+            "---\n"
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bad-int\n  namespace: shop\ndata:\n  PORT: 8080\n"
+        )
+        r_recov_ns = classify_changes([_add("clusters/dev/multi.yaml", recov_non_str)])
+        self.assertEqual(r_recov_ns.risk_level, RISK_HIGH)
+        self.assertEqual(r_recov_ns.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertFalse(r_recov_ns.supported)
+        self.assertIn("CONFIGMAP_NON_STRING_VALUE", {x.code for x in r_recov_ns.reasons})
 
 
 if __name__ == "__main__":

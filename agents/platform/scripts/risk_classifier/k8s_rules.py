@@ -1235,8 +1235,7 @@ def _is_critical_host_path(path_str: str) -> bool:
     clean = posixpath.normpath(raw)
     if clean == ".":
         return True
-    if not clean.startswith("/"):
-        clean = "/" + clean
+    clean = "/" + clean.lstrip("/")
     for crit in _CRITICAL_HOST_PATHS:
         if crit == "/":
             if clean == "/":
@@ -3107,6 +3106,20 @@ def _check_workload_modify(
                 field_path=d.dotted,
             )
 
+    b_has_rep_early = "replicas" in b_spec and b_spec["replicas"] is not None
+    a_has_rep_early = "replicas" in a_spec and a_spec["replicas"] is not None
+    b_rep_est = (
+        b_spec["replicas"]
+        if b_has_rep_early and _is_strict_int(b_spec["replicas"]) and b_spec["replicas"] >= 0
+        else 1
+    )
+    a_rep_est = (
+        a_spec["replicas"]
+        if a_has_rep_early and _is_strict_int(a_spec["replicas"]) and a_spec["replicas"] >= 0
+        else 1
+    )
+    eff_rep_est = min(b_rep_est, a_rep_est)
+
     if kind == "Deployment":
         a_strat = a_spec.get("strategy")
         b_strat = b_spec.get("strategy")
@@ -3133,8 +3146,7 @@ def _check_workload_modify(
             else:
                 ru = a_strat.get("rollingUpdate") if isinstance(a_strat, dict) else None
                 max_unavail = ru.get("maxUnavailable") if isinstance(ru, dict) else None
-                b_rep_est = b_spec.get("replicas", 1) if _is_strict_int(b_spec.get("replicas", 1)) else 1
-                if _is_aggressive_max_unavailable(max_unavail, b_rep_est):
+                if _is_aggressive_max_unavailable(max_unavail, eff_rep_est):
                     ev.add(
                         "AGGRESSIVE_ROLLOUT_STRATEGY",
                         DIM_DISRUPTIVENESS,
@@ -3152,20 +3164,34 @@ def _check_workload_modify(
                         f"modifies Deployment {ev.ref.name!r} rollout strategy",
                         field_path="spec.strategy",
                     )
-        elif (
-            isinstance(a_strat, dict)
-            and str(a_strat.get("type") or "") == "Recreate"
-            and a_spec.get("template") != b_spec.get("template")
-        ):
-            ev.add(
-                "RECREATE_WORKLOAD_ROLLOUT",
-                DIM_DISRUPTIVENESS,
-                RISK_HIGH,
-                f"triggers pod rollout on Deployment {ev.ref.name!r} with Recreate strategy (causes downtime)",
-                revert=REVERT_MODERATE,
-                disrupt=DISRUPT_DISRUPTIVE,
-                field_path="spec.template",
-            )
+        else:
+            if a_rep_est < b_rep_est and isinstance(a_strat, dict):
+                ru = a_strat.get("rollingUpdate")
+                max_unavail = ru.get("maxUnavailable") if isinstance(ru, dict) else None
+                if _is_aggressive_max_unavailable(max_unavail, eff_rep_est):
+                    ev.add(
+                        "AGGRESSIVE_ROLLOUT_STRATEGY",
+                        DIM_DISRUPTIVENESS,
+                        RISK_HIGH,
+                        f"replica scale-down makes Deployment rollingUpdate.maxUnavailable={max_unavail!r} aggressive",
+                        revert=REVERT_MODERATE,
+                        disrupt=DISRUPT_DISRUPTIVE,
+                        field_path="spec.strategy.rollingUpdate.maxUnavailable",
+                    )
+            if (
+                isinstance(a_strat, dict)
+                and str(a_strat.get("type") or "") == "Recreate"
+                and a_spec.get("template") != b_spec.get("template")
+            ):
+                ev.add(
+                    "RECREATE_WORKLOAD_ROLLOUT",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"triggers pod rollout on Deployment {ev.ref.name!r} with Recreate strategy (causes downtime)",
+                    revert=REVERT_MODERATE,
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.template",
+                )
 
     if kind in ("DaemonSet", "StatefulSet"):
         a_ustrat = a_spec.get("updateStrategy")
@@ -3183,8 +3209,7 @@ def _check_workload_modify(
             else:
                 ru = a_ustrat.get("rollingUpdate") if isinstance(a_ustrat, dict) else None
                 max_unavail = ru.get("maxUnavailable") if isinstance(ru, dict) else None
-                b_rep_est = b_spec.get("replicas", 1) if _is_strict_int(b_spec.get("replicas", 1)) else 1
-                if _is_aggressive_max_unavailable(max_unavail, b_rep_est):
+                if _is_aggressive_max_unavailable(max_unavail, eff_rep_est):
                     ev.add(
                         "AGGRESSIVE_ROLLOUT_STRATEGY",
                         DIM_DISRUPTIVENESS,
@@ -3194,6 +3219,19 @@ def _check_workload_modify(
                         disrupt=DISRUPT_DISRUPTIVE,
                         field_path="spec.updateStrategy.rollingUpdate.maxUnavailable",
                     )
+        elif a_rep_est < b_rep_est and isinstance(a_ustrat, dict):
+            ru = a_ustrat.get("rollingUpdate")
+            max_unavail = ru.get("maxUnavailable") if isinstance(ru, dict) else None
+            if _is_aggressive_max_unavailable(max_unavail, eff_rep_est):
+                ev.add(
+                    "AGGRESSIVE_ROLLOUT_STRATEGY",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"replica scale-down makes {kind} updateStrategy.rollingUpdate.maxUnavailable={max_unavail!r} aggressive",
+                    revert=REVERT_MODERATE,
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.updateStrategy.rollingUpdate.maxUnavailable",
+                )
 
     if kind == "StatefulSet":
         ev.add(
@@ -3729,17 +3767,29 @@ def _check_workload_modify(
                     field_path=f"spec.template.spec.{sched_key}",
                 )
 
-    # Volume removals (safe against unhashable non-string volume names)
+    # Volume removals or in-place volume source swaps (safe against unhashable non-string volume names)
     b_vols = b_ps.get("volumes") if isinstance(b_ps.get("volumes"), list) else []
     a_vols = a_ps.get("volumes") if isinstance(a_ps.get("volumes"), list) else []
-    b_vnames = {v["name"] for v in b_vols if isinstance(v, dict) and isinstance(v.get("name"), str) and v["name"]}
-    a_vnames = {v["name"] for v in a_vols if isinstance(v, dict) and isinstance(v.get("name"), str) and v["name"]}
-    if b_vnames - a_vnames:
+    b_vol_map = {v["name"]: v for v in b_vols if isinstance(v, dict) and isinstance(v.get("name"), str) and v["name"]}
+    a_vol_map = {v["name"]: v for v in a_vols if isinstance(v, dict) and isinstance(v.get("name"), str) and v["name"]}
+    dropped_or_swapped_vols: list[str] = []
+    for vname, bv in sorted(b_vol_map.items()):
+        av = a_vol_map.get(vname)
+        if av is None:
+            dropped_or_swapped_vols.append(vname)
+            continue
+        b_src_keys = {str(k) for k in bv.keys() if k != "name"}
+        a_src_keys = {str(k) for k in av.keys() if k != "name"}
+        if b_src_keys != a_src_keys or (
+            (b_src_keys & {"configMap", "downwardAPI", "emptyDir"}) and bv != av
+        ):
+            dropped_or_swapped_vols.append(vname)
+    if dropped_or_swapped_vols:
         ev.add(
             "VOLUME_REMOVED",
             DIM_DISRUPTIVENESS,
             RISK_HIGH,
-            f"removes volumes {sorted(b_vnames - a_vnames)}",
+            f"removes or replaces volume sources {dropped_or_swapped_vols}",
             disrupt=DISRUPT_DISRUPTIVE,
             field_path=f"{'.'.join(pod_prefix)}.volumes",
         )
@@ -3777,7 +3827,7 @@ def _check_workload_modify(
                     and t[len(pod_prefix) + 4] in ("cpu", "memory")
                 ):
                     continue
-        if ev.risk_level == RISK_LOW or (
+        if ev.risk_level == RISK_LOW or ev.revertability == REVERT_EASY or (
             t[: len(pod_prefix)] == pod_prefix
             and len(t) >= len(pod_prefix) + 4
             and t[len(pod_prefix) + 2] == "resources"
@@ -3788,6 +3838,7 @@ def _check_workload_modify(
                 DIM_BLAST_RADIUS,
                 RISK_MEDIUM,
                 f"modifies field {d.dotted!r} outside the low-risk allowlist",
+                revert=REVERT_MODERATE,
                 field_path=d.dotted,
             )
 
@@ -4064,13 +4115,24 @@ def _check_configmap(
                                 field_path=f"binaryData.{ks}",
                                 security=True,
                             )
-                    ev.add(
-                        "CONFIGMAP_BINARY_DATA",
-                        DIM_BLAST_RADIUS,
-                        RISK_MEDIUM,
-                        f"ConfigMap {ev.ref.name!r} writes opaque binaryData key {ks!r}",
-                        field_path=f"binaryData.{ks}",
-                    )
+                    if action == ACTION_MODIFY and k in bmap and val == "" and bmap.get(k):
+                        ev.add(
+                            "CONFIGMAP_VALUE_WIPED",
+                            DIM_DISRUPTIVENESS,
+                            RISK_HIGH,
+                            f"wipes ConfigMap {ev.ref.name!r} binaryData.{ks} to empty string",
+                            disrupt=DISRUPT_DISRUPTIVE,
+                            field_path=f"binaryData.{ks}",
+                        )
+                    else:
+                        ev.add(
+                            "CONFIGMAP_BINARY_DATA",
+                            DIM_BLAST_RADIUS,
+                            RISK_MEDIUM,
+                            f"ConfigMap {ev.ref.name!r} writes opaque binaryData key {ks!r}",
+                            revert=REVERT_MODERATE,
+                            field_path=f"binaryData.{ks}",
+                        )
                 else:
                     s_trim = val.strip()
                     is_complex = (
@@ -4147,13 +4209,21 @@ def _check_configmap(
                     disrupt=DISRUPT_DISRUPTIVE,
                     field_path=f"{field_name}.{k}",
                 )
-    if action == ACTION_ADD and not ev.reasons:
-        ev.add(
-            "CONFIGMAP_CREATED",
-            DIM_BLAST_RADIUS,
-            RISK_LOW,
-            f"creates empty ConfigMap {ev.ref.name!r}",
-        )
+    if not ev.reasons:
+        if action == ACTION_ADD:
+            ev.add(
+                "CONFIGMAP_CREATED",
+                DIM_BLAST_RADIUS,
+                RISK_LOW,
+                f"creates empty ConfigMap {ev.ref.name!r}",
+            )
+        else:
+            ev.add(
+                "CONFIGMAP_SAFE_SCALAR_ADDED",
+                DIM_BLAST_RADIUS,
+                RISK_LOW,
+                f"updates benign structure on ConfigMap {ev.ref.name!r}",
+            )
 
 
 def _parse_int_or_pct(val: Any) -> tuple[str, float] | None:
@@ -4294,12 +4364,19 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
     b_type = str(b_spec.get("type") or "ClusterIP")
     if b_type != svc_type:
         if svc_type in ("LoadBalancer", "NodePort", "ExternalName"):
+            if b_type == "LoadBalancer":
+                type_disrupt = DISRUPT_DESTRUCTIVE
+            elif svc_type == "ExternalName" or b_type == "ExternalName":
+                type_disrupt = DISRUPT_DISRUPTIVE
+            else:
+                type_disrupt = DISRUPT_NONE
             ev.add(
                 "PUBLIC_EXPOSURE_SERVICE",
                 DIM_SECURITY,
                 RISK_HIGH,
                 f"changes Service {ev.ref.name!r} type from {b_type} to {svc_type}",
                 blast=BLAST_HIGH,
+                disrupt=type_disrupt,
                 field_path="spec.type",
                 security=True,
             )
@@ -4413,13 +4490,26 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
             field_path="spec.loadBalancerSourceRanges",
             security=True,
         )
+    handled_svc_prefixes: set[tuple[str, ...]] = {
+        ("metadata",),
+        ("spec", "type"),
+        ("spec", "externalName"),
+        ("spec", "clusterIP"),
+        ("spec", "clusterIPs"),
+        ("spec", "selector"),
+        ("spec", "ports"),
+        ("spec", "externalTrafficPolicy"),
+        ("spec", "internalTrafficPolicy"),
+        ("spec", "loadBalancerSourceRanges"),
+    }
     for d in diffs:
-        if d.tokens and d.tokens[0] != "metadata" and ev.risk_level == RISK_LOW:
+        if d.tokens and not any(d.tokens[: len(p)] == p for p in handled_svc_prefixes):
             ev.add(
                 "UNALLOWLISTED_FIELD_CHANGE",
                 DIM_BLAST_RADIUS,
                 RISK_MEDIUM,
                 f"modifies Service field {d.dotted!r}",
+                revert=REVERT_MODERATE,
                 field_path=d.dotted,
             )
 
@@ -4556,6 +4646,7 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
                 DIM_BLAST_RADIUS,
                 RISK_MEDIUM,
                 f"modifies HPA field {d.dotted!r}",
+                revert=REVERT_MODERATE,
                 field_path=d.dotted,
             )
 
@@ -6058,6 +6149,7 @@ def evaluate_resource(
             RISK_HIGH if (zero_quota or action == ACTION_MODIFY) else RISK_MEDIUM,
             f"{_action_verb(action)} {ref.kind} {ref.name!r}",
             blast=BLAST_MEDIUM,
+            revert=REVERT_MODERATE,
             disrupt=DISRUPT_DISRUPTIVE if (zero_quota or action == ACTION_MODIFY) else DISRUPT_NONE,
         )
         return _finalize()
@@ -6090,6 +6182,7 @@ def evaluate_resource(
             DIM_DISRUPTIVENESS if active else DIM_BLAST_RADIUS,
             RISK_HIGH if active else RISK_MEDIUM,
             f"{_action_verb(action)} VerticalPodAutoscaler {ref.name!r} with updateMode={mode!r}",
+            revert=REVERT_MODERATE,
             disrupt=DISRUPT_DISRUPTIVE if active else DISRUPT_NONE,
         )
         return _finalize()

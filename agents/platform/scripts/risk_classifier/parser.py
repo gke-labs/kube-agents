@@ -859,27 +859,6 @@ def _is_list_envelope(doc: dict[str, Any], kind: str) -> bool:
     return True
 
 
-def _coerce_recovered_configmap(doc: dict[str, Any]) -> dict[str, Any]:
-    """Normalize non-string scalar values in a recovered `ConfigMap.data` during error recovery.
-
-    Kubernetes apiserver rejects unquoted non-string `ConfigMap.data` values (`data: {k: 1}`),
-    so normalizing scalar ints/floats/bools to strings during duplicate-key/anchor error recovery
-    preserves `ParsedResource` extraction and secret-key scanning without letting broken scalar
-    types trigger `CONFIGMAP_NON_STRING_VALUE` (`RISK_HIGH`) on benign parse-error tests.
-    """
-    data = doc.get("data")
-    if not isinstance(data, dict):
-        return doc
-    if all(isinstance(v, str) for v in data.values()):
-        return doc
-    copied = dict(doc)
-    copied["data"] = {
-        k: (str(v) if isinstance(v, (int, float, bool)) else ("" if v is None else v))
-        for k, v in data.items()
-    }
-    return copied
-
-
 def _extract_resources(
     doc: Any,
     out: list[ParsedResource],
@@ -985,8 +964,6 @@ def _extract_resources(
     normalized = dict(doc)
     normalized["apiVersion"] = api_version
     normalized["kind"] = kind
-    if recovery_mode and group == "" and kind == "ConfigMap":
-        normalized = _coerce_recovered_configmap(normalized)
 
     ref = ResourceRef(
         group=group,
