@@ -468,7 +468,8 @@ class TestRiskRules(unittest.TestCase):
         self.assertFalse(ar.decide_risk(rules, "low", "dev", install_max_risk="off").allowed)
 
     def test_install_max_risk_ceiling_fails_closed_on_invalid_values(self):
-        self.assertIsNone(ar.install_max_risk_ceiling(""))
+        self.assertEqual(ar.install_max_risk_ceiling(""), "off")
+        self.assertEqual(ar.install_max_risk_ceiling("   "), "off")
         self.assertEqual(ar.install_max_risk_ceiling("low"), "low")
         self.assertEqual(ar.install_max_risk_ceiling("MEDIUM"), "medium")
         self.assertEqual(ar.install_max_risk_ceiling("off"), "off")
@@ -564,8 +565,25 @@ class TestRiskRules(unittest.TestCase):
         root = _tree(text)
         fake = types.ModuleType("kubeagents_switches")
         fake.switch = lambda name: "on"
+
+        # Unset KUBEAGENTS_AUTOMERGE_MAX_RISK keeps risk-based auto-merge off by default
+        buf_unset = io.StringIO()
+        clean_env = {k: v for k, v in os.environ.items() if k != ar.INSTALL_MAX_RISK_ENV}
+        with (
+            mock.patch.dict(os.environ, clean_env, clear=True),
+            mock.patch.dict(sys.modules, {"kubeagents_switches": fake}),
+            redirect_stdout(buf_unset),
+        ):
+            rc_unset = ar.main([str(root), "--risk", "low", "--environment", "staging"])
+        self.assertEqual(rc_unset, 0)
+        self.assertFalse(json.loads(buf_unset.getvalue())["decision"]["allowed"])
+
         buf = io.StringIO()
-        with mock.patch.dict(sys.modules, {"kubeagents_switches": fake}), redirect_stdout(buf):
+        with (
+            mock.patch.dict(os.environ, {ar.INSTALL_MAX_RISK_ENV: "low"}),
+            mock.patch.dict(sys.modules, {"kubeagents_switches": fake}),
+            redirect_stdout(buf),
+        ):
             code = ar.main([
                 str(root),
                 "--risk", "low",
@@ -577,7 +595,11 @@ class TestRiskRules(unittest.TestCase):
         self.assertTrue(json.loads(buf.getvalue())["decision"]["allowed"])
 
         buf2 = io.StringIO()
-        with mock.patch.dict(sys.modules, {"kubeagents_switches": fake}), redirect_stdout(buf2):
+        with (
+            mock.patch.dict(os.environ, {ar.INSTALL_MAX_RISK_ENV: "low"}),
+            mock.patch.dict(sys.modules, {"kubeagents_switches": fake}),
+            redirect_stdout(buf2),
+        ):
             code2 = ar.main([
                 str(root),
                 "--risk", "low",

@@ -388,20 +388,16 @@ def has_risk_allow_rules(rules: Rules) -> bool:
     return rules.status == LOADED and any(bool(r.max_risk) for r in rules.allow)
 
 
-def install_max_risk_ceiling(raw_override: str | None = None) -> str | None:
+def install_max_risk_ceiling(raw_override: str | None = None) -> str:
     """Return the install-level risk ceiling from `KUBEAGENTS_AUTOMERGE_MAX_RISK`.
 
-    Returns:
-    - `None` when unset/empty (defers to `.kube-agents/automation.yaml`, capped at `ALLOWABLE_RISK_LEVELS`),
-    - `"low"` or `"medium"` when pinned by the install admin,
-    - `"off"` when explicitly disabled or set to an unrecognized value (fail closed).
+    Autonomy stays off by default: an unset or empty variable returns `"off"` so
+    an install already running `KUBEAGENTS_AUTOMERGE=on` for `no-pdb` never
+    implicitly activates risk-tier auto-merge on upgrade without explicit admin
+    opt-in (`"low"` or `"medium"`).
     """
     raw = os.environ.get(INSTALL_MAX_RISK_ENV, "") if raw_override is None else raw_override
     clean = raw.strip().lower()
-    if not clean:
-        return None
-    if clean in ("off", "none", "disabled"):
-        return "off"
     if clean in ALLOWABLE_RISK_LEVELS:
         return clean
     return "off"

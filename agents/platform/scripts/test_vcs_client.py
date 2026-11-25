@@ -1763,7 +1763,7 @@ class RiskClassificationClientTest(unittest.TestCase):
                 cluster="proj/us-east4/staging-c1",
                 expected_head_sha="a" * 40,
             )
-            res2 = vcs_client.label_proposal_risk(17, "acme/infra")
+            res2 = vcs_client.label_proposal_risk(17, "acme/infra", expected_head_sha="b" * 40)
 
         self.assertEqual(res1["risk_level"], "low")
         self.assertEqual(res2["risk_label"], "risk:low")
@@ -1779,7 +1779,14 @@ class RiskClassificationClientTest(unittest.TestCase):
                         "repository": "acme/infra",
                     },
                 ),
-                ("proposal-risk-label", {"number": 17, "repository": "acme/infra"}),
+                (
+                    "proposal-risk-label",
+                    {
+                        "number": 17,
+                        "expected_head_sha": "b" * 40,
+                        "repository": "acme/infra",
+                    },
+                ),
             ],
         )
 
@@ -1791,6 +1798,8 @@ class RiskClassificationClientTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, "INVALID_ARGUMENT")
             with self.assertRaises(vcs_client.VcsError):
                 vcs_client.classify_proposal_risk(17, "acme/infra", cluster="   ")
+            with self.assertRaises(vcs_client.VcsError):
+                vcs_client.label_proposal_risk(17, "acme/infra")
             with self.assertRaises(vcs_client.VcsError):
                 vcs_client.label_proposal_risk(17, "acme/infra", expected_head_sha="")
 
@@ -1862,7 +1871,9 @@ class RiskClassificationClientTest(unittest.TestCase):
         with mock.patch.object(
             vcs_client, "call", side_effect=vcs_client.VcsError("not managed", code="REPOSITORY_NOT_MANAGED")
         ), contextlib.redirect_stdout(err_buf):
-            rc_err = vcs_client.main(["proposal-risk-label", "17", "--repo", "acme/other"])
+            rc_err = vcs_client.main(
+                ["proposal-risk-label", "17", "--repo", "acme/other", "--expected-head-sha", "a" * 40]
+            )
         self.assertEqual(rc_err, 1)
         err_doc = json.loads(err_buf.getvalue())
         self.assertEqual(err_doc["code"], "REPOSITORY_NOT_MANAGED")

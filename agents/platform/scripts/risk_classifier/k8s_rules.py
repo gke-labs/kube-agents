@@ -2722,11 +2722,15 @@ def _check_pod_template_metadata(
                 )
 
 
+_MAX_UNAVAILABLE_PCT_LIMIT = 50.0
+_MAX_UNAVAILABLE_RATIO_LIMIT = 0.5
+
+
 def _is_aggressive_max_unavailable(max_unavail: Any, replicas_est: int = 1) -> bool:
     if isinstance(max_unavail, str) and max_unavail.strip().endswith("%"):
         try:
             pct = float(max_unavail.strip()[:-1])
-            return pct > 50.0 or pct < 0.0 or not math.isfinite(pct)
+            return pct > _MAX_UNAVAILABLE_PCT_LIMIT or pct < 0.0 or not math.isfinite(pct)
         except ValueError:
             return True
     if max_unavail is not None and not _is_strict_int(max_unavail):
@@ -2734,7 +2738,11 @@ def _is_aggressive_max_unavailable(max_unavail: Any, replicas_est: int = 1) -> b
     if _is_strict_int(max_unavail):
         if max_unavail < 0:
             return True
-        if max_unavail > 1 and replicas_est > 0 and max_unavail / replicas_est > 0.5:
+        if (
+            max_unavail > 1
+            and replicas_est > 0
+            and max_unavail / replicas_est > _MAX_UNAVAILABLE_RATIO_LIMIT
+        ):
             return True
     return False
 
@@ -4382,13 +4390,26 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
             field_path="spec.loadBalancerSourceRanges",
             security=True,
         )
-    elif a_lb_ranges and ({"0.0.0.0/0", "::/0"} & {str(x) for x in a_lb_ranges}) and a_lb_ranges != b_lb_ranges:
+    elif a_lb_ranges and ({"0.0.0.0/0", "::/0"} & {str(x).strip() for x in a_lb_ranges}) and a_lb_ranges_raw != b_lb_ranges:
         ev.add(
             "PUBLIC_EXPOSURE_SERVICE",
             DIM_SECURITY,
             RISK_HIGH,
             f"opens Service {ev.ref.name!r} loadBalancerSourceRanges to public CIDR",
             blast=BLAST_HIGH,
+            field_path="spec.loadBalancerSourceRanges",
+            security=True,
+        )
+    elif svc_type == "LoadBalancer" and a_lb_ranges_raw != b_lb_ranges:
+        b_lb_list = b_lb_ranges if isinstance(b_lb_ranges, list) else []
+        narrowed_lb = any(item not in a_lb_ranges for item in b_lb_list)
+        ev.add(
+            "PUBLIC_EXPOSURE_SERVICE",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"modifies LoadBalancer Service {ev.ref.name!r} loadBalancerSourceRanges",
+            blast=BLAST_HIGH,
+            disrupt=DISRUPT_DISRUPTIVE if narrowed_lb else DISRUPT_NONE,
             field_path="spec.loadBalancerSourceRanges",
             security=True,
         )
@@ -4549,9 +4570,18 @@ def _check_pvc(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             revert=REVERT_DIFFICULT,
         )
         return
+    pre_pvc_reasons = len(ev.reasons)
     b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
     a_spec = _as_dict(ev, after_obj.get("spec"), "spec")
-    for imm in ("storageClassName", "accessModes", "volumeMode", "volumeName", "dataSource", "dataSourceRef"):
+    for imm in (
+        "storageClassName",
+        "accessModes",
+        "volumeMode",
+        "volumeName",
+        "selector",
+        "dataSource",
+        "dataSourceRef",
+    ):
         if b_spec.get(imm) != a_spec.get(imm):
             ev.add(
                 "IMMUTABLE_FIELD_CHANGED",
@@ -4578,6 +4608,17 @@ def _check_pvc(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.resources.requests.storage",
         )
+    elif b_sz is not None and a_req.get("storage") is None:
+        ev.add(
+            "PVC_STORAGE_SHRUNK",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"removes PVC {ev.ref.name!r} storage request",
+            blast=BLAST_MEDIUM,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec.resources.requests.storage",
+        )
     elif b_sz is not None and a_sz is not None and b_sz != a_sz:
         if a_sz < b_sz:
             ev.add(
@@ -4600,7 +4641,7 @@ def _check_pvc(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
                 revert=REVERT_DIFFICULT,
                 field_path="spec.resources.requests.storage",
             )
-    if not ev.reasons:
+    if len(ev.reasons) == pre_pvc_reasons and (b_spec != a_spec or not ev.reasons):
         ev.add(
             "PVC_MODIFIED",
             DIM_REVERTABILITY,
@@ -5604,7 +5645,7 @@ def evaluate_resource(
             else:
                 b_rules = before.obj.get("rules") if isinstance(before.obj.get("rules"), list) else []
                 a_rules = primary.obj.get("rules") if isinstance(primary.obj.get("rules"), list) else []
-                if len(a_rules) < len(b_rules):
+                if any(r not in a_rules for r in b_rules):
                     rbac_narrowed = True
         ev.add(
             "RBAC_CHANGE",

@@ -282,7 +282,7 @@ PATHSPEC_NO_MATCH = "did not match any files"
 # `export-ignore` is unset too: it leaves files out of the tar with no sign,
 # and a caller would read a partial tree as the whole one.
 SNAPSHOT_ATTRIBUTES_FILE = Path("info") / "attributes"
-SNAPSHOT_ATTRIBUTES = "* -export-subst -export-ignore -ident -text -working-tree-encoding\n"
+SNAPSHOT_ATTRIBUTES = "* -export-subst -export-ignore -ident -text -working-tree-encoding -filter\n"
 # What `git ls-tree` prints for each entry of the revision `snapshot` measures:
 # the mode, the size (`-` for a tree or a submodule) and the path, NUL-ended.
 SNAPSHOT_LISTING_FORMAT = "--format=%(objectmode) %(objectsize) %(path)"
@@ -532,6 +532,35 @@ def _extract_expected_head_sha(payload: Mapping[str, Any]) -> str:
 
 
 _MAX_SUMMARY_REASONS = 10
+_MAX_STATUS_DESC_LEN = 140
+_MAX_STATUS_REASON_CODES = 4
+_RISK_SHALLOW_FETCH_DEPTH = 64
+_RISK_DEEPEN_STEP = 192
+_MAX_PUBLISH_RISK_PROPOSALS = 3
+RISK_VERDICT_STATUS_CONTEXT = "kube-agents/risk"
+RISK_AUTOMERGE_STATUS_CONTEXT = "kube-agents/auto-merge"
+
+
+def _format_risk_status_description(
+    verdict: risk_classifier.ClassificationResult,
+    base_rev: str,
+    *,
+    prefix: str = "",
+) -> str:
+    """Format a commit-status description citing risk axes, base revision, and reason codes."""
+    codes: list[str] = []
+    for item in verdict.reasons:
+        if item.code and item.code not in codes:
+            codes.append(item.code)
+        if len(codes) >= _MAX_STATUS_REASON_CODES:
+            break
+    base_short = base_rev[:12] if base_rev else "unknown"
+    code_part = f" [{','.join(codes)}]" if codes else ""
+    text = (
+        f"{prefix}risk:{verdict.risk_level} ({verdict.disruptiveness}, {verdict.revertability}) "
+        f"base:{base_short}{code_part}"
+    )
+    return text[:_MAX_STATUS_DESC_LEN]
 
 
 def _risk_summary_payload(risk_res: Mapping[str, Any]) -> dict[str, Any]:
@@ -2018,20 +2047,24 @@ class VcsBroker:
                 policy_base_rev,
                 tip,
             )
+            # Strip carried risk:* and auto-merge labels BEFORE pushing so a
+            # synchronize pipeline triggered by the push never sees stale labels
+            # on the new, unjudged head commit.
+            open_numbers = (
+                self._drop_practice_label(bound, branch) if (existing_head or advance) else []
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
         risk_summaries: list[dict[str, Any]] = []
-        if existing_head or advance:
-            open_numbers = self._drop_practice_label(bound, branch)
-            if self._auto_label_risk:
-                for num in open_numbers:
-                    r_res = self._best_effort_risk_label(
-                        bound, payload, num, expected_head_sha=tip
-                    )
-                    if isinstance(r_res, dict):
-                        risk_summaries.append(_risk_summary_payload(r_res))
+        if self._auto_label_risk and open_numbers:
+            for num in open_numbers[:_MAX_PUBLISH_RISK_PROPOSALS]:
+                r_res = self._best_effort_risk_label(
+                    bound, payload, num, expected_head_sha=tip
+                )
+                if isinstance(r_res, dict):
+                    risk_summaries.append(_risk_summary_payload(r_res))
         result: dict[str, Any] = {"branch": branch, "revision": tip}
         if dm_markdown:
             result["decisionMemoryMarkdown"] = dm_markdown
@@ -3154,13 +3187,14 @@ class VcsBroker:
                 bound = self._bind(payload)
                 raw_sha = str(prop.get("sourceRevision") or "")
                 expected_sha = raw_sha if _OBJECT_ID.fullmatch(raw_sha) else ""
-                risk_res = self._best_effort_risk_label(
-                    bound, payload, num, expected_head_sha=expected_sha
-                )
-                if isinstance(risk_res, dict):
-                    created["risk"] = _risk_summary_payload(risk_res)
-                    if isinstance(risk_res.get("applied_labels"), list):
-                        prop["labels"] = list(risk_res["applied_labels"])
+                if expected_sha:
+                    risk_res = self._best_effort_risk_label(
+                        bound, payload, num, expected_head_sha=expected_sha
+                    )
+                    if isinstance(risk_res, dict):
+                        created["risk"] = _risk_summary_payload(risk_res)
+                        if isinstance(risk_res.get("applied_labels"), list):
+                            prop["labels"] = list(risk_res["applied_labels"])
         return created
 
     def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3253,7 +3287,15 @@ class VcsBroker:
             if type(num) is int and num > 0:
                 bound = self._bind(payload)
                 if self._auto_label_risk:
-                    risk_res = self._best_effort_risk_label(bound, payload, num)
+                    raw_sha = str(prop.get("sourceRevision") or "")
+                    expected_sha = raw_sha if _OBJECT_ID.fullmatch(raw_sha) else ""
+                    risk_res = (
+                        self._best_effort_risk_label(
+                            bound, payload, num, expected_head_sha=expected_sha
+                        )
+                        if expected_sha
+                        else None
+                    )
                     if isinstance(risk_res, dict):
                         updated["risk"] = _risk_summary_payload(risk_res)
                         if isinstance(risk_res.get("applied_labels"), list):
@@ -3475,7 +3517,7 @@ class VcsBroker:
             out_practice["blast_radius"] = risk_verdict.blast_radius
             out_practice["revertability"] = risk_verdict.revertability
             out_practice["disruptiveness"] = risk_verdict.disruptiveness
-            out_practice["reasons"] = [r.to_dict() for r in risk_verdict.reasons[:10]]
+            out_practice["reasons"] = [r.to_dict() for r in risk_verdict.reasons[:_MAX_SUMMARY_REASONS]]
         return bound.stamp(out_practice)
 
     def _practice_refusal(
@@ -3916,11 +3958,13 @@ class VcsBroker:
                 diff_base = parent_proc.stdout.strip()
                 diff_head = merge_commit
             else:
-                # Open or closed-unmerged PR: fetch target + head ref in one fetch when possible
+                # Open or closed-unmerged PR: fetch bounded shallow window first to keep
+                # inline request latency small on large repositories; deepen only if
+                # merge-base falls outside the initial window.
                 refspecs = [f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}"]
                 if source_branch:
                     refspecs.append(f"refs/heads/{source_branch}:refs/remotes/origin/{source_branch}")
-                fetched = guarded_fetch(*refspecs, check=False)
+                fetched = guarded_fetch(f"--depth={_RISK_SHALLOW_FETCH_DEPTH}", *refspecs, check=False)
                 if fetched.returncode != 0:
                     if state == OPEN_PROPOSAL_STATE:
                         # An open PR whose source or target branch cannot be fetched fails closed.
@@ -3935,11 +3979,12 @@ class VcsBroker:
                         )
                     # Closed-unmerged PR: head branch may have been deleted; fetch target first, then try expected_rev
                     guarded_fetch(
+                        f"--depth={_RISK_SHALLOW_FETCH_DEPTH}",
                         f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
                         check=True,
                     )
                     if expected_rev and _OBJECT_ID.fullmatch(expected_rev):
-                        rev_fetch = guarded_fetch(expected_rev, check=False)
+                        rev_fetch = guarded_fetch(f"--depth={_RISK_SHALLOW_FETCH_DEPTH}", expected_rev, check=False)
                         if rev_fetch.returncode != 0:
                             return (
                                 proposal,
@@ -3995,7 +4040,7 @@ class VcsBroker:
                 elif expected_rev and not head_sha:
                     sha_probe = bare_git(bare, "rev-parse", "--verify", f"{expected_rev}^{{commit}}", check=False)
                     if sha_probe.returncode != 0 and _OBJECT_ID.fullmatch(expected_rev):
-                        guarded_fetch(expected_rev, check=False)
+                        guarded_fetch(f"--depth={_RISK_SHALLOW_FETCH_DEPTH}", expected_rev, check=False)
                         sha_probe = bare_git(bare, "rev-parse", "--verify", f"{expected_rev}^{{commit}}", check=False)
                     if sha_probe.returncode != 0:
                         return (
@@ -4018,7 +4063,26 @@ class VcsBroker:
                         [],
                         False,
                     )
+
+                def _shallow_set() -> set[str]:
+                    s_file = bare / "shallow"
+                    return set(s_file.read_text(encoding="utf-8").split()) if s_file.is_file() else set()
+
                 mb = bare_git(bare, "merge-base", target_tip, head_sha, check=False)
+                shallow_oids = _shallow_set()
+                if shallow_oids and (
+                    mb.returncode != 0 or not mb.stdout.strip() or mb.stdout.strip() in shallow_oids
+                ):
+                    deepen_specs = list(refspecs) if head_probe and head_probe.returncode == 0 else [refspecs[0]]
+                    guarded_fetch(f"--deepen={_RISK_DEEPEN_STEP}", *deepen_specs, check=False)
+                    mb = bare_git(bare, "merge-base", target_tip, head_sha, check=False)
+                    shallow_oids = _shallow_set()
+                    if shallow_oids and (
+                        mb.returncode != 0 or not mb.stdout.strip() or mb.stdout.strip() in shallow_oids
+                    ):
+                        guarded_fetch("--unshallow", *deepen_specs, check=False)
+                        mb = bare_git(bare, "merge-base", target_tip, head_sha, check=False)
+
                 if mb.returncode != 0 or not mb.stdout.strip():
                     return (
                         proposal,
@@ -4072,6 +4136,9 @@ class VcsBroker:
                             stale_base = True
                             break
 
+            if out_context is not None:
+                out_context["diff_base"] = diff_base
+                out_context["target_tip"] = target_tip
             if out_context is not None and state == OPEN_PROPOSAL_STATE and target_tip:
                 resolved_base = ""
                 try:
@@ -4407,18 +4474,36 @@ class VcsBroker:
         `max_risk` allow rules, keeping `no-pdb`-only repos zero-overhead.
         """
         try:
+            if automation_rules.install_max_risk_ceiling() == "off":
+                return False, "", None
             base = self._practice_base(bound)
             if not base or proposal.get("target") != base:
                 return False, "", None
             rules = self._practice_rules(payload, base)
             if not automation_rules.has_risk_allow_rules(rules):
                 return False, "", None
+            git_ctx: dict[str, Any] = {}
             _, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
-                bound, number, proposal_override=proposal
+                bound, number, proposal_override=proposal, out_context=git_ctx
             )
             want, reason = self._evaluate_risk_automerge(
                 payload, base, switch, verdict, changed_paths, stale_base, rules_override=rules
             )
+            if want == automerge_eligibility.AUTOMERGE_LABEL:
+                head_rev = str(proposal.get("sourceRevision") or "")
+                base_rev = str(git_ctx.get("target_tip") or git_ctx.get("diff_base") or "")
+                if not getattr(bound.forge, "commit_statuses", False) or not _OBJECT_ID.fullmatch(head_rev):
+                    return False, "forge cannot record a commit-bound auto-merge status", verdict
+                bound.forge.commit_status_set(
+                    bound.api,
+                    bound.repo,
+                    {
+                        "revision": head_rev,
+                        "state": "success",
+                        "context": RISK_AUTOMERGE_STATUS_CONTEXT,
+                        "description": _format_risk_status_description(verdict, base_rev, prefix="eligible "),
+                    },
+                )
             return want is not None, reason, verdict
         except Exception as exc:  # noqa: BLE001
             LOGGER.info("practice risk fallback failed repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
@@ -4524,9 +4609,12 @@ class VcsBroker:
         return bound.stamp(out)
 
     def proposal_risk_label(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Classify a PR from git and apply deterministic `risk:<level>` + auto-merge labels."""
+        """Classify a PR from git and apply SHA-bound commit statuses + `risk:<level>` and auto-merge labels."""
         number = validate_number(payload.get("number"))
-        expected_sha = _extract_expected_head_sha(payload)
+        raw_expected = payload.get("expected_head_sha")
+        if raw_expected is None:
+            raw_expected = payload.get("expectedRevision")
+        expected_sha = validate_revision(raw_expected, "expected_head_sha")
         bound = self._bind(payload)
         switch = self._automerge_switch()
 
@@ -4588,6 +4676,80 @@ class VcsBroker:
                         keep_auto.add(recipe_want)
             except Exception:  # noqa: BLE001
                 pass
+
+        # Bind the verdict and any auto-merge eligibility to the exact judged head SHA
+        # and base revision via broker-owned commit statuses.
+        head_rev = str(proposal.get("sourceRevision") or "")
+        base_rev = str(git_ctx.get("target_tip") or git_ctx.get("diff_base") or "")
+        status_posted = False
+        if gate_ok and not transient_mismatch and _OBJECT_ID.fullmatch(head_rev):
+            if getattr(bound.forge, "commit_statuses", False):
+                try:
+                    bound.forge.commit_status_set(
+                        bound.api,
+                        bound.repo,
+                        {
+                            "revision": head_rev,
+                            "state": "success",
+                            "context": RISK_VERDICT_STATUS_CONTEXT,
+                            "description": _format_risk_status_description(verdict, base_rev),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001 -- informational risk status is best-effort
+                    LOGGER.info(
+                        "risk commit status failed repo=%s number=%s rev=%s: %s",
+                        bound.repo, number, head_rev[:12], str(exc)[:300],
+                    )
+            if want_auto == automerge_eligibility.AUTOMERGE_LABEL:
+                if not getattr(bound.forge, "commit_statuses", False):
+                    want_auto = None
+                    reason = "forge cannot record a commit-bound auto-merge status"
+                else:
+                    try:
+                        bound.forge.commit_status_set(
+                            bound.api,
+                            bound.repo,
+                            {
+                                "revision": head_rev,
+                                "state": "success",
+                                "context": RISK_AUTOMERGE_STATUS_CONTEXT,
+                                "description": _format_risk_status_description(
+                                    verdict, base_rev, prefix="eligible "
+                                ),
+                            },
+                        )
+                        status_posted = True
+                    except Exception as exc:  # noqa: BLE001 -- fail closed when status cannot be recorded
+                        LOGGER.warning(
+                            "auto-merge commit status failed repo=%s number=%s rev=%s: %s",
+                            bound.repo, number, head_rev[:12], str(exc)[:300],
+                        )
+                        want_auto = None
+                        reason = "could not record commit-bound auto-merge status on head revision"
+            elif (
+                getattr(bound.forge, "commit_statuses", False)
+                and any(
+                    lbl.casefold() == automerge_eligibility.AUTOMERGE_LABEL.casefold()
+                    for lbl in carried_auto
+                )
+                and automerge_eligibility.AUTOMERGE_LABEL not in keep_auto
+            ):
+                try:
+                    bound.forge.commit_status_set(
+                        bound.api,
+                        bound.repo,
+                        {
+                            "revision": head_rev,
+                            "state": "pending",
+                            "context": RISK_AUTOMERGE_STATUS_CONTEXT,
+                            "description": f"held: {reason}"[:_MAX_STATUS_DESC_LEN],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.info(
+                        "auto-merge status revocation failed repo=%s number=%s: %s",
+                        bound.repo, number, str(exc)[:300],
+                    )
 
         carried_risk_fold = {lbl.casefold() for lbl in carried_risk}
         carried_auto_fold = {lbl.casefold() for lbl in carried_auto}
@@ -4707,7 +4869,9 @@ class VcsBroker:
         return bound.stamp(
             {
                 "number": number,
-                "sourceRevision": str(proposal.get("sourceRevision") or ""),
+                "sourceRevision": head_rev,
+                "baseRevision": base_rev,
+                "commit_status_posted": status_posted,
                 "stale_base": stale_base,
                 "risk_level": verdict.risk_level,
                 "blast_radius": verdict.blast_radius,

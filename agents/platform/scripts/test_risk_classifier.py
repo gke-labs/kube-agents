@@ -2156,6 +2156,61 @@ class TriageEngineHardeningTests(unittest.TestCase):
         self.assertEqual(r_sk.revertability, REVERT_IRREVERSIBLE)
         self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_sk.reasons})
 
+        # 11. PVC metadata + spec.selector / removed storage / unmodelled spec field never downgrade to easy
+        pvc_b = (
+            "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\n  namespace: shop\n"
+            "spec:\n  accessModes: [ReadWriteOnce]\n  resources:\n    requests:\n      storage: 10Gi\n"
+        )
+        pvc_sel = (
+            "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\n  namespace: shop\n"
+            "  labels:\n    team: core\n"
+            "spec:\n  accessModes: [ReadWriteOnce]\n  selector:\n    matchLabels:\n      disk: ssd\n"
+            "  resources:\n    requests:\n      storage: 10Gi\n"
+        )
+        r_pvc_sel = classify_changes([_mod("clusters/dev/pvc.yaml", pvc_b, pvc_sel)])
+        self.assertEqual(r_pvc_sel.risk_level, RISK_HIGH)
+        self.assertEqual(r_pvc_sel.disruptiveness, DISRUPT_DESTRUCTIVE)
+
+        pvc_drop_st = (
+            "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\n  namespace: shop\n"
+            "  labels:\n    team: core\n"
+            "spec:\n  accessModes: [ReadWriteOnce]\n  resources:\n    requests: {}\n"
+        )
+        r_pvc_drop = classify_changes([_mod("clusters/dev/pvc.yaml", pvc_b, pvc_drop_st)])
+        self.assertEqual(r_pvc_drop.risk_level, RISK_HIGH)
+        self.assertEqual(r_pvc_drop.revertability, REVERT_DIFFICULT)
+
+        pvc_vac = (
+            "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: data\n  namespace: shop\n"
+            "  labels:\n    team: core\n"
+            "spec:\n  accessModes: [ReadWriteOnce]\n  volumeAttributesClassName: gold\n"
+            "  resources:\n    requests:\n      storage: 10Gi\n"
+        )
+        r_pvc_vac = classify_changes([_mod("clusters/dev/pvc.yaml", pvc_b, pvc_vac)])
+        self.assertEqual(r_pvc_vac.revertability, REVERT_MODERATE)
+        self.assertIn("PVC_MODIFIED", {x.code for x in r_pvc_vac.reasons})
+
+        # 12. LoadBalancer Service modifying loadBalancerSourceRanges (split prefixes / narrowing) -> RISK_HIGH
+        svc_lb1 = (
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: edge\n  namespace: shop\n"
+            "spec:\n  type: LoadBalancer\n  loadBalancerSourceRanges:\n    - 10.0.0.0/8\n"
+        )
+        svc_lb_split = svc_lb1.replace("10.0.0.0/8", "0.0.0.0/1\n    - 128.0.0.0/1")
+        r_lb_split = classify_changes([_mod("clusters/dev/svc.yaml", svc_lb1, svc_lb_split)])
+        self.assertEqual(r_lb_split.risk_level, RISK_HIGH)
+        self.assertEqual(r_lb_split.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertIn("PUBLIC_EXPOSURE_SERVICE", {x.code for x in r_lb_split.reasons})
+
+        # 13. Role / ClusterRole narrowing a rule in place -> disruptiveness == disruptive
+        role_b = (
+            "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: reader\n  namespace: shop\n"
+            "rules:\n  - apiGroups: [\"\"]\n    resources: [pods, configmaps]\n    verbs: [get, list]\n"
+        )
+        role_a = role_b.replace("[pods, configmaps]", "[pods]")
+        r_role_narrow = classify_changes([_mod("clusters/dev/role.yaml", role_b, role_a)])
+        self.assertEqual(r_role_narrow.risk_level, RISK_HIGH)
+        self.assertEqual(r_role_narrow.disruptiveness, DISRUPT_DISRUPTIVE)
+
 
 if __name__ == "__main__":
     unittest.main()

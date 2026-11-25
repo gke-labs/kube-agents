@@ -79,6 +79,7 @@ _NAMED_LIST_KEYS = frozenset(
 )
 
 _LIST_ENVELOPE_ALLOWED_KEYS = frozenset({"apiVersion", "kind", "metadata", "items"})
+MAX_LIST_NESTING_DEPTH = 4
 _LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
 _REDACTED_PREFIX = "<redacted-secret:"
 _NAN_SENTINEL = object()
@@ -99,10 +100,6 @@ class ParsedResource:
     ref: ResourceRef
     obj: dict[str, Any]
     sanitized: dict[str, Any]
-
-    @property
-    def identity_key(self) -> tuple[str, str, str, str]:
-        return (self.ref.group, self.ref.kind, self.ref.namespace, self.ref.name)
 
 
 @dataclass(frozen=True)
@@ -152,13 +149,6 @@ def _find_string_safety_violation(text: str, *, context: str = "manifest") -> tu
                 "HOSTILE_UNICODE",
             )
     return None
-
-
-def _check_string_safety(text: str, *, context: str = "manifest") -> None:
-    """Reject NUL, C0/C1 controls, DEL, UTF-16 surrogates, BOM, and BiDi/zero-width chars."""
-    violation = _find_string_safety_violation(text, context=context)
-    if violation is not None:
-        raise ManifestParseError(violation[0], code=violation[1])
 
 
 def _decode_raw_utf8(raw: bytes) -> str:
@@ -929,7 +919,7 @@ def _extract_resources(
 
     # Unpack Kubernetes List / *List envelopes
     if _is_list_envelope(doc, kind):
-        if depth > 4:
+        if depth > MAX_LIST_NESTING_DEPTH:
             raise ManifestParseError("nested Kubernetes List exceeds depth limit", code="LIST_TOO_DEEP")
         extra_keys = set(doc.keys()) - _LIST_ENVELOPE_ALLOWED_KEYS
         first_err = ""

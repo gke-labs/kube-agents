@@ -1833,17 +1833,26 @@ def _validate_proposal_number(number: object) -> int:
     return number
 
 
+_MAX_SUMMARY_REASONS = 10
+
+
 def _risk_request_payload(
     number: object,
     *,
     cluster: str | None = None,
     expected_head_sha: str | None = None,
+    require_head_sha: bool = False,
 ) -> dict:
     payload: dict[str, object] = {"number": _validate_proposal_number(number)}
     if cluster is not None:
         if not isinstance(cluster, str) or not cluster.strip():
             raise VcsError("cluster must be a non-empty string", code="INVALID_ARGUMENT")
         payload["cluster"] = cluster.strip()
+    if require_head_sha and expected_head_sha is None:
+        raise VcsError(
+            "expected_head_sha is required when applying risk or auto-merge labels",
+            code="INVALID_ARGUMENT",
+        )
     if expected_head_sha is not None:
         if not isinstance(expected_head_sha, str) or not expected_head_sha.strip():
             raise VcsError("expected_head_sha must be a non-empty commit SHA", code="INVALID_ARGUMENT")
@@ -1879,7 +1888,10 @@ def label_proposal_risk(
 ) -> dict:
     """Classify a pull request via the broker and reconcile `risk:*` and auto-merge labels."""
     payload = _risk_request_payload(
-        number, cluster=cluster, expected_head_sha=expected_head_sha
+        number,
+        cluster=cluster,
+        expected_head_sha=expected_head_sha,
+        require_head_sha=True,
     )
     return forge("proposal-risk-label", payload, repository)
 
@@ -1953,7 +1965,7 @@ def _format_risk_summary(result: dict) -> str:
         reasons = cls_dict.get("reasons") if isinstance(cls_dict, dict) else []
     if isinstance(reasons, list) and reasons:
         lines.append("  reasons:")
-        for item in reasons[:10]:
+        for item in reasons[:_MAX_SUMMARY_REASONS]:
             if not isinstance(item, dict):
                 continue
             code = item.get("code", "REASON")
@@ -1974,7 +1986,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     verbs = parser.add_subparsers(dest="verb", required=True)
 
-    def _add_risk_verb(name: str, aliases: tuple[str, ...], help_text: str, fn) -> None:
+    def _add_risk_verb(
+        name: str, aliases: tuple[str, ...], help_text: str, fn, *, require_sha: bool = False
+    ) -> None:
         sub = verbs.add_parser(name, aliases=list(aliases), help=help_text)
         sub.add_argument("number", type=int, help="change proposal number")
         sub.add_argument(
@@ -1989,7 +2003,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--expected-head-sha",
             dest="expected_head_sha",
-            help="optional expected head commit SHA to pin against concurrent branch updates",
+            required=require_sha,
+            help="expected 40-char head commit SHA pinned against concurrent branch updates",
         )
         sub.add_argument(
             "--format",
@@ -2010,6 +2025,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ("label-proposal-risk",),
         "classify a pull request and reconcile its risk:* and auto-merge labels",
         label_proposal_risk,
+        require_sha=True,
     )
     return parser
 

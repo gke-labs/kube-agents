@@ -35,19 +35,38 @@ DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
 
 _SPECIAL_MODES = frozenset({"120000", "160000"})
 _MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
-_DISABLE_ATTRS_CONTENT = "* -export-subst -export-ignore -ident -text -working-tree-encoding\n"
+_DISABLE_ATTRS_CONTENT = "* -export-subst -export-ignore -ident -text -working-tree-encoding -filter\n"
 _HEX_SHA_CHARS = frozenset("0123456789abcdefABCDEF")
+_HEX_OID_LENGTHS = (40, 64)
+_ASCII_DEL = 0x7F
+_ASCII_SPACE = 0x20
 
 GitRunner = Callable[..., subprocess.CompletedProcess]
 
 
 def _default_git_runner(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Standalone local CLI git runner (`python3 -m risk_classifier`).
+
+    Inside `credential-proxy`, `VcsBroker` always injects its own hardened
+    `bound.git` runner (`CommandExecutor`). For local CLI runs, disable system
+    gitconfigs, hooks, smudge filters, network protocols, and terminal prompts.
+    """
     is_bare = (cwd / "HEAD").is_file() and not (cwd / ".git").exists()
     prefix = ("--git-dir=.",) if is_bare else ()
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    forced_cfg = (
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "filter.lfs.smudge=",
+        "-c", "filter.lfs.process=",
+    )
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ALLOW_PROTOCOL": "",
+    }
     try:
         return subprocess.run(
-            ["git", *prefix, *args],
+            ["git", *forced_cfg, *prefix, *args],
             cwd=str(cwd),
             env=env,
             capture_output=True,
@@ -84,7 +103,7 @@ def _decode_git_path(raw_path: bytes) -> tuple[str, bool]:
         decoded = raw_path.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         return raw_path.decode("utf-8", errors="replace"), False
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded):
+    if any(ord(ch) < _ASCII_SPACE or ord(ch) == _ASCII_DEL for ch in decoded):
         return decoded, False
     return decoded, True
 
@@ -109,7 +128,7 @@ def _parse_diff_tree_raw_z(raw: bytes) -> list[dict[str, object]]:
         if not header.startswith(b":"):
             # Skip leading hex commit OID header if emitted by a single-tree invocation
             hdr_str = header.decode("ascii", errors="replace")
-            if len(hdr_str) in (40, 64) and all(c in _HEX_SHA_CHARS for c in hdr_str):
+            if len(hdr_str) in _HEX_OID_LENGTHS and all(c in _HEX_SHA_CHARS for c in hdr_str):
                 i += 1
                 continue
             raise ValueError(f"unexpected diff-tree record header: {header!r}")
@@ -783,9 +802,8 @@ def load_path_pair(before_path: str, after_path: str, *, logical_path: str = "")
                 if b_mode == "120000":
                     if b_lnk == a_lnk:
                         continue
-                elif b_sz > MAX_FILE_BYTES or a_sz > MAX_FILE_BYTES:
-                    if _regular_files_identical_streamed(bf, af, b_sz, a_sz):
-                        continue
+                elif _regular_files_identical_streamed(bf, af, b_sz, a_sz):
+                    continue
 
             full_rel = f"{prefix}/{rel}" if prefix else rel
             ctype = CHANGE_ADDED if bf is None else (CHANGE_DELETED if af is None else CHANGE_MODIFIED)
@@ -828,7 +846,7 @@ def load_path_pair(before_path: str, after_path: str, *, logical_path: str = "")
             a_sz = int(it["a_sz"])
             err = str(it["err"])
 
-            if err or b_mode == "120000" or a_mode == "120000":
+            if err or (b_mode in ("", "120000") and a_mode in ("", "120000")):
                 resolved[idx] = FileChange(
                     path=path,
                     change_type=ctype,
@@ -861,11 +879,11 @@ def load_path_pair(before_path: str, after_path: str, *, logical_path: str = "")
             a_bytes: bytes | None = None
             b_over = False
             a_over = False
-            if bf is not None:
+            if bf is not None and b_mode != "120000":
                 b_bytes, b_over, b_open_err = _read_bounded_regular_file(bf, min(MAX_FILE_BYTES, remaining_budget))
                 if b_open_err:
                     err = b_open_err
-            if not err and not b_over and af is not None:
+            if not err and not b_over and af is not None and a_mode != "120000":
                 rem_after_b = remaining_budget - len(b_bytes or b"")
                 a_bytes, a_over, a_open_err = _read_bounded_regular_file(af, min(MAX_FILE_BYTES, rem_after_b))
                 if a_open_err:

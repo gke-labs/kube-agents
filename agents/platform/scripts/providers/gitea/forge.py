@@ -33,6 +33,7 @@ from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
 from ..credentials import Credential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
+    MAX_STATUS_DESCRIPTION,
     repo_segments,
     validate_branch,
     validate_comment_limit,
@@ -41,7 +42,10 @@ from ..validate import (
     validate_login,
     validate_number,
     validate_page,
+    validate_revision,
     validate_state,
+    validate_status_context,
+    validate_status_state,
     validate_text,
 )
 from . import translate
@@ -129,6 +133,7 @@ class GiteaForge(Forge):
     # Issues and pull requests carry labels; `label-ensure` creates them and
     # the list verbs match them by name.
     labels = True
+    commit_statuses = True
     whoami_route = ("user", "login")
     COMMIT_CAP = COMMIT_CAP
     REACH_PAGES = REACH_PAGES
@@ -858,3 +863,24 @@ class GiteaForge(Forge):
         else:
             node = api("PATCH", f"repos/{repo}/labels/{found.get('id')}", body=body)
         return {"label": translate.label(node)}
+
+    def commit_status_set(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        revision = validate_revision(payload.get("revision"), "revision")
+        state = validate_status_state(payload.get("state"))
+        context = validate_status_context(payload.get("context"))
+        description = validate_text(payload.get("description"), "description", required=False)[
+            :MAX_STATUS_DESCRIPTION
+        ]
+        api(
+            "POST",
+            f"repos/{repo}/statuses/{revision}",
+            body={"state": state, "context": context, "description": description},
+        )
+        return {
+            "status": {
+                "revision": revision,
+                "state": state,
+                "context": context,
+                "description": description,
+            }
+        }

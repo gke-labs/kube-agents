@@ -78,6 +78,7 @@ HIGH_COMPOUND_CPU_M = 64000.0
 HIGH_COMPOUND_MEM_B = 128 * 1024**3
 CRITICAL_COMPOUND_CPU_M = 256000.0
 CRITICAL_COMPOUND_MEM_B = 512 * 1024**3
+_FLEET_CRITICAL_CLUSTER_COUNT = 3
 
 # Unicode BiDi / Trojan-Source overrides and zero-width characters disallowed in file paths
 _PATH_HOSTILE_UNICODE = frozenset(
@@ -1994,7 +1995,6 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
             )
         )
 
-    _FLEET_CRITICAL_CLUSTER_COUNT = 3
     if len(clusters_touched) > _FLEET_CRITICAL_CLUSTER_COUNT:
         overall_risk = combine_risk(overall_risk, RISK_CRITICAL)
         overall_blast = combine_blast_radius(overall_blast, BLAST_CRITICAL)

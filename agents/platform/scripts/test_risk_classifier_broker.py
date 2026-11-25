@@ -89,6 +89,7 @@ class _FakeForge:
     name = "github"
     hosts = ("github.com",)
     labels = True
+    commit_statuses = True
     text_sets_labels = False
     credential = NoCredential()
     verbs = frozenset(
@@ -103,6 +104,9 @@ class _FakeForge:
         self.ensured_labels: list[str] = []
         self.label_adds: list[tuple[int, list[str]]] = []
         self.label_removes: list[tuple[int, list[str]]] = []
+        self.statuses: dict[tuple[str, str], tuple[str, str]] = {}
+        self.status_calls: list[dict[str, Any]] = []
+        self.fail_status_contexts: set[str] = set()
         self.on_label_add: Any = None
 
     def clone_url(self, repo: str) -> str:
@@ -192,6 +196,17 @@ class _FakeForge:
             prop["labels"] = [lbl for lbl in labels if lbl not in rem]
         return {"proposal": dict(prop)}
 
+    def commit_status_set(self, api: Any, repo: str, payload: dict[str, Any]) -> dict[str, Any]:
+        ctx = str(payload["context"])
+        if ctx in self.fail_status_contexts:
+            raise RuntimeError(f"simulated status failure on {ctx}")
+        rev = str(payload["revision"])
+        state = str(payload["state"])
+        desc = str(payload.get("description") or "")
+        self.statuses[(rev, ctx)] = (state, desc)
+        self.status_calls.append({"revision": rev, "state": state, "context": ctx, "description": desc})
+        return {"status": {"revision": rev, "state": state, "context": ctx, "description": desc}}
+
 
 _HERMETIC_GIT_ENV = {
     "GIT_AUTHOR_NAME": "Bot",
@@ -203,6 +218,7 @@ _HERMETIC_GIT_ENV = {
     "GIT_CONFIG_COUNT": "1",
     "GIT_CONFIG_KEY_0": "safe.bareRepository",
     "GIT_CONFIG_VALUE_0": "explicit",
+    "KUBEAGENTS_AUTOMERGE_MAX_RISK": "medium",
 }
 
 _SCRUBBED_BROKER_ENV_KEYS = (
@@ -287,6 +303,13 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
 
     def _rev(self, ref: str) -> str:
         return subprocess.check_output(["git", "rev-parse", ref], cwd=self.work, text=True).strip()
+
+    def _risk_label(self, broker: vcs_broker.VcsBroker, number: int, **extra: Any) -> dict[str, Any]:
+        req: dict[str, Any] = {"repository": "acme/infra", "number": number}
+        if "expected_head_sha" not in extra:
+            req["expected_head_sha"] = self.forge.proposals[number]["sourceRevision"]
+        req.update(extra)
+        return broker.proposal_risk_label(req)
 
     def _push_branch(self, branch: str, edits: dict[str, str | None], *, base: str = "main") -> str:
         subprocess.run(["git", "checkout", "-q", "-B", branch, base], cwd=self.work, check=True)
@@ -399,41 +422,53 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         broker = self._make_broker(switch="on")
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
             # Notice NO `cluster` arg passed by caller -- broker resolves cluster from path!
-            r1 = broker.proposal_risk_label({"repository": "acme/infra", "number": 1})
+            r1 = self._risk_label(broker, 1)
             self.assertEqual(r1["risk_level"], "low")
             self.assertTrue(r1["labelled"])
             self.assertEqual(r1["label"], automerge_eligibility.AUTOMERGE_LABEL)
             self.assertEqual(sorted(self.forge.proposals[1]["labels"]), ["kube-agents:auto-merge", "risk:low"])
+            # Commit statuses bind both risk verdict and auto-merge eligibility to head SHA + base SHA
+            sha1 = self.forge.proposals[1]["sourceRevision"]
+            self.assertIn((sha1, vcs_broker.RISK_VERDICT_STATUS_CONTEXT), self.forge.statuses)
+            am_state, am_desc = self.forge.statuses[(sha1, vcs_broker.RISK_AUTOMERGE_STATUS_CONTEXT)]
+            self.assertEqual(am_state, "success")
+            self.assertIn(f"base:{self.main_sha[:12]}", am_desc)
+            self.assertIn("WORKLOAD_REPLICA_BUMP", am_desc)
 
-            r2 = broker.proposal_risk_label({"repository": "acme/infra", "number": 2})
+            r2 = self._risk_label(broker, 2)
             self.assertEqual(r2["risk_level"], "medium")
             self.assertTrue(r2["labelled"])
             self.assertEqual(sorted(self.forge.proposals[2]["labels"]), ["kube-agents:auto-merge", "risk:medium"])
 
-            r3 = broker.proposal_risk_label({"repository": "acme/infra", "number": 3})
+            r3 = self._risk_label(broker, 3)
             self.assertEqual(r3["risk_level"], "medium")
             self.assertFalse(r3["labelled"])
             self.assertEqual(self.forge.proposals[3]["labels"], ["risk:medium"])
 
-            r4 = broker.proposal_risk_label({"repository": "acme/infra", "number": 4})
+            r4 = self._risk_label(broker, 4)
             self.assertFalse(r4["labelled"])
             self.assertIn("risk:medium", self.forge.proposals[4]["labels"])  # prod path escalates low -> medium!
 
         # Install ceiling KUBEAGENTS_AUTOMERGE_MAX_RISK=low blocks medium in dev
         with mock.patch.dict(os.environ, {"KUBEAGENTS_AUTOMERGE_MAX_RISK": "low"}):
             with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-                r2_clamped = broker.proposal_risk_label({"repository": "acme/infra", "number": 2})
+                r2_clamped = self._risk_label(broker, 2)
                 self.assertFalse(r2_clamped["labelled"])
                 self.assertEqual(self.forge.proposals[2]["labels"], ["risk:medium"])
 
         # Dial below Auto-merge blocks `on` label, while `practice` still applies `would-auto-merge`
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=False):
-            r1_dial = broker.proposal_risk_label({"repository": "acme/infra", "number": 1})
+            r1_dial = self._risk_label(broker, 1)
             self.assertFalse(r1_dial["labelled"])
             self.assertEqual(self.forge.proposals[1]["labels"], ["risk:low"])
+            # Revoking kube-agents:auto-merge also updates commit status to pending
+            self.assertEqual(
+                self.forge.statuses[(self.forge.proposals[1]["sourceRevision"], vcs_broker.RISK_AUTOMERGE_STATUS_CONTEXT)][0],
+                "pending",
+            )
 
             broker_prac = self._make_broker(switch="practice")
-            r1_prac = broker_prac.proposal_risk_label({"repository": "acme/infra", "number": 1})
+            r1_prac = self._risk_label(broker_prac, 1)
             self.assertTrue(r1_prac["labelled"])
             self.assertEqual(r1_prac["label"], automerge_eligibility.PRACTICE_LABEL)
 
@@ -479,7 +514,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         }
         broker = self._make_broker(switch="on")
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            res = broker.proposal_risk_label({"repository": "acme/infra", "number": 11})
+            res = self._risk_label(broker, 11)
         self.assertEqual(res["risk_level"], "low")
         self.assertTrue(res["stale_base"])
         self.assertFalse(res["labelled"])
@@ -518,9 +553,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             "sourceRevision": sha_stg, "target": "main", "labels": [],
         }
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            r_spoof = broker.proposal_risk_label(
-                {"repository": "acme/infra", "number": 20, "cluster": "my-gcp-project/us-east4/dev-c1"}
-            )
+            r_spoof = self._risk_label(broker, 20, cluster="my-gcp-project/us-east4/dev-c1")
         self.assertFalse(r_spoof["labelled"])
         self.assertIn("does not match", r_spoof["reason"])
 
@@ -544,7 +577,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         }
         self.forge.on_label_add = lambda prop: prop.update({"state": "merged"})
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            r_merge = broker.proposal_risk_label({"repository": "acme/infra", "number": 31})
+            r_merge = self._risk_label(broker, 31)
         self.assertTrue(r_merge["labelled"])
         self.assertEqual(sorted(self.forge.proposals[31]["labels"]), ["kube-agents:auto-merge", "risk:low"])
 
@@ -643,7 +676,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         broker = self._make_broker(switch="on")
         broker._cluster_read = spy_cluster_read
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            res = broker.proposal_risk_label({"repository": "acme/infra", "number": 45})
+            res = self._risk_label(broker, 45)
         self.assertFalse(res["labelled"])
         self.assertEqual(called, [])
 
@@ -658,7 +691,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             "sourceRevision": sha2, "target": "main", "labels": [],
         }
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            res2 = broker.proposal_risk_label({"repository": "acme/infra", "number": 46})
+            res2 = self._risk_label(broker, 46)
         self.assertFalse(res2["labelled"])
         self.assertIn("invalid cluster directory name", res2["reason"])
         self.assertEqual(called, [])
@@ -738,7 +771,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         }
         broker = self._make_broker(switch="on")
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            res = broker.proposal_risk_label({"repository": "acme/infra", "number": 51})
+            res = self._risk_label(broker, 51)
         self.assertEqual(res["risk_level"], "unknown")
         self.assertEqual(res["reasons"][0]["code"], "PROPOSAL_BRANCH_MOVED")
         self.assertFalse(res["labelled"])
@@ -810,7 +843,11 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         # Update fake forge's sourceRevision on push when git push lands, or simulate forge updating at push
         orig_git = broker._bind({"repository": "acme/infra"}).git
 
+        labels_at_push_moment: list[list[str]] = []
+
         def sync_forge_on_push(cwd: Path, *args: str, **kw: Any) -> subprocess.CompletedProcess:
+            if args and args[0] == "push":
+                labels_at_push_moment.append(list(self.forge.proposals[num]["labels"]))
             proc = orig_git(cwd, *args, **kw)
             if args and args[0] == "push" and proc.returncode == 0:
                 self.forge.proposals[num]["sourceRevision"] = tip2
@@ -832,6 +869,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             })
 
         self.assertIn("risk", pub2)
+        self.assertEqual(labels_at_push_moment, [[]])
         self.assertEqual(pub2["risk"]["disruptiveness"], "destructive")
         self.assertFalse(pub2["risk"]["labelled"])
         self.assertNotIn("kube-agents:auto-merge", self.forge.proposals[num]["labels"])
@@ -857,7 +895,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         }
         broker = self._make_broker(switch="on")
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            res = broker.proposal_risk_label({"repository": "acme/infra", "number": 60})
+            res = self._risk_label(broker, 60)
         self.assertFalse(res["labelled"])
         self.assertIsNone(res["risk_label"])
         self.assertEqual(self.forge.proposals[60]["labels"], [])
@@ -875,7 +913,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             "labels": ["RISK:LOW", "risk:high", "risk:none", "custom:keep"],
         }
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            res2 = broker.proposal_risk_label({"repository": "acme/infra", "number": 61})
+            res2 = self._risk_label(broker, 61)
         self.assertTrue(res2["labelled"])
         self.assertEqual(
             sorted(self.forge.proposals[61]["labels"]),
@@ -1117,7 +1155,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             )
             broker._bind = lambda payload: bound  # type: ignore[method-assign]
             with self.subTest(mode=mode), mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-                res = broker.proposal_risk_label({"repository": "acme/infra", "number": 95})
+                res = self._risk_label(broker, 95)
                 self.assertTrue(res["stale_base"])
                 self.assertFalse(res["labelled"])
                 self.assertIn("rebase", res["reason"])
@@ -1149,13 +1187,13 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         ):
             c_off = broker_off.proposal_classify_risk({"repository": "acme/infra", "number": 96})
             self.assertEqual(c_off["risk_level"], "low")
-            l_off = broker_off.proposal_risk_label({"repository": "acme/infra", "number": 96})
+            l_off = self._risk_label(broker_off, 96)
             self.assertEqual(l_off["risk_level"], "low")
             self.assertEqual(self.forge.proposals[96]["labels"], ["risk:low"])
 
         with mock.patch.object(broker_off, "_default_branch_of_remote", side_effect=OSError("symref failed")):
             broker_off.base_branch = ""
-            l_base_err = broker_off.proposal_risk_label({"repository": "acme/infra", "number": 96})
+            l_base_err = self._risk_label(broker_off, 96)
             self.assertEqual(l_base_err["risk_level"], "low")
             self.assertFalse(l_base_err["labelled"])
 
@@ -1198,7 +1236,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         )
         broker_excl._bind = lambda payload: bound  # type: ignore[method-assign]
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            r_excl = broker_excl.proposal_risk_label({"repository": "acme/infra", "number": 96})
+            r_excl = self._risk_label(broker_excl, 96)
             self.assertFalse(r_excl["labelled"])
             self.assertEqual(r_excl["reason"], "the cluster's labels could not be read")
 
@@ -1219,16 +1257,12 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         ]
         broker_ambig = self._make_broker(switch="on")
         with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
-            r_steer = broker_ambig.proposal_risk_label(
-                {"repository": "acme/infra", "number": 96, "cluster": "dev-proj/us-east4/dev-c1"}
-            )
+            r_steer = self._risk_label(broker_ambig, 96, cluster="dev-proj/us-east4/dev-c1")
             self.assertFalse(r_steer["labelled"])
             self.assertEqual(r_steer["reason"], "the cluster's labels could not be read")
 
             # Non-string `cluster` coordinate fails closed as invalid
-            r_bad_type = broker_ambig.proposal_risk_label(
-                {"repository": "acme/infra", "number": 96, "cluster": 123}
-            )
+            r_bad_type = self._risk_label(broker_ambig, 96, cluster=123)
             self.assertFalse(r_bad_type["labelled"])
             self.assertEqual(r_bad_type["reason"], "invalid cluster coordinate")
 
@@ -1236,11 +1270,143 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             self.clusters_list = [
                 {"name": "dev-c1", "location": "us-east4", "resourceLabels": {"environment": "dev"}}
             ]
-            r_unverified = broker_ambig.proposal_risk_label(
-                {"repository": "acme/infra", "number": 96, "cluster": "evil-proj/us-east4/dev-c1"}
-            )
+            r_unverified = self._risk_label(broker_ambig, 96, cluster="evil-proj/us-east4/dev-c1")
             self.assertFalse(r_unverified["labelled"])
             self.assertEqual(r_unverified["reason"], "the cluster's labels could not be read")
+
+    def test_unset_ceiling_disables_risk_tier_and_status_failure_or_exception_fails_closed_and_deepens(self) -> None:
+        """Unset KUBEAGENTS_AUTOMERGE_MAX_RISK stays off, status errors hold back auto-merge, exceptions strip stale labels, and >64-commit branches deepen."""
+        from workspace_paths import WorkspaceError
+
+        sha = self._push_branch(
+            "platform-agent/dev-status",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        self.forge.proposals[97] = {
+            "number": 97,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/dev-status",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha,
+            "target": "main",
+            "labels": [],
+        }
+        broker = self._make_broker(switch="on")
+
+        # 1. Missing expected_head_sha on write verb is refused
+        with self.assertRaises(WorkspaceError):
+            broker.proposal_risk_label({"repository": "acme/infra", "number": 97})
+
+        # 2. Unset KUBEAGENTS_AUTOMERGE_MAX_RISK disables risk-tier auto-merge even when KUBEAGENTS_AUTOMERGE=on
+        env_no_ceiling = {k: v for k, v in os.environ.items() if k != "KUBEAGENTS_AUTOMERGE_MAX_RISK"}
+        with (
+            mock.patch.dict(os.environ, env_no_ceiling, clear=True),
+            mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True),
+        ):
+            r_unset = self._risk_label(broker, 97)
+            self.assertEqual(r_unset["risk_level"], "low")
+            self.assertFalse(r_unset["labelled"])
+            self.assertEqual(self.forge.proposals[97]["labels"], ["risk:low"])
+
+        # 3. Failing to post kube-agents/auto-merge commit status holds back kube-agents:auto-merge
+        self.forge.fail_status_contexts.add(vcs_broker.RISK_AUTOMERGE_STATUS_CONTEXT)
+        try:
+            with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+                r_st_fail = self._risk_label(broker, 97)
+                self.assertFalse(r_st_fail["labelled"])
+                self.assertNotIn("kube-agents:auto-merge", self.forge.proposals[97]["labels"])
+        finally:
+            self.forge.fail_status_contexts.clear()
+
+        # 4. Unexpected KeyError inside classifier fails closed to risk:unknown and strips stale auto-merge
+        self.forge.proposals[97]["labels"] = ["risk:low", "kube-agents:auto-merge"]
+        with (
+            mock.patch.object(vcs_broker.risk_classifier, "classify_git_range", side_effect=KeyError("boom")),
+            mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True),
+        ):
+            r_exc = self._risk_label(broker, 97)
+            self.assertEqual(r_exc["risk_level"], "unknown")
+            self.assertFalse(r_exc["labelled"])
+            self.assertEqual(self.forge.proposals[97]["labels"], ["risk:unknown"])
+
+        # 5. Deeply diverged branch (>64 commits on main) deepens shallow fetch cleanly
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.work, check=True)
+        for idx in range(70):
+            (self.work / "README.md").write_text(f"tick {idx}\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=self.work, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", f"tick {idx}"], cwd=self.work, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=self.work, check=True)
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            r_deep = self._risk_label(broker, 97)
+            self.assertEqual(r_deep["risk_level"], "low")
+            self.assertTrue(r_deep["labelled"])
+            self.assertEqual(sorted(self.forge.proposals[97]["labels"]), ["kube-agents:auto-merge", "risk:low"])
+
+
+class CommitStatusForgeTests(unittest.TestCase):
+    """Verify broker-internal `commit_status_set` across forge providers via the public `providers` surface."""
+
+    def test_commit_status_set_on_supported_and_unsupported_forges(self) -> None:
+        from providers import AVAILABLE, Forge, ForgeUnsupported, StubForge
+        from workspace_paths import WorkspaceError
+
+        testdata = Path(__file__).resolve().parent / "testdata" / "providers"
+        by_name: dict[str, Any] = {}
+        for cls in AVAILABLE:
+            cfg_file = testdata / cls.name / "config.json"
+            cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.is_file() else {}
+            insts = list(cls.for_config(cfg))
+            self.assertTrue(insts)
+            by_name[cls.name] = insts[0]
+
+        self.assertTrue({"github", "gitlab", "gitea"}.issubset(set(by_name.keys())))
+        sha = "a" * 40
+        for name in ("github", "gitlab", "gitea"):
+            inst = by_name[name]
+            self.assertTrue(inst.commit_statuses)
+            calls: list[tuple] = []
+
+            def fake_api(method: str, path: str, *, body: Any = None, **kw: Any) -> dict[str, Any]:
+                calls.append((method, path, body))
+                return {}
+
+            ans = inst.commit_status_set(
+                fake_api,
+                "acme/infra",
+                {
+                    "revision": sha,
+                    "state": "failure",
+                    "context": "kube-agents/auto-merge",
+                    "description": "x" * 200,
+                },
+            )
+            self.assertEqual(ans["status"]["revision"], sha)
+            self.assertEqual(len(ans["status"]["description"]), 140)
+            self.assertEqual(len(calls), 1)
+            method, path, body = calls[0]
+            self.assertEqual(method, "POST")
+            self.assertIn(sha, path)
+            if name == "gitlab":
+                self.assertEqual(body["state"], "failed")
+                self.assertEqual(body["name"], "kube-agents/auto-merge")
+            else:
+                self.assertEqual(body["state"], "failure")
+                self.assertEqual(body["context"], "kube-agents/auto-merge")
+
+            for bad_payload in (
+                {"revision": "short", "state": "success", "context": "kube-agents/risk"},
+                {"revision": sha, "state": "bogus", "context": "kube-agents/risk"},
+                {"revision": sha, "state": "success", "context": "bad context!"},
+            ):
+                with self.assertRaises(WorkspaceError):
+                    inst.commit_status_set(fake_api, "acme/infra", bad_payload)
+
+        with self.assertRaises(ForgeUnsupported):
+            Forge().commit_status_set(lambda *a, **k: {}, "acme/infra", {"revision": sha, "state": "success", "context": "c"})
+        stub = StubForge("stub", ("stub.example",), "pull request", ("missing token",))
+        with self.assertRaises(ForgeUnsupported):
+            stub.commit_status_set(lambda *a, **k: {}, "acme/infra", {"revision": sha, "state": "success", "context": "c"})
 
 
 if __name__ == "__main__":

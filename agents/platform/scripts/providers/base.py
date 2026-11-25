@@ -328,6 +328,9 @@ class Forge:
     # find their own items by branch prefix and body marker. Off by default,
     # so a new forge that forgets it refuses a label instead of dropping one.
     labels = False
+    # Whether the broker can record SHA-bound commit statuses on this forge.
+    # Broker-internal only: no caller route exposes commit-status writes.
+    commit_statuses = False
     # Whether text a caller writes -- a comment, a description -- can itself
     # set a label on this forge (a `/label` quick action). Where it
     # can, no label is the broker's alone, so the broker applies none it
@@ -629,6 +632,10 @@ class Forge:
     def label_ensure(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("label-ensure")
 
+    def commit_status_set(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """Record a broker-owned commit status on `payload["revision"]`."""
+        return self._unsupported("commit-status-set")
+
 
 class StubForge(Forge):
     """A host this install recognises and cannot yet serve.
@@ -701,5 +708,5 @@ class StubForge(Forge):
     proposal_create = proposal_list = proposal_view = proposal_comment = _refuse
     proposal_update = proposal_close = proposal_commits = proposal_acknowledge = _refuse
     issue_create = issue_list = issue_view = issue_comment = _refuse
-    issue_update = issue_close = label_ensure = _refuse
+    issue_update = issue_close = label_ensure = commit_status_set = _refuse
     proposal_list_by_author = proposal_tally = proposal_reviews = proposal_closer = _refuse

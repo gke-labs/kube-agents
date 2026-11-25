@@ -889,6 +889,44 @@ class CLIEntrypointUXTests(unittest.TestCase):
             )
             self.assertEqual(rc_unk_block, 2)
 
+    def test_load_path_pair_directory_symlink_typechange_and_unchanged_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            b_dir = Path(td) / "before"
+            a_dir = Path(td) / "after"
+            b_dir.mkdir()
+            a_dir.mkdir()
+
+            # 1. Symlink -> regular manifest containing cluster-admin CRB still loads `after` bytes (`critical`)
+            (b_dir / "target.yaml").write_text("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n", encoding="utf-8")
+            (a_dir / "target.yaml").write_text("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n", encoding="utf-8")
+            (b_dir / "rbac.yaml").symlink_to("target.yaml")
+            (a_dir / "rbac.yaml").write_text(CLUSTER_ADMIN_CRB, encoding="utf-8")
+
+            fcs = load_path_pair(b_dir, a_dir, logical_path="clusters/prod")
+            self.assertEqual(len(fcs), 1)
+            self.assertEqual(fcs[0].path, "clusters/prod/rbac.yaml")
+            self.assertIsNotNone(fcs[0].after)
+            verdict = classify_changes(fcs)
+            self.assertEqual(verdict.risk_level, RISK_CRITICAL)
+            self.assertIn("CRITICAL_PRIVILEGED_RBAC", {r.code for r in verdict.reasons})
+
+            # 2. Untouched large regular files are skipped before budget accounting
+            b2 = Path(td) / "b2"
+            a2 = Path(td) / "a2"
+            b2.mkdir()
+            a2.mkdir()
+            untouched_blob = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: big\ndata:\n  blob: " + ("x" * 300_000) + "\n"
+            (b2 / "untouched.yaml").write_text(untouched_blob, encoding="utf-8")
+            (a2 / "untouched.yaml").write_text(untouched_blob, encoding="utf-8")
+            for idx in range(9):
+                base_txt = f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c{idx}\ndata:\n  v: " + ("a" * 225_000) + "\n"
+                after_txt = f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: c{idx}\ndata:\n  v: " + ("b" * 225_000) + "\n"
+                (b2 / f"c{idx}.yaml").write_text(base_txt, encoding="utf-8")
+                (a2 / f"c{idx}.yaml").write_text(after_txt, encoding="utf-8")
+            fcs2 = load_path_pair(b2, a2, logical_path="clusters/dev")
+            self.assertNotIn("clusters/dev/untouched.yaml", {fc.path for fc in fcs2})
+            self.assertTrue(all(not fc.oversized for fc in fcs2))
+
 
 if __name__ == "__main__":
     unittest.main()

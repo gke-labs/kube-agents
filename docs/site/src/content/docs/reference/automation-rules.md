@@ -66,8 +66,8 @@ Each rule has `environments` plus one target selector:
 fix or `max_risk` level and its environments, so a new kind of fix, or a new environment, never
 merges unattended because of a rule written before it existed.
 
-An install admin can also clamp risk-based auto-merge globally with the `KUBEAGENTS_AUTOMERGE_MAX_RISK`
-environment variable (`low`, `medium`, or `off`; any unrecognized non-empty value fails closed as `off`).
+Risk-based auto-merge stays off by default even when `KUBEAGENTS_AUTOMERGE` is `on` for `no-pdb`.
+An install admin must set `KUBEAGENTS_AUTOMERGE_MAX_RISK` to `low` or `medium` to opt in (`off` or unset disables it).
 The credential broker computes and applies a deterministic `risk:low`, `risk:medium`, `risk:high`,
 `risk:critical`, or `risk:unknown` label to open kube-agents pull requests; callers cannot create,
 add, or remove any `risk:*` label.
@@ -90,7 +90,7 @@ these labels has no environment, and no rule matches it.
 5. For risk-based rules (`max_risk`), the credential broker classifies the pull request from git
    across four orthogonal axes before consulting allow/deny rules:
    - `risk_level`: `low | medium | high | critical | unknown` (only `low` or `medium` can qualify,
-     subject to `KUBEAGENTS_AUTOMERGE_MAX_RISK` when set).
+     capped by `KUBEAGENTS_AUTOMERGE_MAX_RISK`, which must be `low` or `medium`).
    - `blast_radius`: `low | medium | high | critical | unknown`.
    - `revertability`: `easy | moderate | difficult | irreversible | unknown` (auto-merge requires
      `easy`).
@@ -142,12 +142,14 @@ the broker also runs deterministic git risk classification (`proposal-risk-label
 1. The pull request is open, originates from the managed repository (not a fork), was opened by
    kube-agents, and targets the repository's base branch at a verified head commit SHA.
 2. The broker applies the computed `risk:low`, `risk:medium`, `risk:high`, `risk:critical`, or
-   `risk:unknown` label, and removes any stale `risk:*` label.
-3. The broker checks `.kube-agents/automation.yaml` on the base branch for a matching `max_risk`
-   rule in the verified cluster environment. When `disruptiveness` is `non_disruptive`,
-   `revertability` is `easy`, `supported` and `effective_changes` are `true`, and `stale_base` is
-   `false`, it applies `kube-agents:would-auto-merge` (`practice`) or `kube-agents:auto-merge`
-   (`on`, when the autonomy dial allows auto-merge).
+   `risk:unknown` label, removes any stale `risk:*` label, and posts a `kube-agents/risk` commit status
+   on the head SHA citing the base SHA and reason codes.
+3. The broker checks `KUBEAGENTS_AUTOMERGE_MAX_RISK` (`low` or `medium`) and `.kube-agents/automation.yaml`
+   on the base branch for a matching `max_risk` rule in the verified cluster environment. It also requires
+   `disruptiveness: non_disruptive`, `revertability: easy`, `supported: true`, `effective_changes: true`,
+   and `stale_base: false`. When all hold, it records a green `kube-agents/auto-merge` commit status on
+   the head SHA (`on`) and applies `kube-agents:would-auto-merge` (`practice`) or
+   `kube-agents:auto-merge` (`on`, when the autonomy dial allows auto-merge).
 
 A pull request that carries a label and no longer qualifies loses it when re-evaluated, which
 includes after the switch is turned back to `off` or if a pull request is retargeted. A change of
@@ -156,10 +158,10 @@ switch value swaps one label for the other. While the autonomy dial is below Aut
 itself, verifies the head commit SHA before and after applying labels, and refuses any caller request
 to add, remove, or create `kube-agents:*` auto-merge or `risk:*` labels.
 
-A push kube-agents makes to the branch takes carried `risk:*` and auto-merge labels off at once and
-re-evaluates the new head commit SHA. A push made outside kube-agents keeps existing labels until the
-next broker evaluation, so a pipeline that merges on the label should also require that every commit
-on the pull request is kube-agents' own.
+Before pushing a new commit in `publish`, the broker strips carried `risk:*` and auto-merge labels,
+then re-evaluates the pushed head SHA. Your auto-merge pipeline should require the green
+`kube-agents/auto-merge` commit status on the current head SHA (plus up-to-date base branches or a merge
+queue), rather than merging on the `kube-agents:auto-merge` label alone.
 
 The labels are applied only on GitHub and Gitea. Bitbucket has no labels, and on GitLab a `/label` line in a comment or a description sets a
 label, so no label there is kube-agents' alone. Under `practice` the label is the whole effect:
@@ -201,7 +203,7 @@ In the install's shell sandbox (the `<name>-shell` Pod), where the agent's check
 python3 /opt/defaults/scripts/automation_rules.py <checkout> --fix no-pdb --environment dev
 
 # Check a risk-based rule across risk_level, disruptiveness, and revertability:
-python3 /opt/defaults/scripts/automation_rules.py <checkout> \
+KUBEAGENTS_AUTOMERGE_MAX_RISK=low python3 /opt/defaults/scripts/automation_rules.py <checkout> \
   --risk low --disruptiveness non_disruptive --revertability easy --environment staging
 
 # Deterministically classify an open or merged pull request via the credential broker (read-only):
