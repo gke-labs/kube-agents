@@ -254,6 +254,9 @@ def helm_args(result: subprocess.CompletedProcess) -> list[str]:
     return [line.partition("=")[2] for line in result.stdout.splitlines() if line.startswith("HELM=")]
 
 
+_DOCKER_HUB_MIRROR = yaml.safe_load(text(_CLOUDBUILD))["substitutions"]["_DOCKER_HUB_MIRROR"]
+
+
 def build_step(step_id: str) -> dict:
     steps = yaml.safe_load(text(_CLOUDBUILD))["steps"]
     for step in steps:
@@ -266,6 +269,9 @@ def run_build_step(step_id: str, subs: dict[str, str], docker_stub: str) -> subp
     """Run a step's script as Cloud Build would: `$$` collapsed to `$` and
     each `$_NAME` replaced by its substitution, with `docker` stubbed."""
     script = build_step(step_id)["args"][1].replace("$$", "$")
+    # The Docker Hub mirror takes its declared default unless a test passes it,
+    # as Cloud Build fills an unset substitution (#7033).
+    subs = {"_DOCKER_HUB_MIRROR": _DOCKER_HUB_MIRROR, **subs}
     for name, value in subs.items():
         script = script.replace(f"${name}", value)
     return run_bash(f"{docker_stub}\n{script}")
@@ -1906,19 +1912,19 @@ class BridgeImageBuildTest(unittest.TestCase):
             # from agents/platform/scripts, so it builds from the repository
             # root; the gateway and the callout stay on the a2a/ module root.
             context = "." if suffix == "worker" else "a2a"
-            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} {context}")
+            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node {context}")
             expected.append(f"docker push {uri}")
         # The cluster persona, from its own directory, as the ghcr workflow builds it.
         uri = f"{_AR_REPO}/persona-cluster:{_TAG}"
-        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster agents/cluster/persona")
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node agents/cluster/persona")
         expected.append(f"docker push {uri}")
         # The tse persona, the same way (#3842).
         uri = f"{_AR_REPO}/persona-tse:{_TAG}"
-        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse agents/tse/persona")
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node agents/tse/persona")
         expected.append(f"docker push {uri}")
         # The fleet-audit persona, the same way (#5623).
         uri = f"{_AR_REPO}/persona-fleet-audit:{_TAG}"
-        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-fleet-audit agents/fleet-audit/persona")
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-fleet-audit --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node agents/fleet-audit/persona")
         expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 
@@ -1932,7 +1938,8 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertEqual(
             result.stdout.splitlines(),
             [
-                f"docker build --platform linux/amd64 -t {uri} --build-arg PLATFORM_AGENT_IMAGE={_PLATFORM_URI} -f a2a/Dockerfile.hermes-bridge a2a",
+                f"docker build --platform linux/amd64 -t {uri} --build-arg PLATFORM_AGENT_IMAGE={_PLATFORM_URI}"
+                f" --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang -f a2a/Dockerfile.hermes-bridge a2a",
                 f"docker push {uri}",
             ],
         )

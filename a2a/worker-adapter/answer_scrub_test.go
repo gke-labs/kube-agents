@@ -607,3 +607,31 @@ func TestAnAgyToolOutputFeedsTheSeenSet(t *testing.T) {
 		}
 	}
 }
+
+// A core-agent tool result is the tool's function response, a JSON object: a
+// Secret a command printed on stdout reaches the seen set read whole, and an
+// answer echoing its value is redacted.
+func TestACoreAgentToolResultFeedsTheSeenSet(t *testing.T) {
+	stdout := secretManifest(t, synthSeenValue)
+	response, err := json.Marshal(map[string]any{"exit_code": 0, "stderr": "", "stdout": stdout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{"type": "tool_result", "id": "adk-1", "tool": "bash", "text": string(response)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := newCoreAgentDriver().NewDecoder()
+	if _, err := dec.Decode([]byte(`{"type":"init","session":"s-1","model":"m"}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := dec.Decode(line)
+	if err != nil || len(evs) != 1 || evs[0].Kind != EventToolResult {
+		t.Fatalf("decode: %v %+v", err, evs)
+	}
+	var seen answerscrub.Seen
+	seen.CollectToolResult(evs[0].ToolResult)
+	if got := answerscrub.Scrub("the stored value is "+synthSeenValue, &seen); strings.Contains(got, synthSeenValue) {
+		t.Fatalf("not redacted: %q", got)
+	}
+}

@@ -30,11 +30,13 @@ func TestIsStopPressIsTheButtonOnAGatedBackend(t *testing.T) {
 		backend string
 		want    bool
 	}{
-		"slack's button":       {InboundMessage{Intent: IntentCancel}, slackBackend, true},
-		"chat's button":        {InboundMessage{Intent: IntentCancel, TaskID: "task-1", Click: true}, gchatBackend, true},
-		"a program's cancel":   {InboundMessage{Intent: IntentCancel, TaskID: "task-1"}, gchatBackend, false},
-		"a typed stop on chat": {InboundMessage{Text: "stop"}, gchatBackend, false},
-		"a cancel on discord":  {InboundMessage{Intent: IntentCancel, Click: true}, discordBackend, false},
+		"slack's button":        {InboundMessage{Intent: IntentCancel}, slackBackend, true},
+		"chat's button":         {InboundMessage{Intent: IntentCancel, TaskID: "task-1", Click: true}, gchatBackend, true},
+		"a program's cancel":    {InboundMessage{Intent: IntentCancel, TaskID: "task-1"}, gchatBackend, false},
+		"a typed stop on chat":  {InboundMessage{Text: "stop"}, gchatBackend, false},
+		"a cancel on discord":   {InboundMessage{Intent: IntentCancel, Click: true}, discordBackend, false},
+		"teams's button":        {InboundMessage{Intent: IntentCancel, TaskID: "task-1", Click: true}, teamsBackend, true},
+		"a typed stop on teams": {InboundMessage{Text: "stop"}, teamsBackend, false},
 	} {
 		if got := isStopPress(tc.msg, tc.backend); got != tc.want {
 			t.Errorf("%s: isStopPress = %v, want %v", name, got, tc.want)
@@ -229,6 +231,7 @@ func TestTellsRefusedPresserOnChatInASpaceWithAViewer(t *testing.T) {
 		"slack":            {InboundMessage{Kind: sessionKindGroup}, slackBackend, false},
 		"slack, a viewer":  {InboundMessage{Kind: sessionKindGroup, Viewer: "U1"}, slackBackend, false},
 		"a program's door": {InboundMessage{Kind: sessionKindGroup, Viewer: "users/1"}, "inject", false},
+		"teams":            {InboundMessage{Kind: sessionKindGroup, Viewer: "users/1"}, teamsBackend, false},
 	} {
 		if got := tellsRefusedPresser(tc.msg, tc.backend); got != tc.want {
 			t.Errorf("%s: tellsRefusedPresser = %v, want %v", name, got, tc.want)

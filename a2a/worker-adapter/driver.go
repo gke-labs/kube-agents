@@ -180,6 +180,8 @@ func DriverFor(h persona.Harness) (Driver, error) {
 		return claudeDriver{}, nil
 	case persona.Antigravity:
 		return agyDriver{}, nil
+	case persona.CoreAgent:
+		return newCoreAgentDriver(), nil
 	}
-	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
+	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
 }

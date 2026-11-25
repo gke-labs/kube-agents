@@ -44,8 +44,9 @@ const (
 	OriginSeqUnknown = "unknown"
 	// EnvClusterView is the spawner telling the worker that this pod has
 	// the credential broker's read-only kubectl/gcloud wrappers on PATH
-	// (the operator's A2A_SESSION_CLUSTER_VIEW flag, rendered onto the
-	// gateway and translated here per pod). Literal "true" is on. One
+	// (the session pods' cluster view, which the operator turns on for the
+	// session route or under its A2A_SESSION_CLUSTER_VIEW flag, renders onto
+	// the gateway, and the gateway translates here per pod). Literal "true" is on. One
 	// constant for both ends, like EnvOriginSeq above: a spelling that
 	// drifted would leave a pod with the token and the shims but no Bash,
 	// and nothing would say so.
@@ -72,19 +73,20 @@ const (
 	// Job's pod. Literal "1" or "true" is on.
 	EnvProfileWorkerOneShot = "PROFILE_WORKER_ONE_SHOT"
 	// EnvHarness names the harness a worker runs, session pod or profile
-	// worker alike (persona.ClaudeCode or persona.Antigravity): its driver,
-	// its argv and env, and a profile worker's persona adapter. Unset is
-	// Claude Code; a value the worker doesn't know refuses to start.
-	// Antigravity also needs EnvHarnessUnisolated and A2A_HARNESS_PATH
-	// (cmd/worker-adapter's selectHarness).
+	// worker alike (persona.ClaudeCode, persona.Antigravity or
+	// persona.CoreAgent): its driver, its argv and env, and a profile
+	// worker's persona adapter. Unset is Claude Code; a value the worker
+	// doesn't know refuses to start. Antigravity also needs
+	// EnvHarnessUnisolated and A2A_HARNESS_PATH, and core-agent
+	// EnvHarnessUnisolated (cmd/worker-adapter's selectHarness).
 	EnvHarness = "A2A_HARNESS"
 	// EnvProfileHarness is EnvHarness's older name, read only by a profile
 	// worker and only when EnvHarness is unset. It once picked the persona
 	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
 	// EnvHarnessUnisolated must be HarnessUnisolatedAllow for a worker to
-	// select persona.Antigravity, which runs without its per-task HOME
-	// locking and workspace scrub until #6710 lands; #6710 removes it.
+	// select persona.Antigravity or persona.CoreAgent, which run without
+	// their isolation until #6710 lands; #6710 removes it.
 	// Nothing in the operator or chart sets it to allow; the operator
 	// renders it empty beside A2A_HARNESS on a profile that names
 	// spec.harness.type.
