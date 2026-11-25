@@ -801,6 +801,14 @@ func readPrimer(log *slog.Logger) string {
 	return string(b)
 }
 
+// envOrDefaultFrom is getenv(key), or def when that is empty.
+func envOrDefaultFrom(getenv func(string) string, key, def string) string {
+	if v := getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 // envOrDefault is the variable's value, or def when it's unset.
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -851,6 +859,16 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// core-agent's tool grant travels in every turn's envelope, so the
+	// driver carries it. One that doesn't map or render stops the worker
+	// here rather than running with every tool refused.
+	if driver.Harness() == persona.CoreAgent {
+		p, err := coreAgentSessionGrant(getenv, envOrDefaultFrom(getenv, "A2A_WORKDIR", defaultWorkdir))
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("the tool grant for harness %q: %w", driver.Harness(), err)
+		}
+		driver = workeradapter.NewCoreAgentDriver(p, nil)
 	}
 	// A harness with no default path in the image needs one named, unless a
 	// test replaces the whole argv. Refused here, at startup, rather than at

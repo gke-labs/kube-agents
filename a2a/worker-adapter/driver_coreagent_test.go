@@ -213,6 +213,39 @@ func TestTheCoreAgentDecoderKeepsOnlyTheTurnsOrder(t *testing.T) {
 	}
 }
 
+// TestACoreAgentDriverWithAPolicyKeepsItsHistory: the exported constructor
+// carries the turn's policy and still keeps the conversation history from
+// one turn to the next.
+func TestACoreAgentDriverWithAPolicyKeepsItsHistory(t *testing.T) {
+	d := NewCoreAgentDriver(coreagentwire.Policy{Tools: []string{"read_file"}, Allow: []string{"read_file:/w/*"}}, nil)
+	dec := d.NewDecoder()
+	for _, l := range []string{
+		`{"type":"init","session":"s1","model":"m"}`,
+		`{"type":"event","event":{"author":"user","n":1}}`,
+		`{"type":"event","event":{"author":"model","n":2}}`,
+		`{"type":"result","text":"ok"}`,
+	} {
+		if _, err := dec.Decode([]byte(l)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.WithResume([]string{"/h"}, "s1")
+	b, err := d.EncodeUser("next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env coreagentwire.Envelope
+	if err := json.Unmarshal(b, &env); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.History) != 2 {
+		t.Errorf("history %d entries, want 2: %s", len(env.History), b)
+	}
+	if len(env.Policy.Tools) != 1 || env.Policy.Tools[0] != "read_file" || len(env.Policy.Allow) != 1 {
+		t.Errorf("policy %+v not carried", env.Policy)
+	}
+}
+
 // Every line outside the turn is ignored, not only history lines: progress,
 // activity and tool results before init or after the result, a result
 // before init that isn't a start failure, and an init after the result.
