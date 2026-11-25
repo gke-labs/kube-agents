@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import cluster_metadata_scope
 import codecs
 import collections
 import contextlib
@@ -493,7 +494,7 @@ BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
 # The session role's own share of that pool. Session pods are opened by chat
-# conversations, and under the cluster-view flag all of them draw on the one
+# conversations, and under the session pods' cluster view all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
 # conversation holding slow reads could starve the shell for the slot wait.
 # Counted before the pool is asked, and refused at once rather than queued:
@@ -667,11 +668,13 @@ SHUTDOWN_DRAIN_SECONDS = 30
 # drain that followed a longer timeout would outlast them.
 EXEC_SHUTDOWN_DRAIN_SECONDS = 360
 # The variable that stops gcloud writing a log file for each command, set in
-# the commands an exec pod runs. gcloud logs under CLOUDSDK_CONFIG on the
-# state volume and keeps 30 days; at the tier's 8-slot cap that measured about
-# 386 KiB a command, some 3.3 GiB a day, past any emptyDir the pod could carry
-# (#4536). The caller still gets the command's stderr and the audit line; only
-# the pod's own log files, for debugging a gcloud failure on the pod, are lost.
+# the commands the proxy runs, in every role. gcloud logs under CLOUDSDK_CONFIG
+# on the state volume and keeps 30 days; at the exec tier's 8-slot cap that
+# measured about 386 KiB a command, some 3.3 GiB a day, past any emptyDir a pod
+# could carry (#4536), and the stateful broker's state volume took the same
+# files (#5417). The caller still gets the command's stderr and the audit line;
+# only the pod's own log files, for debugging a gcloud failure on the pod, are
+# lost.
 GCLOUD_FILE_LOGGING_OFF_ENV = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
 CLOUDSDK_CLIENT_CERT_ENV = "CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE"
 CLIENT_CERT_DISABLED_VALUE = "false"
@@ -687,12 +690,19 @@ GCE_METADATA_MAX_BYTES = 512
 # metadata server takes to answer a pod that has just started.
 UNIVERSE_CHECK_ATTEMPTS = 10
 UNIVERSE_CHECK_PAUSE_SECONDS = 1.0
-# What the broker does when the metadata server gives no answer in every try:
-# True starts with the value unchecked and says so in one WARNING record, False
-# does not start. A host with no metadata server, such as a harness on kind,
-# never gets an answer, so False stops it. The decision is here and nowhere
-# else.
-UNIVERSE_CHECK_UNANSWERED_STARTS = True
+# With no answer in every try the broker starts with the value unchecked, says
+# so in one WARNING record, and asks again with this pause between tries until
+# the metadata server answers. A host with no metadata server, such as a
+# harness on kind, never gets an answer: it serves, and each try costs it one
+# request of GCE_METADATA_TIMEOUT_SECONDS.
+UNIVERSE_RECHECK_PAUSE_SECONDS = 30.0
+UNIVERSE_RECHECK_THREAD_NAME = "universe-recheck"
+# How long the stop after a later contradiction waits for its own log record.
+# A log write that does not return in this time does not keep the broker up.
+UNIVERSE_STOP_LOG_SECONDS = 5.0
+UNIVERSE_NO_ROUTE_WARNING = (
+    "universe domain %s from the environment was not checked: the metadata server has no universe route"
+)
 _METADATA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _CACHED_METADATA_UNIVERSE_DOMAIN: str | None = None
 _METADATA_UNIVERSE_LOCK = threading.Lock()
@@ -858,9 +868,9 @@ WATCHER_K8S_UNRELAYABLE_ERROR = "the upstream answer could not be relayed"
 # It only narrows: with it, a clusters-get for a cluster that
 # spec.scope.exclude.clusters names is refused, so the shim sends the command
 # on to /v1/exec and that route's excluded-cluster refusal answers (#5305).
-# Without it the read is unchanged, so the reconcile's existence check and
-# every other control-plane read stay allowed. A caller that sets it can only
-# be refused more, never reach more.
+# Without it the read is unchanged, so the reconcile's existence check stays
+# allowed (it is projected to name, location, status and id). A caller that
+# sets it can only be refused more, never reach more.
 GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
@@ -1630,7 +1640,20 @@ def probe_gce_universe_domain_status(
     return domain or credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN, answered
 
 
-def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> None:
+def _universe_contradiction(configured: str, reported: str) -> str:
+    """The error for a universe domain from the environment that the metadata server contradicts."""
+    variables = (
+        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
+        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
+    )
+    return (
+        f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
+        f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
+        f"no credential to another. Set the variable to {reported!r} or remove it."
+    )
+
+
+def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time.sleep) -> bool:
     """Refuse a universe domain from the environment that the metadata server contradicts.
 
     The environment's value otherwise goes unchecked: a value that names hosts
@@ -1639,8 +1662,9 @@ def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time
     host is in, so an answer that differs raises and the broker does not start.
     An answer that agrees passes. A host with no universe route has nothing to
     contradict the value: it passes, with a WARNING record that the value was
-    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries is
-    UNIVERSE_CHECK_UNANSWERED_STARTS's case, with the same record.
+    not checked. No answer in UNIVERSE_CHECK_ATTEMPTS tries passes with the same
+    record and returns False: the value is still unchecked, and
+    `recheck_universe_domain` asks again. True is an answer; nothing is left to ask.
     """
     reported, answered = None, False
     for attempt in range(UNIVERSE_CHECK_ATTEMPTS):
@@ -1649,34 +1673,82 @@ def check_universe_domain_against_metadata(configured: str, *, sleep: Any = time
         reported, answered = probe_gce_universe_domain_answer()
         if answered:
             break
-    variables = (
-        f"{credential_proxy_client.GOOGLE_CLOUD_UNIVERSE_DOMAIN_ENV} or "
-        f"{credential_proxy_client.CLOUDSDK_UNIVERSE_DOMAIN_ENV}"
-    )
     if not answered:
-        if not UNIVERSE_CHECK_UNANSWERED_STARTS:
-            raise RuntimeError(
-                f"the environment ({variables}) names universe domain {configured!r}, and the "
-                f"metadata server gave no answer in {UNIVERSE_CHECK_ATTEMPTS} tries to check it against"
-            )
         LOGGER.warning(
             "universe domain %s from the environment was not checked: the metadata server gave no answer in %d tries",
             configured,
             UNIVERSE_CHECK_ATTEMPTS,
         )
-        return
+        return False
     if reported is None:
-        LOGGER.warning(
-            "universe domain %s from the environment was not checked: the metadata server has no universe route",
-            configured,
-        )
-        return
+        LOGGER.warning(UNIVERSE_NO_ROUTE_WARNING, configured)
+        return True
     if reported != configured:
-        raise RuntimeError(
-            f"the environment ({variables}) names universe domain {configured!r}, and the metadata "
-            f"server reports {reported!r}. One credential proxy serves one universe domain and sends "
-            f"no credential to another. Set the variable to {reported!r} or remove it."
-        )
+        raise RuntimeError(_universe_contradiction(configured, reported))
+    return True
+
+
+def end_broker_for_universe_contradiction(message: str) -> None:
+    """End the process at once, with the error as one CRITICAL record.
+
+    Not a drain: the broker answers no request after this, where a drain would
+    give each request in flight time to send this host's credential to the
+    universe that the metadata server contradicts. A command that a request
+    started is a process of its own and ends with the container. The exit
+    status is the one of a start that failed. The container starts again, and
+    the start check then refuses the value when the metadata server answers.
+    """
+    # The process ends also when the record cannot be written: a log write that
+    # does not return ends at the timer, and one that raises ends in the `finally`.
+    timer = threading.Timer(UNIVERSE_STOP_LOG_SECONDS, os._exit, (EXIT_STARTUP_FAILURE,))
+    timer.daemon = True
+    timer.start()
+    try:
+        LOGGER.critical("credential proxy stops serving: %s", message)
+        # os._exit runs no exit hook, so a handler that holds its records is flushed here.
+        logging.shutdown()
+    finally:
+        os._exit(EXIT_STARTUP_FAILURE)
+
+
+def recheck_universe_domain(
+    configured: str,
+    *,
+    sleep: Any = time.sleep,
+    stop: Callable[[str], None] = end_broker_for_universe_contradiction,
+) -> None:
+    """After a start with the value unchecked, ask the metadata server until it answers.
+
+    An answer that differs calls `stop` with the error of the start check. An
+    answer that agrees, or a host with no universe route, ends the loop. No
+    answer asks again after UNIVERSE_RECHECK_PAUSE_SECONDS, with no limit of
+    tries. A fault in one try is logged and is not an answer: only an answer
+    that differs stops the broker.
+    """
+    while True:
+        sleep(UNIVERSE_RECHECK_PAUSE_SECONDS)
+        try:
+            reported, answered = probe_gce_universe_domain_answer()
+        except Exception:
+            LOGGER.exception("the check of universe domain %s against the metadata server failed; it is tried again", configured)
+            continue
+        if not answered:
+            continue
+        if reported is None:
+            LOGGER.warning(UNIVERSE_NO_ROUTE_WARNING, configured)
+        elif reported != configured:
+            stop(_universe_contradiction(configured, reported))
+        else:
+            LOGGER.info("universe domain %s from the environment agrees with the metadata server's answer after the start", configured)
+        return
+
+
+def start_universe_recheck(configured: str) -> threading.Thread:
+    thread = threading.Thread(
+        target=recheck_universe_domain, args=(configured,), name=UNIVERSE_RECHECK_THREAD_NAME, daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def _cached_metadata_universe_domain() -> tuple[str, bool]:
@@ -2486,8 +2558,8 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
 # a2a-chat role reach the Teams routes (see _teams_route_roles).
 TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
-# The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# The session pod the A2A gateway spawns, under the session pods' cluster
+# view (the session route's default, or the operator's A2A_SESSION_CLUSTER_VIEW). Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
 # executes model output, and the read-only posture command_policy enforces is
 # the view it gets. A demo aid until declarative profiles carry a session's
@@ -2526,6 +2598,16 @@ CALLER_ROLE_A2A_REPORTS = "a2a-reports"
 # managed repository only, so the curator can verify active and superseded
 # records from Git without holding a forge credential of its own.
 CALLER_ROLE_CURATOR = "curator"
+# The callers whose project-wide cluster listings (`gcloud container clusters
+# list`, `operations list`) drop the install's excluded clusters (#7031). The
+# platform agent's own shell keeps the full list: its upgrade-readiness watch
+# grades an excluded cluster's versions from it, as the exclusion's docs say.
+# The scope role is left out too: its lookups are the reconcile's own, matched
+# token for token (scope_policy.SHAPES), and the reconcile leaves excluded
+# clusters out by itself.
+LISTING_FILTERED_ROLES = frozenset({CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE})
+# The project segment of a relayed GKE path (v1/projects/<project>/...).
+API_RELAY_PROJECT_SEGMENT = 2
 CALLER_ROLE_TEAMS_INBOUND = "teams-inbound"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -10629,7 +10711,6 @@ class CommandExecutor:
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
         metrics: "ProxyMetrics | None" = None,
-        gcloud_file_logging: bool = True,
         exclusions: "scope_exclude.Exclusions | None" = None,
         universe_domain: str | None = None,
         probe_metadata_universe: bool = False,
@@ -10924,10 +11005,9 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
-        # After the forwarded names, so the pod's environment cannot turn it
-        # back on (GCLOUD_FILE_LOGGING_OFF_ENV).
-        if not gcloud_file_logging:
-            self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
+        # In every role, and after the forwarded names, so the pod's
+        # environment cannot turn it back on (GCLOUD_FILE_LOGGING_OFF_ENV).
+        self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
         # Prevent workstation/host mTLS client-certificate env vars from
         # rewriting Google API endpoints to *.mtls.<universe_domain> inside
         # brokered gcloud invocations, and propagate non-default universe
@@ -14890,6 +14970,15 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def _mcp_listing_tool(server_name: str, message: Any) -> str | None:
+    """The gke listing tool a tools/call names (mcp_policy.GKE_LISTING_TOOLS), or None."""
+    if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if name in mcp_policy.GKE_LISTING_TOOLS else None
+
+
 def mcp_relay_decision(
     principal: Principal | None, server_name: str, message: dict[str, Any] | None
 ) -> tuple[command_policy.Decision, frozenset[str] | None]:
@@ -16015,6 +16104,22 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        # A `logging read` filter gets the clause that drops the install's
+        # excluded clusters' entries, for every caller, before confinement and
+        # policy read it, so each judges the command that will run
+        # (cluster_metadata_scope). The describe and node-pool checks run after
+        # the gates below, on the argv that will run.
+        exclusions = getattr(self, "exclusions", None)
+        if exclusions is not None:
+            try:
+                if principal.role in LISTING_FILTERED_ROLES:
+                    # A project-wide cluster listing drops excluded clusters for
+                    # these callers (cluster_metadata_scope.scoped_listing_argv).
+                    argv = cluster_metadata_scope.scoped_listing_argv(argv, exclusions)
+                argv = cluster_metadata_scope.scoped_argv(argv, exclusions)
+            except scope_exclude.ExcludedCluster as exc:
+                self._refuse_excluded_cluster(exc, request_id, audit, count)
+                return
         # A profile caller's argv is held to its task's target before any
         # policy reads it, so every check below judges the command that will
         # run: the injected --project, the target's context.
@@ -16227,6 +16332,18 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 count(TOOL_STATUS_BLOCKED)
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return
+
+            # A describe or node-pool read naming an excluded cluster, for every
+            # caller: after confinement, so a profile caller's argv carries its
+            # target's project, location and cluster, and after the gates, so a
+            # command they refuse has had its own rule (cluster_metadata_scope).
+            exclusions = getattr(self, "exclusions", None)
+            if exclusions is not None:
+                try:
+                    cluster_metadata_scope.check_cluster_reads(exec_argv, exclusions)
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, count)
+                    return
 
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
@@ -16653,7 +16770,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # check was still let through for that resource, and over the cap
                 # the upstream has served it.
                 LOGGER.info(API_RELAY_BODY_CHECKED_LOG, request_id, decision.rule_id, resource)
-        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and (
+            self.headers.get(GET_CREDENTIALS_CHECK_HEADER) or CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES
+        ):
             # The route's pattern has fixed the path's shape:
             # v1/projects/<project>/locations/<location>/clusters/<cluster>.
             segments = path.split("/")
@@ -16761,6 +16880,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             upstream = replace(upstream, body=projected)
+            relay_exclusions = getattr(self, "exclusions", None)
+            if (decision.rule_id == api_policy.GKE_CLUSTER_LIST_RULE and relay_exclusions is not None
+                    and CALLER_ROLE_SHELL in LISTING_FILTERED_ROLES):
+                # The relay is the shell's: its listing drops excluded clusters
+                # only when the shell is among the filtered callers (#7031).
+                # The route's pattern fixes the path: v1/projects/<project>/...
+                try:
+                    upstream = replace(upstream, body=cluster_metadata_scope.filtered_cluster_list(
+                        upstream.body, path.split("/")[API_RELAY_PROJECT_SEGMENT], relay_exclusions,
+                    ))
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, lambda _status: None)
+                    return
         # `resource` has passed the route's body check, so it is logged as it is. The
         # audit mapping stays identifiers and outcomes.
         LOGGER.info(
@@ -16858,6 +16990,20 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return None
+        exclusions = getattr(self, "exclusions", None)
+        if rule_id == api_policy.LOGGING_ENTRIES_LIST_RULE and exclusions is not None:
+            # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+            # an excluded cluster's entries never come back.
+            try:
+                caller_filter = parsed.get(api_policy.LOGGING_FILTER, "")
+                scoped_filter = cluster_metadata_scope.filter_with_exclusion(caller_filter, exclusions)
+                if scoped_filter != caller_filter:
+                    parsed[api_policy.LOGGING_FILTER] = scoped_filter
+            except scope_exclude.ExcludedCluster as exc:
+                self._refuse_excluded_cluster(
+                    exc, request_id, audit, lambda _status: None,
+                )
+                return None
         return json.dumps(parsed, separators=(",", ":")).encode(), api_policy.body_resource(rule_id, parsed)
 
     def _handle_mcp_relay(self) -> None:
@@ -16998,6 +17144,30 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
                 reply_body = filtered
+        listing_tool = _mcp_listing_tool(server_name, message)
+        if (
+            refused is None
+            and listing_tool is not None
+            and principal is not None
+            and principal.role in LISTING_FILTERED_ROLES
+            and upstream.status < HTTPStatus.MULTIPLE_CHOICES
+        ):
+            # A gke listing drops the install's excluded clusters for these
+            # callers (#7031); a reply the broker can't read is refused while
+            # any cluster is excluded rather than relayed whole. Unreachable
+            # today: this relay admits chat and profile, and profile workers are
+            # refused the gke server, so it applies only if chat joins the set.
+            try:
+                if self.exclusions.excluded_names_pattern() is not None:
+                    filtered = mcp_policy.filter_listing_reply(
+                        listing_tool, reply_body, self._is_excluded_cluster,
+                    )
+                    if filtered is None:
+                        refused = ("UPSTREAM_UNREADABLE", "the upstream listing reply could not be read")
+                    else:
+                        reply_body = filtered
+            except scope_exclude.ExcludedCluster:
+                refused = ("UPSTREAM_UNREADABLE", "the install's scope file can't be read, so the listing isn't relayed")
         if refused is not None:
             code, reason = refused
             LOGGER.warning(
@@ -18809,22 +18979,40 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _mcp_exclusion_decision(
         self, server_name: str, message: dict[str, Any] | None,
     ) -> "command_policy.Decision | None":
-        """A refusal for a gke in-cluster tool call on an excluded cluster, or None.
+        """A refusal for a gke tool call on an excluded cluster, or None: an
+        in-cluster tool (on a held cluster too), or a control-plane tool that
+        reads one named cluster or its node pools.
 
-        The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters).
-        One the broker can't tie to a cluster is refused while any is excluded.
+        The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters,
+        mcp_policy.metadata_tool_clusters). One the broker can't tie to a cluster
+        is refused while any is excluded (or, for an in-cluster tool, held).
         """
         clusters = mcp_policy.k8s_tool_clusters(server_name, message)
+        # An in-cluster tool reaches the cluster, so a hold refuses it too; a
+        # metadata tool is held to the exclusions alone (cluster_metadata_scope).
+        include_holds = clusters is not None
+        if clusters is None:
+            clusters = mcp_policy.metadata_tool_clusters(server_name, message)
         if clusters is None:
             return None
         try:
             if not clusters:
-                self.exclusions.check_unnamed()
+                self.exclusions.check_unnamed(include_holds=include_holds)
             for project, location, cluster in clusters:
-                self.exclusions.check(project, location, cluster)
+                self.exclusions.check(project, location, cluster, include_holds=include_holds)
         except scope_exclude.ExcludedCluster as exc:
             return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
         return None
+
+    def _is_excluded_cluster(self, project: str, location: str, cluster: str) -> bool:
+        """Whether the install excludes this cluster (holds aside), for a listing filter."""
+        try:
+            self.exclusions.check(project, location, cluster, include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            if exc.rule == scope_exclude.RULE_EXCLUDE_UNREADABLE:
+                raise
+            return True
+        return False
 
     def _refuse_excluded_cluster(
         self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,
@@ -19277,8 +19465,8 @@ def serve(args: argparse.Namespace) -> None:
     # Read before the resolve below, which can put a metadata answer into the
     # environment: only a value the environment came with is checked.
     configured_universe = configured_universe_domain()
-    if configured_universe is not None:
-        check_universe_domain_against_metadata(configured_universe)
+    if configured_universe is not None and not check_universe_domain_against_metadata(configured_universe):
+        start_universe_recheck(configured_universe)
     universe_domain = resolve_universe_domain(probe_metadata=True)
     if universe_domain != credential_proxy_client.DEFAULT_UNIVERSE_DOMAIN:
         os.environ.setdefault(
@@ -19300,9 +19488,6 @@ def serve(args: argparse.Namespace) -> None:
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
         metrics=CredentialProxyHandler.metrics,
-        # An exec pod's state volume is sized for no gcloud log files
-        # (GCLOUD_FILE_LOGGING_OFF_ENV); the other roles keep gcloud's default.
-        gcloud_file_logging=role != EXEC_ROLE,
         probe_metadata_universe=True,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)

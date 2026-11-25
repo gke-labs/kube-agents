@@ -672,6 +672,18 @@ check, or a reason the comment does not name, a write user can re-add it with th
 comment if the push does not work. To keep a pull request out past its next push, add a hold
 (`/hold`).
 
+**Do not push to a pull request that is in the queue.** The queue merges the commit it built when
+the pull request entered it. GitHub does not remove the pull request from the queue on a later
+push, and the sweep removes it only when the push costs it a label or gains it a hold, and the
+sweep runs before the merge. Otherwise the pushed commits do not reach `main`, although GitHub
+shows the pushed commit as the merged head. After each merge, the `dropped-push` job in
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml) runs `scripts/merge_queue_dropped_push.py`,
+which repeats the queue's merge with the final head. When the result differs from what merged, it
+posts one comment, which names the missing commits when it can find them; open a new pull request
+for them. A late push that only merges `main` into the branch loses nothing and gets no comment.
+A merge the script cannot decide, such as a final head that conflicts with `main`, gets no comment
+either, and the job's log says why. The script's docstring is the reference.
+
 The two labels are the two people:
 
 - **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment
