@@ -1421,6 +1421,13 @@
 # projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
 ./tasks/networking-world-open-ingress/task.yaml
 
+# Observability DNS scaling probe (#5736, #7095): a pure Q&A diagnosis of
+# kube-dns saturation during a rapid GKE Standard node-pool scale-up from 15
+# to 180 nodes, graded on the KUBE-DNS-UNDERSCALED verdict line and
+# prescriptions for kube-dns-autoscaler linear parameter tuning and NodeLocal
+# DNSCache. deployer: noop, no fixture, transcript-only.
+./tasks/observability-kube-dns-scaling-probe/task.yaml
+
 # The obtainability stream's `image-pull-failing` check (3.28), nightly from
 # the start: a per-run plant (`prebuilt/image-pull-failing`) of two Deployments
 # whose image pull the registry refuses, one through the node identity and one
