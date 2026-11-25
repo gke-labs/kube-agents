@@ -244,7 +244,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		Containers: []corev1.Container{{
 			Name:         profileWorkerContainer,
 			Image:        profile.Spec.Harness.Image,
-			Env:          env,
+			Env:          withToolWithheldList(env),
 			VolumeMounts: mounts,
 			Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: profileWorkerStatusPort}},
 			// Ready only once the worker is listening on its dispatch
@@ -511,4 +511,24 @@ func (r *PlatformAgentReconciler) deleteProfileCABundle(ctx context.Context, age
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, bundle))
+}
+
+// envToolWithheld is the worker adapter's lib.EnvToolWithheld: the worker
+// withholds each variable it names from the processes a turn's tools start.
+const envToolWithheld = "A2A_TOOL_WITHHELD_ENV"
+
+// withToolWithheldList is env with envToolWithheld naming every entry sourced
+// from a Secret (secretKeyRef); env as it was when there is none. A worker
+// container takes no envFrom Secret: its keys aren't known here.
+func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
+	var names []string
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			names = append(names, e.Name)
+		}
+	}
+	if len(names) == 0 {
+		return env
+	}
+	return append(env, corev1.EnvVar{Name: envToolWithheld, Value: strings.Join(names, ",")})
 }

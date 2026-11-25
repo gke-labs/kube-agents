@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -637,6 +638,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			})
 		}
 	}
+	// Every variable the container takes from a Secret is named to the
+	// worker, which withholds it from the processes a turn's tools start.
+	pod.Spec.Containers[0].Env = withToolWithheldList(pod.Spec.Containers[0].Env)
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
 		// AlreadyExists included: session names are minted per incarnation,
@@ -1435,4 +1439,20 @@ func delegateToolFor(rec *SessionRecord, taskID string) string {
 		}
 	}
 	return "on"
+}
+
+// withToolWithheldList is env with lib.EnvToolWithheld naming every entry
+// sourced from a Secret (secretKeyRef), for the worker to withhold from its
+// tools; env as it was when there is none.
+func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
+	var names []string
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			names = append(names, e.Name)
+		}
+	}
+	if len(names) == 0 {
+		return env
+	}
+	return append(env, corev1.EnvVar{Name: lib.EnvToolWithheld, Value: strings.Join(names, ",")})
 }
