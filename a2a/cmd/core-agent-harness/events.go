@@ -37,10 +37,10 @@ func (m *mapper) observe(ev *session.Event) {
 		return
 	}
 	if u := ev.UsageMetadata; u != nil && !ev.Partial {
-		m.usage.Input += u.PromptTokenCount
-		m.usage.Output += u.CandidatesTokenCount
-		m.usage.Cached += u.CachedContentTokenCount
-		m.usage.Thoughts += u.ThoughtsTokenCount
+		m.usage.Input += int64(u.PromptTokenCount)
+		m.usage.Output += int64(u.CandidatesTokenCount)
+		m.usage.Cached += int64(u.CachedContentTokenCount)
+		m.usage.Thoughts += int64(u.ThoughtsTokenCount)
 	}
 	if ev.Content == nil {
 		return
