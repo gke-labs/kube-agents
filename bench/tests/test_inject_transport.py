@@ -4077,6 +4077,48 @@ def test_a_card_of_this_runs_own_that_vanishes_keeps_the_plain_message(
 
 
 
+
+def test_an_earlier_runs_card_past_the_cap_deleted_before_its_promotion_is_still_named(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cap holds CARD_B back while its row is still read; CARD_A and CARD_B are then deleted.
+    CARD_KEEP keeps the wait going, so the slot CARD_A frees promotes CARD_B with no row left, and
+    CARD_B drops out too. Its creation time comes from the read that had its row, so it is still
+    named as not this run's."""
+    floor = 1_700_000_000
+    keep = "t_0000beef"
+    monkeypatch.setattr(harness, "_MAX_AWAITED_TASKS", 2)
+    build_session_store(tmp_path, created=[CARD_A, keep, CARD_B])
+    for tid, created_at in ((CARD_A, floor + 5), (keep, floor + 5), (CARD_B, floor - 60)):
+        set_card(tmp_path, tid, "running")
+        with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, tid))
+
+    def board_moves(n: int) -> None:
+        with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+            if n == 2:
+                conn.execute("DELETE FROM tasks WHERE id IN (?, ?)", (CARD_A, CARD_B))
+            if n == 12:
+                conn.execute("UPDATE tasks SET status = 'done', result = 'kept going' WHERE id = ?", (keep,))
+
+    real = local_shell(tmp_path, monkeypatch, board_moves)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        result = KubeAgentsHarness().run("check the fleet")
+
+    (b_error,) = [e for e in result.errors if e.startswith(f"card {CARD_B} ")]
+    assert "this repetition is not independent" in b_error
+    (a_error,) = [e for e in result.errors if e.startswith(f"card {CARD_A} ")]
+    assert "not independent" not in a_error
+    assert any(r.getMessage().startswith(f"awaited card {CARD_B} ") for r in caplog.records)
+
 def test_an_earlier_runs_card_that_settles_is_graded_and_logged_as_not_this_runs(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

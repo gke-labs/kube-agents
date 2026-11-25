@@ -5992,16 +5992,18 @@ class KubeAgentsHarness(AgentHarness):
                 None if capped else result,
             )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            # Every card the read has a row for, awaited or past the cap: a card the
+            # cap held back can be deleted before a freed slot promotes it.
+            for t, card in read.cards.items():
+                created[t] = card.get("created_at")
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
-                if t in read.cards:
-                    created[t] = read.cards[t].get("created_at")
-                    if t not in predating and _predates_run(created[t], self._pod_floor):
-                        predating.add(t)
-                        _log.warning(
-                            "awaited card %s was filed before this run started, so this run did not "
-                            "file it and this repetition is not independent", t,
-                        )
+                if t not in predating and _predates_run(created.get(t), self._pod_floor):
+                    predating.add(t)
+                    _log.warning(
+                        "awaited card %s was filed before this run started, so this run did not "
+                        "file it and this repetition is not independent", t,
+                    )
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
                 result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
