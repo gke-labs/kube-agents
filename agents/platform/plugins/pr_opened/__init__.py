@@ -48,7 +48,7 @@ the sandbox hop outlasts the hook, and a claim that times out is an unanswered
 hop. The claim is one broker call through the sandbox
 (``forge.call``), made in line rather than on a thread because a worker leaves
 through ``os._exit``, which would drop a thread still
-waiting on the broker. A claim or a write that fails is logged: the PR is open
+waiting on the broker. A claim or a write that fails is logged: the PR exists
 either way, and it counts as missed. Background processes are not covered,
 since this hook runs on foreground output only. Design:
 ``docs/designs/proposal-origin.md`` §2.2.

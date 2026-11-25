@@ -3122,7 +3122,7 @@ class VcsBroker:
         ):
             raise WorkspaceError(
                 "The forge does not say this install opened that proposal in the "
-                "last few minutes: it is not open, not this credential's, not the "
+                "last few minutes: it is not open or merged, not this credential's, not the "
                 "one the claim was minted for, or older than the claim window.",
                 status=409,
                 code="CLAIM_NOT_CONFIRMED",
