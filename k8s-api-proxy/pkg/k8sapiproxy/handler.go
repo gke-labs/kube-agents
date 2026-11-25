@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -375,9 +376,9 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	// After classification, which a rule on the verb or the resource needs, and before the
 	// policy, the cache and the coalescer: nothing below runs for a caller the hook refuses.
 	if h.authorize != nil {
-		if aerr := runAuthorize(h.authorize, h.authorizeAttributes(r, caller, clusterID, info)); aerr != nil {
-			ev.Err = aerr
-			refuseReadably(w, ev, authorizeRefusal(aerr), apiPath)
+		if perr, cause := runAuthorize(h.authorize, h.authorizeAttributes(r, caller, clusterID, info)); perr != nil {
+			ev.Err = cause
+			refuseReadably(w, ev, perr, apiPath)
 			return
 		}
 	}
@@ -422,14 +423,16 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 }
 
 // authorizeAttributes builds what Config.Authorize is handed from the request as received.
-// The hook gets r without its body, which is the upstream's to read, and a copy of info,
-// which the policy and the cache go on to read.
+// The hook gets r without its body, which is the upstream's to read, and copies of the
+// caller, which the audit event carries, and of info, which the policy and the cache go on
+// to read.
 func (h *handler) authorizeAttributes(r *http.Request, caller *CallerIdentity, clusterID string, info *request.RequestInfo) AuthorizeAttributes {
 	view := r.WithContext(r.Context())
 	view.Body = http.NoBody
 	view.GetBody = nil
 	infoCopy := *info
-	return AuthorizeAttributes{Request: view, Caller: caller, ClusterID: clusterID, RequestInfo: &infoCopy}
+	infoCopy.Parts = slices.Clone(info.Parts)
+	return AuthorizeAttributes{Request: view, Caller: caller.clone(), ClusterID: clusterID, RequestInfo: &infoCopy}
 }
 
 // acquireSlot takes an in-flight slot without waiting; ok is false when all are taken.

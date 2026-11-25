@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 )
 
 // CallerIdentity is an authenticated sandbox caller.
@@ -28,6 +29,19 @@ type CallerIdentity struct {
 	// values can be large and are not the proxy's to judge safe to log. A custom AuditSink
 	// that wants them reads AuditEvent.Caller.
 	Extra map[string][]string
+}
+
+// clone returns a copy of c that shares no slice or map with it.
+func (c *CallerIdentity) clone() *CallerIdentity {
+	out := *c
+	out.Groups = slices.Clone(c.Groups)
+	if c.Extra != nil {
+		out.Extra = make(map[string][]string, len(c.Extra))
+		for key, values := range c.Extra {
+			out.Extra[key] = slices.Clone(values)
+		}
+	}
+	return &out
 }
 
 // ErrAuthenticationUnavailable is the error a CallerAuthenticator wraps when it could not

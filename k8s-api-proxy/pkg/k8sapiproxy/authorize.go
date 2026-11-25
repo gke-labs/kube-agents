@@ -36,15 +36,15 @@ type AuthorizeAttributes struct {
 	// its URL still has the /clusters/<id> prefix. Its Body is empty: the body is the
 	// upstream's to read. Changing the request does not change what is forwarded.
 	Request *http.Request
-	// Caller is the identity the authenticator returned; never nil. It is the one the audit
-	// event carries, so the hook must not modify it.
+	// Caller is the identity the authenticator returned; never nil. It is the hook's own
+	// copy: changing it changes neither the audit event nor the caller's partition.
 	Caller *CallerIdentity
 	// ClusterID is the cluster the path names, or Config.DefaultClusterID for a path that
 	// names none.
 	ClusterID string
 	// RequestInfo is the API server's classification of the request (verb, API group,
 	// resource, namespace, name; Path is the API path without the /clusters/<id> prefix). It
-	// is the hook's own copy.
+	// is the hook's own copy, Parts included.
 	RequestInfo *request.RequestInfo
 }
 
@@ -70,42 +70,47 @@ func (e *AuthorizeError) Error() string {
 	return e.Message
 }
 
-// runAuthorize calls the hook and returns its refusal, nil when it admits the request. A
-// hook that panics has not admitted anything: the panic becomes a refusal, recorded like any
-// other, rather than a request that ends with no outcome. A nil *AuthorizeError in the
-// error is replaced, so nothing downstream holds a typed nil.
-func runAuthorize(hook func(AuthorizeAttributes) error, attrs AuthorizeAttributes) (err error) {
+// runAuthorize calls the hook and returns its refusal, nil when it admits the request, with
+// the cause for the audit event. The cause is the hook's error text in an error of the
+// handler's own, so nothing downstream calls a method on a value the hook made: an error
+// whose Error panics, such as a nil pointer of the embedder's type, would otherwise panic
+// the audit sink and leave the refusal unrecorded. A hook that panics, in its own code or
+// in its error's methods, has not admitted anything: the panic becomes a refusal recorded
+// like any other.
+func runAuthorize(hook func(AuthorizeAttributes) error, attrs AuthorizeAttributes) (perr *PolicyError, cause error) {
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf(authorizePanicFormat, p)
+			perr, cause = newAuthorizeRefusal(), fmt.Errorf(authorizePanicFormat, p)
 		}
 	}()
-	err = hook(attrs)
-	var aerr *AuthorizeError
-	if err != nil && errors.As(err, &aerr) && aerr == nil {
-		return errAuthorizeNilError
+	err := hook(attrs)
+	if err == nil {
+		return nil, nil
 	}
-	return err
+	refusal := newAuthorizeRefusal()
+	var aerr *AuthorizeError
+	if errors.As(err, &aerr) {
+		if aerr == nil {
+			return refusal, errAuthorizeNilError
+		}
+		if aerr.Reason != "" {
+			refusal.RejectionReason = aerr.Reason
+		}
+		if aerr.Message != "" {
+			refusal.Message = aerr.Message
+		}
+	}
+	return refusal, errors.New(err.Error())
 }
 
-// authorizeRefusal turns the error Config.Authorize returned into the 403 the caller gets.
-// Only an AuthorizeError's fields reach the caller; any other error's text stays in the
-// audit event.
-func authorizeRefusal(err error) *PolicyError {
-	perr := &PolicyError{
+// newAuthorizeRefusal is the 403 a Config.Authorize refusal gets unless an AuthorizeError
+// says otherwise. Only an AuthorizeError's fields reach the caller; any other error's text
+// stays in the audit event.
+func newAuthorizeRefusal() *PolicyError {
+	return &PolicyError{
 		Code:            http.StatusForbidden,
 		Reason:          metav1.StatusReasonForbidden,
 		RejectionReason: ReasonAuthorizeRefused,
 		Message:         authorizeRefusedMessage,
 	}
-	var aerr *AuthorizeError
-	if errors.As(err, &aerr) && aerr != nil {
-		if aerr.Reason != "" {
-			perr.RejectionReason = aerr.Reason
-		}
-		if aerr.Message != "" {
-			perr.Message = aerr.Message
-		}
-	}
-	return perr
 }
