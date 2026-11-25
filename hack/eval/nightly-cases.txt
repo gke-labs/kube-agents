@@ -638,7 +638,7 @@
 # inject transport; over the agent API every check passes
 # without testing anything (its TRANSPORT note). deployer: noop; reads the
 # seeded fleet's crashloop-workload role.
-./tasks/session-crashloop-question-loads-a-skill/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/session-crashloop-question-loads-a-skill/task.yaml
 
 # The fleet-audit carry: a drift finding whose evidence and severity did not
 # change keeps the words of the previous run. prebuilt/unchanged-finding-wording
@@ -670,7 +670,7 @@
 # transport, where the gateway routes /session to a session pod; over
 # the agent API it reaches the platform agent as a plain prompt and its
 # forbidden-phrase check passes without testing anything. deployer: noop.
-./tasks/session-cluster-question-wake-answers-once/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/session-cluster-question-wake-answers-once/task.yaml
 # gitops-drift-noise-filtered-triage: the drift detector's principal
 # classifier, which nothing else exercises. The sibling
 # gitops-drift-out-of-band-triage posts to the daemon's inject and so starts
@@ -1144,7 +1144,7 @@
 # pull request (pull_request_opened, the budget file only) and an unchanged
 # cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
 # (the persona's version-control skill) land; its record shows when they do.
-./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
 # A cluster profile task that names no repository finds the one it may use
 # (#6389): the same confirmed PodDisruptionBudget pull request as the case
@@ -1153,7 +1153,7 @@
 # same way. Regression coverage: it passed on main's persona too (the
 # behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
 # one forge and one GitOps repository per leased project).
-./tasks/cluster-profile-finds-the-managed-repository/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/cluster-profile-finds-the-managed-repository/task.yaml
 
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
@@ -1540,7 +1540,7 @@
 # graded by delegated_to (#5194 moved it to the cluster profile). Needs the
 # inject door and the AgentProfile dispatcher, which every CI eval install
 # runs, with profiles.cluster, from #5394.
-./tasks/session-delegates-to-the-profile-asked-for/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
 
 # #6882: at the session cap, a new conversation gets the queued notice, then
 # its answer (the session-cap directive, bench/kube_agents_bench/session_cap.py).
@@ -1555,7 +1555,7 @@
 # front door the Hermes halt does, so either wording passes. Red on main in
 # session mode, where the turn ran on. deployer: noop, read-only: the write is
 # refused either way.
-./tasks/session-turn-stops-at-write-attempt/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/session-turn-stops-at-write-attempt/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
@@ -1608,7 +1608,7 @@
 # dispatched profile on its own persona image and names the crashloop-workload
 # fixture's OOM kill from its own reads, read-only. Needs the inject door,
 # the dispatcher and profiles.tse, which every CI eval install enables.
-./tasks/tse-profile-names-the-oom-kill/task.yaml
+# harness A/B twin: in presubmit-cases.txt: ./tasks/tse-profile-names-the-oom-kill/task.yaml
 
 # The API deprecation scan reads a repository over the broker's snapshot
 # ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
@@ -1942,3 +1942,21 @@
 # kanban_complete's verified_claims, #3200). deployer: noop, read-only against
 # the crashloop-workload fixture, three units at the 200s default.
 ./tasks/verified-claims-carry-evidence/task.yaml
+
+# harness A/B twin (never merges): the presubmit's own cases, kept registered
+./tasks/reliability-pdb-probe/task.yaml
+./tasks/capacity-pinned-pool-probe/task.yaml
+./tasks/security-overgrant-probe/task.yaml
+./tasks/upgrades-lagging-master-probe/task.yaml
+./tasks/cost-idle-pool-probe/task.yaml
+./tasks/consistency-drift-outlier/task.yaml
+./tasks/obtainability-remediation-proposal/task.yaml
+./tasks/pdb-remediation-pr/task.yaml
+./tasks/cluster-agent-crashloop-debug/task.yaml
+./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml
+./tasks/cluster-agent-crashloop-evidence-chain/task.yaml
+./tasks/incident-triage-oom-event-probe/task.yaml
+./tasks/monitoring-alert-policy-read/task.yaml
+./tasks/agent-kanban-smoke/task.yaml
+./tasks/vcs-spent-branch-reuse/task.yaml
+./tasks/compliance-rbac-overgrant/task.yaml

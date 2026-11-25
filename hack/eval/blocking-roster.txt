@@ -47,19 +47,22 @@
 # is withdrawn by moving its line from presubmit-cases.txt back to
 # nightly-cases.txt, no roster edit.
 
-reliability-pdb-probe
-capacity-pinned-pool-probe
-security-overgrant-probe
-upgrades-lagging-master-probe
-cost-idle-pool-probe
-consistency-drift-outlier
-obtainability-remediation-proposal
-pdb-remediation-pr
-cluster-agent-crashloop-debug
-cluster-agent-crashloop-misleading-symptom
-cluster-agent-crashloop-evidence-chain
-incident-triage-oom-event-probe
-monitoring-alert-policy-read
-agent-kanban-smoke
-vcs-spent-branch-reuse
-compliance-rbac-overgrant
+# harness A/B twin: reliability-pdb-probe
+# harness A/B twin: capacity-pinned-pool-probe
+# harness A/B twin: security-overgrant-probe
+# harness A/B twin: upgrades-lagging-master-probe
+# harness A/B twin: cost-idle-pool-probe
+# harness A/B twin: consistency-drift-outlier
+# harness A/B twin: obtainability-remediation-proposal
+# harness A/B twin: pdb-remediation-pr
+# harness A/B twin: cluster-agent-crashloop-debug
+# harness A/B twin: cluster-agent-crashloop-misleading-symptom
+# harness A/B twin: cluster-agent-crashloop-evidence-chain
+# harness A/B twin: incident-triage-oom-event-probe
+# harness A/B twin: monitoring-alert-policy-read
+# harness A/B twin: agent-kanban-smoke
+# harness A/B twin: vcs-spent-branch-reuse
+# harness A/B twin: compliance-rbac-overgrant
+
+# harness A/B twin (never merges)
+cluster-profile-finds-the-managed-repository
