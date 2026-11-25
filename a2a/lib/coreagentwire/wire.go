@@ -18,10 +18,10 @@ package coreagentwire
 import "encoding/json"
 
 // MaxEnvelopeBytes bounds one turn's Envelope, its trailing newline aside.
-// The harness refuses a larger one, failing the turn. A conversation stays
-// well under it: the harness compacts the history before a turn once it
-// passes a quarter of this, and the adapter keeps only the events from the
-// latest summary on (IsHistoryBoundary).
+// The harness refuses a larger one, failing the turn. The harness compacts
+// the history before a turn once it passes --compact-over-bytes (512 KiB by
+// default, a thirty-second of this), and the adapter keeps only the events
+// from the latest summary on (IsHistoryBoundary).
 const MaxEnvelopeBytes = 16 << 20
 
 // Envelope is one turn's input, a single JSON object on stdin.
@@ -31,7 +31,8 @@ type Envelope struct {
 	// Session is the conversation's id; empty starts a new one, whose id the
 	// init event reports.
 	Session string `json:"session,omitempty"`
-	// History is the conversation's events so far, each as an event line's
+	// History is the conversation's events from its latest summary or
+	// checkpoint on (all of them before the first), each as an event line's
 	// Event carried it, oldest first.
 	History []json.RawMessage `json:"history,omitempty"`
 	// Policy is the turn's tool policy.
@@ -73,7 +74,8 @@ const (
 	TypeToolResult = "tool_result"
 	TypeResult     = "result"
 	// TypeEvent carries one event the turn added to the conversation, for
-	// the adapter to keep and send back in the next turn's History.
+	// the adapter to keep and send back in the next turn's History (from
+	// the latest summary on).
 	TypeEvent = "event"
 )
 

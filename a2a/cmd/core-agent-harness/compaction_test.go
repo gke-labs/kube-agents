@@ -99,3 +99,58 @@ func TestAShortConversationIsNotCompacted(t *testing.T) {
 		}
 	}
 }
+
+// The turn after a compaction starts from the summary the adapter kept, and
+// the model gets it framed as a handover, as in the compacting turn itself:
+// core-agent frames a summary only when an event comes before it, so the
+// harness seeds one.
+func TestTheTurnAfterACompactionGetsTheSummaryFramed(t *testing.T) {
+	m := &bigModel{}
+	withModel(t, m)
+	dir := t.TempDir()
+	wd, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(wd)
+	var session string
+	var history []json.RawMessage
+	compacted := -1
+	for turn := 0; turn < 30; turn++ {
+		in, _ := json.Marshal(coreagentwire.Envelope{Session: session, History: history, Message: "go on"})
+		m.mu.Lock()
+		before := len(m.texts)
+		m.mu.Unlock()
+		var out, errOut bytes.Buffer
+		if code := run(context.Background(), []string{"--model", "m", "--compact-over-bytes", "16384"}, bytes.NewReader(in), &out, &errOut); code != 0 {
+			t.Fatalf("turn %d exit %d: %s", turn, code, errOut.String())
+		}
+		var evs []coreagentwire.Event
+		sawSummary := false
+		for _, l := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+			var ev coreagentwire.Event
+			json.Unmarshal([]byte(l), &ev)
+			if ev.Type == coreagentwire.TypeInit {
+				session = ev.Session
+			}
+			if ev.Type == coreagentwire.TypeEvent && coreagentwire.IsHistoryBoundary(ev.Event) {
+				sawSummary = true
+			}
+			evs = append(evs, ev)
+		}
+		history = keep(history, evs)
+		if compacted >= 0 {
+			// This is the turn after the compaction: its first model
+			// request (after the summariser's, which it doesn't make).
+			m.mu.Lock()
+			first := m.texts[before]
+			m.mu.Unlock()
+			if len(first) == 0 || !strings.HasPrefix(first[0], "[Conversation compacted.") {
+				t.Fatalf("the turn after the compaction sent the model %q first, not the framed summary", first)
+			}
+			return
+		}
+		if sawSummary {
+			compacted = turn
+		}
+	}
+	t.Fatal("30 long turns never compacted")
+}

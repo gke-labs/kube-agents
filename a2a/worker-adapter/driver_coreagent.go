@@ -20,8 +20,9 @@ import (
 //
 // The driver holds each conversation's history, in memory: the harness
 // keeps no session file, so nothing a turn's commands write can change what
-// the next turn resumes. The decoder keeps the event lines a turn emits and
-// the next turn's envelope carries them back.
+// the next turn resumes. The decoder keeps the event lines a turn emits,
+// starting over at each compaction summary, and the next turn's envelope
+// carries them back.
 type coreAgentDriver struct {
 	// Policy and MCP are the turn's tool policy and MCP servers, set from
 	// the persona grant (SEAM: tigerteam-dev-1, tigerteam-dev-3).

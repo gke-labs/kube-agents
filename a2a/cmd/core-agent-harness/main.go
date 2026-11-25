@@ -99,7 +99,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		emit(coreagentwire.Event{Type: coreagentwire.TypeResult, Failed: true, Error: "reading the turn envelope: " + err.Error()})
 		return 1
 	}
-	if err := turn(ctx, o, env, emit); err != nil {
+	if err := turn(ctx, o, env, emit, stderr); err != nil {
 		emit(coreagentwire.Event{Type: coreagentwire.TypeResult, Failed: true, Error: err.Error()})
 		return 1
 	}
@@ -107,7 +107,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 }
 
 // turn builds the agent for one turn and runs it, emitting its events.
-func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(coreagentwire.Event)) error {
+func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(coreagentwire.Event), stderr io.Writer) error {
 	llm, err := newModel(ctx, o.model)
 	if err != nil {
 		return fmt.Errorf("model: %w", err)
@@ -170,7 +170,7 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	// from, and the adapter keeps only the events from it on. A summary
 	// that fails leaves the history whole; the turn still runs.
 	if _, err := a.CompactIfNeeded(ctx, ""); err != nil {
-		fmt.Fprintln(os.Stderr, "core-agent-harness: compaction failed; running on the whole history:", err)
+		fmt.Fprintln(stderr, "core-agent-harness: compaction failed; running on the whole history:", err)
 	}
 	m := newMapper(emit)
 	var runErr error
@@ -203,6 +203,17 @@ func seedSession(ctx context.Context, env coreagentwire.Envelope) (session.Servi
 	if err != nil {
 		return nil, "", 0, err
 	}
+	seeded := 0
+	// The adapter keeps a compacted conversation from its summary on, so
+	// such a history starts with the summary. core-agent frames a summary
+	// for the model only when an event comes before it; a content-less one,
+	// which no request carries, goes first.
+	if len(env.History) > 0 && coreagentwire.IsHistoryBoundary(env.History[0]) {
+		if err := svc.AppendEvent(ctx, created.Session, session.NewEvent(ctx, "history-start")); err != nil {
+			return nil, "", 0, fmt.Errorf("history start: %w", err)
+		}
+		seeded++
+	}
 	for i, raw := range env.History {
 		var ev session.Event
 		if err := json.Unmarshal(raw, &ev); err != nil {
@@ -211,8 +222,9 @@ func seedSession(ctx context.Context, env coreagentwire.Envelope) (session.Servi
 		if err := svc.AppendEvent(ctx, created.Session, &ev); err != nil {
 			return nil, "", 0, fmt.Errorf("event %d: %w", i, err)
 		}
+		seeded++
 	}
-	return svc, id, len(env.History), nil
+	return svc, id, seeded, nil
 }
 
 // emitAdded writes an event line for each event the session holds past the
