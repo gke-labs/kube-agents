@@ -4571,6 +4571,35 @@ fi
 # awk reads every value the check above accepts (08, +3, " 3") as the number
 # seq does, so a log line can never stop the job.
 echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(awk -v n="${#TASKS[@]}" -v r="${EVAL_REPETITIONS}" 'BEGIN { print n * r }') unit(s)"
+# harness A/B twin only (never merges): follow every session pod's and
+# AgentProfile worker pod's log for the whole matrix into
+# ${ARTIFACT_DIR}/worker-logs/, so per-case tool-refusal lines and turn
+# timings survive pods that are gone by the end-of-run diagnostics. Best
+# effort: every command ends in || true; its own output goes to a file so no
+# child holds the job's stdout open, and it stops when the job's pod does.
+TWIN_WORKER_LOG_DIR="${ARTIFACT_DIR}/worker-logs"
+mkdir -p "${TWIN_WORKER_LOG_DIR}" || true
+(
+  set +e +o pipefail
+  twin_kctl=(kubectl)
+  if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then twin_kctl+=(--context "${AGENT_CLUSTER_CONTEXT}"); fi
+  while :; do
+    for twin_sel in "app.kubernetes.io/component=a2a-session" "kubeagents.x-k8s.io/agentprofile"; do
+      "${twin_kctl[@]}" --request-timeout=20s get pods -A -l "${twin_sel}" \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+        | while IFS=$'\t' read -r twin_ns twin_pod; do
+            [ -n "${twin_pod}" ] || continue
+            twin_f="${TWIN_WORKER_LOG_DIR}/${twin_ns//[^A-Za-z0-9._-]/_}_${twin_pod//[^A-Za-z0-9._-]/_}.log"
+            [ -e "${twin_f}" ] && continue
+            : > "${twin_f}" || continue
+            ( "${twin_kctl[@]}" logs -f "pod/${twin_pod}" -n "${twin_ns}" \
+                --all-containers --prefix --timestamps --ignore-errors --max-log-requests=10 \
+                >> "${twin_f}" 2>&1 || true ) &
+          done
+    done
+    sleep 15
+  done
+) > "${TWIN_WORKER_LOG_DIR}/follower.log" 2>&1 < /dev/null &
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one
