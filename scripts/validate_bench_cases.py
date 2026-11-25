@@ -1243,12 +1243,18 @@ def _with_sample_delegating_name(prompt: str) -> str:
 
 
 def slack_lane_cases() -> set[str]:
-    """Case ids on the Slack lane: each line's first word, blank and `#` lines skipped."""
+    """Case ids on the Slack lane, read as hack/slack-lane/run.sh reads them:
+    everything from a line's first `#` is a comment, then its first word."""
     try:
         text = SLACK_LANE_CASES_FILE.read_text(encoding="utf-8")
     except OSError:
         return set()
-    return {line.split()[0] for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")}
+    ids = set()
+    for line in text.splitlines():
+        words = line.split("#", 1)[0].split()
+        if words:
+            ids.add(words[0])
+    return ids
 
 
 def _delegating_profile(name: str, spec: dict[str, Any], problems: list[str]) -> None:
@@ -1292,7 +1298,12 @@ def _delegating_profile(name: str, spec: dict[str, Any], problems: list[str]) ->
             f"prompt: addresses the throwaway delegating profile ({dp.PLACEHOLDER}) without '{key}: true'; "
             "declare it, so the case tooling knows the run makes and deletes a profile"
         )
-    if declared is True and not (uses == 1 and addressed == dp.new_name(DELEGATING_PROFILE_SAMPLE_TOKEN)):
+    # The raw directive must carry the placeholder as its name= field: compared
+    # after substitution, a literal sample name beside a placeholder used
+    # elsewhere would pass.
+    directive = prompt[: prompt.find(hook.DIRECTIVE_END) + 1] if prompt.startswith(hook.PROFILE_DIRECTIVE) else ""
+    named_by_placeholder = f"name={dp.PLACEHOLDER}" in directive.split()
+    if declared is True and not (uses == 1 and named_by_placeholder and addressed == dp.new_name(DELEGATING_PROFILE_SAMPLE_TOKEN)):
         problems.append(
             f"'{key}: true' needs the prompt to open with {hook.PROFILE_DIRECTIVE} name={dp.PLACEHOLDER} ...] "
             f"and name the placeholder nowhere else: the harness makes the profile only for that prompt"

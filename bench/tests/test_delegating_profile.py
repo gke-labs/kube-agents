@@ -606,3 +606,21 @@ def test_a_literal_prefixed_name_is_still_refused_by_the_validator(validator: An
     # Broader than a name the harness makes: no case should name one at all.
     problems = _problems(validator, {"prompt": "[bench:profile name=delegating-prod] ask"})
     assert any("names a throwaway delegating profile literally" in p for p in problems)
+
+
+def test_a_literal_sample_name_beside_a_placeholder_elsewhere_is_refused(validator: Any) -> None:
+    sample = delegating_profile.new_name("0a1b2c3d")
+    prompt = f"[bench:profile name={sample}]\nDelegate from {delegating_profile.PLACEHOLDER}."
+    problems = _problems(validator, {"prompt": prompt, "delegating_profile": True})
+    assert any("needs the prompt to open with" in p for p in problems), problems
+
+
+def test_a_slack_lane_entry_with_an_inline_comment_is_still_caught(
+    validator: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lane = tmp_path / "cases.txt"
+    lane.write_text("made-up-case#note\n", encoding="utf-8")
+    monkeypatch.setattr(validator, "SLACK_LANE_CASES_FILE", lane)
+    monkeypatch.setattr(validator, "REPO_ROOT", tmp_path)
+    problems = _problems(validator, {"prompt": PROMPT, "delegating_profile": True})
+    assert any("on the Slack lane" in p for p in problems)
