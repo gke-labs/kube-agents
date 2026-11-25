@@ -100,7 +100,9 @@ jobs:
     # graph is read from, and where the candidate images are looked for. Resolving
     # those from a different scope than the deploy job would verify one registry
     # and install from another. An unbound job resolves every `vars.*` to empty in
-    # silence, and GH_ORG and GH_REPO have no fallback.
+    # silence, and GH_ORG and GH_REPO have no fallback. The image check's
+    # Google login reads GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT
+    # from the same binding.
     #
     # REGISTRY_PREFIX is set at no scope, so it arrives empty and
     # get_registry_prefix falls back to DEFAULT_REGISTRY_PREFIX. Binding is what
@@ -109,6 +111,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      id-token: write
     outputs:
       commit_sha: ${{ steps.resolve.outputs.commit_sha }}
       rc_tag: ${{ steps.resolve.outputs.rc_tag }}
@@ -131,10 +134,29 @@ jobs:
           GH_REPO: ${{ vars.GH_REPO }}
         run: ./scripts/release/resolve_promotion_candidate.sh
 
+      # Only when the environment's registry is an Artifact Registry
+      # repository: the image check below then asks that registry as the
+      # environment's deploy identity, which has to hold read on it
+      # (registry_image_exists asks Artifact Registry over its API with the
+      # job's Google credential, before docker). With
+      # REGISTRY_PREFIX unset the images are on GHCR, which answers without a
+      # login, and these two steps are skipped; on a run that skips the check
+      # they are skipped too.
+      - name: Authenticate to Google Cloud for the image check
+        if: steps.resolve.outputs.skip_pipeline != 'true' && contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK for the image check
+        if: steps.resolve.outputs.skip_pipeline != 'true' && contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
       # The candidate was validated hours or days ago and its images are what
       # the environment installs. A retention sweep or a registry problem
       # between then and now must fail here, before a cluster is built.
-      - name: Verify candidate images are still in GHCR
+      - name: Verify candidate images are still in the environment's registry
         if: steps.resolve.outputs.skip_pipeline != 'true'
         env:
           COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}

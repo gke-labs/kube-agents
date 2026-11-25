@@ -268,9 +268,10 @@ and dispatched through [the rebuild button](../../docs/environment-reconcile.md#
    `registry_image_exists` — the probe `check_commit_images_exist` runs per image — asks. An Artifact
    Registry prefix (`*-docker.pkg.dev`) is asked over the registry API with the caller's `gcloud`
    access token, docker or not, so the job has to be logged in to Google as an identity that can read
-   the repository. `autopush-deploy.yml`'s candidate image check logs in for such a prefix;
-   `staging-deploy.yml`, `rc-create-tag.yml`, `rc-scheduler.yml`, `staging-promotion-pipeline.yml`'s
-   candidate check and `release-publish.yml` do not. Where the API cannot be asked, and for every other
+   the repository. The candidate image checks of `autopush-deploy.yml`, `staging-deploy.yml`,
+   `rc-create-tag.yml`, `rc-scheduler.yml` and `staging-promotion-pipeline.yml` log in for such a
+   prefix, as their environment's `GCP_SERVICE_ACCOUNT`; `release-publish.yml` does not. Where the
+   API cannot be asked, and for every other
    registry, a GitHub Actions runner takes the `docker manifest inspect` branch, which reads a private
    repository only after a `docker login` to it. A caller without docker has a docker-free fallback
    for `ghcr.io` and Artifact Registry only, and gets a warning and a "missing image" answer when

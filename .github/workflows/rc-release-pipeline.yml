@@ -36,6 +36,9 @@ jobs:
     uses: ./.github/workflows/rc-create-tag.yml
     permissions:
       contents: write
+      # rc-create-tag.yml's job asks for it, for the Google login its image
+      # check takes when the registry is an Artifact Registry repository.
+      id-token: write
     with:
       commit_sha: ${{ inputs.commit_sha }}
       rc_tag: ${{ inputs.rc_tag }}
