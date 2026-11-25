@@ -142,11 +142,31 @@ def test_wrong_verdict_or_missing_prescription_fails():
             "The cluster has NodeLocal DNSCache disabled. "
             "Fix: tune kube-dns-autoscaler nodesPerReplica and coresPerReplica."
         ),
-        # Negated NodeLocal DNSCache prescription.
+        # Negated NodeLocal DNSCache prescriptions and root-cause descriptions.
         (
             "VERDICT: KUBE-DNS-UNDERSCALED\n\n"
             "Tune kube-dns-autoscaler nodesPerReplica and coresPerReplica. "
             "Do not enable NodeLocal DNSCache."
+        ),
+        (
+            "VERDICT: KUBE-DNS-UNDERSCALED\n\n"
+            "Tune kube-dns-autoscaler nodesPerReplica and coresPerReplica.\n"
+            "Do not configure NodeLocal DNSCache on this cluster."
+        ),
+        (
+            "VERDICT: KUBE-DNS-UNDERSCALED\n\n"
+            "Tune kube-dns-autoscaler nodesPerReplica and coresPerReplica.\n"
+            "NodeLocal DNSCache should not be enabled on the cluster."
+        ),
+        (
+            "VERDICT: KUBE-DNS-UNDERSCALED\n\n"
+            "Tune kube-dns-autoscaler nodesPerReplica and coresPerReplica.\n"
+            "NodeLocal DNSCache is an add-on that is unnecessary here."
+        ),
+        (
+            "VERDICT: KUBE-DNS-UNDERSCALED\n\n"
+            "NodeLocal DNSCache is disabled, so there is no local cache.\n"
+            "Tune kube-dns-autoscaler nodesPerReplica and coresPerReplica."
         ),
         # Missing kube-dns-autoscaler.
         (
