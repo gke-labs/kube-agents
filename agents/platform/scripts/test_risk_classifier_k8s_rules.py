@@ -221,6 +221,37 @@ class RegistryCompletenessAndFailClosedTests(unittest.TestCase):
                         codes,
                         f"{group}/{kind} on {action} fell through to UNMODELED_RESOURCE_CHANGE",
                     )
+                    for reason in ev.reasons:
+                        self.assertNotIn(
+                            "modifys",
+                            reason.message.lower(),
+                            f"{group}/{kind} on {action} emitted typo 'modifys': {reason.message!r}",
+                        )
+
+    def test_no_modifys_typo_in_source_or_modify_verdicts(self) -> None:
+        k8s_rules_src = (Path(__file__).resolve().parent / "risk_classifier" / "k8s_rules.py").read_text(encoding="utf-8")
+        self.assertNotIn("modifys", k8s_rules_src)
+        self.assertNotIn("{action}s ", k8s_rules_src)
+        self.assertNotIn("action + 's'", k8s_rules_src)
+        self.assertNotIn('action + "s"', k8s_rules_src)
+
+        extra_modify_docs = (
+            "apiVersion: persona.kube-agents.x-k8s.io/v1alpha1\nkind: AgentProfile\nmetadata:\n  name: p\n  namespace: kubeagents-system\nspec:\n  role: a\n",
+            "apiVersion: custom.acme.io/v1\nkind: Widget\nmetadata:\n  name: w\n  namespace: kube-system\nspec:\n  v: 1\n",
+            "apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: pol\nspec:\n  validationFailureAction: Enforce\n",
+            "apiVersion: sql.cnrm.cloud.google.com/v1beta1\nkind: SQLInstance\nmetadata:\n  name: db\n  namespace: shop\nspec:\n  region: us-central1\n",
+            "apiVersion: networking.istio.io/v1\nkind: VirtualService\nmetadata:\n  name: vs\n  namespace: shop\nspec:\n  hosts: [web]\n",
+            "apiVersion: cert-manager.io/v1\nkind: Certificate\nmetadata:\n  name: cert\n  namespace: shop\nspec:\n  secretName: tls\n",
+        )
+        for doc in extra_modify_docs:
+            after_mod = doc + "  extraField: 2\n"
+            r = classify_changes([_mod("clusters/dev/m.yaml", doc, after_mod)])
+            for reason in r.reasons:
+                self.assertNotIn("modifys", reason.message.lower(), reason.message)
+            self.assertTrue(
+                any("modifies " in reason.message for reason in r.reasons),
+                f"expected 'modifies ' in reasons for {doc.splitlines()[1]}: {[x.message for x in r.reasons]}",
+            )
 
     def test_volume_attachment_and_csinode_are_high_difficult_revert_not_medium(self) -> None:
         va = """\
