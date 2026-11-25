@@ -6,6 +6,7 @@ import math
 import posixpath
 from typing import Any
 
+from . import k8s_rules as _k8s_rules
 from .k8s_rules import (
     SYSTEM_NAMESPACES,
     WORKLOAD_KINDS,
@@ -744,6 +745,18 @@ def _resource_meta_labels(res: ParsedResource) -> dict[str, Any]:
         return {}
     lbls = meta.get("labels")
     return lbls if isinstance(lbls, dict) else {}
+
+
+def _is_kube_agents_group(group: str) -> bool:
+    """Match kube-agents CR API groups (`kubeagents.x-k8s.io`, `*.kube-agents.x-k8s.io`, etc.)."""
+    fn = getattr(_k8s_rules, "is_kube_agents_group", None)
+    if callable(fn):
+        return bool(fn(group))
+    low = group.lower()
+    return (
+        low in ("kubeagents.x-k8s.io", "kube-agents.x-k8s.io")
+        or low.endswith((".kubeagents.x-k8s.io", ".kube-agents.x-k8s.io"))
+    )
 
 
 def classify_changes(changes: list[FileChange]) -> ClassificationResult:
@@ -1621,7 +1634,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                         ):
                             ren_prod = True
                     for r_item in a_out.resources:
-                        if r_item.ref.group == "kubeagents.x-k8s.io":
+                        if _is_kube_agents_group(r_item.ref.group):
                             ren_risk = combine_risk(ren_risk, RISK_CRITICAL)
                             ren_blast = combine_blast_radius(ren_blast, BLAST_CRITICAL)
                             ren_revert = combine_revertability(ren_revert, REVERT_DIFFICULT)

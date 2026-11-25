@@ -1841,6 +1841,34 @@ class TriageEngineHardeningTests(unittest.TestCase):
         )
         self.assertEqual(r_ks_ren.risk_level, RISK_CRITICAL)
 
+        # Same-directory rename of AgentPersona / *.kube-agents.x-k8s.io CRs escalates to CRITICAL
+        for ka_api in (
+            "persona.kube-agents.x-k8s.io/v1alpha1",
+            "kube-agents.x-k8s.io/v1alpha1",
+            "kubeagents.x-k8s.io/v1alpha1",
+        ):
+            with self.subTest(ka_api=ka_api):
+                persona_cr = (
+                    f"apiVersion: {ka_api}\nkind: AgentPersona\n"
+                    "metadata:\n  name: cluster-sre\n  namespace: default\nspec: {}\n"
+                )
+                r_ka_ren = classify_changes(
+                    [
+                        FileChange(
+                            path="clusters/dev/persona-renamed.yaml",
+                            old_path="clusters/dev/persona.yaml",
+                            change_type=CHANGE_RENAMED,
+                            before=persona_cr.encode("utf-8"),
+                            after=persona_cr.encode("utf-8"),
+                            before_mode="100644",
+                            after_mode="100644",
+                        )
+                    ]
+                )
+                self.assertEqual(r_ka_ren.risk_level, RISK_CRITICAL)
+                self.assertEqual(r_ka_ren.blast_radius, BLAST_CRITICAL)
+                self.assertIn("KUBE_AGENTS_SELF_MODIFICATION", {x.code for x in r_ka_ren.reasons})
+
         # Executable mode removal (`100755 -> 100644`) emits FILE_MODE_CHANGED (not COMMENT_OR_WHITESPACE_ONLY)
         r_chmod = classify_changes(
             [_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY, before_mode="100755", after_mode="100644")]
