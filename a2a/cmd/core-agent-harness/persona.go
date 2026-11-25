@@ -19,9 +19,9 @@ import (
 // can't lead a read outside it. core-agent's own skills loader (env
 // interpolation, discovery) is not used.
 //
-// SEAM (dev-2): the persona's layout, rendered read-only to this process by
-// a second UID (#6713); PrepareTurn checks the directory before each spawn.
-// TODO(dev-2, #6713): replace this reader with coreagent.Snapshot(dir).
+// The persona's layout is rendered read-only to this process by a second
+// UID (#6713); PrepareTurn checks the directory before each spawn.
+// TODO(#6713): replace this reader with coreagent.Snapshot(dir).
 //
 // A missing dir is no persona, unless required: a pod configured for a
 // persona that finds none fails the turn rather than run without it.

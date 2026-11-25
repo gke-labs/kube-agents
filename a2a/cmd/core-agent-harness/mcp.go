@@ -15,7 +15,7 @@ import (
 // and a func that stops them; the process exits after the turn, so an MCP
 // server lives for one turn.
 //
-// SEAM (tigerteam-dev-3): building the servers from the Envelope and
+// Not built yet (#7158): starting the servers from the Envelope and
 // stopping them, grandchildren included. Until then a turn that names one
 // fails rather than running without it.
 func buildMCP(_ context.Context, servers []coreagentwire.MCPServer, _ *permissions.Gate) ([]adktool.Toolset, func(), error) {

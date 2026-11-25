@@ -245,3 +245,10 @@ func TestACoreAgentDriverWithAPolicyKeepsItsHistory(t *testing.T) {
 		t.Errorf("policy %+v not carried", env.Policy)
 	}
 }
+
+// core-agent reads no config dir, so it names none for the harness env.
+func TestCoreAgentNamesNoConfigDir(t *testing.T) {
+	if kv := newCoreAgentDriver().ConfigDirEnv("/x"); kv != "" {
+		t.Errorf("ConfigDirEnv = %q, want empty", kv)
+	}
+}
