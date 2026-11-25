@@ -114,6 +114,9 @@ type Event struct {
 
 	Tool  string
 	Input json.RawMessage
+	// CallID is the harness's id for a tool invocation (EventActivity),
+	// when it gives one: what a refused-call log record names.
+	CallID string
 
 	// Failed is a turn the harness reported as failed. Token is the reason
 	// token a failed terminal carries (`reason: <token>`); an empty Token on
