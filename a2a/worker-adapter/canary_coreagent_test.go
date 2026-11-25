@@ -267,6 +267,15 @@ type countingDriver struct {
 	onStart func()
 }
 
+// WithMCP keeps the wrapper: the adapter gives each turn's driver its MCP
+// servers (turnDriver), and the embedded driver's WithMCP alone would return
+// the bare core-agent driver, dropping the count and the control leg's
+// skipped check.
+func (d countingDriver) WithMCP(servers []coreagentwire.MCPServer) Driver {
+	d.coreAgentDriver = d.coreAgentDriver.WithMCP(servers).(coreAgentDriver)
+	return d
+}
+
 func (d countingDriver) PrepareTurn(ctx context.Context, dirs TurnDirs) error {
 	d.onStart()
 	if !d.guarded {
