@@ -1186,6 +1186,13 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# #2800: the drift audit's kubelet-config facet, the second voted by node
+# pool. seeded-c's default-pool sets podPidsLimit where the stack's other
+# pools set no kubelet key the facet reads; graded on the ledger's
+# kubelet-config finding and the pool it names. The same full audit and band
+# as consistency-drift-outlier.
+./tasks/consistency-kubelet-config-pool-outlier/task.yaml
+
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst
 # windows and GPU duty-cycle metrics delivered via GitOps PR. deployer: noop.
