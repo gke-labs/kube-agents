@@ -187,14 +187,19 @@ same session instead of starting a new one.
 **`incidents`** keeps the first triage report per thread — the one carrying the proposed fix.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
-knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
-the session row names a thread, whether or not the report was posted into it; and the kanban notifier, when it delivers a card whose result carries
-a fix a reply could authorise into one. Only the last of those is on the event-triage path, and it is the only one
+knows what Option B was. Four paths write it: the cron report relay, in-process; `send_notification`, when
+the session row names a thread, whether or not the report was posted into it; the kanban notifier, when it delivers a card whose result carries
+a fix a reply could authorise into one; and the hermes-bridge, for each scheduled report the A2A gateway posts
+into a home-channel thread under `spec.mode: next`, asked over the bus (`chat.incident`). Only the last of those is on the event-triage path, and it is the only one
 that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
 event-triage card from an ordinary one by the time it runs, so the artifact is the test.
 
-The two remote writers go through `POST /v1/incidents`, which is `INSERT OR IGNORE`: later chatter in the
-thread cannot overwrite the decision record. The relay writes in-process (`_store_incident_report`) and
+The remote writers go through `POST /v1/incidents`, which is `INSERT OR IGNORE` by default: later chatter in the
+thread cannot overwrite the decision record. The hermes-bridge sends `replace: true` with `source: a2a-schedule`, because a schedule posts
+every report of its UTC day into one thread and a reply there is answered with the newest; a replaced row's age
+restarts. A replace updates only a row the same source wrote, so a report another writer stored in that thread
+(the relay, the notifier, a triage card, every row from before the `source` column) stays first-write-wins, and
+replace without a source is refused. The relay writes in-process (`_store_incident_report`) and
 replaces, so each run of a cron job updates the row for the thread it keeps posting into rather than being
 ignored after the first. Both tables expire on a TTL sweep
 (`SESSION_KV_CLEANUP_TTL_DAYS`, default 14).

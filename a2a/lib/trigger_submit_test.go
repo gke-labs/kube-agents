@@ -110,6 +110,49 @@ func TestScheduleDeliveryIsChatOrLocalWithALabelKey(t *testing.T) {
 	}
 }
 
+// TestAThreadDeliveryNamesItsThreadAndOnlyItDoes: mode thread names its
+// platform, chat and thread, with an a2a- incident source or none; no other
+// mode names any of them.
+func TestAThreadDeliveryNamesItsThreadAndOnlyItDoes(t *testing.T) {
+	good := ScheduleDelivery{Mode: ScheduleDeliveryThread, JobKey: "cluster-triage", Platform: NotifyPlatformSlack, ChatID: "C0HOME", ThreadID: "1763100000.000100"}
+	withSource := good
+	withSource.IncidentSource = "a2a-triage"
+	for _, d := range []ScheduleDelivery{good, withSource} {
+		if err := ValidateScheduleDelivery(d); err != nil {
+			t.Errorf("%+v: %v", d, err)
+		}
+	}
+	for name, edit := range map[string]func(*ScheduleDelivery){
+		"no platform":                   func(d *ScheduleDelivery) { d.Platform = "" },
+		"no chat":                       func(d *ScheduleDelivery) { d.ChatID = "" },
+		"no thread":                     func(d *ScheduleDelivery) { d.ThreadID = "" },
+		"a padded thread":               func(d *ScheduleDelivery) { d.ThreadID = " 1763100000.000100" },
+		"a control character":           func(d *ScheduleDelivery) { d.ThreadID = "1763100000.000100\n" },
+		"an overlong chat":              func(d *ScheduleDelivery) { d.ChatID = strings.Repeat("C", 257) },
+		"a source outside a2a-":         func(d *ScheduleDelivery) { d.IncidentSource = "kanban" },
+		"a source with an upper letter": func(d *ScheduleDelivery) { d.IncidentSource = "a2a-Triage" },
+		"an overlong source":            func(d *ScheduleDelivery) { d.IncidentSource = "a2a-" + strings.Repeat("a", 29) },
+		"the scheduled reports' source": func(d *ScheduleDelivery) { d.IncidentSource = IncidentSourceSchedule },
+		"a bad job key":                 func(d *ScheduleDelivery) { d.JobKey = "has.dot" },
+		"chat mode naming a thread":     func(d *ScheduleDelivery) { d.Mode = ScheduleDeliveryChat },
+		"local mode naming a source": func(d *ScheduleDelivery) {
+			*d = ScheduleDelivery{Mode: ScheduleDeliveryLocal, JobKey: "a", IncidentSource: "a2a-triage"}
+		},
+	} {
+		d := good
+		edit(&d)
+		if err := ValidateScheduleDelivery(d); err == nil {
+			t.Errorf("%s: %+v accepted", name, d)
+		}
+	}
+	if got := good.IncidentSourceOf(); got != ScheduleDeliveryThreadSource {
+		t.Errorf("default source = %q", got)
+	}
+	if got := withSource.IncidentSourceOf(); got != "a2a-triage" {
+		t.Errorf("source = %q", got)
+	}
+}
+
 func TestATriggerReplyIsOnlyInItsSourcesNamespace(t *testing.T) {
 	good := TriggerReplySubject("schedule", "abc123")
 	if good != "a2a.trigger.reply.schedule.abc123" || !ValidTriggerReplySubject("schedule", good) {

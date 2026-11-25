@@ -125,6 +125,15 @@ const (
 	a2aSessionStateBucket  = "session-state"
 	a2aFeedbackBucket      = "feedback"
 	a2aPeopleBucket        = "people"
+	// a2aScheduledReportsBucket is lib.ScheduledReportsBucket: a schedule
+	// trigger's finished runs, written by the gateway alone.
+	a2aScheduledReportsBucket = "SCHEDULED_REPORTS"
+	// a2aScheduleThreadsBucket is lib.ScheduleThreadsBucket: each
+	// schedule's home-channel thread for a UTC day, the gateway's alone.
+	a2aScheduleThreadsBucket = "SCHEDULE_THREADS"
+	// a2aNotifyThreadsBucket is lib.NotifyThreadsBucket: the home-channel
+	// threads the gateway opened with a keyed notify post, its alone.
+	a2aNotifyThreadsBucket = "NOTIFY_THREADS"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
@@ -2161,7 +2170,8 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
-	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS", "KV_SCHEDULED_REPORTS",
+	"KV_SCHEDULE_THREADS", "KV_NOTIFY_THREADS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2432,6 +2442,24 @@ func a2aAgentJetStreamGrants() []string {
 //     CONSUMER.DELETE for the desk's watch and the purge's key list. Put and
 //     Delete are publishes on $KV.people.>.
 //
+//   - KV_SCHEDULED_REPORTS, a schedule trigger's finished runs
+//     (a2a/gateway/scheduled_reports.go): STREAM.INFO to bind it and
+//     DIRECT.GET for the run's record, read back before each write so a
+//     redelivered terminal never posts twice. No consumer verb: the gateway
+//     lists no keys. Create and Update are publishes on
+//     $KV.SCHEDULED_REPORTS.>.
+//
+//   - KV_SCHEDULE_THREADS, each schedule's home-channel thread for a UTC
+//     day (a2a/gateway/schedule_threads.go): the same two verbs, STREAM.INFO
+//     to bind it and DIRECT.GET for the day's entry. Its claim's create,
+//     the thread's update and a failed claim's delete are publishes on
+//     $KV.SCHEDULE_THREADS.>.
+//
+//   - KV_NOTIFY_THREADS, the home-channel threads the gateway opened with a
+//     keyed notify post (a2a/gateway/notify_threads.go): the same two verbs,
+//     STREAM.INFO to bind it and DIRECT.GET for a thread's entry. The
+//     record's put is a publish on $KV.NOTIFY_THREADS.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -2514,6 +2542,9 @@ func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
 	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
+	kvScheduledReports := a2aKVStreamPrefix + a2aScheduledReportsBucket
+	kvScheduleThreads := a2aKVStreamPrefix + a2aScheduleThreadsBucket
+	kvNotifyThreads := a2aKVStreamPrefix + a2aNotifyThreadsBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -2534,6 +2565,12 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
+		"$JS.API.STREAM.INFO." + kvScheduledReports,
+		"$JS.API.DIRECT.GET." + kvScheduledReports + ".>",
+		"$JS.API.STREAM.INFO." + kvScheduleThreads,
+		"$JS.API.DIRECT.GET." + kvScheduleThreads + ".>",
+		"$JS.API.STREAM.INFO." + kvNotifyThreads,
+		"$JS.API.DIRECT.GET." + kvNotifyThreads + ".>",
 	}
 }
 
@@ -2856,6 +2893,7 @@ accounts {
       { stream: "a2a.cap.reply.>", accounts: [ APP ] }
       { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
       { stream: "chat.board", accounts: [ APP ] }
+      { stream: "chat.incident", accounts: [ APP ] }
       { stream: "_INBOX.bridge.>", accounts: [ APP ] }
       { stream: "_INBOX.web.>", accounts: [ APP ] }
       { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
@@ -2873,6 +2911,7 @@ accounts {
       { stream: { account: APP, subject: "chat.notify.teams" } }
       { stream: { account: APP, subject: "chat.notify.console" } }
       { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+      { stream: { account: APP, subject: "chat.incident.reply.gateway.>" } }
     ]
     users [
 ` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
@@ -2911,6 +2950,7 @@ accounts {
       { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
       { stream: "chat.notify.console", accounts: [ TRUSTED ] }
       { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+      { stream: "chat.incident.reply.gateway.>", accounts: [ TRUSTED ] }
     ]
     imports [
       { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
@@ -2932,6 +2972,7 @@ accounts {
       { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
       { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
       { stream: { account: TRUSTED, subject: "chat.board" } }
+      { stream: { account: TRUSTED, subject: "chat.incident" } }
       { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
       { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
     ]
@@ -4299,6 +4340,37 @@ $NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 -
 # dispatcher reads expiry from each record, so a restarted one can still read
 # every lease it has to re-adopt or fail.
 $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=67108864
+
+# SCHEDULED_REPORTS: one record per finished run of a schedule trigger, the
+# report and whether and where it was posted (a2a/gateway/scheduled_reports.go;
+# docs/designs/scheduling-on-profiles.md section 4). Written only by the
+# gateway, before any post, so a run is on record whether it posts or not.
+# History 1: each record moves through its statuses in place, and only the
+# last is read. It is the durable record later readers enumerate, so the max
+# age is long, 90 days, rather than none: KV is discard=new, and a bucket with
+# no age would fill and refuse every later run's record, which posts nothing.
+# The gateway cuts a report at 24KiB, and a value is capped at 256KiB, room
+# for that report's JSON escaping at its worst; a full-size record is about
+# 25KB, so 256MiB holds about ten thousand, over a hundred runs a day for the
+# 90 days.
+$NATS kv info SCHEDULED_REPORTS >/dev/null 2>&1 || $NATS kv add SCHEDULED_REPORTS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456 --max-value-size=262144 --ttl=2160h
+
+# SCHEDULE_THREADS: the home-channel thread each schedule posts into for one
+# UTC day, keyed <jobKey>.<YYYY-MM-DD> (a2a/gateway/schedule_threads.go;
+# docs/designs/scheduling-on-profiles.md section 4, item 3). Written and read
+# only by the gateway, so a failover keeps posting into the day's thread.
+# History 1; a 48h max age keeps a day's entry past its day and then drops
+# it. An entry is a few hundred bytes: 8MiB holds tens of thousands, and a
+# value is capped at 4KiB.
+$NATS kv info SCHEDULE_THREADS >/dev/null 2>&1 || $NATS kv add SCHEDULE_THREADS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=8388608 --max-value-size=4096 --ttl=48h
+
+# NOTIFY_THREADS: the home-channel threads the gateway opened with a keyed
+# chat.notify post (an alert's), keyed <platform>.<hash of chat and thread>
+# (a2a/gateway/notify_threads.go). Written and read only by the gateway: a
+# thread delivery must name a thread on it. History 1; a 7-day max age
+# outlives an alert's triage and its replies. An entry is a few hundred
+# bytes: 8MiB holds tens of thousands, and a value is capped at 1KiB.
+$NATS kv info NOTIFY_THREADS >/dev/null 2>&1 || $NATS kv add NOTIFY_THREADS --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=8388608 --max-value-size=1024 --ttl=168h
 
 # PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
 # (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and

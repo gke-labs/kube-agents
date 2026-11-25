@@ -236,6 +236,11 @@ type Notifier struct {
 	// threadTS turns an admitted thread into the one the poster takes (Slack's
 	// channel-qualified thread to its bare ts); nil leaves it as it is.
 	threadTS func(string) string
+	// threadRecorder, when set, is told the thread every keyed home post
+	// that named no thread opened: the gateway's record of the threads it
+	// opened, which a thread delivery must name (notify_threads.go). Set
+	// before Start.
+	threadRecorder func(platform, chatID, thread string)
 	// convPrefix is the conversation-key prefix of this backend, and conv
 	// the gateway's conversations; nil leaves conversation requests refused.
 	convPrefix string
@@ -465,6 +470,11 @@ type notifyJob struct {
 	// when it carried none; reply draws it once the request is answered
 	// with a post, and never for a request that posted nothing.
 	mark *MarkState
+	// dropLate drops the job unposted once its deadline has passed, rather
+	// than posting it for a requester that stopped waiting: a scheduled
+	// report's (postHomeReport), whose caller records a late post as one
+	// whose outcome is unknown. A chat.notify request posts late, as before.
+	dropLate bool
 	// rootTask is the root of the task the request's reply_to named, as
 	// postConsole resolved it for the frame; "" when it named none. reply
 	// keeps the post under it.
@@ -642,6 +652,10 @@ func (n *Notifier) work() {
 	for job := range n.jobs {
 		if n.isStopping() {
 			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
+			continue
+		}
+		if job.dropLate && !job.deadline.IsZero() && time.Now().After(job.deadline) {
+			job.answer(lib.NotifyReply{Error: "dropped unposted: its requester stopped waiting"})
 			continue
 		}
 		n.post(job)
@@ -925,6 +939,11 @@ func (n *Notifier) post(job notifyJob) {
 			n.reply(job, lib.NotifyReply{MessageID: first, ThreadID: thread})
 		}
 	}
+	if job.req.Conversation == "" && job.req.Update != "" && job.req.Thread == "" && thread != "" && n.threadRecorder != nil {
+		// A keyed home post too long for postHome opened its thread here,
+		// in chunks: on the record as postHome's would be.
+		n.threadRecorder(n.backend, job.home, thread)
+	}
 	n.log.Info("notify posted", "home", job.home, "thread", thread, "message", first)
 }
 
@@ -1202,6 +1221,12 @@ func (n *Notifier) postHome(job notifyJob) bool {
 		landed = thread
 	}
 	if landed != "" {
+		if n.threadRecorder != nil && thread == "" {
+			// Only a thread this post opened: a reply into a thread the
+			// request named puts nothing on the record, so no notify
+			// caller can add an existing thread to it.
+			n.threadRecorder(n.backend, home, landed)
+		}
 		n.updates.put(notifyHomeKeyPrefix+landed, key, message)
 		if m.Feedback != "" {
 			// The thread's opening post was rated: its key's later edit
