@@ -174,6 +174,9 @@ type CallerIdentity struct {
 	Partition string
 	// Authenticator names the authenticator that admitted the caller; empty when it does not say.
 	Authenticator string
+	// Extra holds further verified attributes of the caller, under the authenticator's own keys;
+	// pkg/tokenreview copies the TokenReview's status.user.extra. The default audit sink omits it.
+	Extra map[string][]string
 }
 
 // ErrAuthenticationUnavailable is wrapped by an authenticator that could not decide, so the
@@ -224,11 +227,32 @@ type Config struct {
 	TracerProvider   trace.TracerProvider
 	Cache            *CacheConfig
 	Exclusions       *Exclusions
+	// Authorize is the embedder's own per-request rule; an error is a 403 before the policy,
+	// the cache, coalescing and the upstream.
+	Authorize func(AuthorizeAttributes) error
+	// ExtraCallerHeaders are further request headers stripped before forwarding.
+	ExtraCallerHeaders []string
 	CallerPartition  func(*CallerIdentity) string
 	MaxInFlight      int
 	DefaultClusterID string
 }
+
+// AuthorizeAttributes is what Config.Authorize decides on.
+type AuthorizeAttributes struct {
+	Request     *http.Request // as received, headers not yet stripped, without its body
+	Caller      *CallerIdentity
+	ClusterID   string
+	RequestInfo *request.RequestInfo
+}
+
+// AuthorizeError lets Config.Authorize choose the audit reason and the caller's message.
+type AuthorizeError struct {
+	Reason  RejectionReason
+	Message string
+}
 ```
+
+The handler decides in a fixed order: it authenticates the caller, computes `Config.CallerPartition`, splits the cluster ID from the path, checks `Exclusions` and `Holds`, classifies the request (`RequestInfo`), calls `Config.Authorize` when one is set, evaluates `Policy`, takes an in-flight slot, strips the caller's headers, and only then reaches the response cache, the in-flight coalescer and the upstream. `Config.Authorize` is for a rule the embedder owns, such as binding a caller to the clusters it may reach. It runs on every request, a cache hit included, so a response fetched for one caller is never served to a caller it refuses, and a refused caller never joins another's in-flight fetch. Any error it returns is a `403 Forbidden` audited as `refused`; there is no "could not decide" answer, so a hook whose dependency is unavailable fails closed. The caller reads a fixed message and the audit record's `rejection_reason` is `authorize.refused`, unless the error is an `AuthorizeError`, whose `Reason` and `Message` are used; the error itself goes to the audit record's `error` and never to the caller. On a discovery path the refusal is plain text, as a scope refusal is.
 
 ### 2. End-to-end request flow
 
@@ -244,12 +268,13 @@ sequenceDiagram
     P->>P: 2. Extract clusterID ("gke_proj_loc_clu") & normalize path ("/api/v1/namespaces/default/secrets")
     P->>P: 3. Strip caller Authorization, Impersonate-*, X-Remote-* headers
     P->>P: 4. Parse RequestInfo (Verb="list", Resource="secrets", Version="v1")
-    P->>P: 5. Enforce Policy (allow "list"; rewrite Accept -> PartialObjectMetadata)
-    P->>T: 6. RoundTripCluster(ctx, "gke_proj_loc_clu", sanitizedReq)
+    P->>P: 5. Call Config.Authorize when the embedder set one (403 on any error)
+    P->>P: 6. Enforce Policy (allow "list"; rewrite Accept -> PartialObjectMetadata)
+    P->>T: 7. RoundTripCluster(ctx, "gke_proj_loc_clu", sanitizedReq)
     T->>A: GET /api/v1/namespaces/default/secrets<br/>Authorization: Bearer <upstream-gcp-or-ksa-token>
     A-->>T: 200 OK (PartialObjectMetadataList / SecretList)
     T-->>P: *http.Response
-    P->>P: 7. Redact any residual .data, .stringData, last-applied-configuration
+    P->>P: 8. Redact any residual .data, .stringData, last-applied-configuration
     P-->>K: 200 OK (Metadata only)
 ```
 
@@ -325,6 +350,7 @@ How multi-cluster context switching works:
 3. Checks `AudienceCallers` so `status.user.username` matches the allowlist bound to the specific audience that authenticated (`CREDENTIAL_PROXY_ALLOWED_CALLERS` for `CREDENTIAL_PROXY_AUDIENCE`, and `CREDENTIAL_PROXY_SESSION_CALLERS` for `CREDENTIAL_PROXY_SESSION_AUDIENCE`).
 4. Caches verified token results (`sha256(token)`) in memory for `min(10s, tokenExpiry)` (`defaultTokenReviewCacheTTL`) so repeated `kubectl` calls do not block on `TokenReview` round trips.
 5. Holds the request to the pod the token was issued to ([`pkg/tokenreview/podbinding.go`](../../k8s-api-proxy/pkg/tokenreview/podbinding.go)). The `TokenReview` of a projected token names its pod in `status.user.extra` (`authentication.kubernetes.io/pod-name` and `pod-uid`). `kube-proxy` reads that pod (`get` on pods in the caller's namespace, which is its `ServiceAccount`'s), checks its UID, and requires the request's direct TCP peer to be one of its `status.podIPs` (or `status.podIP`). The peer is the connection's own address, never a header: nothing fronts `kube-proxy`, and the sandbox and session pods dial its ClusterIP Service directly, which keeps the source address. A token that names no pod, a pod that is gone, unreadable or stopped (`Succeeded` or `Failed`), a UID that does not match, an API error, or a peer that is not one of the pod's addresses gets the same `401` as an unknown token. A `403` on the pod read also logs, at most once a minute per namespace, the permission and namespace. A matched pod's addresses are reused for the `TokenReview` cache's TTL (at most 30 seconds); a refusal is not cached, concurrent lookups of one pod share one read, and one pod and UID is read at most once a second, so a token refused on the read costs one read a second however often it is sent. In a chain (`--auth-mode=token-review,jwt`) this refusal is final: the token never reaches the next authenticator. The `jwt` authenticator also refuses any token carrying the `kubernetes.io` claim, which every Kubernetes `ServiceAccount` token carries, so in either order a pod's token is admitted only by `token-review` and only from its pod.
+6. Returns the review's `status.user.extra` as `CallerIdentity.Extra`. For a pod-bound `ServiceAccount` token, Kubernetes names the pod there (`authentication.kubernetes.io/pod-name`, `authentication.kubernetes.io/pod-uid`), which a `Config.Authorize` can decide on. The handler reads none of it and the default audit sink does not log it.
 
 **`kubectl port-forward` to `kube-proxy` is refused.** A request that reaches `kube-proxy` through a port-forward arrives from the forwarding path, not from the pod its token was issued to, so it fails the pod check above even with a valid sandbox token. To run `kubectl` the way the agent does, run it inside the sandbox (`kubectl exec -it <agent>-shell-0 -c shell -- kubectl ...`), where the pod's own token and address match; to inspect the cluster as an operator, use your own credentials against the API server directly.
 
@@ -399,6 +425,9 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 - `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid`, and any header matching `^Impersonate-Extra-` (case-insensitive)
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
 - `Connection` and `Upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled and `Upgrade` is non-empty, in which case `Connection: Upgrade` is set)
+- Every header `Config.ExtraCallerHeaders` names, for an embedder whose authenticator or `Config.Authorize` reads the caller's identity or credential from headers of its own. A name matches a whole header name in any case. `NewHandler` refuses an entry that is not an HTTP header name, and `Host`, `Content-Length`, `Transfer-Encoding`, `Connection` and `Upgrade`, which `net/http` and the handler manage themselves. The binary sets none.
+
+The authenticator and `Config.Authorize` run on the request as received, so they still read these headers; the handler strips them from its own copy of the request at one point, after the policy admits it, and every forwarded request (plain, watch, and upgrade) is built from that copy.
 
 Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`, `caller_partition` when the authenticator named one, and `caller_authenticator`, the `--auth-mode` entry that admitted the caller; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
 
@@ -455,7 +484,7 @@ Neither transport needs Google credentials to start, so a proxy that serves `in-
 1. **Prometheus metrics (`/metrics` on port `8444`)**:
    - All label values come from closed vocabularies so caller-supplied paths or CRD resource names cannot increase series cardinality.
    - `kubeagents_kube_proxy_requests_total` (`verb`, `resource`, `subresource`, `mode`, `dry_run`, `outcome`, `status_code`): Total Kubernetes API requests processed by `kube-proxy`.
-   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `secret_write_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`, `streaming_blocked`, `scope.excluded-cluster`, `scope.exclude-unreadable`).
+   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `secret_write_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`, `streaming_blocked`, `scope.excluded-cluster`, `scope.exclude-unreadable`, `authorize.refused`; a reason of an embedder's own from `Config.Authorize` is counted as `other`).
    - `kubeagents_kube_proxy_secrets_redacted_total` (`action`): Total `core/v1` `Secret` redaction actions (`accept_header_rewritten` and `payload_scrubbed`).
    - `kubeagents_kube_proxy_cache_requests_total` (`result`, `verb`, `resource`): Total cache lookups in `kube-proxy`, labeled by result (`hit`, `miss`, `coalesced`, `bypass`), verb, and resource.
    - `kubeagents_kube_proxy_cache_evictions_total` (`reason`): Total cached responses evicted from the `kube-proxy` cache, labeled by reason (`capacity`, `expired`, `invalidated`).

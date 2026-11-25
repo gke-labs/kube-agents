@@ -60,6 +60,29 @@ type Config struct {
 	// Holds refuses every request to a cluster spec.hold names, at the same point;
 	// nil holds nothing.
 	Holds *Holds
+	// Authorize decides whether an authenticated caller may make this request, for a rule
+	// the embedder owns, such as one that binds a caller to the clusters it may reach. It
+	// runs on every request that names a cluster and classifies as an API request: after
+	// Exclusions and Holds, and before Policy, the response cache, in-flight coalescing and
+	// the upstream, so a refused caller is never served a response fetched for another. Nil
+	// authorizes every request.
+	//
+	// Any non-nil error refuses the request with 403 Forbidden, audited as refused; there
+	// is no "could not decide" answer, so a hook that depends on something unavailable fails
+	// closed. The error is recorded in the audit event and not shown to the caller, except
+	// for an AuthorizeError, whose Reason and Message are used. On a discovery path the
+	// refusal is plain text, as a scope refusal is. The hook is called on the request's
+	// goroutine, must be safe for concurrent use, and must not panic.
+	Authorize func(AuthorizeAttributes) error
+	// ExtraCallerHeaders names request headers the handler strips before forwarding, on
+	// every path (plain, watch and upgrade), besides the ones it always strips: headers
+	// that carry a caller's identity or credential to the Authenticator or to Authorize and
+	// that the upstream must not see. Both still read them: they run on the request as
+	// received. A name matches a whole header name, in any case, never a prefix or a
+	// pattern. An entry that is empty, is not an HTTP header name, or is one of Host,
+	// Content-Length, Transfer-Encoding, Connection and Upgrade is an error: net/http and
+	// the handler manage those themselves.
+	ExtraCallerHeaders []string
 	// CallerPartition names the upstream credential an authenticated caller's requests use,
 	// for an Upstream that chooses a credential per caller or tenant. Its value is part of
 	// the cache key and the in-flight coalescing key, so requests share a cached response or
@@ -85,6 +108,8 @@ type handler struct {
 	authenticator    CallerAuthenticator
 	exclusions       *Exclusions
 	holds            *Holds
+	authorize        func(AuthorizeAttributes) error
+	extraHeaders     map[string]struct{}
 	policy           Policy
 	defaultClusterID string
 	audit            AuditSink
@@ -99,9 +124,9 @@ type handler struct {
 }
 
 // NewHandler returns an http.Handler that authenticates the caller, resolves the target
-// cluster from the path, evaluates cfg.Policy against the API server's classification of the
-// request, strips caller credentials and identity headers, and forwards the request through
-// cfg.Upstream.
+// cluster from the path, asks cfg.Authorize when set, evaluates cfg.Policy against the API
+// server's classification of the request, strips caller credentials and identity headers,
+// and forwards the request through cfg.Upstream.
 func NewHandler(cfg Config) (http.Handler, error) {
 	if cfg.Authenticator == nil {
 		return nil, errors.New("k8sapiproxy: Config.Authenticator is required")
@@ -117,6 +142,10 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	}
 	if cfg.DefaultClusterID != "" && !validClusterID.MatchString(cfg.DefaultClusterID) {
 		return nil, fmt.Errorf("k8sapiproxy: invalid Config.DefaultClusterID %q", cfg.DefaultClusterID)
+	}
+	extraCallerHeaders, err := newExtraCallerHeaders(cfg.ExtraCallerHeaders)
+	if err != nil {
+		return nil, err
 	}
 	var slots chan struct{}
 	if cfg.MaxInFlight > 0 {
@@ -154,6 +183,8 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		authenticator:    cfg.Authenticator,
 		exclusions:       cfg.Exclusions,
 		holds:            cfg.Holds,
+		authorize:        cfg.Authorize,
+		extraHeaders:     extraCallerHeaders,
 		policy:           cfg.Policy,
 		defaultClusterID: cfg.DefaultClusterID,
 		audit:            audit,
@@ -332,6 +363,15 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	ev.DryRun = HasStrictDryRunAll(out)
 	secretRedacted := h.policy.RedactSecrets && isCoreV1Secret(info)
 	annotateRequestSpanInfo(trace.SpanFromContext(out.Context()), clusterID, info, ev.DryRun, secretRedacted)
+	// After classification, which a rule on the verb or the resource needs, and before the
+	// policy, the cache and the coalescer: nothing below runs for a caller the hook refuses.
+	if h.authorize != nil {
+		if aerr := h.authorize(h.authorizeAttributes(r, caller, clusterID, info)); aerr != nil {
+			ev.Err = aerr
+			refuseReadably(w, ev, authorizeRefusal(aerr), apiPath)
+			return
+		}
+	}
 	if perr := h.policy.Evaluate(out, info); perr != nil {
 		refuse(w, ev, perr)
 		return
@@ -350,7 +390,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		defer release()
 	}
 
-	sanitizeRequestHeaders(out.Header, h.policy.permitsUpgrade(info))
+	sanitizeRequestHeaders(out.Header, h.extraHeaders, h.policy.permitsUpgrade(info))
 	ev.Outcome = OutcomeForwarded
 	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
 	if h.partition != nil {
@@ -370,6 +410,17 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	}
 	out = out.WithContext(ctx)
 	h.proxy.ServeHTTP(w, out)
+}
+
+// authorizeAttributes builds what Config.Authorize is handed from the request as received.
+// The hook gets r without its body, which is the upstream's to read, and a copy of info,
+// which the policy and the cache go on to read.
+func (h *handler) authorizeAttributes(r *http.Request, caller *CallerIdentity, clusterID string, info *request.RequestInfo) AuthorizeAttributes {
+	view := r.WithContext(r.Context())
+	view.Body = http.NoBody
+	view.GetBody = nil
+	infoCopy := *info
+	return AuthorizeAttributes{Request: view, Caller: caller, ClusterID: clusterID, RequestInfo: &infoCopy}
 }
 
 // acquireSlot takes an in-flight slot without waiting; ok is false when all are taken.
