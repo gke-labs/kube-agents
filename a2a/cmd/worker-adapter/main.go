@@ -465,22 +465,7 @@ func harnessCommand() []string {
 	// control; this list agreeing with it is what keeps the failure legible.
 	// Under A2A_CLUSTER_VIEW the egress fence has one more peer, the
 	// credential broker, and Bash is what reaches it.
-	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
-	disallowed := defaultDisallowedTools
-	clusterView := os.Getenv(lib.EnvClusterView) == "true"
-	if allowed == "" {
-		allowed = defaultAllowedTools
-		if clusterView {
-			allowed = clusterViewAllowedTools
-		}
-	}
-	// The view is only on when Bash is actually allowed: an override that
-	// leaves it out keeps Bash disallowed and gets no prompt telling the
-	// model to use it.
-	bashView := clusterView && allowsBash(allowed)
-	if bashView {
-		disallowed = clusterViewDisallowed
-	}
+	allowed, disallowed, clusterView, bashView := sessionToolLists(os.Getenv)
 	// The delegate tool has its own switch, independent of
 	// A2A_ALLOWED_TOOLS: it is appended to whatever surface was resolved
 	// above, including an explicit override, because the gateway -- not
@@ -577,6 +562,30 @@ func delegateToolEnabled() bool {
 // assembled. configFromEnv runs once, before anything else is started, so
 // nothing reads it concurrently.
 var delegateToolSuppressed bool
+
+// sessionToolLists is a session pod's tool surface before the delegate
+// tool: the allowlist and denylist in Claude Code's names, whether the pod
+// has the cluster view, and whether Bash is actually allowed under it (the
+// view is only on then: an override that leaves Bash out keeps it
+// disallowed and gets no prompt telling the model to use it). Every
+// harness's grant is read from these lists (harnessCommand; the core-agent
+// grant, coreAgentSessionGrant).
+func sessionToolLists(getenv func(string) string) (allowed, disallowed string, clusterView, bashView bool) {
+	allowed = getenv("A2A_ALLOWED_TOOLS")
+	disallowed = defaultDisallowedTools
+	clusterView = getenv(lib.EnvClusterView) == "true"
+	if allowed == "" {
+		allowed = defaultAllowedTools
+		if clusterView {
+			allowed = clusterViewAllowedTools
+		}
+	}
+	bashView = clusterView && allowsBash(allowed)
+	if bashView {
+		disallowed = clusterViewDisallowed
+	}
+	return allowed, disallowed, clusterView, bashView
+}
 
 // harnessCommandWithoutDelegate is harnessCommand as it would be under
 // A2A_DELEGATE_TOOL=off: no delegate tool on the allowlist, no MCP config, no
@@ -722,6 +731,14 @@ func readPrimer(log *slog.Logger) string {
 	return string(b)
 }
 
+// envOrDefaultFrom is getenv(key), or def when that is empty.
+func envOrDefaultFrom(getenv func(string) string, key, def string) string {
+	if v := getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 // envOrDefault is the variable's value, or def when it's unset.
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -777,6 +794,16 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// core-agent's tool grant travels in every turn's envelope, so the
+	// driver carries it. One that doesn't map or render stops the worker
+	// here rather than running with every tool refused.
+	if driver.Harness() == persona.CoreAgent {
+		p, err := coreAgentSessionGrant(getenv, envOrDefaultFrom(getenv, "A2A_WORKDIR", defaultWorkdir))
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("the tool grant for harness %q: %w", driver.Harness(), err)
+		}
+		driver = workeradapter.NewCoreAgentDriver(p, nil)
 	}
 	// A harness with no default path in the image needs one named, unless a
 	// test replaces the whole argv. Refused here, at startup, rather than at

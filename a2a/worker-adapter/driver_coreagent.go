@@ -23,8 +23,9 @@ import (
 // the next turn resumes. The decoder keeps the event lines a turn emits and
 // the next turn's envelope carries them back.
 type coreAgentDriver struct {
-	// Policy and MCP are the turn's tool policy and MCP servers, set from
-	// the persona grant (SEAM: tigerteam-dev-1, tigerteam-dev-3).
+	// Policy and MCP are the turn's tool policy and MCP servers, set by
+	// NewCoreAgentDriver from the worker's grant (the session allowlist
+	// today; MCP is none until the delegate server is wired).
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 
@@ -168,4 +169,16 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	// An event type this decoder doesn't know is skipped, so a newer
 	// harness can add one.
 	return nil, nil
+}
+
+// NewCoreAgentDriver is the core-agent driver carrying a turn's tool
+// policy and MCP servers, which every turn's envelope sends to the
+// harness. DriverFor's driver carries none: no built-in or MCP tool is
+// offered (the persona's read-only skill tools still are).
+func NewCoreAgentDriver(p coreagentwire.Policy, mcp []coreagentwire.MCPServer) Driver {
+	// Built from newCoreAgentDriver, so the conversation history store is
+	// there: a driver without it would drop history between turns.
+	d := newCoreAgentDriver()
+	d.Policy, d.MCP = p, mcp
+	return d
 }
