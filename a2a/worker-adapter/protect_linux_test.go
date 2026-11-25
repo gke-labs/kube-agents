@@ -24,6 +24,9 @@ func TestProtectProcessMakesTheEnvironUnreadableToChildren(t *testing.T) {
 		if out, err := exec.Command("/bin/cat", self+"/environ").CombinedOutput(); err != nil || len(out) == 0 {
 			t.Fatalf("a same-user child could not read environ even before protectProcess: %v %q", err, out)
 		}
+		// Whether a same-user child can open mem at all before the flag
+		// (Yama's ptrace_scope can refuse it to a child either way).
+		memOpenableBefore := exec.Command("/bin/sh", "-c", "exec 3<"+self+"/mem").Run() == nil
 		if err := protectProcess(); err != nil {
 			t.Fatal(err)
 		}
@@ -31,12 +34,18 @@ func TestProtectProcessMakesTheEnvironUnreadableToChildren(t *testing.T) {
 			t.Fatalf("dumpable = %v, %v after protectProcess", d, err)
 		}
 		for _, f := range []string{"environ", "mem", "fd/1"} {
-			// dd reads mem at an offset that is mapped (the start of the
-			// heap is not guaranteed, so any read error short of a
-			// permission refusal still counts as refused here, and success
-			// fails).
+			// mem and fd/1 are only opened, not read: reading mem at
+			// offset 0 fails on any process, since address 0 is never
+			// mapped, so only the open shows the refusal.
 			cmd := exec.Command("/bin/dd", "if="+self+"/"+f, "of=/dev/null", "bs=1", "count=1", "status=none")
-			if f == "fd/1" {
+			switch f {
+			case "mem":
+				if !memOpenableBefore {
+					t.Logf("mem: a same-user child could not open it even before protectProcess (Yama ptrace_scope); not checked here")
+					continue
+				}
+				cmd = exec.Command("/bin/sh", "-c", "exec 3<"+self+"/mem")
+			case "fd/1":
 				cmd = exec.Command("/bin/sh", "-c", "exec 3>"+self+"/fd/1")
 			}
 			if out, err := cmd.CombinedOutput(); err == nil {
