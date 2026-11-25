@@ -184,17 +184,19 @@ class SnapshotTest(DialCase):
         self.check_answer = "merged"
         dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
         row = self.row()
-        self.assertEqual((row["state"], row["note"]), ("off", "Stepped down: PR #11 was still broken after it merged."))
+        self.assertEqual((row["state"], row["note"]), (
+            "off", "Stepped down: PR #11 was still broken after it merged. Delete its deny rule to allow it again."))
 
     def test_a_tap_on_an_open_step_down_is_refused(self):
         self.auto_merging()
         self.step_down_records((11, "no-pdb", "dev", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/12"}))
         self.row()
         dial_state.write_level("automerge", ADMIN)
-        for action in (dial_state.ACTION_STOP, dial_state.ACTION_REQUEST):
+        for action, expected in ((dial_state.ACTION_STOP, (True, dial_state.STEP_DOWN_STOPPING)),
+                                 (dial_state.ACTION_REQUEST, (False, dial_state.STEP_DOWN_OPEN))):
             with self.subTest(action=action):
                 answer = self.request(action)
-                self.assertEqual((answer["ok"], answer["message"]), (False, dial_state.STEP_DOWN_OPEN))
+                self.assertEqual((answer["ok"], answer["message"]), expected)
         self.assertEqual(self.runs, [])
         self.assertEqual(self.row()["pending_pr"]["number"], 12)
 
@@ -208,6 +210,38 @@ class SnapshotTest(DialCase):
         # Back on as of the fix, so the closed step-down is not taken up again.
         self.assertEqual((entry["state"], entry["set_at"]), ("on", int(datetime(2026, 11, 16, 11, 0, tzinfo=timezone.utc).timestamp())))
         self.assertEqual((self.row()["state"], self.row().get("note")), ("on", None))
+
+    def test_the_oldest_step_down_is_followed_and_a_closed_one_hands_on_to_the_next(self):
+        self.auto_merging()
+        self.step_down_records(
+            (13, "no-pdb", "dev", "2026-11-16T11:30:00Z", {"stepDown": f"{REPO}/pull/14"}),
+            (11, "no-pdb", "dev", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/12"}),
+        )
+        self.assertEqual(self.row()["pending_pr"]["number"], 12)
+        self.check_answer = "closed"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        row = self.row()
+        self.assertEqual((row["state"], row["pending_pr"]["number"]), ("pending", 14))
+        self.check_answer = "merged"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        self.assertEqual(self.row()["state"], "off")
+
+    def test_the_step_downs_own_record_is_what_the_row_follows(self):
+        # The real step-down's answer, stored as the post-merge follow-up stores it, so a rename
+        # of its action or its stepDown key on either side fails here.
+        import post_merge_followups
+        import test_post_merge_stepdown as stepdown_test
+
+        answer = stepdown_test.run(stepdown_test.FakeForge(), stepdown_test.FakeOpen())
+        self.auto_merging()
+        self.db.execute(
+            "CREATE TABLE post_merge_records (repo TEXT, number INTEGER, kind TEXT, environment TEXT, "
+            "merged_at TEXT, followup_state TEXT, followup_detail TEXT)"
+        )
+        self.db.execute("INSERT INTO post_merge_records VALUES (?, 7, 'no-pdb', 'dev', '2026-11-16T11:00:00Z', ?, ?)",
+                        (REPO, answer["action"], post_merge_followups._detail(answer)))
+        row = self.row()
+        self.assertEqual((row["state"], row["pending_pr"]["url"]), ("pending", answer["stepDown"]))
 
     def test_a_closed_stop_keeps_the_request_time(self):
         self.auto_merging()

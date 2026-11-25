@@ -104,7 +104,8 @@ SWITCH_FAILED = "The switch did not run: {reason}"
 OPENING = "Opening the rules pull request for {repo}; the row shows it once it is open."
 CLOSING = "Changing the rules file for {repo}; the row shows the result."
 STEPPING_DOWN = "Stepping down: {fix} was still broken after it merged."
-STEPPED_DOWN = "Stepped down: {fix} was still broken after it merged."
+STEPPED_DOWN = "Stepped down: {fix} was still broken after it merged. Delete its deny rule to allow it again."
+STEP_DOWN_STOPPING = "Already stopping: the step-down's rules pull request turns it off once it merges."
 STEP_DOWN_OPEN = "A step-down's rules pull request is open for this kind; merge or close it first."
 #: The post-merge record of a fix the step-down acted on, and where it names the rules pull request.
 STEPPED_DOWN_FOLLOWUP = "stepped-down"
@@ -237,8 +238,8 @@ def _repo_state(entry: dict) -> tuple[str, dict | None]:
     return STATE_OFF, None
 
 
-def step_downs(session_db: Any) -> dict[tuple[str, str, str], dict]:
-    """``{(repo_key, kind, environment): {merged_at, fix, pr, number}}``, the newest step-down of each.
+def step_downs(session_db: Any) -> dict[tuple[str, str, str], list[dict]]:
+    """``{(repo_key, kind, environment): [{merged_at, fix, pr, number}, ...]}``, oldest fix first.
 
     A step-down is a still-broken fix whose post-merge follow-up opened a deny rule's pull
     request (``followup_detail.stepDown``). A follow-up that refused the rule, or one a person
@@ -252,7 +253,7 @@ def step_downs(session_db: Any) -> dict[tuple[str, str, str], dict]:
     except Exception as exc:  # noqa: BLE001 — no step-downs rather than no board
         logger.debug("dial: could not read step-downs: %s", exc)
         return {}
-    found: dict[tuple[str, str, str], dict] = {}
+    found: dict[tuple[str, str, str], list[dict]] = {}
     for repo, number, kind, environment, merged_at, detail in rows:
         key, merged = clean_merges.repo_key(repo), clean_merges._parse_time(merged_at)
         try:
@@ -263,9 +264,10 @@ def step_downs(session_db: Any) -> dict[tuple[str, str, str], dict]:
         if not key or not isinstance(kind, str) or merged is None or match is None:
             continue
         group = (key, kind, environment.strip().lower() if isinstance(environment, str) else "")
-        if group not in found or merged > found[group]["merged_at"]:
-            found[group] = {"merged_at": merged, "fix": number if type(number) is int else 0, "pr": pr,
-                            "number": int(match.group(1))}
+        found.setdefault(group, []).append({"merged_at": merged, "fix": number if type(number) is int else 0,
+                                            "pr": pr, "number": int(match.group(1))})
+    for downs in found.values():
+        downs.sort(key=lambda down: down["merged_at"])
     return found
 
 
@@ -273,7 +275,8 @@ def adopt_step_downs(session_db: Any, state: dict) -> dict:
     """Record each step-down of a kind that auto-merges here as its pending rules pull request.
 
     Only a fix merged after auto-merge was requested counts, so a new request starts over; an
-    entry with no ``set_at`` is left alone. The entry then settles as a Stop's does
+    entry with no ``set_at`` is left alone. The oldest such step-down is followed first: if its
+    pull request is closed, the row comes back on as of that fix and takes up the next one. The entry then settles as a Stop's does
     (:func:`refresh_pending`): off once the deny rule merges, back on if it is closed. Returns the
     record as it stands after.
     """
@@ -281,10 +284,12 @@ def adopt_step_downs(session_db: Any, state: dict) -> dict:
     due = []
     for kind, _title, environment in FIX_KINDS:
         for key, entry in state["kinds"].get(kind, {}).items():
-            down = found.get((key, kind, environment))
             set_at = entry.get("set_at")
-            if (down is None or _repo_state(entry)[0] != STATE_ON or type(set_at) is not int
-                    or down["merged_at"].timestamp() <= set_at):
+            if _repo_state(entry)[0] != STATE_ON or type(set_at) is not int:
+                continue
+            down = next((d for d in found.get((key, kind, environment), []) if d["merged_at"].timestamp() > set_at),
+                        None)
+            if down is None:
                 continue
             due.append((kind, key, entry, down))
     if not due:
@@ -607,6 +612,8 @@ def _switch(action: str, user: str, payload: dict) -> dict:
     # The step-down's branch is not the switch's, so a tap would open a second rules pull
     # request and stop following the first.
     if _repo_state(current)[0] == STATE_PENDING and type(current.get("stepped_down")) is int:
+        if action == ACTION_STOP:
+            return _answer(action, True, STEP_DOWN_STOPPING)
         return _answer(action, False, STEP_DOWN_OPEN)
     turning_on = action == ACTION_REQUEST
     if turning_on and state["level"] != LEVEL_AUTOMERGE:
