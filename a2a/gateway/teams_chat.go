@@ -315,6 +315,9 @@ type teamsChatCard struct {
 	text    string
 	choices []map[string]any
 	rest    []map[string]any
+	// closed marks a message that was a card and is text now: nothing is
+	// drawn on it again.
+	closed bool
 }
 
 // actions is the card's buttons in order: choices, then the rest.

@@ -303,6 +303,15 @@ func TestTeamsEditWithoutChoicesClosesTheQuestion(t *testing.T) {
 	if n := teamsCallCount(relay); n != 2 {
 		t.Fatalf("a typed message after the question closed wrote on it: %d calls", n)
 	}
+	stale, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:42", testTeamsPosted, teamsChoice("yes, restart it", 0, "Yes"))))
+	if reason != "" || stale.Text != "yes, restart it" {
+		t.Fatalf("a late press on the text was not its turn: %+v %s", stale, reason)
+	}
+	a.InboundVerified(stale.Conversation, stale.MessageID, true)
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != 2 {
+		t.Fatalf("a late press on a question closed as text posted or wrote: %d calls", n)
+	}
 	settled := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Restarted checkout-gateway."}
 	if err := a.EditMessage(conversation, testTeamsPosted, OutMessage{Text: "fallback", Chat: settled}); err != nil {
 		t.Fatal(err)
@@ -429,5 +438,42 @@ func TestTeamsChatTextSurvivesTheCardBuilder(t *testing.T) {
 	}
 	if strings.Contains(text, "## ") {
 		t.Errorf("a heading outside a fence was left as a heading:\n%s", text)
+	}
+}
+
+// A question asked again on its message while an earlier answer's redraw
+// waited keeps its choices: the redraw gives way.
+func TestTeamsReAskBeforeTheRedrawKeepsItsChoices(t *testing.T) {
+	a, relay := askedTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	msg, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:30", testTeamsPosted, teamsChoice("No", 1, "No"))))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	release := a.lockEdit(testTeamsPosted)
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.trackQuestion(testTeamsPosted, conversation, testTeamsQuestion(), &teamsChatCard{text: "asked again"})
+	release()
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != 1 {
+		t.Fatalf("the old answer's redraw ran over a re-ask: %d calls, want the first post alone", n)
+	}
+	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:31", testTeamsPosted, teamsChoice("No", 1, "No")))); reason != "" {
+		t.Fatalf("the re-asked question does not take a press: %s", reason)
+	}
+}
+
+// A text edit that fails leaves the question as it was: it still takes a
+// press.
+func TestTeamsFailedTextEditKeepsTheQuestion(t *testing.T) {
+	a, relay := askedTeamsAdapter(t)
+	relay.mu.Lock()
+	relay.apiStatus = http.StatusBadGateway
+	relay.mu.Unlock()
+	if err := a.EditMessage("teams:"+testTeamsChannel, testTeamsPosted, OutMessage{Text: "settled as text"}); err == nil {
+		t.Fatal("the edit did not fail")
+	}
+	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:30", testTeamsPosted, teamsChoice("No", 1, "No")))); reason != "" {
+		t.Fatalf("the question was forgotten by an edit that never landed: %s", reason)
 	}
 }

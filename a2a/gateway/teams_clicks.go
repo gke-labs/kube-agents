@@ -3,6 +3,7 @@ package gateway
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -32,6 +33,39 @@ const (
 	teamsLinkJoin  = "]("
 	teamsLinkApart = "] ("
 )
+
+// teamsEditLock orders the edits of one message; holders counts the edits
+// holding or waiting on it, under the adapter's lock.
+type teamsEditLock struct {
+	mu      sync.Mutex
+	holders int
+}
+
+// lockEdit takes message id's edit lock and returns its release. The
+// adapter's lock is held only to find or drop the entry, never while
+// waiting or editing.
+func (a *TeamsAdapter) lockEdit(id string) (unlock func()) {
+	a.mu.Lock()
+	if a.editing == nil {
+		a.editing = map[string]*teamsEditLock{}
+	}
+	l := a.editing[id]
+	if l == nil {
+		l = &teamsEditLock{}
+		a.editing[id] = l
+	}
+	l.holders++
+	a.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		a.mu.Lock()
+		if l.holders--; l.holders == 0 {
+			delete(a.editing, id)
+		}
+		a.mu.Unlock()
+	}
+}
 
 // teamsQuestion is a laid-out message with choices: the conversation it
 // was posted in, whether it asks (a choice that is not a next step), and
@@ -94,15 +128,19 @@ var _ VerifiedObserver = (*TeamsAdapter)(nil)
 // Choices open it as a question, even one answered before: a card asking
 // again is a fresh question, so the earlier answer and its line are
 // forgotten. Laying it out without choices, or as text (m nil), closes it,
-// so a late press on buttons a client still shows does not write the old
-// question back.
+// so a late press on buttons a client still shows is its turn and writes
+// nothing on the message.
 func (a *TeamsAdapter) trackQuestion(id, conversation string, m *chatmsg.Message, card *teamsChatCard) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
 	if card == nil {
-		delete(ux.cards, id)
-		forget(&ux.cardsOrder, id)
+		// A message that was a card and is text now keeps a closed record,
+		// so a late press on buttons a client still shows writes nothing;
+		// a message that never was one (every status line) keeps none.
+		if _, was := ux.cards[id]; was {
+			ux.cards[id] = teamsChatCard{closed: true}
+		}
 	} else {
 		ux.cards[id] = *card
 		remember(&ux.cardsOrder, id, func(k string) { delete(ux.cards, k) })
@@ -316,12 +354,18 @@ func (a *TeamsAdapter) InboundVerified(conversation, messageID string, verified 
 // the answer is on record where the question is; a next step's press
 // (asks false) answered no question, so nothing is posted for it.
 func (a *TeamsAdapter) rewriteAnswered(conversation, id, line string, asks bool) {
-	a.rateMu.Lock()
-	defer a.rateMu.Unlock()
+	defer a.lockEdit(id)()
 	a.mu.Lock()
-	card, held := a.uxLocked().cards[id]
+	ux := a.uxLocked()
+	card, held := ux.cards[id]
+	stands := ux.answered[id]
 	a.mu.Unlock()
-	if held {
+	if !stands {
+		// The message asked again while this redraw waited: the new
+		// question keeps its choices, and the old answer shows nowhere.
+		return
+	}
+	if held && !card.closed {
 		next := teamsChatCard{text: teamsWithLine(card.text, line), rest: card.rest}
 		if teamsFitsCard(next.text, next.rest) {
 			err := a.edit(conversation, id, next.text, next.rest)
@@ -334,15 +378,19 @@ func (a *TeamsAdapter) rewriteAnswered(conversation, id, line string, asks bool)
 				if _, still := ux.cards[id]; still {
 					ux.cards[id] = next
 				}
-				if rated, ok := a.rated[id]; ok {
-					rated.text = next.text
-					a.rated[id] = rated
-				}
 				a.mu.Unlock()
 				return
 			}
 			a.log.Warn("teams: drawing an answered question again failed; posting the answer in its conversation", "conversation", conversation, "err", err)
 		}
+		// The card still shows its choices; its record does not, so a
+		// later redraw (a rating's) takes them off.
+		a.mu.Lock()
+		if now, still := a.uxLocked().cards[id]; still {
+			now.choices = nil
+			a.uxLocked().cards[id] = now
+		}
+		a.mu.Unlock()
 	}
 	if !asks {
 		return

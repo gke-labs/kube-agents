@@ -3292,7 +3292,7 @@ the plan with a status mark per item and a tick or an open mark per step, or the
 bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
 the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
 carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
-line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn. A
+line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn, and the adapter has no `PostNotifyMessage`, so an unkeyed home post stays text. A
 layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
 (`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
 `ErrTextOnly` as before. The shared cases lay out as the golden files in

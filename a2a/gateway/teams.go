@@ -253,6 +253,11 @@ type TeamsAdapter struct {
 	// so a rating and the redraw it causes are never interleaved with
 	// another's. It does not order two presses pulled back to back.
 	rateMu sync.Mutex
+	// editing is the lock each message's edits hold, by message id, from
+	// reading what the message shows to writing it back: the gateway's
+	// edit, a rating's redraw and an answered question's (lockEdit). An
+	// entry lives only while an edit holds or waits on it.
+	editing map[string]*teamsEditLock
 	// rating counts the ratings in flight, for a test to wait on.
 	rating sync.WaitGroup
 	// ux is the adapter's record of its laid-out messages: the questions
@@ -294,6 +299,7 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		seen:           map[string]bool{},
 		serviceURLs:    map[string]string{},
 		rated:          map[string]teamsRated{},
+		editing:        map[string]*teamsEditLock{},
 		allowed:        map[string]bool{},
 		countInterval:  teamsEventCountInterval,
 		typing:         map[string]*teamsTyping{},
@@ -889,9 +895,9 @@ func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage)
 	// and an answered question cause (teams_feedback.go, teams_clicks.go):
 	// each reads what the message shows and writes it back, and two of
 	// them interleaved would leave the older text or lose the answered
-	// line.
-	a.rateMu.Lock()
-	defer a.rateMu.Unlock()
+	// line. The lock is the message's own, so a slow call on one message
+	// holds up no other.
+	defer a.lockEdit(messageID)()
 	if m.Chat != nil && a.adaptiveCards {
 		return a.editChat(conversation, messageID, m)
 	}

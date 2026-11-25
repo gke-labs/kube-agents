@@ -227,9 +227,11 @@ func (a *TeamsAdapter) rate(recorder FeedbackRecorder, r FeedbackRating, note st
 	actions := teamsRatingActions(rated.task, recorder.KeptDays())
 	// A laid-out answer keeps its own buttons, the rating controls among
 	// them (teams_chat.go).
+	defer a.lockEdit(r.MessageID)()
 	a.mu.Lock()
 	card, laidOut := a.uxLocked().cards[r.MessageID]
 	a.mu.Unlock()
+	laidOut = laidOut && !card.closed
 	if laidOut {
 		text, actions = teamsWithLine(card.text, teamsRatingRecordedLine), card.actions()
 	}
