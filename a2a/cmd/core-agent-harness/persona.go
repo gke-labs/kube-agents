@@ -27,6 +27,11 @@ func loadPersona(ctx context.Context, dir string) (string, []adktool.Toolset, er
 		return "", nil, nil
 	}
 	root, err := os.OpenRoot(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		// No persona rendered for this pod: the turn runs on core-agent's
+		// own prompt. Whether a pod must have one is PrepareTurn's check.
+		return "", nil, nil
+	}
 	if err != nil {
 		return "", nil, err
 	}
