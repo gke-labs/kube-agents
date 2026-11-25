@@ -38,6 +38,12 @@ func wireServer(s persona.MCPServer) coreagentwire.MCPServer {
 	}
 }
 
+// turnDriver is d with a turn's MCP servers (the persona's, then delegate
+// when non-nil) when d takes them in-process, else d unchanged.
+func turnDriver(d Driver, personaMCP []persona.MCPServer, delegate *persona.MCPServer) Driver {
+	return withTurnMCP(d, coreAgentTurnMCP(personaMCP, delegate))
+}
+
 // withTurnMCP is d with servers as its turn's MCP servers when d takes them
 // in-process, else d unchanged.
 func withTurnMCP(d Driver, servers []coreagentwire.MCPServer) Driver {

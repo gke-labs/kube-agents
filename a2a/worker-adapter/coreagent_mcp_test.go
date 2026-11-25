@@ -38,27 +38,35 @@ func TestACoreAgentTurnCarriesThePersonaServersThenTheDelegate(t *testing.T) {
 	}
 }
 
-// A profile worker with a rendered persona puts its MCP servers in every
-// core-agent turn's stdin envelope; the Claude Code driver, which takes them
-// as flags, is left alone.
-func TestAProfileWorkersCoreAgentTurnsCarryThePersonaServers(t *testing.T) {
-	w := &profileWorker{persona: &persona.Output{MCPServers: []persona.MCPServer{relayServer}}}
-	d := w.personaDriver(newCoreAgentDriver())
-	line, err := d.EncodeUser("hello")
-	if err != nil {
-		t.Fatal(err)
+// Each turn's driver carries the persona's servers, rebuilt from source: a
+// turn without a delegate doesn't keep one an earlier turn had. The Claude
+// Code driver, which takes its servers as flags, is left alone.
+func TestEachTurnsEnvelopeCarriesItsOwnServers(t *testing.T) {
+	delegate := persona.MCPServer{Name: "a2a", Command: "/worker-adapter", Tools: []string{"delegate"}}
+	pod := Driver(newCoreAgentDriver())
+	first := turnDriver(pod, []persona.MCPServer{relayServer}, &delegate)
+	second := turnDriver(first, []persona.MCPServer{relayServer}, nil)
+	for i, tc := range []struct {
+		d    Driver
+		want []string
+	}{{first, []string{"developer_knowledge", "a2a"}}, {second, []string{"developer_knowledge"}}} {
+		line, err := tc.d.EncodeUser("hello")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env coreagentwire.Envelope
+		if err := json.Unmarshal(line, &env); err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, s := range env.MCP {
+			names = append(names, s.Name)
+		}
+		if !reflect.DeepEqual(names, tc.want) {
+			t.Errorf("turn %d servers = %v, want %v", i+1, names, tc.want)
+		}
 	}
-	var env coreagentwire.Envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		t.Fatal(err)
-	}
-	if len(env.MCP) != 1 || env.MCP[0].Name != "developer_knowledge" || !reflect.DeepEqual(env.MCP[0].Tools, []string{"search_documents"}) || !reflect.DeepEqual(env.MCP[0].Args, relayServer.Args) {
-		t.Errorf("envelope MCP = %+v", env.MCP)
-	}
-	if _, ok := w.personaDriver(claudeDriver{}).(claudeDriver); !ok {
+	if _, ok := turnDriver(claudeDriver{}, []persona.MCPServer{relayServer}, nil).(claudeDriver); !ok {
 		t.Error("the Claude Code driver was changed")
-	}
-	if got := (&profileWorker{}).personaDriver(newCoreAgentDriver()).(coreAgentDriver); got.MCP != nil {
-		t.Errorf("a worker with no persona set MCP %+v", got.MCP)
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // Config is the adapter's contract with its pod: everything here arrives as
@@ -107,6 +108,10 @@ type Config struct {
 	// Driver is the harness's headless contract (driver.go). Nil means
 	// Claude Code, the harness every argv below is built for.
 	Driver Driver
+	// PersonaMCP are the persona's MCP servers, for a harness that takes
+	// them in-process (core-agent): each turn's are built from these, plus
+	// the delegate server when the turn may delegate.
+	PersonaMCP []persona.MCPServer
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
@@ -873,6 +878,12 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 				"socket", socket)
 		}
 	}
+
+	// A harness that takes its MCP servers in-process gets this turn's in its
+	// envelope, built from source here each turn so nothing an earlier turn
+	// added carries over. The delegate server joins later (#6789); nil now.
+	a.cfg.Driver = turnDriver(a.cfg.driver(), cfg.PersonaMCP, nil)
+	drv = a.cfg.driver()
 
 	if delegate {
 		// The agents this turn's requester may delegate to, as the gateway
