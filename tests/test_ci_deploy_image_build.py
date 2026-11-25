@@ -14,7 +14,9 @@ the log; a build that never reaches a terminal state exits at the cap naming
 the build id (the test that keeps the loop from being simplified back into a
 stream); FAILURE prints the log and exits non-zero; a `describe` call that
 errors is polled again rather than failing the run; the region the worker
-pool needs reaches every call.
+pool needs reaches every call; a build that ended failed on BuildKit's
+"flightcontrol: exceeded retry timeout" is submitted once more, and no other
+failure is (#3911).
 """
 
 import os
@@ -32,16 +34,23 @@ _BUILD_END = "# ─── 5. Chart Deployment"
 _BUILD_ID = "2110451680007950336"
 _BUILD_URL = f"https://console.cloud.google.com/cloud-build/builds/{_BUILD_ID}?project=1"
 _LOG_LINE = "Step #1: ERROR: failed to push"
+# What the second submit returns, so a test can tell the two builds apart.
+_RETRY_BUILD_ID = "2110451680007950337"
+_FLIGHTCONTROL_LOG_LINE = "Step #1: #37 ERROR: flightcontrol: exceeded retry timeout"
+_RETRY_WARNING = "#3911"
 
 # Answers `builds submit` with the id and URL the real --format prints, one
-# tab between; `builds describe` with the next status in
+# tab between (a second submit gets _RETRY_BUILD_ID); `builds describe` with the next status in
 # GCLOUD_DESCRIBE_SEQUENCE (the last one repeats; ERR exits 1 with no
-# status); `builds log` with one recognisable line. Every call's argv is
+# status); `builds log` with GCLOUD_LOG_LINE, or one recognisable line. Every call's argv is
 # appended to GCLOUD_CALLS.
 _GCLOUD_STUB = f"""#!/bin/bash
 echo "$*" >> "${{GCLOUD_CALLS}}"
 case "$1 $2" in
-  "builds submit") printf '{_BUILD_ID}\\t{_BUILD_URL}\\n'; exit 0 ;;
+  "builds submit")
+    id={_BUILD_ID}
+    [ "$(grep -c '^builds submit' "${{GCLOUD_CALLS}}")" -gt 1 ] && id={_RETRY_BUILD_ID}
+    printf '%s\\t{_BUILD_URL}\\n' "${{id}}"; exit 0 ;;
   "builds describe")
     n="$(grep -c '^builds describe' "${{GCLOUD_CALLS}}")"
     set -- ${{GCLOUD_DESCRIBE_SEQUENCE}}
@@ -49,7 +58,7 @@ case "$1 $2" in
     status="$(eval "echo \\${{${{n}}}}")"
     if [ "${{status}}" = "ERR" ]; then echo "ERROR: (gcloud.builds.describe) connection reset" >&2; exit 1; fi
     echo "${{status}}"; exit 0 ;;
-  "builds log") echo "{_LOG_LINE}"; exit 0 ;;
+  "builds log") echo "${{GCLOUD_LOG_LINE:-{_LOG_LINE}}}"; exit 0 ;;
 esac
 exit 0
 """
@@ -92,7 +101,7 @@ class CiDeployImageBuildTest(unittest.TestCase):
     # A test that reaches a terminal status never waits on the cap, so the
     # default only has to outlast a slow runner: at 2 s, a loaded runner hit it
     # after two ERR polls and failed "ERR ERR SUCCESS". The cap test passes 1.
-    def _run(self, describe_sequence, cap_seconds=60, region_args="", max_errors=20):
+    def _run(self, describe_sequence, cap_seconds=60, region_args="", max_errors=20, log_line=_LOG_LINE):
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -116,6 +125,7 @@ class CiDeployImageBuildTest(unittest.TestCase):
             "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
             "GCLOUD_CALLS": str(self.calls),
             "GCLOUD_DESCRIBE_SEQUENCE": describe_sequence,
+            "GCLOUD_LOG_LINE": log_line,
             # The real values are 4200 s, 15 s and 60 s; the tests shrink the
             # poll to zero, and the cap test shrinks the cap, so a
             # never-terminal build ends in seconds.
@@ -197,6 +207,71 @@ class CiDeployImageBuildTest(unittest.TestCase):
             for call in self._calls(prefix):
                 self.assertIn("--region=us-central1", call, call)
             self.assertGreaterEqual(len(self._calls(prefix)), 1, prefix)
+
+    def test_a_flightcontrol_failure_is_submitted_once_more_and_can_succeed(self):
+        result = self._run("WORKING FAILURE SUCCESS", log_line=_FLIGHTCONTROL_LOG_LINE)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("REACHED SECTION 5", result.stdout)
+        self.assertEqual(len(self._calls("builds submit")), 2, self.calls.read_text())
+        self.assertIn(_FLIGHTCONTROL_LOG_LINE, result.stdout, "the first build's log still reaches the job log")
+        warning = [ln for ln in result.stderr.splitlines() if ln.startswith("WARNING:") and _RETRY_WARNING in ln]
+        self.assertEqual(len(warning), 1, result.stderr)
+        self.assertIn(_BUILD_ID, warning[0], "the warning names the build that failed")
+        self.assertIn("attempt 1 of 2", warning[0])
+        # The second build is the one polled to SUCCESS.
+        self.assertIn(_RETRY_BUILD_ID, result.stdout)
+        self.assertIn(_RETRY_BUILD_ID, self._calls("builds describe")[-1])
+        self.assertEqual(self._calls("builds cancel"), [], "a build that ended needs no cancel")
+
+    def test_a_second_flightcontrol_failure_fails_the_run(self):
+        result = self._run("FAILURE", log_line=_FLIGHTCONTROL_LOG_LINE)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("REACHED SECTION 5", result.stdout)
+        self.assertEqual(len(self._calls("builds submit")), 2, self.calls.read_text())
+        self.assertEqual(len(self._calls("builds log")), 2, self.calls.read_text())
+        self.assertIn(_RETRY_BUILD_ID, result.stderr, "the error names the second build")
+        self.assertIn("again, on the one resubmit", result.stderr)
+
+    def test_the_resubmit_repeats_the_first_submit_exactly(self):
+        self._run("FAILURE", log_line=_FLIGHTCONTROL_LOG_LINE)
+        submits = self._calls("builds submit")
+        self.assertEqual(len(submits), 2, self.calls.read_text())
+        self.assertEqual(submits[0], submits[1])
+
+    def test_a_near_miss_of_the_flightcontrol_line_is_not_submitted_again(self):
+        result = self._run("FAILURE", log_line="Step #1: #37 ERROR: flightcontrol: retry timeout")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self._calls("builds submit")), 1, self.calls.read_text())
+
+    def test_a_build_that_ended_other_than_failure_is_not_submitted_again(self):
+        # TIMEOUT, CANCELLED and the rest ended for another reason, even when
+        # an earlier step logged the line and recovered.
+        for status in ("TIMEOUT", "CANCELLED", "INTERNAL_ERROR"):
+            with self.subTest(status=status):
+                self.calls.write_text("")
+                result = self._run(status, log_line=_FLIGHTCONTROL_LOG_LINE)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(len(self._calls("builds submit")), 1, self.calls.read_text())
+
+    def test_describe_errors_are_not_submitted_again_even_with_flightcontrol_in_the_log(self):
+        result = self._run("ERR", max_errors=2, log_line=_FLIGHTCONTROL_LOG_LINE)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self._calls("builds submit")), 1, self.calls.read_text())
+        self.assertEqual(len(self._calls("builds cancel")), 1, self.calls.read_text())
+
+    def test_a_failure_without_flightcontrol_is_not_submitted_again(self):
+        result = self._run("FAILURE")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self._calls("builds submit")), 1, self.calls.read_text())
+        self.assertNotIn(_RETRY_WARNING, result.stdout + result.stderr)
+
+    def test_a_cap_timeout_is_not_submitted_again_even_with_flightcontrol_in_its_log(self):
+        # Only a build that ended failed is a flightcontrol flake; one the loop
+        # gave up on is cancelled and fails the run as before.
+        result = self._run("WORKING", cap_seconds=1, log_line=_FLIGHTCONTROL_LOG_LINE)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(self._calls("builds submit")), 1, self.calls.read_text())
+        self.assertEqual(len(self._calls("builds cancel")), 1, self.calls.read_text())
 
     def test_the_region_args_are_derived_before_section_4(self):
         text = _text()

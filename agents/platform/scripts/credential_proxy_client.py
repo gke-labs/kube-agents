@@ -278,6 +278,11 @@ REFUSAL_RECORD_ROUTE = "route"
 REFUSAL_RECORD_TIME = "time"
 REFUSAL_RECORD_TASK = "task"
 REFUSAL_RECORD_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A session pod's kubectl write attempt (record_kubectl_write_attempt): its rule,
+# its route, and the env naming the kube-proxy mode the gateway passes the pod.
+WRITE_ATTEMPT_RULE = "kube-proxy.write-attempt"
+KUBE_PROXY_ROUTE = "kube-proxy"
+KUBE_PROXY_MODE_ENV = "KUBE_PROXY_MODE"
 _REFUSAL_RULE_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _REFUSAL_VERB_WORDS = 3
 # The line a malformed exec URL writes, once per process, when the stateful
@@ -378,6 +383,15 @@ KUBECONFIG_LOCK_UNOPENABLE_NOTICE = (
     "context {context} was not checked or registered in {kubeconfig}"
 )
 KUBECONFIG_LOCK_OWNER_NOTE = " (owned by uid {uid})"
+ROOT_UID = 0
+# What a caller is told when `.kubeconfigs` is not its own. The per-target file and the shell's pin
+# are written only by the folder's owner.
+NOT_THE_CALLERS_FOLDER_NOTICE = "{folder} belongs to uid {owner}, not to this caller (uid {caller})"
+# The way to the cluster for a caller that the rule refuses: a kubeconfig that it names itself.
+OWN_KUBECONFIG_ADVICE_LINES = (
+    "    KUBECONFIG=<a file of your own> gcloud container clusters get-credentials ...",
+    "    KUBECONFIG=<the same file> kubectl ...",
+)
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -1180,7 +1194,8 @@ def record_shell_context(context: str) -> bool:
     context-less kubectl there reads the host cluster exactly as #1852 left it.
 
     Returns whether the pin was recorded. Failing to record it costs the
-    convenience, not the command, so it is reported and not raised.
+    convenience, not the command, so it is reported and not raised. The pin is
+    recorded only in a folder that the caller owns (`_claim_callers_folder`).
     """
     keys = _shell_keys()
     if not keys:
@@ -1188,6 +1203,9 @@ def record_shell_context(context: str) -> bool:
     directory = _shell_context_dir()
     path = directory / f"{keys[0]}{SHELL_CONTEXT_SUFFIX}"
     try:
+        # `.kubeconfigs` first: root as the owner counts only for the folder above it.
+        _claim_callers_folder(kubeconfig_dir())
+        _claim_callers_folder(directory)
         _replace_file(path, context)
     except OSError as exc:
         print(f"credential proxy: could not record the shell's context in {path}: {exc}", file=sys.stderr)
@@ -1344,6 +1362,38 @@ def _caller_owns_folder(folder: Path) -> bool:
     holds the file, not the one above it. A worker's home can be a mount that root owns, and the
     worker makes `.kube` in it."""
     return folder.stat().st_uid == os.geteuid()
+
+
+class NotTheCallersFolder(PermissionError):
+    """The folder for a per-target kubeconfig or a shell's pin is not the caller's."""
+
+
+def _claim_callers_folder(folder: Path) -> None:
+    """Make `folder` when it is missing, and raise `NotTheCallersFolder` unless the caller owns it.
+
+    The per-target kubeconfig and the shell's pin are written only in a folder that the caller
+    owns. Root in the shell pod has the agent's home as its default: a `.kubeconfigs` that root
+    made there was one the agent could not write its file in.
+
+    A missing folder is made only below a folder that belongs to the caller or to root. A session
+    pod's home can be a mount that root made for the pod's user, and that user makes
+    `.kubeconfigs` in it. Another user's home gets no new folder.
+    """
+    caller = os.geteuid()
+    existing = folder
+    while not existing.exists():
+        existing = existing.parent
+    if existing != folder:
+        owner = existing.stat().st_uid
+        if owner not in (caller, ROOT_UID):
+            raise NotTheCallersFolder(
+                NOT_THE_CALLERS_FOLDER_NOTICE.format(folder=existing, owner=owner, caller=caller)
+            )
+        folder.mkdir(parents=True, exist_ok=True)
+    if not _caller_owns_folder(folder):
+        raise NotTheCallersFolder(
+            NOT_THE_CALLERS_FOLDER_NOTICE.format(folder=folder, owner=folder.stat().st_uid, caller=caller)
+        )
 
 
 def _ensure_host_kubeconfig_initialized(
@@ -1642,8 +1692,11 @@ def land_implicit_kubeconfig(generated: str) -> None:
     resolves an omitted `--project` or a `--zone`/`--region` spelling itself,
     and the file is the only place the answer is written down.
 
-    Never changes the exit code. gcloud succeeded, and `--context` reaches the
-    cluster whether or not the file could be written here.
+    The file is written only in a `.kubeconfigs` that the caller owns
+    (`_claim_callers_folder`). A caller that this rule refuses is told to name
+    a file of its own on both commands.
+
+    Never changes the exit code: gcloud succeeded.
     """
     context = read_current_context(generated)
     target = parse_gke_context(context) if context else None
@@ -1651,10 +1704,13 @@ def land_implicit_kubeconfig(generated: str) -> None:
         return
     path = per_target_kubeconfig_path(target)
     written = True
+    refused = False
     try:
+        _claim_callers_folder(path.parent)
         _replace_file(path, generated)
     except OSError as exc:
         written = False
+        refused = isinstance(exc, NotTheCallersFolder)
         print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
     pinned = False
     if not os.environ.get("KUBE_PROXY_URL", "").strip():
@@ -1675,7 +1731,10 @@ def land_implicit_kubeconfig(generated: str) -> None:
         )
     if written:
         lines.append(f"    export KUBECONFIG={path}")
-    lines.append(f"    kubectl --context={target.context_name} ...")
+    if refused:
+        lines.extend(OWN_KUBECONFIG_ADVICE_LINES)
+    else:
+        lines.append(f"    kubectl --context={target.context_name} ...")
     print("\n".join(lines), file=sys.stderr)
 
 
@@ -1979,11 +2038,40 @@ def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
     """
     if status != 403 or not isinstance(payload, dict) or payload.get(WRITE_REFUSAL_KEY) is not True:
         return
-    target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
-    if not target:
-        return
     rule = payload.get(REFUSAL_RECORD_RULE)
     if not isinstance(rule, str) or not _REFUSAL_RULE_RE.match(rule):
+        return
+    _append_refusal_record(rule, verb_words, route)
+
+
+def record_kubectl_write_attempt(argv: list[str], exit_code: int) -> None:
+    """Record a session pod's kubectl call that tried a change and failed.
+
+    A session pod's kubectl reaches the cluster through kube-proxy, not the
+    broker, so no broker answer marks its refusal. The kubectl wrapper calls
+    this after a non-zero exit. The record is written when KUBE_PROXY_MODE_ENV,
+    which the gateway sets from the mode the operator gives kube-proxy, is a
+    read-only mode and the argv tries a change that mode refuses
+    (command_policy.kubectl_write_attempt). It reads the argv and the exit
+    code, never what kubectl printed, and a failure before kubectl reached the
+    proxy records the same: a change was attempted and not made. Never raises.
+    """
+    if exit_code == 0 or not os.environ.get(REFUSAL_FILE_ENV, "").strip():
+        return
+    try:
+        import command_policy  # shipped beside this module in the worker image
+    except ImportError:
+        return
+    verb = command_policy.kubectl_write_attempt(argv, os.environ.get(KUBE_PROXY_MODE_ENV, "").strip())
+    if verb is None:
+        return
+    _append_refusal_record(WRITE_ATTEMPT_RULE, list(verb), KUBE_PROXY_ROUTE)
+
+
+def _append_refusal_record(rule: str, verb_words, route: str) -> None:
+    """Append one write-refusal record to the file REFUSAL_FILE_ENV names, if set."""
+    target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
+    if not target:
         return
     words = verb_words if isinstance(verb_words, list) else []
     verb = " ".join(_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in words[:_REFUSAL_VERB_WORDS] if str(w))
@@ -2983,6 +3071,14 @@ def main():
     form, and `--ensure-kubectl-context`. Ends with SystemExit. The
     images' launcher imports this module, so its precompiled bytecode
     is used, and calls this."""
+    if len(sys.argv) >= 3 and sys.argv[1] == "--record-kubectl-write-attempt":
+        # The session kubectl wrapper: <exit code> then kubectl's own arguments.
+        try:
+            code = int(sys.argv[2])
+        except ValueError:
+            raise SystemExit(0) from None
+        record_kubectl_write_attempt(["kubectl", *sys.argv[3:]], code)
+        raise SystemExit(0)
     if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
         try:
             ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])

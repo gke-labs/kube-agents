@@ -827,6 +827,77 @@ class ContractTest(unittest.TestCase):
                     linked = [c for c in answer["commits"] if c["email"] != INSTALL_COMMIT_EMAIL]
                     self.assertTrue(linked and all(c["bot"] for c in linked))
 
+    def _github(self):
+        (found,) = [(forge, directory) for name, forge, directory in self.instances() if name == "github"]
+        return found
+
+    def _github_answer_with(self, verb: str, changed: dict) -> dict:
+        """The answer of `verb` from its recording, with `changed` put over the first recorded
+        object that has a `title` or a `body` (the pull request, the issue or the comment)."""
+        forge, directory = self._github()
+        fixture = self.load(directory, verb)
+        (node,) = [r for r in fixture["responses"] if isinstance(r, dict) and ("title" in r or "body" in r)][:1]
+        node.update(changed)
+        answer, _ = self.invoke(forge, verb, fixture)
+        return answer
+
+    def test_a_github_title_or_number_of_another_type_reads_as_an_absent_one_and_such_a_body_as_none(self):
+        """A forge answer is another party's text. A `title` that is not a text is `""`, and a
+        `number` that is not an integer is `None`: what an absent field gives. A `body` that is
+        not a text is `None`, which is not the empty text: an empty body is one that a caller
+        can write over, and `None` is a body that did not arrive. A nested value stops at the
+        translation and does not go on to a caller that prints it."""
+        deep = [[[["nested"]]]]
+        for value in (deep, {"a": {"b": "c"}}, 7, 1.5, True, False, [], {}, 0):
+            with self.subTest(text=value):
+                changed = {"title": value, "body": value}
+                proposal = self._github_answer_with("proposal-view", changed)["proposal"]
+                self.assertEqual(("", None), (proposal["title"], proposal["body"]))
+                issue = self._github_answer_with("issue-view", changed)["issue"]
+                self.assertEqual(("", None), (issue["title"], issue["body"]))
+                self.assertIsNone(self._github_answer_with("issue-comment", {"body": value})["comment"]["body"])
+        for value in ("7", deep, {"n": 7}, 7.0, True, False, None):
+            with self.subTest(number=value):
+                changed = {"number": value}
+                self.assertIsNone(self._github_answer_with("proposal-view", changed)["proposal"]["number"])
+                self.assertIsNone(self._github_answer_with("issue-view", changed)["issue"]["number"])
+
+    def test_a_github_body_that_is_null_is_an_empty_body(self):
+        """GitHub sends `null` for a body with no text. That is a real empty body, as before."""
+        changed = {"title": None, "body": None}
+        proposal = self._github_answer_with("proposal-view", changed)["proposal"]
+        self.assertEqual(("", ""), (proposal["title"], proposal["body"]))
+        issue = self._github_answer_with("issue-view", changed)["issue"]
+        self.assertEqual(("", ""), (issue["title"], issue["body"]))
+        self.assertEqual("", self._github_answer_with("issue-comment", {"body": None})["comment"]["body"])
+
+    def test_a_github_search_hit_with_a_number_of_another_type_has_no_number(self):
+        forge, directory = self._github()
+        for value in ("7", [[7]], {"n": 7}, 7.0, True, False, None):
+            with self.subTest(number=value):
+                fixture = self.load(directory, "proposal-list-by-author")
+                (found,) = [r for r in fixture["responses"] if isinstance(r, dict) and "items" in r][:1]
+                found["items"][0]["number"] = value
+                answer, _ = self.invoke(forge, "proposal-list-by-author", fixture)
+                self.assertIsNone(answer["proposals"][0]["number"])
+
+    def test_the_title_body_and_number_that_github_sends_pass_as_they_are(self):
+        """The control for the two tests above, on the same recordings."""
+        changed = {"number": 12, "title": "Scale web", "body": "Two replicas."}
+        proposal = self._github_answer_with("proposal-view", changed)["proposal"]
+        self.assertEqual((12, "Scale web", "Two replicas."), (proposal["number"], proposal["title"], proposal["body"]))
+        issue = self._github_answer_with("issue-view", changed)["issue"]
+        self.assertEqual((12, "Scale web", "Two replicas."), (issue["number"], issue["title"], issue["body"]))
+        self.assertEqual("Two replicas.", self._github_answer_with("issue-comment", {"body": "Two replicas."})["comment"]["body"])
+        self.assertEqual(0, self._github_answer_with("issue-view", {"number": 0})["issue"]["number"])
+        forge, directory = self._github()
+        fixture = self.load(directory, "proposal-list-by-author")
+        (found,) = [r for r in fixture["responses"] if isinstance(r, dict) and "items" in r][:1]
+        recorded = found["items"][0]["number"]
+        self.assertIsInstance(recorded, int)
+        answer, _ = self.invoke(forge, "proposal-list-by-author", fixture)
+        self.assertEqual(recorded, answer["proposals"][0]["number"])
+
     def test_github_proposal_commits_makes_one_call_at_the_callers_page_size(self):
         # Every caller page is one call at the caller's own size, the default
         # size included: no full-page read behind it, no re-read of page 1.
