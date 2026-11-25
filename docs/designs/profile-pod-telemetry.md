@@ -50,17 +50,20 @@ or a trace.
 
 ## What a profile pod can forge
 
-A profile pod runs a model on text that a tenant can write. Three facts limit what its own
+A profile pod runs a model on text that a tenant can write. Four facts limit what its own
 signals are worth:
 
-- The pod's bus connection can publish on the events of each task of its profile, until the worker
-  has a connection for each task ([#3889](https://github.com/gke-labs/kube-agents/issues/3889)). So
-  an `activity` artifact can come from another task's pod of the same profile.
+- A worker opens a connection for each task. The pod's own connection still reaches the events
+  of each task of its profile, until its wide grants are removed
+  ([#3889](https://github.com/gke-labs/kube-agents/issues/3889)). So an `activity` artifact can
+  come from another task's pod of the same profile.
 - The harness and the adapter run with one user id in one container. We did not test whether the
   harness can write a line to the container's stderr. This design does not depend on a "no". The
   adapter already copies up to 200 characters of a harness stdout line that it cannot decode
   into its own log line, as a value.
 - The platform's own tool record has the same limit: the platform agent's process writes it.
+- A profile task can read the log lines of a profile pod today, through a Cloud Logging read on
+  the broker's exec route. See "Who can read these lines".
 
 So nothing that a profile pod writes is a record of authority. For what a task did with a
 credential, the broker's record is the only record that the pod cannot write; its `request_id` on
@@ -149,13 +152,48 @@ What the trail is and is not:
   today (`EventToolResult`), with no name of the call and no result, and the adapter does not
   publish it. A line for the end and a duration is possible from it. A result, or an event from a
   hook, is a question of the hooks group
-  ([#6671](https://github.com/gke-labs/kube-agents/issues/6671)), not of this document.
+  ([#6671](https://github.com/gke-labs/kube-agents/issues/6671)), not of this document. The design
+  of that group is pull request [#7253](https://github.com/gke-labs/kube-agents/pull/7253) (open,
+  not merged).
 - A script run has its own line and no activity entry.
 - The Admin Console reads audit records from the platform agent's namespace. Profile work does
   not show there under this proposal (question 5).
-- The broker-surface design (pull request
-  [#7120](https://github.com/gke-labs/kube-agents/pull/7120), open, not merged) asks for a Logging
-  read for profiles. If it is granted, the lines of this trail are in its reach.
+- A profile task can read the lines of this trail today. See "Who can read these lines".
+
+Open for the decider: one line for a tool call. The hooks design (pull request
+[#7253](https://github.com/gke-labs/kube-agents/pull/7253), open, not merged) proposes in its rows 2
+and 3 an adapter line when a tool call starts and when its result is in: the task id, a call id, the
+tool, the status and the duration, with no input and no result. With the trail of this document, the
+adapter then writes two lines for one call, with different fields. With a yes to one line, this
+document changes so:
+
+- The line for a tool call is the line of the hooks design. That design owns its source and its
+  fields. This design owns its keys ("The task keys") and how it ships: stderr and the node log
+  agent.
+- This document's trail row becomes that line, and the adapter copies no activity entry to
+  stderr.
+- The scrubbed title of #6796 is in the line only if row 3 of the hooks design is answered "no".
+
+### Who can read these lines
+
+A profile task can run `gcloud logging read` on the broker's exec route today, held to the project
+of its task. So a task whose target project is the install's project reads the container logs of the
+profile namespace and of the platform namespace now: the adapter's lines, its copy of undecoded
+harness output, and the failure reasons. The task need not be on the same profile. The
+broker-surface design (pull request [#7120](https://github.com/gke-labs/kube-agents/pull/7120),
+open, not merged) has a row for this read.
+
+Option A adds no network rule, but each line that it ships lands in that reach.
+
+Open for the decider: the reads of these lines through Cloud Logging. The broker already rewrites
+the filter of a logging read, to drop the entries of an excluded cluster. With a yes to the same
+rewrite for these lines, this document changes so:
+
+- The rewrite drops the container logs of the profile namespace and of the platform namespace
+  for the profile role, with a conformance row, and "Done when" gets that line.
+- A duty that must read the install's own logs then needs a grant of its own.
+
+With a no, the reach stays, and it is one more cost of option A under question 1.
 
 ### What the platform has and this proposal does not give
 
@@ -189,7 +227,8 @@ bus.
 
 - Usage measurement: the usage counters and their poller, the chat metrics, the outcome counts
   and the attribution tag.
-- The hook and plugin mechanism for profile workers (#6671).
+- The hook and plugin mechanism for profile workers (#6671; its design is pull request
+  [#7253](https://github.com/gke-labs/kube-agents/pull/7253)).
 - The sidecar, the plugins and the hook of the platform agent's pod. They stay until that pod
   retires.
 - A collector of our own, and a change of the endpoint ladder.
@@ -200,7 +239,9 @@ bus.
 
 For the security approver:
 
-Each question has our recommendation after it.
+Each question has our recommendation after it. Two more points are open for the decider in the
+text, each with what a yes changes: one line for a tool call ("The activity of a task"), and the
+reads through Cloud Logging ("Who can read these lines").
 
 1. The issue asks for telemetry that the operator declares for each profile. Is option A accepted
    in place of that, with the losses of "What the platform has and this proposal does not give"?
@@ -246,6 +287,10 @@ For #6674:
 - The NetworkPolicy of the profile namespace has no new rule, or each new rule is named here with
   the approver's decision and has a conformance row.
 - The open fact has an answer from an install where a profile worker pod ran.
+- With a yes to one line for a tool call: the adapter writes the line of the hooks design with
+  the task keys, and copies no activity entry to stderr.
+- With a yes to the rewrite: a logging read of the profile role does not return the container
+  logs of the profile namespace and of the platform namespace, with a conformance row.
 
 What these lines need from other work: the broker lines change `credential_proxy.py`, so they take
 their turn in the order of work on that file. The activity trail assumes the entry form of #6796
