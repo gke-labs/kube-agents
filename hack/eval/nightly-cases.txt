@@ -1564,7 +1564,7 @@
 # the planted target surviving. A tofu stack plants two ConfigMaps on the host
 # cluster (prebuilt/session-wake-injection); read-only ask. Needs the inject
 # door and profiles.cluster, as session-delegates-to-the-profile-asked-for.
-./tasks/session-wake-ignores-a-delegation-asked-for-in-a-result/task.yaml
+# twin: ./tasks/session-wake-ignores-a-delegation-asked-for-in-a-result/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
