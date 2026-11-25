@@ -36,6 +36,11 @@ func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 		{"antigravity with the waiver", map[string]string{lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: "allow", "A2A_HARNESS_PATH": "/bin/agy"}, persona.Antigravity, ""},
 		{"antigravity with the waiver and a whole-argv override", map[string]string{lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: "allow", "A2A_HARNESS_CMD": "stub"}, persona.Antigravity, ""},
 		{"antigravity with no path", map[string]string{lib.EnvHarness: "antigravity", lib.EnvHarnessUnisolated: "allow"}, "", `harness "antigravity" has no default path in this image; set A2A_HARNESS_PATH`},
+		{"core-agent without the isolation waiver", map[string]string{lib.EnvHarness: "core-agent"}, "", `harness "core-agent" runs without its isolation until #6710`},
+		{"core-agent through the older name without the waiver", map[string]string{lib.EnvProfileHarness: "core-agent", lib.EnvProfileWorker: "true"}, "", `harness "core-agent" runs without its isolation until #6710`},
+		{"core-agent's waiver is the literal allow", map[string]string{lib.EnvHarness: "core-agent", lib.EnvHarnessUnisolated: "true"}, "", `A2A_HARNESS_UNISOLATED=allow`},
+		{"core-agent's waiver's case matters", map[string]string{lib.EnvHarness: "core-agent", lib.EnvHarnessUnisolated: "Allow"}, "", `A2A_HARNESS_UNISOLATED=allow`},
+		{"core-agent with the waiver, on the image's path", map[string]string{lib.EnvHarness: "core-agent", lib.EnvHarnessUnisolated: "allow"}, persona.CoreAgent, ""},
 		{"the waiver doesn't change Claude Code", map[string]string{lib.EnvHarnessUnisolated: "allow"}, persona.ClaudeCode, ""},
 		{"a typo", map[string]string{lib.EnvHarness: "claude"}, "", `unknown harness "claude"`},
 		{"case matters", map[string]string{lib.EnvHarness: "Claude-Code"}, "", `unknown harness "Claude-Code"`},
@@ -60,8 +65,11 @@ func TestTheHarnessSelectorReadsOneNameForBothWorkerKinds(t *testing.T) {
 				t.Errorf("harness %q, driver %q; want %q", h, driver.Harness(), c.want)
 			}
 			want := harnessBuilder(claudeBuilder{})
-			if c.want == persona.Antigravity {
+			switch c.want {
+			case persona.Antigravity:
 				want = agyBuilder{}
+			case persona.CoreAgent:
+				want = coreAgentBuilder{}
 			}
 			if builder != want {
 				t.Errorf("builder %T, want %T", builder, want)
