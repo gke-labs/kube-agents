@@ -1592,4 +1592,4 @@ const envSessionHarness = "A2A_SESSION_HARNESS"
 
 // sessionHarnesses are the harnesses the gateway spawns session pods for.
 // Antigravity joins when its worker isolation lands.
-var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
+var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true, string(persona.CoreAgent): true} // harness A/B twin only

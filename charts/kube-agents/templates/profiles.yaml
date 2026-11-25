@@ -28,6 +28,7 @@ spec:
     image: {{ printf "%s:%s" $harnessRepo $harnessTag | quote }}
     model: {{ $tse.harness.model | quote }}
     maxTurns: {{ $tse.harness.maxTurns }}
+    type: core-agent {{- /* harness A/B twin only */}}
   bus:
     {{- with $tse.bus.publishTopics }}
     publishTopics:
@@ -87,6 +88,7 @@ spec:
     image: {{ printf "%s:%s" $harnessRepo $harnessTag | quote }}
     model: {{ $cluster.harness.model | quote }}
     maxTurns: {{ $cluster.harness.maxTurns }}
+    type: core-agent {{- /* harness A/B twin only */}}
   identity: {}
   allowedTiers:
     {{- toYaml $cluster.allowedTiers | nindent 4 }}
