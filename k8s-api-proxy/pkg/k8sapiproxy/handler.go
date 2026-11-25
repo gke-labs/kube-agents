@@ -71,8 +71,17 @@ type Config struct {
 	// is no "could not decide" answer, so a hook that depends on something unavailable fails
 	// closed. The error is recorded in the audit event and not shown to the caller, except
 	// for an AuthorizeError, whose Reason and Message are used. On a discovery path the
-	// refusal is plain text, as a scope refusal is. The hook is called on the request's
-	// goroutine, must be safe for concurrent use, and must not panic.
+	// refusal is plain text, as a scope refusal is. A hook that panics refuses the request
+	// the same way, with the panic value in the audit event only.
+	//
+	// The hook does not hide a cluster's scope state: route validation, Exclusions, Holds
+	// and classification answer first, so a caller the hook would refuse still gets those
+	// refusals, a hold's reason text included. An embedder that must keep that from
+	// unauthorized callers cannot rely on the hook for it.
+	//
+	// The hook is called on the request's goroutine and must be safe for concurrent use. It
+	// runs before the request takes a MaxInFlight slot and gets no deadline beyond the
+	// request's context, so a hook that does I/O must bound it itself.
 	Authorize func(AuthorizeAttributes) error
 	// ExtraCallerHeaders names request headers the handler strips before forwarding, on
 	// every path (plain, watch and upgrade), besides the ones it always strips: headers
@@ -366,7 +375,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	// After classification, which a rule on the verb or the resource needs, and before the
 	// policy, the cache and the coalescer: nothing below runs for a caller the hook refuses.
 	if h.authorize != nil {
-		if aerr := h.authorize(h.authorizeAttributes(r, caller, clusterID, info)); aerr != nil {
+		if aerr := runAuthorize(h.authorize, h.authorizeAttributes(r, caller, clusterID, info)); aerr != nil {
 			ev.Err = aerr
 			refuseReadably(w, ev, authorizeRefusal(aerr), apiPath)
 			return

@@ -2,6 +2,7 @@ package k8sapiproxy
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +18,15 @@ const (
 	// an AuthorizeError that carries a message. The hook's own error text can describe the
 	// embedder's setup, so it is not the caller's to read.
 	authorizeRefusedMessage = messagePrefix + "the caller is not authorized for this request." + boundaryNotice
+
+	// authorizePanicFormat is the audit event's error for a hook that panicked. The panic
+	// value goes there and never to the caller.
+	authorizePanicFormat = "authorize hook panicked: %v"
 )
+
+// errAuthorizeNilError stands in the audit event for a hook that returned a nil
+// *AuthorizeError as its error: a non-nil error, so a refusal, with nothing to read from.
+var errAuthorizeNilError = errors.New("authorize hook returned a nil *AuthorizeError")
 
 // AuthorizeAttributes is what Config.Authorize decides on: one authenticated request, after
 // its route and its API classification are known.
@@ -52,11 +61,31 @@ type AuthorizeError struct {
 	Message string
 }
 
+// Error is safe on a nil receiver: a hook that returns a nil *AuthorizeError as an error
+// has returned a non-nil error, which the handler and the audit sink go on to read.
 func (e *AuthorizeError) Error() string {
-	if e.Message != "" {
-		return e.Message
+	if e == nil || e.Message == "" {
+		return authorizeRefusedMessage
 	}
-	return authorizeRefusedMessage
+	return e.Message
+}
+
+// runAuthorize calls the hook and returns its refusal, nil when it admits the request. A
+// hook that panics has not admitted anything: the panic becomes a refusal, recorded like any
+// other, rather than a request that ends with no outcome. A nil *AuthorizeError in the
+// error is replaced, so nothing downstream holds a typed nil.
+func runAuthorize(hook func(AuthorizeAttributes) error, attrs AuthorizeAttributes) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf(authorizePanicFormat, p)
+		}
+	}()
+	err = hook(attrs)
+	var aerr *AuthorizeError
+	if err != nil && errors.As(err, &aerr) && aerr == nil {
+		return errAuthorizeNilError
+	}
+	return err
 }
 
 // authorizeRefusal turns the error Config.Authorize returned into the 403 the caller gets.

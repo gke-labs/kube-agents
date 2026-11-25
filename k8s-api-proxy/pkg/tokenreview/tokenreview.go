@@ -234,9 +234,9 @@ func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapi
 	return &k8sapiproxy.CallerIdentity{
 		Username: name,
 		UID:      resp.User.GetUID(),
-		Groups:   resp.User.GetGroups(),
 		// The response is the cache's, shared by every request with this token.
-		Extra: copyExtra(resp.User.GetExtra()),
+		Groups: slices.Clone(resp.User.GetGroups()),
+		Extra:  copyExtra(resp.User.GetExtra()),
 	}, nil
 }
 

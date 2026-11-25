@@ -1,9 +1,11 @@
 package k8sapiproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,6 +26,15 @@ const (
 	// hookDetail is text only the operator should read.
 	hookDetail = "signing key kms://internal/key-7 rejected the credential"
 )
+
+// teeAuditSink records each event in every sink it holds.
+type teeAuditSink []AuditSink
+
+func (s teeAuditSink) Record(ctx context.Context, ev AuditEvent) {
+	for _, sink := range s {
+		sink.Record(ctx, ev)
+	}
+}
 
 // refuseTenant refuses every request of refusedTenant's callers and counts its calls.
 func refuseTenant(calls *atomic.Int32) func(AuthorizeAttributes) error {
@@ -143,6 +154,96 @@ func TestHandlerAuthorizeRefusal(t *testing.T) {
 				t.Errorf("metrics missing a rejection with %s\n%s", tc.wantMetric, exposition)
 			}
 		})
+	}
+}
+
+// A hook that returns a nil *AuthorizeError as its error has returned a non-nil error: the
+// request is refused, and the refusal is audited rather than lost to a nil dereference.
+func TestHandlerAuthorizeTypedNilErrorIsARefusal(t *testing.T) {
+	for name, hook := range map[string]func(AuthorizeAttributes) error{
+		"returned": func(AuthorizeAttributes) error {
+			var none *AuthorizeError
+			return none
+		},
+		"wrapped": func(AuthorizeAttributes) error {
+			var none *AuthorizeError
+			return fmt.Errorf("deciding: %w", none)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The slog sink reads Err.Error(), which is where a typed nil would panic.
+			var logged strings.Builder
+			recorded := &auditRecordingSink{}
+			sink := teeAuditSink{recorded, NewSlogAuditSink(slog.New(slog.NewTextHandler(&logged, nil)))}
+			h, upstream := newTestHandler(t, Config{Audit: sink, Authorize: hook})
+
+			rec := serve(h, newClusterRequest(http.MethodGet, testPodsPath, nil))
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("code = %d, want 403: %s", rec.Code, rec.Body.String())
+			}
+			if status := decodeStatus(t, rec); status.Message != authorizeRefusedMessage {
+				t.Errorf("message = %q, want the fixed message", status.Message)
+			}
+			if upstream.calls != 0 {
+				t.Errorf("upstream calls = %d for a refused request", upstream.calls)
+			}
+			events := recorded.snapshot()
+			if len(events) != 1 {
+				t.Fatalf("audit events = %d, want 1", len(events))
+			}
+			if ev := events[0]; ev.Outcome != OutcomeRefused || ev.Reason != ReasonAuthorizeRefused || !errors.Is(ev.Err, errAuthorizeNilError) {
+				t.Errorf("audit = (%q, %q, %v), want (%q, %q, %v)", ev.Outcome, ev.Reason, ev.Err, OutcomeRefused, ReasonAuthorizeRefused, errAuthorizeNilError)
+			}
+			if !strings.Contains(logged.String(), string(ReasonAuthorizeRefused)) {
+				t.Errorf("the slog sink wrote no record of the refusal: %q", logged.String())
+			}
+		})
+	}
+}
+
+// A hook that panics has not admitted the request: it is refused and recorded as a refusal,
+// and the panic value stays in the audit event.
+func TestHandlerAuthorizePanicIsARefusal(t *testing.T) {
+	sink := &auditRecordingSink{}
+	metrics := NewMetrics()
+	h, upstream := newTestHandler(t, Config{
+		Audit:     sink,
+		Metrics:   metrics,
+		Authorize: func(AuthorizeAttributes) error { panic(hookDetail) },
+	})
+
+	rec := serve(h, newClusterRequest(http.MethodGet, testPodsPath, nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
+	if status := decodeStatus(t, rec); status.Reason != metav1.StatusReasonForbidden || status.Message != authorizeRefusedMessage {
+		t.Errorf("Status = (%q, %q), want Forbidden and the fixed message", status.Reason, status.Message)
+	}
+	if strings.Contains(rec.Body.String(), "kms://") {
+		t.Errorf("the panic value reached the caller: %s", rec.Body.String())
+	}
+	if upstream.calls != 0 {
+		t.Errorf("upstream calls = %d for a refused request", upstream.calls)
+	}
+	events := sink.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.Outcome != OutcomeRefused || ev.Reason != ReasonAuthorizeRefused || ev.StatusCode != http.StatusForbidden {
+		t.Errorf("audit = (%q, %q, %d), want (%q, %q, 403)", ev.Outcome, ev.Reason, ev.StatusCode, OutcomeRefused, ReasonAuthorizeRefused)
+	}
+	if want := fmt.Sprintf(authorizePanicFormat, hookDetail); ev.Err == nil || ev.Err.Error() != want {
+		t.Errorf("audit Err = %v, want %q", ev.Err, want)
+	}
+	exposition := scrapeMetricsText(t, metrics)
+	for _, want := range []string{
+		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="authorize.refused",resource="pods",subresource="none",verb="list"} 1`,
+		`outcome="` + OutcomeRejectedPolicy + `",resource="pods",status_code="403"`,
+	} {
+		if !strings.Contains(exposition, want) {
+			t.Errorf("metrics missing %q\n%s", want, exposition)
+		}
 	}
 }
 
