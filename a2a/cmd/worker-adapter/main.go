@@ -319,6 +319,9 @@ func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
 	// lines are not its own.
 	cfg.Driver = workeradapter.WithInstructions(cfg.Driver, nil)
 	cfg.DelegateSocket = ""
+	// A profile's delegate tool is #6789's worker change (PR B); until it
+	// lands a profile worker gets no session delegate server.
+	cfg.DelegateMCP, cfg.DelegateInstructions = nil, nil
 	return cfg
 }
 
@@ -388,9 +391,10 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		return workeradapter.Config{}, false
 	}
 	// core-agent reads a session pod's system-prompt lines from each turn's
-	// envelope, not its argv. No delegate line: core-agent has no delegate
-	// tool yet (its MCP servers aren't wired), and a model told of a tool it
-	// doesn't have calls it. A profile worker drops these (profileModeConfig).
+	// envelope, not its argv. The delegate line isn't here: the adapter adds
+	// it per turn (Config.DelegateInstructions) only on a turn that gets the
+	// delegate server, since a model told of a tool it doesn't have calls it.
+	// A profile worker drops these (profileModeConfig).
 	driver = workeradapter.WithInstructions(driver, sessionPrompts(os.Getenv))
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
@@ -434,6 +438,11 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		Namespace:       namespace,
 		Scope:           scope,
 		DelegateSocket:  delegateSocket,
+		// A harness that takes its MCP servers in the stdin envelope
+		// (core-agent) gets the delegate server, its grant and its
+		// instruction there, per turn, rather than in argv.
+		DelegateMCP:          sessionDelegateMCP(driver, delegateSocket),
+		DelegateInstructions: sessionDelegateInstructions(driver, delegateSocket),
 		// Unset means required: a submission with no capability is
 		// refused. "false" is the mixed-version window only — a gateway
 		// that predates the mint. It does not switch enforcement off; a
@@ -921,4 +930,35 @@ func builderFor(h persona.Harness) (harnessBuilder, error) {
 		return coreAgentBuilder{}, nil
 	}
 	return nil, fmt.Errorf("harness %q has no argv builder", h)
+}
+
+// delegateMCPSubcommand is the subcommand this binary serves the delegate MCP
+// server under (main's dispatch, and harness_claude.go's --mcp-config).
+const delegateMCPSubcommand = "mcp"
+
+// sessionDelegateMCP is a session pod's delegate server for a harness that
+// takes its MCP servers in the stdin envelope (core-agent): this binary's
+// delegate subcommand at the pod's socket, under the reserved name, with the
+// one delegate tool, as harnessCommand gives Claude Code's --mcp-config. The
+// adapter adds it to a turn that may delegate, with that turn's socket,
+// targets, grant and instruction. Nil for any other harness, or with the tool
+// off.
+func sessionDelegateMCP(driver workeradapter.Driver, socket string) *persona.MCPServer {
+	if driver == nil || driver.Harness() != persona.CoreAgent || socket == "" {
+		return nil
+	}
+	return &persona.MCPServer{
+		Name: persona.ReservedServer, Command: selfPath(), Args: []string{delegateMCPSubcommand},
+		Env: map[string]string{workeradapter.EnvDelegateSocket: socket}, Tools: []string{workeradapter.DelegateToolName},
+	}
+}
+
+// sessionDelegateInstructions is the line that tells a core-agent session's
+// model of the delegate tool, added on exactly the turns that get
+// sessionDelegateMCP. Nil wherever that is nil.
+func sessionDelegateInstructions(driver workeradapter.Driver, socket string) []string {
+	if sessionDelegateMCP(driver, socket) == nil {
+		return nil
+	}
+	return []string{delegatePrompt}
 }

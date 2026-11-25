@@ -131,6 +131,16 @@ type Config struct {
 	// them in-process (core-agent): each turn's are built from these (and,
 	// once #6789 lands, the delegate server when the turn may delegate).
 	PersonaMCP []persona.MCPServer
+	// DelegateMCP is the delegate server for a harness that takes its MCP
+	// servers in the stdin envelope (core-agent): a turn that may delegate
+	// gets it with that turn's socket and delegateTargets part in its env
+	// (turnDelegateServer), its gate rule (withDelegateGrant) and
+	// DelegateInstructions, all three or none. Nil for any other harness and
+	// for a pod with the tool off.
+	DelegateMCP *persona.MCPServer
+	// DelegateInstructions are the system-prompt lines that tell the model of
+	// the delegate tool, added only on a turn that gets DelegateMCP.
+	DelegateInstructions []string
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
@@ -911,10 +921,22 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 
 	// A harness that takes its MCP servers in-process gets this turn's in its
 	// envelope, built from source here each turn so nothing an earlier turn
-	// added carries over. The delegate server joins later (#6789); nil now.
-	// The turn's driver stays local: a reused pod's next turn, or a wake,
-	// starts again from the pod's.
-	drv = turnDriver(drv, cfg.PersonaMCP, nil)
+	// added carries over: the persona's, then, on a turn that may delegate,
+	// the delegate server at this turn's socket with its targets, with its
+	// gate rule and the instruction that names the tool, all three together
+	// (a wake, or a pod with the tool off, gets none). The turn's driver
+	// stays local: a reused pod's next turn, or a wake, starts again from the
+	// pod's.
+	ds := turnDelegateServer(cfg.DelegateMCP, delegate, socket, origin)
+	drv = turnDriver(drv, cfg.PersonaMCP, ds)
+	if ds != nil {
+		if drv, err = withDelegateGrant(drv, ds); err != nil {
+			state := lib.StateFailed
+			ferr := a.finalize(state, "reason: delegate-grant-failed - "+err.Error(), "")
+			return broken(Result{State: state}, ferr)
+		}
+		drv = withTurnInstructions(drv, cfg.DelegateInstructions)
+	}
 
 	if delegate {
 		// The agents this turn's requester may delegate to, as the gateway
