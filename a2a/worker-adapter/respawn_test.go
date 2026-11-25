@@ -94,6 +94,8 @@ func useRespawnScope(t *testing.T) *respawnScope {
 //     (pid in $dir/writer) that the boundary must end;
 //   - double: a clean result, then a second one once its stdin closes, so
 //     the second decides the task while a steer waits for the next process;
+//   - delegate: no result; it waits mid-turn (the test delegates on the
+//     adapter's socket) and exits 0 on the delegation's SIGTERM;
 //   - anything else: a clean result.
 //
 // It then reads stdin to its end and exits with $dir/exitcode (0 if none).
@@ -117,6 +119,7 @@ writer)
   if [ $n = 1 ]; then /usr/bin/perl -MPOSIX -e 'if (fork) { exit 0 } POSIX::setsid(); open(STDIN,"<","/dev/null"); open(STDOUT,">","/dev/null"); open(STDERR,">","/dev/null"); open(my $f, ">", $ARGV[0]) or die; print $f "$$\n"; close($f); sleep 60' "$dir/writer"; fi
   echo "OK turn $n" ;;
 double) echo "OK turn $n"; while read -r more; do :; done; echo "OK again $n" ;;
+delegate) echo 1 > "$dir/mid-turn"; trap 'exit 0' TERM; while :; do sleep 0.05; done ;;
 *) echo "OK turn $n" ;;
 esac
 while read -r more; do :; done
@@ -298,8 +301,32 @@ func TestNoSupervisorStopStartsAnotherProcess(t *testing.T) {
 			}, nil)
 		}, want: lib.StateFailed},
 		stopAbandoned: {unreachable: "an abandon reaches only a dispatched profile task's adapter (profile tests drive that arm); the respawn checks a.abandoned() itself, and the abandon arm kills the process, which the clean-exit check refuses"},
-		stopDelegated: {unreachable: "the toy configures no delegate tool; a delegation records its stop before setting the result, and its kill leaves an exit error"},
-		stopEvicted:   {unreachable: "the loop's SIGTERM arm returns at once; pendingStops records an eviction only in the gap between processes, which the toy can't hit deterministically, and the final switch ends the task as the arm does"},
+		// A delegation mid-turn ends the turn: the loop ignores any later
+		// harness result and, when the process exits (0 here, on the
+		// delegation's SIGTERM), completes the task with the delegation line
+		// and refuses the held steer, before the respawn decision. So this
+		// case shows the behaviour (one process, steer refused, delegation
+		// line) through that path; the halt(stopDelegated) record is
+		// defence for a path this can't reach, and removing it doesn't fail
+		// this case.
+		stopDelegated: {run: func(t *testing.T) respawnResult {
+			sock := delegateSock(t)
+			r := respawnRun(t, "delegate", 0, func(cfg *Config, _ *respawnScope) {
+				cfg.DelegateSocket = sock
+				cfg.KillGrace = 5 * time.Second
+			}, func(_ *lib.Client, _ *lib.Envelope, _, _, dir string) {
+				waitFileFor(t, filepath.Join(dir, "mid-turn"), 10*time.Second)
+				if reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"}); !reply.OK {
+					t.Fatalf("delegation refused: %+v", reply)
+				}
+			})
+			c := testClient(t, r.url)
+			if got := artifactText(foldTask(t, c, r.session, r.id), lib.ArtifactResult); got != "delegated to platform" {
+				t.Errorf("result %q, want the delegation line", got)
+			}
+			return r
+		}, want: lib.StateCompleted},
+		stopEvicted: {unreachable: "the loop's SIGTERM arm returns at once; pendingStops records an eviction only in the gap between processes, which the toy can't hit deterministically, and the final switch ends the task as the arm does"},
 	}
 	for _, s := range supervisorStops {
 		c, ok := cases[s]
