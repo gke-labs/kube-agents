@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
@@ -218,9 +219,10 @@ echo '{"type":"result","subtype":"success","result":"two clusters"}'
 // what it leaves is still JSON.
 func TestTheTrajectoryScrubsSecretsThatSpanFields(t *testing.T) {
 	cases := map[string]struct{ in, secret string }{
-		"argv flag and value": {`{"argv":["mysql","--password","argvP4ssw0rdValue"]}`, "argvP4ssw0rdValue"},
-		"env name and value":  {`{"env":[{"name":"DB_PASSWORD","value":"envP4ssw0rdValue"}]}`, "envP4ssw0rdValue"},
-		"token as a key":      {`{"ghp_abcdefghijklmnopqrstuvwx0123":"x"}`, "ghp_abcdefghijklmnopqrstuvwx0123"},
+		"argv flag and value":  {`{"argv":["mysql","--password","argvP4ssw0rdValue"]}`, "argvP4ssw0rdValue"},
+		"env name and value":   {`{"env":[{"name":"DB_PASSWORD","value":"envP4ssw0rdValue"}]}`, "envP4ssw0rdValue"},
+		"token as a key":       {`{"ghp_abcdefghijklmnopqrstuvwx0123":"x"}`, "ghp_abcdefghijklmnopqrstuvwx0123"},
+		"argv in a long input": {`{"argv":["mysql","--password","longP4ssw0rdValue"],"pad":"` + strings.Repeat("z", trajectoryInputCap*2) + `"}`, "longP4ssw0rdValue"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -293,4 +295,57 @@ func (zeros) Read(p []byte) (int, error) {
 		p[i] = '0'
 	}
 	return len(p), nil
+}
+
+// A long input is decoded like a short one before it's scrubbed: a Secret's
+// stringData in a Write's content, whose line breaks are JSON escapes, is
+// scrubbed in the kept head, and the head is the input's text, not a JSON
+// string of it. "bytes" is the input's size as sent.
+func TestALongInputIsScrubbedAsDecodedJSON(t *testing.T) {
+	const secret = "s3cret-app-conf-value-9x8y"
+	content := "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\nstringData:\n  app.conf: " + secret + "\n" + strings.Repeat("# pad\n", trajectoryScrubMax/3)
+	raw, _ := json.Marshal(map[string]string{"file_path": "/tmp/s.yaml", "content": content})
+	store := NewTrajectoryStore()
+	store.Record("task-y", "Write", raw, nil, time.Now())
+	var got struct {
+		Truncated bool   `json:"truncated"`
+		Bytes     int    `json:"bytes"`
+		Head      string `json:"head"`
+	}
+	if err := json.Unmarshal(store.Task("task-y").Calls[0].Input, &got); err != nil || !got.Truncated {
+		t.Fatalf("long input = %s (%v)", store.Task("task-y").Calls[0].Input, err)
+	}
+	if strings.Contains(got.Head, secret) {
+		t.Fatalf("the Secret's value survived in the head: %q", got.Head)
+	}
+	if !strings.HasPrefix(got.Head, `{"content":"apiVersion: v1`) {
+		t.Fatalf("head isn't the input's own text: %q", got.Head[:60])
+	}
+	if got.Bytes != len(raw) {
+		t.Fatalf("bytes = %d, want the input's %d", got.Bytes, len(raw))
+	}
+}
+
+// Numbers are kept as written, and no cut splits a rune: a 64-bit id
+// survives exactly, and a head or tool name cut beside a multi-byte
+// character stays valid UTF-8 with no replacement character.
+func TestTheTrajectoryKeepsNumbersAndRunes(t *testing.T) {
+	store := NewTrajectoryStore()
+	store.Record("task-n", "Bash", json.RawMessage(`{"id":9007199254740993}`), nil, time.Now())
+	if got := string(store.Task("task-n").Calls[0].Input); got != `{"id":9007199254740993}` {
+		t.Fatalf("number input = %s", got)
+	}
+	for pad := 0; pad < 4; pad++ {
+		raw, _ := json.Marshal(map[string]string{"c": strings.Repeat("a", pad) + strings.Repeat("é", trajectoryInputCap)})
+		store.Record("task-n", strings.Repeat("b", pad)+strings.Repeat("工", trajectoryToolMax), raw, nil, time.Now())
+	}
+	for _, c := range store.Task("task-n").Calls[1:] {
+		var cut struct{ Head string }
+		_ = json.Unmarshal(c.Input, &cut)
+		for name, s := range map[string]string{"head": cut.Head, "tool": c.Tool} {
+			if !utf8.ValidString(s) || strings.ContainsRune(s, utf8.RuneError) {
+				t.Fatalf("%s split a rune: %q", name, s)
+			}
+		}
+	}
 }

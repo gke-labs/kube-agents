@@ -18,18 +18,21 @@ package workeradapter
 // from it. Nothing here reaches the TASKS stream, a chat surface or the disk.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 )
@@ -61,6 +64,12 @@ const (
 	trajectoryTaskBytes  = 4 << 20
 	trajectoryTasksKept  = 8
 	trajectoryStoreBytes = 16 << 20
+
+	// The read port's timeouts, and the client's for one read.
+	trajectoryReadHeaderTimeout = 5 * time.Second
+	trajectoryWriteTimeout      = 30 * time.Second
+	trajectoryIdleTimeout       = time.Minute
+	trajectoryFetchTimeout      = 10 * time.Second
 )
 
 // TrajectoryCall is one captured tool call.
@@ -107,10 +116,8 @@ func (s *TrajectoryStore) Record(task, tool string, input json.RawMessage, seen 
 	if s == nil || task == "" {
 		return
 	}
-	in := capTrajectoryInput(scrubTrajectoryInput(input, seen))
-	if len(tool) > trajectoryToolMax {
-		tool = tool[:trajectoryToolMax]
-	}
+	in := scrubTrajectoryInput(input, seen)
+	tool = cutUTF8(tool, trajectoryToolMax)
 	size := len(tool) + len(in)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,38 +168,59 @@ func (s *TrajectoryStore) Task(task string) TaskTrajectory {
 	return out
 }
 
-// scrubTrajectoryInput scrubs a tool call's input in two passes. First every
-// string value in it through answerscrub.Scrub (the seen values, when there
-// are any, and the inline shape rules), with a secret-looking key's whole
-// value replaced. Then the whole serialised input once more as one text,
-// keys included, which catches what spans fields (a name and its value in an
-// env list, a flag and its value in an argv array). If that second pass leaves
-// text that is no longer JSON, the input is stored as Redacted. Input past
-// trajectoryScrubMax, or that isn't JSON, is scrubbed as one string.
+// scrubTrajectoryInput scrubs and caps a tool call's input. It is decoded
+// (numbers kept as written), and every string value goes through
+// answerscrub.Scrub (the seen values, when there are any, and the inline
+// shape rules), with a secret-looking key's whole value replaced. Then the
+// whole serialised input is scrubbed once more as one text, keys included,
+// which catches what spans fields (a name and its value in an env list, a
+// flag and its value in an argv array). If that second pass leaves text that
+// is no longer JSON, the input is stored as Redacted.
+//
+// An input past trajectoryInputCap is kept as its head in the truncated
+// shape, and "bytes" is the input's size as the harness sent it. At most
+// trajectoryScrubMax bytes of string values, and of the serialised text, are
+// scrubbed, so a huge input can't hold the event loop; only the head is
+// kept, and it lies well inside that. Input that isn't JSON is scrubbed and
+// kept as text the same way.
 func scrubTrajectoryInput(raw json.RawMessage, seen *answerscrub.Seen) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
 	}
-	asString := func(s string) json.RawMessage {
-		out, _ := json.Marshal(answerscrub.Scrub(s, seen))
-		return out
-	}
-	if len(raw) > trajectoryScrubMax {
-		return asString(string(raw[:trajectoryScrubMax]))
-	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return asString(string(raw))
+	if err := dec.Decode(&v); err != nil || dec.More() {
+		text := answerscrub.Scrub(cutUTF8(string(raw), trajectoryScrubMax), seen)
+		if len(raw) <= trajectoryInputCap {
+			out, _ := json.Marshal(text)
+			return out
+		}
+		return truncatedTrajectoryInput(len(raw), text)
 	}
-	first, err := json.Marshal(scrubTrajectoryValue(v, seen))
+	budget := trajectoryScrubMax
+	first, err := json.Marshal(scrubTrajectoryValue(v, seen, &budget))
 	if err != nil {
 		return redactedTrajectoryInput()
+	}
+	if len(raw) > trajectoryInputCap || len(first) > trajectoryInputCap {
+		return truncatedTrajectoryInput(len(raw), answerscrub.Scrub(cutUTF8(string(first), trajectoryScrubMax), seen))
 	}
 	whole := answerscrub.Scrub(string(first), seen)
 	if !json.Valid([]byte(whole)) {
 		return redactedTrajectoryInput()
 	}
+	if len(whole) > trajectoryInputCap {
+		return truncatedTrajectoryInput(len(raw), whole)
+	}
 	return json.RawMessage(whole)
+}
+
+// truncatedTrajectoryInput is the shape the bench reads as truncated: the
+// input's size and the head of its scrubbed text.
+func truncatedTrajectoryInput(size int, scrubbed string) json.RawMessage {
+	out, _ := json.Marshal(map[string]any{"truncated": true, "bytes": size, "head": cutUTF8(scrubbed, trajectoryInputHead)})
+	return out
 }
 
 func redactedTrajectoryInput() json.RawMessage {
@@ -200,23 +228,29 @@ func redactedTrajectoryInput() json.RawMessage {
 	return out
 }
 
-func scrubTrajectoryValue(v any, seen *answerscrub.Seen) any {
+// scrubTrajectoryValue scrubs every string in v, spending budget on their
+// bytes: a string past what's left is cut to it first (and an empty budget
+// leaves strings empty). Map keys are walked in order, as they serialise, so
+// what's cut is what lies past the head.
+func scrubTrajectoryValue(v any, seen *answerscrub.Seen, budget *int) any {
 	switch t := v.(type) {
 	case string:
+		t = cutUTF8(t, max(*budget, 0))
+		*budget -= len(t)
 		return answerscrub.Scrub(t, seen)
 	case []any:
 		for i := range t {
-			t[i] = scrubTrajectoryValue(t[i], seen)
+			t[i] = scrubTrajectoryValue(t[i], seen, budget)
 		}
 		return t
 	case map[string]any:
 		out := make(map[string]any, len(t))
-		for k, e := range t {
+		for _, k := range slices.Sorted(maps.Keys(t)) {
 			if answerscrub.SecretLookingKey(k) {
 				out[k] = answerscrub.Redacted
 				continue
 			}
-			out[k] = scrubTrajectoryValue(e, seen)
+			out[k] = scrubTrajectoryValue(t[k], seen, budget)
 		}
 		return out
 	default:
@@ -224,14 +258,15 @@ func scrubTrajectoryValue(v any, seen *answerscrub.Seen) any {
 	}
 }
 
-// capTrajectoryInput keeps an input past trajectoryInputCap bytes as its
-// head, in the shape the bench reads as truncated.
-func capTrajectoryInput(in json.RawMessage) json.RawMessage {
-	if len(in) <= trajectoryInputCap {
-		return in
+// cutUTF8 is s cut to at most n bytes, never inside a rune.
+func cutUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	out, _ := json.Marshal(map[string]any{"truncated": true, "bytes": len(in), "head": string(in[:trajectoryInputHead])})
-	return out
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // ServeTrajectory binds the capture's read port on addr, which must be a
@@ -264,7 +299,8 @@ func ServeTrajectory(ctx context.Context, store *TrajectoryStore, addr string, l
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(store.Task(task))
 	})
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: trajectoryReadHeaderTimeout,
+		WriteTimeout: trajectoryWriteTimeout, IdleTimeout: trajectoryIdleTimeout}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
@@ -281,7 +317,7 @@ func ServeTrajectory(ctx context.Context, store *TrajectoryStore, addr string, l
 // line, then the capture as one JSON document. An error writes nothing, so a
 // reader sees no sentinel and counts the capture unread.
 func FetchTrajectory(ctx context.Context, addr, task string, w io.Writer) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, trajectoryFetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+trajectoryPath+"?task="+url.QueryEscape(task), nil)
 	if err != nil {
