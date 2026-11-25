@@ -116,3 +116,9 @@ type Usage struct {
 	Cached   int32 `json:"cached,omitempty"`
 	Thoughts int32 `json:"thoughts,omitempty"`
 }
+
+// RefusalLogPrefix starts the one line the harness writes to its stderr for
+// each refused tool call: the prefix, the tool's name as a Go-quoted
+// string, and the reason in parentheses, never the call's arguments. The
+// worker forwards only such lines to its own log.
+const RefusalLogPrefix = "tool refused: "
