@@ -14,8 +14,9 @@
 
 # The deployer drops an injected variable this stack does not declare and
 # raises on a task.yaml variable it does not declare, so this file and
-# bench/tasks/fleet-audit-unchanged-finding-keeps-wording/task.yaml are a
-# matched pair.
+# the task.yaml of each case on this stack are matched
+# (fleet-audit-unchanged-finding-keeps-wording, fleet-audit-remediation-right-and-not-stale,
+# fleet-audit-wrong-kept-remediation-gives-way).
 
 variable "host_cluster_name" {
   type        = string
@@ -41,5 +42,22 @@ variable "agent_namespace" {
 
 variable "mark" {
   type        = string
-  description = "The word that starts each planted title, impact, recommendation and note. The case's objective looks for it in the published ledger."
+  description = "The word that starts each planted title, impact, recommendation and note. A case looks for it in the published ledger or in the stored report."
+}
+
+variable "planted_remediation" {
+  type        = string
+  description = "What the planted authorized-networks finding proposes: manual (a marked note), gcloud-stale (a marked gcloud command with a literal range, on evidence that differs from this run's, which finish must not carry), or gcloud-same (the same command on equal evidence: finish keeps the planted title and impact, and its content rules make the planted command give way to this run's, when this run's own passes them)."
+  default     = "manual"
+
+  validation {
+    condition     = contains(["manual", "gcloud-stale", "gcloud-same"], var.planted_remediation)
+    error_message = "planted_remediation is one of manual, gcloud-stale, gcloud-same."
+  }
+}
+
+variable "collector_args" {
+  type        = string
+  description = "Arguments the plant passes to the drift collector. Empty on an install that declares no scope; on one that does, the scope flags the fleet_scope tool gives (for example --scope-projects <project>), without which the collector sweeps nothing and the plant has no candidate."
+  default     = ""
 }

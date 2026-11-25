@@ -11,12 +11,20 @@ import pathlib
 import subprocess
 import unittest
 
-from tests.testing.common import MOCK_DEFAULT_REGISTRY_PREFIX, create_mock_git_repo, get_isolated_test_env
+from tests.testing.common import (
+    MOCK_DEFAULT_REGISTRY_PREFIX,
+    create_minimal_tools_bin,
+    create_mock_git_repo,
+    get_isolated_test_env,
+)
 from tests.testing.release import (
+    MOCK_AR_REGISTRY_PREFIX,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
     commit_required_release_images,
+    create_mock_ar_curl_binary,
     create_mock_docker_binary,
+    create_mock_gcloud_token_binary,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -98,6 +106,30 @@ class VerifyCandidateImagesScriptTest(unittest.TestCase):
         self.assertIn("has no scripts/release/common.sh", proc.stderr)
         for img in MOCK_REQUIRED_RELEASE_IMAGES:
             self.assertIn(f"Checking image '{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{candidate}'", proc.stdout)
+
+
+
+    def test_an_artifact_registry_candidate_is_verified_without_docker(self):
+        """The script asks through `registry_image_exists`, so a runner with no
+        docker still gets an answer from Artifact Registry, and a refusal there
+        is a failure, not a pass."""
+        for http_status, passes in ((200, True), (404, False), (403, False)):
+            with self.subTest(http_status=http_status):
+                temp_dir, repo_dir, git = create_mock_git_repo()
+                self.addCleanup(temp_dir.cleanup)
+                candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+                bin_dir = create_minimal_tools_bin(temp_dir.name)
+                create_mock_ar_curl_binary(bin_dir, manifest_http_status=http_status)
+                create_mock_gcloud_token_binary(bin_dir)
+                env = get_isolated_test_env(overrides={"PATH": str(bin_dir), "REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX})
+                proc = subprocess.run(
+                    ["bash", str(_VERIFY_CANDIDATE_IMAGES_SH), candidate],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    cwd=repo_dir,
+                )
+                self.assertEqual(proc.returncode == 0, passes, proc.stderr)
 
 
 if __name__ == "__main__":
