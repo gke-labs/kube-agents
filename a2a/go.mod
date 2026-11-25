@@ -22,7 +22,7 @@ require (
 	golang.org/x/sys v0.50.0
 	golang.org/x/text v0.44.0
 	google.golang.org/adk/v2 v2.6.0
-	google.golang.org/genai v1.79.1
+	google.golang.org/genai v1.77.0
 	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2
 	k8s.io/client-go v0.37.2

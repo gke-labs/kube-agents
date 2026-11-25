@@ -17,9 +17,15 @@ import (
 // answer and then an SSE event whose data is an error object fails the
 // turn with that error. The genai client read such an event as an empty
 // chunk before v1.76.0, so the turn completed with the partial text.
+//
+// The call goes to the v1beta path, the only one the adapter's gateway
+// proxy and the gateway's caller routes admit: genai v1.78.0 made v1 the
+// Developer API's default, which would refuse every call.
 func TestAnErrorInTheStreamFailsTheTurn(t *testing.T) {
+	var path string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
+		path = r.URL.Path
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}]}\n\n"+
 			"data: {\"error\":{\"code\":500,\"message\":\"Internal error encountered.\",\"status\":\"INTERNAL\"}}\n\n")
@@ -42,6 +48,9 @@ func TestAnErrorInTheStreamFailsTheTurn(t *testing.T) {
 			last = err
 			break
 		}
+	}
+	if path != "/v1beta/models/gemini-default:streamGenerateContent" {
+		t.Errorf("the call went to %q, want the v1beta streamGenerateContent path", path)
 	}
 	if last == nil {
 		t.Fatal("the turn completed from a stream that carried an error; want the error")
