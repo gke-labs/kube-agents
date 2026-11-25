@@ -812,6 +812,15 @@ func profileBatchEndState(end BatchEnd) lib.TaskState {
 	return end.State
 }
 
+// wireRound is a child's round as its end carries it (lib.ChildResult.Round):
+// omitted for round one, as an end from before rounds is.
+func wireRound(r int) int {
+	if r <= 1 {
+		return 0
+	}
+	return r
+}
+
 // endWithdrawnProfileBatch ends each entry of a profile parent's batch that
 // was withdrawn (it was cut short, or a child couldn't reach the bus) and
 // had no end yet, so a parent counting its batch's ends isn't left waiting
@@ -845,7 +854,7 @@ func (g *Gateway) endWithdrawnProfileBatch(ctx context.Context, rec *SessionReco
 		}
 		child, ok := kept[i]
 		if !ok {
-			child = TaskRef{BatchIndex: i}
+			child = TaskRef{BatchIndex: i, BatchRound: parent.DelegationRound}
 		}
 		g.sendWithdrawnEnd(ctx, rec, parent, child, lib.StateFailed, "", why)
 	}
@@ -896,7 +905,7 @@ func (g *Gateway) publishChildResult(ctx context.Context, rec *SessionRecord, pa
 		return errors.New("publish: failed by the test hook")
 	}
 	part, err := lib.ChildResultPart(lib.ChildResult{ChildTaskID: child.ID, Addressee: child.Addressee, State: state, Text: text,
-		Entry: child.BatchIndex})
+		Entry: child.BatchIndex, Round: wireRound(child.BatchRound)})
 	if err != nil {
 		return fmt.Errorf("build: %w", err)
 	}

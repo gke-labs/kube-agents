@@ -167,12 +167,19 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// handed to an observer as the answer (handOffEnd). Written now, under
 	// the session lock the caller holds, as startTaskWith writes a mint:
 	// left to the relay's end-of-batch write, a failed write would lose it.
+	// startRound, once set below, begins the request's delegation round
+	// for a profile parent, whose request uses a round whether it mints or
+	// is refused: it is called where the request is decided (noChild, the
+	// mints), so a request ignored without a decision uses none. It returns
+	// the round as the parent's ends and refusals carry it.
+	startRound := func() int { return 0 }
 	noChild := func(reason string) {
+		round := startRound()
 		rec.markDelegationEnd(taskID, reason)
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
 		}
-		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, 0)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, wireRound(round))
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
@@ -208,7 +215,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// a DelegationEnd written here would hold back its children's ends
 	// (profileBatchChildEnded).
 	refuseRounds := func(notice string, extra ...any) {
-		used := profileRoundsUsed(parent)
+		used := roundsUsed(parent)
 		log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationRounds, "roundsUsed", used, "roundsMax", g.cfg.DelegationRoundsMax}, audit...), extra...)...)
 		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+fmt.Sprintf(noticeDelegationRounds, used, plural(used))+notice), used+1)
 	}
@@ -223,7 +230,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// nothing; the parent is told, tagged so it ends nothing. That request
 	// used the task's round, so this is the delegation.rounds refusal at
 	// the one round there is today.
-	if profileParent && parent.DelegationEnd != "" && profileRoundsUsed(parent) >= g.cfg.DelegationRoundsMax {
+	if profileParent && parent.DelegationEnd != "" && roundsUsed(parent) >= g.cfg.DelegationRoundsMax {
 		refuseRounds("", "delegationEnd", parent.DelegationEnd)
 		return
 	}
@@ -247,7 +254,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			// minted: one past its rounds is refused to it, and ends
 			// nothing. A request with rounds left while those children
 			// run is no new round, and stays the busy ignore below.
-			if profileParent && profileRoundsUsed(parent) >= g.cfg.DelegationRoundsMax {
+			if profileParent && roundsUsed(parent) >= g.cfg.DelegationRoundsMax {
 				// Told its children will still report back only while one
 				// of them has an end to send.
 				notice := ""
@@ -257,16 +264,42 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 				refuseRounds(notice, "child", last)
 				return
 			}
-			ignore(ruleDelegationBusy, "child", last)
-			return
+			// Rounds left: the next round waits for this one to settle,
+			// every child's end recorded (a batch) or the child ended and
+			// the conversation back with the parent (a single child). A
+			// request before that is no new round.
+			if !profileParent || profileChildrenRunning(rec, parent, last) {
+				ignore(ruleDelegationBusy, "child", last)
+				return
+			}
+		} else {
+			resuming = true
 		}
-		resuming = true
+	}
+	if resuming {
 		defer func() {
 			if !minting {
 				g.withdrawCutShortBatch(ctx, rec, taskID, log)
 			}
 		}()
 		log.Info("finishing a batch cut short", "minted", len(parent.Children), "tasks", parent.BatchSize)
+	}
+	// A profile parent's request that gets past the round checks uses a
+	// round, minted or refused: the parent's next one, or, for a batch cut
+	// short and being finished, the round it was started in. Begun where
+	// the request is decided (startRound's callers), not here.
+	if profileParent {
+		used, started := roundsUsed(parent), 0
+		startRound = func() int {
+			if resuming {
+				return roundOf(parent.DelegationRound)
+			}
+			if started == 0 {
+				started = used + 1
+				rec.startDelegationRound(taskID, started)
+			}
+			return started
+		}
 	}
 	// Only a profile whose card says it delegates (spec.delegates): the
 	// worker's tool is the profile admin's opt-in, and this is where it
@@ -366,6 +399,10 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		// What the dispatcher re-checks the child against (#5686).
 		authority.Via.ProfileChain, authority.Via.Scope = parent.ProfileChain, parent.Scope
 	}
+	if profileParent {
+		startRound()
+		parent, _ = rec.TaskRefFor(taskID)
+	}
 	if len(routes) > 1 {
 		minting = true
 		g.mintBatch(ctx, rec, taskID, parent, profileParent, req.Tasks, routes, authority, noChild, log)
@@ -399,6 +436,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		LineNote:             lineNote,
 		Route:                route,
 		ProfileChain:         childProfileChain(parent, profileParent),
+		BatchRound:           mintRound(parent, profileParent),
 		Scheduled:            profileParent && parent.belowSchedule(),
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
@@ -630,6 +668,7 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			LineNote:      lineNote,
 			Route:         routes[i],
 			ProfileChain:  childProfileChain(parent, profileParent),
+			BatchRound:    mintRound(parent, profileParent),
 			// Below a scheduled run, as a single child is: the mark is what
 			// holds this child's own delegation to the unattended card check.
 			Scheduled:            profileParent && parent.belowSchedule(),
@@ -1548,24 +1587,14 @@ func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionReco
 	return nil
 }
 
-// profileRoundsUsed is how many delegation rounds a profile parent has used:
-// every delegate request the gateway handled for it uses one, minted or
-// refused. Until rounds past the first are supported (DelegationRoundsMax is
-// held to one) the record carries one request a task, so it is one once that
-// request has ended (DelegationEnd) or minted its child or whole batch, and
-// none before. A batch cut short and being finished is still its first.
-//
-// It is right only while the most is one: it never counts past one, and the
-// checks that call it no longer hold a profile parent with an ended request
-// back on their own. Raising delegationRoundsSupportedMax needs a real per-task
-// round count on the record first, or a parent whose first request was refused
-// would mint on its second, and a request made while children run with rounds
-// left would be ignored without telling the parent.
-func profileRoundsUsed(parent TaskRef) int {
-	if parent.DelegationEnd != "" || (len(parent.Children) > 0 && parent.batchComplete()) {
-		return 1
+// mintRound is the round a profile parent's child is minted in, as the child
+// records it (TaskRef.BatchRound): 0 for round one, so a record is what it
+// was before rounds while DelegationRoundsMax is one.
+func mintRound(parent TaskRef, profileParent bool) int {
+	if !profileParent || parent.DelegationRound <= 1 {
+		return 0
 	}
-	return 0
+	return parent.DelegationRound
 }
 
 // profileChildrenRunning reports whether a profile parent's minted children
