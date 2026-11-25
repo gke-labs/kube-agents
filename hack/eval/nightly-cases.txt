@@ -1186,6 +1186,16 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# #6492: the waste audit reads the CPU peak in buckets of one minute. Over
+# seeded-cpu-cycle (role cpu-burst-and-flat): cpu-burst uses its whole CPU
+# request for 45 seconds in each 10 minutes, which is under the bar of the
+# overrequest check in a bucket of 300 seconds and above it in a bucket of 60.
+# Graded on the cost ledger: no finding id for cpu-burst or for cpu-flat, the
+# control.
+# The same full audit as cost-declared-intent-no-finding. deployer: noop,
+# read-only over the seeded fleet.
+./tasks/cost-cpu-burst-no-overrequest/task.yaml
+
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst
 # windows and GPU duty-cycle metrics delivered via GitOps PR. deployer: noop.
