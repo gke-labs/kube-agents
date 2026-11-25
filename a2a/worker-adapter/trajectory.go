@@ -50,8 +50,13 @@ const (
 	// past trajectoryInputCap bytes is kept as its head, a task keeps at most
 	// trajectoryCallsCap calls and trajectoryTaskBytes bytes, and the store
 	// keeps the last trajectoryTasksKept tasks within trajectoryStoreBytes.
-	trajectoryInputCap   = 2000
-	trajectoryInputHead  = 1000
+	trajectoryInputCap  = 2000
+	trajectoryInputHead = 1000
+	// trajectoryScrubMax bounds what of one input is scrubbed at all: the
+	// served head is far shorter, and scrubbing a harness line's full 8 MB
+	// would hold the event loop for seconds.
+	trajectoryScrubMax   = 64 << 10
+	trajectoryToolMax    = 200
 	trajectoryCallsCap   = 2000
 	trajectoryTaskBytes  = 4 << 20
 	trajectoryTasksKept  = 8
@@ -103,6 +108,9 @@ func (s *TrajectoryStore) Record(task, tool string, input json.RawMessage, seen 
 		return
 	}
 	in := capTrajectoryInput(scrubTrajectoryInput(input, seen))
+	if len(tool) > trajectoryToolMax {
+		tool = tool[:trajectoryToolMax]
+	}
 	size := len(tool) + len(in)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -111,6 +119,7 @@ func (s *TrajectoryStore) Record(task, tool string, input json.RawMessage, seen 
 		c = &taskCapture{}
 		s.tasks[task] = c
 		s.order = append(s.order, task)
+		s.evictLocked(task)
 	}
 	if len(c.calls) >= trajectoryCallsCap || c.bytes+size > trajectoryTaskBytes {
 		c.dropped++
@@ -152,23 +161,42 @@ func (s *TrajectoryStore) Task(task string) TaskTrajectory {
 	return out
 }
 
-// scrubTrajectoryInput scrubs every string in a tool call's input: the seen
-// values and the inline shape rules (answerscrub.Scrub), and a value under a
-// key that looks like a secret replaced whole. Input that isn't JSON is
-// scrubbed as one string.
+// scrubTrajectoryInput scrubs a tool call's input in two passes. First every
+// string value in it through answerscrub.Scrub (the seen values, when there
+// are any, and the inline shape rules), with a secret-looking key's whole
+// value replaced. Then the whole serialised input once more as one text,
+// keys included, which catches what spans fields (a name and its value in an
+// env list, a flag and its value in an argv array). If that second pass leaves
+// text that is no longer JSON, the input is stored as Redacted. Input past
+// trajectoryScrubMax, or that isn't JSON, is scrubbed as one string.
 func scrubTrajectoryInput(raw json.RawMessage, seen *answerscrub.Seen) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
 	}
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		out, _ := json.Marshal(answerscrub.Scrub(string(raw), seen))
+	asString := func(s string) json.RawMessage {
+		out, _ := json.Marshal(answerscrub.Scrub(s, seen))
 		return out
 	}
-	out, err := json.Marshal(scrubTrajectoryValue(v, seen))
-	if err != nil {
-		return nil
+	if len(raw) > trajectoryScrubMax {
+		return asString(string(raw[:trajectoryScrubMax]))
 	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return asString(string(raw))
+	}
+	first, err := json.Marshal(scrubTrajectoryValue(v, seen))
+	if err != nil {
+		return redactedTrajectoryInput()
+	}
+	whole := answerscrub.Scrub(string(first), seen)
+	if !json.Valid([]byte(whole)) {
+		return redactedTrajectoryInput()
+	}
+	return json.RawMessage(whole)
+}
+
+func redactedTrajectoryInput() json.RawMessage {
+	out, _ := json.Marshal(answerscrub.Redacted)
 	return out
 }
 
@@ -182,14 +210,15 @@ func scrubTrajectoryValue(v any, seen *answerscrub.Seen) any {
 		}
 		return t
 	case map[string]any:
+		out := make(map[string]any, len(t))
 		for k, e := range t {
 			if answerscrub.SecretLookingKey(k) {
-				t[k] = answerscrub.Redacted
+				out[k] = answerscrub.Redacted
 				continue
 			}
-			t[k] = scrubTrajectoryValue(e, seen)
+			out[k] = scrubTrajectoryValue(e, seen)
 		}
-		return t
+		return out
 	default:
 		return v
 	}
@@ -235,7 +264,7 @@ func ServeTrajectory(ctx context.Context, store *TrajectoryStore, addr string, l
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(store.Task(task))
 	})
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
@@ -266,9 +295,13 @@ func FetchTrajectory(ctx context.Context, addr, task string, w io.Writer) error 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("trajectory capture: %s", resp.Status)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, trajectoryTaskBytes*2))
+	limit := int64(trajectoryTaskBytes * 2)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return err
+	}
+	if int64(len(body)) > limit {
+		return fmt.Errorf("trajectory capture: the answer is past %d bytes", limit)
 	}
 	_, err = fmt.Fprintf(w, "%s\n%s", TrajectorySentinel, body)
 	return err

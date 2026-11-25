@@ -479,13 +479,19 @@ artifact, and nine names are reserved so renderers and audit tooling can rely on
 adapter also keeps every tool call its harness makes, as the driver decodes it, for the evals:
 the tool's name and its input, which the `activity` artifact may not carry. It is not published.
 It isn't on the TASKS stream, in any artifact, on a chat surface, or on disk; it stays in the
-adapter's memory and goes with the pod. Each input is scrubbed (the task's seen values and the
-inline secret rules, and the whole value of a secret-looking key) and cut past 2000 bytes, a task
-keeps at most 2000 calls and 4 MB, and the pod keeps the last 8 tasks within 16 MB. It is
+adapter's memory and goes with the pod. Each input is scrubbed with the answer scrub's inline
+secret rules, on every string value and then on the whole input, and a secret-looking key's
+whole value is replaced. The task's seen values join once the session tracks them. An input is
+cut past 2000 bytes, a task keeps at most 2000 calls and 4 MB, and the pod keeps the last 8
+tasks within 16 MB. It is
 served read-only on the pod's loopback (`127.0.0.1:7346`, in no Service and no container port)
 and read with `kubectl exec <pod> -c worker -- worker-adapter trajectory <task>`. It's in memory
 rather than a file because the harness and every shell the agent runs share the adapter's uid, so
-a file could be rewritten and a graded trajectory forged. The agent in that pod can read its own
+a file could be rewritten and a graded trajectory forged. The adapter is marked not dumpable, so
+those processes can't reach its memory or file descriptors through `/proc` either. One residual
+remains, the same one the `activity` artifact and the answer have: a process with the agent's uid
+can write to the harness's own stdout pipe, and the adapter would decode what it wrote as the
+harness's. Only separate uids would close that. The agent in that pod can read its own
 session's scrubbed calls through the port: it made them, so nothing in it is private from the
 agent. If the port can't be bound, the session runs without a capture, and a reader sees none.
 

@@ -211,3 +211,86 @@ echo '{"type":"result","subtype":"success","result":"two clusters"}'
 		t.Fatalf("first call's input = %s", in)
 	}
 }
+
+// A secret that spans fields only shows as one in the whole input: a flag
+// and its value as two argv entries, a name and its value as an env entry,
+// and a key that is itself a token. The whole-input pass scrubs them, and
+// what it leaves is still JSON.
+func TestTheTrajectoryScrubsSecretsThatSpanFields(t *testing.T) {
+	cases := map[string]struct{ in, secret string }{
+		"argv flag and value": {`{"argv":["mysql","--password","argvP4ssw0rdValue"]}`, "argvP4ssw0rdValue"},
+		"env name and value":  {`{"env":[{"name":"DB_PASSWORD","value":"envP4ssw0rdValue"}]}`, "envP4ssw0rdValue"},
+		"token as a key":      {`{"ghp_abcdefghijklmnopqrstuvwx0123":"x"}`, "ghp_abcdefghijklmnopqrstuvwx0123"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := NewTrajectoryStore()
+			store.Record("task-x", "Bash", json.RawMessage(c.in), nil, time.Now())
+			got := store.Task("task-x").Calls[0].Input
+			if strings.Contains(string(got), c.secret) {
+				t.Fatalf("input kept %q: %s", c.secret, got)
+			}
+			if !json.Valid(got) {
+				t.Fatalf("stored input isn't JSON: %s", got)
+			}
+		})
+	}
+}
+
+// An input past the scrub bound is scrubbed as text, so a secret early in a
+// huge input still doesn't survive into the head that's kept.
+func TestTheTrajectoryScrubsALongInput(t *testing.T) {
+	const secret = "ghp_abcdefghijklmnopqrstuvwx0123"
+	in := fmt.Sprintf(`{"content":"token %s %s"}`, secret, strings.Repeat("z", trajectoryScrubMax*2))
+	store := NewTrajectoryStore()
+	store.Record("task-l", "Write", json.RawMessage(in), nil, time.Now())
+	got := string(store.Task("task-l").Calls[0].Input)
+	if strings.Contains(got, secret) || !strings.Contains(got, `"truncated":true`) {
+		t.Fatalf("long input = %.300s", got)
+	}
+}
+
+// Seq numbers each call of a task in order, counting the dropped ones, and a
+// tool name past its cap is cut.
+func TestTheTrajectorySeqAndToolCap(t *testing.T) {
+	store := NewTrajectoryStore()
+	store.Record("task-q", "Bash", json.RawMessage(`{}`), nil, time.Now())
+	store.Record("task-q", strings.Repeat("T", trajectoryToolMax*3), json.RawMessage(`{}`), nil, time.Now())
+	got := store.Task("task-q").Calls
+	if got[0].Seq != 1 || got[1].Seq != 2 {
+		t.Fatalf("seqs %d %d, want 1 2", got[0].Seq, got[1].Seq)
+	}
+	if len(got[1].Tool) != trajectoryToolMax {
+		t.Fatalf("tool name kept %d bytes, want %d", len(got[1].Tool), trajectoryToolMax)
+	}
+}
+
+// The client prints nothing for an answer past its limit, so a reader never
+// takes a cut capture for a whole one.
+func TestTheTrajectoryClientRefusesACutAnswer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.CopyN(w, zeros{}, int64(trajectoryTaskBytes*2)+10)
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	var buf bytes.Buffer
+	if err := FetchTrajectory(context.Background(), ln.Addr().String(), "task-big", &buf); err == nil {
+		t.Fatal("an oversized answer was accepted")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("wrote %d bytes on an error", buf.Len())
+	}
+}
+
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = '0'
+	}
+	return len(p), nil
+}

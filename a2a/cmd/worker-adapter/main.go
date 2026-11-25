@@ -268,9 +268,18 @@ func run() int {
 	}
 
 	// The session's tool-call capture for the evals, on loopback only. A
-	// port that can't be bound costs the capture, never the session.
+	// port that can't be bound costs the capture, never the session. The
+	// port stays open until Run returns, not just until a signal arrives, so
+	// the calls of a turn being stopped can still be read while it winds
+	// down. Not dumpable, so the agent's processes (same uid) can't reach
+	// the capture through this process's /proc entries.
+	if err := workeradapter.HideFromSameUID(); err != nil {
+		log.Warn("trajectory capture: couldn't mark the adapter not dumpable", "err", err)
+	}
+	trajCtx, trajStop := context.WithCancel(context.Background())
+	defer trajStop()
 	traj := workeradapter.NewTrajectoryStore()
-	if _, err := workeradapter.ServeTrajectory(ctx, traj, workeradapter.TrajectoryAddr, log); err != nil {
+	if _, err := workeradapter.ServeTrajectory(trajCtx, traj, workeradapter.TrajectoryAddr, log); err != nil {
 		log.Warn("trajectory capture: the read port couldn't be bound; the session runs without it", "addr", workeradapter.TrajectoryAddr, "err", err)
 	} else {
 		cfg.Trajectory = traj
