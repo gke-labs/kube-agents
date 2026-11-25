@@ -132,6 +132,11 @@ CLUSTER_SCOPED_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("monitoring.googleapis.com", "ClusterNodeMonitoring"),
         ("monitoring.googleapis.com", "ClusterRules"),
         ("monitoring.googleapis.com", "GlobalRules"),
+        ("container.gke.io", "Cluster"),
+        ("container.gke.io", "NodePool"),
+        ("kueue.x-k8s.io", "ClusterQueue"),
+        ("kueue.x-k8s.io", "ResourceFlavor"),
+        ("kueue.x-k8s.io", "WorkloadPriorityClass"),
     }
 )
 
@@ -176,6 +181,8 @@ DATA_STATEFUL_DELETE_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("postgresql.cnpg.io", "ScheduledBackup"),
         ("container.cnrm.cloud.google.com", "ContainerCluster"),
         ("container.cnrm.cloud.google.com", "ContainerNodePool"),
+        ("container.gke.io", "Cluster"),
+        ("container.gke.io", "NodePool"),
         ("sql.cnrm.cloud.google.com", "SQLInstance"),
         ("sql.cnrm.cloud.google.com", "SQLDatabase"),
         ("spanner.cnrm.cloud.google.com", "SpannerInstance"),
@@ -326,10 +333,25 @@ GITOPS_RECONCILER_KINDS: frozenset[tuple[str, str]] = frozenset(
 
 CLOUD_IAC_GROUP_SUFFIXES = (
     ".cnrm.cloud.google.com",
+    "container.gke.io",
     ".crossplane.io",
     ".upbound.io",
     ".services.k8s.aws",
     ".azure.com",
+)
+
+AI_ML_WORKLOAD_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("ray.io", "RayCluster"),
+        ("ray.io", "RayJob"),
+        ("ray.io", "RayService"),
+        ("jobset.x-k8s.io", "JobSet"),
+        ("leaderworkerset.x-k8s.io", "LeaderWorkerSet"),
+        ("kueue.x-k8s.io", "ClusterQueue"),
+        ("kueue.x-k8s.io", "LocalQueue"),
+        ("kueue.x-k8s.io", "ResourceFlavor"),
+        ("kueue.x-k8s.io", "WorkloadPriorityClass"),
+    }
 )
 
 CORE_KNOWN_KINDS: frozenset[tuple[str, str]] = (
@@ -346,6 +368,7 @@ CORE_KNOWN_KINDS: frozenset[tuple[str, str]] = (
     | MONITORING_KINDS
     | GITOPS_RECONCILER_KINDS
     | DATA_STATEFUL_DELETE_KINDS
+    | AI_ML_WORKLOAD_KINDS
     | frozenset(
         {
             ("", "ConfigMap"),
@@ -1005,6 +1028,16 @@ def _is_production_labels(labels: dict[str, Any]) -> bool:
             if any(t in PRODUCTION_VALUES for t in tokens):
                 return True
     return False
+
+
+def _is_production_namespace(namespace: str) -> bool:
+    if not isinstance(namespace, str) or not namespace.strip():
+        return False
+    cleaned = _strip_negated_prod_compounds(namespace.strip().lower()).strip()
+    if cleaned == "live":
+        return True
+    tokens = [t for t in _PROD_TOKEN_SPLIT_RE.split(cleaned) if t]
+    return any(t in PRODUCTION_PATH_VALUES for t in tokens)
 
 
 def _is_production_path(file_path: str) -> bool:
@@ -4912,7 +4945,7 @@ def evaluate_resource(
     in_system_ns = ref.namespace in SYSTEM_NAMESPACES
     is_cluster_scoped = is_cluster_scoped_kind(ref.group, ref.kind)
 
-    # Determine production environment from object labels, PR Namespace labels, or path
+    # Determine production environment from object labels, PR Namespace labels, namespace name, or path
     obj_labels = _meta_dict(primary.obj, "labels")
     prior_labels = _meta_dict(before.obj, "labels") if before is not None else {}
     ns_lbl = (ns_labels or {}).get(ref.namespace, {})
@@ -4920,6 +4953,8 @@ def evaluate_resource(
         _is_production_labels(obj_labels)
         or _is_production_labels(prior_labels)
         or _is_production_labels(ns_lbl)
+        or _is_production_namespace(ref.namespace)
+        or (gk == ("", "Namespace") and _is_production_namespace(ref.name))
         or _is_production_path(file_path)
     )
 
@@ -5482,19 +5517,49 @@ def evaluate_resource(
         _check_gitops_reconciler(ev, action, before.obj if before else None, primary.obj)
         return _finalize()
 
-    # 13. Cloud Infrastructure CRDs (KCC / Crossplane / Upbound / ACK / ASO) & CNPG DBs
+    # 13. Cloud Infrastructure CRDs (KCC / GKE Cluster / Crossplane / Upbound / ACK / ASO) & CNPG DBs
     if is_cloud_infra_group(ref.group) or ref.group.endswith(".cnpg.io"):
         ev.add(
             "CLOUD_INFRA_CHANGE",
             DIM_REVERTABILITY,
             RISK_HIGH,
             f"{_action_verb(action)} cloud/database infrastructure resource {ref.gvk_label()} {ref.name!r}",
-            blast=BLAST_CRITICAL if ref.kind in ("ContainerCluster", "Project", "ComputeNetwork") else BLAST_HIGH,
+            blast=BLAST_CRITICAL if ref.kind in ("ContainerCluster", "Cluster", "Project", "ComputeNetwork") else BLAST_HIGH,
             revert=REVERT_DIFFICULT,
             security=True,
         )
         if "iam" in ref.group.lower() or "iam" in ref.kind.lower():
             _check_cloud_iam(ev, primary.obj)
+        return _finalize()
+
+    # 13b. AI/ML Distributed Workloads & Batch Scheduling (KubeRay, JobSet, LeaderWorkerSet, Kueue)
+    if gk in AI_ML_WORKLOAD_KINDS:
+        def _scan_nested_pod_templates(node: Any, depth: int = 0) -> None:
+            if depth > 12:
+                return
+            if isinstance(node, dict):
+                tmpl = node.get("template")
+                if isinstance(tmpl, dict):
+                    ps = tmpl.get("spec")
+                    if isinstance(ps, dict) and any(k in ps for k in ("containers", "initContainers", "ephemeralContainers", "volumes", "securityContext", "hostNetwork", "hostPID", "hostIPC")):
+                        _check_pod_spec_posture(ev, ps, require_containers=False)
+                for v in node.values():
+                    _scan_nested_pod_templates(v, depth + 1)
+            elif isinstance(node, list):
+                for item in node:
+                    _scan_nested_pod_templates(item, depth + 1)
+
+        _scan_nested_pod_templates(primary.obj.get("spec"))
+        is_kueue_cluster = ref.group == "kueue.x-k8s.io" and is_cluster_scoped
+        ev.add(
+            "AI_ML_WORKLOAD_CHANGE",
+            DIM_BLAST_RADIUS,
+            RISK_HIGH if (is_kueue_cluster or action == ACTION_MODIFY) else RISK_MEDIUM,
+            f"{_action_verb(action)} distributed AI/ML or batch scheduling resource {ref.gvk_label()} {ref.name!r}",
+            blast=BLAST_HIGH if is_kueue_cluster else BLAST_MEDIUM,
+            revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+        )
         return _finalize()
 
     # 14. Istio Mesh Resources

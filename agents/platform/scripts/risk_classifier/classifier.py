@@ -11,6 +11,7 @@ from .k8s_rules import (
     SYSTEM_NAMESPACES,
     WORKLOAD_KINDS,
     _is_production_labels,
+    _is_production_namespace,
     _is_production_path,
     _scan_value_for_secrets,
     evaluate_resource,
@@ -331,7 +332,8 @@ _PURE_DOC_EXACT_BASENAMES = frozenset(
     }
 )
 _MANIFEST_EXTENSIONS = frozenset({".yaml", ".yml", ".json"})
-_OVERLAY_SEGMENTS = frozenset({"patches", "overlays", "templates"})
+_OVERLAY_SEGMENTS = frozenset({"patches", "overlays"})
+_TEMPLATE_DIR_SEGMENTS = frozenset({"templates"})
 _TERRAFORM_EXTENSIONS = frozenset({".tf", ".tfvars", ".hcl", ".tofu"})
 _TERRAFORM_COMPOUND_SUFFIXES = (".tf.json", ".tofu.json", ".tfvars.json")
 
@@ -419,6 +421,8 @@ def _is_unrendered_package_path(norm_path: str) -> bool:
         return True
     parts = low.split("/")[:-1]
     if any(seg in _OVERLAY_SEGMENTS for seg in parts):
+        return True
+    if ext not in _MANIFEST_EXTENSIONS and any(seg in _TEMPLATE_DIR_SEGMENTS for seg in parts):
         return True
     return False
 
@@ -1629,8 +1633,11 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     for r_item in (*a_out.resources, *b_out.resources):
                         if not is_cluster_scoped_kind(r_item.ref.group, r_item.ref.kind) and r_item.ref.namespace:
                             namespaces_touched.add(r_item.ref.namespace)
-                        if _is_production_labels(_resource_meta_labels(r_item)) or _is_production_labels(
-                            effective_ns_labels.get(r_item.ref.namespace, {})
+                        if (
+                            _is_production_labels(_resource_meta_labels(r_item))
+                            or _is_production_labels(effective_ns_labels.get(r_item.ref.namespace, {}))
+                            or _is_production_namespace(r_item.ref.namespace)
+                            or (r_item.ref.group == "" and r_item.ref.kind == "Namespace" and _is_production_namespace(r_item.ref.name))
                         ):
                             ren_prod = True
                     for r_item in a_out.resources:

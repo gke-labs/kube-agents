@@ -1948,6 +1948,71 @@ class TriageEngineHardeningTests(unittest.TestCase):
         self.assertEqual(r_high_cap.blast_radius, BLAST_HIGH)
         self.assertIn("COMPOUND_CAPACITY_HIGH_CAP", {x.code for x in r_high_cap.reasons})
 
+    def test_real_world_fleet_repo_patterns_and_prod_namespaces(self) -> None:
+        # 1. Production namespace detection (`prod-analytics`, `prod-gateway`, `production`)
+        # even when the file path (`manifests/domains/...`) has no `prod` segment, while
+        # `non-prod` / `pre-prod` namespaces never false-positive.
+        prod_ns_before = BASE_DEPLOY.replace("namespace: shop", "namespace: prod-analytics")
+        prod_ns_after = prod_ns_before.replace("replicas: 4", "replicas: 5")
+        r_prod_ns = classify_changes([_mod("manifests/domains/analytics/worker.yaml", prod_ns_before, prod_ns_after)])
+        self.assertEqual(r_prod_ns.risk_level, RISK_MEDIUM)
+        self.assertIn("PRODUCTION_ENVIRONMENT_ESCALATION", {x.code for x in r_prod_ns.reasons})
+
+        nonprod_ns_before = BASE_DEPLOY.replace("namespace: shop", "namespace: non-prod-analytics")
+        nonprod_ns_after = nonprod_ns_before.replace("replicas: 4", "replicas: 5")
+        r_nonprod_ns = classify_changes([_mod("manifests/domains/analytics/worker.yaml", nonprod_ns_before, nonprod_ns_after)])
+        self.assertEqual(r_nonprod_ns.risk_level, RISK_LOW)
+        self.assertNotIn("PRODUCTION_ENVIRONMENT_ESCALATION", {x.code for x in r_nonprod_ns.reasons})
+
+        # 2. Static plain-YAML manifest inside `workloads/<cluster>/templates/*.yaml` (zero `{{ }}`)
+        # classifies concretely (`low`), while templated YAML and `_helpers.tpl` stay `unknown`.
+        bump = BASE_DEPLOY.replace("replicas: 4", "replicas: 5")
+        r_static_tmpl = classify_changes([_mod("workloads/wolfram-auto-01/templates/web-tier-go.yaml", BASE_DEPLOY, bump)])
+        self.assertEqual(r_static_tmpl.risk_level, RISK_LOW)
+        self.assertTrue(r_static_tmpl.supported)
+
+        r_go_tmpl = classify_changes(
+            [_add("workloads/wolfram-auto-01/templates/web.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Values.name }}\n")]
+        )
+        self.assertEqual(r_go_tmpl.risk_level, RISK_UNKNOWN)
+        self.assertFalse(r_go_tmpl.supported)
+
+        r_tpl_helper = classify_changes([_add("workloads/wolfram-auto-01/templates/_helpers.tpl", "{{- define \"x\" -}}y{{- end -}}\n")])
+        self.assertEqual(r_tpl_helper.risk_level, RISK_UNKNOWN)
+        self.assertFalse(r_tpl_helper.supported)
+
+        # 3. GKE declarative `container.gke.io/Cluster` and KubeRay `ray.io/RayCluster` (including nested PodSpec check)
+        gke_cluster = (
+            "apiVersion: container.gke.io/v1\nkind: Cluster\nmetadata:\n  name: fh-h100\n"
+            "spec:\n  location: us-central1\n"
+        )
+        r_gke_cls = classify_changes([_add("clusters/fh-h100/cluster.yaml", gke_cluster)])
+        self.assertEqual(r_gke_cls.risk_level, RISK_HIGH)
+        self.assertTrue(r_gke_cls.supported)
+        self.assertIn("CLOUD_INFRA_CHANGE", {x.code for x in r_gke_cls.reasons})
+
+        ray_priv = (
+            "apiVersion: ray.io/v1\nkind: RayCluster\nmetadata:\n  name: ray-job\n  namespace: ml\n"
+            "spec:\n  headGroupSpec:\n    template:\n      spec:\n        containers:\n"
+            "          - name: ray-head\n            image: rayproject/ray:2.9.0\n"
+            "            securityContext:\n              privileged: true\n"
+        )
+        r_ray_priv = classify_changes([_add("clusters/dev/ray.yaml", ray_priv)])
+        self.assertEqual(r_ray_priv.risk_level, RISK_HIGH)
+        self.assertIn("PRIVILEGED_CONTAINER", {x.code for x in r_ray_priv.reasons})
+        r_ray_priv_prod = classify_changes([_add("clusters/prod/ray.yaml", ray_priv)])
+        self.assertEqual(r_ray_priv_prod.risk_level, RISK_CRITICAL)
+
+        # 4. Runtime K8s reason sorts ahead of non-effective `DOCUMENTATION_ONLY` at equal `low` severity
+        r_doc_and_bump = classify_changes(
+            [
+                _add("README.md", "# Docs\n"),
+                _mod("clusters/dev/web.yaml", BASE_DEPLOY, bump),
+            ]
+        )
+        self.assertEqual(r_doc_and_bump.risk_level, RISK_LOW)
+        self.assertEqual(r_doc_and_bump.reasons[0].code, "WORKLOAD_REPLICA_BUMP")
+
 
 if __name__ == "__main__":
     unittest.main()

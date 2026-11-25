@@ -302,6 +302,15 @@ class ResourceRef:
         return f"{self.group}/{self.kind}" if self.group else self.kind
 
 
+_NON_EFFECTIVE_REASON_CODES = frozenset(
+    {
+        "DOCUMENTATION_ONLY",
+        "COMMENT_OR_WHITESPACE_ONLY",
+        "ALLOWLISTED_METADATA_EDIT",
+    }
+)
+
+
 @dataclass(frozen=True)
 class Reason:
     """One deterministic, structured explanation contributing to a PR verdict."""
@@ -339,8 +348,9 @@ class Reason:
             out["resource"] = self.resource.to_dict()
         return out
 
-    def sort_key(self) -> tuple[int, str, str, tuple[str, str, str, str, str], str, str, str]:
+    def sort_key(self) -> tuple[int, int, str, str, tuple[str, str, str, str, str], str, str, str]:
         sev_rank = -_RISK_COMBINE_RANK.get(self.severity, _RISK_COMBINE_RANK[RISK_UNKNOWN])
+        non_eff_rank = 1 if self.code in _NON_EFFECTIVE_REASON_CODES else 0
         res_key = (
             (
                 self.resource.group,
@@ -352,7 +362,7 @@ class Reason:
             if self.resource is not None
             else ("", "", "", "", "")
         )
-        return (sev_rank, self.code, self.file, res_key, self.field_path, self.message, self.dimension)
+        return (sev_rank, non_eff_rank, self.code, self.file, res_key, self.field_path, self.message, self.dimension)
 
 
 @dataclass(frozen=True)
