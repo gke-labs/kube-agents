@@ -1041,7 +1041,7 @@ func TestTheClusterViewDoesNotHoldTheSessionRouteOff(t *testing.T) {
 		})
 	}
 	t.Run("off", func(t *testing.T) {
-		t.Setenv(a2aSessionClusterViewEnvVar, "")
+		t.Setenv(a2aSessionClusterViewEnvVar, "false")
 		r, cl, _, agent := sessionCapRig(t, nil, tasksAt(150))
 		r.resolveA2ASessionCap(ctx, agent, nil)
 		if gateway, platformAgent := renderedDefaultRoutes(t, agent, nil); gateway != agentv1alpha1.DefaultRouteSession || platformAgent != agentv1alpha1.DefaultRouteSession {

@@ -1022,6 +1022,15 @@ func startGchatRig(t *testing.T, allowed []string, allowAll bool, opts ...func(*
 // arms sessions, so `/session` is answered rather than refused.
 func startGchatRigWith(t *testing.T, spawn spawner, allowed []string, allowAll bool, opts ...func(*Config)) *rig {
 	t.Helper()
+	fill := func(cfg *Config) { cfg.GchatAllowedUsers, cfg.GchatAllowAllUsers = allowed, allowAll }
+	return startRigOnBackend(t, gchatBackend, spawn, append([]func(*Config){fill}, opts...)...)
+}
+
+// startRigOnBackend is a rig whose gateway runs as backend, its fake adapter
+// standing in for that backend; opts fill the config, the backend's
+// allowlist included.
+func startRigOnBackend(t *testing.T, backend string, spawn spawner, opts ...func(*Config)) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -1042,19 +1051,17 @@ func startGchatRigWith(t *testing.T, spawn spawner, allowed []string, allowAll b
 
 	adapter := newFakeAdapter()
 	cfg := &Config{
-		NATSURL:            url,
-		DefaultAddressee:   "platform",
-		IdleTTL:            30 * time.Minute,
-		AttributionSalt:    []byte("test-salt"),
-		GchatAllowedUsers:  allowed,
-		GchatAllowAllUsers: allowAll,
+		NATSURL:          url,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
 	}
 	for _, o := range opts {
 		o(cfg)
 	}
 	logs := &lockedBuffer{}
 	log := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs), nil))
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "gchat", Spawner: spawn, Logger: log})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: backend, Spawner: spawn, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

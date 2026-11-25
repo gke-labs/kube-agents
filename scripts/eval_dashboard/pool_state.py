@@ -27,8 +27,8 @@ which needs the project-level read roles bench/tf/fleet grants it
 gcloud's own words. The default-branch read is one `gh api` call per private
 repository with whatever GitHub credential the job puts in GH_TOKEN, and is
 "not checked" with that reason while it carries none. Not run here: the fleet
-fixtures (fixture_state.py already does), the warm-cache reader grants in the
-Prow project (warm_cache), the GitHub-reading checks that need a credential
+fixtures (fixture_state.py already does), the warm-cache and candidate-image
+reader grants in the Prow project (warm_cache), the GitHub-reading checks that need a credential
 the bot must not hold (github_repo_and_app, gitops_declaration,
 gitops_workload_manifest, ledger_read_credential) and the GitLab read of the same
 fixture (gitlab_workload_manifest), the minter check's signing half (token_minter; the

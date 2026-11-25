@@ -122,6 +122,10 @@ readonly FORGE_VM_BIND_DELAY_S=10
 # not seen yet. Any other failure stops the step at once.
 readonly FORGE_VM_BIND_RETRY_PATTERN="does not exist"
 readonly FORGE_RECORD_TTL=60
+# The Prow project's `us` repositories this project's build and node identities
+# read: the warm cache image's, and the one for per-commit candidate images.
+# scripts/verify_ci_pool_project.py checks the same two (PROW_READ_REPOSITORIES).
+readonly PROW_READ_REPOSITORIES=(kube-agents kube-agents-candidates)
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -517,14 +521,17 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 # Cross-project read of the warm cache image. hack/ci-deploy.sh defaults
 # CACHE_IMAGE to us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest,
 # which lives in the `us` multi-region repository -- not us-central1.
+# The same read on the repository for per-commit candidate images.
 echo "Granting Artifact Registry reader on kube-agents-prow (location: us)..."
-for member in "${CLOUDBUILD_SA}" "${COMPUTE_SA}"; do
-  gcloud artifacts repositories add-iam-policy-binding kube-agents \
-    --project=kube-agents-prow \
-    --location=us \
-    --member="${member}" \
-    --role="roles/artifactregistry.reader" \
-    --quiet >/dev/null
+for repository in "${PROW_READ_REPOSITORIES[@]}"; do
+  for member in "${CLOUDBUILD_SA}" "${COMPUTE_SA}"; do
+    gcloud artifacts repositories add-iam-policy-binding "${repository}" \
+      --project=kube-agents-prow \
+      --location=us \
+      --member="${member}" \
+      --role="roles/artifactregistry.reader" \
+      --quiet >/dev/null
+  done
 done
 
 # The pull-kube-agents-smoke-test job runs on the build-kube-agents cluster, not

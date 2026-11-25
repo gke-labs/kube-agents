@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -42,6 +43,12 @@ const (
 	// sha256sumTextSeparator is what sha256sum writes between a digest and
 	// its path in text mode.
 	sha256sumTextSeparator = "  "
+	// integrityManifestMode is the manifest's file mode: readable by all,
+	// like the files it describes.
+	integrityManifestMode = 0o644
+	// manifestLineBreaks can't appear in a manifest path: each entry is one
+	// line.
+	manifestLineBreaks = "\r\n"
 	// manifestFieldSeparators split a manifest line's digest from its path.
 	manifestFieldSeparators = " \t"
 )
@@ -298,4 +305,114 @@ func FormatIntegrityManifest(files map[string][]byte) []byte {
 		b.WriteString(hex.EncodeToString(sum[:]) + sha256sumTextSeparator + findDotPrefix + rel + "\n")
 	}
 	return []byte(b.String())
+}
+
+// WriteIntegrityManifest writes dir's IntegrityManifestFile over every
+// regular file under it but the root manifest, replacing one already there.
+// A symlink or other non-regular entry is an error: the check would refuse
+// it, so a manifest can't describe it.
+func WriteIntegrityManifest(dir string) error {
+	files := map[string][]byte{}
+	// The trailing separator walks into a dir that is itself a symlink, as
+	// the check does (scanForIntegrity).
+	root := dir + string(filepath.Separator)
+	err := filepath.WalkDir(root, func(full string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, full)
+		rel = filepath.ToSlash(rel)
+		switch {
+		case rel == ".", d.IsDir() && d.Type()&fs.ModeSymlink == 0:
+			return nil
+		case rel == IntegrityManifestFile:
+			return nil
+		case !d.Type().IsRegular():
+			return fmt.Errorf("%s: not a regular file; %s covers regular files only", rel, IntegrityManifestFile)
+		case strings.ContainsAny(rel, manifestLineBreaks):
+			return fmt.Errorf("%q: a line break in a name can't be written as one manifest line", rel)
+		}
+		f, err := openNoFollow(full)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return err
+		}
+		files[rel] = data
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return writeManifestFile(dir, files)
+}
+
+// WriteIntegrityManifestOf writes dir's IntegrityManifestFile over exactly
+// the files rels names (slash-separated, relative to dir), such as a
+// repository's tracked files, so anything else in the directory (an ignored
+// cache, say) is left out and left alone. A name that is not a plain path
+// inside dir, holds a line break, or is not a regular file is an error.
+func WriteIntegrityManifestOf(dir string, rels []string) error {
+	files := map[string][]byte{}
+	for _, rel := range rels {
+		switch {
+		case rel == IntegrityManifestFile:
+			continue
+		case !LocalPath(rel) || path.Clean(rel) != rel:
+			return fmt.Errorf("%q: not a plain path inside the persona", rel)
+		case strings.ContainsAny(rel, manifestLineBreaks):
+			return fmt.Errorf("%q: a line break in a name can't be written as one manifest line", rel)
+		}
+		f, err := openNoFollow(filepath.Join(dir, filepath.FromSlash(rel)))
+		if errors.Is(err, errSymlink) {
+			return fmt.Errorf("%s: not a regular file; %s covers regular files only", rel, IntegrityManifestFile)
+		}
+		if err != nil {
+			return err
+		}
+		data, err := readRegular(f)
+		_ = f.Close() // read-only; readRegular's error is the one that matters
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+		files[rel] = data
+	}
+	return writeManifestFile(dir, files)
+}
+
+// readRegular reads an open file that must be a regular file.
+func readRegular(f *os.File) ([]byte, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file; %s covers regular files only", IntegrityManifestFile)
+	}
+	return io.ReadAll(f)
+}
+
+// writeManifestFile writes files' manifest into dir.
+func writeManifestFile(dir string, files map[string][]byte) error {
+	// Written beside it and renamed over it, so a symlink planted at the
+	// manifest's path is replaced rather than followed.
+	tmp, err := os.CreateTemp(dir, IntegrityManifestFile+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(FormatIntegrityManifest(files)); err != nil {
+		_ = tmp.Close() // the write error is the one to report; the temp file is removed either way
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), integrityManifestMode); err != nil { // #nosec G302 -- a build input committed beside the persona; read by everyone by design
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, IntegrityManifestFile))
 }

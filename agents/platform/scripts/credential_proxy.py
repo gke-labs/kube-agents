@@ -494,7 +494,7 @@ BUSY_BEFORE_ADMISSION_KEY = "before_admission"
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
 # The session role's own share of that pool. Session pods are opened by chat
-# conversations, and under the cluster-view flag all of them draw on the one
+# conversations, and under the session pods' cluster view all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
 # conversation holding slow reads could starve the shell for the slot wait.
 # Counted before the pool is asked, and refused at once rather than queued:
@@ -2558,8 +2558,8 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # backend is the Teams queue's consumer (A2A_TEAMS_BACKEND); only then does the
 # a2a-chat role reach the Teams routes (see _teams_route_roles).
 TEAMS_A2A_CALLER_ENV = "CREDENTIAL_PROXY_TEAMS_A2A_CALLER"
-# The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# The session pod the A2A gateway spawns, under the session pods' cluster
+# view (the session route's default, or the operator's A2A_SESSION_CLUSTER_VIEW). Exec route only, and within it gcloud only
 # (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
 # executes model output, and the read-only posture command_policy enforces is
 # the view it gets. A demo aid until declarative profiles carry a session's
