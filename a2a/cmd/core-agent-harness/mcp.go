@@ -78,13 +78,20 @@ func buildMCP(ctx context.Context, servers []coreagentwire.MCPServer, gate *perm
 		srvs, sets, err := coremcp.Build(coremcp.WithTrustedAgentsDir(ctx, dir), dir, "", mcpLog, gate, nil, nil)
 		done <- built{srvs, sets, err}
 	}()
+	// abandon stops whatever a Build still running started, once it
+	// returns; the process exits on the error meanwhile, and the adapter
+	// ends what it left.
+	abandon := func() {
+		go func() { coremcp.CloseAll((<-done).srvs) }()
+	}
 	var b built
 	select {
 	case b = <-done:
 	case <-time.After(mcpStartBound):
-		// The process exits on this error; the adapter ends what it left.
+		abandon()
 		return nil, func() {}, fmt.Errorf("the MCP servers did not start within %s", mcpStartBound)
 	case <-ctx.Done():
+		abandon()
 		return nil, func() {}, ctx.Err()
 	}
 	closeAll := func() { coremcp.CloseAll(b.srvs) }
@@ -135,12 +142,27 @@ func mcpSpecs(servers []coreagentwire.MCPServer) (map[string]coremcp.ServerSpec,
 	return specs, nil
 }
 
-// checkStarted is the started-check: every granted server is up and lists
-// every tool its entry names, and registers nothing else.
+// checkStarted is the started-check: exactly the granted servers came up,
+// each lists every tool its entry names and registers nothing else, and no
+// tool name is registered twice.
 func checkStarted(granted []coreagentwire.MCPServer, srvs []*coremcp.Server) error {
+	isGranted := make(map[string]bool, len(granted))
+	for _, g := range granted {
+		isGranted[g.Name] = true
+	}
 	byName := make(map[string]*coremcp.Server, len(srvs))
+	registered := map[string]string{}
 	for _, s := range srvs {
+		if !isGranted[s.Name] {
+			return fmt.Errorf("MCP server %q started, but no entry grants it", s.Name)
+		}
 		byName[s.Name] = s
+		for _, t := range s.Tools {
+			if other, dup := registered[t]; dup {
+				return fmt.Errorf("MCP tool %s is registered by both %q and %q", t, other, s.Name)
+			}
+			registered[t] = s.Name
+		}
 	}
 	for _, g := range granted {
 		s := byName[g.Name]
@@ -149,6 +171,11 @@ func checkStarted(granted []coreagentwire.MCPServer, srvs []*coremcp.Server) err
 		}
 		if s.Status != coremcp.StatusOK {
 			return fmt.Errorf("MCP server %q did not start: %v", g.Name, s.Err)
+		}
+		// core-agent reports a server whose tool listing failed (one that
+		// exited, say) as started with no tools.
+		if len(s.Tools) == 0 {
+			return fmt.Errorf("MCP server %q did not start: it lists no tools", g.Name)
 		}
 		want := make([]string, 0, len(g.Tools))
 		for _, t := range g.Tools {

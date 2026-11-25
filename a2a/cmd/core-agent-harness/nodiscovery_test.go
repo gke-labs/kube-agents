@@ -14,9 +14,9 @@ import (
 // core-agent's discovery (config.Load, instruction.Load, skills.Load or
 // skills.LoadAll, mcp.Build), which read AGENTS.md, .agents/ and HOME.
 //
-// One exception: buildMCP calls mcp.Build on the private directory it wrote
-// the Envelope's servers into, with no home directory (a "" third
-// argument), since core-agent exports no builder that takes the servers in
+// One exception: buildMCP calls mcp.Build once, on the private directory it
+// wrote the Envelope's servers into (its dir), with no home directory (a ""
+// third argument), since core-agent exports no builder that takes the servers in
 // memory. Build then reads that one file and nothing else.
 func TestTheHarnessCallsNoDiscovery(t *testing.T) {
 	banned := map[string][]string{
@@ -70,13 +70,18 @@ func TestTheHarnessCallsNoDiscovery(t *testing.T) {
 				if !ok || sel.Sel.Name != "Build" || !strings.HasSuffix(imports[identName(sel.X)], "/pkg/mcp") {
 					return true
 				}
-				if len(call.Args) > 2 {
+				// Only Build(<ctx>, dir, "", ...): dir is buildMCP's own
+				// MkdirTemp result, and no home directory.
+				if len(call.Args) > 2 && identName(call.Args[1]) == "dir" {
 					if lit, ok := call.Args[2].(*ast.BasicLit); ok && lit.Value == `""` {
 						allowed[sel] = true
 					}
 				}
 				return true
 			})
+		}
+		if len(allowed) > 1 {
+			t.Errorf("%s: buildMCP calls mcp.Build %d times; the exception covers one", f, len(allowed))
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			sel, ok := n.(*ast.SelectorExpr)

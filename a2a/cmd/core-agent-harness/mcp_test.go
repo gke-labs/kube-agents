@@ -148,7 +148,7 @@ func TestAGrantedServerThatCannotServeFailsTheTurn(t *testing.T) {
 				s.Env["FAKE_MCP_EXIT"] = "1"
 				return s, pf
 			},
-			want: `"fake"`,
+			want: `"fake" did not start`,
 		},
 		"a command that does not exist": {
 			server: func(t *testing.T) (coreagentwire.MCPServer, string) {
@@ -156,7 +156,7 @@ func TestAGrantedServerThatCannotServeFailsTheTurn(t *testing.T) {
 				s.Command = filepath.Join(t.TempDir(), "missing")
 				return s, pf
 			},
-			want: `"fake"`,
+			want: `"fake" did not start`,
 		},
 		"no granted tools (the whole catalog to core-agent)": {
 			server: func(t *testing.T) (coreagentwire.MCPServer, string) { return fakeServer(t, "fake", "a") },
@@ -270,5 +270,44 @@ func TestAGrantedMCPToolRunsThroughThePolicy(t *testing.T) {
 				t.Errorf("the server ran %q; want %q", got, c.wantRan)
 			}
 		})
+	}
+}
+
+// TestTheStartedCheckRefusesWhatTheGrantDoesNotDescribe: a server no entry
+// grants, a tool its entry doesn't name, and a tool name two servers both
+// register each fail the check.
+func TestTheStartedCheckRefusesWhatTheGrantDoesNotDescribe(t *testing.T) {
+	ok := func(name string, tools ...string) *coremcp.Server {
+		return &coremcp.Server{Name: name, Status: coremcp.StatusOK, Tools: tools}
+	}
+	for name, c := range map[string]struct {
+		granted []coreagentwire.MCPServer
+		srvs    []*coremcp.Server
+		want    string
+	}{
+		"an extra server": {
+			granted: []coreagentwire.MCPServer{{Name: "a", Tools: []string{"x"}}},
+			srvs:    []*coremcp.Server{ok("a", "a_x"), ok("evil", "evil_y")},
+			want:    `"evil" started, but no entry grants it`,
+		},
+		"an extra tool": {
+			granted: []coreagentwire.MCPServer{{Name: "a", Tools: []string{"x"}}},
+			srvs:    []*coremcp.Server{ok("a", "a_x", "a_y")},
+			want:    "registered a_y",
+		},
+		"one name from two servers": {
+			granted: []coreagentwire.MCPServer{{Name: "a", Tools: []string{"b_c"}}, {Name: "a_b", Tools: []string{"c"}}},
+			srvs:    []*coremcp.Server{ok("a", "a_b_c"), ok("a_b", "a_b_c")},
+			want:    "a_b_c is registered by both",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := checkStarted(c.granted, c.srvs); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("err = %v; want it to say %s", err, c.want)
+			}
+		})
+	}
+	if err := checkStarted([]coreagentwire.MCPServer{{Name: "a", Tools: []string{"x"}}}, []*coremcp.Server{ok("a", "a_x")}); err != nil {
+		t.Errorf("an exact match failed: %v", err)
 	}
 }
