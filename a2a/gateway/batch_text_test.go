@@ -45,6 +45,9 @@ func TestTheAskBoundDropsAnUnsentBatchEndOnce(t *testing.T) {
 	if c2.BatchEnd == nil || c2.BatchEnd.Text != "" || c2.BatchEnd.State != lib.StateCompleted {
 		t.Fatalf("sent end after the bound = %+v, want its text cleared, its state kept", c2.BatchEnd)
 	}
+	if p, _ := got.TaskRefFor("p"); p.Attribution != nil {
+		t.Fatal("the parent's attribution survived the bound: an unsent end could still have been sent")
+	}
 	if r.g.batchTextExpired(got, past.Add(time.Minute)) {
 		t.Fatal("the next pass would clear again: the bound would rewrite the record every pass")
 	}

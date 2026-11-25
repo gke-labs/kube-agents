@@ -577,7 +577,8 @@ type BatchEnd struct {
 	Cards    bool           `json:"cards,omitempty"`
 	// Unsent marks a profile parent's batch child whose end couldn't be
 	// published to the parent: Text is kept, and the heal sends it again
-	// (healProfileBatch) and clears this.
+	// (healProfileBatch) and clears this, or the ask bound drops the end
+	// with its text past AskTTL (TaskRef.clearBatchText).
 	Unsent bool `json:"unsent,omitempty"`
 }
 

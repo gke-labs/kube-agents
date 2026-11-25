@@ -1027,4 +1027,18 @@ func TestAHealedProfileParentEndGetsNoBatchEnds(t *testing.T) {
 	if got := childResultsOn(t, r2, "chat", origin.TaskID); len(got) != 0 {
 		t.Fatalf("ends sent to a parent that had ended: %+v", got)
 	}
+	// The child that completed is booked from its own terminal, not
+	// cancelled as live by the parent's release.
+	for _, e := range streamEnvelopes(t, r2.url, lib.TaskInSubject("cluster", kids[0].TaskID)) {
+		if e.env.Kind == lib.KindCancel {
+			t.Fatal("the completed child was cancelled as if it were live")
+		}
+	}
+	rec, _ := r2.g.reg.Get(ctx, conv)
+	if k, _ := rec.TaskRefFor(kids[0].TaskID); k.BatchEnd == nil || k.BatchEnd.State != lib.StateCompleted || k.Canceled {
+		t.Fatalf("completed child's entry = canceled %v end %+v, want its completed end booked", k.Canceled, k.BatchEnd)
+	}
+	if p, _ := rec.TaskRefFor(origin.TaskID); !p.TerminalObserved {
+		t.Fatal("the parent's own end wasn't marked observed by its heal")
+	}
 }

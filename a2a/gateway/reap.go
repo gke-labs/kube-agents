@@ -235,7 +235,9 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	// copy too, from the child's terminal on the stream: bounded from the
 	// child's start, which is never later than that terminal, so the copy
 	// never outlives the stream's. The end itself stays, so the batch still
-	// counts the child ended.
+	// counts the child ended. A profile parent's end that was never sent
+	// (Unsent) can't be sent past this bound either, since the loop above
+	// clears the parent's attribution, so it is dropped with its text.
 	var batchTextIDs []string
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]

@@ -200,7 +200,8 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 		// nothing is held for a wake: the end is sent now and recorded
 		// without its text, which only a wake would read. A send that
 		// failed is recorded Unsent with its text, and the heal sends it
-		// again (healProfileBatch); the parent dedupes on the entry. The
+		// again (healProfileBatch) until AskTTL, when the bound drops it
+		// (TaskRef.clearBatchText); the parent dedupes on the entry. The
 		// last end changes nothing: the parent holds the conversation until
 		// its own end, which is the chain's.
 		if g.profileBatchChildEnded(ctx, rec, parent, child, end) {
