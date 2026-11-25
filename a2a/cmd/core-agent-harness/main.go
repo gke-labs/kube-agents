@@ -42,9 +42,10 @@ import (
 const userID = "worker"
 
 type options struct {
-	personaDir      string
-	personaRequired bool
-	model           string
+	personaDir       string
+	personaRequired  bool
+	model            string
+	compactOverBytes int
 }
 
 func main() {
@@ -68,6 +69,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	var o options
 	fs.StringVar(&o.personaDir, "persona-dir", "", "the rendered persona (instructions.md, skills/<name>/SKILL.md), read once into memory")
 	fs.BoolVar(&o.personaRequired, "persona-required", false, "fail the turn when --persona-dir is missing, rather than run with no persona")
+	fs.IntVar(&o.compactOverBytes, "compact-over-bytes", defaultCompactOverBytes, "compact the conversation before the turn when its history is over this many bytes")
 	fs.StringVar(&o.model, "model", "", "the model name (required)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -138,8 +140,15 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 		return fmt.Errorf("history: %w", err)
 	}
 
+	historyBytes := 0
+	for _, raw := range env.History {
+		historyBytes += len(raw)
+	}
+	compactor := newHistoryCompactor(historyBytes, o.compactOverBytes)
+
 	opts := []agent.Option{
 		agent.WithMode(agent.ModeAutonomous),
+		agent.WithCompactor(compactor),
 		agent.WithGate(gate),
 		agent.WithTools(reg.Tools),
 		agent.WithToolsets(append(append([]adktool.Toolset{}, skillsets...), mcpsets...)),
@@ -156,6 +165,13 @@ func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(
 	}
 
 	emit(coreagentwire.Event{Type: coreagentwire.TypeInit, Session: session, Model: o.model})
+	// A history over the threshold is summarised before the turn: the
+	// summary is a marker event that core-agent's next request starts
+	// from, and the adapter keeps only the events from it on. A summary
+	// that fails leaves the history whole; the turn still runs.
+	if _, err := a.CompactIfNeeded(ctx, ""); err != nil {
+		fmt.Fprintln(os.Stderr, "core-agent-harness: compaction failed; running on the whole history:", err)
+	}
 	m := newMapper(emit)
 	var runErr error
 	for ev, err := range a.Run(ctx, env.Message) {

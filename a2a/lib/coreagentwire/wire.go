@@ -18,10 +18,10 @@ package coreagentwire
 import "encoding/json"
 
 // MaxEnvelopeBytes bounds one turn's Envelope, its trailing newline aside.
-// The harness refuses a larger one, failing the turn. Nothing compacts the
-// history yet, so a long enough conversation reaches it (TODO(#7158):
-// compact before the turn and send only the events from the latest summary
-// on).
+// The harness refuses a larger one, failing the turn. A conversation stays
+// well under it: the harness compacts the history before a turn once it
+// passes a quarter of this, and the adapter keeps only the events from the
+// latest summary on (IsHistoryBoundary).
 const MaxEnvelopeBytes = 16 << 20
 
 // Envelope is one turn's input, a single JSON object on stdin.
@@ -108,4 +108,20 @@ type Usage struct {
 	Output   int32 `json:"output"`
 	Cached   int32 `json:"cached,omitempty"`
 	Thoughts int32 `json:"thoughts,omitempty"`
+}
+
+// IsHistoryBoundary reports whether a conversation event is a compaction
+// summary or a checkpoint. core-agent marks one in its custom metadata and
+// starts every later request from the latest, so the adapter keeps only the
+// events from the latest one on (core-agent's CompactionMetadataKey,
+// CompactionEventTag and CheckpointEventTag).
+func IsHistoryBoundary(event json.RawMessage) bool {
+	var ev struct {
+		CustomMetadata map[string]any `json:"customMetadata"`
+	}
+	if json.Unmarshal(event, &ev) != nil {
+		return false
+	}
+	tag, _ := ev.CustomMetadata["compaction"].(string)
+	return tag == "summary" || tag == "checkpoint"
 }

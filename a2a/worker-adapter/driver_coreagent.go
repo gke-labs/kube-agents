@@ -129,6 +129,11 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	case coreagentwire.TypeEvent:
 		if d.inited && !d.ended && d.conv != nil && d.session != "" && len(ln.Event) > 0 {
 			d.conv.mu.Lock()
+			if coreagentwire.IsHistoryBoundary(ln.Event) {
+				// A compaction summary: core-agent starts its next request
+				// from it, so nothing before it is sent again.
+				d.conv.history[d.session] = nil
+			}
 			d.conv.history[d.session] = append(d.conv.history[d.session], ln.Event)
 			d.conv.mu.Unlock()
 		}
