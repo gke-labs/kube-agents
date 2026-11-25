@@ -327,3 +327,46 @@ func TestCoreAgentNamesNoConfigDir(t *testing.T) {
 		t.Errorf("ConfigDirEnv = %q, want empty", kv)
 	}
 }
+
+// A turn's events join the history only when it completes: a stopped turn
+// (no result) and a failed one leave it as it was.
+func TestACoreAgentTurnJoinsTheHistoryOnlyWhenItCompletes(t *testing.T) {
+	d := newCoreAgentDriver()
+	turn := func(result string) {
+		dec := d.NewDecoder()
+		for _, l := range []string{`{"type":"init","session":"s1","model":"m"}`, `{"type":"event","event":{"n":1}}`} {
+			if _, err := dec.Decode([]byte(l)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if result != "" {
+			if _, err := dec.Decode([]byte(result)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	turn("")                                            // stopped: no result line
+	turn(`{"type":"result","failed":true,"error":"x"}`) // failed
+	if h := d.conv.history["s1"]; len(h) != 0 {
+		t.Fatalf("a stopped or failed turn reached the history: %s", h)
+	}
+	turn(`{"type":"result","text":"ok"}`)
+	if h := d.conv.history["s1"]; len(h) != 1 {
+		t.Fatalf("history has %d events after a completed turn, want 1", len(h))
+	}
+}
+
+// Only the conversation the next turn resumes is kept.
+func TestCoreAgentKeepsOnlyTheResumedConversation(t *testing.T) {
+	d := newCoreAgentDriver()
+	d.conv.history["a"] = []json.RawMessage{json.RawMessage(`{}`)}
+	d.conv.history["b"] = []json.RawMessage{json.RawMessage(`{}`)}
+	d.WithResume(nil, "a")
+	if _, ok := d.conv.history["b"]; ok || len(d.conv.history["a"]) != 1 {
+		t.Errorf("history %v, want only a", d.conv.history)
+	}
+	d.WithResume(nil, "")
+	if len(d.conv.history) != 0 {
+		t.Errorf("a turn that resumes nothing kept %v", d.conv.history)
+	}
+}
