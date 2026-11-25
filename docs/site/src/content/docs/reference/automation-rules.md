@@ -35,6 +35,10 @@ automerge:
   allow:
     - fix: no-pdb
       environments: [dev]
+    - max_risk: low
+      environments: [staging]
+    - max_risk: medium
+      environments: [dev]
   deny:
     - fix: "*"
       environments: [prod]
@@ -43,17 +47,28 @@ automerge:
 `version` is required and must be `1`. `automerge` holds two optional lists, `allow` and `deny`. A
 file with only `version: 1` is valid and allows nothing.
 
-Each rule has exactly two keys:
+Each rule has `environments` plus one target selector:
 
 - `fix`: the kind of fix, named by the audit check that finds the problem. The one kind today is
   `no-pdb`, which adds a missing PodDisruptionBudget. A rule naming any other kind refuses the
   whole file.
+- `max_risk` (in `allow` rules only): the highest deterministic pull request risk level (`low` or
+  `medium`) permitted to carry an auto-merge label when the change is also non-destructive and
+  easily revertable. `high`, `critical`, `unknown`, and `*` are refused in `allow` rules.
+- `risk` (in `deny` rules only): denies risk-based auto-merge at or above that risk level (`low`,
+  `medium`, or `*`). A `deny` rule with `fix: "*"` denies both recipe fixes and risk-based rules in
+  those environments.
 - `environments`: a non-empty list of environment names, written as GKE label values (lowercase
   letters, digits, `_` and `-`, at most 63 characters).
 
-`*` matches every fix or every environment, in deny rules only. An allow rule must name its fix
-and its environments, so a new kind of fix, or a new environment, never merges unattended because
-of a rule written before it existed.
+`*` matches every fix, risk level, or environment, in deny rules only. An allow rule must name its
+fix or `max_risk` level and its environments, so a new kind of fix, or a new environment, never
+merges unattended because of a rule written before it existed.
+
+An install admin can also clamp risk-based auto-merge globally with the `KUBEAGENTS_AUTOMERGE_MAX_RISK`
+environment variable (`low`, `medium`, or `off`). The credential broker computes and applies a
+deterministic `risk:low`, `risk:medium`, `risk:high`, `risk:critical`, or `risk:unknown` label to
+open kube-agents pull requests; callers cannot forge or remove any `risk:*` label.
 
 ## The environment of a fix
 

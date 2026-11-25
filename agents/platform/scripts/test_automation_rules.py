@@ -409,5 +409,96 @@ class TestWithAllow(unittest.TestCase):
             ar.with_allow("{version: 1}\n", "no-pdb", "dev")
 
 
+class TestRiskRules(unittest.TestCase):
+    def test_parse_max_risk_allow_and_risk_deny_rules(self):
+        text = (
+            "version: 1\n"
+            "automerge:\n"
+            "  allow:\n"
+            "    - fix: no-pdb\n"
+            "      environments: [dev]\n"
+            "    - max_risk: low\n"
+            "      environments: [staging]\n"
+            "    - max_risk: medium\n"
+            "      environments: [dev]\n"
+            "  deny:\n"
+            "    - fix: '*'\n"
+            "      environments: [prod]\n"
+            "    - risk: medium\n"
+            "      environments: [staging]\n"
+        )
+        rules = ar.parse(text)
+        self.assertEqual(rules.status, ar.LOADED, rules.error)
+        self.assertTrue(ar.has_risk_allow_rules(rules))
+        # dev allows low and medium
+        self.assertTrue(ar.decide_risk(rules, "low", "dev").allowed)
+        self.assertTrue(ar.decide_risk(rules, "medium", "dev").allowed)
+        # staging allows low, denies medium
+        self.assertTrue(ar.decide_risk(rules, "low", "staging").allowed)
+        self.assertFalse(ar.decide_risk(rules, "medium", "staging").allowed)
+        # prod denied by wildcard `fix: "*"`
+        self.assertFalse(ar.decide_risk(rules, "low", "prod").allowed)
+        # high / critical / unknown are NEVER allowed
+        for blocked in ("high", "critical", "unknown"):
+            self.assertFalse(ar.decide_risk(rules, blocked, "dev").allowed)
+
+    def test_refuses_high_critical_unknown_or_wildcard_in_max_risk_allow(self):
+        for bad in ("high", "critical", "unknown", "*", "bogus"):
+            with self.subTest(bad=bad):
+                rules = ar.parse(f"version: 1\nautomerge:\n  allow:\n    - max_risk: '{bad}'\n      environments: [dev]\n")
+                self.assertEqual(rules.status, ar.INVALID)
+
+    def test_refuses_both_fix_and_max_risk_or_neither(self):
+        both = "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      max_risk: low\n      environments: [dev]\n"
+        neither = "version: 1\nautomerge:\n  allow:\n    - environments: [dev]\n"
+        self.assertEqual(ar.parse(both).status, ar.INVALID)
+        self.assertEqual(ar.parse(neither).status, ar.INVALID)
+
+    def test_decide_risk_enforces_non_destructive_easy_revert_effective_and_install_ceiling(self):
+        rules = ar.parse("version: 1\nautomerge:\n  allow:\n    - max_risk: medium\n      environments: [dev]\n")
+        self.assertTrue(ar.decide_risk(rules, "medium", "dev").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", destructiveness="destructive").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", destructiveness="unknown").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", revertability="moderate").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", effective_changes=False).allowed)
+        self.assertFalse(ar.decide_risk(rules, "medium", "dev", install_max_risk="low").allowed)
+        self.assertTrue(ar.decide_risk(rules, "low", "dev", install_max_risk="low").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", install_max_risk="off").allowed)
+
+    def test_install_max_risk_ceiling_fails_closed_on_invalid_values(self):
+        self.assertIsNone(ar.install_max_risk_ceiling(""))
+        self.assertEqual(ar.install_max_risk_ceiling("low"), "low")
+        self.assertEqual(ar.install_max_risk_ceiling("MEDIUM"), "medium")
+        self.assertEqual(ar.install_max_risk_ceiling("off"), "off")
+        self.assertEqual(ar.install_max_risk_ceiling("high"), "off")
+        self.assertEqual(ar.install_max_risk_ceiling("garbage"), "off")
+
+    def test_known_fix_types_remains_recipe_only(self):
+        self.assertNotIn("low-risk", ar.KNOWN_FIX_TYPES)
+
+    def test_with_allow_and_with_deny_preserve_existing_max_risk_rules(self):
+        text = (
+            "version: 1\n"
+            "automerge:\n"
+            "  allow:\n"
+            "    - max_risk: low\n"
+            "      environments: [dev, staging]\n"
+            "  deny:\n"
+            "    - risk: medium\n"
+            "      environments: [staging]\n"
+        )
+        added_allow = ar.with_allow(text, "no-pdb", "dev")
+        parsed_allow = ar.parse(added_allow)
+        self.assertEqual(parsed_allow.status, ar.LOADED)
+        self.assertTrue(ar.decide(parsed_allow, "no-pdb", "dev").allowed)
+        self.assertTrue(ar.decide_risk(parsed_allow, "low", "staging").allowed)
+
+        added_deny = ar.with_deny(added_allow, "no-pdb", "dev", note="step down after revert")
+        parsed_deny = ar.parse(added_deny)
+        self.assertEqual(parsed_deny.status, ar.LOADED)
+        self.assertFalse(ar.decide(parsed_deny, "no-pdb", "dev").allowed)
+        self.assertTrue(ar.decide_risk(parsed_deny, "low", "dev").allowed)
+
+
 if __name__ == "__main__":
     unittest.main()
