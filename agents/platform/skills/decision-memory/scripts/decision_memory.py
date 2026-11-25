@@ -391,12 +391,39 @@ def _is_already_framed_untrusted(text: str) -> bool:
     )
 
 
+def _unwrap_framed_untrusted_body(text: str) -> str:
+    """Extract the inner payload from a pre-framed untrusted memory block."""
+    raw_body = text or ""
+    if not _is_already_framed_untrusted(raw_body):
+        return raw_body
+    stripped = raw_body.strip()
+    without_footer = stripped[: -len(UNTRUSTED_MEMORY_CLOSE_TAG)]
+    if without_footer.endswith("\n"):
+        without_footer = without_footer[:-1]
+    open_line_idx = without_footer.find(f"\n{UNTRUSTED_MEMORY_OPEN_PREFIX}")
+    if open_line_idx >= 0:
+        after_open = without_footer[open_line_idx + 1 + len(UNTRUSTED_MEMORY_OPEN_PREFIX) :]
+    else:
+        open_idx = without_footer.find(UNTRUSTED_MEMORY_OPEN_PREFIX)
+        if open_idx < 0:
+            return raw_body
+        after_open = without_footer[open_idx + len(UNTRUSTED_MEMORY_OPEN_PREFIX) :]
+    line_end_idx = after_open.find(">\n")
+    if line_end_idx >= 0:
+        return after_open[line_end_idx + 2 :]
+    gt_idx = after_open.find(">")
+    if gt_idx >= 0:
+        inner = after_open[gt_idx + 1 :]
+        return inner[1:] if inner.startswith("\n") else inner
+    return raw_body
+
+
 def _frame_untrusted_memory_text(text: str, src: str) -> str:
-    """Wrap recalled untrusted text in a data-only fence unless already framed."""
-    if _is_already_framed_untrusted(text):
-        return text
-    sanitized = _neutralize_untrusted_memory(text)
-    return UNTRUSTED_MEMORY_WRAPPER_TEMPLATE.format(src=src, sanitized=sanitized)
+    """Unwrap pre-framed text, sanitize the inner payload, and wrap it once."""
+    clean_src = _sanitize_untrusted_source(src) or UNTRUSTED_SOURCE_EXTERNAL
+    raw_body = _unwrap_framed_untrusted_body(text)
+    sanitized = _neutralize_untrusted_memory(raw_body)
+    return UNTRUSTED_MEMORY_WRAPPER_TEMPLATE.format(src=clean_src, sanitized=sanitized)
 
 
 def _canonical_repo_id(raw: Any) -> str:

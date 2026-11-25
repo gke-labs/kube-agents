@@ -530,7 +530,7 @@ func matchExistingProposedOrActive(ev OutcomeEvent, records []Record) string {
 	evRepo := strings.TrimSpace(ev.Repo)
 
 	for _, r := range records {
-		if evRepo != "" && strings.TrimSpace(r.Meta.Repo) != "" && !strings.EqualFold(evRepo, strings.TrimSpace(r.Meta.Repo)) {
+		if evRepo != "" && strings.TrimSpace(r.Meta.Repo) != "" && !SameRepoSlug(evRepo, r.Meta.Repo) {
 			continue
 		}
 		if r.Meta.Type != rtype {
@@ -1494,7 +1494,10 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 					}
 					// Attaching a newly opened PR reference to a PR-less proposed record:
 					// update only missing evidence links without overwriting title, guard, or body.
-					if existing.Meta.Evidence.PullRequest == "" && prRef != "" {
+					// Do not let a backfill event attach to or relabel a live proposed record.
+					isBackfillOntoLive := strings.EqualFold(strings.TrimSpace(ev.Outcome), UntrustedSourceBackfill) &&
+						!strings.EqualFold(strings.TrimSpace(existing.Meta.Evidence.Outcome), UntrustedSourceBackfill)
+					if existing.Meta.Evidence.PullRequest == "" && prRef != "" && !isBackfillOntoLive {
 						existing.Meta.Evidence.PullRequest = prRef
 						existing.Meta.Evidence.RemediationPR = firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
 						existing.Meta.Evidence.BreakingPR = firstNonEmpty(existing.Meta.Evidence.BreakingPR, ev.BreakingPR)
@@ -1734,7 +1737,7 @@ func matchRecordIDByPR(ev OutcomeEvent, byID map[string]Record) string {
 	sort.Strings(ids)
 	evRepo := strings.TrimSpace(ev.Repo)
 	for _, id := range ids {
-		if evRepo != "" && strings.TrimSpace(byID[id].Meta.Repo) != "" && !strings.EqualFold(evRepo, strings.TrimSpace(byID[id].Meta.Repo)) {
+		if evRepo != "" && strings.TrimSpace(byID[id].Meta.Repo) != "" && !SameRepoSlug(evRepo, byID[id].Meta.Repo) {
 			continue
 		}
 		have := strings.TrimSpace(byID[id].Meta.Evidence.PullRequest)
@@ -2206,7 +2209,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 	cleanRepo := strings.TrimSpace(repoID)
 	var repoScoped []Record
 	for _, r := range records {
-		if cleanRepo != "" && strings.TrimSpace(r.Meta.Repo) != "" && !strings.EqualFold(cleanRepo, strings.TrimSpace(r.Meta.Repo)) {
+		if cleanRepo != "" && strings.TrimSpace(r.Meta.Repo) != "" && !SameRepoSlug(cleanRepo, r.Meta.Repo) {
 			continue
 		}
 		repoScoped = append(repoScoped, r)
@@ -4292,7 +4295,7 @@ func SyncRecordsToHindsight(ctx context.Context, hs *HindsightClient, repoID, re
 			continue
 		}
 		recRepo := strings.TrimSpace(r.Meta.Repo)
-		if cleanPrimary != "" && recRepo != "" && !strings.EqualFold(recRepo, cleanPrimary) {
+		if cleanPrimary != "" && recRepo != "" && !SameRepoSlug(recRepo, cleanPrimary) {
 			secondary = append(secondary, r)
 			continue
 		}
@@ -4350,7 +4353,7 @@ func (c *Curator) RunDream(ctx context.Context) (DreamReport, error) {
 		if r.Meta.Status != StatusActive || r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
 			continue
 		}
-		if strings.TrimSpace(c.cfg.RepoID) != "" && strings.TrimSpace(r.Meta.Repo) != "" && !strings.EqualFold(strings.TrimSpace(r.Meta.Repo), strings.TrimSpace(c.cfg.RepoID)) {
+		if strings.TrimSpace(c.cfg.RepoID) != "" && strings.TrimSpace(r.Meta.Repo) != "" && !SameRepoSlug(r.Meta.Repo, c.cfg.RepoID) {
 			continue
 		}
 		if GuardPassesOnHead(c.cfg.RepoDir, r.Meta.Guard, r.Meta.Scope.Resources) {

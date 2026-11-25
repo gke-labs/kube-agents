@@ -4563,3 +4563,143 @@ func TestSecurityHardeningWhitespaceTagsFrontmatterSlugsAndAliasEviction(t *test
 		t.Fatalf("expected okf:acme/primary:ADR-0001 (has=%v) and zero context leak ADR-0099 (leaked=%v, upserted=%v)", hasPrimaryADR, leakedCtxADR, upserted)
 	}
 }
+
+func TestBackfillUntrustedProvenanceAndRepoSlugDreamAndProposalIsolation(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Pin types.go:426: outcome=backfill marks Record untrusted even when Untrusted=false and Role="".
+	backfillOnlyRec := Record{
+		Meta: RecordMeta{
+			Evidence: RecordEvidence{
+				Outcome: "backfill",
+			},
+		},
+	}
+	if !backfillOnlyRec.IsUntrusted() {
+		t.Fatal("expected Record with Evidence.Outcome=\"backfill\" to report IsUntrusted() == true")
+	}
+	if got := backfillOnlyRec.UntrustedSource(); got != UntrustedSourceBackfill {
+		t.Fatalf("expected UntrustedSource() == %q, got %q", UntrustedSourceBackfill, got)
+	}
+
+	// 2. RunDream matches github.com/acme/infra and acme/infra consistently via SameRepoSlug.
+	dreamDir := t.TempDir()
+	driftedRec := Record{
+		Meta: RecordMeta{
+			Type:   RecordTypeDecision,
+			ID:     "DEC-2026-001",
+			Title:  "Enforce replica floor on checkout",
+			Status: StatusActive,
+			Repo:   "https://github.com/acme/infra.git",
+			Date:   "2026-11-20",
+			Scope:  RecordScope{Paths: []string{"clusters/prod/checkout.yaml"}},
+			Guard: &RecordGuard{
+				Rule:     "Keep checkout replicas >= 3",
+				Severity: "block",
+				Expect: &GuardExpect{
+					File:  "clusters/prod/checkout.yaml",
+					Path:  "spec.replicas",
+					Op:    ">=",
+					Value: 3,
+				},
+			},
+		},
+		Body: "## Context\nReplica floor.\n\n## Decision\nKeep >= 3.\n\n## Consequences\nSafe drains.\n",
+	}
+	if err := os.MkdirAll(filepath.Join(dreamDir, "clusters", "prod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dreamDir, "clusters", "prod", "checkout.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n  replicas: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveRecord(dreamDir, &driftedRec); err != nil {
+		t.Fatal(err)
+	}
+	dreamCur, err := NewCurator(CuratorConfig{
+		RepoDir: dreamDir,
+		RepoID:  "acme/infra",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := dreamCur.RunDream(ctx)
+	if err != nil {
+		t.Fatalf("RunDream: %v", err)
+	}
+	if len(report.DemotedDrifted) != 1 || report.DemotedDrifted[0] != "DEC-2026-001" {
+		t.Fatalf("expected DEC-2026-001 demoted via SameRepoSlug match, got %+v", report)
+	}
+
+	// 3. Backfill OutcomeProposed never attaches to or relabels a PR-less live proposed record.
+	propDir := t.TempDir()
+	propCur, err := NewCurator(CuratorConfig{
+		RepoDir: propDir,
+		RepoID:  "acme/infra",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveRes, err := propCur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeLesson,
+		Repo:       "acme/infra",
+		Title:      "Keep checkout memory floor at 512Mi",
+		Rule:       "Keep checkout memory floor at 512Mi",
+		Summary:    "Live incident follow-up without PR yet.",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome(live proposed): %v", err)
+	}
+	backfillFuzzyRes, err := propCur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:      OutcomeSchema,
+		Kind:        OutcomeProposed,
+		RecordType:  RecordTypeLesson,
+		Repo:        "acme/infra",
+		Title:       "Keep checkout memory floor at 512Mi",
+		Rule:        "Keep checkout memory floor at 512Mi",
+		Summary:     "Historical revert PR body.",
+		PullRequest: "#88",
+		Outcome:     UntrustedSourceBackfill,
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome(backfill fuzzy): %v", err)
+	}
+	if backfillFuzzyRes.RecordID == liveRes.RecordID {
+		t.Fatalf("expected backfill proposal to allocate a fresh ID instead of reusing live %q", liveRes.RecordID)
+	}
+	if _, err := propCur.ProcessOutcome(ctx, OutcomeEvent{
+		Schema:      OutcomeSchema,
+		Kind:        OutcomeProposed,
+		RecordID:    liveRes.RecordID,
+		RecordType:  RecordTypeLesson,
+		Repo:        "acme/infra",
+		Title:       "Keep checkout memory floor at 512Mi",
+		PullRequest: "#89",
+		Outcome:     UntrustedSourceBackfill,
+	}, ""); err != nil {
+		t.Fatalf("ProcessOutcome(backfill explicit ID): %v", err)
+	}
+	reloaded, err := LoadRecords(propDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Record{}
+	for _, r := range reloaded {
+		byID[r.Meta.ID] = r
+	}
+	liveAfter, ok := byID[liveRes.RecordID]
+	if !ok {
+		t.Fatalf("missing live record %q after backfill events", liveRes.RecordID)
+	}
+	if liveAfter.IsUntrusted() || liveAfter.Meta.Evidence.PullRequest != "" {
+		t.Fatalf("expected live record %q to remain trusted and PR-less, got untrusted=%v evidence=%+v", liveRes.RecordID, liveAfter.IsUntrusted(), liveAfter.Meta.Evidence)
+	}
+	backfillAfter, ok := byID[backfillFuzzyRes.RecordID]
+	if !ok {
+		t.Fatalf("missing backfill record %q", backfillFuzzyRes.RecordID)
+	}
+	if !backfillAfter.IsUntrusted() || backfillAfter.Meta.Evidence.PullRequest != "#88" {
+		t.Fatalf("expected backfill record %q to be untrusted with PR #88, got untrusted=%v evidence=%+v", backfillFuzzyRes.RecordID, backfillAfter.IsUntrusted(), backfillAfter.Meta.Evidence)
+	}
+}
