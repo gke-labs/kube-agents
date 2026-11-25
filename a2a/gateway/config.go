@@ -1315,7 +1315,7 @@ func FromEnv() (*Config, error) {
 	cfg.DelegationWidthMax = wm
 	if v := strings.TrimSpace(os.Getenv(delegationRoundsEnv)); v != "" {
 		rm, err := strconv.Atoi(v)
-		if err != nil {
+		if err != nil || rm < 1 {
 			return nil, fmt.Errorf("%s %q: need an integer from 1 to %d", delegationRoundsEnv, v, lib.DelegateRoundsCeiling)
 		}
 		cfg.DelegationRoundsMax = rm

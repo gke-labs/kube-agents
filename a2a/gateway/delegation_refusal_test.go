@@ -388,3 +388,71 @@ func TestASecondRoundIsRefusedUnderTheRoundsRuleEvenWhenSetHigher(t *testing.T) 
 		t.Fatalf("%d child submissions after the second round, want %d", n, len(kids))
 	}
 }
+
+// TestAProfileParentsRepeatAfterItsChildrenReportedIsNotToldTheyWillReport:
+// once every child of the first round has sent its end, a second request is
+// refused under delegation.rounds without the line that the tasks it started
+// will still report back, for a batch and for a single child alike.
+func TestAProfileParentsRepeatAfterItsChildrenReportedIsNotToldTheyWillReport(t *testing.T) {
+	t.Parallel()
+	t.Run("batch", func(t *testing.T) {
+		t.Parallel()
+		r := startProfileRig(t)
+		ctx := context.Background()
+		parent, origin, kids := profileBatchParent(t, r, "console:tab-repeat-after-batch", "a", "b")
+		for i, k := range kids {
+			completeChild(t, r, k, fmt.Sprintf("result %d", i+1))
+		}
+		waitFor(t, "both children's ends on the parent's .in", func() bool {
+			return len(childResultsOn(t, r, "chat", origin.TaskID)) == len(kids)
+		})
+		again := delegateArtifactWithParameters(t, "cluster", "look again", targetParams("p1", "us-east1", "c"))
+		again.ArtifactID += "-again"
+		if err := parent.PublishArtifact(ctx, again); err != nil {
+			t.Fatal(err)
+		}
+		var got []lib.DelegationRefusal
+		waitFor(t, "the repeat's refusal on the parent's .in", func() bool {
+			got = refusalsOn(t, r, "chat", origin.TaskID)
+			return len(got) > 0
+		})
+		if len(got) != 1 || got[0].Round != 2 || got[0].Text != roundsRefusal(1, false) {
+			t.Fatalf("refusals on the parent's .in = %+v, want one tagged round 2 with no report-back line", got)
+		}
+	})
+	t.Run("single", func(t *testing.T) {
+		t.Parallel()
+		r := startProfileRig(t)
+		r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
+		ctx := context.Background()
+		conv := "console:tab-repeat-after-single"
+		turn := profileTurn(conv, "chat", nil)
+		turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+		r.adapter.inbox <- turn
+		origin := submissionOn(t, r, "chat")
+		parent := r.execFor(t, origin, "chat")
+		if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "a"))); err != nil {
+			t.Fatal(err)
+		}
+		completeChild(t, r, submissionOn(t, r, "cluster"), "result")
+		waitFor(t, "the child's end on the parent's .in", func() bool {
+			return len(childResultsOn(t, r, "chat", origin.TaskID)) == 1
+		})
+		again := delegateArtifactWithParameters(t, "cluster", "look again", targetParams("p1", "us-east1", "b"))
+		again.ArtifactID += "-again"
+		if err := parent.PublishArtifact(ctx, again); err != nil {
+			t.Fatal(err)
+		}
+		var got []lib.DelegationRefusal
+		waitFor(t, "the repeat's refusal on the parent's .in", func() bool {
+			got = refusalsOn(t, r, "chat", origin.TaskID)
+			return len(got) > 0
+		})
+		if len(got) != 1 || got[0].Round != 2 || got[0].Text != roundsRefusal(1, false) {
+			t.Fatalf("refusals on the parent's .in = %+v, want one tagged round 2 with no report-back line", got)
+		}
+	})
+}
