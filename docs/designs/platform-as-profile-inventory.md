@@ -597,6 +597,7 @@ To move this group, needed: the dial and post-merge state somewhere other than t
 
 ## Designs for the Blockers
 
+- Blocker 4 (#6667): [Reads with no cluster from profile work](profile-reads-with-no-cluster.md), a proposal for a project target for the reads of a project that name no cluster.
 - Blockers 6 and 14 ([#6669](https://github.com/gke-labs/kube-agents/issues/6669), [#6673](https://github.com/gke-labs/kube-agents/issues/6673)): [`platform-as-profile-state-homes.md`](platform-as-profile-state-homes.md) proposes a home for each piece of durable state, for the dial and for the post-merge records.
 - Blocker 7 (#6670): [the broker surface of a profile](profile-broker-surface.md), a proposal for each route and verb that the profile role does not reach.
 - Blocker 11 (#6671): [Hooks, plugins and the local MCP server for profile workers](profile-worker-hooks.md), what a profile worker gets in place of the platform agent's plugins and its local MCP server, without memory.
