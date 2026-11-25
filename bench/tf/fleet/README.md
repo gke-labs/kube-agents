@@ -484,12 +484,14 @@ presubmit provisions its own cluster rather than borrowing slot a or b.
 
 `config-sync.tf` registers `seeded-a` to the project's fleet and turns on GKE-managed Config Sync
 for it, with no RootSync, for a project listed in `var.post_merge_sync_projects` and for no other.
-The list is empty by default, so a project plans and applies none of it until its pool steps are
-done: the reconciler holds `roles/gkehub.editor`, the project has
-`anthosconfigmanagement.googleapis.com`, and the post-merge fixture's deploy key is in its Secret
-Manager ([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) section 5.13). A pull
-request that adds a project to the list is the switch, reviewed like any fixture change; a dev
-fleet passes `-var 'post_merge_sync_projects=["<project>"]'`.
+The list's default names every mapped pool project (`gitops_repo_for_project()` in
+`hack/ci-deploy.sh`), in pool order, each with its pool steps done: the reconciler holds
+`roles/gkehub.editor`, the project has `anthosconfigmanagement.googleapis.com`, and the post-merge
+fixture's read-only deploy key is in its Secret Manager, with the declaration and the budget seeded
+([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) section 5.13). A project not on
+the list plans and applies none of it. Adding a new pool project to the list is the switch, after
+its pool steps, reviewed like any fixture change; a dev fleet passes
+`-var 'post_merge_sync_projects=["<project>"]'`.
 
 ## The one fixture a reconciler writes
 
