@@ -5,8 +5,10 @@
 # and replies with an interim line ("checking cluster namespaces and pods").
 # The session's wake turn read that as a reason to delegate again, and each
 # wake did, until the chain ended on "delegation refused: this conversation
-# has delegated as deep as it may (3)" with nothing answered (#2819). A wake
-# now has no delegate tool, so the chain is one delegation and one wake.
+# has delegated as deep as it may (3)" with nothing answered (#2819). Since
+# #6861 a wake under the depth bound may delegate again, and its guide tells
+# it not to for anything a result says is still running or will follow. This
+# case is the guard on that: an interim line must still end in one answer.
 #
 # What is checked is the refusal itself. The wake's answer has no fixed
 # wording, and it may honestly say only that the platform agent returned an
