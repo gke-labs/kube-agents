@@ -51,7 +51,7 @@ One more source stamps labels at runtime rather than at install: the a2a chatops
 load-bearing the same way Hindsight's are, and for more consumers: the gateway's
 session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
 admits them to NATS by it, the operator's session egress policy selects them by it, and under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the credential broker's and `<name>-kube-proxy`'s ingress policies admit them by it — and a
+session pods' [cluster view](/kube-agents/operator/platformagent-crd/#the-session-pods-cluster-view) the credential broker's and `<name>-kube-proxy`'s ingress policies admit them by it — and a
 NetworkPolicy that selects nothing looks exactly like one that is
 working. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
 runtime rather than installed, so the `kube-agents` half of the footprint query above does not

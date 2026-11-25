@@ -724,6 +724,47 @@ func TestThePlatformAgentCRDBoundsTheDispatchIntervals(t *testing.T) {
 	}
 }
 
+// spec.harness.sessionWorker.type admits only claude-code (or nothing):
+// antigravity is not selectable until its worker isolation lands.
+func TestThePlatformAgentCRDAdmitsOnlyKnownSessionHarnesses(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "platformagent-session-harness"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range []struct {
+		worker *agentv1alpha1.SessionWorkerSpec
+		admit  bool
+	}{
+		{nil, true},
+		{&agentv1alpha1.SessionWorkerSpec{}, true},
+		{&agentv1alpha1.SessionWorkerSpec{Type: "claude-code"}, true},
+		{&agentv1alpha1.SessionWorkerSpec{Type: "antigravity"}, false},
+		{&agentv1alpha1.SessionWorkerSpec{Type: "claude"}, false},
+		{&agentv1alpha1.SessionWorkerSpec{Type: "Claude-Code"}, false},
+	} {
+		agent := a2aTestAgent()
+		agent.Name = fmt.Sprintf("agent-%d", i)
+		agent.Namespace = ns
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+			ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+			SessionWorker: tc.worker,
+		}
+		err := c.Create(ctx, agent)
+		if (err == nil) != tc.admit {
+			t.Errorf("case %d (%+v): err %v, want admit=%v", i, tc.worker, err, tc.admit)
+		}
+		if err == nil {
+			_ = c.Delete(ctx, agent)
+		}
+	}
+}
+
 // A declared parameter is a lower-case identifier, named once.
 func TestTheAgentProfileCRDBoundsItsParameters(t *testing.T) {
 	cfg, scheme := startEnvtestConfig(t)

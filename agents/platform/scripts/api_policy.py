@@ -229,6 +229,7 @@ def project_gke_cluster_list(body: bytes) -> bytes | None:
 # The cluster read the shim's get-credentials check uses; the broker refuses it
 # for an excluded cluster when the check's header is set
 # (credential_proxy.GET_CREDENTIALS_CHECK_HEADER).
+GKE_CLUSTER_LIST_RULE = "gcp.api.container.clusters-list"
 GKE_CLUSTER_GET_RULE = "gcp.api.container.clusters-get"
 
 API_READ_ROUTES: tuple[ApiRoute, ...] = (
@@ -288,7 +289,7 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         "container.googleapis.com",
         API_READ_METHOD,
         re.compile(rf"^v1/projects/{PROJECT}/locations/{GKE_LOCATION}/clusters$"),
-        "gcp.api.container.clusters-list",
+        GKE_CLUSTER_LIST_RULE,
         project_gke_cluster_list,
     ),
     ApiRoute(

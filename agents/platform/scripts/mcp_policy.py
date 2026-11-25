@@ -122,6 +122,15 @@ NODE_POOL_RESOURCE = re.compile(
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)/nodePools/[a-z0-9][a-z0-9-]*"
 )
 NODE_POOL_TOOL = "get_node_pool"
+# The gke project-wide listing tools whose replies drop excluded clusters
+# (`filter_listing_reply`, #7031), and the list each reply carries.
+GKE_LISTING_TOOLS = {"list_clusters": "clusters", "list_operations": "operations"}
+# Where a listed cluster or operation names its cluster: a cluster's selfLink,
+# an operation's targetLink (a node pool's link names its cluster too).
+LISTING_LINK_KEYS = {"clusters": "selfLink", "operations": "targetLink"}
+LINKED_CLUSTER = re.compile(
+    r"/projects/(?P<project>[^/]+)/(?:locations|zones)/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)(?:/|\Z)"
+)
 # The arguments a cluster-metadata tool names its resource in: get_cluster and
 # get_node_pool take `name`, list_node_pools `parent`.
 METADATA_NAME_ARGUMENTS = ("name", "parent")
@@ -487,3 +496,75 @@ def metadata_tool_clusters(server_name: str, message: dict[str, Any] | None) -> 
             return []
         clusters.append((match["project"], match["location"], match["cluster"]))
     return clusters
+
+
+def filter_listing_reply(tool: str, body: bytes, excluded) -> bytes | None:
+    """A gke listing tool's JSON-RPC reply less the clusters (or the operations on
+    clusters) for which excluded(project, location, cluster) is true, or None
+    when the reply isn't a shape the broker can read, which the caller refuses.
+
+    The server answers in two places, `content[].text` (a JSON document) and
+    `structuredContent`, each holding the list, whose items are JSON objects or
+    JSON strings encoding one. Each is filtered and written back in the form it
+    came in. Every item has to name its cluster through its link; one that
+    doesn't makes the whole reply unreadable. So does a reply with neither
+    carrier, or a carrier without the list: that fails closed, including an empty
+    listing whose server leaves the empty list out.
+    """
+    key = GKE_LISTING_TOOLS.get(tool)
+    if key is None:
+        return body
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return None
+    result = message.get("result") if isinstance(message, dict) else None
+    if not isinstance(result, dict) or result.get("isError"):
+        return body
+
+    def keep(items):
+        if not isinstance(items, list):
+            return None
+        kept = []
+        for item in items:
+            obj = item
+            if isinstance(item, str):
+                try:
+                    obj = json.loads(item)
+                except ValueError:
+                    return None
+            link = obj.get(LISTING_LINK_KEYS[key]) if isinstance(obj, dict) else None
+            match = LINKED_CLUSTER.search(link) if isinstance(link, str) else None
+            if match is None:
+                return None
+            if not excluded(match["project"], match["location"], match["cluster"]):
+                kept.append(item)
+        return kept
+
+    carriers = 0
+    for entry in result.get("content") or []:
+        if not isinstance(entry, dict) or entry.get("type") != "text":
+            return None
+        try:
+            document = json.loads(entry.get("text", ""))
+        except ValueError:
+            return None
+        if not isinstance(document, dict) or key not in document:
+            return None
+        kept = keep(document[key])
+        if kept is None:
+            return None
+        entry["text"] = json.dumps({**document, key: kept}, separators=(",", ":"))
+        carriers += 1
+    structured = result.get("structuredContent")
+    if structured is not None:
+        if not isinstance(structured, dict) or key not in structured:
+            return None
+        kept = keep(structured[key])
+        if kept is None:
+            return None
+        result["structuredContent"] = {**structured, key: kept}
+        carriers += 1
+    if not carriers:
+        return None
+    return json.dumps(message, separators=(",", ":")).encode()

@@ -136,6 +136,16 @@ task, then its answer
 ([`bench/kube_agents_bench/session_cap.py`](../../bench/kube_agents_bench/session_cap.py)). A cap
 above `max-cap`, or one the fillers did not hold, is infrastructure; the ask's POST refused with the
 cap's own text is the graded red. Inject transport only.
+A first line of `[bench:burst-reads]`, optionally with `levels=<n>,<n>,...` (strictly ascending,
+default `1,3,6`), with a `/session` ask under it, measures concurrent sessions: for each level in
+turn the harness opens that many conversations through the inject door at once, each with the ask,
+follows every one to its terminal, cancels and fails any still running at `AGENT_INJECT_TIMEOUT`, and
+starts the next level only when this one has ended and every cancelled session has been released. It writes `harness_burst_reads`, completed when every
+conversation ended completed, with the per-level and per-conversation record (keys, task ids,
+terminal states, submit and end times) as its arguments
+([`bench/kube_agents_bench/burst_reads.py`](../../bench/kube_agents_bench/burst_reads.py)). A
+session cap below the highest level, a conversation queued or refused at submit or never started,
+and a door outage are infrastructure. Inject transport only.
 
 A first line that opens with `[bench:` and names none of these directives is infrastructure: the
 harness does not send a directive it does not know to the agent as text. A pull request is graded
@@ -396,7 +406,10 @@ lead), `report_times_in_window` (every date and time on a report line one of its
 `max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
 the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
+published; its `required_patterns` and `forbidden_patterns` are regular expressions searched over
+the text its phrases read under the same `scope`, without regard to case and with its line breaks
+kept, for a claim no substring binds, such as a check, a cluster and a severity on one findings row;
+`{cluster:<slot>}` is not expanded there and is refused), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
 names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds, including whether an added PodDisruptionBudget lets the planted workload drain), `github_writes` (every pull request or branch under the agent's
@@ -841,10 +854,15 @@ Without the package the rule does not run, and the target's last line, on stderr
 The same holds when the installed package is another checkout's, or a copy that an install
 made: the line then says that the package is installed, but behind the tree. Only an editable
 install of this checkout counts. The rule knows the check types and the fields of the
-installed package and of the installed devops-bench, so after a pull that changes
-`bench/pyproject.toml`, install again: `make test-bench-deps` brings the package's entry
-points up to date; for a new devops-bench pin use `uv sync` in `bench/` or a new environment,
-because pip can keep the old commit when the version did not change.
+installed package and of the installed devops-bench, and an editable install does not follow a
+pull that changes `bench/pyproject.toml`. The target therefore compares two things with that
+file: the installed entry points of the `devops_bench.verifiers` group, and the commit of the
+installed devops-bench (an install with no recorded git commit differs). When one differs, the
+rule does not run, and the line names each difference. Then install again:
+`make test-bench-deps` brings the package's entry points up to date; for a new devops-bench
+pin, uninstall devops-bench first or use a new environment, because pip can keep the old commit
+when the version did not change. `uv sync` in `bench/` updates `bench/.venv` only, which the
+target reads only when that environment's `python3` runs it.
 The lint's job does not install the package; `bench/tests/test_case_entries_load.py` holds
 the rule in the job that does, over every case in the tree.
 

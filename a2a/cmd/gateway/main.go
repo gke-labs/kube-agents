@@ -224,6 +224,10 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("config", "err", err)
 		return err
 	}
+	if cfg.SessionHarnessRefused != "" {
+		log.Error("A2A_SESSION_HARNESS names a harness this gateway doesn't spawn sessions for; session pods run the default harness (claude-code)",
+			"harness", cfg.SessionHarnessRefused)
+	}
 	// The install's Tier resources, rendered by the operator (#3659): the
 	// mint validates every grant against the tier table.
 	capability.StartTierFile(ctx, os.Getenv, log)

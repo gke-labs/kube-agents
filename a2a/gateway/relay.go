@@ -150,7 +150,7 @@ var reasonSentences = map[string]string{
 
 // reasonDetailShown names the tokens whose detail is written for the
 // person: the verifier's rule (capability.Reason), the dispatcher's
-// admission wording, a delegation's own why. That detail is shown, cut
+// admission wording, a delegation's own why, a write refusal's verb. That detail is shown, cut
 // before any session id (reasonSessionMarker).
 var reasonDetailShown = map[string]bool{
 	"capability-refused":     true,
@@ -158,6 +158,9 @@ var reasonDetailShown = map[string]bool{
 	"parameters-invalid":     true,
 	"queue-timeout":          true,
 	"delegation-not-started": true,
+	// A task stopped at its first write refusal (worker-adapter
+	// writeRefusedReason): the refused verb, and that the change was not made.
+	"write-refused": true,
 }
 
 // KV access rides withRetry with these shapes: enough to ride out a
@@ -1142,6 +1145,12 @@ func reasonInPlainWords(reason string) (string, bool) {
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
 	ref, _ := rec.TaskRefFor(taskID)
+	// A profile task's own terminal, the executor's or the supervisor's,
+	// ends its wait: its live children, a batch or a single child holding
+	// the conversation, are cancelled now. Nothing else here triggers it.
+	if !ref.Canceled {
+		g.cancelOrphanedChildren(ctx, rec, taskID)
+	}
 	// A task the gateway canceled posts nothing at its end: no turn answer,
 	// result, notice or steer shortfall (applyCanceledEvent). Its line is
 	// still closed below, once, and its end logged and observed. A task with
@@ -1407,14 +1416,17 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, onLine), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
-		if !active.Detached && rec.fanOutPending(taskID) {
+		if !active.Detached && rec.fanOutPending(taskID) && !rec.profileTask(taskID) {
 			// A turn whose batch is still running keeps the conversation
 			// until the last child ends (wakeBatch releases it): a stop
 			// reaches it, a steer is refused and a status lists the
-			// children. Its line is closed above.
+			// children. Its line is closed above. A profile parent's
+			// terminal is its real end, not a hand-off: it waited open for
+			// its children and stopped waiting, so it lets go here as any
+			// task does, and its children are cancelled (cancelOrphanedChildren).
 			active.StatusMsgID = ""
 		} else {
-			rec.ActiveTask = nil
+			g.releaseEndedTask(ctx, rec, active)
 		}
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts

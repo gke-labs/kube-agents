@@ -307,9 +307,17 @@ const (
 	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
-	a2aWorkerImageEnvVar   = "A2A_WORKER_IMAGE"
-	a2aImagePullRefsEnvVar = "A2A_IMAGE_PULL_REFS"
-	a2aImagePullRefsSep    = ","
+	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
+	// a2aSessionHarnessEnvVar carries spec.harness.sessionWorker.type to
+	// the gateway (a2a/gateway/config.go reads it).
+	a2aSessionHarnessEnvVar = "A2A_SESSION_HARNESS"
+	// sessionHarnessCondition is False (reason sessionHarnessReasonNotSupported)
+	// while spec.harness.sessionWorker.type names a harness this operator
+	// doesn't render, and absent otherwise.
+	sessionHarnessCondition          = "SessionHarness"
+	sessionHarnessReasonNotSupported = "SessionHarnessNotSupported"
+	a2aImagePullRefsEnvVar           = "A2A_IMAGE_PULL_REFS"
+	a2aImagePullRefsSep              = ","
 
 	// a2aInjectBackendEnvVar arms the gateway's inject backend, and it is
 	// read from the CONTROLLER's environment rather than from the CR.
@@ -352,9 +360,11 @@ const (
 	// broker's `session` role for read-only gcloud. A demo aid until
 	// declarative profiles (spec-subagent-profiles) carry a session's
 	// identity and tools; the flag and everything it renders go when they
-	// do. Operator-level and off by default for the reason
-	// a2aInjectBackendEnvVar is: the pod executes model output, and what
-	// widens its fence is a property of who deployed the operator.
+	// do. Since 2026-11-20 the view is on by default for the session route
+	// (#6538), and the flag is an operator-level override: "true" turns it
+	// on on any route, "false" turns it off on the session route
+	// (a2aSessionClusterViewEnabled). Unset, it follows the route, so a
+	// platform-route install still gets no view.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
 	// The platform agent's trusted-human allowlists, handed to the gateway
 	// so a session's request to delegate to the platform agent is checked
@@ -1971,11 +1981,23 @@ func a2aChatDisplayMode(mode string) string {
 }
 
 // a2aSessionClusterViewEnabled reports whether this install's session pods
-// get the temporary cluster view: the literal "true" on the operator, and a
-// mode-next CR (nothing else spawns a session pod). Anything but "true" is
-// off, so a typo leaves the fence as it is.
+// get the temporary cluster view (#6538, #6987). Since 2026-11-20 the view is
+// on by default for the session route: with the operator's
+// A2A_SESSION_CLUSTER_VIEW unset (or empty), it is on exactly when the resolved route is
+// session (resolveA2ADefaultRoute, so its fallbacks to platform turn it off
+// too). The flag overrides it until the view is replaced by the profile path
+// (#6483): "true" turns it on whatever the route, as before, and "false"
+// turns it off on the session route too. Any other value is off, so a typo
+// never widens the fence.
 func a2aSessionClusterViewEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return os.Getenv(a2aSessionClusterViewEnvVar) == "true"
+	switch os.Getenv(a2aSessionClusterViewEnvVar) {
+	case "true":
+		return true
+	case "":
+		return resolveA2ADefaultRoute(agent) == agentv1alpha1.DefaultRouteSession
+	default:
+		return false
+	}
 }
 
 // a2aCapabilityRequired renders "false" only for an explicit "false", so a
@@ -3510,7 +3532,7 @@ func buildA2ANATSPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruption
 // the operator, so it uses the standard key; operator-rendered pieces carry
 // a2aComponentLabel). Everything that selects session pods must agree on this
 // pair: the bus fence's session peer, the session fence's own podSelector,
-// the broker fence's session peer under the cluster-view flag, and the
+// the broker fence's session peer under the session pods' cluster view, and the
 // gateway's session cap and sweeper, which count and list pods by it. The
 // operator's selectors all come from a2aSessionPodSelector so they cannot
 // drift apart.
@@ -3541,7 +3563,7 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 //
 // Deny-by-default with three destinations, which is the whole of a worker's
 // job description (plus a fourth, the credential broker on its one port, only
-// under the operator's cluster-view flag; see the rule at the end):
+// under the session pods' cluster view; see the rule at the end):
 //
 //	DNS       — name resolution for the two peers below, same peer set the
 //	            agent's egress policy uses so the two cannot drift on what DNS
@@ -3615,7 +3637,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The credential broker (and its exec tier while it renders) for gcloud,
-		// plus kube-proxy for kubectl, under the cluster-view flag. Both
+		// plus kube-proxy for kubectl, under the session pods' cluster view. Both
 		// authenticate the session pod's projected token.
 		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
 		if credentialProxyExecTierEnabled(agent) {
@@ -3647,8 +3669,8 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 			// PlatformAgent per cluster, so two agents' session pods never
 			// share a namespace; were that rule ever relaxed, each agent's
 			// fence would select the other's pods too, and what would then
-			// separate them is the bus grants at auth and, under the
-			// cluster-view flag, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
+			// separate them is the bus grants at auth and, under the session
+			// pods' cluster view, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
 			// and session-callers binding — not this selector.
 			PodSelector: metav1.LabelSelector{
 				MatchLabels: a2aSessionPodSelector(),
@@ -7283,6 +7305,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
 			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
 			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
+			{Name: "A2A_KUBE_PROXY_MODE", Value: kubeProxyMode},
 		}
 		// The kubectl admission's tier, normalised as for the shell sandbox;
 		// the spawner sets it on each session pod beside KUBE_PROXY_URL.
@@ -7615,6 +7638,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, a2aTierMembershipEnv(agent)...)
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
+	}
+	// The session worker's harness (spec.harness.sessionWorker.type), only
+	// when set: an install that leaves it out renders the gateway it had,
+	// so an operator upgrade doesn't roll the gateway for it. The gateway
+	// reads unset as Claude Code.
+	if t := a2aSessionHarness(agent); t != "" {
+		env = append(env, corev1.EnvVar{Name: a2aSessionHarnessEnvVar, Value: t})
 	}
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
@@ -9804,4 +9834,66 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionHarnessSpec is spec.harness.sessionWorker.type as written, ""
+// when unset.
+func a2aSessionHarnessSpec(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.SessionWorker == nil {
+		return ""
+	}
+	return agent.Spec.Harness.SessionWorker.Type
+}
+
+// a2aSessionHarnessSupported is whether the operator renders a session
+// harness: claude-code. Antigravity joins when its worker isolation lands.
+func a2aSessionHarnessSupported(t string) bool {
+	return t == agentv1alpha1.AgentProfileHarnessClaudeCode
+}
+
+// a2aSessionHarness is the session harness the gateway is given: the
+// spec's value when this operator supports it, else "". An unsupported
+// value (a CRD that admitted more than this operator knows) is not
+// rendered, so the shared gateway keeps serving and session pods run the
+// default harness; syncSessionHarness says so on the SessionHarness
+// condition and in a Warning event. A refused AgentProfile only loses its
+// own pool, so it is refused instead (HarnessNotSupported).
+func a2aSessionHarness(agent *agentv1alpha1.PlatformAgent) string {
+	if t := a2aSessionHarnessSpec(agent); a2aSessionHarnessSupported(t) {
+		return t
+	}
+	return ""
+}
+
+// syncSessionHarness writes the SessionHarness condition: False with
+// reason SessionHarnessNotSupported, and a Warning event once it is first
+// stored, while the spec names a session harness this operator doesn't
+// render; removed once the value is supported or unset.
+func (r *PlatformAgentReconciler) syncSessionHarness(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	t := a2aSessionHarnessSpec(agent)
+	if t == "" || a2aSessionHarnessSupported(t) {
+		if meta.RemoveStatusCondition(&agent.Status.Conditions, sessionHarnessCondition) {
+			return r.Status().Update(ctx, agent)
+		}
+		return nil
+	}
+	msg := fmt.Sprintf("spec.harness.sessionWorker.type %q is not a harness this operator renders (supported: %s); session pods run the default harness, %s", t, agentv1alpha1.AgentProfileHarnessClaudeCode, agentv1alpha1.AgentProfileHarnessClaudeCode)
+	prior := meta.FindStatusCondition(agent.Status.Conditions, sessionHarnessCondition)
+	first := prior == nil || prior.Reason != sessionHarnessReasonNotSupported || prior.Message != msg
+	if !meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: sessionHarnessCondition, Status: metav1.ConditionFalse, Reason: sessionHarnessReasonNotSupported,
+		Message: msg, ObservedGeneration: agent.Generation,
+	}) {
+		return nil
+	}
+	// The event only once the condition is stored: a write that conflicts
+	// leaves the condition unstored, so the next pass would read it as
+	// first and warn again.
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	if first {
+		r.recordEvent(agent, "Warning", sessionHarnessReasonNotSupported, msg)
+	}
+	return nil
 }

@@ -783,8 +783,7 @@ Layout:
   ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
-  other legitimate destination, save the credential broker on its one port when the
-  operator's `A2A_SESSION_CLUSTER_VIEW` flag is on; see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
+  other legitimate destination, save the credential broker on its one port under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it); see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
   ServiceAccount and a projected bus token, so the reason for the fence's shape changed
   while the fence did not. The kubelet delivers that token through a volume, so the
   credential arrives without the pod dialling anything, and this policy is what withholds
