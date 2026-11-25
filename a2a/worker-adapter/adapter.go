@@ -109,8 +109,8 @@ type Config struct {
 	// Claude Code, the harness every argv below is built for.
 	Driver Driver
 	// PersonaMCP are the persona's MCP servers, for a harness that takes
-	// them in-process (core-agent): each turn's are built from these, plus
-	// the delegate server when the turn may delegate.
+	// them in-process (core-agent): each turn's are built from these (and,
+	// once #6789 lands, the delegate server when the turn may delegate).
 	PersonaMCP []persona.MCPServer
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
