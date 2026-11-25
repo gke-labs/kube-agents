@@ -1261,7 +1261,12 @@ Lifecycle:
     violation counter has to know it: per-subject CAS cannot span two subjects, so the
     janitor's terminal on `…supervisor` is no longer serialized against the executor's own
     terminal on `…events`. A genuine race produces exactly one counted post-final drop, and
-    the counter does not distinguish it from a forged one. The one exception to "exactly
+    the counter does not distinguish it from a forged one. A second expected case: the
+    dispatcher's terminal on a profile task's `…supervisor` written twice, identical (a
+    dispatcher restart between its publish and its settle, or, on the six-token form, a
+    send whose ack was lost: its envelope id is drawn again after a failed send, #6883);
+    readers take the first, and the second is one counted post-final drop on every read
+    of the task. The one exception to "exactly
     one" is a profile task on a latched install settled with the reason
     `terminal-unpublished` (#5301): the dispatcher's six-token terminal was refused for its
     whole retry bound, so no terminal is written.

@@ -626,13 +626,16 @@ leave open:
   On the five-token form a terminal's envelope id is fixed per task, so a retry after a lost ack
   is a duplicate the stream drops. The duplicate window is keyed on the id alone, whatever the
   subject, so a fixed id is one another writer could store a message under first. On the
-  six-token form the id is therefore 128 random bits, drawn once per retry loop and kept in the
-  dispatcher's memory (#6883): a retry in the loop is a duplicate the stream drops, and since no
-  other writer can predict the id, a duplicate ack is always that loop's own earlier send. There
-  is no read-back and no grant for one. The cost is a dispatcher that restarts between the
-  publish and the settle: the redelivery writes the terminal again under a new id, so the
-  subject can hold two identical final statuses. Every reader takes the first final status as
-  the task's end; a later one, identical or not, is a post-final drop (`PostFinalDropped`).
+  six-token form the id is therefore 128 random bits from crypto/rand, kept in the dispatcher's
+  memory while sends succeed and drawn again after any that fails (#6883): no other writer can
+  predict it, or plant one it saw on a send that reached subscribers without being stored, so a
+  duplicate ack is always the terminal's own earlier send. There is no read-back and no grant for
+  one. The cost: a send stored but whose ack was lost, or a dispatcher that restarts between the
+  publish and the settle of a held task, writes the terminal again under a new id, so the subject
+  can hold two identical final statuses. Every reader takes the first final status as the task's
+  end; a later one is a post-final drop (`PostFinalDropped`), counted and logged on each read. The
+  five-token form keeps the fixed id, and with it the planting gap this closes on the six-token
+  form: on an unlatched install readers take any supervisor terminal anyway.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for

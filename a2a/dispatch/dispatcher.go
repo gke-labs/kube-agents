@@ -989,8 +989,10 @@ func (d *Dispatcher) followHolder(ctx context.Context, log *slog.Logger, del lib
 // written the refusal stands, so its terminal is owed even to a stop, for up
 // to reportAfterStop; one still unpublished then (or lost to a crash) stays
 // unpublished, since the redelivery finds the tombstone and is acked as a
-// replay. A repeat terminal is a duplicate the stream drops (its envelope id
-// is fixed).
+// replay. A repeat terminal after a lost ack is a duplicate the stream drops
+// on the five-token form (its envelope id is fixed per task); on the
+// six-token form, whose id is drawn again after a failed send, it can be a
+// second identical final status, which readers fold past.
 func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, ref *refusal) {
 	d.endUnstarted(ctx, log, del, hk, lib.StateRejected, ref)
 }
@@ -1694,7 +1696,7 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 // terminalRefusal is one terminal's retry state across its attempts: the
 // start of its run of permission refusals, for terminalGivenUp's bound, and
 // the six-token terminal's envelope id (sixTokenTerminalID), drawn on the
-// first attempt, so every attempt of the loop dedupes onto the others.
+// first attempt and again after any attempt that fails (publishTerminal).
 type terminalRefusal struct {
 	since time.Time
 	id    string

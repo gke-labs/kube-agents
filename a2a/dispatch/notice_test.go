@@ -322,9 +322,9 @@ func TestAPlantedTerminalIDDoesNotSwallowTheSixTokenTerminal(t *testing.T) {
 	}
 }
 
-// The six-token terminal's id is drawn once per retry loop: a repeat in the
-// same loop (a retry after a lost ack) is the stream's duplicate and stores
-// nothing more, while a second loop (a dispatcher that restarted between the
+// The six-token terminal's id is kept while sends succeed: a repeat after a
+// send that landed is the stream's duplicate and stores nothing more, while
+// a second loop (a dispatcher that restarted between the
 // publish and the settle) stores a second identical final status under its
 // own id, which readers fold past. That is the cost the random id carries.
 func TestTheSixTokenTerminalIDIsOnePerRetryLoop(t *testing.T) {
@@ -583,15 +583,18 @@ func TestAnotherTiersTerminalIsItsOwnMessage(t *testing.T) {
 	}
 }
 
-// A six-token publish that fails transiently is an ordinary retry, not a
-// give-up, and the retry goes out under the same id: whether the failed send
-// was stored (its ack lost) or not, exactly one terminal lands, with no
-// give-up and no Error log.
-func TestATransientPublishErrorRetriesUnderTheSameID(t *testing.T) {
+// A six-token publish that fails is an ordinary retry, not a give-up, and the
+// retry goes out under a new id: the failed send may have reached the
+// subject's subscribers unstored, so its id is never reused. A failed send
+// that was never stored leaves one terminal; one stored with its ack lost
+// leaves a second identical one, which readers fold past. Neither gives up or
+// logs at Error.
+func TestAFailedPublishRetriesUnderANewID(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		stored bool // the failed publish was stored, its ack lost
-	}{{"not stored", false}, {"ack lost", true}} {
+		want   uint64
+	}{{"not stored", false, 1}, {"ack lost", true, 2}} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newBus(t, "tse-0")
 			b.ensure("tse", 2, 0, "read")
@@ -627,20 +630,57 @@ func TestATransientPublishErrorRetriesUnderTheSameID(t *testing.T) {
 			if !d.publishTerminalRetry(ctx, log, del, h, lib.StateFailed, ReasonLeaseExpired, "") {
 				t.Fatal("the terminal never landed")
 			}
-			if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-flaky")); n != 1 {
-				t.Errorf("%d terminals on the six-token subject, want 1", n)
+			if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-flaky")); n != tc.want {
+				t.Errorf("%d terminals on the six-token subject, want %d", n, tc.want)
 			}
 			if n := d.Health().SupervisorGiveUps; n != 0 {
 				t.Errorf("supervisorGiveUps = %d, want 0", n)
 			}
 			if out := logs.String(); out != "" {
-				t.Errorf("Error logs on a transient publish error:\n%s", out)
+				t.Errorf("Error logs on a failed publish:\n%s", out)
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if len(ids) != 2 || ids[0] != ids[1] {
-				t.Errorf("publish ids %v, want the same id twice", ids)
+			if len(ids) != 2 || ids[0] == ids[1] {
+				t.Errorf("publish ids %v, want a new id on the retry", ids)
 			}
 		})
+	}
+}
+
+// A send that reached the subject's subscribers but wasn't stored shows its
+// id to anyone listening, who could store a message under it on another
+// subject before the retry. The retry's new id isn't that one, so the real
+// terminal still lands.
+func TestAnIDSeenOnAnUnstoredSendDoesNotSwallowTheRetry(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	h := &holding{profile: "tse", tier: "read", kind: lib.SubmitKindTop, taskID: "task-seen"}
+	calls := 0
+	d.publishAck = func(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error) {
+		calls++
+		if calls == 1 {
+			// The send went out unstored; a listener plants its id.
+			plant := nats.NewMsg(lib.TaskSupervisorSubject("tse", "task-seen"))
+			plant.Header.Set(jetstream.MsgIDHeader, env.EnvelopeID)
+			plant.Data = []byte(`{}`)
+			if _, err := b.js.PublishMsg(ctx, plant); err != nil {
+				t.Error(err)
+			}
+			return 0, false, nats.ErrTimeout
+		}
+		return c.PublishAck(ctx, subject, env)
+	}
+	del := &envDelivery{env: submissionEnv(t, "tse", "task-seen", "", map[string]string{})}
+	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	defer cancel()
+	if !d.publishTerminalRetry(ctx, quietLog(), del, h, lib.StateFailed, ReasonLeaseExpired, "") {
+		t.Fatal("the terminal never landed")
+	}
+	if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-seen")); n != 1 {
+		t.Fatalf("%d terminals on the six-token subject, want the real one", n)
 	}
 }

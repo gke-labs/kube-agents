@@ -56,3 +56,24 @@ func TestASecondIdenticalSixTokenTerminalChangesNothingOnTheRelay(t *testing.T) 
 		t.Errorf("the second terminal was acked %d times, want settled once", d2.acks)
 	}
 }
+
+// The same with both terminals in one relay batch: the task ends once.
+func TestTwoIdenticalSixTokenTerminalsInOneBatchEndTheTaskOnce(t *testing.T) {
+	t.Parallel()
+	r := startCutoffRig(t, time.Now().Add(-time.Minute))
+	conv := "discord:cut/duplicate-batch"
+	r.putRecord(t, cutoffRecord(conv, cutoffProfileAddressee, cutoffProfileTask, true))
+	subject := lib.ProfileSupervisorSubject(cutoffProfileAddressee, cutoffProfileTask)
+	envs := dispatcherTerminals(t, cutoffProfileTask, 2)
+	d1 := &stampedDelivery{fakeDelivery: fakeDelivery{env: envs[0], subj: subject, seq: 801}, at: time.Now()}
+	d2 := &stampedDelivery{fakeDelivery: fakeDelivery{env: envs[1], subj: subject, seq: 802}, at: time.Now()}
+	r.g.relayBatch(conv, []relayItem{{env: envs[0], subject: subject, d: d1}, {env: envs[1], subject: subject, d: d2}})
+	waitFor(t, "the terminal", func() bool { return len(r.terminalsFor(cutoffProfileTask)) >= 1 })
+	time.Sleep(300 * time.Millisecond)
+	if got := r.terminalsFor(cutoffProfileTask); len(got) != 1 {
+		t.Fatalf("terminals from one batch of two = %+v, want one", got)
+	}
+	if d1.acks != 1 || d2.acks != 1 {
+		t.Errorf("acks %d and %d, want each settled once", d1.acks, d2.acks)
+	}
+}

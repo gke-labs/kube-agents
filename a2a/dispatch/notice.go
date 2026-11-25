@@ -140,9 +140,10 @@ func terminalEnvelopeID(hk holdKey) string {
 //
 // A duplicate ack is the write landing. The stream's duplicate window is
 // keyed on the envelope id alone, whatever the subject, so on the six-token
-// form the id is drawn at random once per retry loop and kept in r
-// (sixTokenTerminalID): no other writer can store a message under an id it
-// can't predict, so a duplicate can only be this loop's own earlier send
+// form the id is drawn at random (sixTokenTerminalID), kept in r while
+// attempts succeed and drawn again after any that fails: no other writer can
+// store a message under an id it can't predict, or one it saw on a send that
+// wasn't stored, so a duplicate can only be this terminal's own earlier send
 // (#6883). A predictable id would let a message planted under it first, on a
 // subject readers don't take as this task's terminal, swallow the real one.
 // The cost: a dispatcher that restarts between the publish and the settle
@@ -170,6 +171,16 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, r *terminalRefusal, hk
 	c := d.busFor(hk.profile)
 	refused := d.refusals.expect(c, subject)
 	_, _, err = d.publishAckOn(ctx, c, subject, env)
+	if err != nil {
+		// A failed send may still have reached the subject's core
+		// subscribers without being stored (a store timeout, a quorum
+		// loss, a full stream), and one of them could plant the id it saw
+		// before the retry. The retry draws a new one: the id is never
+		// reused once it may have been seen unstored. A failed send that
+		// was stored after all (its ack lost) leaves a second identical
+		// final status, which readers fold past.
+		r.id = ""
+	}
 	if refused() && err != nil {
 		return fmt.Errorf("%w: %w", errSupervisorPublishRefused, err)
 	}

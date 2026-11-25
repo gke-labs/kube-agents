@@ -634,9 +634,10 @@ func (c *Client) PublishSeq(ctx context.Context, subject string, env *Envelope) 
 // PublishAck is PublishSeq also reporting whether the server took the
 // message as a duplicate: an envelopeId already stored inside the stream's
 // duplicate window, on any subject, so nothing was stored for this publish
-// and the sequence is the earlier message's. A caller whose envelope id is
-// predictable (the dispatcher's terminal) checks what that earlier message
-// is rather than take the duplicate as its own write landing.
+// and the sequence is the earlier message's. A duplicate is the caller's own
+// write landing only when no other writer could have stored a message under
+// that id first: the dispatcher's six-token terminal draws its id at random
+// for that reason (#6883).
 func (c *Client) PublishAck(ctx context.Context, subject string, env *Envelope) (uint64, bool, error) {
 	if err := env.ValidateEmit(); err != nil {
 		return 0, false, err
