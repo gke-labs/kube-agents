@@ -710,7 +710,9 @@ func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("teams: encoding activity: %w", err)
 	}
+	a.quietTyping(conversation)
 	raw, err := a.apiPost(context.Background(), http.MethodPost, endpoint, payload)
+	a.quietTyping(conversation)
 	if err != nil {
 		return "", err
 	}

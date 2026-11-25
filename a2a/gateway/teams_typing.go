@@ -37,7 +37,8 @@ import (
 // and return; one loop per conversation posts a `typing` activity through
 // the broker's passthrough every teamsTypingInterval until the ask is no
 // longer open or teamsTypingMax has passed since the ask opened or the
-// newest task started. A post that fails is dropped: the indicator is a
+// newest task started or ended. A new message the adapter posts there
+// holds the indicator off for one interval too (quietTyping). A post that fails is dropped: the indicator is a
 // courtesy, and the next tick tries again.
 const (
 	teamsTypingActivityType = "typing"
@@ -50,8 +51,8 @@ const (
 	teamsTypingRequestTimeout = 2 * time.Second
 	// teamsTypingMax ends the loop for an ask that never settles, so no
 	// indicator outlives its work by more than this, and forgets a task
-	// that never reports an end. It runs from the newest task's start, so
-	// a second ask late in the first's ten minutes gets its own.
+	// that never reports an end. It runs from the newest task's start or
+	// end, so a second ask late in the first's ten minutes gets its own.
 	teamsTypingMax = 10 * time.Minute
 )
 
@@ -89,7 +90,8 @@ func (a *TeamsAdapter) TaskStarted(conversation, taskID string) {
 }
 
 // TaskTerminal records the task's end; the indicator may go on one
-// interval later if the conversation's ask is still open (TaskObserver).
+// interval later if the conversation's ask is still open, with its bound
+// run from here (TaskObserver).
 func (a *TeamsAdapter) TaskTerminal(conversation, taskID string, _ lib.TaskState, _ TerminalSource, _ string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -100,7 +102,25 @@ func (a *TeamsAdapter) TaskTerminal(conversation, taskID string, _ lib.TaskState
 	now := time.Now()
 	delete(t.tasks, taskID)
 	t.quietUntil = now.Add(a.typingInterval)
+	if t.open {
+		// A long chain that hands off gets the whole bound for its card
+		// work, not what its own run left of it.
+		t.deadline = now.Add(a.typingMax)
+		a.startTypingLocked(conversation, t)
+	}
 	a.forgetTypingLocked(conversation, t, now)
+}
+
+// quietTyping holds conversation's indicator off for one interval. The
+// adapter calls it around each new message it posts there: a card's answer
+// is posted before its mark settles (Notifier.reply), and a typing post
+// landing behind the answer would sit under it.
+func (a *TeamsAdapter) quietTyping(conversation string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if t := a.typing[conversation]; t != nil {
+		t.quietUntil = time.Now().Add(a.typingInterval)
+	}
 }
 
 // MarkChanged wants the indicator while the conversation's ask is open and

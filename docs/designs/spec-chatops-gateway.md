@@ -3296,8 +3296,10 @@ it. It is not posted while a chain the gateway started is running there (`TaskOb
 within one interval of that chain's end. A live run showed why: Teams leaves the indicator on
 screen for about twenty seconds after the last post unless a new message from the bot clears
 it, and a chain's answer is an edit of its line, so typing beside a running chain sat under its
-answer. The hand-off's answer is a new message. The indicator stops ten minutes after the ask
-opened or the newest chain started at the latest (`teamsTypingMax`), since only a notify
+answer. The hand-off's answer is a new message, and each new message the adapter posts holds the
+indicator off for one interval, since a card's answer is posted before its mark settles. The
+indicator stops ten minutes after the ask opened or the newest chain started or ended at the
+latest (`teamsTypingMax`), since only a notify
 settles an older ask; a later chain starts it again. A post that fails is dropped and the next
 one tries again. Teams accepts the post in every conversation and draws it only in some: a
 live run showed the indicator in a one-to-one chat with the bot and nothing in a channel
