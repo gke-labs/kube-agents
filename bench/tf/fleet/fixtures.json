@@ -1992,6 +1992,13 @@
           "why": "the label, read off the pool through clusters describe so a node re-creation never reads as drift; without it the cluster has general capacity again and the obtainability audit's 3.24 files nothing for the untargeted workloads"
         },
         {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].config.machineType",
+          "op": "eq",
+          "value": "e2-standard-2",
+          "why": "the room the slot's workloads schedule into. On an e2-medium the node keeps about 60m of CPU unrequested, and a node replacement can leave kube-dns at two replicas on it with the five seeded-compute-class pods Pending for good, which then reads as drift on the four workload roles. No drift facet reads machine type, so this is what says a project the reconcile has not reached is still on the smaller size; a re-apply restores it in place"
+        },
+        {
           "subject": "node?cloud.google.com/compute-class=general-ccc",
           "path": "spec.taints[?(@.key=='cloud.google.com/compute-class')]",
           "op": "absent",
