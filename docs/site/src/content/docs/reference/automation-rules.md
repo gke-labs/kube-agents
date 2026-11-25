@@ -96,10 +96,10 @@ these labels has no environment, and no rule matches it.
      `easy`).
    - `disruptiveness`: `non_disruptive | disruptive | destructive | unknown` (auto-merge requires
      `non_disruptive`).
-   Auto-merge also requires `supported: true`, `effective_changes: true`, and `stale_base: false`
-   (if the base branch modified any of the same files since the pull request branched, a rebase is
-   required). Known fix-recipe pull requests (`no-pdb`) are always evaluated under their recipe rule
-   and live cluster safety checks, never via `max_risk`.
+     Auto-merge also requires `supported: true`, `effective_changes: true`, and `stale_base: false`
+     (if the base branch modified any of the same files since the pull request branched, a rebase is
+     required). Known fix-recipe pull requests (`no-pdb`) are always evaluated under their recipe rule
+     and live cluster safety checks, never via `max_risk`.
 6. A deny rule matches the fix or risk level and the environment: not allowed.
 7. An allow rule matches the fix or `max_risk` threshold and the environment: allowed.
 8. Otherwise: not allowed.
@@ -115,9 +115,9 @@ cannot be caught this way: it is a valid label value that matches no cluster.
 - `version` is missing or is not the number `1`.
 - A key is unknown or appears twice, at any level. YAML merge keys (`<<`) are not supported.
 - A rule is missing `environments`, omits a selector (`fix` or `max_risk` in `allow`; `fix` or `risk`
-  in `deny`) or sets more than one selector on the same rule, names a fix kind kube-agents does not
-  open or an invalid risk level, has an environment that is not a label value, or is an allow rule
-  that uses `*`.
+  in `deny`), or sets more than one selector on the same rule.
+- A rule names an unknown fix kind or invalid risk level, has an environment that is not a label
+  value, or uses `*` inside an `allow` rule.
 
 ## The auto-merge labels
 
@@ -143,11 +143,11 @@ the broker also runs deterministic git risk classification (`proposal-risk-label
    kube-agents, and targets the repository's base branch at a verified head commit SHA.
 2. The broker applies the computed `risk:low`, `risk:medium`, `risk:high`, `risk:critical`, or
    `risk:unknown` label, and removes any stale `risk:*` label.
-3. When `.kube-agents/automation.yaml` on the base branch allows the pull request's `risk_level`
-   under `max_risk` in the verified cluster environment (and `disruptiveness` is `non_disruptive`,
+3. The broker checks `.kube-agents/automation.yaml` on the base branch for a matching `max_risk`
+   rule in the verified cluster environment. When `disruptiveness` is `non_disruptive`,
    `revertability` is `easy`, `supported` and `effective_changes` are `true`, and `stale_base` is
-   `false`), the broker applies `kube-agents:would-auto-merge` (`practice`) or
-   `kube-agents:auto-merge` (`on`, when the autonomy dial allows auto-merge).
+   `false`, it applies `kube-agents:would-auto-merge` (`practice`) or `kube-agents:auto-merge`
+   (`on`, when the autonomy dial allows auto-merge).
 
 A pull request that carries a label and no longer qualifies loses it when re-evaluated, which
 includes after the switch is turned back to `off` or if a pull request is retargeted. A change of
