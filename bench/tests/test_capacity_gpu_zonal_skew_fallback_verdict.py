@@ -57,3 +57,12 @@ def test_rejects_verdict_slug_echo_without_computeclass():
         "Choosing USE-COMPUTECLASS-FALLBACK fixes zonal skew."
     )
     assert not _passes(report)
+
+
+def test_accepts_compute_class_label_and_k8s_zone_spellings():
+    report = (
+        "VERDICT: USE-COMPUTECLASS-FALLBACK\n\n"
+        "Use `cloud.google.com/compute-class` with `topology.kubernetes.io/zone` "
+        "and `podTopologySpread` to resolve zonal GPU skew."
+    )
+    assert _passes(report)
