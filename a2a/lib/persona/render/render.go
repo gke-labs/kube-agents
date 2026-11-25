@@ -14,17 +14,18 @@ import (
 
 // For returns the adapter for h, the harness value the worker is started
 // with.
-// Antigravity is a known harness without an adapter yet: its agent file
-// format is being settled, and refusing it by name is clearer than
-// treating it as unknown.
+// Antigravity and core-agent are known harnesses without an adapter yet
+// (Antigravity's agent file format is being settled; core-agent's comes
+// with its persona render, #6713), and refusing them by name is clearer
+// than treating them as unknown.
 func For(h persona.Harness) (persona.Adapter, error) {
 	switch h {
 	case persona.ClaudeCode:
 		return claudecode.Adapter{}, nil
-	case persona.Antigravity:
+	case persona.Antigravity, persona.CoreAgent:
 		return nil, fmt.Errorf("harness %q has no persona adapter yet", h)
 	}
-	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
+	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
 }
 
 // CheckOutput refuses an Output with a file path that is absolute, unclean

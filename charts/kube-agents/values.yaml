@@ -205,6 +205,14 @@ operator:
   # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
   # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
   slackTestUsers: []
+  # How many delegate requests one AgentProfile task may make, each minted or
+  # refused using one up (the A2A gateway's delegation.rounds rule). 1, the
+  # only value supported until a profile task's later rounds ship: the schema
+  # and the render refuse anything else. Rendered onto the gateway as
+  # A2A_DELEGATION_ROUNDS_MAX by the controller manager, which renders 1 for
+  # any other value it carries and says so in its log.
+  delegation:
+    roundsMax: 1
   # The A2A gateway's Microsoft Teams backend is off until the operator runs
   # with A2A_TEAMS_BACKEND=true (an extraEnv entry; no value key yet): with it,
   # a PlatformAgent whose integration.teams is enabled has the gateway, not the
@@ -1440,6 +1448,14 @@ platformAgent:
       # pod. Against a PlatformAgent CRD that predates the field the chart
       # fails; apply crds/ first (upgrade.sh does).
       # defaultRoute: platform
+      # warmSessions is how many warm session pods the gateway keeps ready on
+      # the session route, so a new conversation's first turn skips scheduling
+      # and the image pull. Unset means 1. Each costs one session pod's requests
+      # (sessionResources) while it waits, billed on Autopilot; 0 turns the pool
+      # off. It never takes the session cap's last slot. Against a PlatformAgent
+      # CRD that predates the field the chart fails; apply crds/ first
+      # (upgrade.sh does).
+      # warmSessions: 0
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
@@ -1553,11 +1569,13 @@ platformAgent:
     # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
     #
-    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
-    # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
+    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the kubectl cost table
+    # (deploy/sandbox/kubectl-costs.json) that fleet-wide reads are charged
     # from; "fleet" for clusters of tens of thousands of Pods, unset for
-    # "default". Forwarded to the shell sandbox and, under the session
-    # cluster view, to the A2A gateway for the session pods it starts.
+    # "default". Forwarded to the shell sandbox, to the credential broker
+    # (stateful and exec tiers), which charges a brokered cluster-wide kubectl
+    # read from the same column, and, under the session cluster view, to the
+    # A2A gateway for the session pods it starts.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
@@ -1797,10 +1815,8 @@ platformAgent:
     # with CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on its container so the mode an
     # install is in is readable from the Deployment; `enabled: true` renders
     # the mapping into the broker's ConfigMap and sets it to 1. The key this
-    # block replaced, `scopedServiceAccounts`, is still admitted by the schema
-    # as an empty list for one release, because every earlier release record
-    # carries it empty and a retag re-applies the record; a populated one is
-    # refused by name (values.schema.json). Enabled with
+    # block replaced, `scopedServiceAccounts`, is refused by name, empty or
+    # populated (values.schema.json). Enabled with
     # an empty list is refused at `helm install`: the broker refuses to start
     # on an empty pool.
     #

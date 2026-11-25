@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import burst_reads, idle_reply, pushed_report, scope_exclude, scope_hold, session_cap, stop_hook, worker_trajectory
+from kube_agents_bench import burst_reads, delegating_profile, idle_reply, pushed_report, scope_exclude, scope_hold, session_cap, stop_hook, worker_trajectory
 from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
 from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
 from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
@@ -73,7 +73,9 @@ __all__ = [
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
-#   ``scope_exclude.py``), ``scope_hold`` (read by ``scope_hold.py``), ``writes_alone`` and ``requested_pull_requests``
+#   ``scope_exclude.py``), ``scope_hold`` (read by ``scope_hold.py``),
+#   ``delegating_profile`` (the throwaway delegating profile the harness makes
+#   for the run, ``delegating_profile.py``), ``writes_alone`` and ``requested_pull_requests``
 #   (read by ``lane.py`` and by ``load_case``), ``suite``
 #   (``validated-capabilities``: the case runs on the validated-capabilities lane only; the
 #   lane and scripts/validate_bench_cases.py read the bare line from the task
@@ -91,7 +93,7 @@ REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", scope_exclude.KEY, scope_hold.KEY, "task_version", "writes_alone", "suite",
-        "suite_part",
+        "suite_part", delegating_profile.KEY,
         _REQUESTED_KEY,
     }
 )

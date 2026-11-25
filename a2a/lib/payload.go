@@ -408,11 +408,36 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 // (the gateway's A2A_DELEGATION_WIDTH_MAX). Absent means one: the single
 // shape only, which is all a gateway built before batches takes, so the
 // session's tool offers a batch only when the part says more (Width).
+//
+// RoundsMax is how many delegate requests this turn's task may make (the
+// gateway's A2A_DELEGATION_ROUNDS_MAX), at most DelegateRoundsCeiling. Absent
+// means one, which is all a gateway built before rounds takes (Rounds).
 type DelegateTargets struct {
 	Targets   []DelegateTarget `json:"targets"`
 	Truncated bool             `json:"truncated,omitempty"`
 	WidthMax  int              `json:"widthMax,omitempty"`
+	RoundsMax int              `json:"roundsMax,omitempty"`
 }
+
+// DelegateRoundsCeiling bounds a task's delegation rounds: the most
+// A2A_DELEGATION_ROUNDS_MAX may be set to, the most a delegateTargets part
+// may advertise, and the highest Round a childResult or delegationRefused part
+// may carry, so a forged part cannot put an arbitrary round into a reader's
+// dedupe map.
+const DelegateRoundsCeiling = 16
+
+// Rounds is the delegation rounds the part advertises: RoundsMax, or one when
+// unset.
+func (t DelegateTargets) Rounds() int {
+	if t.RoundsMax < 1 {
+		return 1
+	}
+	return t.RoundsMax
+}
+
+// validRound: a round as a part carries it, 1-based, with 0 (omitted) read as
+// one, and at most DelegateRoundsCeiling.
+func validRound(r int) bool { return r >= 0 && r <= DelegateRoundsCeiling }
 
 // Width is the batch width the part advertises: WidthMax, or one when unset.
 func (t DelegateTargets) Width() int {
@@ -474,6 +499,9 @@ func validateDelegateTargets(t DelegateTargets) error {
 	}
 	if t.WidthMax < 0 || t.WidthMax > DelegateBatchMax {
 		return fmt.Errorf("delegate targets: width %d, want 1 to %d", t.WidthMax, DelegateBatchMax)
+	}
+	if !validRound(t.RoundsMax) {
+		return fmt.Errorf("delegate targets: rounds %d, want 1 to %d", t.RoundsMax, DelegateRoundsCeiling)
 	}
 	for _, d := range t.Targets {
 		if !ValidSubjectToken(d.Name) {
@@ -684,12 +712,16 @@ type ChildResult struct {
 	// delegation's on ChildTaskID. An entry that never got a child (its
 	// batch was cut short and withdrawn) ends failed with no ChildTaskID.
 	Entry int `json:"entry,omitempty"`
+	// Round is the 1-based delegation round whose request minted the child,
+	// omitted for round one, at most DelegateRoundsCeiling. A parent dedupes
+	// a batch's ends on (Round, Entry), 0 read as one.
+	Round int `json:"round,omitempty"`
 }
 
 // validChildResult: a terminal end, with text in the cap, that names its
 // child, or a batch entry that never got one and so ended failed.
 func validChildResult(c ChildResult) bool {
-	if !c.State.Terminal() || len(c.Text) > ChildResultTextCap || c.Entry < 0 || c.Entry > DelegateBatchMax {
+	if !c.State.Terminal() || len(c.Text) > ChildResultTextCap || c.Entry < 0 || c.Entry > DelegateBatchMax || !validRound(c.Round) {
 		return false
 	}
 	if c.ChildTaskID == "" {
@@ -738,6 +770,62 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 	return ChildResult{}, false
 }
 
+// DelegationRefusal is the delegationRefused data part: the gateway's word
+// to a profile parent, on its .in, that its delegate request minted no child
+// (#4860). A refused request mints nothing, so there is no child to end and no
+// childResult to send; without this the parent waits to its deadline. Text is
+// the notice the room sees, at most ChildResultTextCap bytes. A parent that
+// waits on children reads a first refusal as the end of the whole wait.
+//
+// Round is the 1-based delegation round the refused request would have been,
+// omitted for round one, at most DelegateRoundsCeiling. A parent ends its wait
+// only on a refusal for the round it waits on: a refusal of a request made
+// after the task had used its rounds carries a later round, and ends nothing,
+// so the children of the earlier request are still the task's to wait for.
+// Any other JSON type there, or a round out of bounds, makes the part no
+// refusal at all (DelegationRefusalOf).
+type DelegationRefusal struct {
+	Text  string `json:"text"`
+	Round int    `json:"round,omitempty"`
+}
+
+func validDelegationRefusal(r DelegationRefusal) bool {
+	return r.Text != "" && len(r.Text) <= ChildResultTextCap && validRound(r.Round)
+}
+
+const delegationRefusedKey = "delegationRefused"
+
+// DelegationRefusalPart wraps r as the delegationRefused data part. A refusal
+// with no text, or text over the cap, is refused: the parent's model reads it.
+// So is a round out of bounds.
+func DelegationRefusalPart(r DelegationRefusal) (Part, error) {
+	if !validDelegationRefusal(r) {
+		return Part{}, fmt.Errorf("delegation refusal: needs text of at most %d bytes and a round of at most %d", ChildResultTextCap, DelegateRoundsCeiling)
+	}
+	data, err := json.Marshal(map[string]DelegationRefusal{delegationRefusedKey: r})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegationRefusalOf finds the delegationRefused part among parts, skipping
+// one DelegationRefusalPart would refuse.
+func DelegationRefusalOf(parts []Part) (DelegationRefusal, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegationRefusedKey)
+		if !ok {
+			continue
+		}
+		var r DelegationRefusal
+		if json.Unmarshal(raw, &r) != nil || !validDelegationRefusal(r) {
+			continue
+		}
+		return r, true
+	}
+	return DelegationRefusal{}, false
+}
+
 // wrappedData is a data part's payload under key, when p is a data part
 // wrapping one.
 func wrappedData(p Part, key string) (json.RawMessage, bool) {
@@ -754,10 +842,13 @@ func wrappedData(p Part, key string) (json.RawMessage, bool) {
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
-// receives on a running task: one per follow-up envelope, either queued or
-// refused with a reason. The gateway's relay reads it to word its posts
-// and to count what it promised the room; a reader that does not know it
-// sees the text part beside it.
+// receives on a running task: one when the follow-up arrives, either queued
+// or refused with a reason, and a second, refused, for a queued follow-up
+// that does not get its turn. Neither is guaranteed: for example, a
+// follow-up that arrives after the terminal gets none, and an executor that
+// crashes sends none for its queue. The gateway's relay reads it to word
+// its posts and to count what it promised the room; a reader that does not
+// know it sees the text part beside it.
 type SteerNotice struct {
 	Steer      string `json:"steer"`
 	EnvelopeID string `json:"envelopeId"`
@@ -1025,6 +1116,11 @@ type AgentCard struct {
 	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
 	// Parameters are the task parameters the profile's persona declares.
 	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// Delegates says the profile's tasks may delegate (AgentProfile
+	// spec.delegates, #6789). The gateway refuses a delegate request from a
+	// task of a profile whose card doesn't say so; a card from an operator
+	// that predates the field doesn't, so it fails closed.
+	Delegates bool `json:"delegates,omitempty"`
 	// YieldToPinned hands a task addressed to this profile to the profile
 	// pinned to its target cluster, when there is one: the generic cluster
 	// agent sets it, and a specialist addressed by name keeps the task.

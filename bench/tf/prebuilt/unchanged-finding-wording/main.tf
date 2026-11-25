@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/fleet-audit-unchanged-finding-keeps-wording:
+# The scenario driver for bench/tasks/fleet-audit-unchanged-finding-keeps-wording,
+# bench/tasks/fleet-audit-remediation-right-and-not-stale and
+# bench/tasks/fleet-audit-wrong-kept-remediation-gives-way:
 # plant a previous run of the fleet-consistency-drift stream in the report store
 # of the install under test, and remove it again on destroy.
 #
@@ -23,8 +25,11 @@
 #
 # The planted run has the evidence and severity that `finish` gives each drift
 # candidate on the unchanged seeded fleet, and wording that starts with
-# var.mark. The planted envelope names no issue, so it does not change the delta
-# of the next run.
+# var.mark. var.planted_remediation chooses what the planted authorized-networks
+# finding proposes, and whether its evidence equals this run's (plant.py says
+# what each state plants; a case names its state in its task.yaml, or takes
+# the default, `manual`). The planted envelope names no issue, so it does not
+# change the delta of the next run.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -52,6 +57,7 @@ resource "null_resource" "previous_run" {
     host_project     = var.project_id
     namespace        = var.agent_namespace
     mark             = var.mark
+    remediation      = var.planted_remediation
     pod_selector     = local.pod_selector
     store_containers = local.store_containers
     scripts_dir      = local.scripts_dir
@@ -69,7 +75,7 @@ resource "null_resource" "previous_run" {
       plant_store() {
         printf '%s' '${local.script_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "$container" -- \
-            env PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "${local.scripts_dir}" "${var.mark}"
+            env PYTHONDONTWRITEBYTECODE=1 PLANT_COLLECTOR_ARGS="${var.collector_args}" python3 - "$1" "${local.scripts_dir}" "${var.mark}" "${var.planted_remediation}"
       }
       on_exit() {
         status=$?

@@ -163,7 +163,7 @@ Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is the agent API transpor
    turn and every wake that continued its chain
    (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
    the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
-   leaves them null when it carries none. The scorer's liveness rule
+   leaves them null when it carries none; they are also null when the harness made no such read or got no answer to it. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
    `working` and the terminal, is a trajectory entry under the status-event name, the latency
@@ -347,7 +347,7 @@ transport. `tool_called` reads the trajectory, which on this path carries tool-c
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
 never posts `activity` to a conversation, so the harness reads the trace off the read route when
 the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry
-the bridge does not label with a card worker's session to a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+the bridge does not label with a card worker's session to a trajectory item in the api path's shape (plus the entry's `callId` as `call_id`, beside `args`, when it carries one), and writes one `a2a.activity` marker whenever the key
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the

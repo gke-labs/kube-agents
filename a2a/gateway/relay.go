@@ -939,6 +939,18 @@ var canceledReasonShown = map[string]bool{
 	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
 }
 
+// canceledTerminalTokens are the canceled terminals' own tokens, which the
+// chat notice leaves bare (canceledReasonShown names the ones it explains)
+// but a scheduled run's record still carries.
+var canceledTerminalTokens = map[string]bool{
+	"canceled-by-request":     true,
+	"canceled-before-start":   true,
+	"canceled-while-orphaned": true,
+	// A run the operator or a parent stopped (dispatch.ReasonStopped, and
+	// the gateway's own stop in stoptree.go).
+	"stopped": true,
+}
+
 // noticeWithReason joins a notice's prefix to the reason's text: bare when
 // there is none, after a dash when it came out of the executors' shape, and
 // after a colon when it was plain text already.
@@ -1511,6 +1523,49 @@ func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID strin
 		}
 	}
 	return g.client.TasksGet(ctx, addressee, taskID, lib.ProfileTaskIf(profile))
+}
+
+// runReasonToken is the token a scheduled run's record carries for a
+// terminal message (lib.TriggerStatusReply.Reason): reasonToken's, when it is
+// one the gateway knows, in reasonSentences, reasonDetailShown,
+// canceledReasonShown or canceledTerminalTokens. Those tables are the one
+// vocabulary: a token an executor adds is added to one of them in the same
+// change. Anything else, malformed included, is empty, and no detail is ever
+// returned.
+func runReasonToken(message string) string {
+	token := reasonToken(message)
+	if token == "" || token == reasonTokenMalformed {
+		return ""
+	}
+	if _, ok := reasonSentences[token]; ok {
+		return token
+	}
+	if reasonDetailShown[token] || canceledReasonShown[token] || canceledTerminalTokens[token] {
+		return token
+	}
+	return ""
+}
+
+// runReasonTokens lists every token runReasonToken can return, for the
+// cross-module test that the operator's shape pattern accepts each one.
+func runReasonTokens() []string {
+	seen := map[string]bool{}
+	for t := range reasonSentences {
+		seen[t] = true
+	}
+	for _, m := range []map[string]bool{reasonDetailShown, canceledReasonShown, canceledTerminalTokens} {
+		for t, ok := range m {
+			if ok {
+				seen[t] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // reasonToken is the token of an executor's `reason: <token>[ - detail]`

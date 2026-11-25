@@ -238,6 +238,9 @@ func TestTheTrackerReadsARunsEndFromTheGateway(t *testing.T) {
 		{"gone", triggerStatusReplyWire{Found: false}, ScheduleTaskState{Found: false}},
 		{"delivered", triggerStatusReplyWire{Found: true, State: "completed", Terminal: true, Delivery: "posted"},
 			ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: time.Unix(1763100500, 0), Delivery: "posted"}},
+		{"failed with a reason", triggerStatusReplyWire{Found: true, State: "failed", Terminal: true, Reason: "deadline-exceeded"},
+			ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: time.Unix(1763100500, 0), Reason: "deadline-exceeded"}},
+		{"a reason before the end is not read", triggerStatusReplyWire{Found: true, State: "working", Reason: "deadline-exceeded"}, ScheduleTaskState{Found: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var asked triggerStatusWire
