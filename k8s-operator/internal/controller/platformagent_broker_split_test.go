@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"reflect"
 )
 
 // brokerPodAgent is a CR in the only layout the operator renders: the credential
@@ -1154,10 +1155,11 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 	}
 }
 
-// TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
-// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true, and
-// never otherwise.
-func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
+// TestTheSessionCallerIsNamedOnTheFlagOnThePlatformRoute: on the platform
+// route, the session pod becomes a broker caller when the operator carries
+// A2A_SESSION_CLUSTER_VIEW=true, and not otherwise. (On the session route the
+// view is on by default: TestTheSessionRouteRendersTheServerHalfOfTheViewWithNoFlag.)
+func TestTheSessionCallerIsNamedOnTheFlagOnThePlatformRoute(t *testing.T) {
 	agent := brokerPodAgent()
 	// Chat off: with Google Chat enabled the A2A gateway is a caller too
 	// (a2aChatArmed), and this test is about the session flag alone.
@@ -1197,14 +1199,74 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 }
 
-// TestSessionClusterViewArmsOnlyOnTheLiteralTrue: no other spelling of the
-// flag enables the view.
-func TestSessionClusterViewArmsOnlyOnTheLiteralTrue(t *testing.T) {
+// TestSessionClusterViewArmsOnThePlatformRouteOnlyOnTheLiteralTrue: on the
+// platform route no other spelling of the flag enables the view.
+func TestSessionClusterViewArmsOnThePlatformRouteOnlyOnTheLiteralTrue(t *testing.T) {
 	for _, v := range []string{"", "false", "TRUE", "1"} {
 		t.Setenv(a2aSessionClusterViewEnvVar, v)
 		if a2aSessionClusterViewEnabled(brokerPodAgent()) {
-			t.Errorf("value %q enabled the view; only the literal true may", v)
+			t.Errorf("value %q enabled the view on the platform route; only the literal true may", v)
 		}
+	}
+}
+
+// TestTheSessionRouteRendersTheServerHalfOfTheViewWithNoFlag: on the session
+// route with the flag unset (#6987), the servers a session pod's view reaches
+// admit it as they do under the flag: the broker names the session caller
+// and binds its audience, kube-proxy binds the same audience, and both
+// NetworkPolicies admit the session pods. With "false" none of it renders.
+func TestTheSessionRouteRendersTheServerHalfOfTheViewWithNoFlag(t *testing.T) {
+	agent := brokerPodAgent()
+	if agent.Spec.Integration != nil {
+		agent.Spec.Integration.GoogleChat = nil
+	}
+	if agent.Spec.Harness.Tuning == nil {
+		agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{}
+	}
+	agent.Spec.Harness.Tuning.DefaultRoute = ptr.To(agentv1alpha1.DefaultRouteSession)
+	agent.Status.EffectiveSessionCap = ptr.To(4)
+	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
+	admits := func(policy *networkingv1.NetworkPolicy) bool {
+		for _, rule := range policy.Spec.Ingress {
+			for _, peer := range rule.From {
+				if peer.PodSelector != nil && reflect.DeepEqual(peer.PodSelector.MatchLabels, a2aSessionPodSelector()) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	kubeProxyEnv := func() []corev1.EnvVar {
+		return buildKubeProxyDeployment(agent, "", true, "tls-hash").Spec.Template.Spec.Containers[0].Env
+	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if !strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), sessionCaller) {
+		t.Error("the session ServiceAccount is not a broker caller on the session route with no flag")
+	}
+	broker := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
+	if v, _ := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
+		t.Errorf("broker CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	if v, _ := brokerEnvValue(kubeProxyEnv(), "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
+		t.Errorf("kube-proxy CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	if !admits(buildCredentialProxyNetworkPolicy(agent)) {
+		t.Error("the broker's NetworkPolicy does not admit the session pods on the session route with no flag")
+	}
+	if !admits(buildKubeProxyNetworkPolicy(agent)) {
+		t.Error("kube-proxy's NetworkPolicy does not admit the session pods on the session route with no flag")
+	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "false")
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), sessionCaller) {
+		t.Error("the session ServiceAccount is a broker caller with the flag \"false\"")
+	}
+	if _, found := brokerEnvValue(kubeProxyEnv(), "CREDENTIAL_PROXY_SESSION_AUDIENCE"); found {
+		t.Error("kube-proxy binds the session audience with the flag \"false\"")
+	}
+	if admits(buildCredentialProxyNetworkPolicy(agent)) || admits(buildKubeProxyNetworkPolicy(agent)) {
+		t.Error("a NetworkPolicy admits the session pods with the flag \"false\"")
 	}
 }
 
