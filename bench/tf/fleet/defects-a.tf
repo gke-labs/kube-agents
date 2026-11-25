@@ -2636,12 +2636,12 @@ resource "kubernetes_cron_job_v1" "cuda_pinned_trainer" {
 }
 
 # Defect (role state-sync-controller): a controller workload in seeded-shapes
-# whose startup arguments disable client-side Kubernetes API rate limiting
-# (--qps=0, --burst=0) and configure a sub-second sync loop (--sync-period=100ms),
-# the shape gce_compute_fleet_sop.md §2.6 (apiserver-configmap-lease-write-storm)
-# flags. The container process is an inert sleep that ignores its positional
-# arguments and mounts no API token, so the pod runs on the default pool without
-# generating live API server write load.
+# whose startup argument disables client-side Kubernetes API rate limiting
+# (--kube-api-qps=-1, a negative QPS), the shape
+# control-plane-configmap-lease-write-storm requires. The container process is
+# an inert sleep that ignores its positional argument and mounts no API token,
+# so the pod runs on the default pool without generating live API server write
+# load.
 resource "kubernetes_deployment_v1" "state_sync_controller" {
   metadata {
     name      = "state-sync-controller"
@@ -2669,7 +2669,7 @@ resource "kubernetes_deployment_v1" "state_sync_controller" {
           name    = "controller"
           image   = "busybox:1.36"
           command = ["sh", "-c", "exec sleep infinity"]
-          args    = ["--qps=0", "--burst=0", "--sync-period=100ms"]
+          args    = ["--kube-api-qps=-1"]
           resources {
             requests = { cpu = "10m", memory = "16Mi" }
             limits   = { memory = "32Mi" }

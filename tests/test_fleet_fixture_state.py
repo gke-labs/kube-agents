@@ -749,7 +749,7 @@ def _healthy_world() -> dict:
             "configconnector/configconnector.core.cnrm.cloud.google.com": {"spec": {"mode": "namespaced"}, "status": {"healthy": True}},
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
             "deployment/state-sync-controller": {
-                "spec": {"template": {"spec": {"containers": [{"name": "controller", "args": ["--qps=0", "--burst=0", "--sync-period=100ms"]}]}}},
+                "spec": {"template": {"spec": {"containers": [{"name": "controller", "args": ["--kube-api-qps=-1"]}]}}},
                 "status": {"readyReplicas": 1, "replicas": 1},
             },
         },
@@ -1628,8 +1628,8 @@ class PassTest(_Harness):
             ),
             "state-sync-controller": (
                 "deployment/state-sync-controller",
-                {"spec": {"template": {"spec": {"containers": [{"name": "controller", "args": ["--qps=20", "--burst=30", "--sync-period=10s"]}]}}}, "status": {"readyReplicas": 1, "replicas": 1}},
-                'spec.template.spec.containers[*].args[*] any_eq "--qps=0": observed',
+                {"spec": {"template": {"spec": {"containers": [{"name": "controller", "args": ["--kube-api-qps=0"]}]}}}, "status": {"readyReplicas": 1, "replicas": 1}},
+                'spec.template.spec.containers[*].args[*] any_eq "--kube-api-qps=-1": observed "--kube-api-qps=0"',
             ),
         }
         for role, (subject, healed, line) in heals.items():
