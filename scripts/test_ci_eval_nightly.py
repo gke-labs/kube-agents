@@ -735,6 +735,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
             "consistency-boot-disk-pool-outlier",
+            "consistency-kubelet-config-pool-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",
@@ -742,6 +743,8 @@ class ArrayHygieneTest(unittest.TestCase):
             "obtainability-pdb-kustomize-overlay",
             "gce-chat-request-runs-collector",
             "fleet-audit-manifest-fix-names-stalled-config-connector",
+            "fleet-audit-remediation-right-and-not-stale",
+            "fleet-audit-wrong-kept-remediation-gives-way",
         ):
             with self.subTest(audit=audit):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {audit}")

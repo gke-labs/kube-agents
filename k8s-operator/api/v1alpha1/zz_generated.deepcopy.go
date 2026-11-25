@@ -893,6 +893,11 @@ func (in *AgentStatus) DeepCopyInto(out *AgentStatus) {
 		*out = new(int)
 		**out = **in
 	}
+	if in.EffectiveWarmSessions != nil {
+		in, out := &in.EffectiveWarmSessions, &out.EffectiveWarmSessions
+		*out = new(int)
+		**out = **in
+	}
 	if in.InferenceKeys != nil {
 		in, out := &in.InferenceKeys, &out.InferenceKeys
 		*out = new(InferenceKeysStatus)
@@ -2937,6 +2942,11 @@ func (in *TuningSpec) DeepCopyInto(out *TuningSpec) {
 	if in.DefaultRoute != nil {
 		in, out := &in.DefaultRoute, &out.DefaultRoute
 		*out = new(string)
+		**out = **in
+	}
+	if in.WarmSessions != nil {
+		in, out := &in.WarmSessions, &out.WarmSessions
+		*out = new(int)
 		**out = **in
 	}
 	if in.BusReplicas != nil {

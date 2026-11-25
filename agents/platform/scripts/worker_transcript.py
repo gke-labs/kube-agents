@@ -439,6 +439,9 @@ COMMAND_ARG_KEYS = ("command", "cmd")
 # list (`SECRET_READ_COMMAND_RE`): the paths that hold a credential are not
 # enumerable, so that rule names the well-known mounts and the directory
 # names that announce one.
+# A credential read from the metadata server is a list too
+# (`METADATA_CREDENTIAL_PATH_RE`): it reads the whole text of the command,
+# not each simple command.
 #
 # The shell's escape and the separators `split_shell_commands` reads; the
 # quotes are `SHELL_QUOTE_CHARS` above.
@@ -642,6 +645,31 @@ SECRET_READ_COMMAND_RE = re.compile(
     r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/"
     r"(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_|(?:[^\s/]*-)?(?:secrets?|creds|credentials)/)[^\r\n]*"
     r")"
+)
+# A read of a credential from the metadata server: the path of a service
+# account's `token` or `identity`, in a command that also holds a sign of the
+# metadata server (one of its hosts or addresses, or the header that a request
+# to it carries). The path is read from `instance/` on, because the part ahead
+# of it is often in a variable (`"$MD/instance/service-accounts/default/token"`),
+# so the path of each version of the server's tree counts. The last part can
+# hold other text ahead of the word, as a brace list does
+# (`default/{email,token}`). The sign can stand anywhere in the command, on
+# another of its lines too: a command often assigns the host in one place and
+# reads the path in another. The rule reads the text and not the command word,
+# so any client withholds (`curl`, `wget`, a script in a quoted argument), and
+# so does a command that only prints such a read. A path with no sign is text
+# about the server (`grep -rn instance/service-accounts/default/token docs/`),
+# and an account's other paths (`email`, `scopes`) hold no credential; both
+# are served. The path pattern starts from fixed text and reads to the next
+# `/` or blank, and the sign pattern is fixed text, so a run of either costs
+# linear time.
+METADATA_CREDENTIAL_PATH_RE = re.compile(r"(?i)instance/service-accounts/[^/\s]+/[^/\s]*\b(?:token|identity)\b")
+METADATA_FLAVOR_HEADER = "metadata-flavor"
+METADATA_SERVER_HOSTS = ("metadata.google.internal", "metadata.goog", "169.254.169.254", "169.254.169.252", "fd20:ce::254")
+# `metadata.goog` also matches the longer host name, which is in the list for the reader. The short
+# host name `metadata` counts only behind `//` (`//metadata/`, `//metadata:80`).
+METADATA_SERVER_SIGN_RE = re.compile(
+    r"(?i)" + "|".join(re.escape(sign) for sign in (METADATA_FLAVOR_HEADER, *METADATA_SERVER_HOSTS)) + r"|//metadata(?![\w.-])"
 )
 # A command that prints the caller's own token or its environment, which holds
 # whatever credentials the process was started with
@@ -2763,6 +2791,8 @@ def _simple_command_reads_a_secret(command: str, depth: int) -> bool:
 def _command_reads_a_secret(command: str, depth: int) -> bool:
     folded = fold_shell_continuations(command)
     if SECRET_READ_COMMAND_RE.search(folded):
+        return True
+    if METADATA_CREDENTIAL_PATH_RE.search(folded) and METADATA_SERVER_SIGN_RE.search(folded):
         return True
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))
 

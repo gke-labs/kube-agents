@@ -285,7 +285,7 @@ Three layers run, in this order:
 1. **The built-in credential patterns**, always on. They match:
    - GCP API keys and OAuth tokens, PEM private keys, bearer and basic auth values;
    - GitHub, OpenAI, Anthropic and Slack tokens, AWS access key IDs, JWTs;
-   - the password in a URL (`scheme://user:password@host`, unless it holds `,`, `;`, a quote or an unencoded `/`, `?` or `#`);
+   - the password in a URL (`scheme://user:password@host`, unless it holds `,`, `;`, a quote or an unencoded `/`, `?` or `#`; a JSON escape such as `\u0026` counts as one character);
    - secret-shaped key/value pairs (a block scalar's lines included), and container env entries whose name is secret-shaped (in YAML and in JSON);
    - Kubernetes Secret `data:` blocks and the `data`/`stringData` objects of JSON that holds a Secret;
    - e-mail addresses other than service-account principals.

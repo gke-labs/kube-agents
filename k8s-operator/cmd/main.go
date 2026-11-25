@@ -175,6 +175,11 @@ func main() {
 		setupLog.Error(nil, "invalid --webhook-port: must be between 1 and 65535", "port", webhookPort)
 		os.Exit(1)
 	}
+	// A delegation rounds setting the gateway can't take yet is refused by
+	// name and rendered as 1, not a reason to stop reconciling every install.
+	if err := controller.ValidateA2ADelegationRoundsMax(); err != nil {
+		setupLog.Error(err, "delegation rounds setting refused")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
