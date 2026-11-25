@@ -1,0 +1,5 @@
+{"type":"init","session":"110711ee-3082-431c-a975-12d95ea4a4f0","model":"gemini-2.5-flash"}
+{"type":"text","text":"hello there"}
+{"type":"event","event":{"content":{"parts":[{"text":"say hello"}],"role":"user"},"id":"ad5dc7a5-e2d9-41ed-8957-27455221afc7","timestamp":"2026-11-24T23:31:37.114499052Z","invocationId":"e-f23f1bf5-0c16-47d1-a7c4-c98ab198b610","author":"user","actions":{"stateDelta":{},"artifactDelta":{}}}}
+{"type":"event","event":{"content":{"parts":[{"text":"hello there"}],"role":"model"},"usageMetadata":{"candidatesTokenCount":7,"promptTokenCount":100,"totalTokenCount":107},"customMetadata":{"core_models.usage":{"backend":"gemini"}},"turnComplete":true,"finishReason":"STOP","id":"c8c9cb88-ece1-486c-8596-c7aea931fd9b","timestamp":"2026-11-24T23:31:37.118278672Z","invocationId":"e-f23f1bf5-0c16-47d1-a7c4-c98ab198b610","author":"core_agent","actions":{"stateDelta":{},"artifactDelta":{}},"nodeInfo":{"path":"core_agent"}}}
+{"type":"result","text":"hello there","usage":{"input":100,"output":7}}
