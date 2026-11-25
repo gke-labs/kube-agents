@@ -53,6 +53,9 @@ const (
 	// profile's card doesn't list the unattended tier: its owner hasn't
 	// agreed to runs nobody is watching, even read-only ones (#6744).
 	ruleDelegationUnattendedChild = "delegation.unattended-child"
+	// ruleDelegationWake refuses a delegation from a wake the gateway didn't
+	// let delegate again (wakeMayDelegate, #6861).
+	ruleDelegationWake = "delegation.wake"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
@@ -465,6 +468,13 @@ func (g *Gateway) delegateEntryCheck(rec *SessionRecord, parent TaskRef, profile
 	// interactive turn's.
 	if !profileParent && parent.belowSchedule() {
 		return nil, refuseEntry(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+noticeBelowScheduleSession)
+	}
+	// A wake the gateway didn't let delegate again (a card report still to
+	// come, or a wake written before the grant existed) runs without the
+	// tool; one delegating anyway is refused here rather than trusted to
+	// the adapter. A wake at the depth bound was refused above.
+	if !profileParent && parent.Role == taskRoleWake && !parent.WakeDelegate {
+		return nil, refuseEntry(ruleDelegationWake, noticeDelegationRefusedFor+noticeWakeNotGranted)
 	}
 	if addressee == targetPlatform && len(e.Parameters) > 0 {
 		// Only a profile route carries parameters; platform's would be dropped.

@@ -74,6 +74,10 @@ const (
 	// in a chain a schedule started: such a turn never gets the delegate
 	// tool (wakeMayDelegate), so one arriving anyway is refused here too.
 	noticeBelowScheduleSession = "a turn in a chain a schedule started doesn't delegate"
+	// noticeWakeNotGranted refuses a delegation from a wake the gateway
+	// didn't let delegate again (wakeMayDelegate): it has no delegate tool,
+	// so one arriving anyway is refused.
+	noticeWakeNotGranted = "this turn reports what came back and wasn't let delegate again"
 	// The profile parent's chain and scope refusals (#5686). The chain and
 	// scope named are the parent's own.
 	noticeProfileCycle         = "%s is already working on this request above this task (%s), so it can't take it again"

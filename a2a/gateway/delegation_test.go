@@ -3346,6 +3346,23 @@ func TestAChildsResultThatAsksForADelegationIsDataAndAWakesDelegationIsChecked(t
 // it regardless, to any addressee, before any route is resolved: the
 // schedule rules that hold a profile parent's children to unattended
 // profiles don't apply to a session turn, so nothing else would check it.
+// TestAWakeNotLetDelegateIsRefusedIfItDelegatesAnyway: a wake without the
+// grant (a card report still to come, or one written before the grant)
+// has no delegate tool, and the gateway refuses a delegation from it to any
+// addressee rather than trusting the adapter to have withheld the tool.
+func TestAWakeNotLetDelegateIsRefusedIfItDelegatesAnyway(t *testing.T) {
+	g := &Gateway{}
+	for _, addressee := range []string{targetPlatform, "cluster"} {
+		route, no := g.delegateEntryCheck(&SessionRecord{}, TaskRef{ID: "wake-1", Role: taskRoleWake}, false, lib.DelegateTask{Addressee: addressee}, true)
+		if no == nil || route != nil {
+			t.Fatalf("%s: route %+v, refusal %+v; want a refusal and no route", addressee, route, no)
+		}
+		if no.rule != ruleDelegationWake || !strings.Contains(no.notice, noticeWakeNotGranted) {
+			t.Errorf("%s: refused %s %q, want %s with the not-granted notice", addressee, no.rule, no.notice, ruleDelegationWake)
+		}
+	}
+}
+
 func TestASessionTurnBelowAScheduleIsRefusedIfItDelegatesAnyway(t *testing.T) {
 	g := &Gateway{}
 	for _, addressee := range []string{targetPlatform, "cluster"} {
