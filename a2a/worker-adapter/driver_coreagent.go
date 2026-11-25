@@ -71,8 +71,6 @@ func (d coreAgentDriver) WithMCP(servers []coreagentwire.MCPServer) Driver {
 	return d
 }
 
-// WithInstructions is d with the worker's system-prompt lines for core-agent,
-// which reads them from each turn's envelope; any other driver is returned as
 // WithAllow is the driver with patterns added to its policy's allow rules,
 // each once. The receiver's policy is not modified.
 func (d coreAgentDriver) WithAllow(patterns []string) Driver {
@@ -97,6 +95,8 @@ func withTurnInstructions(d Driver, lines []string) Driver {
 	return d
 }
 
+// WithInstructions is d with the worker's system-prompt lines for core-agent,
+// which reads them from each turn's envelope; any other driver is returned as
 // it is (Claude Code gets the same lines on its argv).
 func WithInstructions(d Driver, lines []string) Driver {
 	if c, ok := d.(coreAgentDriver); ok {
