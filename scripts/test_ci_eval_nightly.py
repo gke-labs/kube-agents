@@ -735,6 +735,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
             "consistency-boot-disk-pool-outlier",
+            "consistency-kubelet-config-pool-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",

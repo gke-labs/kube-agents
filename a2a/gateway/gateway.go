@@ -2279,13 +2279,7 @@ func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionReco
 	if lib.IsTaskSupervisorSubject(terminalSubject, addressee, taskID) {
 		source = TerminalFromSupervisor
 	}
-	g.mu.Lock()
-	rs, ok := g.relays[taskID]
-	if !ok {
-		rs = &relayState{}
-		g.relays[taskID] = rs
-	}
-	g.mu.Unlock()
+	rs := g.relayFor(taskID)
 	g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
 		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
@@ -3410,6 +3404,9 @@ type taskStart struct {
 	// for a child of a batch of two or more only.
 	BatchIndex int
 	Target     string
+	// BatchRound is the delegation round a profile parent's child is minted
+	// in (TaskRef.BatchRound), 0 for round one.
+	BatchRound int
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -3679,7 +3676,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if ts.KeepActive {
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
-	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
+	ref.BatchIndex, ref.Target, ref.BatchRound = ts.BatchIndex, ts.Target, ts.BatchRound
 	ref.Lineless = lineless
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))

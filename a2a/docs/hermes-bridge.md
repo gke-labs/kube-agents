@@ -560,9 +560,10 @@ refused. Follow-ups run on the `api` executor only: the `cli` executor cannot co
 The bridge answers each follow-up with a non-final status carrying the task's current state
 (`submitted` while queued or waiting for the session, `working` after) and a `steerNotice` data
 part: `queued`, or `refused` with `no-resume` (the task runs on the `cli` executor, which can't
-continue a session; every follow-up to it is refused so when it arrives, the notice's text says
-to send it again after the answer, and the gateway posts that to the room at once),
-`queue-full` (a task takes at most 16 follow-ups, counted per task: those already run count, not
+continue a session, so the bridge refuses every follow-up to it on arrival; the notice's text says
+to send it again after the answer, and the gateway posts the refusal to the room at once),
+`queue-full` (a task takes at most 16 follow-ups, `steerQueueCapacity` in
+`a2a/hermes-bridge/bridge.go`, counted per task: those already run count, not
 only those waiting), `task-ending` (the answer was already
 chosen), `no-text` (no text part holds anything but white space, U+001C-U+001F or NUL: Hermes's API
 server refuses a turn that Python's `str.strip()` empties, which strips U+001C-U+001F too, and a
@@ -575,7 +576,9 @@ slot, and the `Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `
 follow-up never replays the opening answer. A follow-up's text needs no length check of its own: the
 gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
-request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
+request far under the server's 10 MB body limit (`MAX_REQUEST_BYTES`). The two server limits are
+constants in `gateway/platforms/api_server.py` of the Hermes release that `tags.env` pins, not in
+this repository. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
 then the one terminal. At each turn boundary the bridge checks each distinct capability among the
 queued follow-ups once, not once per follow-up, so a verifier it cannot reach holds the previous
@@ -592,7 +595,7 @@ it was, and a cancel still ends `canceled`). A failed follow-up turn names itsel
 12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
 not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
 whose turn had started when the bridge crashed counts as run, though its answer never arrives.
-Mid-turn steering through the runs API is gke-labs#2628.
+The bridge does not steer a turn that is running: a follow-up waits for that turn to end.
 
 **Upgrade order for steering.** The gateway and the bridge do not always roll together. The
 gateway's image follows the operator; the rendered bridge's image is chosen as
