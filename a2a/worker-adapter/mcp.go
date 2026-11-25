@@ -109,15 +109,10 @@ const batchMinItems = 2
 // description built from the turn's targets (nil for none). A width over one
 // adds the tasks list; otherwise the schema is the single-child one, exactly,
 // so a pod talking to a gateway built before batches is unchanged.
-func delegateToolSchema(targets *lib.DelegateTargets) map[string]any {
-	return delegateToolSchemaWith(targets, nil)
-}
-
-// delegateToolSchemaWith is delegateToolSchema with the turn's scopeClusters
-// page (nil for none) named once, at the end of the tool's own description
-// (scopeClustersDescription), when an agent on the turn's list takes a
-// cluster (offersClusterTarget). Otherwise the schema is delegateToolSchema's.
-func delegateToolSchemaWith(targets *lib.DelegateTargets, scope *lib.ScopeClusters) map[string]any {
+// The turn's scopeClusters page (nil for none) is named once, at the end of
+// the tool's own description (scopeClustersDescription), when an agent on the
+// turn's list takes a cluster (offersClusterTarget).
+func delegateToolSchema(targets *lib.DelegateTargets, scope *lib.ScopeClusters) map[string]any {
 	entry := func() map[string]any {
 		return map[string]any{
 			"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},
@@ -396,7 +391,7 @@ func ServeDelegateMCPWith(ctx context.Context, in io.Reader, out io.Writer, sock
 				"serverInfo":      map[string]any{"name": DelegateMCPServer, "version": "1"},
 			}
 		case "tools/list":
-			resp.Result = map[string]any{"tools": []any{delegateToolSchemaWith(targets, scope)}}
+			resp.Result = map[string]any{"tools": []any{delegateToolSchema(targets, scope)}}
 		case "tools/call":
 			resp.Result = callDelegate(req.Params, socketPath, log)
 		case "ping":

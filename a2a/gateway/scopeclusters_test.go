@@ -466,6 +466,9 @@ func TestScopeClustersAtScale(t *testing.T) {
 	// with the map (3ms without); with the member hash and the row scan
 	// per project it took about 650ms, and re-parsing the listing on each
 	// build added about 9ms. A tenfold regression passes the bound.
+	// The fastest of the builds is held to it: that is the build's own cost,
+	// where the slowest also carries a scheduler or GC pause on a busy runner
+	// (CI saw 74ms once).
 	const buildBound = 40 * time.Millisecond
 	explicit := make([]string, 0, 40)
 	for i := range 40 {
@@ -496,11 +499,11 @@ func TestScopeClustersAtScale(t *testing.T) {
 		g.cfg.Namespace = chainTestNamespace
 
 		got := g.profileScopeClusters(parent) // the read, the parse, and the first build
-		var slowest time.Duration
+		fastest := time.Duration(1<<63 - 1)
 		for range 5 {
 			start := time.Now()
 			again := g.profileScopeClusters(parent)
-			slowest = max(slowest, time.Since(start))
+			fastest = min(fastest, time.Since(start))
 			if !reflect.DeepEqual(again, got) {
 				t.Fatalf("a second build differs: %+v", again)
 			}
@@ -537,9 +540,9 @@ func TestScopeClustersAtScale(t *testing.T) {
 		if len(got.UnlistedProjects) != lib.ScopeClustersUnlistedMax {
 			t.Fatalf("%d unlisted named, want %d", len(got.UnlistedProjects), lib.ScopeClustersUnlistedMax)
 		}
-		if slowest > buildBound {
-			t.Fatalf("with the map %v: a build over %d rows took %v, over %v", withClusters, rows, slowest, buildBound)
+		if fastest > buildBound {
+			t.Fatalf("with the map %v: the fastest of the builds over %d rows took %v, over %v", withClusters, rows, fastest, buildBound)
 		}
-		t.Logf("with the map %v: %d rows, %d-byte document, slowest build %v", withClusters, rows, len(raw), slowest)
+		t.Logf("with the map %v: %d rows, %d-byte document, fastest build %v", withClusters, rows, len(raw), fastest)
 	}
 }
