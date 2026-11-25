@@ -192,6 +192,13 @@ OPEN_PROPOSAL_STATE = "open"
 CLAIM_WINDOW_SECONDS = 900
 CLAIM_CLOCK_SKEW_SECONDS = 60
 CLAIM_TITLE_MAX = 300
+# The states `proposal-claim` accepts. Merged as well as open: a repository
+# whose own workflow merges the fix seconds after it opens (the
+# `kube-agents:auto-merge` label) can merge it before the hook presents the
+# token, and a refused claim writes no post-merge record, so the one fix the
+# check exists to guard went unverified (#6947). Closed without a merge stays
+# refused.
+CLAIM_STATES = frozenset({OPEN_PROPOSAL_STATE, MERGED_PROPOSAL_STATE})
 # The forge failures `proposal-claim` asks again once: the two refusals the
 # provider layer reads as the forge's own trouble (`providers/errors.py`), the
 # set the agent side's `forge.TRANSIENT_CODES` retries reads on. The claim
@@ -3077,8 +3084,9 @@ class VcsBroker:
         a `proposal-create` answer, and with that answer's url, number and
         repository in `payload` in place of anything the caller sent: the
         token is what proves the call, this is what proves the proposal. The
-        forge must answer `proposal-view` for the number with the same url, an
-        open state, a creation time inside CLAIM_WINDOW_SECONDS, and as author
+        forge must answer `proposal-view` for the number with the same url, a
+        state in CLAIM_STATES (open, or merged already), a creation time inside
+        CLAIM_WINDOW_SECONDS, and as author
         the account this credential acts as. Anything else the forge answers
         is a 409; the answer is the forge's, never the caller's. A forge that
         must name its account and cannot raises IdentityUnknown, whose code
@@ -3107,7 +3115,7 @@ class VcsBroker:
             and isinstance(url, str)
             and view.get("url") == url
             and view.get("number") == number
-            and view.get("state") == OPEN_PROPOSAL_STATE
+            and view.get("state") in CLAIM_STATES
             and age is not None
             and -CLAIM_CLOCK_SKEW_SECONDS <= age <= CLAIM_WINDOW_SECONDS
             and _login_key(str(view.get("author") or "")) == _login_key(viewer)

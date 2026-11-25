@@ -17,7 +17,7 @@ record's token is presented to the broker's ``proposal-claim`` verb
 (:func:`claim`), addressed to the record's ``repo`` whatever shape the forge
 gives its url (``…/pull/7``, ``…/pulls/7``, ``…/pull-requests/7``,
 ``…/-/merge_requests/7``). The broker burns the token, checks with the forge
-that the proposal the token was minted for is open, recent and authored by the
+that the proposal the token was minted for is open or merged, recent and authored by the
 broker's own account, and answers the forge's ``url``, ``number`` and ``title``. Only a claimed
 proposal counts: it is written to the Session KV ledger
 (``POST /v1/proposals/opened``) with the origin of this process
