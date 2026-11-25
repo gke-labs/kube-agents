@@ -563,13 +563,13 @@ func delegateToolEnabled() bool {
 // nothing reads it concurrently.
 var delegateToolSuppressed bool
 
-// sessionToolLists is a session pod's tool surface before the delegate
-// tool: the allowlist and denylist in Claude Code's names, whether the pod
-// has the cluster view, and whether Bash is actually allowed under it (the
-// view is only on then: an override that leaves Bash out keeps it
-// disallowed and gets no prompt telling the model to use it). Every
-// harness's grant is read from these lists (harnessCommand; the core-agent
-// grant, coreAgentSessionGrant).
+// harnessCommand builds the harness argv: the native binary driven over the
+// headless stream-json contract. A2A_HARNESS_CMD overrides the whole argv
+// (tests, stubs); A2A_HARNESS_EXTRA_ARGS appends without replacing.
+// sessionToolLists is a session pod's tool allowlist and denylist, whether
+// it has the cluster view, and whether that view's Bash is allowed. The view
+// is only on when Bash is actually allowed: an override that leaves it out
+// keeps Bash disallowed and gets no prompt telling the model to use it.
 func sessionToolLists(getenv func(string) string) (allowed, disallowed string, clusterView, bashView bool) {
 	allowed = getenv("A2A_ALLOWED_TOOLS")
 	disallowed = defaultDisallowedTools
