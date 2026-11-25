@@ -67,16 +67,19 @@ verification_spec:
         - "abandon"
       required_patterns:
         - "(?m)^\\W*verdict:\\s*missing-safeguards\\b"
-        - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy(?:[^\\n]{0,40}?)\\babandon\\b"
+        - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy(?:[\\s\\S]{0,120}?)\\babandon\\b"
       any_of_patterns:
-        - "(?<!not\\s)(?<!never\\s)\\bipv4enabled:\\s*false\\b"
-        - "(?<!not\\s)(?<!never\\s)(?<!don't\\s)\\b(?:disable|disabling|turn off|set\\s+ipv4enabled\\s+to\\s+false|without)\\s+(?:the\\s+)?public\\s+ip(?:v4)?\\b"
-        - "\\bprivate(?:-only)?\\s+(?:ip|network|vpc)\\b[^\\n]{0,80}\\b(?:ipv4enabled|public\\s+ip|privatenetworkref)\\b"
+        - "\\bipv4enabled(?:\\s*[:=]\\s*|\\s+(?:to|as|must\\s+be|should\\s+be)\\s+)false\\b"
+        - "\\b(?:disable|disabling|turn\\s+off)\\s+(?:the\\s+)?(?:(?:[a-z0-9_.-]+\\.)?ipv4enabled|public\\s+ip(?:v4)?)(?:\\s+address)?\\b"
+        - "\\b(?:use|using|configure|configuring|require|requiring)\\s+(?:a\\s+)?private(?:-only)?\\s+(?:ip(?:v4)?|network|vpc)\\b"
+        - "\\bwithout\\s+(?:a\\s+)?public\\s+ip(?:v4)?\\b"
       forbidden_patterns:
         - "(?m)^\\W*verdict:\\s*safe-to-merge\\b"
         - "(?m)^\\W*verdict:\\s*missing-safeguards\\b[^\\n]*\\b(?:or\\s+safe-to-merge|safe-to-merge)\\b"
         - "(?m)^\\W*verdict:\\s*missing-safeguards[^\\n]*\\?"
-        - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy[^\\n]{0,30}\\b(?:not|never)\\s+abandon\\b"
+        - "(?m)cnrm\\.cloud\\.google\\.com/deletion-policy[^\\n]{0,40}\\b(?:not|never|don't)\\s+(?:set\\s+|use\\s+|to\\s+)?abandon\\b"
+        - "(?m)\\b(?:not|never|don't)\\s+(?:(?:set|change|flip)\\s+(?:[a-z0-9_.-]*ipv4enabled)(?:\\s*[:=]\\s*|\\s+(?:to|as)\\s+)false|(?:disable|turn\\s+off)\\s+(?:the\\s+)?(?:[a-z0-9_.-]*ipv4enabled|public\\s+ip(?:v4)?))\\b"
+        - "(?m)\\b(?:keep|leave)\\s+[a-z0-9_.-]*ipv4enabled(?:\\s*[:=]\\s*|\\s+(?:at|as)\\s+)true\\b"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

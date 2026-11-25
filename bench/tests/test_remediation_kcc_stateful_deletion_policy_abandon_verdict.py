@@ -10,36 +10,14 @@ quote markers when ``fold_decoration: true`` is set.
 
 from __future__ import annotations
 
-from pathlib import Path
+from conftest import check_passes
 
-import pytest
-import yaml
-
-from kube_agents_bench import transcript
-from kube_agents_bench.verifiers import ReportContainsVerifier
-
-TASK = (
-    Path(__file__).resolve().parent.parent
-    / "tasks"
-    / "remediation-kcc-stateful-deletion-policy-abandon"
-    / "task.yaml"
-)
+CASE = "remediation-kcc-stateful-deletion-policy-abandon"
 CHECK = "the-review-flags-missing-deletion-policy-and-public-ip"
-TIMEOUT_SEC = 5.0
-
-
-@pytest.fixture(autouse=True)
-def _clean_transcript():
-    transcript.clear()
-    yield
-    transcript.clear()
 
 
 def _passes(report: str) -> bool:
-    doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
-    (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    transcript.set(report, [], final_message=report)
-    return ReportContainsVerifier(**check["check"]).verify(TIMEOUT_SEC).success
+    return check_passes(CASE, CHECK, report)
 
 
 def test_missing_safeguards_verdict_with_annotation_and_network_fixes_passes():
@@ -67,6 +45,22 @@ def test_missing_safeguards_verdict_with_annotation_and_network_fixes_passes():
             "1. **VERDICT: MISSING-SAFEGUARDS** — This production SQLInstance is not safe to merge.\n"
             "2. Add `cnrm.cloud.google.com/deletion-policy: abandon`.\n"
             "3. Set `ipv4Enabled: false` under `spec.settings.ipConfiguration`."
+        ),
+        # Prose phrasings for deletion-policy (gap > 40 chars or across a newline) and ipv4Enabled to false.
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add the `cnrm.cloud.google.com/deletion-policy` annotation to `metadata.annotations` with value `abandon`.\n"
+            "Set `spec.settings.ipConfiguration.ipv4Enabled` to `false`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "- Annotation: `cnrm.cloud.google.com/deletion-policy`\n"
+            "  Value: `abandon`\n"
+            "- Set `ipv4Enabled` to `false`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add `cnrm.cloud.google.com/deletion-policy: abandon` and disable `ipv4Enabled` in `ipConfiguration`."
         ),
     ):
         assert _passes(report), report
@@ -123,6 +117,19 @@ def test_safe_to_merge_missing_fixes_or_inline_verdict_fails():
         (
             "VERDICT: MISSING-SAFEGUARDS\n\n"
             "Set `cnrm.cloud.google.com/deletion-policy` to `none` (not `abandon`) and `ipv4Enabled: false`."
+        ),
+        # Contradictory or negated network advice.
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add `cnrm.cloud.google.com/deletion-policy: abandon`. A private network is not needed; keep `ipv4Enabled: true`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add `cnrm.cloud.google.com/deletion-policy: abandon`, and do not set `ipv4Enabled: false`."
+        ),
+        (
+            "VERDICT: MISSING-SAFEGUARDS\n\n"
+            "Add `cnrm.cloud.google.com/deletion-policy: abandon`, and don't disable the public IP."
         ),
     ):
         assert not _passes(report), report
