@@ -3917,6 +3917,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		}
 	}
 	rec.recordSteerAuthor(active.TaskID, author)
+	rec.SteeredSession = rec.BusSession
 	if rec.AddressedToOwnSession() {
 		rec.addSessionAuthor(author)
 	}

@@ -124,8 +124,9 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 		return // never delete a pod out from under a running task
 	}
 	// The idle clock is the last user message, not the last activity: the
-	// answer to a message does not keep the pod (idleSince).
-	if time.Since(rec.idleSince()) < g.cfg.IdleTTL {
+	// answer to a message does not keep the pod (idleSince), except under the
+	// short single-turn DM TTL (Config.idleExpired).
+	if !g.cfg.idleExpired(rec, time.Now()) {
 		return
 	}
 	l := g.lockSession(rec.Key)
@@ -137,7 +138,7 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	fresh, err := g.reg.Get(ctx, rec.Key)
 	if err != nil || fresh == nil || fresh.PodName == "" ||
 		(fresh.ActiveTask != nil && !fresh.ActiveTask.Detached) ||
-		time.Since(fresh.idleSince()) < g.cfg.IdleTTL {
+		!g.cfg.idleExpired(fresh, time.Now()) {
 		l.Unlock()
 		return
 	}

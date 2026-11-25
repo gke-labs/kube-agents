@@ -2927,6 +2927,16 @@ func (in *TuningSpec) DeepCopyInto(out *TuningSpec) {
 		*out = new(int)
 		**out = **in
 	}
+	if in.SessionIdleMinutes != nil {
+		in, out := &in.SessionIdleMinutes, &out.SessionIdleMinutes
+		*out = new(int32)
+		**out = **in
+	}
+	if in.DMSessionIdleMinutes != nil {
+		in, out := &in.DMSessionIdleMinutes, &out.DMSessionIdleMinutes
+		*out = new(int32)
+		**out = **in
+	}
 	if in.SessionResources != nil {
 		in, out := &in.SessionResources, &out.SessionResources
 		*out = new(v1.ResourceRequirements)
