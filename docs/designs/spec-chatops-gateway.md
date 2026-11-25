@@ -3297,7 +3297,9 @@ starting, the person's answer, lifts the pause. The
 indicator stops with the last hold, and ten minutes after the newest hold was added at the
 latest (`teamsTypingMax`), since only a notify settles an older ask; a later hold starts it
 again. A post that fails is
-dropped and the next one tries again.
+dropped and the next one tries again. Teams accepts the post in every conversation and draws
+it only in some: a live run showed the indicator in a one-to-one chat with the bot and nothing
+in a channel thread, so a channel has the line and the plan alone.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
