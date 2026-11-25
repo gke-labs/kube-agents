@@ -90,8 +90,9 @@ type StreamPolicy struct {
 // `a2a.topics.>` is refused against a policy listing `a2a.topics.x`, since
 // either captures more. Fewer subjects capture less, so a subset is
 // accepted; an install provisioned before a subject was added (TOPICS-STATE
-// before topology-skew, which the provision Job never edits in) restores
-// as it was, and MissingSubjects reports the gap as a warning. An empty
+// before topology-skew, which the provision Job never edits in) has the
+// missing subject appended on a forward restore, and restores as it was on
+// the way back with MissingSubjects reporting the gap as a warning. An empty
 // list is refused, because the server reads it as the stream's own name.
 func (p StreamPolicy) Check(cfg nats.StreamConfig) []string {
 	var diffs []string
