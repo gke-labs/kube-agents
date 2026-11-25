@@ -240,3 +240,54 @@ func TestARefusedCallReachesTheHarnesssStderr(t *testing.T) {
 		t.Errorf("stderr carries the command: %s", errOut.String())
 	}
 }
+
+// replyModel calls one tool, then records the tool's response it is sent.
+type replyModel struct {
+	callModel
+	responses []map[string]any
+}
+
+func (m *replyModel) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
+	m.mu.Lock()
+	for _, c := range req.Contents {
+		for _, p := range c.Parts {
+			if p.FunctionResponse != nil {
+				m.responses = append(m.responses, p.FunctionResponse.Response)
+			}
+		}
+	}
+	m.mu.Unlock()
+	return m.callModel.GenerateContent(ctx, req, stream)
+}
+
+// TestARefusedShellCommandTellsTheModelWhatToDo: through the harness's own
+// turn, the tool result the model reads for a refused shell command says
+// why and what to do instead: for a granted command in a pipe, that the
+// shell runs one plain command and to shape output with the command's own
+// flags; for a command the grant doesn't name, which commands may run.
+func TestARefusedShellCommandTellsTheModelWhatToDo(t *testing.T) {
+	for _, c := range []struct {
+		name, command, want string
+	}{
+		{"a granted command in a pipe", "kubectl get pods -A | grep -v Running", "one plain command at a time"},
+		{"a granted command with a redirect", "kubectl get pods 2>&1", "-o jsonpath"},
+		{"a command not granted", "gcloud info", "Only these commands may run here, each as one plain command: kubectl"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": c.command}}}}
+			withModel(t, m)
+			runTurn(t, t.TempDir(), coreagentwire.Envelope{Message: "go", Policy: coreagentwire.Policy{
+				Tools: []string{"bash"}, Allow: []string{"bash:kubectl", "bash:kubectl *"},
+			}})
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if len(m.responses) != 1 {
+				t.Fatalf("the model was sent %d tool responses, want 1: %v", len(m.responses), m.responses)
+			}
+			got, _ := m.responses[0]["error"].(string)
+			if !strings.Contains(got, c.want) || !strings.Contains(got, "requires an allowlist entry") {
+				t.Errorf("the model read %q, want the gate's refusal and %q", got, c.want)
+			}
+		})
+	}
+}
