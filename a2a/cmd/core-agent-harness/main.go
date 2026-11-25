@@ -56,7 +56,9 @@ func main() {
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Non-dumpable before anything else: a same-UID command the turn runs
 	// can then neither read this process's memory or environ nor open its
-	// /proc/<pid>/fd, so it can't write forged event lines into stdout.
+	// /proc/<pid>/fd. That covers this end of the stdout pipe only; the
+	// adapter's end is the adapter's to protect, and its decoder accepts
+	// event lines only in the turn's order.
 	if err := childenv.Protect(); err != nil {
 		fmt.Fprintln(stderr, "core-agent-harness: protect:", err)
 		return 1
@@ -83,7 +85,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	var env coreagentwire.Envelope
 	raw, err := bufio.NewReaderSize(io.LimitReader(stdin, coreagentwire.MaxEnvelopeBytes+1), 64<<10).ReadBytes('\n')
 	switch {
-	case len(raw) > coreagentwire.MaxEnvelopeBytes:
+	case len(bytes.TrimSuffix(raw, []byte("\n"))) > coreagentwire.MaxEnvelopeBytes:
 		err = fmt.Errorf("over %d bytes", coreagentwire.MaxEnvelopeBytes)
 	case err == io.EOF && len(bytes.TrimSpace(raw)) > 0:
 		err = nil // a final line without its newline
