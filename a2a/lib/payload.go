@@ -675,6 +675,27 @@ type ChildResult struct {
 	// Text is the child's deliverable when it completed, and the reason it
 	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
 	Text string `json:"text,omitempty"`
+	// Entry is the 1-based index of the batch entry this result ends, on
+	// every end of a batch, and 0 for a single delegation (a tasks list of
+	// one included). The gateway sends each entry of a batch one end, which
+	// can arrive twice or, across a restart, be lost: a parent waiting on a
+	// batch dedupes its ends on Entry and counts them to the batch's size,
+	// with its own deadline bounding the wait, and dedupes a single
+	// delegation's on ChildTaskID. An entry that never got a child (its
+	// batch was cut short and withdrawn) ends failed with no ChildTaskID.
+	Entry int `json:"entry,omitempty"`
+}
+
+// validChildResult: a terminal end, with text in the cap, that names its
+// child, or a batch entry that never got one and so ended failed.
+func validChildResult(c ChildResult) bool {
+	if !c.State.Terminal() || len(c.Text) > ChildResultTextCap || c.Entry < 0 || c.Entry > DelegateBatchMax {
+		return false
+	}
+	if c.ChildTaskID == "" {
+		return c.Entry >= 1 && c.State == StateFailed
+	}
+	return ValidSubjectToken(c.ChildTaskID)
 }
 
 // ChildResultTextCap bounds ChildResult.Text in bytes. The gateway cuts a
@@ -684,11 +705,12 @@ const ChildResultTextCap = 64 * 1024
 
 const childResultKey = "childResult"
 
-// ChildResultPart is c as a data part, refused without a child task id or a
-// terminal state, or with text past ChildResultTextCap.
+// ChildResultPart is c as a data part, refused without a terminal state,
+// with text past ChildResultTextCap, or without a child task id unless it
+// ends a batch entry that never got a child (validChildResult).
 func ChildResultPart(c ChildResult) (Part, error) {
-	if !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() || len(c.Text) > ChildResultTextCap {
-		return Part{}, fmt.Errorf("child result: needs a task id, a terminal state and at most %d bytes of text", ChildResultTextCap)
+	if !validChildResult(c) {
+		return Part{}, fmt.Errorf("child result: needs a terminal state, at most %d bytes of text, and a task id or a not-started batch entry", ChildResultTextCap)
 	}
 	data, err := json.Marshal(map[string]ChildResult{childResultKey: c})
 	if err != nil {
@@ -698,8 +720,8 @@ func ChildResultPart(c ChildResult) (Part, error) {
 }
 
 // ChildResultOf finds the childResult part among parts. A data part that is
-// not one, or one without a task id or a terminal state or with text past
-// the cap, is skipped: a malformed child result is no event, where a
+// not one, or one ChildResultPart would refuse, is skipped: a malformed
+// child result is no event, where a
 // malformed parameter set (TaskParametersOf) would change what runs.
 func ChildResultOf(parts []Part) (ChildResult, bool) {
 	for _, p := range parts {
@@ -708,8 +730,7 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 			continue
 		}
 		var c ChildResult
-		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() ||
-			len(c.Text) > ChildResultTextCap {
+		if json.Unmarshal(raw, &c) != nil || !validChildResult(c) {
 			continue
 		}
 		return c, true
