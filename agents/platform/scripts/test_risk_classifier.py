@@ -23,9 +23,10 @@ from risk_classifier import (
     CHANGE_DELETED,
     CHANGE_MODIFIED,
     CHANGE_RENAMED,
-    DESTRUCTIVE_NO,
-    DESTRUCTIVE_UNKNOWN,
-    DESTRUCTIVE_YES,
+    DISRUPT_DESTRUCTIVE,
+    DISRUPT_DISRUPTIVE,
+    DISRUPT_NONE,
+    DISRUPT_UNKNOWN,
     REVERT_DIFFICULT,
     REVERT_EASY,
     REVERT_IRREVERSIBLE,
@@ -40,7 +41,7 @@ from risk_classifier import (
     classify_changes,
     classify_git_range,
     combine_blast_radius,
-    combine_destructiveness,
+    combine_disruptiveness,
     combine_revertability,
     combine_risk,
     load_git_changes,
@@ -202,10 +203,14 @@ class LatticeTests(unittest.TestCase):
         self.assertEqual(combine_revertability(REVERT_DIFFICULT, REVERT_UNKNOWN), REVERT_UNKNOWN)
         self.assertEqual(combine_revertability(REVERT_IRREVERSIBLE, REVERT_UNKNOWN), REVERT_IRREVERSIBLE)
 
-    def test_destructiveness_anti_masking(self) -> None:
-        self.assertEqual(combine_destructiveness(DESTRUCTIVE_NO, DESTRUCTIVE_UNKNOWN), DESTRUCTIVE_UNKNOWN)
-        self.assertEqual(combine_destructiveness(DESTRUCTIVE_YES, DESTRUCTIVE_UNKNOWN), DESTRUCTIVE_YES)
-        self.assertEqual(combine_destructiveness(DESTRUCTIVE_UNKNOWN, DESTRUCTIVE_YES), DESTRUCTIVE_YES)
+    def test_disruptiveness_anti_masking(self) -> None:
+        self.assertEqual(combine_disruptiveness(DISRUPT_NONE, DISRUPT_UNKNOWN), DISRUPT_UNKNOWN)
+        self.assertEqual(combine_disruptiveness(DISRUPT_DISRUPTIVE, DISRUPT_UNKNOWN), DISRUPT_DISRUPTIVE)
+        self.assertEqual(combine_disruptiveness(DISRUPT_UNKNOWN, DISRUPT_DISRUPTIVE), DISRUPT_DISRUPTIVE)
+        self.assertEqual(combine_disruptiveness(DISRUPT_DESTRUCTIVE, DISRUPT_UNKNOWN), DISRUPT_DESTRUCTIVE)
+        self.assertEqual(combine_disruptiveness(DISRUPT_UNKNOWN, DISRUPT_DESTRUCTIVE), DISRUPT_DESTRUCTIVE)
+        self.assertEqual(combine_disruptiveness(DISRUPT_DISRUPTIVE, DISRUPT_DESTRUCTIVE), DISRUPT_DESTRUCTIVE)
+        self.assertEqual(combine_disruptiveness(DISRUPT_DESTRUCTIVE, DISRUPT_DISRUPTIVE), DISRUPT_DESTRUCTIVE)
 
 
 class WorkloadScenarioTests(unittest.TestCase):
@@ -216,7 +221,7 @@ class WorkloadScenarioTests(unittest.TestCase):
         self.assertEqual(r.risk_level, RISK_LOW)
         self.assertEqual(r.blast_radius, BLAST_LOW)
         self.assertEqual(r.revertability, REVERT_EASY)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
         self.assertTrue(r.supported)
         self.assertTrue(r.effective_changes)
         self.assertEqual(r.risk_label, "risk:low")
@@ -241,7 +246,7 @@ class WorkloadScenarioTests(unittest.TestCase):
     def test_modest_replica_bump_is_low(self) -> None:
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("replicas: 4", "replicas: 6"))])
         self.assertEqual(r.risk_level, RISK_LOW)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
         self.assertEqual(r.revertability, REVERT_EASY)
 
     def test_large_replica_spike_is_medium(self) -> None:
@@ -249,30 +254,37 @@ class WorkloadScenarioTests(unittest.TestCase):
         self.assertEqual(r.risk_level, RISK_MEDIUM)
         self.assertEqual(r.blast_radius, BLAST_MEDIUM)
 
-    def test_modest_scale_down_is_medium_non_destructive(self) -> None:
+    def test_modest_scale_down_is_medium_non_disruptive(self) -> None:
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("replicas: 4", "replicas: 3"))])
         self.assertEqual(r.risk_level, RISK_MEDIUM)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
 
-    def test_steep_scale_down_and_zero_are_high_destructive(self) -> None:
+    def test_steep_scale_down_and_zero_are_high_disruptive_easy_revert(self) -> None:
         for target in (1, 0):
             with self.subTest(replicas=target):
                 r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("replicas: 4", f"replicas: {target}"))])
                 self.assertEqual(r.risk_level, RISK_HIGH)
-                self.assertEqual(r.destructiveness, DESTRUCTIVE_YES)
+                self.assertEqual(r.disruptiveness, DISRUPT_DISRUPTIVE)
+                self.assertEqual(r.revertability, REVERT_EASY)
 
-    def test_recreate_strategy_is_high_destructive(self) -> None:
+        # In production, scaling to zero still escalates high -> critical while staying disruptive + easy revert
+        r_prod_zero = classify_changes([_mod("clusters/prod-us/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("replicas: 4", "replicas: 0"))])
+        self.assertEqual(r_prod_zero.risk_level, RISK_CRITICAL)
+        self.assertEqual(r_prod_zero.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertEqual(r_prod_zero.revertability, REVERT_EASY)
+
+    def test_recreate_strategy_is_high_disruptive(self) -> None:
         after = BASE_DEPLOY.replace("replicas: 4", "replicas: 4\n  strategy:\n    type: Recreate")
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, after)])
         self.assertEqual(r.risk_level, RISK_HIGH)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r.disruptiveness, DISRUPT_DISRUPTIVE)
         self.assertEqual(r.revertability, REVERT_MODERATE)
 
     def test_immutable_selector_change_is_high_destructive(self) -> None:
         after = BASE_DEPLOY.replace("matchLabels:\n      app: web", "matchLabels:\n      app: web-v2")
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, after)])
         self.assertEqual(r.risk_level, RISK_HIGH)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r.disruptiveness, DISRUPT_DESTRUCTIVE)
         self.assertEqual(r.revertability, REVERT_MODERATE)
 
     def test_command_args_and_lifecycle_edits_are_high(self) -> None:
@@ -314,13 +326,13 @@ class WorkloadScenarioTests(unittest.TestCase):
         after = before.replace('cpu: "50m"', 'cpu: "100m"').replace('cpu: "100m"\n              memory: "128Mi"', 'cpu: "200m"\n              memory: "128Mi"')
         r = classify_changes([_mod("clusters/dev/web.yaml", before, after)])
         self.assertEqual(r.risk_level, RISK_LOW)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
 
-    def test_request_exceeds_limit_is_high_destructive(self) -> None:
+    def test_request_exceeds_limit_is_high_disruptive(self) -> None:
         after = BASE_DEPLOY.replace('cpu: "100m"', 'cpu: "800m"')
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, after)])
         self.assertEqual(r.risk_level, RISK_HIGH)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_privileged_daemonset_node_rootkit_is_critical(self) -> None:
         ds = """\
@@ -409,7 +421,7 @@ spec:
         self.assertEqual(r_low.risk_level, RISK_LOW)
         r_susp = classify_changes([_mod("clusters/dev/cj.yaml", cj, cj.replace("suspend: false", "suspend: true"))])
         self.assertEqual(r_susp.risk_level, RISK_HIGH)
-        self.assertEqual(r_susp.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_susp.disruptiveness, DISRUPT_DISRUPTIVE)
 
 
 class StorageConfigScalingSecurityTests(unittest.TestCase):
@@ -420,7 +432,7 @@ class StorageConfigScalingSecurityTests(unittest.TestCase):
         self.assertEqual(r_ok.risk_level, RISK_LOW)
         r_bad = classify_changes([_mod("clusters/dev/hpa.yaml", BASE_HPA, BASE_HPA.replace("maxReplicas: 6", "maxReplicas: 1"))])
         self.assertEqual(r_bad.risk_level, RISK_HIGH)
-        self.assertEqual(r_bad.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_bad.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_vpa_unquoted_off_parses_as_yaml12_string_medium_vs_auto_high(self) -> None:
         vpa_off = """\
@@ -438,9 +450,9 @@ spec:
         self.assertTrue(r_off.supported)
         r_auto = classify_changes([_add("clusters/dev/vpa.yaml", vpa_off.replace("Off", "Auto"))])
         self.assertEqual(r_auto.risk_level, RISK_HIGH)
-        self.assertEqual(r_auto.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_auto.disruptiveness, DISRUPT_DISRUPTIVE)
 
-    def test_pdb_offline_add_is_medium_and_drain_deadlock_is_high_destructive(self) -> None:
+    def test_pdb_offline_add_is_medium_and_drain_deadlock_is_high_disruptive(self) -> None:
         pdb = """\
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -455,10 +467,10 @@ spec:
 """
         r_add = classify_changes([_add("clusters/dev/pdb.yaml", pdb)])
         self.assertEqual(r_add.risk_level, RISK_MEDIUM)
-        self.assertEqual(r_add.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r_add.disruptiveness, DISRUPT_NONE)
         r_dead = classify_changes([_add("clusters/dev/pdb.yaml", pdb.replace("maxUnavailable: 1", "maxUnavailable: 0"))])
         self.assertEqual(r_dead.risk_level, RISK_HIGH)
-        self.assertEqual(r_dead.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_dead.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_configmap_safe_scalar_vs_secret_leak_critical(self) -> None:
         r_ok = classify_changes([_mod("clusters/dev/cm.yaml", BASE_CONFIGMAP, BASE_CONFIGMAP + '  CACHE_TTL: "60"\n')])
@@ -479,17 +491,17 @@ spec:
         r_exp = classify_changes([_mod("clusters/dev/pvc.yaml", BASE_PVC, BASE_PVC.replace("10Gi", "20Gi"))])
         self.assertEqual(r_exp.risk_level, RISK_HIGH)
         self.assertEqual(r_exp.revertability, REVERT_DIFFICULT)
-        self.assertEqual(r_exp.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r_exp.disruptiveness, DISRUPT_NONE)
 
         r_shr = classify_changes([_mod("clusters/dev/pvc.yaml", BASE_PVC, BASE_PVC.replace("10Gi", "5Gi"))])
         self.assertEqual(r_shr.risk_level, RISK_HIGH)
-        self.assertEqual(r_shr.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_shr.disruptiveness, DISRUPT_DESTRUCTIVE)
         self.assertEqual(r_shr.revertability, REVERT_IRREVERSIBLE)
 
         r_del = classify_changes([_del("clusters/dev/pvc.yaml", BASE_PVC)])
         self.assertEqual(r_del.risk_level, RISK_CRITICAL)
         self.assertEqual(r_del.revertability, REVERT_IRREVERSIBLE)
-        self.assertEqual(r_del.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_del.disruptiveness, DISRUPT_DESTRUCTIVE)
 
     def test_namespace_delete_and_kube_system_delete_are_critical(self) -> None:
         ns = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: payments\n"
@@ -497,21 +509,25 @@ spec:
         self.assertEqual(r_ns.risk_level, RISK_CRITICAL)
         self.assertEqual(r_ns.blast_radius, BLAST_CRITICAL)
         self.assertEqual(r_ns.revertability, REVERT_IRREVERSIBLE)
-        self.assertEqual(r_ns.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_ns.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         ks = BASE_DEPLOY.replace("namespace: shop", "namespace: kube-system")
         r_ks = classify_changes([_del("clusters/dev/coredns.yaml", ks)])
         self.assertEqual(r_ks.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_ks.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_ks.disruptiveness, DISRUPT_DESTRUCTIVE)
 
-    def test_service_loadbalancer_non_destructive_vs_ports_destructive_vs_external_ips_critical(self) -> None:
+    def test_service_loadbalancer_non_disruptive_vs_ports_disruptive_vs_teardown_destructive(self) -> None:
         r_lb = classify_changes([_mod("clusters/dev/svc.yaml", BASE_SERVICE, BASE_SERVICE.replace("ClusterIP", "LoadBalancer"))])
         self.assertEqual(r_lb.risk_level, RISK_HIGH)
-        self.assertEqual(r_lb.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r_lb.disruptiveness, DISRUPT_NONE)
+
+        r_lb_down = classify_changes([_mod("clusters/dev/svc.yaml", BASE_SERVICE.replace("ClusterIP", "LoadBalancer"), BASE_SERVICE)])
+        self.assertEqual(r_lb_down.risk_level, RISK_HIGH)
+        self.assertEqual(r_lb_down.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         r_port = classify_changes([_mod("clusters/dev/svc.yaml", BASE_SERVICE, BASE_SERVICE.replace("port: 80", "port: 8081"))])
         self.assertEqual(r_port.risk_level, RISK_HIGH)
-        self.assertEqual(r_port.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_port.disruptiveness, DISRUPT_DISRUPTIVE)
 
         r_ext = classify_changes([_mod("clusters/dev/svc.yaml", BASE_SERVICE, BASE_SERVICE + "  externalIPs: [1.2.3.4]\n")])
         self.assertEqual(r_ext.risk_level, RISK_CRITICAL)
@@ -626,7 +642,7 @@ class UnsupportedUnknownAndGovernanceTests(unittest.TestCase):
     def test_pure_docs_are_low_non_effective_while_sync_dir_md_is_unknown(self) -> None:
         r_doc = classify_changes([_add("docs/soak-test.md", "# Soak Test\n")])
         self.assertEqual(r_doc.risk_level, RISK_LOW)
-        self.assertEqual(r_doc.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r_doc.disruptiveness, DISRUPT_NONE)
         self.assertFalse(r_doc.effective_changes)
         self.assertTrue(r_doc.supported)
 
@@ -638,7 +654,7 @@ class UnsupportedUnknownAndGovernanceTests(unittest.TestCase):
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, "# harmless comment\n" + BASE_DEPLOY)])
         self.assertEqual(r.risk_level, RISK_LOW)
         self.assertEqual(r.revertability, REVERT_EASY)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_NO)
+        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
         self.assertFalse(r.effective_changes)
 
     def test_unsupported_inputs_default_to_unknown(self) -> None:
@@ -665,7 +681,7 @@ class UnsupportedUnknownAndGovernanceTests(unittest.TestCase):
     def test_terraform_delete_is_high_destructive(self) -> None:
         r = classify_changes([_del("infra/main.tf", 'resource "google_storage_bucket" "b" {}\n')])
         self.assertEqual(r.risk_level, RISK_HIGH)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r.disruptiveness, DISRUPT_DESTRUCTIVE)
         self.assertFalse(r.supported)
 
 
@@ -680,7 +696,7 @@ class AdversarialEvasionAndPerformanceTests(unittest.TestCase):
         )
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, after_req_null)])
         self.assertEqual(r.risk_level, RISK_HIGH)
-        self.assertEqual(r.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_yaml11_boolean_smuggling_on_privileged_fails_closed(self) -> None:
         after = BASE_DEPLOY.replace(
@@ -715,7 +731,7 @@ class AdversarialEvasionAndPerformanceTests(unittest.TestCase):
         prod_before = BASE_DEPLOY.replace("    app: web\n", "    app: web\n    env: prod\n", 1)
         r_tamp = classify_changes([_mod("clusters/dev/web.yaml", prod_before, BASE_DEPLOY)])
         self.assertEqual(r_tamp.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_tamp.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_tamp.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_production_escalation_low_to_medium_and_destructive_high_to_critical(self) -> None:
         r_bump = classify_changes([_mod("clusters/prod-us/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("replicas: 4", "replicas: 5"))])
@@ -877,16 +893,16 @@ spec:
         )
         r_pol = classify_changes([_mod("clusters/dev/sts.yaml", sts, sts_del_pol)])
         self.assertEqual(r_pol.risk_level, RISK_HIGH)
-        self.assertEqual(r_pol.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_pol.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         r_imm = classify_changes([_mod("clusters/dev/sts.yaml", sts, sts.replace("db-headless", "db-new"))])
         self.assertEqual(r_imm.risk_level, RISK_HIGH)
-        self.assertEqual(r_imm.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_imm.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         r_del = classify_changes([_del("clusters/dev/sts.yaml", sts)])
         self.assertEqual(r_del.risk_level, RISK_HIGH)
         self.assertEqual(r_del.revertability, REVERT_DIFFICULT)
-        self.assertEqual(r_del.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_del.disruptiveness, DISRUPT_DESTRUCTIVE)
 
     def test_daemonset_image_bump_and_nodeselector_removal(self) -> None:
         ds = """\
@@ -916,12 +932,12 @@ spec:
 
         r_ns = classify_changes([_mod("clusters/dev/ds.yaml", ds, ds.replace("      nodeSelector:\n        pool: app\n", ""))])
         self.assertEqual(r_ns.risk_level, RISK_HIGH)
-        self.assertEqual(r_ns.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_ns.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_pod_template_label_removal_sidecar_probe_gpu_and_nameless_container(self) -> None:
         r_lbl = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("      labels:\n        app: web", "      labels:\n        app: web-changed"))])
         self.assertEqual(r_lbl.risk_level, RISK_HIGH)
-        self.assertEqual(r_lbl.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_lbl.disruptiveness, DISRUPT_DISRUPTIVE)
 
         sidecar = BASE_DEPLOY + "        - name: sidecar\n          image: gcr.io/acme/proxy:v1.0.0\n"
         self.assertEqual(classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, sidecar)]).risk_level, RISK_HIGH)
@@ -929,7 +945,7 @@ spec:
         no_probe = BASE_DEPLOY.split("          readinessProbe:")[0]
         r_prb = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, no_probe)])
         self.assertEqual(r_prb.risk_level, RISK_HIGH)
-        self.assertEqual(r_prb.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_prb.disruptiveness, DISRUPT_DISRUPTIVE)
 
         gpu = BASE_DEPLOY.replace('memory: "512Mi"', 'memory: "512Mi"\n              nvidia.com/gpu: "1"')
         self.assertEqual(classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, gpu)]).risk_level, RISK_HIGH)
@@ -942,7 +958,7 @@ spec:
         argo_a = argo_b.replace("prune: false", "prune: true")
         r_argo = classify_changes([_mod("argocd/app.yaml", argo_b, argo_a)])
         self.assertEqual(r_argo.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_argo.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_argo.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         rootsync = "apiVersion: configsync.gke.io/v1beta1\nkind: RootSync\nmetadata:\n  name: root-sync\n  namespace: config-management-system\nspec: {}\n"
         self.assertEqual(classify_changes([_add("bootstrap/rs.yaml", rootsync)]).risk_level, RISK_CRITICAL)
@@ -953,7 +969,7 @@ spec:
         r_np_del = classify_changes([_del("gcp/np.yaml", nodepool)])
         self.assertEqual(r_np_del.risk_level, RISK_CRITICAL)
         self.assertEqual(r_np_del.revertability, REVERT_IRREVERSIBLE)
-        self.assertEqual(r_np_del.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_np_del.disruptiveness, DISRUPT_DESTRUCTIVE)
 
     def test_ingress_snippet_istio_envoyfilter_gateway_routes_and_storageclass(self) -> None:
         ing = "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: web\n  namespace: shop\n  annotations:\n    nginx.ingress.kubernetes.io/configuration-snippet: |\n      more_set_headers \"X-Test: 1\";\nspec: {}\n"
@@ -979,7 +995,7 @@ spec:
 
         r_wipe = classify_changes([_mod("clusters/dev/cm.yaml", BASE_CONFIGMAP, BASE_CONFIGMAP.replace("LOG_LEVEL: info", 'LOG_LEVEL: ""'))])
         self.assertEqual(r_wipe.risk_level, RISK_HIGH)
-        self.assertEqual(r_wipe.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_wipe.disruptiveness, DISRUPT_DISRUPTIVE)
 
         r_ld = classify_changes([_mod("clusters/dev/cm.yaml", BASE_CONFIGMAP, BASE_CONFIGMAP + "  LD_PRELOAD: /tmp/evil.so\n")])
         self.assertEqual(r_ld.risk_level, RISK_HIGH)
@@ -990,7 +1006,7 @@ spec:
         rq = "apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: cap\n  namespace: shop\nspec:\n  hard:\n    pods: \"0\"\n"
         r_rq = classify_changes([_add("clusters/dev/rq.yaml", rq)])
         self.assertEqual(r_rq.risk_level, RISK_HIGH)
-        self.assertEqual(r_rq.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_rq.disruptiveness, DISRUPT_DISRUPTIVE)
 
         sec = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-sec\n  namespace: shop\nstringData:\n  k: super-secret-raw-value\n"
         r_sec = classify_changes([_add("clusters/dev/sec.yaml", sec)])
@@ -1082,7 +1098,7 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
             ]
         )
         self.assertEqual(r_doc.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_doc.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_doc.disruptiveness, DISRUPT_DESTRUCTIVE)
         self.assertEqual(r_doc.revertability, REVERT_IRREVERSIBLE)
 
         # Rename prod PVC to dev cluster -> must evaluate as CRITICAL PVC DELETE in prod
@@ -1100,7 +1116,7 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
             ]
         )
         self.assertEqual(r_pvc.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_pvc.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_pvc.disruptiveness, DISRUPT_DESTRUCTIVE)
         self.assertEqual(r_pvc.revertability, REVERT_IRREVERSIBLE)
 
         # Rename sync-tree manifest to non-sync examples dir -> CRITICAL Namespace DELETE
@@ -1118,7 +1134,7 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
             ]
         )
         self.assertEqual(r_ex.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_ex.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_ex.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         # Rename Terraform to docs -> HIGH destructive Terraform DELETE
         r_tf = classify_changes(
@@ -1135,7 +1151,7 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
             ]
         )
         self.assertEqual(r_tf.risk_level, RISK_HIGH)
-        self.assertEqual(r_tf.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_tf.disruptiveness, DISRUPT_DESTRUCTIVE)
 
     def test_template_marker_in_annotation_cannot_mask_critical_change(self) -> None:
         crb = (
@@ -1158,7 +1174,7 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
         )
         r_del = classify_changes([_add("clusters/dev/del-pvc.yaml", del_patch)])
         self.assertEqual(r_del.risk_level, RISK_CRITICAL)
-        self.assertEqual(r_del.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_del.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         cm_patch = (
             "apiVersion: v1\nkind: ConfigMap\n"
@@ -1166,7 +1182,7 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
         )
         r_cm = classify_changes([_add("clusters/dev/del-cm.yaml", cm_patch)])
         self.assertEqual(r_cm.risk_level, RISK_HIGH)
-        self.assertEqual(r_cm.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_cm.disruptiveness, DISRUPT_DESTRUCTIVE)
 
         frag = (
             "apiVersion: apps/v1\nkind: Deployment\n"
@@ -1294,21 +1310,21 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
         self.assertEqual(r_dup.risk_level, RISK_HIGH)
         self.assertIn("DUPLICATE_CONTAINER_NAME", {x.code for x in r_dup.reasons})
 
-        # Deployment rollingUpdate.maxUnavailable: "100%" -> HIGH destructive
+        # Deployment rollingUpdate.maxUnavailable: "100%" -> HIGH disruptive
         strat_after = BASE_DEPLOY.replace(
             "  replicas: 4\n",
             '  replicas: 4\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: "100%"\n',
         )
         r_strat = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, strat_after)])
         self.assertEqual(r_strat.risk_level, RISK_HIGH)
-        self.assertEqual(r_strat.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_strat.disruptiveness, DISRUPT_DISRUPTIVE)
 
-        # Removing `replicas: 10` (defaults to 1 in K8s) -> HIGH destructive scale-down
+        # Removing `replicas: 10` (defaults to 1 in K8s) -> HIGH disruptive scale-down
         rep10 = BASE_DEPLOY.replace("  replicas: 4\n", "  replicas: 10\n")
         rep_rm = BASE_DEPLOY.replace("  replicas: 4\n", "")
         r_rep = classify_changes([_mod("clusters/dev/web.yaml", rep10, rep_rm)])
         self.assertEqual(r_rep.risk_level, RISK_HIGH)
-        self.assertEqual(r_rep.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_rep.disruptiveness, DISRUPT_DISRUPTIVE)
 
         # resources.claims & ephemeral-storage not bypassed
         claims_after = BASE_DEPLOY.replace(
@@ -1404,12 +1420,12 @@ class AdversarialRegressionSuiteTests(unittest.TestCase):
         lb_a = "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n  namespace: shop\nspec:\n  type: LoadBalancer\n"
         self.assertEqual(classify_changes([_mod("clusters/dev/lb.yaml", lb_b, lb_a)]).risk_level, RISK_CRITICAL)
 
-        # HPA minReplicas 2 -> 0 -> HIGH destructive
+        # HPA minReplicas 2 -> 0 -> HIGH disruptive
         hpa_b = "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  minReplicas: 2\n  maxReplicas: 10\n"
         hpa_a = hpa_b.replace("minReplicas: 2", "minReplicas: 0")
         r_hpa = classify_changes([_mod("clusters/dev/hpa.yaml", hpa_b, hpa_a)])
         self.assertEqual(r_hpa.risk_level, RISK_HIGH)
-        self.assertEqual(r_hpa.destructiveness, DESTRUCTIVE_YES)
+        self.assertEqual(r_hpa.disruptiveness, DISRUPT_DISRUPTIVE)
 
         # PDB offline add has moderate revertability (never auto-merged blindly)
         pdb = "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  minAvailable: 1\n  selector:\n    matchLabels:\n      app: web\n"

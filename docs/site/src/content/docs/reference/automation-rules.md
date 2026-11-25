@@ -53,7 +53,7 @@ Each rule has `environments` plus one target selector:
   `no-pdb`, which adds a missing PodDisruptionBudget. A rule naming any other kind refuses the
   whole file.
 - `max_risk` (in `allow` rules only): the highest deterministic pull request risk level (`low` or
-  `medium`) permitted to carry an auto-merge label when the change is also non-destructive and
+  `medium`) permitted to carry an auto-merge label when the change is also non-disruptive and
   easily revertable. `high`, `critical`, `unknown`, and `*` are refused in `allow` rules.
 - `risk` (in `deny` rules only): denies risk-based auto-merge at or above that risk level (`low`,
   `medium`, or `*`). A `deny` rule with `fix: "*"` denies both recipe fixes and risk-based rules in

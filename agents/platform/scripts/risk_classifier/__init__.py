@@ -1,7 +1,7 @@
 """Deterministic, offline PR risk classifier for kube-agents.
 
 Qualifies every pull request across four orthogonal axes (`risk_level`,
-`blast_radius`, `revertability`, `destructiveness`) with explicit `unknown`
+`blast_radius`, `revertability`, `disruptiveness`) with explicit `unknown`
 handling for unsupported files/CRDs and zero LLM/network/clock dependencies.
 """
 
@@ -24,10 +24,11 @@ from .types import (
     CHANGE_MODIFIED,
     CHANGE_RENAMED,
     CONCRETE_RISK_ORDER,
-    DESTRUCTIVE_NO,
-    DESTRUCTIVE_UNKNOWN,
-    DESTRUCTIVE_YES,
-    DESTRUCTIVENESS_LEVELS,
+    DISRUPT_DESTRUCTIVE,
+    DISRUPT_DISRUPTIVE,
+    DISRUPT_NONE,
+    DISRUPT_UNKNOWN,
+    DISRUPTIVENESS_LEVELS,
     REVERT_DIFFICULT,
     REVERT_EASY,
     REVERT_IRREVERSIBLE,
@@ -53,7 +54,7 @@ from .types import (
     ResourceRef,
     ResourceVerdict,
     combine_blast_radius,
-    combine_destructiveness,
+    combine_disruptiveness,
     combine_revertability,
     combine_risk,
     risk_label_for,
@@ -76,10 +77,11 @@ __all__ = [
     "CHANGE_RENAMED",
     "CONCRETE_RISK_ORDER",
     "ClassificationResult",
-    "DESTRUCTIVENESS_LEVELS",
-    "DESTRUCTIVE_NO",
-    "DESTRUCTIVE_UNKNOWN",
-    "DESTRUCTIVE_YES",
+    "DISRUPTIVENESS_LEVELS",
+    "DISRUPT_DESTRUCTIVE",
+    "DISRUPT_DISRUPTIVE",
+    "DISRUPT_NONE",
+    "DISRUPT_UNKNOWN",
     "FileChange",
     "FileVerdict",
     "PRStats",
@@ -106,7 +108,7 @@ __all__ = [
     "classify_changes",
     "classify_git_range",
     "combine_blast_radius",
-    "combine_destructiveness",
+    "combine_disruptiveness",
     "combine_revertability",
     "combine_risk",
     "load_git_changes",

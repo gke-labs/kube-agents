@@ -412,7 +412,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         res = broker.proposal_classify_risk({"repository": "acme/infra", "number": 10})
         # Must accurately see 3 -> 4 (`low`), NOT 11 -> 4 steep scale-down!
         self.assertEqual(res["risk_level"], "low")
-        self.assertEqual(res["destructiveness"], "non_destructive")
+        self.assertEqual(res["disruptiveness"], "non_disruptive")
 
     def test_stale_base_same_file_modification_withholds_automerge(self) -> None:
         pr_sha = self._push_branch("platform-agent/stale-pr", {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")})

@@ -20,14 +20,15 @@ from .types import (
     CHANGE_ADDED,
     CHANGE_DELETED,
     CHANGE_RENAMED,
-    DESTRUCTIVE_NO,
-    DESTRUCTIVE_UNKNOWN,
-    DESTRUCTIVE_YES,
     DIM_BLAST_RADIUS,
-    DIM_DESTRUCTIVENESS,
+    DIM_DISRUPTIVENESS,
     DIM_INPUT_INTEGRITY,
     DIM_REVERTABILITY,
     DIM_SECURITY,
+    DISRUPT_DESTRUCTIVE,
+    DISRUPT_DISRUPTIVE,
+    DISRUPT_NONE,
+    DISRUPT_UNKNOWN,
     REVERT_DIFFICULT,
     REVERT_EASY,
     REVERT_MODERATE,
@@ -44,7 +45,7 @@ from .types import (
     Reason,
     ResourceVerdict,
     combine_blast_radius,
-    combine_destructiveness,
+    combine_disruptiveness,
     combine_revertability,
     combine_risk,
     unknown_result,
@@ -402,7 +403,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
     overall_risk = RISK_LOW
     overall_blast = BLAST_LOW
     overall_revert = REVERT_EASY
-    overall_destruct = DESTRUCTIVE_NO
+    overall_disrupt = DISRUPT_NONE
     all_supported = True
     any_effective = False
 
@@ -443,14 +444,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_HIGH,
                     blast_radius=BLAST_UNKNOWN,
                     revertability=REVERT_UNKNOWN,
-                    destructiveness=DESTRUCTIVE_UNKNOWN,
+                    disruptiveness=DISRUPT_UNKNOWN,
                     supported=False,
                 )
             )
             overall_risk = combine_risk(overall_risk, RISK_HIGH)
             overall_blast = combine_blast_radius(overall_blast, BLAST_UNKNOWN)
             overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-            overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
             continue
 
         cluster = _cluster_from_path(norm_path)
@@ -468,7 +469,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
         # 2a. Critical governance / CI / agent control-plane files
         if is_gov:
             any_effective = True
-            dest = DESTRUCTIVE_YES if fc.change_type == CHANGE_DELETED else DESTRUCTIVE_NO
+            disrupt = DISRUPT_DESTRUCTIVE if fc.change_type == CHANGE_DELETED else DISRUPT_NONE
             reasons.append(
                 Reason(
                     code="CRITICAL_GOVERNANCE_OR_CI_FILE",
@@ -487,14 +488,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_CRITICAL,
                     blast_radius=BLAST_CRITICAL,
                     revertability=REVERT_DIFFICULT,
-                    destructiveness=dest,
+                    disruptiveness=disrupt,
                     supported=True,
                 )
             )
             overall_risk = combine_risk(overall_risk, RISK_CRITICAL)
             overall_blast = combine_blast_radius(overall_blast, BLAST_CRITICAL)
             overall_revert = combine_revertability(overall_revert, REVERT_DIFFICULT)
-            overall_destruct = combine_destructiveness(overall_destruct, dest)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, disrupt)
             continue
 
         # 2b. Symlinks and git submodules
@@ -523,14 +524,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=sev,
                     blast_radius=BLAST_HIGH if in_sync_tree else BLAST_UNKNOWN,
                     revertability=REVERT_UNKNOWN,
-                    destructiveness=DESTRUCTIVE_UNKNOWN,
+                    disruptiveness=DISRUPT_UNKNOWN,
                     supported=False,
                 )
             )
             overall_risk = combine_risk(overall_risk, sev)
             overall_blast = combine_blast_radius(overall_blast, BLAST_HIGH if in_sync_tree else BLAST_UNKNOWN)
             overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-            overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
             continue
 
         # 2b2. Git archive blob integrity error (e.g. .gitattributes export-ignore/export-subst)
@@ -556,14 +557,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_HIGH,
                     blast_radius=BLAST_UNKNOWN,
                     revertability=REVERT_UNKNOWN,
-                    destructiveness=DESTRUCTIVE_UNKNOWN,
+                    disruptiveness=DISRUPT_UNKNOWN,
                     supported=False,
                 )
             )
             overall_risk = combine_risk(overall_risk, RISK_HIGH)
             overall_blast = combine_blast_radius(overall_blast, BLAST_UNKNOWN)
             overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-            overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
             continue
 
         # 2c. Oversized or binary files -> `unknown`
@@ -595,14 +596,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_UNKNOWN,
                     blast_radius=BLAST_UNKNOWN,
                     revertability=REVERT_UNKNOWN,
-                    destructiveness=DESTRUCTIVE_UNKNOWN,
+                    disruptiveness=DISRUPT_UNKNOWN,
                     supported=False,
                 )
             )
             overall_risk = combine_risk(overall_risk, RISK_UNKNOWN)
             overall_blast = combine_blast_radius(overall_blast, BLAST_UNKNOWN)
             overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-            overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
             continue
 
         # 2d. Supply-chain / container / dependency build files -> `high`
@@ -626,14 +627,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_HIGH,
                     blast_radius=BLAST_HIGH,
                     revertability=REVERT_EASY,
-                    destructiveness=DESTRUCTIVE_UNKNOWN,
+                    disruptiveness=DISRUPT_UNKNOWN,
                     supported=True,
                 )
             )
             overall_risk = combine_risk(overall_risk, RISK_HIGH)
             overall_blast = combine_blast_radius(overall_blast, BLAST_HIGH)
             overall_revert = combine_revertability(overall_revert, REVERT_EASY)
-            overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
             continue
 
         # 2e. Unrendered Helm / Kustomize packaging files -> `unknown`
@@ -659,14 +660,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_UNKNOWN,
                     blast_radius=BLAST_UNKNOWN,
                     revertability=REVERT_UNKNOWN,
-                    destructiveness=DESTRUCTIVE_UNKNOWN,
+                    disruptiveness=DISRUPT_UNKNOWN,
                     supported=False,
                 )
             )
             overall_risk = combine_risk(overall_risk, RISK_UNKNOWN)
             overall_blast = combine_blast_radius(overall_blast, BLAST_UNKNOWN)
             overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-            overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
             continue
 
         # 2f. Pure non-agent documentation outside sync trees -> `low` (not runtime effective)
@@ -689,7 +690,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=RISK_LOW,
                     blast_radius=BLAST_LOW,
                     revertability=REVERT_EASY,
-                    destructiveness=DESTRUCTIVE_NO,
+                    disruptiveness=DISRUPT_NONE,
                     supported=True,
                 )
             )
@@ -703,7 +704,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
             f_risk = RISK_LOW
             f_blast = BLAST_LOW
             f_revert = REVERT_EASY
-            f_destruct = DESTRUCTIVE_NO
+            f_disrupt = DISRUPT_NONE
             f_supported = True
             f_category = "manifest"
             f_effective_resources = 0
@@ -746,7 +747,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                 f_risk = combine_risk(f_risk, RISK_UNKNOWN)
                 f_blast = combine_blast_radius(f_blast, BLAST_UNKNOWN)
                 f_revert = combine_revertability(f_revert, REVERT_UNKNOWN)
-                f_destruct = combine_destructiveness(f_destruct, DESTRUCTIVE_UNKNOWN)
+                f_disrupt = combine_disruptiveness(f_disrupt, DISRUPT_UNKNOWN)
 
             # Unrendered templates / Kustomize files discovered by content:
             # always combine with any valid embedded resources so `${HARMLESS}` in an
@@ -772,7 +773,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                 f_risk = combine_risk(f_risk, RISK_UNKNOWN)
                 f_blast = combine_blast_radius(f_blast, BLAST_UNKNOWN)
                 f_revert = combine_revertability(f_revert, REVERT_UNKNOWN)
-                f_destruct = combine_destructiveness(f_destruct, DESTRUCTIVE_UNKNOWN)
+                f_disrupt = combine_disruptiveness(f_disrupt, DISRUPT_UNKNOWN)
 
             # Valid non-Kubernetes YAML/JSON (e.g. `.golangci.yml`, `tsconfig.json`) -> `unknown`
             is_non_k8s = (
@@ -798,7 +799,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                 f_risk = combine_risk(f_risk, RISK_UNKNOWN)
                 f_blast = combine_blast_radius(f_blast, BLAST_UNKNOWN)
                 f_revert = combine_revertability(f_revert, REVERT_UNKNOWN)
-                f_destruct = combine_destructiveness(f_destruct, DESTRUCTIVE_UNKNOWN)
+                f_disrupt = combine_disruptiveness(f_disrupt, DISRUPT_UNKNOWN)
 
             # Match and evaluate any parsed Kubernetes resources (even alongside template/error flags)
             b_map, b_dup = _group_resources(b_out.resources)
@@ -823,7 +824,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                 f_risk = combine_risk(f_risk, RISK_UNKNOWN)
                 f_blast = combine_blast_radius(f_blast, BLAST_UNKNOWN)
                 f_revert = combine_revertability(f_revert, REVERT_UNKNOWN)
-                f_destruct = combine_destructiveness(f_destruct, DESTRUCTIVE_UNKNOWN)
+                f_disrupt = combine_disruptiveness(f_disrupt, DISRUPT_UNKNOWN)
             elif b_map or a_map:
                 if fc.change_type == CHANGE_RENAMED:
                     any_effective = True
@@ -870,7 +871,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     f_risk = combine_risk(f_risk, ev.risk_level)
                     f_blast = combine_blast_radius(f_blast, ev.blast_radius)
                     f_revert = combine_revertability(f_revert, ev.revertability)
-                    f_destruct = combine_destructiveness(f_destruct, ev.destructiveness)
+                    f_disrupt = combine_disruptiveness(f_disrupt, ev.disruptiveness)
                     reasons.extend(ev.reasons)
                     resource_verdicts.append(ev.to_verdict())
 
@@ -899,14 +900,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=f_risk,
                     blast_radius=f_blast,
                     revertability=f_revert,
-                    destructiveness=f_destruct,
+                    disruptiveness=f_disrupt,
                     supported=f_supported,
                 )
             )
             overall_risk = combine_risk(overall_risk, f_risk)
             overall_blast = combine_blast_radius(overall_blast, f_blast)
             overall_revert = combine_revertability(overall_revert, f_revert)
-            overall_destruct = combine_destructiveness(overall_destruct, f_destruct)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, f_disrupt)
             continue
 
         # 2h. Terraform / OpenTofu files
@@ -915,10 +916,10 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
             all_supported = False
             unsupported_files += 1
             if fc.change_type == CHANGE_DELETED:
-                sev, dest = RISK_HIGH, DESTRUCTIVE_YES
+                sev, disrupt = RISK_HIGH, DISRUPT_DESTRUCTIVE
                 msg = f"deletes Terraform/HCL infrastructure file {norm_path!r} (can destroy cloud resources on apply)"
             else:
-                sev, dest = RISK_UNKNOWN, DESTRUCTIVE_UNKNOWN
+                sev, disrupt = RISK_UNKNOWN, DISRUPT_UNKNOWN
                 msg = f"Terraform/HCL file {norm_path!r} requires a verified plan to determine blast radius"
             reasons.append(
                 Reason(
@@ -938,14 +939,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                     risk_level=sev,
                     blast_radius=BLAST_UNKNOWN,
                     revertability=REVERT_UNKNOWN,
-                    destructiveness=dest,
+                    disruptiveness=disrupt,
                     supported=False,
                 )
             )
             overall_risk = combine_risk(overall_risk, sev)
             overall_blast = combine_blast_radius(overall_blast, BLAST_UNKNOWN)
             overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-            overall_destruct = combine_destructiveness(overall_destruct, dest)
+            overall_disrupt = combine_disruptiveness(overall_disrupt, disrupt)
             continue
 
         # 2i. Everything else (code, scripts, unknown files, docs inside sync trees) -> `unknown`
@@ -970,14 +971,14 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
                 risk_level=RISK_UNKNOWN,
                 blast_radius=BLAST_UNKNOWN,
                 revertability=REVERT_UNKNOWN,
-                destructiveness=DESTRUCTIVE_UNKNOWN,
+                disruptiveness=DISRUPT_UNKNOWN,
                 supported=False,
             )
         )
         overall_risk = combine_risk(overall_risk, RISK_UNKNOWN)
         overall_blast = combine_blast_radius(overall_blast, BLAST_UNKNOWN)
         overall_revert = combine_revertability(overall_revert, REVERT_UNKNOWN)
-        overall_destruct = combine_destructiveness(overall_destruct, DESTRUCTIVE_UNKNOWN)
+        overall_disrupt = combine_disruptiveness(overall_disrupt, DISRUPT_UNKNOWN)
 
     # Pass 3: PR-wide blast-radius and compound capacity caps
     total_objects = res_added + res_modified + res_deleted
@@ -1103,7 +1104,7 @@ def classify_changes(changes: list[FileChange]) -> ClassificationResult:
         risk_level=overall_risk,
         blast_radius=overall_blast,
         revertability=overall_revert,
-        destructiveness=overall_destruct,
+        disruptiveness=overall_disrupt,
         supported=all_supported,
         effective_changes=any_effective,
         reasons=tuple(unique_reasons),

@@ -454,11 +454,12 @@ class TestRiskRules(unittest.TestCase):
         self.assertEqual(ar.parse(both).status, ar.INVALID)
         self.assertEqual(ar.parse(neither).status, ar.INVALID)
 
-    def test_decide_risk_enforces_non_destructive_easy_revert_effective_and_install_ceiling(self):
+    def test_decide_risk_enforces_non_disruptive_easy_revert_effective_and_install_ceiling(self):
         rules = ar.parse("version: 1\nautomerge:\n  allow:\n    - max_risk: medium\n      environments: [dev]\n")
         self.assertTrue(ar.decide_risk(rules, "medium", "dev").allowed)
-        self.assertFalse(ar.decide_risk(rules, "low", "dev", destructiveness="destructive").allowed)
-        self.assertFalse(ar.decide_risk(rules, "low", "dev", destructiveness="unknown").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", disruptiveness="disruptive").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", disruptiveness="destructive").allowed)
+        self.assertFalse(ar.decide_risk(rules, "low", "dev", disruptiveness="unknown").allowed)
         self.assertFalse(ar.decide_risk(rules, "low", "dev", revertability="moderate").allowed)
         self.assertFalse(ar.decide_risk(rules, "low", "dev", effective_changes=False).allowed)
         self.assertFalse(ar.decide_risk(rules, "medium", "dev", install_max_risk="low").allowed)

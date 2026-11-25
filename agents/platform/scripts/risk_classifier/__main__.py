@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "summary":
         print(
             f"risk_level={result.risk_level} blast_radius={result.blast_radius} "
-            f"revertability={result.revertability} destructiveness={result.destructiveness} "
+            f"revertability={result.revertability} disruptiveness={result.disruptiveness} "
             f"supported={result.supported} label={result.risk_label}"
         )
         for r in result.reasons:

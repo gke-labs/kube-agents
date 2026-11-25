@@ -3964,7 +3964,7 @@ class VcsBroker:
             rules,
             verdict.risk_level,
             env,
-            destructiveness=verdict.destructiveness,
+            disruptiveness=verdict.disruptiveness,
             revertability=verdict.revertability,
             effective_changes=verdict.effective_changes,
             install_max_risk=ceiling,
@@ -4174,13 +4174,13 @@ class VcsBroker:
                 bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
 
         LOGGER.info(
-            "risk label repo=%s number=%s risk=%s blast=%s revert=%s destruct=%s risk_label=%s automerge_label=%s switch=%s reason=%s",
+            "risk label repo=%s number=%s risk=%s blast=%s revert=%s disrupt=%s risk_label=%s automerge_label=%s switch=%s reason=%s",
             bound.repo,
             number,
             verdict.risk_level,
             verdict.blast_radius,
             verdict.revertability,
-            verdict.destructiveness,
+            verdict.disruptiveness,
             want_risk_apply,
             want_auto,
             switch,
@@ -4194,7 +4194,7 @@ class VcsBroker:
                 "risk_level": verdict.risk_level,
                 "blast_radius": verdict.blast_radius,
                 "revertability": verdict.revertability,
-                "destructiveness": verdict.destructiveness,
+                "disruptiveness": verdict.disruptiveness,
                 "supported": verdict.supported,
                 "risk_label": want_risk_apply,
                 "labelled": want_auto is not None,

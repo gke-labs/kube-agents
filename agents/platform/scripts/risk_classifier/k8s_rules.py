@@ -18,13 +18,14 @@ from .types import (
     BLAST_LOW,
     BLAST_MEDIUM,
     BLAST_UNKNOWN,
-    DESTRUCTIVE_NO,
-    DESTRUCTIVE_UNKNOWN,
-    DESTRUCTIVE_YES,
     DIM_BLAST_RADIUS,
-    DIM_DESTRUCTIVENESS,
+    DIM_DISRUPTIVENESS,
     DIM_REVERTABILITY,
     DIM_SECURITY,
+    DISRUPT_DESTRUCTIVE,
+    DISRUPT_DISRUPTIVE,
+    DISRUPT_NONE,
+    DISRUPT_UNKNOWN,
     REVERT_DIFFICULT,
     REVERT_EASY,
     REVERT_IRREVERSIBLE,
@@ -39,7 +40,7 @@ from .types import (
     ResourceRef,
     ResourceVerdict,
     combine_blast_radius,
-    combine_destructiveness,
+    combine_disruptiveness,
     combine_revertability,
     combine_risk,
     escalate_risk,
@@ -462,7 +463,7 @@ class ResourceEval:
     risk_level: str = RISK_LOW
     blast_radius: str = BLAST_LOW
     revertability: str = REVERT_EASY
-    destructiveness: str = DESTRUCTIVE_NO
+    disruptiveness: str = DISRUPT_NONE
     supported: bool = True
     reasons: list[Reason] = field(default_factory=list)
     cpu_delta_m: float = 0.0
@@ -478,7 +479,7 @@ class ResourceEval:
         *,
         blast: str | None = None,
         revert: str | None = None,
-        destructive: str | None = None,
+        disrupt: str | None = None,
         field_path: str = "",
         supported: bool | None = None,
         security: bool = False,
@@ -488,8 +489,8 @@ class ResourceEval:
             self.blast_radius = combine_blast_radius(self.blast_radius, blast)
         if revert is not None:
             self.revertability = combine_revertability(self.revertability, revert)
-        if destructive is not None:
-            self.destructiveness = combine_destructiveness(self.destructiveness, destructive)
+        if disrupt is not None:
+            self.disruptiveness = combine_disruptiveness(self.disruptiveness, disrupt)
         if supported is False:
             self.supported = False
         if security:
@@ -514,7 +515,7 @@ class ResourceEval:
             risk_level=self.risk_level,
             blast_radius=self.blast_radius,
             revertability=self.revertability,
-            destructiveness=self.destructiveness,
+            disruptiveness=self.disruptiveness,
             supported=self.supported,
         )
 
@@ -543,7 +544,7 @@ def _as_list(ev: ResourceEval, val: Any, field_path: str) -> list[Any]:
         DIM_SECURITY,
         RISK_HIGH,
         f"expected list at {field_path!r}, got {type(val).__name__}",
-        destructive=DESTRUCTIVE_YES,
+        disrupt=DISRUPT_DISRUPTIVE,
         field_path=field_path,
         security=True,
     )
@@ -560,7 +561,7 @@ def _as_dict(ev: ResourceEval, val: Any, field_path: str) -> dict[str, Any]:
         DIM_SECURITY,
         RISK_HIGH,
         f"expected mapping at {field_path!r}, got {type(val).__name__}",
-        destructive=DESTRUCTIVE_YES,
+        disrupt=DISRUPT_DISRUPTIVE,
         field_path=field_path,
         security=True,
     )
@@ -1177,10 +1178,10 @@ def _check_pod_spec_posture(
         if isinstance(b_ctrs, list) and len(b_ctrs) > 0:
             ev.add(
                 "CONTAINER_REMOVED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 "removes all containers from workload PodSpec",
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DISRUPTIVE,
                 field_path="containers",
             )
         else:
@@ -1191,7 +1192,7 @@ def _check_pod_spec_posture(
                 f"{ev.ref.gvk_label()} {ev.ref.name!r} omits spec containers (possible unrendered Kustomize patch fragment)",
                 blast=BLAST_UNKNOWN,
                 revert=REVERT_UNKNOWN,
-                destructive=DESTRUCTIVE_UNKNOWN,
+                disrupt=DISRUPT_UNKNOWN,
                 field_path="containers",
                 supported=False,
             )
@@ -1592,7 +1593,7 @@ def _check_metadata_edits(
             RISK_CRITICAL,
             f"removes or downgrades production environment label on {ev.ref.gvk_label()} {ev.ref.name!r}",
             blast=BLAST_HIGH,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="metadata.labels",
             security=True,
         )
@@ -1606,7 +1607,7 @@ def _check_metadata_edits(
             RISK_CRITICAL,
             "modifies or removes kube-agents/risk-class override annotation",
             blast=BLAST_HIGH,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="metadata.annotations.kube-agents/risk-class",
             security=True,
         )
@@ -1622,7 +1623,7 @@ def _check_metadata_edits(
                 RISK_HIGH,
                 f"modifies metadata.{sub} on {ev.ref.gvk_label()} {ev.ref.name!r}",
                 revert=REVERT_DIFFICULT,
-                destructive=DESTRUCTIVE_YES if d.op == "remove" else DESTRUCTIVE_NO,
+                disrupt=DISRUPT_DESTRUCTIVE if d.op == "remove" else DISRUPT_NONE,
                 field_path=d.dotted,
             )
         elif sub in ("labels", "annotations"):
@@ -1705,31 +1706,31 @@ def _check_workload_modify(
         if len(t) >= 2 and t[0] == "spec" and t[1] == "selector":
             ev.add(
                 "IMMUTABLE_FIELD_CHANGED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"modifies immutable {kind} spec.selector",
                 revert=REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 field_path=d.dotted,
             )
         if kind == "StatefulSet" and len(t) >= 2 and t[0] == "spec" and t[1] in ("serviceName", "podManagementPolicy", "volumeClaimTemplates"):
             ev.add(
                 "IMMUTABLE_FIELD_CHANGED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"modifies immutable StatefulSet spec.{t[1]}",
                 revert=REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 field_path=d.dotted,
             )
         if kind == "Job" and len(t) >= 2 and t[0] == "spec" and t[1] == "template":
             ev.add(
                 "IMMUTABLE_FIELD_CHANGED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 "modifies immutable Job spec.template",
                 revert=REVERT_IRREVERSIBLE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 field_path=d.dotted,
             )
 
@@ -1740,20 +1741,20 @@ def _check_workload_modify(
             if a_strat is not None and not isinstance(a_strat, dict):
                 ev.add(
                     "MALFORMED_FIELD_TYPE",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     "Deployment spec.strategy is not a mapping",
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path="spec.strategy",
                 )
             elif isinstance(a_strat, dict) and str(a_strat.get("type") or "") == "Recreate":
                 ev.add(
                     "RECREATE_STRATEGY_SET",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     "switches Deployment rollout strategy to Recreate (causes downtime)",
                     revert=REVERT_MODERATE,
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path="spec.strategy.type",
                 )
             else:
@@ -1776,11 +1777,11 @@ def _check_workload_modify(
                 if aggressive_unavail:
                     ev.add(
                         "AGGRESSIVE_ROLLOUT_STRATEGY",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"sets aggressive Deployment rollingUpdate.maxUnavailable={max_unavail!r}",
                         revert=REVERT_MODERATE,
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path="spec.strategy.rollingUpdate.maxUnavailable",
                     )
                 else:
@@ -1799,11 +1800,11 @@ def _check_workload_modify(
             if not (isinstance(b_ret, dict) and str(b_ret.get("whenDeleted") or "") == "Delete"):
                 ev.add(
                     "STATEFULSET_PVC_DELETE_POLICY",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     "sets StatefulSet persistentVolumeClaimRetentionPolicy.whenDeleted to Delete",
                     revert=REVERT_DIFFICULT,
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DESTRUCTIVE,
                     field_path="spec.persistentVolumeClaimRetentionPolicy.whenDeleted",
                 )
 
@@ -1815,19 +1816,19 @@ def _check_workload_modify(
                 if a_susp is not None and not isinstance(a_susp, bool):
                     ev.add(
                         "MALFORMED_FIELD_TYPE",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"sets non-boolean spec.suspend={a_susp!r} on {kind} {ev.ref.name!r}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path="spec.suspend",
                     )
                 elif a_susp is True:
                     ev.add(
                         "CRONJOB_SUSPENDED",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"suspends {kind} {ev.ref.name!r}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path="spec.suspend",
                     )
                 else:
@@ -1859,10 +1860,10 @@ def _check_workload_modify(
     if invalid_rep:
         ev.add(
             "INVALID_REPLICAS",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"sets invalid non-integer or negative spec.replicas={a_rep_raw!r} on {kind} {ev.ref.name!r}",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.replicas",
         )
     elif "replicas" in b_spec or "replicas" in a_spec:
@@ -1870,10 +1871,10 @@ def _check_workload_modify(
             if a_rep <= 0:
                 ev.add(
                     "WORKLOAD_SCALED_TO_ZERO",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     f"scales {kind} {ev.ref.name!r} from {b_rep} to {a_rep}",
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path="spec.replicas",
                 )
             elif a_rep < b_rep:
@@ -1881,10 +1882,10 @@ def _check_workload_modify(
                 if drop_frac > 0.5 or (b_rep >= 2 and a_rep == 1):
                     ev.add(
                         "WORKLOAD_STEEP_SCALE_DOWN",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"reduces {kind} {ev.ref.name!r} replicas sharply from {b_rep} to {a_rep}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path="spec.replicas",
                     )
                 else:
@@ -1945,10 +1946,10 @@ def _check_workload_modify(
         if k not in a_tlbl or a_tlbl[k] != old_v:
             ev.add(
                 "POD_TEMPLATE_LABEL_CHANGED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"changes or removes pod template label {k!r} (may detach Service/PDB/NetworkPolicy selectors)",
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DISRUPTIVE,
                 field_path=f"spec.template.metadata.labels.{k}",
             )
 
@@ -2021,10 +2022,10 @@ def _check_workload_modify(
             if cname not in a_by_name:
                 ev.add(
                     "CONTAINER_REMOVED",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     f"removes {list_key} entry {cname!r}",
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path=f"{'.'.join(pod_prefix)}.{list_key}.{cname}",
                 )
                 continue
@@ -2088,10 +2089,10 @@ def _check_workload_modify(
                 if bc.get(probe_key) is not None and ac.get(probe_key) is None:
                     ev.add(
                         "HEALTH_PROBE_REMOVED",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"removes {probe_key} from container {cname!r}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=f"{c_path}.{probe_key}",
                     )
 
@@ -2105,10 +2106,10 @@ def _check_workload_modify(
                 if len(a_items) < len(b_items):
                     ev.add(
                         "CONTAINER_COMPONENT_REMOVED",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"removes entries from container {cname!r} {sub_list_key}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=f"{c_path}.{sub_list_key}",
                     )
 
@@ -2122,7 +2123,7 @@ def _check_workload_modify(
                     RISK_HIGH,
                     f"modifies DaemonSet {sched_key} across cluster nodes",
                     blast=BLAST_HIGH,
-                    destructive=DESTRUCTIVE_YES if (b_ps.get(sched_key) and not a_ps.get(sched_key)) else DESTRUCTIVE_NO,
+                    disrupt=DISRUPT_DISRUPTIVE if (b_ps.get(sched_key) and not a_ps.get(sched_key)) else DISRUPT_NONE,
                     field_path=f"spec.template.spec.{sched_key}",
                 )
 
@@ -2134,10 +2135,10 @@ def _check_workload_modify(
     if b_vnames - a_vnames:
         ev.add(
             "VOLUME_REMOVED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"removes volumes {sorted(b_vnames - a_vnames)}",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path=f"{'.'.join(pod_prefix)}.volumes",
         )
 
@@ -2215,19 +2216,19 @@ def _check_container_resources(
     if a_cpu_req is not None and a_cpu_lim is not None and a_cpu_req > a_cpu_lim:
         ev.add(
             "RESOURCE_REQUEST_EXCEEDS_LIMIT",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"container {cname!r} CPU request exceeds limit",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path=f"{c_path}.resources",
         )
     if a_mem_req is not None and a_mem_lim is not None and a_mem_req > a_mem_lim:
         ev.add(
             "RESOURCE_REQUEST_EXCEEDS_LIMIT",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"container {cname!r} memory request exceeds limit",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path=f"{c_path}.resources",
         )
 
@@ -2252,29 +2253,29 @@ def _check_container_resources(
             if av_raw is not None and av is None:
                 ev.add(
                     "INVALID_RESOURCE_QUANTITY",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     f"unparseable {rname} quantity {av_raw!r} on container {cname!r}",
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path=fp,
                 )
             elif bv is not None and av is None:
                 ev.add(
                     "CONTAINER_RESOURCE_REMOVED",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_HIGH,
                     f"removes {section}.{rname} on container {cname!r}",
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path=fp,
                 )
             elif bv is None and av is not None:
                 if av < floor_val:
                     ev.add(
                         "CONTAINER_RESOURCE_BELOW_FLOOR",
-                        DIM_DESTRUCTIVENESS,
+                        DIM_DISRUPTIVENESS,
                         RISK_HIGH,
                         f"sets {section}.{rname} below safe floor on container {cname!r}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=fp,
                     )
                 elif av > max_val:
@@ -2299,10 +2300,10 @@ def _check_container_resources(
                     if drop > 0.5 or av < floor_val:
                         ev.add(
                             "CONTAINER_RESOURCE_STEEP_REDUCTION",
-                            DIM_DESTRUCTIVENESS,
+                            DIM_DISRUPTIVENESS,
                             RISK_HIGH,
                             f"sharply reduces {section}.{rname} on container {cname!r} ({bv_raw} -> {av_raw})",
-                            destructive=DESTRUCTIVE_YES,
+                            disrupt=DISRUPT_DISRUPTIVE,
                             field_path=fp,
                         )
                     else:
@@ -2362,7 +2363,7 @@ def _check_configmap(
             DIM_SECURITY,
             RISK_HIGH,
             f"ConfigMap {ev.ref.name!r} sets non-boolean immutable={imm_val!r}",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="immutable",
             security=True,
         )
@@ -2427,7 +2428,7 @@ def _check_configmap(
                         DIM_SECURITY,
                         RISK_HIGH,
                         f"ConfigMap {ev.ref.name!r} {field_name}.{ks} has non-string value type {type(val).__name__}",
-                        destructive=DESTRUCTIVE_YES,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=f"{field_name}.{ks}",
                         security=True,
                     )
@@ -2449,10 +2450,10 @@ def _check_configmap(
                         if val == "" and bmap.get(k):
                             ev.add(
                                 "CONFIGMAP_VALUE_WIPED",
-                                DIM_DESTRUCTIVENESS,
+                                DIM_DISRUPTIVENESS,
                                 RISK_HIGH,
                                 f"wipes ConfigMap {ev.ref.name!r} key {ks!r} to empty string",
-                                destructive=DESTRUCTIVE_YES,
+                                disrupt=DISRUPT_DISRUPTIVE,
                                 field_path=f"data.{ks}",
                             )
                         else:
@@ -2484,11 +2485,11 @@ def _check_configmap(
         if before_obj.get("immutable") is True:
             ev.add(
                 "IMMUTABLE_CONFIGMAP_MODIFIED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"modifies immutable ConfigMap {ev.ref.name!r}",
                 revert=REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 field_path="immutable",
             )
         elif after_obj.get("immutable") is True:
@@ -2506,10 +2507,10 @@ def _check_configmap(
             for k in sorted(set(bmap.keys()) - set(amap.keys()), key=str):
                 ev.add(
                     "CONFIGMAP_KEY_REMOVED",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_MEDIUM,
                     f"removes key {k!r} from ConfigMap {ev.ref.name!r}",
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DISRUPTIVE,
                     field_path=f"{field_name}.{k}",
                 )
     if action == ACTION_ADD and not ev.reasons:
@@ -2541,21 +2542,21 @@ def _check_pdb(ev: ResourceEval, action: str, obj: dict[str, Any]) -> None:
     if empty_sel or negative_only_sel or blocks_drains:
         ev.add(
             "PDB_DRAIN_DEADLOCK_RISK",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"PodDisruptionBudget {ev.ref.name!r} has broad/empty selector or zero disruption allowance (can block node drains)",
             blast=BLAST_HIGH,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec",
         )
         return
     if action == ACTION_MODIFY:
         ev.add(
             "PDB_MODIFIED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"modifies PodDisruptionBudget {ev.ref.name!r}",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec",
         )
     else:
@@ -2622,11 +2623,11 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
         else:
             ev.add(
                 "SERVICE_TYPE_CHANGED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"changes Service {ev.ref.name!r} type from {b_type} to {svc_type}",
                 blast=BLAST_MEDIUM,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE if b_type == "LoadBalancer" else DISRUPT_DISRUPTIVE,
                 field_path="spec.type",
             )
     if b_spec.get("externalName") != a_spec.get("externalName"):
@@ -2636,48 +2637,48 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
             RISK_HIGH,
             f"retargets ExternalName Service {ev.ref.name!r} spec.externalName (DNS/egress hijack risk)",
             blast=BLAST_HIGH,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.externalName",
             security=True,
         )
     if b_spec.get("clusterIP") != a_spec.get("clusterIP") or b_spec.get("clusterIPs") != a_spec.get("clusterIPs"):
         ev.add(
             "IMMUTABLE_FIELD_CHANGED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"modifies immutable Service {ev.ref.name!r} clusterIP",
             revert=REVERT_MODERATE,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DESTRUCTIVE,
             field_path="spec.clusterIP",
         )
     if b_spec.get("selector") != a_spec.get("selector"):
         ev.add(
             "SERVICE_SELECTOR_CHANGED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"retargets Service {ev.ref.name!r} spec.selector",
             blast=BLAST_MEDIUM,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.selector",
         )
     if b_spec.get("ports") != a_spec.get("ports"):
         ev.add(
             "SERVICE_PORTS_CHANGED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"modifies Service {ev.ref.name!r} spec.ports",
             blast=BLAST_MEDIUM,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.ports",
         )
     if b_spec.get("externalTrafficPolicy") != a_spec.get("externalTrafficPolicy"):
         ev.add(
             "SERVICE_TRAFFIC_POLICY_CHANGED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"changes Service {ev.ref.name!r} externalTrafficPolicy",
             blast=BLAST_MEDIUM,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.externalTrafficPolicy",
         )
     b_lb_ranges = b_spec.get("loadBalancerSourceRanges")
@@ -2690,7 +2691,7 @@ def _check_service(ev: ResourceEval, action: str, before_obj: dict[str, Any] | N
             RISK_CRITICAL,
             f"removes loadBalancerSourceRanges on LoadBalancer Service {ev.ref.name!r} (opens to public internet)",
             blast=BLAST_CRITICAL,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.loadBalancerSourceRanges",
             security=True,
         )
@@ -2724,10 +2725,10 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
     if b_spec.get("scaleTargetRef") != a_spec.get("scaleTargetRef"):
         ev.add(
             "HPA_TARGET_CHANGED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"changes HPA {ev.ref.name!r} scaleTargetRef",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.scaleTargetRef",
         )
     b_min_raw = b_spec.get("minReplicas", 1)
@@ -2745,28 +2746,28 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
     ):
         ev.add(
             "INVALID_HPA_REPLICAS",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"sets invalid HPA {ev.ref.name!r} minReplicas={a_min_raw!r} / maxReplicas={a_max_raw!r}",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec",
         )
     elif a_min_valid and b_min_valid and a_min_raw == 0 and b_min_raw > 0:
         ev.add(
             "HPA_SCALED_TO_ZERO",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"lowers HPA {ev.ref.name!r} minReplicas from {b_min_raw} to 0",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.minReplicas",
         )
     elif a_max_valid and b_min_valid and a_max_raw < b_min_raw:
         ev.add(
             "HPA_CAPACITY_REDUCED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"lowers HPA {ev.ref.name!r} maxReplicas ({a_max_raw}) below prior minReplicas ({b_min_raw})",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.maxReplicas",
         )
     elif (a_min_valid and b_min_valid and a_min_raw < b_min_raw) or (
@@ -2828,12 +2829,12 @@ def _check_pvc(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
         if b_spec.get(imm) != a_spec.get(imm):
             ev.add(
                 "IMMUTABLE_FIELD_CHANGED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"modifies immutable PVC {ev.ref.name!r} field spec.{imm}",
                 blast=BLAST_MEDIUM,
                 revert=REVERT_DIFFICULT if imm in ("dataSource", "dataSourceRef") else REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 field_path=f"spec.{imm}",
             )
     b_res = b_spec.get("resources") if isinstance(b_spec.get("resources"), dict) else {}
@@ -2845,22 +2846,22 @@ def _check_pvc(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
     if a_req.get("storage") is not None and a_sz is None:
         ev.add(
             "INVALID_RESOURCE_QUANTITY",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"unparseable PVC {ev.ref.name!r} storage request {a_req.get('storage')!r}",
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DISRUPTIVE,
             field_path="spec.resources.requests.storage",
         )
     elif b_sz is not None and a_sz is not None and b_sz != a_sz:
         if a_sz < b_sz:
             ev.add(
                 "PVC_STORAGE_SHRUNK",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_HIGH,
                 f"attempts to shrink PVC {ev.ref.name!r} storage (unsupported in-place; requires destructive recreate)",
                 blast=BLAST_MEDIUM,
                 revert=REVERT_IRREVERSIBLE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 field_path="spec.resources.requests.storage",
             )
         else:
@@ -2982,7 +2983,7 @@ def _check_gitops_reconciler(ev: ResourceEval, action: str, before_obj: dict[str
         f"{action}s GitOps reconciler {ev.ref.gvk_label()} {ev.ref.name!r}",
         blast=BLAST_CRITICAL if root_reconciler else BLAST_HIGH,
         revert=REVERT_DIFFICULT,
-        destructive=DESTRUCTIVE_YES if (prune_enabled or source_changed) else DESTRUCTIVE_NO,
+        disrupt=DISRUPT_DESTRUCTIVE if (prune_enabled or source_changed) else DISRUPT_NONE,
         security=True,
     )
 
@@ -3032,11 +3033,11 @@ def evaluate_resource(
             )
         if is_prod and ev.risk_level in (RISK_LOW, RISK_MEDIUM, RISK_HIGH):
             escalate_high = (
-                ev.destructiveness == DESTRUCTIVE_YES
+                ev.disruptiveness in (DISRUPT_DISRUPTIVE, DISRUPT_DESTRUCTIVE)
                 or ev.revertability == REVERT_IRREVERSIBLE
                 or ev.security_sensitive
             )
-            new_level = escalate_risk(ev.risk_level, destructive_or_irreversible=escalate_high)
+            new_level = escalate_risk(ev.risk_level, high_impact=escalate_high)
             if new_level != ev.risk_level:
                 ev.add(
                     "PRODUCTION_ENVIRONMENT_ESCALATION",
@@ -3056,12 +3057,12 @@ def evaluate_resource(
                 crit = is_prod or is_cluster_scoped or gk in DATA_STATEFUL_DELETE_KINDS or in_system_ns
                 ev.add(
                     "KUSTOMIZE_DELETE_PATCH",
-                    DIM_DESTRUCTIVENESS,
+                    DIM_DISRUPTIVENESS,
                     RISK_CRITICAL if crit else RISK_HIGH,
                     f"manifest contains Kustomize `$patch: delete` directive targeting {ref.gvk_label()} {ref.name!r}",
                     blast=BLAST_CRITICAL if crit else BLAST_HIGH,
                     revert=REVERT_IRREVERSIBLE if gk in DATA_STATEFUL_DELETE_KINDS else REVERT_DIFFICULT,
-                    destructive=DESTRUCTIVE_YES,
+                    disrupt=DISRUPT_DESTRUCTIVE,
                     field_path=patches[0][0],
                 )
                 return _finalize()
@@ -3072,7 +3073,7 @@ def evaluate_resource(
                 f"manifest contains unrendered Kustomize `$patch` directive on {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_UNKNOWN,
                 revert=REVERT_UNKNOWN,
-                destructive=DESTRUCTIVE_UNKNOWN,
+                disrupt=DISRUPT_UNKNOWN,
                 field_path=patches[0][0],
                 supported=False,
             )
@@ -3087,7 +3088,7 @@ def evaluate_resource(
             f"{action}s kube-agents control-plane CR {ref.gvk_label()} {ref.name!r}",
             blast=BLAST_CRITICAL,
             revert=REVERT_DIFFICULT,
-            destructive=DESTRUCTIVE_YES if action == ACTION_DELETE else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_DELETE else DISRUPT_NONE,
             security=True,
         )
         return ev
@@ -3097,12 +3098,12 @@ def evaluate_resource(
         if action == ACTION_DELETE:
             ev.add(
                 "UNKNOWN_CRD_DELETED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL if in_system_ns else RISK_HIGH,
                 f"deletes unsupported/custom resource {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_HIGH if in_system_ns else BLAST_UNKNOWN,
                 revert=REVERT_UNKNOWN,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 supported=False,
             )
         elif in_system_ns:
@@ -3113,7 +3114,7 @@ def evaluate_resource(
                 f"{action}s unsupported/custom resource {ref.gvk_label()} {ref.name!r} in system namespace {ref.namespace!r}",
                 blast=BLAST_HIGH,
                 revert=REVERT_UNKNOWN,
-                destructive=DESTRUCTIVE_UNKNOWN,
+                disrupt=DISRUPT_UNKNOWN,
                 supported=False,
                 security=True,
             )
@@ -3125,7 +3126,7 @@ def evaluate_resource(
                 f"resource kind {ref.gvk_label()} is not modeled by the deterministic risk classifier",
                 blast=BLAST_UNKNOWN,
                 revert=REVERT_UNKNOWN,
-                destructive=DESTRUCTIVE_UNKNOWN,
+                disrupt=DISRUPT_UNKNOWN,
                 supported=False,
             )
         return ev
@@ -3139,7 +3140,7 @@ def evaluate_resource(
             f"namespaced resource {ref.gvk_label()} {ref.name!r} omits metadata.namespace",
             blast=BLAST_UNKNOWN,
             revert=REVERT_UNKNOWN,
-            destructive=DESTRUCTIVE_YES if action == ACTION_DELETE else DESTRUCTIVE_UNKNOWN,
+            disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_DELETE else DISRUPT_UNKNOWN,
             supported=False,
         )
         return ev
@@ -3149,35 +3150,35 @@ def evaluate_resource(
         if gk == ("", "Namespace"):
             ev.add(
                 "CRITICAL_NAMESPACE_DELETE",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL,
                 f"deletes Namespace {ref.name!r} and cascade-destroys every workload, Secret, and PVC inside it",
                 blast=BLAST_CRITICAL,
                 revert=REVERT_IRREVERSIBLE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
         if in_system_ns:
             ev.add(
                 "CRITICAL_SYSTEM_NAMESPACE_DELETE",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL,
                 f"deletes {ref.gvk_label()} {ref.name!r} in system namespace {ref.namespace!r}",
                 blast=BLAST_CRITICAL,
                 revert=REVERT_IRREVERSIBLE if gk in DATA_STATEFUL_DELETE_KINDS else REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 security=True,
             )
             return _finalize()
         if gk in DATA_STATEFUL_DELETE_KINDS:
             ev.add(
                 "CRITICAL_STATEFUL_OR_INFRA_DELETE",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL,
                 f"deletes stateful or cluster/cloud infrastructure resource {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_CRITICAL if is_cluster_scoped or is_cloud_infra_group(ref.group) else BLAST_HIGH,
                 revert=REVERT_IRREVERSIBLE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
         if gk in CONTROL_PLANE_EXTENSION_KINDS or ref.group in ("kyverno.io", "templates.gatekeeper.sh", "constraints.gatekeeper.sh"):
@@ -3188,52 +3189,52 @@ def evaluate_resource(
                 f"deletes admission/policy control {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_CRITICAL,
                 revert=REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 security=True,
             )
             return _finalize()
         if gk == ("", "Secret") or ref.kind in ("SealedSecret", "ExternalSecret"):
             ev.add(
                 "SECRET_DELETED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL if is_prod else RISK_HIGH,
                 f"deletes {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_MEDIUM,
                 revert=REVERT_IRREVERSIBLE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
                 security=True,
             )
             return _finalize()
         if gk == ("apps", "StatefulSet"):
             ev.add(
                 "STATEFULSET_DELETED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL if is_prod else RISK_HIGH,
                 f"deletes StatefulSet {ref.name!r}",
                 blast=BLAST_MEDIUM,
                 revert=REVERT_DIFFICULT,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
         if is_cloud_infra_group(ref.group):
             ev.add(
                 "CLOUD_INFRA_DELETED",
-                DIM_DESTRUCTIVENESS,
+                DIM_DISRUPTIVENESS,
                 RISK_CRITICAL if is_prod else RISK_HIGH,
                 f"deletes cloud infrastructure resource {ref.gvk_label()} {ref.name!r}",
                 blast=BLAST_HIGH,
                 revert=REVERT_IRREVERSIBLE,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DESTRUCTIVE,
             )
             return _finalize()
         ev.add(
             "RESOURCE_DELETED",
-            DIM_DESTRUCTIVENESS,
+            DIM_DISRUPTIVENESS,
             RISK_HIGH,
             f"deletes {ref.gvk_label()} {ref.name!r}",
             blast=BLAST_HIGH if is_cluster_scoped else BLAST_LOW,
             revert=REVERT_MODERATE,
-            destructive=DESTRUCTIVE_YES,
+            disrupt=DISRUPT_DESTRUCTIVE,
         )
         return _finalize()
 
@@ -3312,7 +3313,7 @@ def evaluate_resource(
             f"{action}s cluster Node {ref.name!r} (affects node scheduling, taints, and workloads)",
             blast=BLAST_CRITICAL,
             revert=REVERT_DIFFICULT,
-            destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3388,7 +3389,7 @@ def evaluate_resource(
             f"{action}s RBAC {ref.kind} {ref.name!r}",
             blast=BLAST_HIGH if is_cluster_scoped else BLAST_MEDIUM,
             revert=REVERT_MODERATE if (action == ACTION_MODIFY and before and before.obj.get("roleRef") != primary.obj.get("roleRef")) else REVERT_EASY,
-            destructive=DESTRUCTIVE_YES if (action == ACTION_MODIFY and before and before.obj.get("roleRef") != primary.obj.get("roleRef")) else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DESTRUCTIVE if (action == ACTION_MODIFY and before and before.obj.get("roleRef") != primary.obj.get("roleRef")) else DISRUPT_NONE,
             security=True,
         )
         _check_rbac_superuser(ev, primary.obj)
@@ -3428,7 +3429,7 @@ def evaluate_resource(
             f"{action}s {ref.gvk_label()} {ref.name!r}",
             blast=BLAST_MEDIUM,
             revert=REVERT_DIFFICULT,
-            destructive=DESTRUCTIVE_YES if is_imm_edit else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DESTRUCTIVE if is_imm_edit else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3468,7 +3469,7 @@ def evaluate_resource(
                 RISK_CRITICAL if mesh_wide else RISK_HIGH,
                 f"{action}s Istio data-plane proxy extension {ref.kind} {ref.name!r}",
                 blast=BLAST_CRITICAL if mesh_wide else BLAST_HIGH,
-                destructive=DESTRUCTIVE_YES,
+                disrupt=DISRUPT_DISRUPTIVE,
                 security=True,
             )
             return _finalize()
@@ -3481,7 +3482,7 @@ def evaluate_resource(
             RISK_HIGH,
             f"{action}s Istio traffic resource {ref.kind} {ref.name!r}",
             blast=BLAST_HIGH if ref.namespace == "istio-system" else BLAST_MEDIUM,
-            destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
         )
         return _finalize()
 
@@ -3504,7 +3505,7 @@ def evaluate_resource(
                 f"{action}s Gateway API {ref.kind} {ref.name!r}",
                 blast=BLAST_HIGH,
                 revert=REVERT_MODERATE,
-                destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
                 security=True,
             )
         else:
@@ -3514,7 +3515,7 @@ def evaluate_resource(
                 RISK_HIGH,
                 f"{action}s Gateway API route {ref.kind} {ref.name!r}",
                 blast=BLAST_MEDIUM,
-                destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+                disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             )
         return _finalize()
 
@@ -3528,7 +3529,7 @@ def evaluate_resource(
             RISK_CRITICAL if has_snippet else RISK_HIGH,
             f"{action}s {ref.kind} {ref.name!r}" + (" with raw proxy snippet annotation" if has_snippet else ""),
             blast=BLAST_CRITICAL if has_snippet else BLAST_HIGH,
-            destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3540,7 +3541,7 @@ def evaluate_resource(
             RISK_HIGH,
             f"{action}s NetworkPolicy {ref.name!r} (can immediately block or expose pod traffic)",
             blast=BLAST_HIGH,
-            destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
             security=True,
         )
         return _finalize()
@@ -3559,7 +3560,7 @@ def evaluate_resource(
             f"{action}s StorageClass {ref.name!r}",
             blast=BLAST_CRITICAL if is_default else BLAST_HIGH,
             revert=REVERT_MODERATE,
-            destructive=DESTRUCTIVE_YES if action == ACTION_MODIFY else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DESTRUCTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
         )
         return _finalize()
     if gk in (("", "PersistentVolume"), ("storage.k8s.io", "CSIDriver"), ("snapshot.storage.k8s.io", "VolumeSnapshot"), ("snapshot.storage.k8s.io", "VolumeSnapshotContent")):
@@ -3603,11 +3604,11 @@ def evaluate_resource(
         zero_pods = str(hard.get("pods") or "").strip() == "0"
         ev.add(
             "QUOTA_OR_LIMIT_CHANGE",
-            DIM_DESTRUCTIVENESS if zero_pods else DIM_BLAST_RADIUS,
+            DIM_DISRUPTIVENESS if zero_pods else DIM_BLAST_RADIUS,
             RISK_HIGH if (zero_pods or action == ACTION_MODIFY) else RISK_MEDIUM,
             f"{action}s {ref.kind} {ref.name!r}",
             blast=BLAST_MEDIUM,
-            destructive=DESTRUCTIVE_YES if zero_pods else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DISRUPTIVE if zero_pods else DISRUPT_NONE,
         )
         return _finalize()
     if ref.group == "cert-manager.io":
@@ -3635,10 +3636,10 @@ def evaluate_resource(
         active = mode in ("Auto", "Recreate")
         ev.add(
             "VPA_CHANGE",
-            DIM_DESTRUCTIVENESS if active else DIM_BLAST_RADIUS,
+            DIM_DISRUPTIVENESS if active else DIM_BLAST_RADIUS,
             RISK_HIGH if active else RISK_MEDIUM,
             f"{action}s VerticalPodAutoscaler {ref.name!r} with updateMode={mode!r}",
-            destructive=DESTRUCTIVE_YES if active else DESTRUCTIVE_NO,
+            disrupt=DISRUPT_DISRUPTIVE if active else DISRUPT_NONE,
         )
         return _finalize()
 

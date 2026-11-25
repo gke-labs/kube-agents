@@ -405,7 +405,7 @@ def decide_risk(
     risk_level: str,
     environment: str,
     *,
-    destructiveness: str = "non_destructive",
+    disruptiveness: str = "non_disruptive",
     revertability: str = "easy",
     effective_changes: bool = True,
     install_max_risk: str | None = None,
@@ -419,8 +419,8 @@ def decide_risk(
         return Decision(False, f"{RULES_FILE} refused ({rules.error}); nothing merges unattended")
     if risk_level not in ALLOWABLE_RISK_LEVELS:
         return Decision(False, f"risk level `{risk_level}` is never eligible for unattended auto-merge")
-    if destructiveness != "non_destructive":
-        return Decision(False, f"changes with destructiveness `{destructiveness}` are not eligible for auto-merge")
+    if disruptiveness != "non_disruptive":
+        return Decision(False, f"changes with disruptiveness `{disruptiveness}` are not eligible for auto-merge")
     if revertability != "easy":
         return Decision(False, f"changes with revertability `{revertability}` are not eligible for auto-merge")
     if not effective_changes:

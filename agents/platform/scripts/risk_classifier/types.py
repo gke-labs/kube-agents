@@ -82,22 +82,33 @@ _REVERT_COMBINE_RANK: dict[str, int] = {
     REVERT_IRREVERSIBLE: 4,
 }
 
-# Destructiveness levels (explicit 3-state enum, avoiding bool truthiness traps)
-DESTRUCTIVE_NO = "non_destructive"
-DESTRUCTIVE_YES = "destructive"
-DESTRUCTIVE_UNKNOWN = "unknown"
+# Disruptiveness levels (separating live outage/disruption from data/resource destruction)
+DISRUPT_NONE = "non_disruptive"
+DISRUPT_DISRUPTIVE = "disruptive"
+DISRUPT_DESTRUCTIVE = "destructive"
+DISRUPT_UNKNOWN = "unknown"
 
-DESTRUCTIVENESS_LEVELS = (DESTRUCTIVE_NO, DESTRUCTIVE_YES, DESTRUCTIVE_UNKNOWN)
+DISRUPTIVENESS_LEVELS = (
+    DISRUPT_NONE,
+    DISRUPT_DISRUPTIVE,
+    DISRUPT_DESTRUCTIVE,
+    DISRUPT_UNKNOWN,
+)
 
-_DESTRUCTIVE_COMBINE_RANK: dict[str, int] = {
-    DESTRUCTIVE_NO: 0,
-    DESTRUCTIVE_UNKNOWN: 1,
-    DESTRUCTIVE_YES: 2,
+# Anti-masking disruptiveness lattice:
+#   non_disruptive < unknown < disruptive < destructive
+# Unknown prevents claiming non_disruptive when any file is unsupported, while
+# known disruptive/destructive impact can never be downgraded to unknown.
+_DISRUPT_COMBINE_RANK: dict[str, int] = {
+    DISRUPT_NONE: 0,
+    DISRUPT_UNKNOWN: 1,
+    DISRUPT_DISRUPTIVE: 2,
+    DISRUPT_DESTRUCTIVE: 3,
 }
 
 # Reason dimensions
 DIM_BLAST_RADIUS = "blast_radius"
-DIM_DESTRUCTIVENESS = "destructiveness"
+DIM_DISRUPTIVENESS = "disruptiveness"
 DIM_REVERTABILITY = "revertability"
 DIM_SECURITY = "security"
 DIM_INPUT_INTEGRITY = "input_integrity"
@@ -127,9 +138,9 @@ RISK_LABEL_COLORS: dict[str, str] = {
 }
 
 RISK_LABEL_DESCRIPTIONS: dict[str, str] = {
-    "risk:low": "kube-agents deterministic PR risk: low blast radius, non-destructive, easy revert",
+    "risk:low": "kube-agents deterministic PR risk: low blast radius, non-disruptive, easy revert",
     "risk:medium": "kube-agents deterministic PR risk: moderate impact requiring review or dev policy",
-    "risk:high": "kube-agents deterministic PR risk: high impact (security, traffic, deletion, or cluster scope)",
+    "risk:high": "kube-agents deterministic PR risk: high impact (security, disruption, deletion, or cluster scope)",
     "risk:critical": "kube-agents deterministic PR risk: critical control-plane, RBAC, governance, or data-loss risk",
     "risk:unknown": "kube-agents deterministic PR risk: unsupported or unverifiable PR content (auto-merge blocked)",
 }
@@ -162,24 +173,24 @@ def combine_revertability(a: str, b: str) -> str:
     return b if rb > ra else a
 
 
-def combine_destructiveness(a: str, b: str) -> str:
-    """Combine two destructiveness values (`destructive > unknown > non_destructive`)."""
-    ra = _DESTRUCTIVE_COMBINE_RANK.get(a, _DESTRUCTIVE_COMBINE_RANK[DESTRUCTIVE_UNKNOWN])
-    rb = _DESTRUCTIVE_COMBINE_RANK.get(b, _DESTRUCTIVE_COMBINE_RANK[DESTRUCTIVE_UNKNOWN])
+def combine_disruptiveness(a: str, b: str) -> str:
+    """Combine two disruptiveness values (`destructive > disruptive > unknown > non_disruptive`)."""
+    ra = _DISRUPT_COMBINE_RANK.get(a, _DISRUPT_COMBINE_RANK[DISRUPT_UNKNOWN])
+    rb = _DISRUPT_COMBINE_RANK.get(b, _DISRUPT_COMBINE_RANK[DISRUPT_UNKNOWN])
     return b if rb > ra else a
 
 
-def escalate_risk(level: str, *, destructive_or_irreversible: bool = False) -> str:
+def escalate_risk(level: str, *, high_impact: bool = False) -> str:
     """Escalate a concrete risk level by one step for production environments.
 
-    `low -> medium`, `medium -> high`, and `high -> critical` when destructive,
-    irreversible, or security-sensitive. `unknown` and `critical` stay as-is.
+    `low -> medium`, `medium -> high`, and `high -> critical` when disruptive,
+    destructive, irreversible, or security-sensitive. `unknown` and `critical` stay as-is.
     """
     if level == RISK_LOW:
         return RISK_MEDIUM
     if level == RISK_MEDIUM:
         return RISK_HIGH
-    if level == RISK_HIGH and destructive_or_irreversible:
+    if level == RISK_HIGH and high_impact:
         return RISK_CRITICAL
     return level
 
@@ -271,7 +282,7 @@ class ResourceVerdict:
     risk_level: str
     blast_radius: str
     revertability: str
-    destructiveness: str
+    disruptiveness: str
     supported: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -286,7 +297,7 @@ class ResourceVerdict:
             "risk_level": self.risk_level,
             "blast_radius": self.blast_radius,
             "revertability": self.revertability,
-            "destructiveness": self.destructiveness,
+            "disruptiveness": self.disruptiveness,
             "supported": self.supported,
         }
 
@@ -301,7 +312,7 @@ class FileVerdict:
     risk_level: str
     blast_radius: str
     revertability: str
-    destructiveness: str
+    disruptiveness: str
     supported: bool = True
     old_path: str = ""
 
@@ -313,7 +324,7 @@ class FileVerdict:
             "risk_level": self.risk_level,
             "blast_radius": self.blast_radius,
             "revertability": self.revertability,
-            "destructiveness": self.destructiveness,
+            "disruptiveness": self.disruptiveness,
             "supported": self.supported,
         }
         if self.old_path and self.old_path != self.path:
@@ -356,7 +367,7 @@ class ClassificationResult:
     risk_level: str
     blast_radius: str
     revertability: str
-    destructiveness: str
+    disruptiveness: str
     supported: bool
     effective_changes: bool
     reasons: tuple[Reason, ...] = ()
@@ -374,7 +385,7 @@ class ClassificationResult:
             "risk_level": self.risk_level,
             "blast_radius": self.blast_radius,
             "revertability": self.revertability,
-            "destructiveness": self.destructiveness,
+            "disruptiveness": self.disruptiveness,
             "supported": self.supported,
             "effective_changes": self.effective_changes,
             "risk_label": self.risk_label,
@@ -397,7 +408,7 @@ def unknown_result(
         risk_level=RISK_UNKNOWN,
         blast_radius=BLAST_UNKNOWN,
         revertability=REVERT_UNKNOWN,
-        destructiveness=DESTRUCTIVE_UNKNOWN,
+        disruptiveness=DISRUPT_UNKNOWN,
         supported=False,
         effective_changes=False,
         reasons=(
