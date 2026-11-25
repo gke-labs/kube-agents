@@ -95,6 +95,8 @@ SOURCE_PROFILE = "cluster"
 #: The run-unique name: the prefix, then NAME_TOKEN_BYTES random bytes in hex.
 NAME_PREFIX = "delegating-"
 NAME_TOKEN_BYTES = 4
+#: A name new_name makes: the prefix, then hex only.
+THROWAWAY_NAME = re.compile(r"\A" + re.escape(NAME_PREFIX) + r"[0-9a-f]+\Z")
 #: A DNS-1123 label short enough for the profile's bus identity (the operator
 #: refuses a name of 56 characters).
 NAME_PATTERN = re.compile(r"\A[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?\Z")
@@ -191,8 +193,16 @@ def new_name(token: str | None = None) -> str:
 
 
 def is_throwaway_name(name: str) -> bool:
-    """Whether ``name`` is one :func:`new_name` makes."""
-    return name.startswith(NAME_PREFIX) and bool(NAME_PATTERN.match(name))
+    """Whether ``name`` is one :func:`new_name` makes: the prefix, then hex
+    only, so ``delegating-prod`` and the like are not."""
+    return bool(THROWAWAY_NAME.match(name)) and bool(NAME_PATTERN.match(name))
+
+
+def looks_like_throwaway_name(name: str) -> bool:
+    """Whether ``name`` has the throwaway prefix at all: what the validator
+    refuses as a literal name, broader than :func:`is_throwaway_name` on
+    purpose, since no case should name one."""
+    return name.startswith(NAME_PREFIX)
 
 
 def crd_declares_delegates(crd: dict[str, Any]) -> bool:
@@ -505,6 +515,16 @@ def main(argv: list[str] | None = None, kubectl: Kubectl | None = None) -> int:
         if args.command == "teardown":
             if not is_throwaway_name(args.name):
                 raise DelegatingProfileError(f"{args.name!r} is not a throwaway profile's name ({NAME_PREFIX}<hex>)")
+            # And it carries the label setup puts on it: a name alone is not
+            # proof this harness made the profile. One that's already gone
+            # is fine: the teardown then only confirms its pools are gone.
+            found = run("get", RESOURCE, args.name, "-n", args.namespace, "--ignore-not-found", "-o", "json")
+            if found.returncode != 0:
+                raise DelegatingProfileError(f"reading {RESOURCE}/{args.name}: {found.stderr.strip() or 'failed'}")
+            if found.stdout.strip():
+                labels = (json.loads(found.stdout).get("metadata") or {}).get("labels") or {}
+                if labels.get(LABEL) != LABEL_VALUE:
+                    raise DelegatingProfileError(f"{RESOURCE}/{args.name} has no {LABEL}={LABEL_VALUE} label: this harness didn't make it")
             tiers = tuple(args.tier) or DEFAULT_TIERS
             teardown(run, Profile(name=args.name, namespace=args.namespace, tiers=tiers, delegates=False))
         else:

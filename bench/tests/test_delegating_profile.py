@@ -109,6 +109,8 @@ class FakeCluster:
             name = rest[1]
             obj = self.profiles.get(name)
             if "--ignore-not-found" in rest:
+                if "json" in rest:
+                    return _done(json.dumps(obj) if obj else "")
                 return _done(f"agentprofile.kubeagents.x-k8s.io/{name}\n" if obj else "")
             if obj is None:
                 return _done(rc=1, stderr=f'agentprofiles "{name}" not found')
@@ -554,3 +556,29 @@ def test_a_second_stop_cannot_abort_a_teardown_and_the_handlers_are_put_back() -
         signal.raise_signal(signal.SIGTERM)
         signal.raise_signal(signal.SIGINT)
     assert {sig: signal.getsignal(sig) for sig in before} == before
+
+
+def test_a_throwaway_name_is_the_prefix_then_hex_only() -> None:
+    assert delegating_profile.is_throwaway_name(delegating_profile.new_name())
+    assert delegating_profile.is_throwaway_name("delegating-3fa2c9d1")
+    for name in ("delegating-prod", "delegating-", "delegating-3FA2", "cluster"):
+        assert not delegating_profile.is_throwaway_name(name), name
+
+
+def test_the_teardown_command_refuses_a_name_or_profile_the_harness_did_not_make() -> None:
+    cluster = FakeCluster(pools_linger=0)
+    assert delegating_profile.main(["teardown", "--name", "delegating-prod", "--namespace", NS], kubectl=cluster) == 1
+    hand = copy.deepcopy(CLUSTER_PROFILE)
+    hand["metadata"] = {"name": "delegating-abc123", "namespace": NS}
+    cluster.profiles["delegating-abc123"] = hand
+    assert delegating_profile.main(["teardown", "--name", "delegating-abc123", "--namespace", NS], kubectl=cluster) == 1
+    assert "delegating-abc123" in cluster.profiles, "an unlabelled profile was deleted"
+    made = _made(cluster, "abcd")
+    assert delegating_profile.main(["teardown", "--name", made.name, "--namespace", NS], kubectl=cluster) == 0
+    assert made.name not in cluster.profiles
+
+
+def test_a_literal_prefixed_name_is_still_refused_by_the_validator(validator: Any) -> None:
+    # Broader than a name the harness makes: no case should name one at all.
+    problems = _problems(validator, {"prompt": "[bench:profile name=delegating-prod] ask"})
+    assert any("names a throwaway delegating profile literally" in p for p in problems)

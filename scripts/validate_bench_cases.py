@@ -1297,7 +1297,7 @@ def _delegating_profile(name: str, spec: dict[str, Any], problems: list[str]) ->
             f"'{key}: true' needs the prompt to open with {hook.PROFILE_DIRECTIVE} name={dp.PLACEHOLDER} ...] "
             f"and name the placeholder nowhere else: the harness makes the profile only for that prompt"
         )
-    if not uses and dp.is_throwaway_name(addressed):
+    if not uses and dp.looks_like_throwaway_name(addressed):
         problems.append(
             f"prompt: {hook.PROFILE_DIRECTIVE} name={addressed}] names a throwaway delegating profile literally, "
             f"which no run made; address it as name={dp.PLACEHOLDER} with '{key}: true'"
