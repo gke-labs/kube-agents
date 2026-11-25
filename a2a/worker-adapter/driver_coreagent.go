@@ -93,8 +93,8 @@ func (coreAgentDriver) ConfiguresMCP([]string) bool { return false }
 // ConfigDirEnv is empty: the harness reads no config directory.
 func (coreAgentDriver) ConfigDirEnv(string) string { return "" }
 
-// PrepareTurn checks nothing yet (SEAM: tigerteam-dev-3 and dev-2: the
-// persona directory check before each spawn).
+// PrepareTurn checks nothing yet; the persona directory check before each
+// spawn comes with the persona render (#6713).
 func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return nil }
 
 // HoldsSteers: a steer waits for the turn to end; core-agent has no way in
