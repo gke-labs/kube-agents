@@ -70,6 +70,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "Whether the dispatcher runs profile tasks as Jobs: unattended ones, and permit-carrying ones at any tier. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
 	},
 	{
+		Type:    sessionHarnessCondition,
+		Written: "While spec.harness.sessionWorker.type names a harness this operator doesn't render",
+		Meaning: "`status: False`, `Reason: SessionHarnessNotSupported`, with a Warning event: the CRD admitted a session harness this operator doesn't know (after a rollback, for example), so the operator doesn't pass it to the gateway and session pods run the default harness, `claude-code`. Removed once the value is supported or unset.",
+	},
+	{
 		Type:    dispatcherCeilingCondition,
 		Written: "While the profile dispatcher is switched on",
 		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 650 profiles at two tiers; the config fills first only for profiles that declare many parameters.",
