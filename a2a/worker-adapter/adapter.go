@@ -983,7 +983,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			if b, ok := drv.(turnBudgeter); ok {
 				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
 			}
-			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log)
+			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 		}
 	}
 

@@ -128,6 +128,9 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 			session, taskID := "chat-callid-"+c.name, "task-callid-"+c.name
 			submit(t, cl, session, taskID, "look")
 			cfg := adapterConfig(url, taskID, session, stub(t, c.script))
+			// The core-agent driver checks it is the container's init before
+			// every process; a test stands in for that (useRespawnScope).
+			useRespawnScope(t)
 			cfg.Driver = c.driver
 			if out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second); out.err != nil {
 				t.Fatalf("run: %v", out.err)
