@@ -454,6 +454,16 @@ def _pod_containers(pod_spec: dict, key: str) -> list[dict]:
     return [c for c in raw if isinstance(c, dict)]
 
 
+def _container_resource_dicts(container: dict) -> tuple[dict, dict]:
+    resources = container.get("resources")
+    requests = resources.get("requests") if isinstance(resources, dict) else None
+    limits = resources.get("limits") if isinstance(resources, dict) else None
+    return (
+        requests if isinstance(requests, dict) else {},
+        limits if isinstance(limits, dict) else {},
+    )
+
+
 def evaluate_workload_resources(pod_spec: dict) -> dict:
     """Evaluate 250m CPU rounding and `requests == limits` burst impact for a pod spec."""
     app_containers = _pod_containers(pod_spec, "containers")
@@ -462,18 +472,22 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
 
     app_requested_cpu_millis = 0
     for container in app_containers:
-        resources = container.get("resources")
-        requests = resources.get("requests") if isinstance(resources, dict) else None
-        cpu_req = parse_cpu_millis(requests.get("cpu") if isinstance(requests, dict) else None)
+        req_dict, lim_dict = _container_resource_dicts(container)
+        raw_cpu_req = req_dict.get("cpu")
+        if raw_cpu_req is None:
+            raw_cpu_req = lim_dict.get("cpu")
+        cpu_req = parse_cpu_millis(raw_cpu_req)
         if cpu_req is not None:
             app_requested_cpu_millis += cpu_req
 
     sidecar_cpu_millis = 0
     init_peak_cpu_millis = 0
     for container in init_containers:
-        resources = container.get("resources")
-        requests = resources.get("requests") if isinstance(resources, dict) else None
-        cpu_req = parse_cpu_millis(requests.get("cpu") if isinstance(requests, dict) else None) or 0
+        req_dict, lim_dict = _container_resource_dicts(container)
+        raw_cpu_req = req_dict.get("cpu")
+        if raw_cpu_req is None:
+            raw_cpu_req = lim_dict.get("cpu")
+        cpu_req = parse_cpu_millis(raw_cpu_req) or 0
         if container.get(RESTART_POLICY_FIELD) == RESTART_POLICY_ALWAYS:
             sidecar_cpu_millis += cpu_req
         else:
@@ -501,24 +515,24 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
 
     for container in all_containers:
         cname = str(container.get("name") or UNNAMED_ITEM)
-        resources = container.get("resources")
-        requests = resources.get("requests") if isinstance(resources, dict) else None
-        limits = resources.get("limits") if isinstance(resources, dict) else None
-        req_dict = requests if isinstance(requests, dict) else {}
-        lim_dict = limits if isinstance(limits, dict) else {}
+        req_dict, lim_dict = _container_resource_dicts(container)
 
-        raw_cpu_req = req_dict.get("cpu")
         raw_cpu_lim = lim_dict.get("cpu")
-        raw_mem_req = req_dict.get("memory")
+        raw_cpu_req = req_dict.get("cpu")
+        if raw_cpu_req is None:
+            raw_cpu_req = raw_cpu_lim
         raw_mem_lim = lim_dict.get("memory")
-
-        if any(v is not None for v in (raw_cpu_req, raw_cpu_lim, raw_mem_req, raw_mem_lim)):
-            any_resource_declared = True
+        raw_mem_req = req_dict.get("memory")
+        if raw_mem_req is None:
+            raw_mem_req = raw_mem_lim
 
         cpu_req = parse_cpu_millis(raw_cpu_req)
         cpu_lim = parse_cpu_millis(raw_cpu_lim)
         mem_req = parse_memory_bytes(raw_mem_req)
         mem_lim = parse_memory_bytes(raw_mem_lim)
+
+        if any(v is not None and v > 0 for v in (cpu_req, cpu_lim, mem_req, mem_lim)):
+            any_resource_declared = True
 
         container_cpu_equal = (
             cpu_req is not None and cpu_lim is not None and cpu_req > 0 and cpu_req == cpu_lim
@@ -538,6 +552,12 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
             burst_details.append(
                 f"{cname}: cpu limit {raw_cpu_lim} > request {raw_cpu_req or '0m'}"
             )
+        elif cpu_req <= 0 and cpu_lim <= 0:
+            burst_details.append(f"{cname}: cpu request and limit are 0")
+        elif cpu_req > cpu_lim:
+            burst_details.append(
+                f"{cname}: cpu request {raw_cpu_req} > limit {raw_cpu_lim}"
+            )
 
         if mem_req is None and mem_lim is None:
             burst_details.append(f"{cname}: memory requests/limits unset")
@@ -546,6 +566,12 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
         elif mem_req is None or mem_lim > mem_req:
             burst_details.append(
                 f"{cname}: memory limit {raw_mem_lim} > request {raw_mem_req or '0'}"
+            )
+        elif mem_req <= 0 and mem_lim <= 0:
+            burst_details.append(f"{cname}: memory request and limit are 0")
+        elif mem_req > mem_lim:
+            burst_details.append(
+                f"{cname}: memory request {raw_mem_req} > limit {raw_mem_lim}"
             )
 
     if all_guaranteed:

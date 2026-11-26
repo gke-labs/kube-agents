@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import autopilot_migration_scan as scan  # noqa: E402
 import collect  # noqa: E402
+
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+scan.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 
 def _make_cluster(
@@ -419,6 +423,81 @@ class ResourceImpactTests(unittest.TestCase):
         self.assertEqual(res["autopilot_cpu_millis"], 500)
         self.assertEqual(res["cpu_delta_millis"], 50)
         self.assertEqual(res["qos_class"], scan.QOS_GUARANTEED)
+
+    def test_limits_only_containers_default_requests_from_limits(self) -> None:
+        dep = _make_deployment(
+            "limits-only",
+            containers=[
+                {
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "500m", "memory": "512Mi"},
+                    },
+                }
+            ],
+            init_containers=[
+                {
+                    "name": "sidecar",
+                    "restartPolicy": "Always",
+                    "resources": {
+                        "limits": {"cpu": "250m", "memory": "128Mi"},
+                    },
+                },
+                {
+                    "name": "init",
+                    "resources": {
+                        "limits": {"cpu": "100m", "memory": "64Mi"},
+                    },
+                },
+            ],
+        )
+        res = scan.evaluate_workload(dep)["resources"]
+        self.assertEqual(res["requested_cpu_millis"], 750)
+        self.assertEqual(res["autopilot_cpu_millis"], 750)
+        self.assertEqual(res["cpu_delta_millis"], 0)
+        self.assertFalse(res["cpu_rounded"])
+        self.assertEqual(res["qos_class"], scan.QOS_GUARANTEED)
+        self.assertFalse(res["burst_impacted"])
+        self.assertEqual(res["burst_details"], [])
+
+    def test_zero_quantity_containers_best_effort_and_burstable_details(self) -> None:
+        all_zero = _make_deployment(
+            "all-zero",
+            containers=[
+                {
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "0m", "memory": "0"},
+                        "limits": {"cpu": "0m", "memory": "0"},
+                    },
+                }
+            ],
+        )
+        zero_res = scan.evaluate_workload(all_zero)["resources"]
+        self.assertEqual(zero_res["qos_class"], scan.QOS_BEST_EFFORT)
+        self.assertTrue(zero_res["burst_impacted"])
+        self.assertIn("BestEffort", zero_res["burst_summary"])
+
+        mixed_zero = _make_deployment(
+            "mixed-zero",
+            containers=[
+                {
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "500m", "memory": "0"},
+                        "limits": {"cpu": "500m", "memory": "0"},
+                    },
+                }
+            ],
+        )
+        mixed_res = scan.evaluate_workload(mixed_zero)["resources"]
+        self.assertEqual(mixed_res["qos_class"], scan.QOS_BURSTABLE)
+        self.assertTrue(mixed_res["burst_impacted"])
+        self.assertIn("app: memory request and limit are 0", mixed_res["burst_details"])
+        self.assertIn(
+            "removing burst above request: app: memory request and limit are 0)",
+            mixed_res["burst_summary"],
+        )
 
 
 class EndToEndCliTests(unittest.TestCase):
