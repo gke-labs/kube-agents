@@ -1504,14 +1504,20 @@ func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
 	if d.Event != hookPostToolCall || d.SessionID == "" {
 		return
 	}
-	// A panic here marks the run it found, as takeDelivery does: that
-	// run's answer folds the card's report in.
+	// Matching the delivery to a run comes first, guarded on its own: no
+	// task is known yet, and a panic there leaves the delivery unused, as
+	// a delivery that matched nothing.
 	var run *taskRun
-	if taskguard.Guard(b.cfg.Logger, "card worker delivery", nil, func() {
-		if run = cardWorkerRun(runs, *d); run != nil {
-			b.collectToolResult(run.act.Load(), d.Extra.Result)
-		}
-	}) != nil && run != nil {
+	if taskguard.Guard(b.cfg.Logger, "card worker match", nil, func() {
+		run = cardWorkerRun(runs, *d)
+	}) != nil || run == nil {
+		return
+	}
+	// A panic in the collection marks the run, as takeDelivery does: that
+	// run's answer folds the card's report in. The record names its task.
+	if taskguard.Guard(b.cfg.Logger, "card worker delivery", []any{"task", run.origin.TaskID}, func() {
+		b.collectToolResult(run.act.Load(), d.Extra.Result)
+	}) != nil {
 		markPanicked(run)
 	}
 }

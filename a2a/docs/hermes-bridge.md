@@ -1112,7 +1112,8 @@ spec names, not one this sweep fills. Three failure classes:
   `recovered a panic`, the panic's type or runtime error, and the stack. The count of
   recoveries is kept in the process with no endpoint, so alert on the log message or the
   reason. A panic anywhere else (the durable's consumer goroutine and the finalizes it
-  runs, the deadline and kill timers, the route-recording and card-abort goroutines)
+  runs, the deadline and kill timers, and the `recordOrigin`, synthesis-watcher, board-action and
+  session-card-abort goroutines)
   still ends the process, and the sweep above finalizes its tasks.
 
 The sweep's publish is a compare-and-swap per the profiles spec, not a read-then-write:

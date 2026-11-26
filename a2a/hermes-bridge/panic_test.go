@@ -398,3 +398,34 @@ func TestPanic_MarkedRunPublishesNoTurnArtifactAtTheBoundary(t *testing.T) {
 		t.Fatalf("%d requests, want the opening one only: the follow-up's turn ran", n)
 	}
 }
+
+// A panic collecting a card worker's tool result (a delivery that matched
+// no trace, read into the set of the task that filed the card) marks that
+// task's run, so its answer fails closed, and the recovery's Error record
+// names the task.
+func TestPanic_CardWorkerCollectionMarksTheRunAndNamesItsTask(t *testing.T) {
+	logs := &lockedBuffer{}
+	b := &Bridge{cfg: Config{Logger: slog.New(slog.NewJSONHandler(logs, nil))}, tasks: make(map[string]*taskRun)}
+	b.collectResult = func(*activityState, json.RawMessage) { panic("injected panic collecting a card worker's result") }
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-cardpanic"
+	a.inTurn.Store(true)
+	a.SyncKanbanCard("t_card91", "Check prod-c", "")
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-card-panic"}, state: stateRunning}
+	run.act.Store(a)
+	d := &hookDelivery{Event: hookPostToolCall, SessionID: "20990101_120003_worker", Cwd: "/var/lib/hermes/kanban/workspaces/t_card91/repo"}
+	before := taskguard.Count()
+
+	b.collectCardWorkerSecrets([]*taskRun{run}, d)
+
+	if !run.panicked.Load() {
+		t.Fatal("the run whose card worker's result panicked is not marked: its answer would go out")
+	}
+	if got := taskguard.Count() - before; got != 1 {
+		t.Fatalf("recovered panics = %d, want 1", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `"msg":"`+taskguard.LogMessage+`"`) || !strings.Contains(out, `"task":"task-card-panic"`) {
+		t.Fatalf("the recovery's Error record doesn't name the task:\n%s", out)
+	}
+}
