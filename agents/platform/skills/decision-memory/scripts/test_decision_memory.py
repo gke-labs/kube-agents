@@ -179,6 +179,8 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(out["records"], 2)
         ext = dm.load_external_doc_records(self.r.path)
         self.assertEqual([r.path for r in ext], ["knowledge/runbooks/RUN-001.md"])
+        single_ext = dm._load_single_repo_external_docs(self.r.path)
+        self.assertEqual([r.path for r in single_ext], ["knowledge/runbooks/RUN-001.md"])
 
     def test_validate_rejects_unscoped_and_unevidenced_lesson(self):
         self.r.write("knowledge/lessons/LES-2026-002-x.md",

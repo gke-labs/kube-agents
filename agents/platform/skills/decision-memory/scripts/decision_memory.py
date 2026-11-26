@@ -2091,13 +2091,7 @@ def _load_single_repo_external_docs(
         if not base.is_dir():
             continue
         for p in sorted(base.rglob("*.md")):
-            if p.name.lower() in (
-                "index.md",
-                "readme.md",
-                "template.md",
-                "state_of_being.md",
-                "0000-template.md",
-            ):
+            if p.name.lower() in SKIP_EXTERNAL_DOC_FILENAMES:
                 continue
             rel = f"{prefix}{p.relative_to(rdir).as_posix()}"
             try:
