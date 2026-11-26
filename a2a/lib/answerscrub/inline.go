@@ -1072,10 +1072,14 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 				if strings.HasPrefix(s[lo:hi], "#") {
 					// YAML reads no value here, but a commented-out value on
 					// a credential key's line is still redacted, as a
-					// line-end read redacted it. Nothing is tracked: it is
-					// not the value YAML reads.
+					// line-end read redacted it. It is not tracked as the
+					// value (it is not the value YAML reads), but a pair
+					// inside it is, as other rules would have found it.
 					if commentReadsAsValue(name, s[lo:hi]) {
 						spans = append(spans, [2]int{lo, hi})
+						if sink != nil {
+							scrubEnvRest("value: "+strings.TrimLeft(s[lo+1:hi], " \t"), sink)
+						}
 					}
 					continue
 				}
@@ -1128,7 +1132,7 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 					sink.emit(decoded)
 				}
 			}
-			if unquoted && (cutAt < 0 || hi > cutAt) && sink != nil {
+			if unquoted && (cutAt < 0 || redactHi > cutAt) && sink != nil {
 				// The whole line went as the value: what other rules would
 				// have found in it (", password: x", "Password=x" in a DSN,
 				// a URL's credential), before or after its first , } or ],
@@ -1136,8 +1140,9 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 				// or isn't read as an env value at all. In its line context
 				// ("value: ..."), so a key inside it is not read as starting
 				// a line of its own, which would read its value to the
-				// line's end.
-				scrubEnvRest("value: "+s[lo:hi], sink)
+				// line's end. A comment redacted with the value
+				// (commentReadsAsValue) is read too.
+				scrubEnvRest("value: "+s[lo:redactHi], sink)
 			}
 		}
 	}

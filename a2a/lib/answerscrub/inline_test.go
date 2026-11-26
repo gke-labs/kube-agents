@@ -1019,6 +1019,10 @@ func TestSeenSecrets_ABlockEnvValueCutAtACommaIsTracked(t *testing.T) {
 		// ambiguous name, as when the line isn't read as an env value.
 		"- name: DB_DSN # main db\n  value: Server=db;User Id=app;Password=plumgravy7731kqzx\n":   {"plumgravy7731kqzx"},
 		"- name: DB_PASS\n  value: quietpasture; api_key=quietmeadow, token: synthtail0005ghij\n": {"quietmeadow", "synthtail0005ghij"},
+		// A pair in a comment redacted with the value, or in a commented-out
+		// value, is tracked as other rules would have tracked it.
+		"- name: DB_PASSWORD\n  value: synthpass0001abcd # old password=plumgravy7731kqzx\n": {"synthpass0001abcd", "plumgravy7731kqzx"},
+		"- name: DB_PASSWORD\n  value: # was password=quietmeadow99zzk\n":                    {"quietmeadow99zzk"},
 	} {
 		var s Seen
 		s.CollectToolResult(terminalResult(t, in))
