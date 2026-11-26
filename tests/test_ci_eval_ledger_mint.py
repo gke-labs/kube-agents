@@ -598,6 +598,7 @@ class LedgerTokenRenewalTest(unittest.TestCase):
             (
                 ("start_ledger_token_renewal subshell", subshell.group(0)),
                 ("mint_ledger_token", _lift_function("mint_ledger_token")),
+                ("_ledger_token_mint", _lift_function("_ledger_token_mint")),
             )
         )
         self.assertEqual(offenders, [], "unsafe construct under an armed trap:\n" + "\n".join(offenders))
@@ -606,6 +607,7 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         proc = self._run(
             textwrap.dedent(
                 """\
+                [ -n "${BASHPID:-}" ] || { echo "SKIP=no BASHPID"; exit 0; }
                 sleep() { :; }
                 for _ in $(seq 1 20); do
                   start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
@@ -616,6 +618,8 @@ class LedgerTokenRenewalTest(unittest.TestCase):
             )
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
+        if "SKIP=" in proc.stdout:
+            self.skipTest("this bash has no BASHPID; the Prow image's does")
         self.assertIn("STOPPED=ok", proc.stdout)
 
 

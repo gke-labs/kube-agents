@@ -377,6 +377,7 @@ class GitopsWriteTokenTest(_Harness):
                 ("start_gitops_write_token subshell", subshell.group(0)),
                 ("forge_write_token", _function("forge_write_token")),
                 ("ledger_reset_token", _function("ledger_reset_token")),
+                ("_ledger_token_mint", _function("_ledger_token_mint")),
             )
         )
         self.assertEqual(offenders, [], "unsafe construct under an armed trap:\n" + "\n".join(offenders))
@@ -384,6 +385,7 @@ class GitopsWriteTokenTest(_Harness):
     def test_stop_returns_promptly_when_sleep_is_a_noop(self):
         proc = self._run(
             """\
+            [ -n "${BASHPID:-}" ] || { echo "SKIP=no BASHPID"; exit 0; }
             sleep() { :; }
             for _ in $(seq 1 20); do
               start_gitops_write_token "case rep 1" "${TOKEN_FILE}" >/dev/null
@@ -393,6 +395,8 @@ class GitopsWriteTokenTest(_Harness):
             """
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
+        if "SKIP=" in proc.stdout:
+            self.skipTest("this bash has no BASHPID; the Prow image's does")
         self.assertIn("STOPPED=ok", proc.stdout)
 
 
