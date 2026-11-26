@@ -9,13 +9,9 @@ This path installs the full operator, inference gateway, A2A stack, and `Platfor
 
 ## Cluster and project prerequisites
 
-Before deploying the chart, confirm that your target GKE cluster meets the [Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements):
+Your target GKE cluster must meet the [Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements): GKE 1.29 or newer, Workload Identity (`<PROJECT_ID>.svc.id.goog`) with `GKE_METADATA` on every node pool, NetworkPolicy enforcement via Dataplane V2 or Calico, and [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster) v1.13.0+ for the operator's admission webhook certificates.
 
-- **GKE 1.29 or newer** with Workload Identity (`<PROJECT_ID>.svc.id.goog`) enabled on the cluster and `GKE_METADATA` enabled on every node pool.
-- **NetworkPolicy enforcement** enabled via GKE Dataplane V2 or the legacy Calico addon.
-- **[cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster) v1.13.0+** installed on the cluster so the operator's admission webhooks receive TLS serving certificates.
-- **A `gvisor` RuntimeClass** available on the cluster (included on GKE Autopilot, or via a sandboxed node pool on GKE Standard). To run on the standard container runtime instead, set `platformAgent.deployment.availability.runtimeClassName: ""` in your Helm values.
-- **Release namespace `kubeagents-system`.** Keep the chart in `kubeagents-system`: the agent's default inference gateway endpoint is fixed to `http://inference-gateway.kubeagents-system.svc.cluster.local/v1`.
+The chart runs the agent under the `gvisor` RuntimeClass by default (included on GKE Autopilot, or via a sandboxed node pool on GKE Standard). To run on the standard container runtime instead, set `platformAgent.deployment.availability.runtimeClassName: ""` in your Helm values. Deploy into the `kubeagents-system` namespace so the release matches the default Terraform Workload Identity bindings and the image's baked fallback gateway address.
 
 ## Pipeline 1: Google Cloud IAM and infrastructure (Terraform)
 
@@ -25,7 +21,7 @@ You can provision the Google Cloud service accounts, IAM bindings, Pub/Sub topic
 
 Setting `install_helm_releases = false` tells [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) to provision only the Google Cloud resources and skip both `helm_release` resources. Terraform never connects to the GKE control plane in this mode, so your cloud pipeline needs no network path to a private cluster endpoint.
 
-Pair `install_helm_releases = false` with `create_cluster = false` and `enable_cert_manager = false` in `terraform.tfvars`:
+Pair `install_helm_releases = false` with `create_cluster = false`, `enable_cert_manager = false`, your release `image_tag`, and `agent_runtime_class = "gvisor"` in `terraform.tfvars`:
 
 ```hcl
 project_id            = "my-gcp-project"
@@ -35,13 +31,16 @@ create_cluster        = false
 enable_cert_manager   = false
 install_helm_releases = false
 
+image_tag             = "<RELEASE_VERSION>"
+agent_runtime_class   = "gvisor" # set "" for the standard container runtime
+
 # Model provider: vertex_ai uses Workload Identity with no API key.
 model_provider        = "vertex_ai"
 api_server_key        = "replace-with-random-bearer-key"
 
-# Optional Google Cloud integrations:
-enable_drift_pubsub   = true
-enable_drift_detector = true
+# Optional Google Cloud integrations (enable drift_pubsub and drift_detector together):
+enable_drift_pubsub   = false
+enable_drift_detector = false
 enable_github_minter  = false
 enable_google_chat    = false
 ```
@@ -61,14 +60,14 @@ After the apply finishes, Terraform exposes three outputs for your Kubernetes de
 | `kube_agents_helm_release`  | Release name (`kube-agents`), target namespace (`kubeagents-system`), relative chart path, and chart version.                                                    |
 | `cert_manager_helm_release` | Repository, chart, version, namespace, and values for `cert-manager`, or `null` when `enable_cert_manager = false`.                                              |
 
-Inspect or export the rendered Helm values documents from Terraform state:
+Inspect the rendered Helm values documents from Terraform state:
 
 ```bash
 terraform output -json kube_agents_helm_values | jq -r '.[0]' > values-0.yaml
 terraform output -json kube_agents_helm_values | jq -r '.[1]' > values-1.yaml
 ```
 
-`kube_agents_helm_values` is marked sensitive because it includes `platformAgent.credentials.data` when Terraform generates the Secret payload. When deploying through Flux or Argo CD, set `platformAgent.credentials.create: false` in your GitOps values and deliver the Secret keys through your secret manager instead.
+Do not commit `values-0.yaml` directly to Git. Terraform renders `platformAgent.credentials.create: true` in `kube_agents_helm_values[0]` and embeds plaintext secrets (`API_SERVER_KEY`, `SESSION_KV_API_KEY`, `SESSION_KV_SALT`, and `SANDBOX_SSH_PRIVATE_KEY`) under `platformAgent.credentials.data`. For Flux or Argo CD, either strip the `platformAgent.credentials.data` block and set `platformAgent.credentials.create: false` before committing, or commit the secret-free values shown under [Minimal Helm chart values](#minimal-helm-chart-values) and deliver the Secret keys through your secret manager.
 
 ### Option B: Compose `terraform/modules/` directly
 
@@ -95,23 +94,15 @@ module "litellm_vertex_iam" {
 }
 ```
 
-Add [`terraform/modules/drift-pubsub`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/drift-pubsub) for out-of-band GKE audit-log drift detection, [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) for the GitHub App token minter, and [`terraform/modules/chat-pubsub`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) for Google Chat ingress. See [Security & IAM](/kube-agents/reference/security-and-iam/#gcp-iam-permission-sets) for the default read-only role list.
+Add [`terraform/modules/drift-pubsub`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/drift-pubsub) when you enable `platformAgent.harness.driftDetector.enabled: true` in the chart, [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) for the GitHub App token minter, and [`terraform/modules/chat-pubsub`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) for Google Chat ingress. See [Security & IAM](/kube-agents/reference/security-and-iam/#gcp-iam-permission-sets) for the default read-only role list.
 
 ## External Secrets for GitOps
 
-In a GitOps workflow, keep credentials out of Git by setting `platformAgent.credentials.create: false` and provisioning two Kubernetes Secrets in `kubeagents-system` before or alongside the Helm release:
+In a GitOps workflow, keep credentials out of Git by setting `platformAgent.credentials.create: false` and provisioning two Kubernetes Secrets in `kubeagents-system` before or alongside the Helm release. The first Secret, `platform-agent-secrets` (`platformAgent.credentials.secretName`, which must keep this default name), holds `API_SERVER_KEY`, `SESSION_KV_API_KEY`, `SESSION_KV_SALT`, `SANDBOX_SSH_PRIVATE_KEY`, `SANDBOX_SSH_PUBLIC_KEY`, and any model provider API key (omitted when `litellm.modelProvider` is `vertex_ai` on Workload Identity). The second Secret, `platform-agent-shell-authorized-keys`, holds a single `authorized_keys` key containing the public key line matching `SANDBOX_SSH_PUBLIC_KEY` so the shell sandbox pod never mounts private keys or API tokens.
 
-1. **`platform-agent-secrets`** (`platformAgent.credentials.secretName`, must keep this default name) holding:
-   - `API_SERVER_KEY`: random bearer token for the pod-local Platform Agent API proxy.
-   - `SESSION_KV_API_KEY`: random bearer token for the pod-local Session KV server (required by `k8s-event-watcher`).
-   - `SESSION_KV_SALT`: stable random HMAC salt for pseudonymising chat identities across upgrades.
-   - `SANDBOX_SSH_PRIVATE_KEY` and `SANDBOX_SSH_PUBLIC_KEY`: an OpenSSH `ed25519` keypair used by the gateway pod to dial the shell sandbox pod.
-   - Your model provider API key (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OPENAI_COMPATIBLE_API_KEY`), omitted when `litellm.modelProvider` is `vertex_ai` on Workload Identity.
-2. **`platform-agent-shell-authorized-keys`** holding a single key, `authorized_keys`, set to the public key line matching `SANDBOX_SSH_PUBLIC_KEY`. The shell sandbox mounts only this Secret so private keys and API tokens never enter the sandbox pod.
+When `platformAgent.credentials.create` is `false`, the chart uses Helm's `lookup` function to copy `SANDBOX_SSH_PUBLIC_KEY` from `platform-agent-secrets` into `platform-agent-shell-authorized-keys`. Offline template renderers such as Argo CD disable `lookup`, so the chart omits `platform-agent-shell-authorized-keys` unless you provision it through your secret manager. For the same reason, set `litellm.masterKey.generate: false` so offline renders do not rotate `litellm-master-key` on every sync.
 
-When `platformAgent.credentials.create` is `false`, the chart template uses Helm's `lookup` function to copy `SANDBOX_SSH_PUBLIC_KEY` from `platform-agent-secrets` into `platform-agent-shell-authorized-keys`. Offline template renderers such as Argo CD disable `lookup`, so the chart omits `platform-agent-shell-authorized-keys` unless you create it via your secret manager. For the same reason, set `litellm.masterKey.generate: false` so offline renders do not rotate `litellm-master-key` on every sync.
-
-See [Deploying kube-agents via Argo CD without Helm lookup](/kube-agents/deploy/gitops-argocd/#deploying-kube-agents-via-argo-cd-without-helm-lookup) for the complete Secret key table, `ExternalSecret` manifests, and the [sandbox SSH keypair rotation procedure](/kube-agents/deploy/gitops-argocd/#rotating-the-sandbox-ssh-keypair).
+See [Deploying kube-agents via Argo CD without Helm lookup](/kube-agents/deploy/gitops-argocd/#deploying-kube-agents-via-argo-cd-without-helm-lookup) for the required and optional Secret key table, `ExternalSecret` manifests, and the [sandbox SSH keypair rotation procedure](/kube-agents/deploy/gitops-argocd/#rotating-the-sandbox-ssh-keypair).
 
 ## Minimal Helm chart values
 
@@ -133,8 +124,9 @@ platformAgent:
     clusterName: <CLUSTER_NAME>
     location: <REGION>
     projectId: <PROJECT_ID>
-    driftDetector:
-      enabled: true
+    # Enable only when the drift-pubsub topic and subscription exist in the project:
+    # driftDetector:
+    #   enabled: true
   security:
     serviceAccountAnnotations:
       iam.gke.io/gcp-service-account: kubeagents-platform-gsa@<PROJECT_ID>.iam.gserviceaccount.com
@@ -155,15 +147,15 @@ hindsight:
   podMonitoring: false
 ```
 
-The `podMonitoring`, `serviceMonitor`, and `vmPodScrape` flags default to `null` (auto-detect via `.Capabilities.APIVersions.Has`). Setting them explicitly guarantees deterministic output across offline `helm template` pipelines.
+The `podMonitoring`, `serviceMonitor`, and `vmPodScrape` flags default to `null` (auto-detect via `.Capabilities.APIVersions.Has`). Setting them explicitly guarantees deterministic output across offline `helm template` pipelines. Only set `platformAgent.harness.driftDetector.enabled: true` when you have provisioned the drift audit-log Pub/Sub subscription via `enable_drift_pubsub = true` in Option A or `terraform/modules/drift-pubsub` in Option B.
 
 ## Pipeline 2: Reconcile the chart with Flux or Argo CD
 
-Each official release publishes the signed chart to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents` at version `<RELEASE_VERSION>` (for example, `0.29.0`, with no `v` prefix).
+Each official release publishes the signed chart to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents` at version `<RELEASE_VERSION>` (for example, `0.29.0`, with no `v` prefix). Pass the [Minimal Helm chart values](#minimal-helm-chart-values) above in your Flux `HelmRelease` or Argo CD `Application`.
 
 ### Flux (`OCIRepository` and `HelmRelease`)
 
-Define an `OCIRepository` pointing at GHCR and a `HelmRelease` that installs and upgrades the chart with `crds: CreateReplace`:
+Define an `OCIRepository` pointing at GHCR and a `HelmRelease` in `kubeagents-system` that installs and upgrades the chart with `crds: CreateReplace`:
 
 ```yaml
 apiVersion: source.toolkit.fluxcd.io/v1
