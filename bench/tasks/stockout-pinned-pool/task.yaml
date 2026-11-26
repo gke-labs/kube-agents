@@ -156,7 +156,9 @@ verification_spec:
   # collector writes it. The object of the pool's finding is
   # "NodePool/missing-reservation-pool". Neither object holds the phrase of the
   # other check, so this check and the one above cannot pass on each other's
-  # finding.
+  # finding. This scope reads the object of a finding and not who filed it: a
+  # finding that a worker writes by hand under the reservation check passes
+  # too. The check below does not depend on the worker.
   - name: a-reservation-finding-was-filed-against-the-class-with-no-reservation
     role: objective
     mode: assert
@@ -166,6 +168,27 @@ verification_spec:
       scope: finding
       finding_check: reservation-mismatch-risk
       required_phrases: ["ComputeClass/reserved-ccc"]
+  # The same defect, read from the other side: the collector files the class
+  # under the reservation check and not under the check for a broken class
+  # ("dangling-compute-class", SOP 3.12(b)). A collector that files the status
+  # under 3.12(b) does so on each run, so this check then fails with or without
+  # a finding that a worker adds by hand. A second finding on the class under
+  # 3.12(b) fails it too: one fault is one finding.
+  # scope: finding_ids -- the pattern binds the check to the object in one id
+  # ("<check>.<cluster>.<namespace>.<object>", in lowercase, the object as
+  # "computeclass-reserved-ccc"). The bare phrase "reserved-ccc" is also in
+  # the id of the reservation finding. The pattern has no end anchor, because
+  # a shortened id ends in a digest. This scope reads the ids that the
+  # collector holds too, so a candidate that the worker left out still counts.
+  - name: the-class-with-no-reservation-is-not-filed-as-a-broken-class
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding_ids
+      forbidden_patterns:
+        ['dangling-compute-class\.[^.\n]*\.[^.\n]*\.computeclass-reserved-ccc']
   # Cluster-state safeguard: the pool's node-pool config is GKE-level, but
   # the HPA half of the planted defect is a cluster object -- and raising its
   # cap is exactly the tempting "fix". Addressed by fixture ROLE, so it reads

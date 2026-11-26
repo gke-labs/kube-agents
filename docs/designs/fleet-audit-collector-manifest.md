@@ -512,7 +512,7 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   named in the ledger's _Awaiting `/remediate`_ section under a paragraph that says to read it
   first, and reported on the JSON line.
 - **Needs triage:** a finding whose candidate carries a `needs_triage` value in `NO_SWEEP_TRIAGE`
-  (`service-fronted`, `new-computeclass`, `class-status`, `reserved-pool`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
+  (`service-fronted`, `new-computeclass`, `class-status`, `reserved-pool`, `reserved-class`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
   `default-deny`, `namespace-token`, `service-selector`, `hard-spread`, `serviceentry-owner`, `manual-pool-fallback`,
   `image-pull`). The collector stands behind the finding; the _fix_ has a consequence
   it could not measure. Named in its own paragraph, worded differently from the one above because

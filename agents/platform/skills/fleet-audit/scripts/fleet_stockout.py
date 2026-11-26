@@ -61,9 +61,9 @@ Some sub-conditions are still uncovered, and governance/stockout_prevention_sop.
 §3 lists every one for the model to check by hand. They need a read this
 collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
-and workload shapes for 3.3, the region's unreserved production workloads
-for 3.10(c)'s qualifier, and the cluster's default-class setting for 3.13's
-`default` class.
+and workload shapes for 3.3, PersistentVolumeClaims for 3.6's Deployment
+form, the region's unreserved production workloads for 3.10(c)'s qualifier,
+and the cluster's default-class setting for 3.13's `default` class.
 
 The ComputeClass field names and family-generation lists below (Gen 2 vs
 Gen 4/Hyperdisk-compatible in `ccc-mixed-disk-generations`, the
@@ -158,8 +158,7 @@ NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
 # The `needs_triage` marker on a §3.12(b) finding. Its fix changes a node pool or a
 # class (for `TaintMissing`, a `NoSchedule` taint on a pool), and the collector reads
 # nothing about the other Pods on that pool, so the automatic sweep leaves it to
-# `/remediate`. A §3.10(b) finding has the same marker: one fix is a new
-# reservation, which is billed. The string matches `TRIAGE_REASONS` in audit_report.py.
+# `/remediate`. The string matches `TRIAGE_REASONS` in audit_report.py.
 CLASS_STATUS_TRIAGE = "class-status"
 
 # §3.1: the zone span credited to an Autopilot cluster, which has no node
@@ -225,9 +224,16 @@ CCC_HEALTH_CONDITION = "Health"
 # that rule. With auto-creation off and no matching node pool the reason is
 # `NapDisabledAndNoMatchingNodegroups`, and the reservation is not named.
 CCC_RESERVATION_NOT_FOUND_REASON = "ReservationNotFound"
+# The end of the two §3.10(b) Impact sentences: what the workloads of the
+# class get when GKE does not use a rule. The collector does not read
+# `spec.whenUnsatisfiable`, so the sentence gives the result for each value.
+CLASS_RULE_UNUSED_EFFECT = (
+    "its workloads get nodes from the rules below it. If no rule is below it, they wait, unless the class sets "
+    "`whenUnsatisfiable: ScaleUpAnyway`: then GKE can give them nodes that match no rule."
+)
 CLASS_RESERVATION_NOT_FOUND_IMPACT = (
     "GKE reports that a reservation named by a rule of this ComputeClass does not exist or cannot be used, so GKE "
-    "does not use that rule: its workloads get nodes from the rules below it, and wait if no rule is below it."
+    f"does not use that rule: {CLASS_RULE_UNUSED_EFFECT}"
 )
 CCC_CONDITION_EXCERPT = "status condition {type} is {state} ({reason}): {message}"
 CCC_CONDITION_JOINER = "; "
@@ -665,22 +671,49 @@ RESERVED_POOL_TRIAGE = "reserved-pool"
 # removes them: a cluster's pools bound to named reservations, and a project's
 # `{reservation name: zones}`.
 RESERVED_POOLS_KEY = "_reserved_pools"
-# §3.10(b), where the class status does not name the reservation: the affinity
-# of a ComputeClass rule that consumes only the reservations it names, the
-# sentence of the finding, and the entry key that carries a cluster's such
-# rules to `collect_fleet`, which removes it.
-CLASS_SPECIFIC_RESERVATION = "Specific"
+# §3.10(b), where the class status does not name the reservation. The sentence
+# of the finding, and the entry key for a cluster's ComputeClass rules that
+# consume only the reservations they name (`SPECIFIC_RESERVATION_AFFINITY`).
+# `collect_fleet` removes the key.
 CLASS_RESERVATION_MISSING_IMPACT = (
     "A rule of this ComputeClass consumes only a named reservation, and that reservation does not exist in a zone "
-    "that the rule can use, so GKE cannot use that rule: its workloads get nodes from the rules below it, and wait "
-    "if no rule is below it."
+    f"that the rule can use, so GKE cannot use that rule: {CLASS_RULE_UNUSED_EFFECT}"
 )
 RESERVED_CLASSES_KEY = "_reserved_classes"
-# Whose zones a class rule is compared in: the rule's own `location.zones`, or
-# the cluster's node locations for a rule that names none. The word is part of
-# the finding's excerpt.
+# Whose zones one named reservation of a class rule is compared in. In order:
+# the zones of its own `reservations.specific[]` item, the rule's
+# `location.zones`, and the zones in which the cluster makes nodes for the
+# class. The words are part of the finding's excerpt.
+CLASS_ZONES_OF_RESERVATION = "its own"
 CLASS_ZONES_OF_RULE = "rule"
 CLASS_ZONES_OF_CLUSTER = "cluster"
+# The `needs_triage` marker on a §3.10(b) finding: one fix creates a
+# reservation, which is billed, and the other fix changes the reservation rule
+# of the class. The automatic sweep opens no pull request for it. Read by
+# `triage_markers` in audit_report.py, as `NEW_COMPUTE_CLASS_TRIAGE` is.
+RESERVED_CLASS_TRIAGE = "reserved-class"
+# §3.10's slug, on the lines that file the ComputeClass forms.
+RESERVATION_MISMATCH_RISK = "reservation-mismatch-risk"
+# The excerpt texts of the reservation comparisons (§3.10(b) and (d)): where
+# one named reservation was found, the zones in which a class rule's
+# reservation was compared, and one class rule.
+RESERVATION_FOUND_EXCERPT = "reservation {name}{compared}: found {where} of project {owner}"
+RESERVATION_FOUND_ONLY_IN = "only in {zones}"
+RESERVATION_FOUND_IN_NO_ZONE = "in no zone"
+RESERVATION_ZONE_JOINER = ", "
+CLASS_COMPARED_ZONES_EXCERPT = ", compared in {zones_of} zones {zones}"
+CLASS_RULE_EXCERPT = "priority {rule}: reservations.affinity={affinity}; {found}"
+RESERVATION_EXCERPT_JOINER = "; "
+# Between the Impact sentences of a class that has the forms (a) and (b).
+RESERVATION_IMPACT_JOINER = " "
+# Between the commands of a class candidate, which rests on more than one read.
+RESERVATION_COMMAND_JOINER = "; "
+# What `_record_uncompared_reservations` calls the users of a reservation that
+# it could not compare: the start of the sentence, and the noun.
+RESERVED_POOLS_SUBJECT = "these node pools consume only a named reservation"
+RESERVED_POOLS_NOUN = "node pools"
+RESERVED_CLASSES_SUBJECT = "these ComputeClasses have a rule that consumes only a named reservation"
+RESERVED_CLASSES_NOUN = "ComputeClasses"
 RESERVATION_ZONES_KEY = "_reservation_zones"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
@@ -1656,9 +1689,28 @@ def check_class_reservation_status(cc: dict) -> dict | None:
     return {
         "object": f"ComputeClass/{cc['metadata']['name']}",
         "excerpt": CCC_CONDITION_JOINER.join(reported),
-        "severity": "critical",
+        "severity": MISSING_RESERVATION_SEVERITY,
         "impact": CLASS_RESERVATION_NOT_FOUND_IMPACT,
-        "needs_triage": CLASS_STATUS_TRIAGE,
+        "needs_triage": RESERVED_CLASS_TRIAGE,
+    }
+
+
+def class_reservation_hit(affinity_hit: dict | None, missing_hit: dict | None) -> dict | None:
+    """One §3.10 hit for a ComputeClass, from its affinity form (a) and its
+    missing-reservation form (b). The finding identity is (check, cluster,
+    namespace, object), so a class with the two forms gets one candidate, as
+    `check_ccc_large_vm_scarcity` files one. That candidate holds the two
+    excerpts and the two Impact sentences.
+
+    It keeps the marker of (b). So the automatic sweep opens no pull request
+    for the fix of (a) on that class while (b) is open: one identity holds one
+    marker, and a fix of (b) can create a billed reservation."""
+    if not affinity_hit or not missing_hit:
+        return affinity_hit or missing_hit
+    return {
+        **missing_hit,
+        "excerpt": RESERVATION_EXCERPT_JOINER.join([affinity_hit["excerpt"], missing_hit["excerpt"]]),
+        "impact": RESERVATION_IMPACT_JOINER.join([affinity_hit.get("impact") or IMPACT[RESERVATION_MISMATCH_RISK], missing_hit["impact"]]),
     }
 
 
@@ -2300,10 +2352,7 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
         elif outside_owners:
             outside.append(f"{reserved['pool']} (project {', '.join(outside_owners)})")
         else:
-            where = "; ".join(
-                f"reservation {name}: found {'only in ' + ', '.join(sorted(zones)) if zones else 'in no zone'} of project {owner}"
-                for owner, name, zones in found
-            )
+            where = RESERVATION_EXCERPT_JOINER.join(_reservation_found(owner, name, zones) for owner, name, zones in found)
             entry["candidates"].append(
                 _emit(
                     slug,
@@ -2319,7 +2368,15 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
                     },
                 )
             )
-    _record_uncompared_reservations(entry, slug, unread, outside, "these node pools consume only a named reservation", "node pools")
+    _record_uncompared_reservations(entry, slug, unread, outside, RESERVED_POOLS_SUBJECT, RESERVED_POOLS_NOUN)
+
+
+def _reservation_found(owner: str, name: str, zones: list[str], compared: str = "") -> str:
+    """Where one named reservation was found, for the excerpt of the two
+    reservation comparisons. `compared` names the zones of the comparison when
+    they are not in the excerpt already."""
+    where = RESERVATION_FOUND_ONLY_IN.format(zones=RESERVATION_ZONE_JOINER.join(sorted(zones))) if zones else RESERVATION_FOUND_IN_NO_ZONE
+    return RESERVATION_FOUND_EXCERPT.format(name=name, compared=compared, where=where, owner=owner)
 
 
 def _record_uncompared_reservations(entry: dict, slug: str, unread: list[str], outside: list[str], subject: str, noun: str) -> None:
@@ -2350,56 +2407,70 @@ def _record_uncompared_reservations(entry: dict, slug: str, unread: list[str], o
 
 def reserved_class_rules(cc: dict, project: str, cluster_zones: list[str] | tuple[str, ...] = ()) -> list[dict]:
     """The priority rules of a ComputeClass that consume only named
-    reservations (§3.10(b)): for each, its 1-based place, its zones and its
-    `(owner project, name)` reservations. A reservation with no `project` is
-    one of the cluster's own project.
+    reservations (§3.10(b)): for each, its 1-based place and its reservations.
+    A reservation is `(owner project, name, zones, whose zones)`. A
+    reservation with no `project` is one of the cluster's own project. A name
+    is read as `reservation_owner` reads the value of a node pool.
 
-    The zones are the rule's own `location.zones`. A rule that names none gets
-    `cluster_zones`, the zones in which the cluster makes nodes; `zones_of`
-    says which of the two the zones are. With neither, the zones are empty and
-    the rule can use each zone."""
+    The zones are those in which the rule can use the reservation. In order:
+    the `zones` of the reservation's own `specific[]` item, as
+    `_priority_zones` reads them; the rule's `location.zones`;
+    `cluster_zones`, the zones in which the cluster makes nodes for the class.
+    With none of the three, the zones are empty and each zone counts.
+
+    An item whose `name` or `project` is not text is not a reservation, and a
+    `zones` value that is not a list of text gives no zone: such a value must
+    not stop the fleet step."""
     rules = []
     for place, priority in enumerate((cc.get("spec") or {}).get("priorities") or [], start=1):
-        reservations = (priority.get("reservations") or {}) if isinstance(priority, dict) else {}
-        if reservations.get("affinity") != CLASS_SPECIFIC_RESERVATION:
+        reservations = priority.get("reservations") if isinstance(priority, dict) else None
+        if not isinstance(reservations, dict) or reservations.get("affinity") != SPECIFIC_RESERVATION_AFFINITY:
             continue
-        named = sorted(
-            (item.get("project") or project, item["name"])
-            for item in reservations.get("specific") or []
-            if isinstance(item, dict) and item.get("name")
-        )
-        if named:
-            own_zones = (priority.get("location") or {}).get("zones") or []
-            rules.append(
-                {
-                    "class": cc["metadata"]["name"],
-                    "rule": place,
-                    "zones": sorted(own_zones or cluster_zones),
-                    "zones_of": CLASS_ZONES_OF_RULE if own_zones or not cluster_zones else CLASS_ZONES_OF_CLUSTER,
-                    "reservations": named,
-                }
+        location = priority.get("location")
+        rule_zones = _zone_names(location.get("zones")) if isinstance(location, dict) else []
+        named = []
+        for item in reservations.get("specific") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"]:
+                continue
+            if not isinstance(item.get("project") or project, str):
+                continue
+            homes = (
+                (_zone_names(item.get("zones")), CLASS_ZONES_OF_RESERVATION),
+                (rule_zones, CLASS_ZONES_OF_RULE),
+                (sorted(cluster_zones), CLASS_ZONES_OF_CLUSTER),
             )
+            zones, zones_of = next((home for home in homes if home[0]), ([], ""))
+            named.append((*reservation_owner(item["name"], item.get("project") or project), zones, zones_of))
+        if named:
+            rules.append({"class": cc["metadata"]["name"], "rule": place, "reservations": sorted(named)})
     return rules
+
+
+def _zone_names(value: object) -> list[str]:
+    """`value`, sorted, when it is a list of zone names; else no zone."""
+    return sorted(value) if isinstance(value, list) and all(isinstance(zone, str) for zone in value) else []
 
 
 def file_reserved_classes(entry: dict, zones_by_project: dict[str, dict[str, list[str]]], swept: frozenset[str]) -> None:
     """§3.10(b) for one cluster entry, where GKE's status does not name the
     reservation: a ComputeClass rule that consumes only named reservations,
-    none of which exists in a zone that the rule can use: the rule's own zones,
-    else the cluster's. With no zone known, the rule can use each zone, so one
-    zone that holds a named reservation is enough.
+    none of which exists in a zone in which the rule can use it. Each named
+    reservation has its own zones, as `reserved_class_rules` gives them. With
+    no zone known for a reservation, one zone that holds it is enough.
 
     Run by `collect_fleet` beside `file_reserved_pools`, with the same two
-    halves. One finding for a class, with each such rule in its excerpt."""
-    slug = "reservation-mismatch-risk"
+    halves. One finding for a class, with each such rule in its excerpt. A
+    class that has a candidate of the affinity form (§3.10(a)) keeps one
+    candidate: `class_reservation_hit` joins the two."""
+    slug = RESERVATION_MISMATCH_RISK
     unread: list[str] = []
     outside: list[str] = []
     missing: dict[str, list[tuple[str, list[str], str]]] = {}
     for reserved in entry.pop(RESERVED_CLASSES_KEY, []):
-        found = [(owner, name, zones_by_project.get(owner, {}).get(name, [])) for owner, name in reserved["reservations"]]
-        if any(zones and (not reserved["zones"] or set(zones) & set(reserved["zones"])) for _, _, zones in found):
+        found = [(owner, name, zones, zones_of, zones_by_project.get(owner, {}).get(name, [])) for owner, name, zones, zones_of in reserved["reservations"]]
+        if any(held and (not zones or set(held) & set(zones)) for _, _, zones, _, held in found):
             continue
-        owners = sorted({owner for owner, _, _ in found})
+        owners = sorted({owner for owner, _, _, _, _ in found})
         unread_owners = [owner for owner in owners if owner in swept and owner not in zones_by_project]
         outside_owners = [owner for owner in owners if owner not in swept]
         target = f"ComputeClass/{reserved['class']}"
@@ -2408,32 +2479,35 @@ def file_reserved_classes(entry: dict, zones_by_project: dict[str, dict[str, lis
         elif outside_owners:
             outside.append(f"{target} (project {', '.join(outside_owners)})")
         else:
-            where = "; ".join(
-                f"reservation {name}: found {'only in ' + ', '.join(sorted(zones)) if zones else 'in no zone'} of project {owner}"
-                for owner, name, zones in found
+            where = RESERVATION_EXCERPT_JOINER.join(
+                _reservation_found(
+                    owner,
+                    name,
+                    held,
+                    CLASS_COMPARED_ZONES_EXCERPT.format(zones_of=zones_of, zones=RESERVATION_ZONE_JOINER.join(zones)) if zones else "",
+                )
+                for owner, name, zones, zones_of, held in found
             )
-            rule_zones = f", {reserved['zones_of']} zones {', '.join(reserved['zones'])}" if reserved["zones"] else ""
-            excerpt = f"priority {reserved['rule']}: reservations.affinity={CLASS_SPECIFIC_RESERVATION}{rule_zones}; {where}"
+            excerpt = CLASS_RULE_EXCERPT.format(rule=reserved["rule"], affinity=SPECIFIC_RESERVATION_AFFINITY, found=where)
             missing.setdefault(reserved["class"], []).append((excerpt, owners, reserved["command"]))
     for name, rules in missing.items():
         owners = sorted({owner for _, rule_owners, _ in rules for owner in rule_owners})
-        entry["candidates"].append(
-            _emit(
-                slug,
-                {
-                    "object": f"ComputeClass/{name}",
-                    "severity": MISSING_RESERVATION_SEVERITY,
-                    "excerpt": "; ".join(excerpt for excerpt, _, _ in rules),
-                    "impact": CLASS_RESERVATION_MISSING_IMPACT,
-                    "needs_triage": CLASS_STATUS_TRIAGE,
-                    # Both reads: the classes, then the reservations of each owner project.
-                    "command": "; ".join([rules[0][2], *(shlex.join(reservations_argv(owner)) for owner in owners)]),
-                },
-            )
-        )
-    _record_uncompared_reservations(
-        entry, slug, unread, outside, "these ComputeClasses have a rule that consumes only a named reservation", "ComputeClasses"
-    )
+        hit = {
+            "object": f"ComputeClass/{name}",
+            "severity": MISSING_RESERVATION_SEVERITY,
+            "excerpt": RESERVATION_EXCERPT_JOINER.join(excerpt for excerpt, _, _ in rules),
+            "impact": CLASS_RESERVATION_MISSING_IMPACT,
+            "needs_triage": RESERVED_CLASS_TRIAGE,
+            # Both reads: the classes, then the reservations of each owner project.
+            "command": RESERVATION_COMMAND_JOINER.join([rules[0][2], *(shlex.join(reservations_argv(owner)) for owner in owners)]),
+        }
+        # The cluster step filed the affinity form of this class, if it has one.
+        earlier = next((c for c in entry["candidates"] if c["check"] == slug and c["object"] == hit["object"]), None)
+        if earlier:
+            entry["candidates"][entry["candidates"].index(earlier)] = _emit(slug, class_reservation_hit(earlier, hit))
+        else:
+            entry["candidates"].append(_emit(slug, hit))
+    _record_uncompared_reservations(entry, slug, unread, outside, RESERVED_CLASSES_SUBJECT, RESERVED_CLASSES_NOUN)
 
 
 # --------------------------------------------------------------------------- #
@@ -3232,20 +3306,36 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                     candidates.append(_emit(UNBACKED_MANUAL_FALLBACK, {**hit, "command": f"{class_read_command}; {pools_record['command']}"}))
         elif not autopilot and _manual_fallback_class(cc) and not _cluster_default_class(cc):
             manual_fallback_unread.append(f"ComputeClass/{cc_meta['name']}")
-        if not non_production:
-            for hit in [check_reservation_affinity(cc)]:
-                if hit:
-                    # Stamped: an unread pool list or an unread owner project
-                    # drops this slug's record (§3.10(d)).
-                    candidates.append(_emit("reservation-mismatch-risk", {**hit, "command": dump_record["command"]}))
-        # §3.10(b) from the class's own status; §3.10 does not flag non-production.
+        # §3.10(a), and §3.10(b) from the class's own status; §3.10 does not
+        # flag non-production. One candidate for a class that has the two.
         reservation_hit = None if non_production else check_class_reservation_status(cc)
-        if reservation_hit:
-            candidates.append(_emit("reservation-mismatch-risk", {**reservation_hit, "command": dump_record["command"]}))
-        elif not non_production:
+        for hit in [None if non_production else class_reservation_hit(check_reservation_affinity(cc), reservation_hit)]:
+            if hit:
+                # Stamped: an unread pool list or an unread owner project
+                # drops this slug's record (§3.10(d)).
+                candidates.append(_emit(RESERVATION_MISMATCH_RISK, {**hit, "command": dump_record["command"]}))
+        if not non_production and not reservation_hit:
             # GKE did not name a reservation: the fleet step compares the rules
-            # with the reservations of their owner projects.
-            node_zones = sorted({*(cluster.get("locations") or []), *(cluster.get("autoprovisioning_locations") or [])})
+            # with the reservations of their owner projects. A rule that names
+            # no zone gets the zones in which the cluster makes nodes for the
+            # class. These are the node locations, the auto-provisioning
+            # locations, and the locations of the node pools that carry the
+            # class label. A pool can be in a zone outside the first two. This
+            # is the widest set, as `cluster_zone_span` takes it, so a
+            # reservation that the class can use is not filed `critical`.
+            # Where the pool list was not read, the pools' zones are not
+            # known, and each zone counts.
+            node_zones = (
+                []
+                if not autopilot and not pools_readable
+                else sorted(
+                    {
+                        *(cluster.get("locations") or []),
+                        *(cluster.get("autoprovisioning_locations") or []),
+                        *(zone for pool in _class_pools(cc_meta["name"], node_pools) for zone in (pool.get("locations") or [])),
+                    }
+                )
+            )
             reserved_classes += [{**rule, "command": dump_record["command"]} for rule in reserved_class_rules(cc, project, node_zones)]
         for hit in [check_compute_class_status(cc, reservation_filed=bool(reservation_hit))]:
             if hit:

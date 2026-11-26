@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -42,6 +43,11 @@ GENERAL_CAPTURE = SCRIPTS / "testdata" / "computeclass_taint_missing.json"
 # The case that grades the stockout finding on the class, and its check.
 CASE_FILE = REPO_ROOT / "bench" / "tasks" / "stockout-pinned-pool" / "task.yaml"
 CASE_CHECK = "a-reservation-finding-was-filed-against-the-class-with-no-reservation"
+# The case's check that the class is not filed under the class-status check.
+CASE_MOVE_CHECK = "the-class-with-no-reservation-is-not-filed-as-a-broken-class"
+# A project ID of the longest length, which makes the finding id longer than
+# the ledger's limit, so the id is shortened.
+LONGEST_PROJECT = "p" * 30
 ROLE = "missing-reservation-compute-class"
 # The stockout check that files the class, and the check that files a class
 # which GKE reports for another cause (slot c's `general-ccc`).
@@ -51,6 +57,7 @@ CLASS_OBJECT = "ComputeClass/reserved-ccc"
 
 sys.path.insert(0, str(SCRIPTS))
 
+import audit_report  # noqa: E402
 import collect  # noqa: E402
 import fleet_stockout  # noqa: E402
 
@@ -153,7 +160,12 @@ class StockoutFindingsTest(unittest.TestCase):
         fleet_stockout.file_reserved_classes(entry, {PROJECT: {}}, frozenset({PROJECT}))
         [hit] = _filed_on_the_class(entry)
         self.assertEqual(hit["check"], RESERVATION_CHECK)
-        self.assertIn("reservation seeded-absent-reservation: found in no zone", hit["excerpt"])
+        # The rule names no zone, so the comparison is in the slot's one zone.
+        self.assertEqual(
+            hit["excerpt"],
+            "priority 1: reservations.affinity=Specific; reservation seeded-absent-reservation, "
+            "compared in cluster zones us-central1-a: found in no zone of project acme",
+        )
 
     def test_the_case_check_names_the_collectors_check_and_object(self):
         # The case `stockout-pinned-pool` grades the finding. The phrase is in
@@ -165,6 +177,33 @@ class StockoutFindingsTest(unittest.TestCase):
         self.assertEqual(check["scope"], "finding")
         self.assertEqual(check["finding_check"], hit["check"])
         self.assertEqual(check["required_phrases"], [hit["object"]])
+
+    def test_the_case_s_second_check_fails_on_the_class_status_id_only(self):
+        # The pattern is in the case file, and the id is derived in
+        # `audit_report.py` from the collector's check and object. This joins
+        # them, as the bench check reads them: lowercase ids, one on each line.
+        case = yaml.safe_load(CASE_FILE.read_text(encoding="utf-8"))
+        [check] = [c["check"] for c in case["verification_spec"] if c.get("name") == CASE_MOVE_CHECK]
+        self.assertEqual(check["scope"], "finding_ids")
+        [pattern] = check["forbidden_patterns"]
+        general = json.loads(GENERAL_CAPTURE.read_text(encoding="utf-8"))
+
+        def ids(entry: dict, candidates: list[dict]) -> str:
+            return "\n".join(audit_report.published_id({**c, "cluster": entry["name"]}) for c in candidates).lower()
+
+        for project in (PROJECT, LONGEST_PROJECT):
+            with self.subTest(project=project), patch.dict(SLOT_C, {"project": project}):
+                entry = _collected(general, RESERVED)
+                # What the collector files on slot c: the reservation finding
+                # on the class, and the class-status finding on `general-ccc`.
+                self.assertNotRegex(ids(entry, entry["candidates"]), re.compile(pattern, re.IGNORECASE))
+                # The class-status hit on the class, which the collector files
+                # when it does not file the status under the reservation check.
+                status_hit = {**fleet_stockout.check_compute_class_status(RESERVED), "check": CLASS_STATUS_CHECK}
+                self.assertEqual(status_hit["object"], CLASS_OBJECT)
+                self.assertRegex(ids(entry, [status_hit]), re.compile(pattern, re.IGNORECASE))
+                shortened = len(audit_report.derive_finding_id({**status_hit, "cluster": entry["name"]})) > audit_report.MAX_FINDING_ID
+                self.assertEqual(shortened, project == LONGEST_PROJECT)
 
     def test_the_second_rule_is_a_fallback_for_each_zone_count(self):
         # A machine type of another family and another size: the two rules
@@ -190,7 +229,7 @@ class StockoutFindingsTest(unittest.TestCase):
     def test_with_auto_creation_on_the_class_is_not_an_unbacked_manual_class(self):
         self.assertIsNone(fleet_stockout.check_ccc_unbacked_manual_fallback(RESERVED, [DEFAULT_POOL]))
 
-    def test_with_auto_creation_off_the_class_gets_a_second_finding(self):
+    def test_with_auto_creation_off_the_class_gets_the_manual_fallback_finding_too(self):
         # Why the stack has auto-creation on in this class.
         off = _reserved(nodePoolAutoCreation={"enabled": False})
         hit = fleet_stockout.check_ccc_unbacked_manual_fallback(off, [DEFAULT_POOL])
