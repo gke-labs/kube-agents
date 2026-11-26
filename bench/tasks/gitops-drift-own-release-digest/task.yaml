@@ -124,6 +124,23 @@ verification_spec:
     check:
       type: report_contains
       any_of_phrases: ["memory limit", "limits.memory"]
+  # What the case is for, so it is an objective: the fixture's read of the
+  # ledger and the board after the records were handled. The agent's reply
+  # cannot satisfy it; only the state the detector and the daemon left can.
+  - name: own-release-writes-were-digested-and-the-controls-carded
+    role: objective
+    mode: assert
+    check:
+      type: resource_property
+      kind: configmap
+      resource_name: eval-drift-own-release-verdict
+      namespace: eval-drift-own-release
+      path: data.verdict
+      op: eq
+      value: ok
+  # The same read as a safeguard too: any other verdict means a change was
+  # routed wrongly (an upgrade's write carded, or a person's write digested),
+  # which fails the case outright whatever the reply says.
   - name: fixture-observed-the-own-release-digested
     role: safeguard
     severity: catastrophic
