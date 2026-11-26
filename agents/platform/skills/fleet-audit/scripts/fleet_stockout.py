@@ -305,6 +305,9 @@ POD_FINISHED_PHASES = frozenset({"Succeeded", "Failed"})
 # `renameByDefault=true`.
 CONTAINER_RESOURCE_FIELDS = ("requests", "limits")
 GPU_RESOURCE_DOMAIN = "nvidia.com/"
+# A quantity that declares none of a resource: `0`, `"0"`, `"0.0"`, or a zero
+# with a suffix (`0m`). Chart templates write it for an optional resource.
+ZERO_QUANTITY_RE = re.compile(r"^\s*[+-]?(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?\d+)?[A-Za-z]{0,2}\s*$")
 NODE_POOL_OBJECT = "NodePool/{name}"
 EXCERPT_SEPARATOR = "; "
 # How a failed read is written to the log.
@@ -1932,20 +1935,27 @@ def pool_opted_out(pool: dict) -> bool:
     return ((pool.get("config") or {}).get("labels") or {}).get(OPT_OUT_LABEL) == OPT_OUT_VALUE
 
 
+def declares_none(quantity: object) -> bool:
+    """Whether a resource quantity is a declared zero: the key is there and
+    asks for nothing."""
+    return bool(ZERO_QUANTITY_RE.match(str(quantity)))
+
+
 def pod_requests_gpu(pod: dict) -> bool:
-    """Whether any container of the pod names an NVIDIA device resource,
+    """Whether any container of the pod asks for an NVIDIA device resource,
     under `requests` or `limits` (Kubernetes defaults a missing request to
     the limit): `nvidia.com/gpu`, or another name in that domain, which
     NVIDIA's device plugin can be set to advertise a MIG slice or a shared
-    GPU by."""
+    GPU by. A declared zero asks for none, so it is no request; a quantity
+    that does not read as zero counts as one."""
     spec = pod.get("spec") or {}
     containers = [*(spec.get("containers") or []), *(spec.get("initContainers") or [])]
     return any(
-        str(resource).startswith(GPU_RESOURCE_DOMAIN)
+        str(resource).startswith(GPU_RESOURCE_DOMAIN) and not declares_none(quantity)
         for container in containers
         if isinstance(container, dict)
         for field in CONTAINER_RESOURCE_FIELDS
-        for resource in ((container.get("resources") or {}).get(field) or {})
+        for resource, quantity in ((container.get("resources") or {}).get(field) or {}).items()
     )
 
 

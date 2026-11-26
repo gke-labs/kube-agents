@@ -1615,6 +1615,26 @@ class GpuPoolMissingTaintTest(unittest.TestCase):
         counted = fs.pods_without_gpu([gpu_request, gpu_limit, gpu_init, gpu_slice, gpu_shared, daemon, system, finished, elsewhere, claimed, kept], ["n1"])
         self.assertEqual([p["metadata"]["name"] for p in counted], ["web-1"])
 
+    def test_a_declared_zero_gpu_quantity_is_no_gpu_request(self):
+        """A chart that writes `nvidia.com/gpu: "0"` for an optional resource asks
+        for no GPU, so its pod on a GPU machine is one that requests none."""
+        for field in fs.CONTAINER_RESOURCE_FIELDS:
+            for zero in ("0", 0, "0.0", "0m"):
+                with self.subTest(field=field, zero=zero):
+                    pod = running_pod("web-1", "n1", containers=[{"name": "c", "resources": {field: {"nvidia.com/gpu": zero}}}])
+                    self.assertFalse(fs.pod_requests_gpu(pod))
+                    self.assertEqual([p["metadata"]["name"] for p in fs.pods_without_gpu([pod], ["n1"])], ["web-1"])
+            for some in ("1", 1, "2", "10"):
+                with self.subTest(field=field, some=some):
+                    pod = running_pod("train", "n1", containers=[{"name": "c", "resources": {field: {"nvidia.com/gpu": some}}}])
+                    self.assertTrue(fs.pod_requests_gpu(pod))
+        # One container with a zero and one with a real request: the pod requests a GPU.
+        mixed = running_pod("mixed", "n1", containers=[
+            {"name": "sidecar", "resources": {"limits": {"nvidia.com/gpu": "0"}}},
+            {"name": "train", "resources": {"limits": {"nvidia.com/gpu": "1"}}},
+        ])
+        self.assertTrue(fs.pod_requests_gpu(mixed))
+
 
 class ReservationTest(unittest.TestCase):
     def test_flags_mostly_idle_reservation(self):
