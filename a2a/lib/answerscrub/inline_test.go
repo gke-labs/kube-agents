@@ -1014,6 +1014,11 @@ func TestSeenSecrets_ABlockEnvValueCutAtACommaIsTracked(t *testing.T) {
 		// With words after the second value too: it is read in its line
 		// context, not as a line of its own that runs to the end.
 		"- name: DB_PASSWORD\n  value: synthpass0001abcd, password: plumgravy7731kqzx is the old one\n": {"synthpass0001abcd", "plumgravy7731kqzx"},
+		// A pair inside the value before its first cut, or with no cut, is
+		// tracked too: under a name with a comment after it, and under an
+		// ambiguous name, as when the line isn't read as an env value.
+		"- name: DB_DSN # main db\n  value: Server=db;User Id=app;Password=plumgravy7731kqzx\n":   {"plumgravy7731kqzx"},
+		"- name: DB_PASS\n  value: quietpasture; api_key=quietmeadow, token: synthtail0005ghij\n": {"quietmeadow", "synthtail0005ghij"},
 	} {
 		var s Seen
 		s.CollectToolResult(terminalResult(t, in))
@@ -1064,6 +1069,7 @@ func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 		// A short number or a placeholder after the span, under a strong key,
 		// may be the rest of the value: the whole cell goes.
 		{"| Key | Value |\n|---|---|\n| password | `admin` / 12345 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| password | `admin` <x> |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
 		// A code span whose content ends in a blank or a tab, at the cell's
 		// end: no panic, and the value is redacted.
 		{"| Key | Value |\n|---|---|\n| DB password | `synthtoken0001abcd ` |\n", "| Key | Value |\n|---|---|\n| DB password | `[redacted]` |\n"},

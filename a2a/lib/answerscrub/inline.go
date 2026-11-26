@@ -1061,7 +1061,8 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			// value included: on a credential key's line a comment that
 			// reads as a value is redacted with it (commentReadsAsValue).
 			var segs []int
-			cutAt, rest := -1, "" // an unquoted value's first , } or ], and the text after it
+			cutAt := -1 // an unquoted value's first , } or ]
+			unquoted := false
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
 				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
@@ -1078,12 +1079,13 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 					}
 					continue
 				}
+				unquoted = true
 				ends = []int{lo + envUnquotedValue(s[lo:hi])}
 				segs = []int{lo + len(strings.TrimRight(s[lo:hi], " \t"))}
 				if cut := strings.IndexAny(s[lo:hi], ",}]"); cut >= 0 {
 					ends = append(ends, lo+envUnquotedValue(s[lo:lo+cut]))
 					segs = append(segs, lo+len(strings.TrimRight(s[lo:lo+cut], " \t")))
-					cutAt, rest = lo+cut, s[lo+cut+1:hi]
+					cutAt = lo + cut
 				}
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
@@ -1126,15 +1128,16 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 					sink.emit(decoded)
 				}
 			}
-			if cutAt >= 0 && hi > cutAt && sink != nil {
+			if unquoted && (cutAt < 0 || hi > cutAt) && sink != nil {
 				// The whole line went as the value: what other rules would
-				// have found after the cut (", password: x", a URL's
-				// credential) is still tracked, as it is when the value
-				// ends at the cut.
-				// In its line context ("value: <redacted>, ..."), so a key
-				// after the cut is not read as starting a line of its own,
-				// which would read its value to the line's end.
-				scrubEnvRest("value: "+Redacted+s[cutAt:cutAt+1]+rest, sink)
+				// have found in it (", password: x", "Password=x" in a DSN,
+				// a URL's credential), before or after its first , } or ],
+				// is still tracked, as it is when the value ends at the cut
+				// or isn't read as an env value at all. In its line context
+				// ("value: ..."), so a key inside it is not read as starting
+				// a line of its own, which would read its value to the
+				// line's end.
+				scrubEnvRest("value: "+s[lo:hi], sink)
 			}
 		}
 	}
@@ -1605,9 +1608,10 @@ func schemeProse(v string) bool {
 // tableNoteAfterSpan says whether rest, the text of a table cell after
 // the code span holding its value, is a note that may stay: no word of it
 // token-shaped and, under a key of the strong class (where every other
-// word reads as a value), every word plainly not a value (valueNotASecret:
-// "(rotated)", "/"). Anything else may be a second value or the value
-// itself (`appuser` synthtoken0001abcd).
+// word reads as a value), every word plainly a note
+// (tableNoteWordUnderStrongKey: "(rotated)", "/"; not a short number or a
+// placeholder). Anything else may be a second value or the value itself
+// (`appuser` synthtoken0001abcd).
 func tableNoteAfterSpan(class secretKeyClass, rest string) bool {
 	for _, w := range strings.Fields(rest) {
 		w = trimValueEdges(strings.TrimLeft(trimValueEdges(w), "([{"))
