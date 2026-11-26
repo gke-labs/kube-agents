@@ -860,18 +860,25 @@ CRONJOB_HISTORY_LIMIT_MAX = 10
 #: what a Job with a `successPolicy` gets instead of `Complete`.
 JOB_TERMINAL_CONDITIONS = ("Complete", "Failed", "SuccessCriteriaMet")
 #: The finished Jobs that a spawner creates as `<stem>-<uuid>` are one finding, `Job/<stem>`
-#: (SOP §3.9). The rule that makes a family is the one of the generated-name Deployments
-#: (`_name_families`): a member's name is in no file, so a finding on a member names nothing
+#: (SOP §3.9). The rule that makes a family is `_name_families`, which the generated-name
+#: Deployments use too: a member's name is in no file, so a finding on a member names nothing
 #: that an owner can change.
 JOB_FAMILY_KIND = "Job"
+#: Who the sentence on a family's owner and labels speaks for: each member, or, where a pod
+#: names a member that the dump does not hold as an object, each member that it does hold.
+FAMILY_EACH_MEMBER = "Each member"
+FAMILY_EACH_READ_MEMBER = "Each member whose Deployment this audit read"
 #: What a single finished Job's excerpt says after its finish time, and what a family's says
 #: after its count.
 JOB_NO_TTL_TEXT = "no ttlSecondsAfterFinished"
 #: What a Job family's excerpt says after its figures: `%(stem)s`, `%(count)d` and `%(plural)s`.
-#: The first sentence is the one of a Deployment family, so the report reads both alike.
+#: The first sentence is the one of a Deployment family, so the report reads both alike. The
+#: last one is for Jobs only: a finished Job with no TTL stays, where a Deployment's member is replaced.
 JOB_FAMILY_SENTENCE = (
     " `Job/%(stem)s` is not an object in the cluster: it stands for %(count)d generated-name Job%(plural)s `%(stem)s-<uuid>`."
-    " A member's name does not last, so set `ttlSecondsAfterFinished` in the template that creates the Jobs, not on a member."
+    " A member's name is in no file, so set `ttlSecondsAfterFinished` in the template that creates the Jobs, not on a member."
+    # The Jobs of the finding have no TTL, so nothing removes them, and the template's TTL is for the Jobs after it.
+    " The template reaches only later Jobs: each Job that this finding counts stays until a person deletes it."
 )
 # A monthly release cycle, and a pre-provisioned environment awaiting its first
 # deploy (SOP §3.10).
@@ -2755,12 +2762,14 @@ def _job_finished_at(status: dict) -> str:
 def _name_families(named: dict[str, dict[str, dict]], declared, *, no_index: bool) -> dict[tuple[str, str], dict]:
     """`(namespace, name) -> family`, for each member of a family among the objects of one kind.
 
-    `named[namespace][name]` is the metadata of each object of the kind. A family is the
-    objects of one namespace named `<stem>-<uuid>` with one stem; one member is a family. Its
-    `owner` and `labels` are what each member carries alike: they tell a reader where the
-    template is, and take no part in the grouping.
+    `named[namespace][name]` is the metadata of each object of the kind, or `{}` for a member
+    that the dump names and does not hold. A family is the objects of one namespace named
+    `<stem>-<uuid>` with one stem; one member is a family. Its `owner` and `labels` are what
+    each member with metadata carries alike: they tell a reader where the template is, and take
+    no part in the grouping. `unread` counts the other members.
 
-    The rule is the one of the generated-name Deployments (`_generated_families`). An object
+    This is the one rule for each kind: the generated-name Deployments (`_generated_families`)
+    and the finished Jobs of check 3.9 both group by it. An object
     that has the stem's own name keeps that name, and the members then stay single: two
     findings may not share one identity. An object with a name that lasts is no member: one
     that the repository declares (`declared`, `(namespace, name)` pairs), or one that carries
@@ -2782,7 +2791,9 @@ def _name_families(named: dict[str, dict[str, dict]], declared, *, no_index: boo
         for stem, members in stems.items():
             if stem in lasting or len(members) < GENERATED_FAMILY_MIN_MEMBERS:
                 continue
-            metas = [objects[member] for member in members]
+            # A member with no metadata here says nothing on what the members carry, so it
+            # does not hide what the others share.
+            metas = [objects[member] for member in members if objects[member]]
             owners = {_owner_key(meta.get("ownerReferences") or []) for meta in metas}
             owner = next(iter(owners)) if len(owners) == 1 else None
             labels = []
@@ -2793,14 +2804,29 @@ def _name_families(named: dict[str, dict[str, dict]], declared, *, no_index: boo
             family = {
                 "stem": stem,
                 "members": sorted(members),
-                # An owner with a generated name of its own does not last either.
+                # An owner with a generated name of its own does not last either, and names no place to look.
                 "owner": f"{owner[0]}/{owner[1]}" if owner and not GENERATED_NAME_RE.match(owner[1]) else "",
                 "labels": labels,
+                "unread": len(members) - len(metas),
                 "no_index": no_index,
             }
             for member in members:
                 families[(ns, member)] = family
     return families
+
+
+def _family_pointers(family: dict) -> str:
+    """The sentence on what the members of a family carry alike, or `""`: the owner and the
+    pointer labels, which tell a reader where the template is. It speaks only for the members
+    that the dump holds as an object."""
+    carried = []
+    if family["owner"]:
+        carried.append(f"is owned by `{family['owner']}`")
+    if family["labels"]:
+        carried.append("carries " + " and ".join(f"`{label}`" for label in family["labels"]))
+    if not carried:
+        return ""
+    return f" {FAMILY_EACH_READ_MEMBER if family['unread'] else FAMILY_EACH_MEMBER} {' and '.join(carried)}."
 
 
 def _job_family_excerpt(family: dict, finished: list[tuple[str, float]]) -> str:
@@ -2813,13 +2839,7 @@ def _job_family_excerpt(family: dict, finished: list[tuple[str, float]]) -> str:
     done, age = max(finished, key=lambda item: item[1])
     text = f"{count} finished Job{plural} `{family['stem']}-<uuid>`, {JOB_NO_TTL_TEXT}, the oldest finished {done}{_ago(age)}."
     text += JOB_FAMILY_SENTENCE % {"stem": family["stem"], "count": count, "plural": plural}
-    carried = []
-    if family["owner"]:
-        carried.append(f"is owned by `{family['owner']}`")
-    if family["labels"]:
-        carried.append("carries " + " and ".join(f"`{label}`" for label in family["labels"]))
-    if carried:
-        text += f" Each member {' and '.join(carried)}."
+    text += _family_pointers(family)
     if family["no_index"]:
         text += FAMILY_NO_INDEX_SENTENCE
     return text
@@ -2879,7 +2899,7 @@ def check_terminal_pods(context: dict, *, now: datetime) -> list[dict]:
             continue
         family = families.get((ns, meta.get("name", "")))
         if family is None:
-            hits.append({"namespace": ns, "object": f"Job/{meta.get('name', '')}", "excerpt": f"finished {done}{_ago(age)}, {JOB_NO_TTL_TEXT}", "severity": "minor"})
+            hits.append({"namespace": ns, "object": f"{JOB_FAMILY_KIND}/{meta.get('name', '')}", "excerpt": f"finished {done}{_ago(age)}, {JOB_NO_TTL_TEXT}", "severity": "minor"})
             continue
         key = (ns, family["stem"])
         if key not in family_hits:
@@ -3109,44 +3129,7 @@ def _generated_families(context: dict) -> dict[tuple[str, str], dict]:
         kind, name = _sizing_owner(meta)
         if kind == GENERATED_FAMILY_KIND:
             live.setdefault(meta.get("namespace", ""), {}).setdefault(name, {})
-    families: dict[tuple[str, str], dict] = {}
-    for ns, deployments in live.items():
-        stems: dict[str, list[str]] = {}
-        lasting: set[str] = set()
-        for name, meta in deployments.items():
-            match = GENERATED_NAME_RE.match(name)
-            if not match or match.group("stem") in deployments:
-                continue
-            if (ns, name) in declared or release_of(meta):
-                lasting.add(match.group("stem"))
-                continue
-            stems.setdefault(match.group("stem"), []).append(name)
-        for stem, members in stems.items():
-            if stem in lasting or len(members) < GENERATED_FAMILY_MIN_MEMBERS:
-                continue
-            # A member that only a pod names has no metadata here: it says nothing
-            # on what the members carry, so it does not hide what the others share.
-            metas = [deployments[member] for member in members if deployments[member]]
-            owners = {_owner_key(meta.get("ownerReferences") or []) for meta in metas}
-            owner = next(iter(owners)) if len(owners) == 1 else None
-            labels = []
-            for label in FAMILY_POINTER_LABELS:
-                values = {str((meta.get("labels") or {}).get(label) or "") for meta in metas}
-                if len(values) == 1 and "" not in values:
-                    labels.append(f"{label}: {values.pop()}")
-            family = {
-                "stem": stem,
-                "members": sorted(members),
-                # An owner with a generated name of its own does not last
-                # either, and names no place to look.
-                "owner": f"{owner[0]}/{owner[1]}" if owner and not GENERATED_NAME_RE.match(owner[1]) else "",
-                "labels": labels,
-                "unread": len(members) - len(metas),
-                "no_index": no_index,
-            }
-            for member in members:
-                families[(ns, member)] = family
-    return families
+    return _name_families(live, declared, no_index=no_index)
 
 
 def _family_owner(families: dict, ns: str, kind: str, name: str) -> tuple[str, dict | None]:
@@ -3204,15 +3187,7 @@ def _family_sentence(entry: dict, name: str, *, uncounted: int = 0) -> str:
         # Before the optional sentences: a cut of a very long excerpt then removes one of those, not this.
         " A member's name does not last, so change the template that creates the members, not a member."
     )
-    carried = []
-    if family["owner"]:
-        carried.append(f"is owned by `{family['owner']}`")
-    if family["labels"]:
-        carried.append("carries " + " and ".join(f"`{label}`" for label in family["labels"]))
-    if carried:
-        # The sentence speaks only for the members that the dump holds as a Deployment.
-        who = "Each member whose Deployment this audit read" if family["unread"] else "Each member"
-        text += f" {who} {' and '.join(carried)}."
+    text += _family_pointers(family)
     spread = _request_spread(entry["pods"])
     if spread:
         text += f" The members declare different requests ({spread} per pod), and the figures above take the hottest pod of any member."

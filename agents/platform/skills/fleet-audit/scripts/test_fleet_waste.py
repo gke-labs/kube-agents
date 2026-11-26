@@ -1820,7 +1820,9 @@ class FinishedJobFamilyTest(unittest.TestCase):
         self.assertEqual((hit["namespace"], hit["object"], hit["severity"]), (self.NS, "Job/reindex", "minor"))
         self.assertTrue(hit["excerpt"].startswith("3 finished Jobs `reindex-<uuid>`, no ttlSecondsAfterFinished, the oldest finished 2026-06-01T00:00:00Z (61d ago)."))
         self.assertIn("`Job/reindex` is not an object in the cluster: it stands for 3 generated-name Jobs `reindex-<uuid>`.", hit["excerpt"])
-        self.assertIn("set `ttlSecondsAfterFinished` in the template that creates the Jobs, not on a member", hit["excerpt"])
+        self.assertIn("A member's name is in no file, so set `ttlSecondsAfterFinished` in the template that creates the Jobs, not on a member.", hit["excerpt"])
+        # The template's TTL does not remove the Jobs that the finding counts.
+        self.assertIn("The template reaches only later Jobs: each Job that this finding counts stays until a person deletes it.", hit["excerpt"])
         # No member's name is in the finding.
         for uuid in (self.U1, self.U2, self.U3):
             self.assertNotIn(uuid, hit["object"] + hit["excerpt"])
@@ -1944,6 +1946,48 @@ class FinishedJobFamilyTest(unittest.TestCase):
         self.assertIn(" Each member carries `app.kubernetes.io/part-of: reindex`.", family["excerpt"])
         namespace = next(hit for hit in hits if hit["object"] == "Namespace/seeded-family")
         self.assertIn("3 terminal pods", namespace["excerpt"])
+
+    def test_an_owner_with_a_generated_name_is_not_named(self):
+        """An owner that a spawner names `<stem>-<uuid>` does not last either, so it is no pointer to the template."""
+        owner = [{"kind": "Workflow", "name": "nightly-0f8fad5b-d9cb-469f-a165-70867728950e", "controller": True}]
+        jobs = [self.job(f"reindex-{uuid}", **{"metadata.ownerReferences": owner}) for uuid in (self.U1, self.U2)]
+        [hit] = self.hits(jobs)
+        self.assertEqual(hit["object"], "Job/reindex")
+        self.assertNotIn("is owned by", hit["excerpt"])
+        self.assertNotIn("0f8fad5b", hit["excerpt"])
+
+    def collected(self, jobs, declarations=None):
+        """The 3.9 candidates of one cluster, through `collect_cluster` with the repository's declarations."""
+        cluster = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(obj("Node", "node-1"), *jobs)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW, declarations=declarations)
+        self.assertEqual(entry["outcome"], "collected")
+        return {c["object"]: c for c in entry["candidates"] if c["check"] == "terminal-pods"}
+
+    def test_a_member_that_the_repository_declares_reaches_the_check_through_collect_cluster(self):
+        jobs = [self.job(f"reindex-{uuid}") for uuid in (self.U1, self.U2, self.U3)]
+        path = "clusters/prod-usc1/lab/reindex.yaml"
+        # A declaration of another kind, of another cluster or of another namespace is not this Job's.
+        for key in (("prod-usc1", "Deployment", self.NS, f"reindex-{self.U1}"), ("other", "Job", self.NS, f"reindex-{self.U1}"), ("prod-usc1", "Job", "other", f"reindex-{self.U1}")):
+            with self.subTest(key=key):
+                self.assertEqual(sorted(self.collected(jobs, {key: {path}})), ["Job/reindex"])
+        # The declared member has a name that lasts: it keeps its finding and its file, and the
+        # other Jobs of the stem stay single too.
+        found = self.collected(jobs, {("prod-usc1", "Job", self.NS, f"reindex-{self.U1}"): {path}})
+        self.assertEqual(sorted(found), sorted(f"Job/reindex-{uuid}" for uuid in (self.U1, self.U2, self.U3)))
+        self.assertEqual(found[f"Job/reindex-{self.U1}"]["declaration"]["path"], path)
+        self.assertNotIn("declaration", found[f"Job/reindex-{self.U2}"])
 
 
 class IdleNamespaceTest(unittest.TestCase):
