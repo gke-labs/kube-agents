@@ -418,6 +418,10 @@ func TestAChainThatEndsWithoutAWakeEndsTheRoot(t *testing.T) {
 		if end.state != lib.StateCanceled {
 			t.Fatalf("root terminal = %+v, want canceled", end)
 		}
+		// Only a wake-not-started end logs the chain's line under the root.
+		holdsAt(t, "chain-end task terminal lines for a stopped chain", 0, func() int {
+			return len(textLogLines(r.logs, "task terminal", "source="+string(terminalLogChainEnd)))
+		})
 		assertOnlyRoot(t, obs, origin.TaskID)
 		assertNoDelivery(t, obs)
 	})

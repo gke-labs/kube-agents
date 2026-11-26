@@ -33,7 +33,9 @@ func childProfileChain(parent TaskRef, profileParent bool) []string {
 }
 
 // profileParentRefusal is why a profile parent may not delegate at all, as
-// a rule and a notice, or "" when it may. Checked once, before any child.
+// a rule and a notice, or "" when it may. Checked once, before any child,
+// after the card check (delegation.profile-not-delegating), which needs the
+// directory and so sits in handleDelegateRequest.
 func profileParentRefusal(parent TaskRef) (rule, notice string) {
 	// A profile task this gateway minted always has a scope, so an empty one
 	// is a record from before #5686 or a path that didn't record it: its
@@ -121,11 +123,21 @@ func chainAgreesWithRecord(rec *SessionRecord, parent TaskRef) bool {
 // whether s is a cluster scope at all. A child's route scope is a cluster or
 // the install's namespace scope, and the caller handles the latter first.
 func clusterForRoom(s capability.Scope) (string, bool) {
+	t, ok := scopeCluster(s)
+	if !ok {
+		return "", false
+	}
+	return scopeKindCluster + " " + t.String(), true
+}
+
+// scopeCluster is the cluster a cluster scope names, and whether s is one:
+// the inverse of clusterTarget.scope.
+func scopeCluster(s capability.Scope) (clusterTarget, bool) {
 	segs := strings.Split(string(s), "/")
 	if len(segs) == clusterScopeSegments && segs[0] == scopeKindProject && segs[2] == scopeKindLocation && segs[4] == scopeKindCluster {
-		return scopeKindCluster + " " + strings.Join([]string{segs[1], segs[3], segs[5]}, "/"), true
+		return clusterTarget{Project: segs[1], Location: segs[3], Cluster: segs[5]}, true
 	}
-	return "", false
+	return clusterTarget{}, false
 }
 
 // belowSchedule reports whether a task is a scheduled run (the unattended

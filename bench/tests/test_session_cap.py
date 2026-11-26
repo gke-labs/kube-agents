@@ -124,6 +124,18 @@ def test_a_refusal_at_the_cap_fails_with_the_refusal():
     assert "refused the turn at the cap" in got["result"] and "not started" in got["result"]
 
 
+def test_a_relayed_report_after_the_task_is_not_its_answer():
+    got = session_cap.assess(
+        [
+            entry(1, "post", text=NOTICE, messageId="inj-1"),
+            entry(2, "task", taskId="t-1"),
+            entry(3, "post", text="card report", messageId="inj-2", report=True),
+        ],
+        "t-1",
+    )
+    assert got["status"] == "error" and "nothing was posted" in got["result"], got
+
+
 @pytest.mark.parametrize(
     ("entries", "why"),
     [

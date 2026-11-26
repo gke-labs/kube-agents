@@ -237,8 +237,11 @@ type fakeAdapter struct {
 	verified []string
 	// feedbacks records every PostMessage's feedback mark, when it has one,
 	// and markedTexts the text each marked post carried.
-	feedbacks   []string
-	markedTexts []string
+	feedbacks []string
+	// editFeedbacks records every EditMessage's feedback mark, when it has
+	// one: a whole answer taken on the task's line.
+	editFeedbacks []string
+	markedTexts   []string
 	// takesTerminals makes PostTerminal record the terminal in terminals, as
 	// the console adapter publishes a terminal frame; without it the fake
 	// answers errNoTerminalFrames, as a chat backend would.
@@ -394,6 +397,9 @@ func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) 
 	a.setLaidOutLocked(messageID, m.Chat != nil)
 	if m.Stop != "" {
 		a.stopLines = append(a.stopLines, fakePost{conversation, messageID, m.Text})
+	}
+	if m.Feedback != "" {
+		a.editFeedbacks = append(a.editFeedbacks, m.Feedback)
 	}
 	a.mu.Unlock()
 	return nil
@@ -1382,6 +1388,13 @@ type fakeSpawner struct {
 	// started is each pod's start time for PodStarted; startedErr fails it.
 	started    map[string]time.Time
 	startedErr error
+	// warm is what WarmPods lists; warmSpawns records SpawnWarm's names,
+	// each added to warm as a pod not yet Ready; warmSpawnErr fails
+	// SpawnWarm and warmErr fails WarmPods.
+	warm         []warmPod
+	warmSpawns   []string
+	warmSpawnErr error
+	warmErr      error
 	// liveSpawns makes each spawn count in live, as the pod it creates
 	// would in the cluster, and maxLive the most live has been since; the
 	// session-cap line's tests free a slot by lowering live.

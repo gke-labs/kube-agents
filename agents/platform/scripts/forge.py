@@ -222,10 +222,23 @@ class ForgeError(Exception):
     because both are quoting the same source.
     """
 
-    def __init__(self, reason: str, value: str = ""):
+    def __init__(
+        self,
+        reason: str,
+        value: str = "",
+        *,
+        revision: Optional[str] = None,
+        entries: Optional[list[dict]] = None,
+    ):
         super().__init__(f"{reason}: {value}" if value else reason)
         self.reason = reason
         self.value = value
+        self.revision: Optional[str] = (
+            revision if isinstance(revision, str) and revision else None
+        )
+        self.entries: Optional[list[dict]] = (
+            entries if isinstance(entries, list) else None
+        )
 
 
 class RepoUnparseable(ForgeError):
@@ -464,7 +477,12 @@ def _as_forge_error(repo: str):
         detail = (refusal.detail or str(refusal)).strip()[:MAX_DETAIL_CHARS]
         if refusal.code == BROKER_UNSUPPORTED:
             raise UnknownForgeHost(_host_of(repo) or repo) from refusal
-        raise ForgeError(refusal.code or REASON_UNREACHABLE, detail) from refusal
+        raise ForgeError(
+            refusal.code or REASON_UNREACHABLE,
+            detail,
+            revision=refusal.revision,
+            entries=refusal.entries,
+        ) from refusal
 
 
 def _host_of(repo: str) -> str:
@@ -617,10 +635,17 @@ def _run_sandbox_forge(
         )
     refusal = answer.get("refusal")
     if refusal:
+        if not isinstance(refusal, dict):
+            raise vcs_client.VcsError(
+                f"{label} on {repo} answered with an unreadable refusal envelope",
+                code=REASON_SANDBOX_UNREACHABLE,
+            )
         raise vcs_client.VcsError(
             str(refusal.get("message") or f"{label} was refused"),
             code=refusal.get("code"),
             detail=refusal.get("detail"),
+            revision=refusal.get("revision"),
+            entries=refusal.get("entries"),
         )
     return answer.get("answer") or {}
 
@@ -833,9 +858,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             answer = vcs_client.forge(args.verb, payload, repository=args.repository)
     except vcs_client.VcsError as refusal:
-        print(json.dumps({"refusal": {
-            "message": str(refusal), "code": refusal.code, "detail": refusal.detail,
-        }}))
+        refusal_payload: dict = {
+            "message": str(refusal),
+            "code": refusal.code,
+            "detail": refusal.detail,
+        }
+        if refusal.revision is not None:
+            refusal_payload["revision"] = refusal.revision
+        if refusal.entries is not None:
+            refusal_payload["entries"] = refusal.entries
+        print(json.dumps({"refusal": refusal_payload}))
         return 0
     print(json.dumps({"answer": answer}))
     return 0

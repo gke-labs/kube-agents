@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `delegating_profile`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -102,6 +102,9 @@ One field is not a parameter: `intent=confirm` submits the ask as a structured c
 refuses any other; a directive without it sends a typed message. The door takes the confirm only
 where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
 which is infrastructure, since the agent never saw the ask.
+A case with the directive can be side B of a permit pair: a second case puts the same ask and
+checks to the platform agent, `hack/eval/permit-pairs.txt` names the two, and the lint holds them
+equal ([permit-pairs.md](permit-pairs.md)).
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -241,13 +244,18 @@ a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
 ledger, or whose agent runs a stream's collector outside a ledger run and so shares that
-stream's scratch state (`upgrade-chat-request-runs-collector`): a list of the Platform Agent
+stream's scratch state (`upgrade-chat-request-runs-collector`), or whose turn runs the
+ledger audit itself and is graded in the report store with no ledger check
+(`fleet-audit-remediation-right-and-not-stale`): a list of the Platform Agent
 job ids (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
 lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. devops-bench ignores the key.
+run beside the case's runs and grade their ledger. What the runner does with the in-flight note
+and the ledger of a declared stream is in
+[`ci-pool-projects.md`](../ci-pool-projects.md#5-gitops-repository-and-github-token-minter).
+devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
 clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
@@ -288,6 +296,22 @@ tasks/<id>/task.yaml --context <ctx> --namespace <ns> --name <cr>` before devops
 after (restore takes no `--task`; `--wait` also waits `PROPAGATION_SECONDS` for the lift to reach
 the pods). The validator refuses a malformed value and a case that
 declares both `scope_hold` and `scope_exclude`. devops-bench ignores the key.
+
+`delegating_profile: true` is for a case that grades a profile task delegating to another profile
+(#6789). The eval install's chart profiles don't delegate, so the harness makes one per run: at the
+case's start it copies the live `cluster` AgentProfile with `spec.delegates: true` and
+`yieldToPinned: false` under a run-unique `delegating-<hex>` name, waits for its card, writes the name
+into the prompt's `{{BENCH_DELEGATING_PROFILE}}` (the `name` of the case's `[bench:profile ...]`
+directive), and deletes it in a `finally` whatever the run did, confirming the profile and its worker
+pool are gone. A setup or teardown it can't complete is recorded as infrastructure. On an install
+whose AgentProfile CRD has no `spec.delegates` the copy has no delegate tool and the case runs as it
+is, graded: that is its red. The access is the harness's own on the install (the same context and
+namespace as its other `kubectl` calls). `python -m kube_agents_bench.delegating_profile sweep`
+deletes labelled leftovers older than six hours, for a run killed before its `finally`; nothing runs it
+yet, so it is a manual step until the lease preflight calls it. The
+validator refuses the placeholder without the key, the key without the placeholder as the
+directive's name, a literal throwaway name, and a case on the Slack lane, which can't address a
+profile. devops-bench ignores the key (`bench/kube_agents_bench/delegating_profile.py`).
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
@@ -522,8 +546,8 @@ the run started (or, with `since_state_file`, since the `fired_at` a case's stac
 JSON file in the agent container, for a scheduled run the stack fired and waited out before the
 turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key; a key the envelope lacks reads `null`, so `precheck: null` holds a run to not having been closed by `precheck`), and, for each
-`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. `shadow_report_stored`, in its own module
-(`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, on the run's shadow
+`required_finding_phrases` entry, a finding in its `document` whose id contains it, no finding whose id contains a `forbidden_finding_phrases` entry, and, for each `required_evidence_phrases` entry, a finding matched by `required_finding_phrases` whose stored `evidence.excerpt` contains it. Its `finding` block reads one stored finding's remediation as data, not as prose: the finding whose id contains every `id_contains` fragment must have `remediation_kind`; some line of its `remediation.note` that opens with `command_prefix` must carry `command_argument` as a whole word and every flag of `command_flags` (a flag is matched whole); no command line of the note may give a flag of `no_cidr_value` a literal IPv4 address or range; no `forbidden_text` may occur in a string of its `recommendation` or `remediation` (a number or a boolean there is not searched); each `title_contains` entry must occur in its `title` (the witness that `finish` kept a planted run's wording for this finding); and no `title_lacks` entry may occur in it (the title holds nothing of a planted run's wording; the impact is not read). `command_argument`, `command_flags` and `no_cidr_value` need `command_prefix`, and `command_prefix` needs one of them. With `planted_mark`, a store with no envelope that holds the mark is `status: "error"`: the previous run the stack planted is gone. The store's ring keeps its newest envelopes only, so a plant must name its ring entry newer than the runs already there. `shadow_report_stored`, in its own module
+(`bench/kube_agents_bench/shadow_run.py`), grades a shadow run's report the same way, without a `finding` block, on the run's shadow
 stream (`stream`, required: the AgentSchedule's name for a scheduled canary, or `<audit>-shadow` for a run
 started by hand; never a live audit's stream), read on the gateway pod, where the broker's report-store
 listener writes, with the install's own `report_query.py --include-shadow` (readers refuse a shadow
@@ -795,6 +819,8 @@ drift check, so `validate_all()` does not carry it; the lint asserts on
 `sanitization_findings()` in its own right. The same way, it rejects any file committed under
 a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
 or on the dev install, and the case cites the run by its directory name or build id.
+With no path given, it also rejects a line of `hack/eval/permit-pairs.txt` whose two cases are not
+a pair (`permit_pair_problems()`, [permit-pairs.md](permit-pairs.md)).
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

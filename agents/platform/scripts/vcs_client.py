@@ -1582,11 +1582,13 @@ def _check_decision_memory(
             with contextlib.suppress(Exception):
                 discard(repo, key=copy_key)
                 discarded = True
-        discard_note = "The working copy has been discarded. " if discarded else ""
+        # Not `discard_note`: CodeQL's private-data heuristic reads `card_no` in
+        # that name as a card number and flags every log line the message reaches.
+        removal_note = "The working copy has been discarded. " if discarded else ""
         msg = (
             "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
             f"{out.get('markdown', '')}\n\n"
-            f"Do NOT open this Pull Request. {discard_note}"
+            f"Do NOT open this Pull Request. {removal_note}"
             "In your final response (and kanban_complete result), you MUST quote the record IDs "
             "(DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), Revert/Fix PR (#...), "
             "and the technical root-cause details from the block above verbatim."

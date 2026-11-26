@@ -1832,6 +1832,35 @@ func TestGatewayDeploymentRendersMaxSessions(t *testing.T) {
 	}
 }
 
+// The session idle times reach the gateway only when set (#2371): unset, the
+// gateway keeps its defaults and the rendered Deployment is unchanged.
+func TestGatewayDeploymentRendersTheSessionIdleTimesWhenSet(t *testing.T) {
+	envOf := func(dep *appsv1.Deployment) map[string]string {
+		got := map[string]string{}
+		for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "A2A_IDLE_TTL" || env.Name == "A2A_DM_IDLE_TTL" {
+				got[env.Name] = env.Value
+			}
+		}
+		return got
+	}
+	agent := a2aTestAgent()
+	agent.Spec.Harness = nil
+	if got := envOf(buildA2AGatewayDeployment(agent)); len(got) != 0 {
+		t.Fatalf("no harness: rendered %v, want neither", got)
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{}}
+	if got := envOf(buildA2AGatewayDeployment(agent)); len(got) != 0 {
+		t.Fatalf("unset: rendered %v, want neither", got)
+	}
+	idle, dm := int32(45), int32(3)
+	agent.Spec.Harness.Tuning.SessionIdleMinutes, agent.Spec.Harness.Tuning.DMSessionIdleMinutes = &idle, &dm
+	got := envOf(buildA2AGatewayDeployment(agent))
+	if got["A2A_IDLE_TTL"] != "45m" || got["A2A_DM_IDLE_TTL"] != "3m" {
+		t.Fatalf("set: rendered %v, want A2A_IDLE_TTL=45m and A2A_DM_IDLE_TTL=3m", got)
+	}
+}
+
 // Reconcile renders the session quota with the stack it bounds.
 func TestA2ASessionQuotaIsRendered(t *testing.T) {
 	scheme := setupScheme()

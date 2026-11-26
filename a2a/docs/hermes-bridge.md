@@ -557,9 +557,10 @@ refused. Follow-ups run on the `api` executor only: the `cli` executor cannot co
 The bridge answers each follow-up with a non-final status carrying the task's current state
 (`submitted` while queued or waiting for the session, `working` after) and a `steerNotice` data
 part: `queued`, or `refused` with `no-resume` (the task runs on the `cli` executor, which can't
-continue a session; every follow-up to it is refused so when it arrives, the notice's text says
-to send it again after the answer, and the gateway posts that to the room at once),
-`queue-full` (a task takes at most 16 follow-ups, counted per task: those already run count, not
+continue a session, so the bridge refuses every follow-up to it on arrival; the notice's text says
+to send it again after the answer, and the gateway posts the refusal to the room at once),
+`queue-full` (a task takes at most 16 follow-ups, `steerQueueCapacity` in
+`a2a/hermes-bridge/bridge.go`, counted per task: those already run count, not
 only those waiting), `task-ending` (the answer was already
 chosen), `no-text` (no text part holds anything but white space, U+001C-U+001F or NUL: Hermes's API
 server refuses a turn that Python's `str.strip()` empties, which strips U+001C-U+001F too, and a
@@ -572,7 +573,9 @@ slot, and the `Idempotency-Key` `<taskId>/<envelopeId>` (the opening turn's is `
 follow-up never replays the opening answer. A follow-up's text needs no length check of its own: the
 gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
-request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
+request far under the server's 10 MB body limit (`MAX_REQUEST_BYTES`). The two server limits are
+constants in `gateway/platforms/api_server.py` of the Hermes release that `tags.env` pins, not in
+this repository. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
 then the one terminal. At each turn boundary the bridge checks each distinct capability among the
 queued follow-ups once, not once per follow-up, so a verifier it cannot reach holds the previous
@@ -589,7 +592,7 @@ it was, and a cancel still ends `canceled`). A failed follow-up turn names itsel
 12). A bridge that crashes with follow-ups queued loses them; the gateway's relay reports them as
 not run at the terminal, unless the gateway restarted too. The count is best-effort: a follow-up
 whose turn had started when the bridge crashed counts as run, though its answer never arrives.
-Mid-turn steering through the runs API is gke-labs#2628.
+The bridge does not steer a turn that is running: a follow-up waits for that turn to end.
 
 **Upgrade order for steering.** The gateway and the bridge do not always roll together. The
 gateway's image follows the operator; the rendered bridge's image is chosen as
@@ -1088,7 +1091,7 @@ agrees with that subject like any executor's. Profile-addressed tasks have no
 supervisor ROLE until the dispatcher lands - though the gateway's rendered grant is an
 addressee wildcard and reaches their `…supervisor` regardless, which the profiles spec
 spells out; that is a gap the profiles
-spec names, not one this sweep fills. Two failure classes:
+spec names, not one this sweep fills. Three failure classes:
 
 - **The subprocess dies under a live bridge.** The runner sees the exit and publishes
   terminal `failed` with the evidence. Ordinary executor path, nothing special.
@@ -1098,6 +1101,20 @@ spec names, not one this sweep fills. Two failure classes:
   deleted after the terminal publish). On startup, before consuming, it sweeps: fold
   each registered task's events, and for any non-final one publish terminal `failed`
   (`reason: bridge-died-without-terminal-event`).
+- **A panic while the bridge handles one task.** It is recovered at that task's goroutine
+  (the worker's task, a card stop, the activity door's handling of a delivery matched to a
+  task, a heartbeat tick), and the bridge keeps serving. The task ends `failed` with
+  `reason: internal-panic`, and the recovery publishes no answer: no result and no further
+  turn artifact. What went out before the panic stays, including the chunks of a result
+  publish it interrupted, as a result publish that fails partway leaves them. A panicked
+  heartbeat tick is only skipped; a door delivery whose handling panicked is dropped and
+  still answered 204. Each recovery is logged at Error with the message
+  `recovered a panic`, the panic's type or runtime error, and the stack. The count of
+  recoveries is kept in the process with no endpoint, so alert on the log message or the
+  reason. A panic anywhere else (the durable's consumer goroutine and the finalizes it
+  runs, the deadline and kill timers, and the `recordOrigin`, synthesis-watcher, board-action and
+  session-card-abort goroutines)
+  still ends the process, and the sweep above finalizes its tasks.
 
 The sweep's publish is a compare-and-swap per the profiles spec, not a read-then-write:
 expected-last-subject-sequence pinned to the last event the fold saw. A dying

@@ -7,26 +7,19 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 // ToolConnectionStatus is the one tool the core registers.
 const ToolConnectionStatus = "connection_status"
 
 const (
-	dash = "—"
-	// tablePipe stands in for "|" in card text: a table cell ends at a pipe
-	// even inside a code span, and an escape the text could undo is no
-	// escape at all.
-	tablePipe = "¦"
+	dash      = inerttext.Dash
 	byteUnit  = 1024
 	byteUnits = "KMGTPE"
 
-	// maxCellRunes caps one card field in the table. Card text is written by
-	// whoever publishes the card and read by a model in the caller's editor,
-	// so it is shown as short, inert data, never as markdown it controls.
-	maxCellRunes = 200
-	ellipsis     = "…"
+	ellipsis = inerttext.Ellipsis
 )
 
 // AgentCard is the part of an agent's A2A card the status shows. The rest of
@@ -148,39 +141,11 @@ func FormatBusStatusMarkdown(st BusStatus) string {
 			sb.WriteString("| Profile | Name | Description |\n| :--- | :--- | :--- |\n")
 			for _, n := range names {
 				c := st.AgentCards[n]
-				fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", n, cell(c.Name), cell(c.Description))
+				fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", n, inerttext.Cell(c.Name), inerttext.Cell(c.Description))
 			}
 		}
 	}
 	return sb.String()
-}
-
-// cell renders untrusted text as one inert table cell: a code span, which
-// markdown renders verbatim, so links, images, HTML and emphasis are shown as
-// text. Backticks become quotes so the text cannot close the span, pipes
-// become tablePipe so it cannot end the cell, control and format characters
-// (line breaks, bidi overrides, zero-width marks) go, and the result is capped
-// at maxCellRunes.
-func cell(s string) string {
-	s = strings.Map(func(r rune) rune {
-		switch {
-		case r == '`':
-			return '\''
-		case unicode.IsControl(r):
-			return ' '
-		case unicode.Is(unicode.Cf, r):
-			return -1
-		}
-		return r
-	}, s)
-	s = strings.ReplaceAll(strings.Join(strings.Fields(s), " "), "|", tablePipe)
-	if r := []rune(s); len(r) > maxCellRunes {
-		s = string(r[:maxCellRunes]) + ellipsis
-	}
-	if s == "" {
-		return dash
-	}
-	return "`" + s + "`"
 }
 
 func orDash(s string) string {

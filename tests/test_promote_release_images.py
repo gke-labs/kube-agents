@@ -9,11 +9,13 @@ import subprocess
 import unittest
 
 from tests.testing.common import (
+    MOCK_DEFAULT_REGISTRY_PREFIX,
     create_mock_git_repo,
     get_isolated_test_env,
 )
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_AR_REGISTRY_PREFIX,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
     MOCK_TARGET_RELEASE_TAG,
@@ -329,6 +331,173 @@ class PromoteReleaseImagesScriptTest(unittest.TestCase):
             self.assertIn("Cannot resolve source image commit for version '9.9.9'", proc.stderr)
         finally:
             temp_dir.cleanup()
+
+
+class PromoteFromCandidateRegistryTest(unittest.TestCase):
+    """CANDIDATE_REGISTRY_PREFIX names where a release reads the commit's
+    images when that is not where the release is published.
+
+    Each image is then tagged with the version twice from the one source: in
+    the candidate registry, then in the registry the release is published to.
+    Unset, or naming the registry prefix itself, promotion is the single tag in
+    one registry it was before the variable existed.
+    """
+
+    _SOURCE_DIGEST = "sha256:" + "a" * 64
+    _OTHER_DIGEST = "sha256:" + "b" * 64
+
+    def setUp(self):
+        self.temp_dir, self.repo_dir, git = create_mock_git_repo()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.bin_dir = pathlib.Path(self.temp_dir.name) / "bin"
+        self.candidate = git("rev-parse", "HEAD").stdout.strip()
+        git("checkout", "--detach", self.candidate)
+        (pathlib.Path(self.repo_dir) / "version.txt").write_text("v0.2.0\n")
+        git("add", "version.txt")
+        git("commit", "-m", "chore(release): stamp release version 0.2.0")
+        git("tag", MOCK_TARGET_RELEASE_TAG, git("rev-parse", "HEAD").stdout.strip())
+
+    def _candidate_ref(self, img, tag):
+        return f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{tag}"
+
+    def _release_ref(self, img):
+        return f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{MOCK_TARGET_RELEASE_TAG}"
+
+    def _candidate_sources(self):
+        return {self._candidate_ref(img, self.candidate): self._SOURCE_DIGEST for img in MOCK_REQUIRED_RELEASE_IMAGES}
+
+    def _promote(self, candidate_registry, images):
+        """Runs the script against a registry holding `images`; returns the
+        process and the (target, source) pair of each tag it created, in order."""
+        _, log_path = create_mock_docker_binary(self.bin_dir, image_digests=images)
+        env = {"CI": "true", "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX}
+        if candidate_registry is not None:
+            env["CANDIDATE_REGISTRY_PREFIX"] = candidate_registry
+        proc = subprocess.run(
+            ["bash", str(_PROMOTE_RELEASE_IMAGES_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(overrides=env, bin_dir=str(self.bin_dir)),
+            cwd=self.repo_dir,
+        )
+        created = []
+        log = pathlib.Path(log_path)
+        for line in log.read_text().splitlines() if log.exists() else []:
+            words = line.split()
+            if "create" in words:
+                created.append((words[words.index("--tag") + 1], words[-1]))
+        return proc, created
+
+    def test_each_image_is_tagged_in_the_candidate_registry_then_published(self):
+        proc, created = self._promote(MOCK_AR_REGISTRY_PREFIX, self._candidate_sources())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        expected = []
+        for img in MOCK_REQUIRED_RELEASE_IMAGES:
+            source = self._candidate_ref(img, self.candidate)
+            expected.append((self._candidate_ref(img, MOCK_TARGET_RELEASE_TAG), source))
+            expected.append((self._release_ref(img), source))
+        self.assertEqual(created, expected)
+
+    def test_a_trailing_slash_on_the_variable_names_the_same_registry(self):
+        proc, created = self._promote(MOCK_AR_REGISTRY_PREFIX + "/", self._candidate_sources())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(created), 2 * len(MOCK_REQUIRED_RELEASE_IMAGES))
+        for target, source in created:
+            self.assertNotIn("//", target)
+            self.assertNotIn("//", source)
+
+    def test_unset_or_naming_the_registry_prefix_is_one_tag_in_one_registry(self):
+        for candidate_registry in (None, "", MOCK_DEFAULT_REGISTRY_PREFIX):
+            with self.subTest(candidate_registry=candidate_registry):
+                proc, created = self._promote(candidate_registry, {})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(
+                    created,
+                    [
+                        (self._release_ref(img), f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{self.candidate}")
+                        for img in MOCK_REQUIRED_RELEASE_IMAGES
+                    ],
+                )
+                (self.bin_dir / "docker.log").unlink()
+
+    def test_a_rerun_after_the_candidate_tags_only_publishes(self):
+        """A first run that stopped between the two tags is resumed, not redone."""
+        images = self._candidate_sources()
+        for img in MOCK_REQUIRED_RELEASE_IMAGES:
+            images[self._candidate_ref(img, MOCK_TARGET_RELEASE_TAG)] = self._SOURCE_DIGEST
+        proc, created = self._promote(MOCK_AR_REGISTRY_PREFIX, images)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            created,
+            [(self._release_ref(img), self._candidate_ref(img, self.candidate)) for img in MOCK_REQUIRED_RELEASE_IMAGES],
+        )
+
+    def test_a_version_already_on_another_image_in_the_candidate_registry_publishes_nothing(self):
+        images = self._candidate_sources()
+        first = MOCK_REQUIRED_RELEASE_IMAGES[0]
+        images[self._candidate_ref(first, MOCK_TARGET_RELEASE_TAG)] = self._OTHER_DIGEST
+        proc, created = self._promote(MOCK_AR_REGISTRY_PREFIX, images)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does NOT match source image", proc.stderr)
+        self.assertIn(self._candidate_ref(first, MOCK_TARGET_RELEASE_TAG), proc.stderr)
+        self.assertEqual(created, [])
+
+    def test_a_published_version_on_another_image_is_refused(self):
+        images = self._candidate_sources()
+        first = MOCK_REQUIRED_RELEASE_IMAGES[0]
+        images[self._release_ref(first)] = self._OTHER_DIGEST
+        proc, created = self._promote(MOCK_AR_REGISTRY_PREFIX, images)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does NOT match source image", proc.stderr)
+        self.assertIn(self._release_ref(first), proc.stderr)
+        self.assertEqual(
+            created,
+            [(self._candidate_ref(first, MOCK_TARGET_RELEASE_TAG), self._candidate_ref(first, self.candidate))],
+        )
+
+    def test_the_source_commit_is_found_by_its_images_in_the_candidate_registry(self):
+        """A tag whose commit is not a stamp commit resolves by where the
+        images are: the tag's own commit when it has them, else its parent
+        when that does. Both lookups have to read the registry the images are
+        in."""
+        for built in ("parent", "both"):
+            with self.subTest(images_at=built):
+                self._assert_source_commit(built)
+
+    def _assert_source_commit(self, built):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        parent = git("rev-parse", "HEAD").stdout.strip()
+        (pathlib.Path(repo_dir) / "note.txt").write_text("after the candidate\n")
+        git("add", "note.txt")
+        git("commit", "-m", "docs: a commit that is not a release stamp")
+        tagged = git("rev-parse", "HEAD").stdout.strip()
+        git("tag", MOCK_TARGET_RELEASE_TAG, "HEAD")
+        holders = [parent] if built == "parent" else [parent, tagged]
+        expected = parent if built == "parent" else tagged
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[
+                f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{sha}" for img in MOCK_REQUIRED_RELEASE_IMAGES for sha in holders
+            ],
+        )
+        proc = subprocess.run(
+            ["bash", str(_PROMOTE_RELEASE_IMAGES_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={
+                    "CI": "true",
+                    "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                    "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX,
+                },
+                bin_dir=str(bin_dir),
+            ),
+            cwd=repo_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Release Commit:  {expected}", proc.stdout)
 
 
 if __name__ == "__main__":
