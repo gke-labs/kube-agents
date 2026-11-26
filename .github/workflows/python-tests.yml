@@ -149,7 +149,7 @@ jobs:
       # is what stops the strongest cross-language test in the repository from
       # being silently absent from the job that gates on it.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum
@@ -491,7 +491,7 @@ jobs:
       # Go and Helm for the same reason the coverage job installs them: the
       # injector seam and the chart-rendering suites skip silently without them.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum

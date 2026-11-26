@@ -4097,7 +4097,7 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         mint = re.search(r"^mint_ledger_token\(\) \{.*?^\}", self.script, re.S | re.M)
         self.assertIsNotNone(mint, "could not find mint_ledger_token in hack/ci-eval-pr.sh")
         body = mint.group(0)
-        failure = re.search(r'^    if \[ "\$\{rc\}" -ne .*?^    fi', body, re.S | re.M)
+        failure = re.search(r'^(    |      )if \[ "\$\{rc\}" -ne .*?^\1fi', body, re.S | re.M)
         self.assertIsNotNone(failure, "could not find the branch that gives up on the mint")
         self.assertNotIn("BENCH_GITHUB_TOKEN", failure.group(0))
         # Non-zero rather than `exit`: the unit call site holds two locks by the

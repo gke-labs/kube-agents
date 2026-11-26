@@ -14,8 +14,8 @@ func TestFor(t *testing.T) {
 	if _, err := For(persona.Antigravity); err == nil || !strings.Contains(err.Error(), "no persona adapter yet") {
 		t.Errorf("antigravity: %v, want a not-yet error", err)
 	}
-	if _, err := For(persona.CoreAgent); err == nil || !strings.Contains(err.Error(), "no persona adapter yet") {
-		t.Errorf("core-agent: %v, want a not-yet error", err)
+	if a, err := For(persona.CoreAgent); err != nil || a == nil {
+		t.Errorf("core-agent: %v, %v; want its adapter", a, err)
 	}
 	if _, err := For("hermes"); err == nil || !strings.Contains(err.Error(), "unknown harness") {
 		t.Errorf("hermes: %v, want unknown", err)

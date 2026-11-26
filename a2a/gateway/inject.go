@@ -532,6 +532,13 @@ type probeReport struct {
 	// the field, so a harness can tell "none" from "can't say". The inject
 	// door's alone: no chat surface or the console reports it.
 	ChildAddressees []string `json:"childAddressees"`
+	// ChildCount is how many child tasks the chain minted, every
+	// delegation counted, so a chain that delegated to platform twice
+	// reads 2 where ChildAddressees names platform once
+	// (ConversationState). On every read, like ChildAddressees: 0 when the
+	// chain delegated nothing, null when the read had no task to look at,
+	// and absent only on a door older than the field.
+	ChildCount *int `json:"childCount"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -2049,6 +2056,7 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string, chainU
 		ChildUsage:      state.ChildUsage,
 		UsagePartial:    state.UsagePartial,
 		ChildAddressees: state.ChildAddressees,
+		ChildCount:      state.ChildCount,
 	}
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.
