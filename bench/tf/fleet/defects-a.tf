@@ -2635,6 +2635,54 @@ resource "kubernetes_cron_job_v1" "cuda_pinned_trainer" {
   }
 }
 
+# Defect (role state-sync-controller): a controller workload in seeded-shapes
+# whose startup argument disables client-side Kubernetes API rate limiting
+# (--kube-api-qps=-1, a negative QPS), the shape
+# control-plane-configmap-lease-write-storm requires. The container process is
+# an inert sleep that ignores its positional argument and mounts no API token,
+# so the pod runs on the default pool without generating live API server write
+# load.
+resource "kubernetes_deployment_v1" "state_sync_controller" {
+  metadata {
+    name      = "state-sync-controller"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "state-sync-controller" }
+    }
+    template {
+      metadata {
+        labels = { app = "state-sync-controller" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "controller"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "exec sleep infinity"]
+          args    = ["--kube-api-qps=-1"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
 # Fixture (stall watch): a switched-off environment behind an in-cluster
 # gateway. Role `scaled-zero-gateway`. An operator scales the whole
 # environment to zero out of hours: the backend and the gateway's own proxy

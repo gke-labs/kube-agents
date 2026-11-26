@@ -167,7 +167,7 @@ if is_truthy "${SKIP_VALIDATION}"; then
   fi
 
   echo "🔎 [Emergency Override] Verifying required container images exist in registry for commit ${RC_CANDIDATE_COMMIT:0:7}..."
-  if ! check_commit_images_exist "${RC_CANDIDATE_COMMIT}"; then
+  if ! check_commit_images_exist "${RC_CANDIDATE_COMMIT}" "$(get_candidate_registry_prefix)"; then
     echo "❌ ERROR: Cannot perform emergency release! Required container images for commit ${RC_CANDIDATE_COMMIT:0:7} do not exist in registry." >&2
     exit 1
   fi
@@ -229,7 +229,7 @@ done
 
 # 6. Verify container images exist in registry
 echo "🔎 Verifying required container images exist in registry for commit ${RC_CANDIDATE_COMMIT:0:7}..."
-if ! check_commit_images_exist "${RC_CANDIDATE_COMMIT}"; then
+if ! check_commit_images_exist "${RC_CANDIDATE_COMMIT}" "$(get_candidate_registry_prefix)"; then
   echo "❌ ERROR: Required container images for commit ${RC_CANDIDATE_COMMIT} do not exist in registry!" >&2
   exit 1
 fi
