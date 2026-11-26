@@ -1955,14 +1955,18 @@ class TestLongSimpleCommandIsWithheld(unittest.TestCase):
         # a quoted body with line breaks, with no quote, behind a comment with
         # an apostrophe, and short commands behind such a comment. With no
         # limit, `shlex` needs 1 s to 8 s of CPU time for each; the limit
-        # decides each after one or two cuts of the line, in 0.1 s or less. The
-        # bound is on CPU time, as in the other linear-time tests of this file.
-        # It is 3 s, not 1 s: under CI's coverage tracing, on a shared runner, the
-        # limited check took 1.07 s to 1.19 s and failed main (#7281, #7296). The
-        # coverage job runs about 5 times slower than a developer's machine, so
-        # the unlimited `shlex` cost there is 5 s or more and still fails it.
-        # #7283 tracks replacing the clock with a growth ratio.
+        # decides each after one or two cuts of the line, in 0.1 s or less on a
+        # developer's machine. The bound is on CPU time, as in the other
+        # linear-time tests of this file. Under coverage tracing it is 3 s, not
+        # 1 s: coverage traces this module but not `shlex`, so on a shared CI
+        # runner the limited check took 1.07 s to 1.19 s and failed main (#7281,
+        # #7296), while the unlimited `shlex` cost there is about 4 s or more and
+        # still fails it. #7283 tracks replacing the clock with a growth ratio.
+        import sys
         import time
+
+        traced = sys.gettrace() is not None or "coverage" in sys.modules
+        bound = 3.0 if traced else 1.0
 
         for command in (
             "echo '" + self.UNIT * 80000 + "'",
@@ -1979,7 +1983,7 @@ class TestLongSimpleCommandIsWithheld(unittest.TestCase):
             with self.subTest(command=command[:24]):
                 start = time.process_time()
                 self.assertTrue(worker_transcript.command_reads_a_secret(command))
-                self.assertLess(time.process_time() - start, 3.0)
+                self.assertLess(time.process_time() - start, bound)
 
 
 class TestSecretReadDetector(unittest.TestCase):
