@@ -167,9 +167,10 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   "non-detached" below mean exactly this state and its absence.
   One stop cancels the conversation's whole task tree (amended for fan-out, #5682):
   the task holding the conversation, the AgentProfile parents waiting open on it,
-  and, walking down from the chain's root through each task's children, every
-  other task of the tree the gateway hasn't seen end, a fan-out's children
-  included. Each gets a cancel on its own addressee's `…in`, is marked canceled on
+  and, walking down from the chain's root through each task's children and
+  from each child to the wake its end started (a wake may delegate again,
+  #6861), every other task of the tree the gateway hasn't seen end, a fan-out's
+  children included. The walk also starts at the stopped task itself. Each gets a cancel on its own addressee's `…in`, is marked canceled on
   its history entry, and gets its `DISPATCH_STOPS` record when it is a
   profile task; a task that keeps its own line on its history entry (a batch child,
   a delegating turn) has it closed on "🛑 stopped". A task that has already ended is

@@ -878,9 +878,13 @@ func (rec *SessionRecord) trimHistory() {
 //
 // Not for a task submitted to an AgentProfile (Tier set): a refused
 // delegation doesn't end it, and its `completed` is a real result of its own.
+// Not for a wake either: a wake the gateway let delegate again (#6861) writes
+// the person's answer from what came back, so a refused second step leaves
+// that answer standing, with the refusal notice beside it, rather than
+// failing the turn with nothing delivered.
 func (rec *SessionRecord) handOffEnd(taskID string, state lib.TaskState) (lib.TaskState, string, bool) {
 	ref, ok := rec.TaskRefFor(taskID)
-	if !ok || ref.Tier != "" || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
+	if !ok || ref.Tier != "" || ref.Role == taskRoleWake || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
 		return state, "", false
 	}
 	return lib.StateFailed, ref.DelegationEnd, true

@@ -263,6 +263,46 @@ func wakeDelegateTargets(t *testing.T, wakeDelegate, overflow bool) {
 	}
 }
 
+// TestAGrantedWakesTargetsCountItsChildsSteerAuthors: a wake carries its
+// child's steer authors (startWake), which the delegation checks, so the list
+// a granted wake is offered leaves out a target whose list doesn't admit
+// them, here u3, who steered the child, off platform's list.
+func TestAGrantedWakesTargetsCountItsChildsSteerAuthors(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	rec := &SessionRecord{Key: "discord:g1/t-wk-steer", ContextID: "ctx-wk-steer", Kind: "group"}
+	r.adapter.inbox <- InboundMessage{Conversation: rec.Key, Kind: "group", AuthorID: "1001", MessageID: "wks-1", Text: "hello"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	r.awaitTask(t, session)
+	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
+	// platform admits everyone already in the session and the requester,
+	// so only u3, the child's steerer, can take it out.
+	listed := map[string]bool{}
+	present, _, _ := delegateAuthors(got, TaskRequester{Backend: "discord", Subject: "u1"})
+	for _, a := range present {
+		listed[a.Subject] = true
+	}
+	r.g.targetAllowed = map[string]map[string]map[string]bool{targetPlatform: {"discord": listed}}
+	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, WakeDelegate: true,
+		SteerAuthors: []TaskRequester{{Backend: "discord", Subject: "u3"}}})
+	if !ok {
+		t.Fatal("the wake wasn't submitted")
+	}
+	var wake *lib.Envelope
+	waitFor(t, "the wake on the bus", func() bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject(session, taskID)) {
+			wake = e.env
+		}
+		return wake != nil
+	})
+	targets, found, _ := lib.DelegateTargetsOf(messageParts(t, wake))
+	if !found || slices.Contains(targetNames(targets), targetPlatform) {
+		t.Fatalf("a granted wake whose child u3 steered was offered %v (found %v), want platform left out", targetNames(targets), found)
+	}
+}
+
 // TestAWakeBelowAScheduleKeepsTheMark: a wake has no route, and the schedule
 // mark still goes on its entry, so the gateway reads it as below a schedule
 // and refuses a delegation from it (delegateEntryCheck).

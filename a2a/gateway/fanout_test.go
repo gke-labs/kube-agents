@@ -1406,3 +1406,31 @@ func TestAFanOutWakeSaysCardsArePending(t *testing.T) {
 		t.Fatalf("wake text lacks the cards note:\n%s", got)
 	}
 }
+
+// TestAFanOutWakeWithACardReportToComeIsNotLetDelegate: a batch whose child
+// handed off to kanban cards wakes the session without the grant
+// (wakeMayDelegate, #6861): its report posts on its own, and asking again for
+// it is the #2819 loop.
+func TestAFanOutWakeWithACardReportToComeIsNotLetDelegate(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	conv := "discord:g1/t-fanout-cards-grant"
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "how are the clusters?")
+	f := fanOutFrom(t, r, conv, exec, origin, platformTask("one"), platformTask("two"))
+	completeTask(t, exec, "delegated the checks")
+	e0, e1 := r.execFor(t, f.envs[0], targetPlatform), r.execFor(t, f.envs[1], targetPlatform)
+	if err := e0.PublishArtifact(context.Background(), lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, e0, "filed cards")
+	completeTask(t, e1, "two done")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wake := r.awaitTask(t, spawn.calls()[1].Session)
+	var auth Authority
+	if err := json.Unmarshal(wake.Authority, &auth); err != nil {
+		t.Fatal(err)
+	}
+	if auth.Via == nil || auth.Via.Delegate {
+		t.Fatalf("a batch wake with a card report to come has via %+v, want no delegate", auth.Via)
+	}
+}
