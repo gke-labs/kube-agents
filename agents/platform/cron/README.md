@@ -1056,6 +1056,18 @@ For `kind: "cron"`, `cron/jobs.py` sets `display` to the raw expression
 back to `display` only for interval jobs — which neither roster has. So `display`
 is a second copy of `expr` that can rot silently. Keep the two identical.
 
+## Suspending jobs on one install
+
+An install turns shipped jobs off without a new image through `PlatformAgent`
+`spec.schedules` (`suspendAll` and per-id `overrides`). The operator renders it
+into `KUBE_AGENTS_BUILTIN_SCHEDULES` on the gateway container, and the
+entrypoint passes that to `profile_scaffold.py --cron-suspend` in the platform
+scaffold and force-sync steps. `suspend_cron_jobs` then writes `enabled: false`
+on each suspended job this roster ships, in the same write as the merge. It is
+the one exception to "the image wins every key it ships": a volume can hold
+`enabled: false` for a job this file enables. It can only hold a job off, and
+it never touches a job this file does not ship.
+
 ## Retiring a watchdog
 
 `profile_scaffold.merge_cron_store` adds and overwrites but never prunes.

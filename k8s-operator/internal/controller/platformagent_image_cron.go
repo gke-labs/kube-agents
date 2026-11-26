@@ -74,7 +74,8 @@ func imageCronJob(name string) bool {
 type imageCronPolicy struct {
 	// SuspendAll is spec.schedules.suspendAll.
 	SuspendAll bool `json:"suspendAll"`
-	// Overrides is spec.schedules.overrides, name to suspend.
+	// Overrides is the entries of spec.schedules.overrides that name a roster job, id to
+	// suspend.
 	Overrides map[string]bool `json:"overrides"`
 }
 
@@ -86,7 +87,11 @@ func builtinSchedulesEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
 	policy := imageCronPolicy{SuspendAll: builtinSuspendAll(agent), Overrides: map[string]bool{}}
 	if agent.Spec.Schedules != nil {
 		for _, o := range agent.Spec.Schedules.Overrides {
-			policy.Overrides[o.Name] = o.Suspend
+			// Only what the pod acts on: an override for an AgentSchedule, or a mistyped
+			// name, must not change the pod template and restart the gateway.
+			if imageCronJob(o.Name) {
+				policy.Overrides[o.Name] = o.Suspend
+			}
 		}
 	}
 	// A bool and a map of bools, which json.Marshal cannot fail on; it writes map keys sorted,

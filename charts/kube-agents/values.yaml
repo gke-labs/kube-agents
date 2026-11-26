@@ -2027,7 +2027,8 @@ platformAgent:
   #       - name: compliance-audit
   #         suspend: false
   #
-  # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
+  # Reference: docs/site/src/content/docs/concepts/autonomous-watchdogs.md,
+  # "Disabling a watchdog"
   schedules: {}
   integration:
     # The forges the agent talks to, and the repositories on them. Set these

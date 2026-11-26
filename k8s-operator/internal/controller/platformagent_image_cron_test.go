@@ -51,7 +51,8 @@ func TestImageCronJobIDsMatchTheShippedRoster(t *testing.T) {
 }
 
 // The agent container carries spec.schedules as one stable JSON document, and carries it with
-// nothing suspended when spec.schedules is unset, so the operator always writes the name.
+// nothing suspended when spec.schedules is unset, so the operator always writes the name. An
+// override naming no roster job is left out, so editing it doesn't restart the gateway.
 func TestBuiltinSchedulesEnvCarriesTheSetting(t *testing.T) {
 	if got := builtinSchedulesEnv(builtinTestAgent()).Value; got != `{"suspendAll":false,"overrides":{}}` {
 		t.Fatalf("with spec.schedules unset: %s", got)
@@ -59,6 +60,7 @@ func TestBuiltinSchedulesEnvCarriesTheSetting(t *testing.T) {
 	agent := builtinTestAgent(
 		agentv1alpha1.AgentScheduleOverride{Name: "stall-watch", Suspend: false},
 		agentv1alpha1.AgentScheduleOverride{Name: "compliance-audit", Suspend: true},
+		agentv1alpha1.AgentScheduleOverride{Name: "compliance-audit-canary", Suspend: true},
 	)
 	agent.Spec.Schedules.SuspendAll = true
 	want := `{"suspendAll":true,"overrides":{"compliance-audit":true,"stall-watch":false}}`
