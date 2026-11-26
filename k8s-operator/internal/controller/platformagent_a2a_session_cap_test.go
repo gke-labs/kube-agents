@@ -126,6 +126,43 @@ func TestA2ASessionsFit(t *testing.T) {
 	}
 }
 
+// The warm pods a stream funds (spec.harness.tuning.warmSessions): only the
+// consumers the session cap leaves spare, at one each, never more than asked
+// and never the cap's last slot. At the default reserve of 80 and 7 a
+// session: 110 fits a cap of 4 (28) and leaves 2 spare, so the one warm pod
+// asked for runs; 150 fits the full cap of 10 (70) and leaves none, so no
+// warm pod runs and no session is lost to one; 151, the width a new stream is
+// created at, funds it. Checked against that definition by brute force over
+// widths and warm counts.
+func TestWarmPodsUseOnlySpareTasksConsumers(t *testing.T) {
+	per := a2aTasksConsumersPerSessionOnSessionRoute
+	const reserve, configured = 80, 10
+	for _, tc := range []struct {
+		live, warm, wantCap, wantWarm int
+	}{
+		{110, 1, 4, 1}, {110, 3, 4, 2}, {108, 1, 4, 0}, {150, 1, 10, 0}, {151, 1, 10, 1},
+		{87, 1, 1, 0}, {94, 1, 2, 0}, {95, 1, 2, 1}, {110, 0, 4, 0}, {80, 1, 0, 0}, {50, 1, 0, 0},
+		{-1, 1, configured, 1},
+	} {
+		c := max(min(configured, a2aSessionsFit(tc.live, reserve, per)), 0)
+		w := a2aWarmSessionsFit(tc.live, reserve, per, c, tc.warm)
+		if c != tc.wantCap || w != tc.wantWarm {
+			t.Errorf("width %d, warm %d asked: cap %d warm %d, want cap %d warm %d", tc.live, tc.warm, c, w, tc.wantCap, tc.wantWarm)
+		}
+	}
+	for warm := 0; warm <= 5; warm++ {
+		for live := reserve - per; live <= reserve+per*(configured+2); live++ {
+			c := max(min(configured, a2aSessionsFit(live, reserve, per)), 0)
+			w := a2aWarmSessionsFit(live, reserve, per, c, warm)
+			spare := live - reserve - c*per
+			want := max(0, min(warm, c-1, spare))
+			if w != want || (w > 0 && c*per+w*a2aTasksConsumersPerWarmSession > live-reserve) {
+				t.Fatalf("width %d, cap %d, warm %d asked: funds %d, want %d", live, c, warm, w, want)
+			}
+		}
+	}
+}
+
 // The provision script's closing check computes the same fit: its block is
 // run under bash against a stubbed tasks_json at widths giving a cap above
 // maxSessions, exactly at it, between 1 and it, 0, negative (a reserve wider
@@ -141,39 +178,49 @@ func TestTheProvisionScriptFitsWhatTheOperatorFits(t *testing.T) {
 	if per != a2aTasksConsumersPerSessionOnSessionRoute {
 		t.Fatalf("precondition: the default agent counts %d a session, not the session route's %d", per, a2aTasksConsumersPerSessionOnSessionRoute)
 	}
-	block := a2aProvisionSessionsFitBlock(reserve, per)
+	warm := a2aFitWarmSessions(resolveA2ADefaultRoute(agent), agent)
+	if warm != agentv1alpha1.DefaultWarmSessions {
+		t.Fatalf("precondition: the default agent's fit counts %d warm pods, not the default %d", warm, agentv1alpha1.DefaultWarmSessions)
+	}
+	configured := resolveA2AMaxSessions(agent)
+	block := a2aProvisionSessionsFitBlock(reserve, per, warm, configured)
 	if !strings.Contains(a2aProvisionScript(agent), block) {
 		t.Fatal("the rendered provision script does not carry a2aProvisionSessionsFitBlock's arithmetic verbatim")
 	}
-	configured := resolveA2AMaxSessions(agent)
 	for _, tc := range []struct {
 		name          string
 		live          int
 		wantEffective int
 	}{
 		{"above maxSessions", reserve + per*(configured+2), configured},
-		{"exactly maxSessions", reserve + per*configured, configured},
+		{"exactly maxSessions, none spare", reserve + per*configured, configured},
+		{"maxSessions and its warm pod", reserve + per*configured + warm, configured},
 		{"between 1 and maxSessions", reserve + per*4, 4},
+		{"one", reserve + per, 1},
 		{"zero", reserve + per - 1, 0},
 		{"negative", reserve - 30, 0},
 		{"no limit", -1, configured},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			script := fmt.Sprintf("tasks_json='{\"name\":\"TASKS\",\"max_consumers\":%d,\"max_msgs_per_subject\":4096}'\n%sprintf '%%s' \"${fits}\"\n", tc.live, block)
+			script := fmt.Sprintf("tasks_json='{\"name\":\"TASKS\",\"max_consumers\":%d,\"max_msgs_per_subject\":4096}'\n%sprintf '%%s %%s' \"${fits}\" \"${warm_fits}\"\n", tc.live, block)
 			out, err := exec.Command(bash, "-c", script).Output()
 			if err != nil {
 				t.Fatalf("bash: %v", err)
 			}
-			shell, err := strconv.Atoi(string(out))
-			if err != nil {
-				t.Fatalf("the block printed %q, not an integer", out)
+			var shell, shellWarm int
+			if _, err := fmt.Sscanf(string(out), "%d %d", &shell, &shellWarm); err != nil {
+				t.Fatalf("the block printed %q, not two integers", out)
 			}
 			want := a2aSessionsFit(tc.live, reserve, a2aTasksConsumersPerSessionOnSessionRoute)
 			if shell != want {
 				t.Errorf("live %d: the shell fits %d, a2aSessionsFit says %d", tc.live, shell, want)
 			}
-			if got := max(min(configured, want), 0); got != tc.wantEffective {
-				t.Errorf("live %d: effective cap %d, want %d", tc.live, got, tc.wantEffective)
+			effective := max(min(configured, want), 0)
+			if effective != tc.wantEffective {
+				t.Errorf("live %d: effective cap %d, want %d", tc.live, effective, tc.wantEffective)
+			}
+			if wantWarm := a2aWarmSessionsFit(tc.live, reserve, a2aTasksConsumersPerSessionOnSessionRoute, effective, warm); shellWarm != wantWarm {
+				t.Errorf("live %d: the shell funds %d warm pods, a2aWarmSessionsFit says %d", tc.live, shellWarm, wantWarm)
 			}
 		})
 	}
@@ -404,18 +451,18 @@ func TestTheEffectiveCapRendersEverywhereButTheCreateWidth(t *testing.T) {
 		t.Errorf("A2A_MAX_SESSIONS = %q, want the effective 4", got)
 	}
 	quota := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if want := int64(4) + a2aQuotaHeadroom(agent); quota.Value() != want {
-		t.Errorf("session quota pods = %d, want %d: the effective cap plus the headroom", quota.Value(), want)
+	if want := int64(4) + 1 + a2aQuotaHeadroom(agent); quota.Value() != want {
+		t.Errorf("session quota pods = %d, want %d: the effective cap, its one warm pod and the headroom", quota.Value(), want)
 	}
 	script := a2aProvisionScript(agent)
-	if want := "required_consumers=" + strconv.Itoa(4*7+reserve) + "\n"; !strings.Contains(script, want) {
+	if want := "required_consumers=" + strconv.Itoa(4*7+1+reserve) + "\n"; !strings.Contains(script, want) {
 		t.Errorf("the provision script does not check %q", strings.TrimSpace(want))
 	}
-	if want := "--max-consumers=" + strconv.Itoa(10*7+reserve) + " "; !strings.Contains(script, want) {
+	if want := "--max-consumers=" + strconv.Itoa(10*7+1+reserve) + " "; !strings.Contains(script, want) {
 		t.Errorf("the provision script does not create TASKS at %q, maxSessions' width", strings.TrimSpace(want))
 	}
-	if a2aTasksMaxConsumers(agent) != 10*7+reserve {
-		t.Errorf("a2aTasksMaxConsumers = %d, want %d", a2aTasksMaxConsumers(agent), 10*7+reserve)
+	if a2aTasksMaxConsumers(agent) != 10*7+1+reserve {
+		t.Errorf("a2aTasksMaxConsumers = %d, want %d", a2aTasksMaxConsumers(agent), 10*7+1+reserve)
 	}
 	// A maxSessions lowered under the stored cap wins.
 	agent.Spec.Harness.Tuning.MaxSessions = ptr.To(3)
@@ -522,11 +569,6 @@ func TestTheSessionCapSignalIsGatedOnChange(t *testing.T) {
 	}
 }
 
-// Through Reconcile, on an existing (provisioned) install that opts into the
-// session route: with the bus's width unreadable and no stored cap, the
-// provision Job is not created and the gateway routes to session at
-// maxSessions; once the width reads, the Job is created at the fitted cap
-// and the gateway's cap follows it.
 // A provisioned bus that answers without TASKS (deleted for recreation, as
 // the provision Job's refusal tells an admin to do) and no stored cap: the
 // provision Job is the one thing that creates TASKS, so it is not held. The
@@ -579,6 +621,11 @@ func TestAProvisionedBusWithoutTasksRunsTheProvisionJob(t *testing.T) {
 	}
 }
 
+// Through Reconcile, on an existing (provisioned) install that opts into the
+// session route: with the bus's width unreadable and no stored cap, the
+// provision Job is not created and the gateway routes to session at
+// maxSessions; once the width reads, the Job is created at the fitted cap
+// and the gateway's cap follows it.
 func TestTheProvisionJobWaitsForTheBusWidth(t *testing.T) {
 	agent := sessionRouteTestAgent()
 	// An existing install, provisioned before it opted in.
@@ -704,7 +751,7 @@ func TestAFreshInstallRendersTheSessionRouteOnce(t *testing.T) {
 	if len(jobs.Items) != 1 || jobs.Items[0].Name != buildA2AProvisionJob(stored).Name {
 		t.Fatalf("%d provision Jobs on a fresh install whose bus does not answer, want the one at maxSessions", len(jobs.Items))
 	}
-	if !strings.Contains(a2aProvisionScript(stored), "required_consumers="+strconv.Itoa(10*7+a2aTasksReserve(stored))+"\n") {
+	if !strings.Contains(a2aProvisionScript(stored), "required_consumers="+strconv.Itoa(10*7+1+a2aTasksReserve(stored))+"\n") {
 		t.Error("the fresh install's Job does not check maxSessions' budget on the session route")
 	}
 	if a2aSessionCapWaiting(stored) {
@@ -765,7 +812,7 @@ func TestAnUpgradeOnAReadableBusRollsOnce(t *testing.T) {
 	}
 	// The Job is named by the digest of its spec, script included, so the
 	// one created is the render whose script checks the fitted budget.
-	if want := "required_consumers=" + strconv.Itoa(4*7+a2aTasksReserve(stored)) + "\n"; !strings.Contains(a2aProvisionScript(stored), want) {
+	if want := "required_consumers=" + strconv.Itoa(4*7+1+a2aTasksReserve(stored)) + "\n"; !strings.Contains(a2aProvisionScript(stored), want) {
 		t.Errorf("the Job does not check %q", strings.TrimSpace(want))
 	}
 }
@@ -809,11 +856,33 @@ func TestAPrunedSessionCapHoldsThePlatformRoute(t *testing.T) {
 		r.sessionCapReadings.Clear()
 	}
 
-	first := storedCapAgent(t, cl, agent)
-	r.resolveA2ASessionCap(ctx, first, nil)
+	// The pass that sees the prune takes no status from the write's echo, on
+	// the render copy or on instance. Each holds status the store doesn't:
+	// the render copy the universe domain Reconcile stamps on it, and
+	// instance, here, a source no write has stored. Taking the echo's status
+	// drops both. Both end the pass at the stored version; on instance the
+	// hold's own write sets it too, so that check does not tell the two
+	// carries apart.
+	first, instance := storedCapAgent(t, cl, agent), storedCapAgent(t, cl, agent)
+	first.Status.ResolvedUniverseDomain = testCustomUniverseDomain
+	instance.Status.UniverseDomainSource = universeDomainSourceDiscovered
+	r.resolveA2ASessionCap(ctx, first, instance)
 	held("the pass that sees the prune", first)
+	held("the pass that sees the prune, on instance", instance)
 	if !r.sessionCapStatusPruned(first) {
 		t.Fatal("the echo without the cap was not noticed")
+	}
+	if first.Status.ResolvedUniverseDomain != testCustomUniverseDomain {
+		t.Errorf("the render copy's resolvedUniverseDomain = %q after the pruned write, want %q: the echo's status is not taken",
+			first.Status.ResolvedUniverseDomain, testCustomUniverseDomain)
+	}
+	if instance.Status.UniverseDomainSource != universeDomainSourceDiscovered {
+		t.Errorf("instance's universeDomainSource = %q after the pruned write, want %q: the echo's status is not taken",
+			instance.Status.UniverseDomainSource, universeDomainSourceDiscovered)
+	}
+	if want := storedCapAgent(t, cl, agent).ResourceVersion; first.ResourceVersion != want || instance.ResourceVersion != want {
+		t.Errorf("after the pass that sees the prune the render copy is at version %q and instance at %q, want the stored %q",
+			first.ResourceVersion, instance.ResourceVersion, want)
 	}
 
 	before := patches
@@ -942,11 +1011,12 @@ func TestTheRefusalNamesTheFittedCap(t *testing.T) {
 	}
 }
 
-// The operator's A2A_SESSION_CLUSTER_VIEW doesn't hold the session route off:
-// since 2026-11-20 the cluster view is on by default for the session route
-// (#6538), so an explicit session routes to session on both containers with
-// the view on, and the cap is fitted to TASKS as with it off. Off, it is
-// session too. (An unset field is platform either way, and writes nothing:
+// The operator's A2A_SESSION_CLUSTER_VIEW doesn't change the route: an
+// explicit session routes to session on both containers with the view on,
+// and the cap is fitted to TASKS as with it off. Off, it is session too. The
+// view is on only where that flag is `true`; nothing sets it from
+// defaultRoute, and making it the session route's default is a later step of
+// #6538. (An unset field is platform either way, and writes nothing:
 // TestTheDefaultPlatformRouteDoesNothingNew.)
 func TestTheClusterViewDoesNotHoldTheSessionRouteOff(t *testing.T) {
 	ctx := context.Background()
@@ -971,7 +1041,7 @@ func TestTheClusterViewDoesNotHoldTheSessionRouteOff(t *testing.T) {
 		})
 	}
 	t.Run("off", func(t *testing.T) {
-		t.Setenv(a2aSessionClusterViewEnvVar, "")
+		t.Setenv(a2aSessionClusterViewEnvVar, "false")
 		r, cl, _, agent := sessionCapRig(t, nil, tasksAt(150))
 		r.resolveA2ASessionCap(ctx, agent, nil)
 		if gateway, platformAgent := renderedDefaultRoutes(t, agent, nil); gateway != agentv1alpha1.DefaultRouteSession || platformAgent != agentv1alpha1.DefaultRouteSession {
@@ -1166,5 +1236,20 @@ func TestAPrunedSessionCapAloneShortensTheRequeue(t *testing.T) {
 	r.sessionCapPruned.Store(client.ObjectKeyFromObject(agent), time.Now().Add(-2*sessionCapPrunedReprobe))
 	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
 		t.Errorf("usageStatusRequeue after the record expired = %s, want %s", got, secretEnvReprobeInterval)
+	}
+}
+
+// A served CRD that keeps the cap and drops status.effectiveWarmSessions
+// schedules the same 5-minute reprobe as a pruned cap, so applying the new
+// CRD renders the warm pod within it rather than at the 15-minute requeue.
+func TestAPrunedWarmCountSchedulesTheReprobe(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := sessionRouteTestAgent()
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("requeue with no pruned record = %s, want %s", got, secretEnvReprobeInterval)
+	}
+	r.sessionWarmPruned.Store(client.ObjectKeyFromObject(agent), time.Now())
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Errorf("requeue with a pruned warm count = %s, want the reprobe interval %s", got, usageStatusReprobeInterval)
 	}
 }

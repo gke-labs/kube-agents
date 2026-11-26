@@ -508,6 +508,146 @@ class StoreStatesTest(unittest.TestCase):
             self.assertIsNone(json.loads((unreadable / "trend.json").read_text())["source"])
 
 
+def build_started_at(started: str) -> str:
+    """A Prow build id whose snowflake encodes ``started`` (nightly.snowflake_start)."""
+    ms = int(datetime.datetime.fromisoformat(started).timestamp() * nightly.MILLIS_PER_SECOND)
+    return str((ms - nightly.PROW_BUILD_ID_EPOCH_MS) << nightly.PROW_BUILD_ID_TIME_SHIFT)
+
+
+class NightsTheCollectorLacksTest(unittest.TestCase):
+    """``data.json`` can hold fewer nights than the store (a refresh with no
+    prior document sweeps ``collect.DEGRADED_SINCE_DAYS``; the store reads
+    its window and lead-in). The builds of a
+    night its runs lack are then joined by their start alone: one night
+    date, started together. Night two, Wed 2025-09-10: the main and writers
+    builds start seconds after 00:00 UTC and record at 06:30 and 02:00; a
+    re-run of the main job starts at 09:00 and records at 15:30."""
+
+    MAIN = build_started_at("2025-09-10T00:00:10+00:00")
+    WRITERS = build_started_at("2025-09-10T00:00:04+00:00")
+    RERUN = build_started_at("2025-09-10T09:00:00+00:00")
+    SAME_DOMAIN = [("case-19", "remediation"), ("case-23", "remediation")]
+
+    @staticmethod
+    def record(case, build, at):
+        r = copy.deepcopy(next(rec for rec in night_one_records() if rec["case"] == "case-24"))
+        r.update(case=case, build=build, recorded_at=at, object=f"{LOCATION}/{case}/x/{build}.jsonl")
+        return r
+
+    def split_night(self):
+        return [self.record("case-23", self.WRITERS, "2025-09-10T02:00:00Z"), self.record("case-19", self.MAIN, "2025-09-10T06:30:00Z")]
+
+    def test_a_split_night_the_collector_lacks_is_one_night(self):
+        nights = trend.night_documents(self.split_night(), data_with_nightly(DOMAINS))
+        self.assertEqual([(n["id"], n["build"], n["cases"], n["at"], n["started"], n["log_url"]) for n in nights],
+                         [(f"build:{self.WRITERS}", self.WRITERS, 2, "2025-09-10T06:30:00Z", None, None)], "under the first build to start: the store does not say which is main")
+
+    def test_its_domain_point_pools_both_parts(self):
+        doc = trend.trend_document(store_doc(self.split_night(), read_at="2025-09-18T14:09:02Z"), data_with_nightly(self.SAME_DOMAIN))
+        self.assertEqual([n["cases"] for n in doc["nights"]], [2])
+        (point,) = doc["domains"]["remediation"]["points"]
+        self.assertEqual((point["night"], point["cases"], point["runs"]), (f"build:{self.WRITERS}", 2, 6))
+        self.assertEqual({p["night"] for case in doc["cases"].values() for p in case["points"]}, {f"build:{self.WRITERS}"})
+
+    def test_a_rerun_the_same_date_stays_a_night_of_its_own(self):
+        records = self.split_night() + [self.record("case-19", self.RERUN, "2025-09-10T15:30:00Z")]
+        nights = trend.night_documents(records, data_with_nightly(DOMAINS))
+        self.assertEqual([(n["build"], n["cases"]) for n in nights], [(self.WRITERS, 2), (self.RERUN, 1)])
+
+    def test_the_collectors_filing_wins_where_it_has_the_build(self):
+        """With the main run on record the night goes under its build, as
+        the report files it, and a part the collector has not read yet
+        joins it; with both on record the store's starts decide nothing."""
+        main = timed_run(self.MAIN, NIGHT_1_RUN["job"], "2025-09-10T00:00:10+00:00", "2025-09-10T06:31:00+00:00", [])
+        rerun = timed_run(self.RERUN, NIGHT_1_RUN["job"], "2025-09-10T09:00:00+00:00", "2025-09-10T15:31:00+00:00", [])
+        records = self.split_night() + [self.record("case-19", self.RERUN, "2025-09-10T15:30:00Z")]
+        nights = trend.night_documents(records, data_with_nightly(DOMAINS, [main, rerun]))
+        self.assertEqual([(n["build"], n["cases"], n["started"]) for n in nights],
+                         [(self.MAIN, 2, "2025-09-10T00:00:10+00:00"), (self.RERUN, 1, "2025-09-10T09:00:00+00:00")])
+        # A main re-run minutes after the cron build is a night of its own
+        # to the collector; the store's rule alone would have joined them.
+        soon = build_started_at("2025-09-10T00:05:00+00:00")
+        runs = [main, timed_run(soon, NIGHT_1_RUN["job"], "2025-09-10T00:05:00+00:00", "2025-09-10T06:40:00+00:00", [])]
+        records = [self.record("case-19", self.MAIN, "2025-09-10T06:30:00Z"), self.record("case-19", soon, "2025-09-10T06:39:00Z")]
+        self.assertEqual([n["build"] for n in trend.night_documents(records, data_with_nightly(DOMAINS, runs))], [self.MAIN, soon])
+
+    def test_a_part_the_collector_lacks_joins_the_known_night_that_started_nearest(self):
+        """A main re-run started ten minutes before the cron builds is the
+        next date's and inside the spread. With both mains on record, the
+        writers build the collector has not read goes to the cron night,
+        six seconds away, as ``nightly.filed_nights`` will file it."""
+        eve = build_started_at("2025-09-09T23:50:00+00:00")
+        runs = [timed_run(eve, NIGHT_1_RUN["job"], "2025-09-09T23:50:00+00:00", "2025-09-10T05:00:00+00:00", []),
+                timed_run(self.MAIN, NIGHT_1_RUN["job"], "2025-09-10T00:00:10+00:00", "2025-09-10T06:31:00+00:00", [])]
+        records = [self.record("case-19", eve, "2025-09-10T04:59:00Z")] + self.split_night()
+        nights = trend.night_documents(records, data_with_nightly(DOMAINS, runs))
+        self.assertEqual([(n["build"], n["cases"]) for n in nights], [(eve, 1), (self.MAIN, 2)])
+        # Mirrored: the re-run is the newer known build, four minutes after
+        # the cron builds, and the nearest is still the cron night. A part
+        # exactly between two known nights takes the newer, as filed_nights does.
+        soon, between = build_started_at("2025-09-10T00:04:10+00:00"), build_started_at("2025-09-10T00:02:10+00:00")
+        runs = [runs[1], timed_run(soon, NIGHT_1_RUN["job"], "2025-09-10T00:04:10+00:00", "2025-09-10T06:40:00+00:00", [])]
+        anchors = trend.night_anchors(self.split_night() + [self.record("case-19", soon, "2025-09-10T06:39:00Z"), self.record("case-24", between, "2025-09-10T03:00:00Z")],
+                                      data_with_nightly(DOMAINS, runs))
+        self.assertEqual((anchors[self.WRITERS], anchors[between]), (self.MAIN, soon))
+
+    def test_a_part_nearest_a_known_part_other_than_main_goes_under_the_nights_build(self):
+        """Main and writers on record, a third part not collected yet and
+        started nearest the writers build: it is filed under the build
+        the collector files the writers build under, the main one."""
+        third = build_started_at("2025-09-10T00:00:01+00:00")
+        runs = [timed_run(self.MAIN, NIGHT_1_RUN["job"], "2025-09-10T00:00:10+00:00", "2025-09-10T06:31:00+00:00", []),
+                timed_run(self.WRITERS, nightly.NIGHTLY_WRITERS_JOB, "2025-09-10T00:00:04+00:00", "2025-09-10T02:10:00+00:00", [])]
+        records = self.split_night() + [self.record("case-24", third, "2025-09-10T03:00:00Z")]
+        nights = trend.night_documents(sorted(records, key=lambda r: r["recorded_at"]), data_with_nightly(DOMAINS, runs))
+        self.assertEqual([(n["build"], n["cases"]) for n in nights], [(self.MAIN, 3)])
+
+    def test_the_spread_is_measured_from_the_first_build_of_the_group(self):
+        """00:00, 00:15 and 00:24: the second is exactly the spread after
+        the first and joins it; the third is within the spread of the
+        second and not of the first, and begins a night of its own."""
+        first, second, third = (build_started_at(f"2025-09-10T00:{minute}:00+00:00") for minute in ("00", "15", "24"))
+        records = [self.record(case, build, "2025-09-10T06:00:00Z") for case, build in (("case-19", first), ("case-23", second), ("case-24", third))]
+        self.assertEqual([(n["build"], n["cases"]) for n in trend.night_documents(records, data_with_nightly(DOMAINS))], [(first, 2), (third, 1)])
+
+    def test_a_night_across_the_windows_edge_keeps_one_id_for_its_points_and_its_night(self):
+        """The writers part recorded in the lead-in, the main part inside
+        the drawn window (read at 14:09 with a 10-day window: drawn from
+        09-08 14:09). The drawn point names a night that ``nights[]`` holds."""
+        writers, main = build_started_at("2025-09-08T00:00:04+00:00"), build_started_at("2025-09-08T00:00:10+00:00")
+        records = [self.record("case-23", writers, "2025-09-08T02:00:00Z"), self.record("case-19", main, "2025-09-08T14:10:00Z")]
+        doc = trend.trend_document(store_doc(records, window_days=10, lead_days=14), data_with_nightly(DOMAINS))
+        self.assertEqual(sorted(doc["cases"]), ["case-19"], "the lead-in record is not drawn")
+        (point,) = doc["cases"]["case-19"]["points"]
+        self.assertEqual(([n["id"] for n in doc["nights"]], point["night"]), ([f"build:{writers}"], f"build:{writers}"))
+
+    def test_a_build_that_is_not_a_string_stands_alone(self):
+        """A damaged store.json must not stop the render: the record is
+        filed under its stamp, as before."""
+        odd = self.record("case-19", ["not", "a", "build"], "2025-09-10T06:30:00Z")
+        self.assertEqual([n["id"] for n in trend.night_documents([odd], data_with_nightly(DOMAINS))], ["at:2025-09-10T06:30:00Z"])
+
+    def test_builds_on_either_side_of_the_night_date_are_two_nights(self):
+        """A build is dated by its start plus the grace, as the collector's
+        runs are: 23:40 is that date's, 23:50 the next date's."""
+        before, after = build_started_at("2025-09-09T23:40:00+00:00"), build_started_at("2025-09-09T23:50:00+00:00")
+        records = [self.record("case-19", before, "2025-09-10T05:00:00Z"), self.record("case-23", after, "2025-09-10T06:00:00Z")]
+        self.assertEqual([n["build"] for n in trend.night_documents(records, data_with_nightly(DOMAINS))], [before, after])
+
+    def test_a_build_its_record_does_not_date_stands_alone(self):
+        """An id is a start only when the record agrees: written at or
+        after it, within ``nightly.RUNNING_MAX_AGE``. Two ids seconds
+        apart whose records predate them, or trail them by days, are two
+        nights; so are ids of another shape."""
+        early = (self.record("case-19", self.MAIN, "2025-09-09T12:00:00Z"), self.record("case-23", self.WRITERS, "2025-09-09T12:00:00Z"))
+        late = (self.record("case-19", self.MAIN, "2025-09-12T06:30:00Z"), self.record("case-23", self.WRITERS, "2025-09-12T02:00:00Z"))
+        odd = (self.record("case-19", "1234", "2025-09-10T06:30:00Z"), self.record("case-23", "1235", "2025-09-10T06:30:00Z"))
+        words = (self.record("case-19", "a" * nightly.PROW_BUILD_ID_DIGITS, "2025-09-10T06:30:00Z"), self.record("case-23", "b" * nightly.PROW_BUILD_ID_DIGITS, "2025-09-10T06:30:00Z"))
+        for pair in (early, late, odd, words):
+            with self.subTest(builds=[r["build"] for r in pair], at=pair[0]["recorded_at"]):
+                self.assertEqual(len(trend.night_documents(sorted(pair, key=lambda r: r["recorded_at"]), data_with_nightly(DOMAINS))), 2)
+
+
 @unittest.skipUnless(chrome(), "headless Chrome not found")
 class TrendPageTest(unittest.TestCase):
     @classmethod

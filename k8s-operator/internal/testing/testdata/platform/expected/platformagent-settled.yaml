@@ -745,6 +745,57 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-kube-proxy-pod-read
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -5490,6 +5541,10 @@ spec:
               value: kubeagents-system
             - name: GOMEMLIMIT
               value: "228170137"
+            - name: A2A_PROFILE_SUPERVISOR_CUTOFF
+              value: <LATCH_TIME_PLUS_MARGIN_FOR_TESTS>
+            - name: A2A_PROFILE_NAMES_FILE
+              value: /etc/a2a-profile-names/profiles.json
             - name: A2A_MCP_BROKER_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: A2A_MCP_BROKER_TOKEN_FILE
@@ -5547,6 +5602,9 @@ spec:
             - mountPath: /var/run/secrets/a2a-mcp-broker
               name: mcp-broker-token
               readOnly: true
+            - mountPath: /etc/a2a-profile-names
+              name: a2a-profile-names
+              readOnly: true
           workingDir: /
       dnsConfig:
         options:
@@ -5585,6 +5643,10 @@ spec:
                   audience: kubeagents-credential-proxy-mcp
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            name: platformagent-a2a-profile-names
+            optional: true
+          name: a2a-profile-names
 status: {}
 ---
 apiVersion: v1
@@ -6299,6 +6361,8 @@ spec:
               value: "false"
             - name: A2A_CARD_STOP_TIMEOUT
               value: 75s
+            - name: A2A_DELEGATION_ROUNDS_MAX
+              value: "1"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
@@ -6349,6 +6413,10 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: A2A_REPORT_STORE_TOKEN_FILE
               value: /var/run/secrets/a2a-reports/token
+            - name: A2A_PROFILE_SUPERVISOR_CUTOFF
+              value: <LATCH_TIME_PLUS_MARGIN_FOR_TESTS>
+            - name: A2A_PROFILE_NAMES_FILE
+              value: /etc/a2a-profile-names/profiles.json
             - name: A2A_TIERS_FILE
               value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
@@ -6395,6 +6463,9 @@ spec:
               readOnly: true
             - mountPath: /etc/a2a-tiers
               name: a2a-tiers
+              readOnly: true
+            - mountPath: /etc/a2a-profile-names
+              name: a2a-profile-names
               readOnly: true
           workingDir: /
       dnsConfig:
@@ -6457,6 +6528,10 @@ spec:
             name: platformagent-a2a-tiers
             optional: true
           name: a2a-tiers
+        - configMap:
+            name: platformagent-a2a-profile-names
+            optional: true
+          name: a2a-profile-names
 status: {}
 ---
 apiVersion: batch/v1
@@ -7029,3 +7104,25 @@ spec:
           name: tmp
   ttlSecondsAfterFinished: 86400
 status: {}
+---
+apiVersion: v1
+data:
+  profiles.json: |
+    {"profiles":[]}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: profile-names
+  name: platformagent-a2a-profile-names
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""

@@ -1346,6 +1346,16 @@ class GitHardeningTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.marker = Path(self.temp_dir.name) / "EXECUTED"
+        # The push guard reads the remote's default branch from the files ref format, and
+        # refuses a push from a clone in another format (#6593). A git whose default is
+        # reftable would make each repository of these tests in that format. The variable
+        # wins over the host's config, and an older git ignores it; a test of another
+        # format names the format in its command. git has had two names for it.
+        ref_format = mock.patch.dict(
+            os.environ, {"GIT_DEFAULT_REF_FORMAT": "files", "GIT_DEFAULT_REF_STORAGE_FORMAT": "files"}
+        )
+        ref_format.start()
+        self.addCleanup(ref_format.stop)
         self.payload = Path(self.temp_dir.name) / "payload.sh"
         self.payload.write_text(
             f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
@@ -1617,6 +1627,8 @@ class GitHardeningTest(unittest.TestCase):
             "gpg.ssh.defaultKeyCommand": "false",
             "gpg.x509.program": "false",
             "help.autocorrect": "0",
+            # A push stays in the repository that the command names.
+            "push.recurseSubmodules": "no",
         }
         for key, value in expected.items():
             result = executor.execute(
@@ -1954,6 +1966,228 @@ class GitHardeningTest(unittest.TestCase):
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
+
+    # -- a push that also pushes the submodules -------------------------------
+
+    SUBMODULE_PUSH_REFUSAL = (
+        "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+        "inside each submodule too, and the broker judges only the repository that the command names."
+    )
+
+    def superproject_with_a_submodule(self, name):
+        """With the host's git: a clone of one remote, with a submodule of a second remote.
+        Each remote has the one branch `release-trunk`, and both work trees are on that
+        branch, as a push into a submodule needs. The submodule has one commit that its
+        remote does not have, and the superproject records it. No git variable and no
+        config file of the host is read. Returns the superproject, a function that says if
+        the submodule's remote got that commit, and the environment of the git calls."""
+        base = Path(self.temp_dir.name) / name
+        base.mkdir()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_DEFAULT_REF_FORMAT="files")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+
+        def must(*arguments):
+            done = subprocess.run(["git", *arguments], env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(0, done.returncode, f"git {' '.join(arguments)}: {done.stderr}{done.stdout}")
+            return done.stdout.strip()
+
+        remotes = {}
+        for remote_name in ("superproject", "module"):
+            remotes[remote_name] = base / f"{remote_name}.git"
+            seed = base / f"{remote_name}-seed"
+            must("init", "--quiet", "--bare", "-b", "release-trunk", str(remotes[remote_name]))
+            must("clone", "--quiet", str(remotes[remote_name]), str(seed))
+            (seed / "README.md").write_text(f"{remote_name}\n", encoding="utf-8")
+            must("-C", str(seed), "add", ".")
+            must("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+            must("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+        superproject = base / "clone"
+        must("clone", "--quiet", str(remotes["superproject"]), str(superproject))
+        # A submodule from a local path needs the file protocol, which git allows a user only by name.
+        must("-C", str(superproject), "-c", "protocol.file.allow=always", "submodule", "add", "--quiet", str(remotes["module"]), "module")
+        module = superproject / "module"
+        self.assertTrue((module / ".git").is_file())
+        (module / "change.txt").write_text("a change in the submodule\n", encoding="utf-8")
+        must("-C", str(module), "add", ".")
+        must("-C", str(module), *identity, "commit", "--quiet", "-m", "a change in the submodule")
+        must("-C", str(superproject), "add", ".")
+        must("-C", str(superproject), *identity, "commit", "--quiet", "-m", "add the module")
+        made = must("-C", str(module), "rev-parse", "HEAD")
+        self.assertNotEqual(made, must("-C", str(remotes["module"]), "rev-parse", "release-trunk"))
+
+        def module_remote_got_the_commit():
+            return made == must("-C", str(remotes["module"]), "rev-parse", "release-trunk")
+
+        return superproject, module_remote_got_the_commit, environment
+
+    def forced_config_layer(self, executor, without=None):
+        """The executor's forced config, as the environment layer that git reads; `without`
+        leaves one key out, for the control of a pin."""
+        environment = executor.environment
+        count = int(environment["GIT_CONFIG_COUNT"])
+        pairs = tuple((environment[f"GIT_CONFIG_KEY_{index}"], environment[f"GIT_CONFIG_VALUE_{index}"]) for index in range(count))
+        kept = tuple(pair for pair in pairs if pair[0] != without)
+        if without is not None:
+            self.assertEqual(count - 1, len(kept), f"{without} is not in the forced config")
+        return credential_proxy._git_forced_config_environment(kept)
+
+    def test_a_push_does_not_push_the_submodules_whatever_the_repository_config_says(self):
+        # `push.recurseSubmodules = on-demand` (or `only`, the same class) and
+        # `submodule.recurse = true` each make a plain `git push` also push inside each
+        # submodule, to that submodule's own remote. The agent can write both in `.git/config`,
+        # the argv has no flag for the push guard to see, and the guard judges only the
+        # repository that the command names. The control shows that the push goes into the
+        # submodule without the pin, so the first half is not true of a fixture that could
+        # never push there.
+        executor = self.executor()
+        for number, setting in enumerate(("[push]\n\trecurseSubmodules = on-demand\n", "[submodule]\n\trecurse = true\n")):
+            for pinned in (False, True):
+                with self.subTest(config=setting.split()[0], pinned=pinned):
+                    superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(
+                        f"config-{number}-{'pinned' if pinned else 'control'}"
+                    )
+                    self.append_repository_config(superproject, "\n" + setting)
+                    layer = self.forced_config_layer(executor, without=None if pinned else "push.recurseSubmodules")
+                    pushed = subprocess.run(
+                        ["git", "push", "origin", "HEAD:release-trunk"],
+                        cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(0, pushed.returncode, pushed.stderr)
+                    self.assertEqual(not pinned, module_remote_got_the_commit(), pushed.stderr)
+
+    def test_a_push_that_asks_git_to_push_the_submodules_is_refused(self):
+        # The flag outranks the forced config, so the pin above does not hold it: the control
+        # is the refusal. The test below runs the spellings that push into a submodule with git.
+        from credential_proxy import GIT_PUSH_RECURSE_SUBMODULES_REFUSAL, git_push_violation
+
+        self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, GIT_PUSH_RECURSE_SUBMODULES_REFUSAL)
+        for flags in (
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules=only"],
+            ["--recurse-submodules=check"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+            # The rule is each value but the word `no`: a value that git reads as on-demand
+            # under another name, values that git reads as off, and values that git refuses.
+            ["--recurse-submodules=only-is-on-demand"],
+            ["--recurse-submodules=false"],
+            ["--recurse-submodules=No"],
+            ["--recurse-submodules=yes"],
+            ["--recurse-submodules=none"],
+            ["--recurse-submodules="],
+            # The last one wins in git; the guard does not rely on the order.
+            ["--recurse-submodules=no", "--recurse-submodules=on-demand"],
+            ["--recurse-submodules=on-demand", "--recurse-submodules=no"],
+        ):
+            for argv in (
+                ["git", "push", *flags, "origin", "HEAD:feature"],
+                ["git", "push", "origin", "HEAD:feature", *flags],
+                ["git", "-C", "clone", "push", *flags, "origin", "HEAD:feature"],
+            ):
+                with self.subTest(argv=argv[1:]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_argument_violation(argv))
+        # The flag as the last word has no value: not `no`.
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL, git_push_violation(["git", "push", "origin", "HEAD:feature", "--recurse-submodules"])
+        )
+        # The flag in a push of tags only (the one push with no refspec that the guard lets
+        # pass), after an option that takes the next word, and as a prefix that names two
+        # options (an error in git).
+        for argv in (
+            ["git", "push", "--tags", "--recurse-submodules=on-demand", "origin"],
+            ["git", "push", "-o", "x", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--repo", "origin", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--rec=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--re=on-demand", "origin", "HEAD:feature"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+        # A prefix that names two options with the value `no` passes this rule; git itself
+        # stops on the prefix.
+        self.assertIsNone(git_push_violation(["git", "push", "--re=no", "origin", "HEAD:feature"]))
+        # Pass-through: the value `no`, the negated flag, no flag, and a command that is not a push.
+        for argv in (
+            ["git", "push", "--recurse-submodules=no", "origin", "HEAD:feature"],
+            ["git", "push", "--recurse-submodules", "no", "origin", "HEAD:feature"],
+            ["git", "push", "--no-recurse-submodules", "origin", "HEAD:feature"],
+            ["git", "push", "origin", "HEAD:feature"],
+            ["git", "fetch", "--recurse-submodules=on-demand", "origin"],
+            ["git", "submodule", "update", "--init"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertIsNone(git_push_violation(argv))
+                self.assertIsNone(git_argument_violation(argv))
+        # After `--` the word is a refspec, and another rule judges it.
+        self.assertNotEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "origin", "--", "--recurse-submodules=on-demand"]),
+        )
+        # The refusals that come before it in the argv keep their text.
+        self.assertIn("`git push --all` is refused", git_push_violation(["git", "push", "--all", "--recurse-submodules=on-demand"]) or "")
+        # Through the executor's own check, with the lease switch on and off, and through an alias.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(repository, "\n[alias]\n\tdeep = push --recurse-submodules=on-demand\n")
+        for lease in (False, True):
+            executor.require_git_lease = lease
+            for argv in (
+                ["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+                ["git", "deep", "origin", "HEAD:feature"],
+            ):
+                with self.subTest(lease=lease, argv=argv[1]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, executor.git_lease_violation(argv, cwd=str(repository)))
+        # In a clone that the guard refuses for its ref format too, the flag's refusal answers first.
+        self.append_repository_config(repository, "\n[extensions]\n\trefStorage = reftable\n")
+        self.assertIn("reftable", git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repository) or "")
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"], cwd=repository),
+        )
+
+    def test_git_takes_each_spelling_of_the_submodule_push_flag_that_is_refused(self):
+        # With the host's git and the executor's forced config: the flag with the value
+        # `on-demand` or `only`, in each spelling of the name and of the value's place, pushes
+        # inside the submodule. So the pin does not hold the flag, and git reads these
+        # spellings as the guard does. `check` is in the list of the test above and not here:
+        # it stops the push and pushes nothing into a submodule.
+        executor = self.executor()
+        layer = self.forced_config_layer(executor)
+        self.assertIn("push.recurseSubmodules", layer.values())
+        for number, flags in enumerate((
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+        )):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"flag-{number}")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertTrue(module_remote_got_the_commit(), pushed.stderr)
+                self.assertEqual(
+                    self.SUBMODULE_PUSH_REFUSAL,
+                    git_argument_violation(["git", "push", *flags, "origin", "HEAD:release-trunk"]),
+                )
+        # The value `no` and the negated flag keep the push out of the submodule, also where
+        # the repository config asks for it.
+        for number, flags in enumerate((["--recurse-submodules=no"], ["--no-recurse-submodules"])):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"off-{number}")
+                self.append_repository_config(superproject, "\n[push]\n\trecurseSubmodules = on-demand\n")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject,
+                    env={**environment, **self.forced_config_layer(executor, without="push.recurseSubmodules")},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertFalse(module_remote_got_the_commit(), pushed.stderr)
 
     def test_the_help_viewer_cannot_run_a_command(self):
         # `git help -m <page>` runs `man.<man.viewer>.cmd` through
@@ -2442,7 +2676,7 @@ class GitHardeningTest(unittest.TestCase):
 
         clone_dir = Path(executor.workspace_dir) / "clone_trunk"
         # The files ref format: the broker reads refs/remotes/origin/HEAD as a file, and a
-        # git whose default is reftable keeps no such file (#6593 is the broker's gap).
+        # git whose default is reftable keeps no such file (the broker refuses a push there: #6593).
         # The variable wins over the host's config and environment; an older git ignores it.
         subprocess.run(
             ["git", "clone", str(bare_remote), str(clone_dir)],
@@ -2686,6 +2920,253 @@ class GitHardeningTest(unittest.TestCase):
         ):
             result = executor.execute(argv, cwd=str(repository))
             self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")
+
+
+    # -- the ref format of the clone (#6593) ---------------------------------
+
+    def clone_folder(self, name, config_text, default_branch=None):
+        """A clone folder written by hand, so no test here depends on the host's git:
+        `.git/config` with `config_text`, and for `default_branch` the file that the
+        files ref format keeps for the remote's HEAD."""
+        repo = Path(self.temp_dir.name) / name
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_text(config_text, encoding="utf-8")
+        if default_branch is not None:
+            head = repo / ".git" / "refs" / "remotes" / "origin" / "HEAD"
+            head.parent.mkdir(parents=True)
+            head.write_text(f"ref: refs/remotes/origin/{default_branch}\n", encoding="utf-8")
+        return repo
+
+    FILES_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+    REFTABLE_CONFIG = "[extensions]\n\trefstorage = reftable\n[core]\n\trepositoryformatversion = 1\n"
+
+    def test_the_ref_format_of_a_clone_is_read_from_its_own_config_file(self):
+        from credential_proxy import _repo_ref_format
+
+        cases = {
+            "no extensions section": (self.FILES_CONFIG, "files"),
+            "the key as git writes it": (self.REFTABLE_CONFIG, "reftable"),
+            "the key in another letter case": ("[Extensions]\n\tRefStorage = Reftable\n", "reftable"),
+            "the key on the line of its section": ("[extensions] refStorage = reftable\n", "reftable"),
+            "files written out": ("[extensions]\n\trefStorage = files\n" + self.FILES_CONFIG, "files"),
+            "a value with a comment after it": ("[extensions]\n\trefStorage = reftable ; the format\n", "reftable"),
+            "a value with the other comment character after it": ("[extensions]\n\trefStorage = reftable # the format\n", "reftable"),
+            "another plain name": ("[extensions]\n\trefStorage = packed-v2\n", "packed-v2"),
+            "a value in quotes": ('[extensions]\n\trefStorage = "reftable"\n', "reftable"),
+            "the last value of two": ("[extensions]\n\trefStorage = files\n\trefStorage = reftable\n", "reftable"),
+            "the key in a comment": ("[extensions]\n\t# refStorage = reftable\n\t; refStorage = reftable\n", "files"),
+            "the key in another section": ("[core]\n\trefStorage = reftable\n", "files"),
+            "the key in a subsection": ('[extensions "other"]\n\trefStorage = reftable\n', "files"),
+            "another key of the section": ("[extensions]\n\tobjectFormat = sha256\n", "files"),
+            "an empty file": ("", "files"),
+        }
+        for number, (name, (text, expected)) in enumerate(cases.items()):
+            with self.subTest(config=name):
+                self.assertEqual(expected, _repo_ref_format(self.clone_folder(f"format-{number}", text)))
+
+    def test_a_ref_format_name_that_is_not_a_plain_word_is_shown_as_unknown(self):
+        """The name goes into the refusal text, and the agent can write the config file."""
+        from credential_proxy import GIT_REF_FORMAT_UNKNOWN, _repo_ref_format
+
+        for number, value in enumerate(("ref table", "x" * 40, "reftable\\n`id`", "$(id)", "réftable", "")):
+            with self.subTest(value=value):
+                repo = self.clone_folder(f"odd-{number}", f"[extensions]\n\trefStorage = {value}\n")
+                self.assertEqual(GIT_REF_FORMAT_UNKNOWN, _repo_ref_format(repo))
+
+    def test_a_config_file_past_the_size_limit_is_not_read_and_its_format_is_unknown(self):
+        """git reads a config of any size. The broker does not, and it does not take
+        the format of such a clone for the files format."""
+        from credential_proxy import GIT_CONFIG_MAX_BYTES, GIT_REF_FORMAT_UNKNOWN, _repo_ref_format, git_push_violation
+
+        filler = "# filler\n" * (GIT_CONFIG_MAX_BYTES // len("# filler\n") + 1)
+        for name, config in (("large-reftable", self.REFTABLE_CONFIG + filler), ("large-files", self.FILES_CONFIG + filler)):
+            with self.subTest(config=name):
+                repo = self.clone_folder(name, config)
+                self.assertEqual(GIT_REF_FORMAT_UNKNOWN, _repo_ref_format(repo))
+                self.assertIn(
+                    "'unknown' ref format",
+                    git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repo) or "",
+                )
+        at_the_limit = self.FILES_CONFIG + "#" * (GIT_CONFIG_MAX_BYTES - len(self.FILES_CONFIG))
+        self.assertEqual("files", _repo_ref_format(self.clone_folder("at-the-limit", at_the_limit)))
+
+    def test_the_config_file_is_read_with_a_limit_whatever_its_size_reads_as(self):
+        """The reader does not trust a size that it asks before the read. The stand-in is a
+        file with no end, as a link to a file whose size reads as 0 can be: the reader asks
+        for one byte more than the limit, one time, and takes the clone for no known format."""
+        import credential_proxy
+
+        asked = []
+
+        class NoEnd:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    raise AssertionError("a read with no limit")
+                asked.append(size)
+                return b"#" * size
+
+        repo = self.clone_folder("no-end", self.FILES_CONFIG)
+        with mock.patch.object(credential_proxy, "open", lambda *_a, **_k: NoEnd(), create=True):
+            self.assertEqual(credential_proxy.GIT_REF_FORMAT_UNKNOWN, credential_proxy._repo_ref_format(repo))
+        self.assertEqual([credential_proxy.GIT_CONFIG_MAX_BYTES + 1], asked)
+
+    def test_a_config_file_that_is_absent_or_cannot_be_opened_takes_the_files_path(self):
+        from credential_proxy import _repo_ref_format
+
+        no_config = Path(self.temp_dir.name) / "no-config"
+        (no_config / ".git").mkdir(parents=True)
+        self.assertEqual("files", _repo_ref_format(no_config))
+        closed = self.clone_folder("closed", self.REFTABLE_CONFIG)
+        config = closed / ".git" / "config"
+        config.chmod(0)
+        self.addCleanup(config.chmod, 0o600)
+        if os.access(config, os.R_OK):
+            self.skipTest("this user can read a file with no permission bits")
+        self.assertEqual("files", _repo_ref_format(closed))
+
+    def test_a_git_file_that_points_to_the_git_directory_is_not_followed(self):
+        """A known limit, held so that a change of it is a decision: a linked worktree, a
+        submodule and a clone with a separate git directory have a `.git` file. The reader
+        does not follow it, so the format reads as `files` and the push is judged as before."""
+        from credential_proxy import _repo_ref_format, git_push_violation
+
+        main = self.clone_folder("main-clone", self.REFTABLE_CONFIG)
+        linked = Path(self.temp_dir.name) / "linked-worktree"
+        linked.mkdir()
+        (linked / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'linked'}\n", encoding="utf-8")
+        self.assertEqual("files", _repo_ref_format(linked))
+        self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=linked))
+
+    def test_a_byte_that_is_not_utf8_does_not_hide_the_format(self):
+        from credential_proxy import _repo_ref_format
+
+        repo = self.clone_folder("bytes", "")
+        (repo / ".git" / "config").write_bytes(b"[user]\n\tname = \xff\xfe\n" + self.REFTABLE_CONFIG.encode())
+        self.assertEqual("reftable", _repo_ref_format(repo))
+
+    def test_the_config_of_a_bare_layout_is_read_only_when_the_clone_has_no_git_folder(self):
+        from credential_proxy import _repo_ref_format
+
+        bare = Path(self.temp_dir.name) / "bare.git"
+        bare.mkdir()
+        (bare / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        (bare / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        self.assertEqual("reftable", _repo_ref_format(bare))
+        # A file named `config` in the work tree of a clone is not the clone's config.
+        clone = self.clone_folder("with-a-config-file", self.FILES_CONFIG)
+        (clone / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        self.assertEqual("files", _repo_ref_format(clone))
+
+    def test_a_push_from_a_clone_that_does_not_use_the_files_ref_format_is_refused_by_name(self):
+        """The guard reads the remote's default branch from a file that only the files
+        ref format has. In another format it cannot tell a push to that branch from
+        another push, so each push is refused, with the format in the reason."""
+        from credential_proxy import git_push_violation
+
+        repo = self.clone_folder("reftable", self.REFTABLE_CONFIG)
+        for target in ("feature", "release-trunk", "platform-agent/work"):
+            with self.subTest(target=target):
+                violation = git_push_violation(["git", "push", "origin", f"HEAD:{target}"], cwd=repo)
+                self.assertEqual(
+                    "`git push` from a clone that uses the 'reftable' ref format is refused: the broker reads "
+                    "the remote's default branch from the files ref format only, so it cannot tell a push to "
+                    "that branch from another.",
+                    violation,
+                )
+        # From a folder inside the clone too.
+        inside = repo / "manifests"
+        inside.mkdir()
+        self.assertIn("'reftable' ref format", git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=inside) or "")
+        # A command that is not a push is not this guard's.
+        self.assertIsNone(git_push_violation(["git", "status"], cwd=repo))
+        # Each format that is not the files format, by its name; a name that is not a plain word as `unknown`.
+        for number, (value, shown) in enumerate((("packed-v2", "packed-v2"), ("ref table", "unknown"))):
+            with self.subTest(ref_format=value):
+                other = self.clone_folder(f"other-{number}", f"[extensions]\n\trefStorage = {value}\n")
+                self.assertIn(
+                    f"'{shown}' ref format",
+                    git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=other) or "",
+                )
+
+    def test_the_executor_refuses_a_push_from_a_reftable_clone_that_the_command_names(self):
+        """Through the executor's own check, with the clone named by `-C` and by the working directory."""
+        executor = self.executor()
+        executor.require_git_lease = False
+        repo = Path(executor.workspace_dir) / "reftable-clone"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        for argv, cwd in (
+            (["git", "push", "origin", "HEAD:feature"], str(repo)),
+            (["git", "-C", str(repo), "push", "origin", "HEAD:feature"], str(executor.workspace_dir)),
+        ):
+            with self.subTest(argv=argv[1]):
+                self.assertIn("'reftable' ref format", executor.git_lease_violation(argv, cwd=cwd) or "")
+
+    def test_a_push_from_a_clone_with_the_files_ref_format_is_judged_as_before(self):
+        from credential_proxy import git_push_violation
+
+        written_out = "[extensions]\n\trefStorage = files\n" + self.FILES_CONFIG
+        for name, config in (("no-key", self.FILES_CONFIG), ("files-written-out", written_out)):
+            with self.subTest(config=name):
+                repo = self.clone_folder(name, config, default_branch="release-trunk")
+                self.assertIn(
+                    "protected branch 'release-trunk'",
+                    git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=repo) or "",
+                )
+                self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repo))
+
+    def test_a_clone_that_git_makes_with_each_ref_format(self):
+        """With the host's git and none of the host's git settings: no `GIT_*` variable, no
+        global config and no system config. A default ref format or a default remote name
+        on the host then changes nothing here."""
+        from credential_proxy import _repo_ref_format, git_push_violation
+
+        git_env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        git_env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def git(*args, check=True):
+            return subprocess.run(["git", *args], check=check, capture_output=True, text=True, env=git_env)
+
+        base = Path(self.temp_dir.name)
+        remote = base / "remote.git"
+        git("init", "--quiet", "--bare", "-b", "release-trunk", str(remote))
+        seed = base / "seed"
+        git("clone", "--quiet", str(remote), str(seed))
+        (seed / "README.md").write_text("hello\n", encoding="utf-8")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+        git("-C", str(seed), "add", ".")
+        git("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+        git("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+        for ref_format in ("files", "reftable"):
+            with self.subTest(ref_format=ref_format):
+                clone = base / f"clone-{ref_format}"
+                # git has had two names for the option.
+                for option in ("--ref-format", "--ref-storage-format"):
+                    made = git("clone", "--quiet", f"{option}={ref_format}", str(remote), str(clone), check=False)
+                    if made.returncode == 0 or "unknown option" not in made.stderr:
+                        break
+                if made.returncode != 0 and "unknown option" in made.stderr and ref_format == "files":
+                    # A git with no option for the format makes the files format only, so
+                    # the control row still runs there.
+                    made = git("clone", "--quiet", str(remote), str(clone), check=False)
+                if made.returncode != 0 and ("unknown option" in made.stderr or "ref storage format" in made.stderr):
+                    self.skipTest(f"this git cannot make a clone in the {ref_format} ref format")
+                self.assertEqual(0, made.returncode, made.stderr)
+                self.assertEqual(ref_format, _repo_ref_format(clone))
+                to_default = git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=clone) or ""
+                to_work = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=clone)
+                if ref_format == "files":
+                    self.assertIn("protected branch 'release-trunk'", to_default)
+                    self.assertIsNone(to_work)
+                else:
+                    self.assertIn("'reftable' ref format", to_default)
+                    self.assertIn("'reftable' ref format", to_work or "")
 
 
 class GitArgumentRefusalTest(unittest.TestCase):
@@ -11222,25 +11703,19 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
 
-    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
-        # An exec pod's state volume is sized for no gcloud log files; the
-        # broker and the sidecar roles keep gcloud's default.
-        for role, off in (
-            (credential_proxy_client.EXEC_ROLE, True),
-            ("broker", False),
-            ("combined", False),
-        ):
+    def test_serve_turns_gcloud_file_logging_off_in_every_role(self):
+        # No role's state volume is sized for gcloud's log files: each command
+        # leaves one, and gcloud keeps them for 30 days.
+        for role in (credential_proxy_client.EXEC_ROLE, "broker", "combined"):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 env = CredentialProxyHandler.executor.environment
-                self.assertEqual(
-                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
-                )
+                self.assertEqual("1", env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV))
 
     def test_serve_keeps_the_pods_allocator_and_gcloud_logging_variables_from_commands(self):
         # The proxy gives the commands it runs a fixed list of names from its
         # own environment. These two, which an operator can set on the pod
-        # (`platformAgent.deployment.env`), are not on it, and the exec role
+        # (`platformAgent.deployment.env`), are not on it, and every role
         # sets the gcloud name itself, to its own value. This keeps both in the
         # proxy's environment from the start of `serve` to the end of each
         # command, and reads what a gcloud and a kubectl command were given.
@@ -11265,8 +11740,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             stand_ins[argv[0]] = str(stand_in)
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role, **pod_environment})
             executor = CredentialProxyHandler.executor
@@ -11290,7 +11765,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         # bootstrap command does not reach that list. This starts `serve` with
         # one, for each role, with both names in the proxy's environment, and
         # reads what the command was given. On GKE the operator's bootstrap
-        # command runs gcloud. The exec role sets the gcloud name itself, to
+        # command runs gcloud. Every role sets the gcloud name itself, to
         # its own value; the pod's value must not replace it.
         pod_environment = {
             "MALLOC_ARENA_MAX": "2",
@@ -11306,8 +11781,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         )
         for role, gcloud_logging_off in (
             (credential_proxy_client.EXEC_ROLE, "1"),
-            ("broker", unset),
-            ("combined", unset),
+            ("broker", "1"),
+            ("combined", "1"),
         ):
             with self.subTest(role=role):
                 self._serve_with(
@@ -20279,6 +20754,36 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
             headers={"Content-Type": "application/json", **(headers or {})},
         )
 
+    def test_an_entries_list_filter_drops_an_excluded_clusters_entries(self):
+        # The same clause `gcloud logging read` gets (cluster_metadata_scope):
+        # ANDed onto the caller's filter, never parsed, so whatever it says the
+        # excluded cluster's entries don't come back.
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        clause = 'NOT resource.labels.cluster_name=~"^(scratch)$"'
+        for caller_filter, sent_filter in (
+            (self.ENTRIES_BODY["filter"], f'(\n{self.ENTRIES_BODY["filter"]}\n) AND {clause}'),
+            ('resource.labels.cluster_name="scratch"', f'(\nresource.labels.cluster_name="scratch"\n) AND {clause}'),
+            (None, clause),
+        ):
+            with self.subTest(filter=caller_filter):
+                self.upstream_bodies.clear()
+                body = dict(self.ENTRIES_BODY)
+                if caller_filter is None:
+                    body.pop("filter")
+                else:
+                    body["filter"] = caller_filter
+                status, _, _ = self._entries_list(body)
+                self.assertEqual(200, status)
+                [sent] = self.upstream_bodies
+                self.assertEqual(sent_filter, json.loads(sent)["filter"])
+
+    def test_an_entries_list_filter_that_could_swallow_the_clause_is_refused(self):
+        self._exclude("kagents-dev", "us-east4", "scratch")
+        status, _, payload = self._entries_list({**self.ENTRIES_BODY, "filter": 'x="open'})
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, payload["rule"])
+        self.assertEqual([], self.upstream_bodies)
+
     def test_an_entries_list_reaches_the_upstream_as_the_brokers_own_post(self):
         self.reply.update(body=b'{"entries":[{"insertId":"a"}],"nextPageToken":"t"}')
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
@@ -21507,6 +22012,30 @@ class ScopeExecRouteTest(unittest.TestCase):
         self.assertEqual(200, status, body)
         self.assertEqual("c1 us-central1\n", body["stdout"])
         self.assertEqual(2, len(self.calls.read_text(encoding="utf-8").splitlines()))
+
+    def test_the_management_project_variable_opens_the_probe_for_that_project_alone(self):
+        mgmt_probe = [*SCOPE_PROBE[:5], "mgmt-proj", SCOPE_PROBE[6]]
+        self.refused({"argv": mgmt_probe}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        with mock.patch.dict(os.environ, {credential_proxy.scope_policy.MANAGEMENT_PROJECT_ENV: " mgmt-proj \n"}):
+            status, body = self.scope({"argv": mgmt_probe})
+            self.assertEqual(200, status, body)
+            self.assertEqual("c1 us-central1\n", body["stdout"])
+            # Only the clusters list takes it, and it opens nothing else.
+            self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+            self.refused({"argv": ["gcloud", "compute", "shared-vpc", "list-associated-resources", "mgmt-proj",
+                                   "--format=json(id,type)"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        self.assertEqual(["container clusters list --project mgmt-proj --format=value(name,location)"],
+                         self.calls.read_text(encoding="utf-8").splitlines())
+
+    def test_a_declared_project_opens_the_probe_unless_excluded(self):
+        declaration = json.loads(self.scope_file.read_text(encoding="utf-8"))
+        declaration["projects"] = ["team-a", "legacy-1"]
+        declaration["exclude"]["projects"] = ["legacy-*"]
+        self.scope_file.write_text(json.dumps(declaration), encoding="utf-8")
+        status, body = self.scope({"argv": [*SCOPE_PROBE[:5], "team-a", SCOPE_PROBE[6]]})
+        self.assertEqual(200, status, body)
+        self.refused({"argv": [*SCOPE_PROBE[:5], "legacy-1", SCOPE_PROBE[6]]},
+                     credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
 
     def test_a_failed_lookup_records_nothing(self):
         self.exit_file.write_text("1", encoding="utf-8")

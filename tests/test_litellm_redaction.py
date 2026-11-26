@@ -26,6 +26,7 @@ import types
 import unittest
 
 import yaml
+from fastapi import HTTPException
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
@@ -82,6 +83,13 @@ _OAUTH_TOKEN = "ya29." + "A" * 195
 # reads a whole `postgres://user:password@host/db` literal as a leaked connection
 # string, and the redactor's URL rule does not depend on this placeholder's value.
 _URL_PASSWORD = "hunter2-example-pw"
+# Strict base64 that a text rule would still rewrite (the GCP API-key shape),
+# so a test can tell a kept payload from a walked one.
+_RULE_MATCHING_BASE64 = "iVBORw0KGgoAIza" + "B" * 37  # a PNG header, then the GCP API-key shape
+# A small real PNG start, for parts whose payload only has to be a PNG.
+_PNG_BASE64 = "iVBORw0KGgo="
+_PDF_BASE64 = "JVBERi0xLjQK"  # %PDF-1.4
+_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IA=="  # RIFF....WAVE
 
 
 def _stub_litellm() -> None:
@@ -189,7 +197,7 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(result["model"], "model-default")
 
     def test_text_content_parts_are_redacted_and_other_parts_left_alone(self) -> None:
-        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _PNG_BASE64}}
         data = {
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "node 10.0.0.9"}, image]}
@@ -289,6 +297,31 @@ class TestCallback(unittest.TestCase):
         call = self._run(data)["messages"][0]["tool_calls"][0]
         self.assertEqual(call["function"]["arguments"], {"api_key": "[REDACTED_SECRET]"})
 
+    def test_tool_call_arguments_that_are_a_json_string_are_decoded(self) -> None:
+        # Arguments that encode a JSON string are walked decoded, so a value
+        # after an escaped line break or tab is redacted as on main; clean
+        # string arguments keep their exact bytes.
+        cases = [json.dumps("kubectl get pods\n10.9.8.7"), json.dumps("hosts:\t10.9.8.7")]
+        clean = json.dumps("kubectl get pods\n-n shop")
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": str(i), "type": "function", "function": {"name": "t", "arguments": a}}
+                        for i, a in enumerate(cases + [clean])
+                    ],
+                }
+            ]
+        }
+        calls = self._run(data)["messages"][0]["tool_calls"]
+        for call in calls[:2]:
+            decoded = json.loads(call["function"]["arguments"])
+            self.assertNotIn("10.9.8.7", decoded)
+            self.assertRegex(decoded, r"\[ip:[0-9a-f]{12}\]$")
+        self.assertEqual(calls[2]["function"]["arguments"], clean)
+
     def test_tool_call_arguments_that_are_not_json_are_redacted_as_text(self) -> None:
         data = {
             "messages": [
@@ -330,6 +363,524 @@ class TestCallback(unittest.TestCase):
             with self.assertLogs(self.module.logger, level="INFO"):
                 self._run(dict(data))
         self.assertEqual(self._run(data), data)
+
+    # The Anthropic messages shape (/v1/messages), as a coding harness sends it:
+    # the system text at the top level, and content blocks that carry text
+    # under keys other than `text`.
+
+    def test_anthropic_system_text_is_redacted_as_a_string_and_as_blocks(self) -> None:
+        as_string = self._run({"system": "you run on prod-eu-1", "messages": []}, "anthropic_messages")
+        self.assertRegex(as_string["system"], r"^you run on \[cluster-name:[0-9a-f]{12}\]$")
+        as_blocks = self._run(
+            {
+                "system": [{"type": "text", "text": "project my-proj-7", "cache_control": {"type": "ephemeral"}}],
+                "messages": [],
+            },
+            "anthropic_messages",
+        )
+        block = as_blocks["system"][0]
+        self.assertEqual(block["text"], "project [REDACTED_PROJECT]")
+        self.assertEqual(block["cache_control"], {"type": "ephemeral"})
+
+    def test_anthropic_tool_results_and_tool_inputs_are_redacted_and_thinking_kept(self) -> None:
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64}}
+        opaque = {"type": "redacted_thinking", "data": "opaque-blob"}
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "the node is 10.0.0.9", "signature": "sig"},
+                        opaque,
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": f"curl -H 'Authorization: Bearer {_OAUTH_TOKEN}' http://10.0.0.5/"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "pod ip 10.0.0.5"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "content": [{"type": "text", "text": f"token {_OAUTH_TOKEN}"}, image],
+                        },
+                    ],
+                },
+            ]
+        }
+        result = self._run(data, "anthropic_messages")
+        thinking, kept, tool_use = result["messages"][0]["content"]
+        # Signed thinking is left as the provider issued it: the provider
+        # checks the text against the signature, and the model wrote it from
+        # input the hook had already redacted.
+        self.assertEqual(thinking["thinking"], "the node is 10.0.0.9")
+        self.assertEqual(thinking["signature"], "sig")
+        self.assertEqual(kept, opaque)
+        self.assertNotIn(_OAUTH_TOKEN, json.dumps(tool_use["input"]))
+        self.assertNotIn("10.0.0.5", json.dumps(tool_use["input"]))
+        self.assertEqual(tool_use["name"], "Bash")
+        first, second = result["messages"][1]["content"]
+        self.assertRegex(first["content"], r"^pod ip \[ip:[0-9a-f]{12}\]$")
+        self.assertEqual(second["content"][0]["text"], "token [REDACTED_SECRET]")
+        self.assertEqual(second["content"][1], image)
+
+    def test_a_tool_input_sent_as_a_json_string_stays_a_json_string(self) -> None:
+        data = {
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "x", "input": json.dumps({"host": "10.0.0.5"})}]}
+            ]
+        }
+        sent = self._run(data, "anthropic_messages")["messages"][0]["content"][0]["input"]
+        self.assertIsInstance(sent, str)
+        self.assertNotIn("10.0.0.5", sent)
+        json.loads(sent)
+
+    def test_a_part_type_this_file_does_not_know_is_walked_whole(self) -> None:
+        data = {"messages": [{"role": "user", "content": [{"type": "input_text", "text": "on prod-eu-1"}, {"type": "search_result", "source": "x", "content": [{"type": "text", "text": "my-proj-3"}]}]}]}
+        parts = self._run(data)["messages"][0]["content"]
+        self.assertNotIn("prod-eu-1", json.dumps(parts))
+        self.assertNotIn("my-proj-3", json.dumps(parts))
+        self.assertEqual(parts[1]["type"], "search_result")
+
+    # The Gemini shape (/v1beta/models/<model>:generateContent), as the
+    # Antigravity CLI sends it.
+
+    def test_gemini_contents_function_calls_and_responses_are_redacted(self) -> None:
+        inline = {"inlineData": {"mimeType": "image/png", "data": _PNG_BASE64}}
+        data = {
+            "contents": [
+                {"role": "user", "parts": [{"text": "pods on prod-eu-1"}, inline]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {"text": "checking 10.0.0.9", "thought": True},
+                        {"functionCall": {"name": "run_command", "args": {"command": f"export TOKEN={_OAUTH_TOKEN}"}}, "thoughtSignature": _RULE_MATCHING_BASE64},
+                    ],
+                },
+                {"role": "user", "parts": [{"functionResponse": {"name": "run_command", "response": {"output": "project my-proj-12 at 10.0.0.5"}}}]},
+            ],
+            "generationConfig": {"temperature": 0},
+        }
+        result = self._run(data, "agenerate_content")
+        user, model, response = result["contents"]
+        self.assertRegex(user["parts"][0]["text"], r"^pods on \[cluster-name:[0-9a-f]{12}\]$")
+        self.assertEqual(user["parts"][1], inline)
+        self.assertRegex(model["parts"][0]["text"], r"^checking \[ip:[0-9a-f]{12}\]$")
+        self.assertTrue(model["parts"][0]["thought"])
+        call = model["parts"][1]
+        self.assertNotIn(_OAUTH_TOKEN, json.dumps(call["functionCall"]["args"]))
+        self.assertEqual(call["thoughtSignature"], _RULE_MATCHING_BASE64)
+        output = json.dumps(response["parts"][0]["functionResponse"]["response"])
+        self.assertNotIn("my-proj-12", output)
+        self.assertNotIn("10.0.0.5", output)
+        self.assertEqual(result["generationConfig"], {"temperature": 0})
+
+    def test_gemini_system_instruction_is_redacted_under_either_spelling(self) -> None:
+        for key in ("systemInstruction", "system_instruction"):
+            data = {key: {"parts": [{"text": "you run on prod-eu-1"}]}, "contents": []}
+            text = self._run(data, "agenerate_content_stream")[key]["parts"][0]["text"]
+            self.assertRegex(text, r"^you run on \[cluster-name:[0-9a-f]{12}\]$", key)
+
+    # Payloads and controls: only a part's binary payload and the request's
+    # control keys are left alone.
+
+    def test_only_a_parts_binary_payload_is_skipped(self) -> None:
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        # A payload a text rule would rewrite if it were walked.
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _RULE_MATCHING_BASE64}, "title": "node 10.0.0.9"},
+                        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "on prod-eu-1"}, "context": "my-proj-4"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _PNG_BASE64}},
+                        {"type": "image_url", "image_url": {"url": f"https://example.com/x?token={_OAUTH_TOKEN}"}},
+                    ],
+                }
+            ]
+        }
+        image, document, inline, linked = self._run(data, "anthropic_messages")["messages"][0]["content"]
+        self.assertEqual(image["source"]["data"], _RULE_MATCHING_BASE64)
+        self.assertNotIn("10.0.0.9", image["title"])
+        self.assertNotIn("prod-eu-1", json.dumps(document))
+        self.assertNotIn("my-proj-4", json.dumps(document))
+        self.assertEqual(inline["image_url"]["url"], "data:image/png;base64," + _PNG_BASE64)
+        self.assertNotIn(_OAUTH_TOKEN, json.dumps(linked))
+
+    def test_gemini_binary_inline_data_keeps_its_payload_and_text_inline_data_is_refused(self) -> None:
+        binary = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": _RULE_MATCHING_BASE64}}]}]}
+        self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], _RULE_MATCHING_BASE64)
+        for mime in ("text/plain", "application/json"):
+            text = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": "b24gcHJvZC1ldS0x"}}]}]}
+            with self.assertRaises(HTTPException, msg=mime):
+                self._run(text, "agenerate_content")
+
+    def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
+        # Forms providers accept: the URL-safe alphabet, no padding, and the
+        # common image/jpg label. Each is kept byte for byte as it came.
+        import base64 as b64
+        png = b"\x89PNG\r\n\x1a\n" + bytes([0xFB, 0xFF, 0xFE]) * 4
+        jpeg = b"\xff\xd8\xff\xe0" + bytes([0xFB, 0xFF]) * 4
+        cases = [
+            ("image/png", b64.urlsafe_b64encode(png).decode()),
+            ("image/png", b64.b64encode(png).decode().rstrip("=")),
+            ("image/png", b64.urlsafe_b64encode(png).decode().rstrip("=")),
+            ("image/jpg", b64.b64encode(jpeg).decode()),
+        ]
+        for mime, data in cases:
+            with self.subTest(mime=mime, data=data):
+                req = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": data}}]}]}
+                out = self._run(req, "agenerate_content")
+                self.assertEqual(out["contents"][0]["parts"][0]["inlineData"]["data"], data)
+        # Normalising doesn't loosen the decode: a length that is 1 mod 4, an
+        # '=' inside the data, and over-padding are still not base64.
+        for bad in ("iVBORw0KGgoAA", "iVBO=Rw0KGgo", "iVBORw0KGgo=AAA", "iVBORw0KGgo==="):
+            with self.subTest(bad=bad), self.assertRaises(HTTPException) as refused:
+                self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": bad}}]}]}, "agenerate_content")
+            self.assertEqual(refused.exception.status_code, 400)
+        # A URL-safe payload that isn't the media it claims is still refused.
+        text = b64.urlsafe_b64encode(b"on prod-eu-1, token here").decode().rstrip("=")
+        with self.assertRaises(HTTPException):
+            self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": text}}]}]}, "agenerate_content")
+
+    # Provider-opaque fields a provider checks byte for byte: kept as they came
+    # at their API positions, even when a rule matches inside them, and
+    # redacted anywhere else.
+    _OPAQUE = "blob-prod-eu-1-my-proj-12-AbCd"
+
+    def test_a_responses_reasoning_items_encrypted_content_is_kept(self) -> None:
+        data = {"input": [
+            {"type": "reasoning", "id": "r1", "encrypted_content": self._OPAQUE, "summary": []},
+            {"type": "message", "role": "user", "content": "on prod-eu-1", "encrypted_content": self._OPAQUE},
+        ]}
+        out = self._run(data, "aresponses")
+        self.assertEqual(out["input"][0]["encrypted_content"], self._OPAQUE)
+        self.assertNotIn("prod-eu-1", out["input"][1]["content"])
+        self.assertNotEqual(out["input"][1]["encrypted_content"], self._OPAQUE, "only a reasoning item's is opaque")
+
+    def test_an_anthropic_web_search_results_encrypted_content_is_kept_in_the_assistants_turn(self) -> None:
+        def block():
+            return {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [
+                {"type": "web_search_result", "url": "https://example.com", "title": "prod-eu-1", "encrypted_content": self._OPAQUE}]}
+        data = {"messages": [
+            {"role": "assistant", "content": [block()]},
+            {"role": "user", "content": [block()]},
+        ]}
+        out = self._run(data)
+        kept = out["messages"][0]["content"][0]["content"][0]
+        self.assertEqual(kept["encrypted_content"], self._OPAQUE)
+        self.assertNotIn("prod-eu-1", kept["title"], "only the encrypted content is opaque")
+        self.assertNotEqual(out["messages"][1]["content"][0]["content"][0]["encrypted_content"], self._OPAQUE, "not in a user's turn")
+
+    def test_an_assistants_reasoning_details_data_and_signature_are_kept(self) -> None:
+        def details():
+            return [{"type": "reasoning.encrypted", "data": self._OPAQUE, "signature": self._OPAQUE, "text": "prod-eu-1"}]
+        data = {"messages": [
+            {"role": "assistant", "content": "ok", "reasoning_details": details()},
+            {"role": "user", "content": "hi", "reasoning_details": details()},
+        ]}
+        out = self._run(data)
+        kept = out["messages"][0]["reasoning_details"][0]
+        self.assertEqual((kept["data"], kept["signature"]), (self._OPAQUE, self._OPAQUE))
+        self.assertNotIn("prod-eu-1", kept["text"], "only data and signature are opaque")
+        self.assertNotEqual(out["messages"][1]["reasoning_details"][0]["data"], self._OPAQUE, "not on a user's message")
+
+    def test_the_chat_shapes_thought_signature_is_kept_on_the_message_and_its_tool_calls(self) -> None:
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"},
+                "provider_specific_fields": {"thought_signature": self._OPAQUE}}
+        data = {"messages": [
+            {"role": "assistant", "content": "ok", "tool_calls": [call], "provider_specific_fields": {"thought_signature": self._OPAQUE}},
+            {"role": "user", "content": "hi", "provider_specific_fields": {"thought_signature": self._OPAQUE}},
+        ]}
+        out = self._run(data)
+        assistant = out["messages"][0]
+        self.assertEqual(assistant["provider_specific_fields"]["thought_signature"], self._OPAQUE)
+        self.assertEqual(assistant["tool_calls"][0]["provider_specific_fields"]["thought_signature"], self._OPAQUE)
+        self.assertNotEqual(out["messages"][1]["provider_specific_fields"]["thought_signature"], self._OPAQUE, "not on a user's message")
+
+    def test_a_refused_request_shape_is_answered_with_400_through_the_hook(self) -> None:
+        # Through the hook LiteLLM calls: a refused shape becomes an
+        # HTTPException with status 400, carrying the refusal text, so a
+        # caller doesn't retry it as it would a 5xx. Other faults stay 500s.
+        data = {"messages": "not a list"}
+        with self.assertRaises(HTTPException) as refused:
+            self._run(data)
+        self.assertEqual(refused.exception.status_code, 400)
+        self.assertIn("refuses a request it cannot walk", str(refused.exception.detail))
+
+    def test_a_fault_in_the_hook_is_not_answered_with_400(self) -> None:
+        # Only a refused shape becomes a 400: any other exception from the
+        # walk surfaces as itself, which LiteLLM answers with a 500.
+        from unittest import mock
+
+        with mock.patch.object(type(self.hook), "redact_request", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._run({"messages": [{"role": "user", "content": "x"}]})
+
+    def test_a_refusal_names_a_media_type_only_when_it_is_a_media_type_name(self) -> None:
+        def part(media):
+            return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{media};base64,AAAA"}}]}]}
+        with self.assertRaises(HTTPException) as named:
+            self._run(part("text/plain"))
+        self.assertIn("text/plain", str(named.exception))
+        with self.assertRaises(HTTPException) as unnamed:
+            self._run(part("deploy key is hunter2-example-pw"))
+        self.assertNotIn("hunter2", str(unnamed.exception))
+
+    def test_top_level_text_outside_the_known_shapes_is_redacted_and_controls_are_not(self) -> None:
+        tools = [{"name": "login", "description": "logs in to prod-eu-1", "input_schema": {"type": "object", "properties": {"password": {"type": "string"}}}}]
+        data = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "instructions": "you run on prod-eu-1",
+            "function_call": {"name": "f", "arguments": json.dumps({"host": "10.0.0.5"})},
+            "metadata": {"user_api_key_hash": "sk-hash-should-stay", "note": "prod-eu-1"},
+            "api_key": f"Bearer {_OAUTH_TOKEN}",
+            "litellm_call_id": "prod-eu-1",
+            "model": "prod-eu-1",
+        }
+        result = self._run(data)
+        self.assertNotIn("prod-eu-1", result["tools"][0]["description"])
+        # Text rules only: a schema's `password` property is still a schema.
+        self.assertEqual(result["tools"][0]["input_schema"]["properties"]["password"], {"type": "string"})
+        self.assertNotIn("prod-eu-1", result["instructions"])
+        self.assertNotIn("10.0.0.5", json.dumps(result["function_call"]))
+        # Controls and the gateway's own bookkeeping are left as they came.
+        self.assertEqual(result["metadata"], {"user_api_key_hash": "sk-hash-should-stay", "note": "prod-eu-1"})
+        self.assertEqual(result["api_key"], f"Bearer {_OAUTH_TOKEN}")
+        self.assertEqual(result["litellm_call_id"], "prod-eu-1")
+        self.assertEqual(result["model"], "prod-eu-1")
+
+    def test_exempt_looking_shapes_inside_tool_traffic_are_walked(self) -> None:
+        # Only the positions the APIs define are exempt. The same shapes inside
+        # a tool's input, a tool's output or a function's arguments are data,
+        # and walked.
+        secret = _RULE_MATCHING_BASE64
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t", "name": "x", "input": {"type": "thinking", "thinking": f"token {_OAUTH_TOKEN}", "signature": "s"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": f"data:image/png;base64,{secret}"},
+                        {"type": "tool_result", "tool_use_id": "u", "content": [{"type": "text", "text": "x", "nested": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": secret}}]}]},
+                        # Two levels down is the tool's own output, not a part.
+                        {"type": "tool_result", "tool_use_id": "v", "content": [{"type": "document", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": secret}}]}]},
+                    ],
+                },
+            ]
+        }
+        sent = json.dumps(self._run(data, "anthropic_messages"))
+        self.assertNotIn(_OAUTH_TOKEN, sent)
+        self.assertNotIn(secret, sent)
+        gemini = {
+            "contents": [
+                {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"inlineData": {"mimeType": "image/png", "data": secret}, "thoughtSignature": secret}}}]}
+            ]
+        }
+        self.assertNotIn(secret, json.dumps(self._run(gemini, "agenerate_content")))
+
+    def test_a_payload_position_holding_anything_but_binary_base64_is_refused(self) -> None:
+        for part in (
+            {"type": "image", "source": {"type": "base64", "media_type": "image/svg+xml", "data": "PHN2Zz4="}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not base64 at all!"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,not base64!"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png,plain"}},
+            {"type": "input_audio", "input_audio": {"format": "wav", "data": "not base64!"}},
+        ):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
+                self._run({"messages": [{"role": "user", "content": [part]}]})
+        with self.assertRaises(HTTPException):
+            self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/svg+xml", "data": "PHN2Zz4="}}]}]}, "agenerate_content")
+
+    def test_thinking_is_exempt_only_in_the_assistants_own_turn(self) -> None:
+        data = {
+            "messages": [
+                {"role": "user", "content": [{"type": "thinking", "thinking": "on prod-eu-1", "signature": "s"}]},
+                {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "opaque", "note": "on prod-eu-1"}]},
+            ]
+        }
+        user, assistant = self._run(data, "anthropic_messages")["messages"]
+        self.assertNotIn("prod-eu-1", user["content"][0]["thinking"])
+        self.assertEqual(assistant["content"][0]["data"], "opaque")
+        self.assertNotIn("prod-eu-1", assistant["content"][0]["note"])
+        gemini = {"contents": [{"role": "user", "parts": [{"text": "x", "thoughtSignature": _RULE_MATCHING_BASE64}]}]}
+        sent = self._run(gemini, "agenerate_content")["contents"][0]["parts"][0]
+        self.assertNotEqual(sent["thoughtSignature"], _RULE_MATCHING_BASE64)
+
+    def test_a_payload_that_is_not_the_media_it_claims_is_refused(self) -> None:
+        import base64 as b64
+
+        text_as_png = b64.b64encode(b"on prod-eu-1, token here").decode()
+        for part in (
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": text_as_png}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + text_as_png}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;name=on-prod-eu-1;base64," + _PNG_BASE64}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo!"}},  # not base64
+            {"type": "image", "source": {"type": "base64", "media_type": "video/mp4", "data": text_as_png}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/heic", "data": text_as_png}},
+            {"type": "input_audio", "input_audio": {"format": "ogg", "data": text_as_png}},
+            {"type": "image", "source": {"type": "base64", "media_type": "audio/x-made-up", "data": _WAV_BASE64}},
+        ):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
+                self._run({"messages": [{"role": "user", "content": [part]}]})
+
+    def test_json_in_tool_arguments_is_decoded_and_tool_output_is_redacted(self) -> None:
+        # A value right after an escaped newline sits after the letter `n` in
+        # the encoded string, where a word-boundary rule cannot see it; the
+        # decoded document has a real newline there.
+        args = json.dumps({"command": "kubectl get pods\n10.0.0.5", "cluster": "prod-eu-1"})
+        output = json.dumps({"items": [{"status": {"podIP": "10.0.0.6"}}], "note": "on\nprod-eu-1"})
+        data = {
+            "messages": [
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "a", "type": "function", "function": {"name": "t", "arguments": args}}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "u", "name": "Bash", "input": args}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "u", "content": output}]},
+            ]
+        }
+        result = self._run(data, "anthropic_messages")["messages"]
+        for sent in (result[0]["tool_calls"][0]["function"]["arguments"], result[1]["content"][0]["input"], result[2]["content"][0]["content"]):
+            self.assertIsInstance(sent, str)
+            decoded = json.loads(sent)
+            text = json.dumps(decoded)
+            for value in ("10.0.0.5", "10.0.0.6", "prod-eu-1"):
+                self.assertNotIn(value, text)
+
+    def test_tool_arguments_with_a_repeated_key_are_re_encoded(self) -> None:
+        # The decoder keeps the last value, so the first never reaches the
+        # walk: the arguments are re-encoded from the document, not sent as
+        # they came.
+        repeated = '{"cmd": "get pods\\n10.0.0.7", "cmd": "safe"}'
+        data = {"messages": [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "t", "arguments": repeated}},
+        ]}]}
+        sent = self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        self.assertNotIn("10.0.0.7", sent)
+        self.assertEqual(json.loads(sent), {"cmd": "safe"})
+
+    def test_tool_arguments_with_nothing_to_redact_keep_their_exact_bytes(self) -> None:
+        untouched = '{"command":   "kubectl get pods",\n "n": 1}'
+        data = {"messages": [{"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "t", "arguments": untouched}}]}]}
+        self.assertEqual(self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"], untouched)
+
+    def test_a_numeric_value_under_a_credential_key_stays_valid_json(self) -> None:
+        arguments = json.dumps({"token": 98765, "user": "admin"})
+        data = {"messages": [{"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": arguments}}]}]}
+        sent = self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        json.loads(sent)
+
+    def test_a_rule_matching_a_protocol_key_renames_no_key_and_drops_no_payload(self) -> None:
+        module = _load_callback_module({"ip": {"action": "off"}, "rules": [{"name": "src", "literal": "source"}]})
+        hook = module.proxy_handler_instance
+        data = {"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64}}]}]}
+        part = asyncio.run(hook.async_pre_call_hook({}, None, data, "anthropic_messages"))["messages"][0]["content"][0]
+        self.assertEqual(part["source"]["data"], _PNG_BASE64)
+
+    def test_a_data_url_is_recognised_whatever_its_case_or_spacing(self) -> None:
+        for url in ("DATA:text/plain;base64,dG9rZW49eGEyOQ==", " data:text/plain;base64,dG9rZW49eGEyOQ=="):
+            with self.assertRaises(HTTPException, msg=url):
+                self._run({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]})
+
+    def test_a_json_looking_string_under_a_credential_key_is_masked(self) -> None:
+        data = {"messages": [{"role": "user", "content": "hi"}], "db_creds": {"password": '["plain_secret_password"]'}}
+        self.assertNotIn("plain_secret_password", json.dumps(self._run(data)))
+
+    def test_caller_data_shaped_like_an_internal_marker_is_just_data(self) -> None:
+        lookalike = {"__kube_agents_json_string__": 0, "__kube_agents_json_document__": "x"}
+        data = {"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a", "name": "t", "input": lookalike},
+            {"type": "tool_use", "id": "b", "name": "t", "input": json.dumps({"host": "10.0.0.5"})},
+        ]}]}
+        first, second = self._run(data, "anthropic_messages")["messages"][0]["content"]
+        self.assertEqual(first["input"], lookalike)
+        self.assertNotIn("10.0.0.5", second["input"])
+
+    # Fail closed.
+
+    def test_a_request_in_a_shape_the_hook_cannot_walk_is_refused(self) -> None:
+        for data in (
+            {"model": "m", "query": f"token {_OAUTH_TOKEN}"},
+            {"model": "m", "documents": ["on prod-eu-1"]},
+            {"model": "m"},
+            {"model": "m", "messages": {"role": "user", "content": "prod-eu-1"}},
+            {"model": "m", "contents": "on prod-eu-1"},
+            {"model": "m", "messages": ["prod-eu-1"]},
+            {"model": "m", "contents": ["on prod-eu-1"]},
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                self._run(dict(data), "arerank")
+            message = str(raised.exception)
+            self.assertIn("refuses a request it cannot walk", message)
+            # It names the keys and never a value.
+            self.assertNotIn(_OAUTH_TOKEN, message)
+            self.assertNotIn("prod-eu-1", message)
+
+    def test_every_shape_the_gateway_serves_is_walked_not_refused(self) -> None:
+        for call_type, data in (
+            ("acompletion", {"messages": [{"role": "user", "content": "on prod-eu-1"}]}),
+            ("anthropic_messages", {"system": "on prod-eu-1", "messages": [{"role": "user", "content": "hi"}]}),
+            ("agenerate_content", {"contents": [{"role": "user", "parts": [{"text": "on prod-eu-1"}]}]}),
+            ("aembedding", {"input": "on prod-eu-1"}),
+            ("atext_completion", {"prompt": "on prod-eu-1"}),
+        ):
+            result = self._run(data, call_type)
+            self.assertNotIn("prod-eu-1", json.dumps(result), call_type)
+
+    def test_every_field_of_a_message_is_walked_not_just_its_content(self) -> None:
+        data = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "the pod is 10.0.0.5",
+                    "function_call": {"name": "f", "arguments": json.dumps({"password": "hunter2-example-pw"})},
+                    "refusal": "not on prod-eu-1",
+                    "tool_calls": [{"type": "custom", "custom": {"name": "c", "input": "project my-proj-8"}}],
+                    "thinking_blocks": [{"type": "thinking", "thinking": "signed", "signature": "sig"}],
+                }
+            ]
+        }
+        message = self._run(data)["messages"][0]
+        sent = json.dumps(message)
+        for value in ("10.0.0.5", "hunter2-example-pw", "prod-eu-1", "my-proj-8"):
+            self.assertNotIn(value, sent)
+        self.assertEqual(message["thinking_blocks"], [{"type": "thinking", "thinking": "signed", "signature": "sig"}])
+
+    def test_a_binary_payload_is_kept_wherever_it_sits_and_a_text_one_is_refused(self) -> None:
+        payload = _RULE_MATCHING_BASE64
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": payload}}]},
+                        {"type": "input_audio", "input_audio": {"format": "wav", "data": _WAV_BASE64}},
+                        {"type": "file", "file": {"filename": "r.pdf", "file_data": "data:application/pdf;base64," + _PDF_BASE64}},
+                    ],
+                }
+            ]
+        }
+        result, audio, filed = self._run(data)["messages"][0]["content"]
+        self.assertEqual(result["content"][0]["source"]["data"], payload)
+        self.assertEqual(audio["input_audio"]["data"], _WAV_BASE64)
+        self.assertEqual(filed["file"]["file_data"], "data:application/pdf;base64," + _PDF_BASE64)
+        for part in (
+            {"type": "image_url", "image_url": {"url": "data:text/plain;base64,b24gcHJvZC1ldS0x"}},
+            {"type": "file", "file": {"file_data": "data:application/json;base64,e30="}},
+            {"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "b24="}},
+        ):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
+                self._run({"messages": [{"role": "user", "content": [part]}]})
 
     def test_a_bad_rule_file_fails_the_import_rather_than_the_request(self) -> None:
         for config in (

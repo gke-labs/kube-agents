@@ -35,6 +35,15 @@ _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "release-publish.yml"
 _GATE_JOB = "evaluate-schedule"
 _PUBLISH_JOB = "publish-release"
 _FORK_GUARD = "github.repository == 'gke-labs/kube-agents'"
+# The sign-in to the registry the commit's images are read from. It comes
+# before the eligibility check, which is the first read, and publishes nothing.
+_CANDIDATE_REGISTRY_LOGIN_STEPS = (
+    "Authenticate to Google Cloud for the candidate registry",
+    "Resolve the candidate registry host",
+    "Log in to the candidate registry",
+)
+_CANDIDATE_REGISTRY_VARIABLE = "${{ vars.CANDIDATE_REGISTRY_PREFIX }}"
+_ARTIFACT_REGISTRY_ONLY = "contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/')"
 
 
 def _load():
@@ -168,6 +177,7 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
                 "Generate Release Bot Token",
                 "Checkout repository",
                 "Calculate Next Release Version",
+                *_CANDIDATE_REGISTRY_LOGIN_STEPS,
                 "Verify Release Eligibility",
             )
         ]
@@ -240,6 +250,52 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
             with self.subTest(step=step):
                 self.assertEqual(self._step(job, step)["env"]["RELEASE_LINE"], "${{ inputs.release_line }}")
         self.assertNotIn("RELEASE_LINE", self._step(_PUBLISH_JOB, "Create Git Tag").get("env", {}))
+
+
+class CandidateRegistryWiringTest(unittest.TestCase):
+    """The publish job reads the commit's images from vars.CANDIDATE_REGISTRY_PREFIX.
+
+    Unset, every script falls back to the registry the release is published
+    to and no sign-in step runs. Set to an Artifact Registry repository, the
+    job signs in to it before the first read.
+    """
+
+    def setUp(self):
+        self.job = _load()["jobs"][_PUBLISH_JOB]
+        self.steps = self.job["steps"]
+        self.names = [step.get("name") for step in self.steps]
+
+    def _step(self, name):
+        return self.steps[self.names.index(name)]
+
+    def test_every_step_reads_the_one_variable(self):
+        """Job-level, so the eligibility check and the promotion cannot look in
+        two places; no step overrides it."""
+        self.assertEqual(self.job["env"]["CANDIDATE_REGISTRY_PREFIX"], _CANDIDATE_REGISTRY_VARIABLE)
+        for step in self.steps:
+            self.assertNotIn("CANDIDATE_REGISTRY_PREFIX", step.get("env", {}), step.get("name"))
+
+    def test_the_sign_in_comes_before_the_first_read(self):
+        first_read = self.names.index("Verify Release Eligibility")
+        positions = [self.names.index(name) for name in _CANDIDATE_REGISTRY_LOGIN_STEPS]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(positions[-1], first_read)
+
+    def test_the_sign_in_runs_only_for_an_artifact_registry_repository(self):
+        for name in _CANDIDATE_REGISTRY_LOGIN_STEPS:
+            self.assertEqual(self._step(name).get("if"), _ARTIFACT_REGISTRY_ONLY, name)
+
+    def test_docker_logs_in_to_the_variable_s_host_with_the_minted_token(self):
+        auth, host, login = (self._step(name) for name in _CANDIDATE_REGISTRY_LOGIN_STEPS)
+        self.assertEqual(auth["with"]["token_format"], "access_token")
+        self.assertEqual(host["run"], 'echo "host=${CANDIDATE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"')
+        self.assertEqual(login["with"]["registry"], f"${{{{ steps.{host['id']}.outputs.host }}}}")
+        self.assertEqual(login["with"]["username"], "oauth2accesstoken")
+        self.assertEqual(login["with"]["password"], f"${{{{ steps.{auth['id']}.outputs.access_token }}}}")
+
+    def test_the_job_may_mint_the_google_credential(self):
+        self.assertEqual(self.job["permissions"]["id-token"], "write")
+
 
 if __name__ == "__main__":
     unittest.main()

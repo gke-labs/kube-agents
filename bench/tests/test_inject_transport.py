@@ -40,7 +40,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -2348,6 +2348,55 @@ def test_an_earlier_task_s_posts_are_not_this_task_s_answer() -> None:
     assert fold.deliverable == "the second answer"
 
 
+def test_a_relayed_report_is_never_this_task_s_answer() -> None:
+    """A card's report relayed over the inject notify route lands on the
+    conversation as a post the door marks `report`. Inside this task's window
+    it is still not the reply: the deliverable is the task's own post, and the
+    report is kept apart, edits included."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True, replyTo="inj-0"))
+    fold.apply(entry(4, inject.ENTRY_EDIT, text="card report, final", messageId="inj-2", report=True))
+
+    assert fold.deliverable == "the answer"
+    assert [p["messageId"] for p in fold.window_posts] == ["inj-1"]
+    assert [(r["kind"], r["text"]) for r in fold.reports] == [
+        (inject.ENTRY_POST, "card report"), (inject.ENTRY_EDIT, "card report, final")]
+    assert fold.reports[0]["replyTo"] == "inj-0"
+    assert "inj-2" not in fold.edited
+
+
+def test_a_window_with_only_a_report_does_not_fall_back_to_an_earlier_task() -> None:
+    """With this task's marker seen and only a relayed report in its window,
+    the answer is empty, not the earlier task's post."""
+    fold = inject.Fold("task-two")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="first answer", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_TASK, taskId="task-two"))
+    fold.apply(entry(4, inject.ENTRY_POST, text="card report", messageId="inj-2", report=True))
+    assert fold.deliverable == ""
+    assert fold.window_posts == []
+
+
+def test_an_edit_marked_report_on_an_ordinary_post_still_rewrites_it() -> None:
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="Working on it...", messageId="inj-1"))
+    fold.apply(entry(3, inject.ENTRY_EDIT, text="card report", messageId="inj-1", report=True))
+    fold.apply(entry(4, inject.ENTRY_POST, text="answer", messageId="inj-2"))
+    assert fold.deliverable == "answer"
+
+
+def test_a_post_marked_report_false_is_an_ordinary_post() -> None:
+    """Only a true `report` sets a post aside; anything else is read as before."""
+    fold = inject.Fold("task-one")
+    fold.apply(entry(1, inject.ENTRY_TASK, taskId="task-one"))
+    fold.apply(entry(2, inject.ENTRY_POST, text="the answer", messageId="inj-1", report=False))
+    assert fold.deliverable == "the answer"
+    assert fold.reports == []
+
+
 @pytest.mark.parametrize(
     ("text", "token"),
     [
@@ -2563,8 +2612,20 @@ def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
             "result": None,
             "status": "completed",
         },
-        {"name": "kanban_create", "args": {"title": "list the fleet"}, "result": None, "status": "completed"},
-        {"name": "terminal", "args": {"command": "kubectl get nodes"}, "result": None, "status": "error"},
+        {
+            "name": "kanban_create",
+            "args": {"title": "list the fleet"},
+            "result": None,
+            "status": "completed",
+            "call_id": "call_1",
+        },
+        {
+            "name": "terminal",
+            "args": {"command": "kubectl get nodes"},
+            "result": None,
+            "status": "error",
+            "call_id": "call_2",
+        },
     ]
     # The block follows the lifecycle rather than interleaving with it.
     names = [e["name"] for e in result.trajectory]
@@ -2587,6 +2648,60 @@ def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
     # existing reads and no read was added for it.
     probed = [p["task"] for p in stub_gateway.polls if p["probe"]]
     assert probed[0] == "" and probed[1:] and all(t == stub_gateway.task_id for t in probed[1:])
+
+
+def test_a_part_without_a_call_id_writes_no_call_id_field(stub_gateway: _StubGatewayServer) -> None:
+    """An executor that publishes no ``callId`` (or an empty or non-string
+    one) gives an entry in the api shape with no ``call_id`` key at all,
+    rather than one carrying a placeholder."""
+    no_id = {k: v for k, v in CALL_CREATE.items() if k != inject.ACTIVITY_CALL_ID_KEY}
+    empty_id = {**CALL_FAILED, inject.ACTIVITY_CALL_ID_KEY: ""}
+    numeric_id = {**CALL_FAILED, inject.ACTIVITY_CALL_ID_KEY: 7}
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+    stub_gateway.probe_activity = [no_id, empty_id, numeric_id]
+
+    result = KubeAgentsHarness().run("file a card")
+
+    calls = trace_block(result.trajectory)[1:]
+    assert [c["name"] for c in calls] == ["kanban_create", "terminal", "terminal"]
+    assert all(inject.ENTRY_CALL_ID_FIELD not in c for c in calls)
+
+
+def test_the_call_id_never_changes_what_tool_called_matches(stub_gateway: _StubGatewayServer) -> None:
+    """``call_id`` sits beside ``args``: the same calls with and without a
+    ``callId`` grade the same under ``tool_called``, by name, by an argument
+    pattern, and by success, and the id never appears in ``args``."""
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    def grades(activity: list[dict[str, Any]]) -> list[str]:
+        stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+        stub_gateway.probe_activity = activity
+        result = KubeAgentsHarness().run("file a card")
+        assert all(
+            inject.ENTRY_CALL_ID_FIELD not in c["args"] and inject.ACTIVITY_CALL_ID_KEY not in c["args"]
+            for c in trace_block(result.trajectory)[1:]
+        )
+        return [
+            ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"]).verify(5.0).status,
+            ToolCalledVerifier(
+                type="tool_called", tool_names=["terminal"], arguments={"command": "(?is).*kubectl.*"}
+            )
+            .verify(5.0)
+            .status,
+            ToolCalledVerifier(
+                type="tool_called", tool_names=["kanban_create"], arguments={inject.ENTRY_CALL_ID_FIELD: "(?is).*call_1.*"}
+            )
+            .verify(5.0)
+            .status,
+            ToolCalledVerifier(type="tool_called", tool_names=["terminal"], require_success=True)
+            .verify(5.0)
+            .status,
+        ]
+
+    without = [{k: v for k, v in c.items() if k != inject.ACTIVITY_CALL_ID_KEY} for c in (CALL_CREATE, CALL_FAILED)]
+    with_ids = grades([CALL_CREATE, CALL_FAILED])
+    assert with_ids == grades(without)
+    assert with_ids == ["pass", "pass", "fail", "fail"]
 
 
 def test_an_empty_trace_still_writes_the_marker(stub_gateway: _StubGatewayServer) -> None:
@@ -2669,7 +2784,13 @@ def test_the_tool_call_wrapper_stays_one_entry_the_verifier_unwraps() -> None:
     fold.note_activity([CALL_WRAPPED], 0, 0)
     calls = trace_block(fold.trajectory)[1:]
     assert calls == [
-        {"name": "tool_call", "args": CALL_WRAPPED["input"], "result": None, "status": "completed"}
+        {
+            "name": "tool_call",
+            "args": CALL_WRAPPED["input"],
+            "result": None,
+            "status": "completed",
+            "call_id": CALL_WRAPPED["callId"],
+        }
     ]
     assert _wrapped_tool_names(calls[0]) == {"mcp__gke__list_clusters", "mcp__gke__get_cluster"}
     transcript.set("answer", fold.trajectory)
@@ -3903,6 +4024,127 @@ def test_a_card_the_board_does_not_know_is_dropped_not_waited_on_to_the_ceiling(
     assert result.metadata["delegated_cards_missing"] == [CARD_A]
 
 
+
+def _adopted_card_run(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, created_at: int, floor: int):
+    """CARD_A is on the board at the first read, running, then gone: a purge owing it deleted it."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_A, "running")
+    set_card(tmp_path, CARD_B, "done", result="fleet report")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, CARD_A))
+
+    def purge_after_first_read(n: int) -> None:
+        if n == 2:
+            with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+                conn.execute("DELETE FROM tasks WHERE id = ?", (CARD_A,))
+
+    real = local_shell(tmp_path, monkeypatch, purge_after_first_read)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    return KubeAgentsHarness().run("check the fleet")
+
+
+def test_an_earlier_runs_card_deleted_mid_wait_is_named_as_adopted_not_lost(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4794: this run's create was handed an earlier repetition's card by its key, and that card's
+    owed purge deleted it before the wait read it settled. The record says the run was not independent."""
+    floor = 1_700_000_000
+    result = _adopted_card_run(tmp_path, monkeypatch, created_at=floor - 60, floor=floor)
+
+    (error,) = result.errors
+    assert error.startswith(f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait")
+    assert "filed before this run started, so this run did not file it" in error
+    assert "this repetition is not independent" in error
+    assert result.metadata["delegated_cards_missing"] == [CARD_A]
+
+
+def test_a_card_of_this_runs_own_that_vanishes_keeps_the_plain_message(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    floor = 1_700_000_000
+    result = _adopted_card_run(tmp_path, monkeypatch, created_at=floor + 5, floor=floor)
+
+    assert result.errors == [
+        f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait, "
+        "nothing graded for it"
+    ]
+
+
+
+
+def test_an_earlier_runs_card_past_the_cap_deleted_before_its_promotion_is_still_named(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cap holds CARD_B back while its row is still read; CARD_A and CARD_B are then deleted.
+    CARD_KEEP keeps the wait going, so the slot CARD_A frees promotes CARD_B with no row left, and
+    CARD_B drops out too. Its creation time comes from the read that had its row, so it is still
+    named as not this run's."""
+    floor = 1_700_000_000
+    keep = "t_0000beef"
+    monkeypatch.setattr(harness, "_MAX_AWAITED_TASKS", 2)
+    build_session_store(tmp_path, created=[CARD_A, keep, CARD_B])
+    for tid, created_at in ((CARD_A, floor + 5), (keep, floor + 5), (CARD_B, floor - 60)):
+        set_card(tmp_path, tid, "running")
+        with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, tid))
+
+    def board_moves(n: int) -> None:
+        with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+            if n == 2:
+                conn.execute("DELETE FROM tasks WHERE id IN (?, ?)", (CARD_A, CARD_B))
+            if n == 12:
+                conn.execute("UPDATE tasks SET status = 'done', result = 'kept going' WHERE id = ?", (keep,))
+
+    real = local_shell(tmp_path, monkeypatch, board_moves)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        result = KubeAgentsHarness().run("check the fleet")
+
+    (b_error,) = [e for e in result.errors if e.startswith(f"card {CARD_B} ")]
+    assert "this repetition is not independent" in b_error
+    (a_error,) = [e for e in result.errors if e.startswith(f"card {CARD_A} ")]
+    assert "not independent" not in a_error
+    assert any(r.getMessage().startswith(f"awaited card {CARD_B} ") for r in caplog.records)
+
+def test_an_earlier_runs_card_that_settles_is_graded_and_logged_as_not_this_runs(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The commoner #4794 case: the earlier run's card stays and is graded as this run's answer. No
+    new error (the scorer reads errors), but the build log names the card this run did not file."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (floor - 60, CARD_A))
+    real = local_shell(tmp_path, monkeypatch)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert f"Result of delegated task {CARD_A}:\nall 3 clusters healthy" in result.metadata["final_message"]
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith(f"awaited card {CARD_A} ")]
+    assert "this repetition is not independent" in line
+
+
 def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4256,13 +4498,176 @@ def test_the_front_doors_usage_fills_the_top_level_buckets(stub_gateway: _StubGa
 
 def test_a_door_that_reports_no_usage_leaves_the_buckets_null(stub_gateway: _StubGatewayServer) -> None:
     """A gateway older than the field: no ``usage`` key, every bucket null,
-    and the note on the result says what the nulls mean."""
+    and the note on the result says what the nulls mean. The stub's answer
+    to the usage read does not name the task, and the note's cause says that."""
     stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
 
     result = KubeAgentsHarness().run("watch it")
 
     assert all(v is None for v in result.tokens.values())
-    assert result.metadata["tokens_note"] == harness._INJECT_TOKENS_NOTE
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_UNANSWERED)
+
+
+def null_note(how: str) -> str:
+    """The note on a record with no front door usage, by how the read went."""
+    return (
+        harness._INJECT_TOKENS_NOTE
+        + harness._INJECT_TOKENS_CAUSE_PREFIX
+        + harness._INJECT_TOKENS_CAUSE_NOTES[how]
+    )
+
+
+def usage_read_fold(
+    monkeypatch: pytest.MonkeyPatch, answer: Callable[..., dict[str, Any]], *, budget: float = 30
+) -> inject.Fold:
+    """The fold of a wait whose relay posted the terminal, the usage read
+    after it answered by ``answer``."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed"},
+    })
+    monkeypatch.setattr(inject, "_request", answer)
+    return task.await_terminal("task-1", deadline=time.monotonic() + budget).fold
+
+
+def test_every_way_the_usage_read_can_go_has_a_cause_text() -> None:
+    """The states live in the transport and the texts in the harness: a state
+    with no text would lose the result to a ``KeyError``."""
+    states = {
+        value for name, value in vars(inject).items()
+        if name.startswith("USAGE_READ_") and isinstance(value, str)
+    }
+    assert states == set(harness._INJECT_TOKENS_CAUSE_NOTES)
+    assert inject.Fold("task-1").usage_read in states
+
+
+def test_the_note_says_the_gateway_reported_none_when_the_read_was_answered(
+    stub_gateway: _StubGatewayServer,
+) -> None:
+    """A door that answers the usage read about the task and sends no usage:
+    the buckets are null because the gateway reported none."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
+    stub_gateway.probe_child_addressees = []
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.tokens["total"] is None
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_ANSWERED)
+
+
+def test_the_note_gives_the_cause_when_the_usage_has_no_readable_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A usage object whose counts cannot be read leaves the buckets null, so
+    the note gives the cause there too. A fold with a count gets no cause."""
+    fold = usage_read_fold(monkeypatch, lambda *a, **k: probe_body(usage={"durationMs": 9000}))
+
+    assert fold.usage == {"input": None, "output": None}
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_ANSWERED)
+
+    fold = usage_read_fold(monkeypatch, lambda *a, **k: probe_body(usage=USAGE))
+    assert harness._inject_tokens_note(fold) == harness._INJECT_TOKENS_NOTE
+
+
+def test_the_note_says_the_read_was_skipped_past_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A terminal that arrives with the wait's deadline already passed gets
+    no usage read, and the note says the read was skipped."""
+    asked: list[str] = []
+    fold = usage_read_fold(monkeypatch, lambda url, *a, **k: asked.append(url) or {}, budget=0)
+
+    assert asked == [] and fold.usage is None
+    assert fold.usage_read == inject.USAGE_READ_SKIPPED
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_SKIPPED)
+
+
+def test_the_note_says_the_read_failed_when_it_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A usage read the door did not answer leaves the buckets null, and the
+    note says the read failed and not that the gateway reported none."""
+    def refused(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    fold = usage_read_fold(monkeypatch, refused)
+
+    assert fold.usage is None
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_FAILED)
+
+
+def test_the_note_says_the_answer_did_not_cover_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An answer about another task says nothing of this one's usage."""
+    fold = usage_read_fold(monkeypatch, lambda *a, **k: probe_body(taskId="task-2", usage=USAGE))
+
+    assert fold.usage is None
+    assert harness._inject_tokens_note(fold) == null_note(inject.USAGE_READ_UNANSWERED)
+
+
+def test_a_failed_second_read_does_not_replace_the_doors_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A partial answer with no front door usage is read once more. When
+    that read fails, the cause stays the door's answer: it reported none."""
+    replies = [probe_body(childUsage={"inputTokens": 900, "outputTokens": 90}, usagePartial=True)]
+
+    def once(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if not replies:
+            raise inject.InjectUnavailable("the door is restarting")
+        return replies.pop(0)
+
+    fold = usage_read_fold(monkeypatch, once)
+
+    assert fold.usage is None and fold.usage_partial
+    assert harness._inject_tokens_note(fold) == (
+        null_note(inject.USAGE_READ_ANSWERED) + harness._INJECT_TOKENS_PARTIAL_NOTE
+    )
+
+
+def test_the_note_says_the_cancel_was_not_confirmed_on_a_graded_timeout(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graded timeout whose cancel no terminal confirmed inside the settle
+    has no terminal to read usage after, and the note says so."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+    monkeypatch.setattr(inject, "CANCEL_SETTLE_SECONDS", 0.5)
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert result.metadata["terminal_state"] is None
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_CANCEL_UNCONFIRMED)
+
+
+def test_the_note_takes_the_settles_cause_when_the_cancel_was_confirmed(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A confirmed cancel is followed by a usage read; when the door answers
+    it with no usage, that is the cause, not the cancel."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.on_cancel = [
+        entry(5, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="canceled",
+              source=inject.TERMINAL_SOURCE_EXECUTOR, reason="reason: canceled-by-request"),
+    ]
+    stub_gateway.probe_child_addressees = []
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert result.metadata["terminal_state"] == "canceled"
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_ANSWERED)
+
+
+def test_the_note_says_no_read_was_made_when_the_wait_had_no_terminal(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout with a stop already pending sends no cancel, so nothing
+    settles and no usage read is made."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.probe_detached = True
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert not stub_gateway.cancels
+    assert result.metadata["tokens_note"] == null_note(inject.USAGE_READ_NOT_MADE)
 
 
 def test_usage_with_no_readable_count_leaves_the_buckets_null() -> None:

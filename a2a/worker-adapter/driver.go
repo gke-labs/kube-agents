@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
@@ -161,8 +162,9 @@ func (a *adapter) turnDirs(env []string) TurnDirs {
 }
 
 // DriverFor is the driver for harness h, the value of the worker's harness
-// selector. Empty means Claude Code. Antigravity is a known harness with no
-// driver yet, refused by name; anything else is refused as unknown. A worker
+// selector. Empty means Claude Code. Antigravity is agyDriver; the worker
+// refuses it without its isolation waiver (cmd/worker-adapter's
+// selectHarness). Anything else is refused as unknown. A worker
 // never falls back to Claude Code for a value it does not know: a typo would
 // otherwise run the wrong harness without a word.
 func DriverFor(h persona.Harness) (Driver, error) {
@@ -170,7 +172,30 @@ func DriverFor(h persona.Harness) (Driver, error) {
 	case "", persona.ClaudeCode:
 		return claudeDriver{}, nil
 	case persona.Antigravity:
-		return nil, fmt.Errorf("harness %q has no worker driver yet", h)
+		return agyDriver{}, nil
+	case persona.CoreAgent:
+		return newCoreAgentDriver(), nil
 	}
-	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
+	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
+}
+
+// turnRestarter is implemented by a driver whose harness takes one user
+// turn per process: the adapter ends the process at each turn boundary and
+// starts the next turn on a fresh one that resumes the conversation, so
+// nothing the last turn started is still running when the driver prepares
+// the next (Driver.PrepareTurn).
+type turnRestarter interface {
+	RestartsPerTurn() bool
+}
+
+func restartsPerTurn(d Driver) bool {
+	r, ok := d.(turnRestarter)
+	return ok && r.RestartsPerTurn()
+}
+
+// turnBudgeter is implemented by a driver whose argv carries a wall-clock
+// bound for the harness, so a fresh process for a later turn gets the time
+// left on the task rather than the whole of it.
+type turnBudgeter interface {
+	WithTurnBudget(argv []string, left time.Duration) []string
 }

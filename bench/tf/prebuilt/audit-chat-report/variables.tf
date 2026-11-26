@@ -13,8 +13,10 @@
 # limitations under the License.
 
 # The deployer drops an injected variable this stack does not declare and
-# raises on a task.yaml variable it does not declare, so this file and
-# bench/tasks/fleet-audit-chat-report-is-the-report/task.yaml are a matched pair.
+# raises on a task.yaml variable it does not declare, so this file and the
+# `variables:` of each task on this stack are held together:
+# bench/tasks/fleet-audit-chat-report-is-the-report/task.yaml and
+# bench/tasks/fleet-audit-scheduled-run-files-the-finding/task.yaml.
 
 variable "host_cluster_name" {
   type        = string
@@ -78,4 +80,14 @@ variable "run_wait" {
   type        = number
   description = "Seconds to wait for the fired run to end"
   default     = 4800
+}
+
+# A case that grades whether the scheduled run happened sets this: a failed
+# apply is graded as broken infrastructure, so a run nobody claimed would
+# never turn that case red. Off, the apply fails, which suits a case that
+# only has something to grade once the run has ended.
+variable "unfinished_run_is_a_result" {
+  type        = bool
+  description = "Whether a fired run that has not ended within run_wait is left to the case's check rather than failing the apply"
+  default     = false
 }

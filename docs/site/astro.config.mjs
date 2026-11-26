@@ -110,6 +110,7 @@ export default defineConfig({
             { label: 'First prompts', link: '/install/first-prompts/' },
             { label: 'Using kube-agents over MCP', link: '/install/mcp/' },
             { label: 'Slack app setup', link: '/install/slack-app/' },
+            { label: 'Microsoft Teams app setup', link: '/install/teams-app/' },
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },
             { label: 'GitLab as the GitOps forge', link: '/install/gitlab/' },

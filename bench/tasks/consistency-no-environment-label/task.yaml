@@ -6,10 +6,10 @@
 #
 # The check this case grades is `no-environment-label`, SOP §4.14: the one
 # check in the drift stream that fires outside a cohort. The stream's other
-# nineteen checks are majority votes, so a cluster with too few peers is
+# twenty-one checks are majority votes, so a cluster with too few peers is
 # compared on nothing -- and an unlabelled cluster has no peers by
 # construction, because §2.3 keys the eight configurable facets on
-# (environment) and the eleven node-level ones on (mode, environment) and
+# (environment) and the thirteen node-level ones on (mode, environment) and
 # merges `unknown` into no named cohort under either. The collector
 # (skills/fleet-audit/scripts/fleet_drift.py) turns that permanent coverage
 # gap into a finding naming the label to set.
@@ -29,7 +29,7 @@
 #      cohorts is short, and for the Standard host the binding one is
 #      (standard, unknown): two stale eval-pr* Standard clusters (a crashed
 #      run's, not swept) that age past the collector's 24h exclusion take it
-#      to the floor of 3, the host is then compared on all nineteen and §4.14
+#      to the floor of 3, the host is then compared on all twenty-one and §4.14
 #      abstains -- the check reads as ran-and-clean, and this case reds on a
 #      fleet the agent audited correctly. Unlabelled AUTOPILOT clusters do not
 #      bind: they raise the cluster-level `unknown` cohort past the floor, but

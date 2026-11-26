@@ -22,6 +22,8 @@ NOW = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
 REPO = "https://github.com/org/infra"
 KEY = "github.com/org/infra"
 ADMIN = "U0ADMIN01"
+# When auto-merge was requested for no-pdb in the step-down tests.
+REQUESTED = int(datetime(2026, 11, 16, 10, 0, tzinfo=timezone.utc).timestamp())
 REAL_REFRESH_ASYNC = dial_state.refresh_pending_async
 REAL_REPORT = dial_state.report_level
 REAL_RUN_SWITCH = dial_state.run_switch
@@ -155,6 +157,111 @@ class SnapshotTest(DialCase):
             self.db.execute("INSERT INTO post_merge_records VALUES (?, 'no-pdb', 'dev', 'verified_fixed', ?, 0, NULL)", (REPO, day))
         row = self.section()["kinds"][0]["repos"][0]
         self.assertEqual((row["clean"], row["days"], row["ready"]), (3, 2, False))
+
+    def step_down_records(self, *rows):
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS post_merge_records (repo TEXT, number INTEGER, kind TEXT, environment TEXT, "
+            "outcome TEXT, merged_at TEXT, human_edited INTEGER, reverted_at TEXT, followup_state TEXT, followup_detail TEXT)"
+        )
+        for number, kind, environment, merged_at, detail in rows:
+            self.db.execute("INSERT INTO post_merge_records VALUES (?, ?, ?, ?, 'still_broken', ?, 0, NULL, 'stepped-down', ?)",
+                            (REPO, number, kind, environment, merged_at, json.dumps(detail)))
+
+    def auto_merging(self, set_at=REQUESTED):
+        entry = {"on": True, "state": "on", "url": REPO}
+        if set_at is not None:
+            entry["set_at"] = set_at
+        dial_state.write_repo("no-pdb", KEY, entry)
+
+    def test_a_step_down_since_the_request_follows_its_rules_pr_to_off(self):
+        # #6953: the row read "auto-merges" after the step-down's deny rule merged.
+        self.auto_merging()
+        self.step_down_records((11, "no-pdb", "Dev", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/12"}))
+        row = self.row()
+        self.assertEqual((row["state"], row["pending_pr"], row["note"]),
+                         ("pending", {"number": 12, "url": f"{REPO}/pull/12"},
+                          "Stepping down: PR #11 was still broken after it merged."))
+        self.check_answer = "merged"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        row = self.row()
+        self.assertEqual((row["state"], row["note"]), (
+            "off", "Stepped down: PR #11 was still broken after it merged. Delete its deny rule to allow it again."))
+
+    def test_a_tap_on_an_open_step_down_is_refused(self):
+        self.auto_merging()
+        self.step_down_records((11, "no-pdb", "dev", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/12"}))
+        self.row()
+        dial_state.write_level("automerge", ADMIN)
+        for action, expected in ((dial_state.ACTION_STOP, (True, dial_state.STEP_DOWN_STOPPING)),
+                                 (dial_state.ACTION_REQUEST, (False, dial_state.STEP_DOWN_OPEN))):
+            with self.subTest(action=action):
+                answer = self.request(action)
+                self.assertEqual((answer["ok"], answer["message"]), expected)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.row()["pending_pr"]["number"], 12)
+
+    def test_a_closed_step_down_puts_the_request_back(self):
+        self.auto_merging()
+        self.step_down_records((11, "no-pdb", "dev", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/12"}))
+        self.row()
+        self.check_answer = "closed"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        entry = dial_state.read_state()["kinds"]["no-pdb"][KEY]
+        # Back on as of the fix, so the closed step-down is not taken up again.
+        self.assertEqual((entry["state"], entry["set_at"]), ("on", int(datetime(2026, 11, 16, 11, 0, tzinfo=timezone.utc).timestamp())))
+        self.assertEqual((self.row()["state"], self.row().get("note")), ("on", None))
+
+    def test_the_oldest_step_down_is_followed_and_a_closed_one_hands_on_to_the_next(self):
+        self.auto_merging()
+        self.step_down_records(
+            (13, "no-pdb", "dev", "2026-11-16T11:30:00Z", {"stepDown": f"{REPO}/pull/14"}),
+            (11, "no-pdb", "dev", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/12"}),
+        )
+        self.assertEqual(self.row()["pending_pr"]["number"], 12)
+        self.check_answer = "closed"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        row = self.row()
+        self.assertEqual((row["state"], row["pending_pr"]["number"]), ("pending", 14))
+        self.check_answer = "merged"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        self.assertEqual(self.row()["state"], "off")
+
+    def test_the_step_downs_own_record_is_what_the_row_follows(self):
+        # The real step-down's answer, stored as the post-merge follow-up stores it, so a rename
+        # of its action or its stepDown key on either side fails here.
+        import post_merge_followups
+        import test_post_merge_stepdown as stepdown_test
+
+        answer = stepdown_test.run(stepdown_test.FakeForge(), stepdown_test.FakeOpen())
+        self.auto_merging()
+        self.db.execute(
+            "CREATE TABLE post_merge_records (repo TEXT, number INTEGER, kind TEXT, environment TEXT, "
+            "merged_at TEXT, followup_state TEXT, followup_detail TEXT)"
+        )
+        self.db.execute("INSERT INTO post_merge_records VALUES (?, 7, 'no-pdb', 'dev', '2026-11-16T11:00:00Z', ?, ?)",
+                        (REPO, answer["action"], post_merge_followups._detail(answer)))
+        row = self.row()
+        self.assertEqual((row["state"], row["pending_pr"]["url"]), ("pending", answer["stepDown"]))
+
+    def test_a_closed_stop_keeps_the_request_time(self):
+        self.auto_merging()
+        self.request(dial_state.ACTION_STOP)
+        self.check_answer = "closed"
+        dial_state.refresh_pending([("no-pdb", KEY, dial_state.read_state()["kinds"]["no-pdb"][KEY])])
+        entry = dial_state.read_state()["kinds"]["no-pdb"][KEY]
+        self.assertEqual((entry["state"], entry["set_at"]), ("on", REQUESTED))
+
+    def test_only_a_step_down_that_opened_a_deny_rule_since_the_request_counts(self):
+        self.step_down_records(
+            (9, "no-pdb", "dev", "2026-11-16T09:00:00Z", {"stepDown": f"{REPO}/pull/10"}),  # before the request
+            (13, "no-pdb", "prod", "2026-11-16T11:00:00Z", {"stepDown": f"{REPO}/pull/14"}),  # another environment
+            # A person merged it, or the rule was refused: nothing changes in the rules file.
+            (15, "no-pdb", "dev", "2026-11-16T11:00:00Z", {"refused": {"stepDown": "KUBEAGENTS_AUTOMERGE is off"}}),
+        )
+        for set_at in (REQUESTED, None):
+            with self.subTest(set_at=set_at):
+                self.auto_merging(set_at)
+                self.assertEqual((self.row()["state"], self.row().get("note")), ("on", None))
 
     def test_admins_take_member_ids_only_and_none_is_nobody(self):
         for value, expected in ((f"{ADMIN}, alice@x.com,W0AB12", [ADMIN, "W0AB12"]), ("none", []), ("", [])):

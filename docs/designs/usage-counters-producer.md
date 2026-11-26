@@ -185,8 +185,9 @@ the counters and gauges from that body still land. Of several replicas, the read
 free space wins, since they share the volume. That projection is a second status patch after the
 `status.usage` one, carrying the resource version because it replaces the conditions list whole; a
 conflict waits for the next poll. The byte fields are rewritten only when free space moves by a
-hundredth of the volume, so a working agent does not wake the reconciler every poll, and they have
-a pruning record of their own for a CRD that predates them.
+hundredth of the volume or when the `DataVolumeNearlyFull` condition changes its status, so a
+working agent does not wake the reconciler every poll and the fields agree with a condition that
+just turned. They have a pruning record of their own for a CRD that predates them.
 
 The `cluster_up` series' labels, the triple each registered cluster's profile names, are read
 beside the gauges into the `ScopeUndeclared` condition (`usage_scope.go`): True, naming the

@@ -6,7 +6,8 @@
 # the PR's images and deploys the kube-agents chart onto that cluster.
 #
 # Setting RC_COMMIT_SHA switches it to the release-candidate path: no build at
-# all, and the chart's published GHCR images at that commit instead. Section 2a
+# all, and the candidate's published images at that commit instead, from the
+# registry get_registry_prefix names (GHCR unless told otherwise). Section 2a
 # is the whole of the difference, and with the variable unset nothing below
 # behaves differently from the day this line was added.
 #
@@ -823,6 +824,13 @@ readonly BUILD_FAILED_STATUSES="FAILURE INTERNAL_ERROR TIMEOUT CANCELLED EXPIRED
 # What a build id looks like (a UUID), so a submit whose stdout is not one is
 # refused before it is polled.
 readonly BUILD_ID_RE='^[0-9a-fA-F-]+$'
+# A build that ended failed on BuildKit's "flightcontrol: exceeded retry
+# timeout" is a Cloud Build builder flake, not the source: the same commit
+# builds on a second submit (#3911). That fixed string, and only it, earns one
+# resubmit; .github/scripts/cloud_build_submit.sh does the same for main's
+# publish and says why. Submits allowed in total: the first, plus one retry.
+readonly BUILD_FLIGHTCONTROL_ERROR="flightcontrol: exceeded retry timeout"
+readonly BUILD_MAX_ATTEMPTS=2
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 # Required on every provider: the judge reads it (JUDGE_API_KEY in
@@ -983,12 +991,16 @@ eval_run_tags_helm_args
 # hack/resolve-rc-target.sh produces the value and documents why the caller, not
 # this script, checks the tree out at that commit.
 #
-# The two paths differ in registry AND in image name: Artifact Registry carries
-# `kube-agents-operator`, the published one is `k8s-operator`. That is why the
-# RC path drops the repository overrides rather than rewriting them — the chart
-# already defaults every image to the published GHCR path, so only the tag has
-# to be said. The same drop is what carries the credential-proxy sidecar across:
-# it is not a chart value at all, the operator derives it from the agent image by
+# The two paths differ in registry AND in image name: the leased project's
+# Artifact Registry carries `kube-agents-operator`, the published one is
+# `k8s-operator`. That is why the RC path drops the repository overrides rather
+# than rewriting them — the chart already defaults every image to its published
+# name on GHCR, so only the tag has to be said. When the registry the candidate
+# was published to is not that default (whatever get_registry_prefix returns
+# that is not DEFAULT_REGISTRY_PREFIX), the RC path says the registry once, as global.imageRegistry, which the chart puts in
+# front of every first-party image's published name; the names stay the
+# chart's. The same drop is what carries the credential-proxy sidecar across:
+# it is not a chart value this lane sets, the operator derives it from the agent image by
 # rewriting the trailing path element and keeping the tag
 # (resolveCredentialProxyImage in k8s-operator/internal/controller/
 # platformagent_manifests.go), so it follows whichever repository the agent uses
@@ -1060,6 +1072,12 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     # one, so the tag is the whole of it.
     --set-string "webConsole.image.tag=${TAG}"
   )
+  # Only when the candidate's registry is not the chart's default: the check
+  # above asked RC_REGISTRY_PREFIX, so the install has to pull from it too, or
+  # the run verifies one registry and installs from another.
+  if [ "${RC_REGISTRY_PREFIX}" != "${DEFAULT_REGISTRY_PREFIX}" ]; then
+    IMAGE_ARGS+=(--set-string "global.imageRegistry=${RC_REGISTRY_PREFIX}")
+  fi
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
   IMAGE_ARGS=(
@@ -1496,7 +1514,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
   # A CA, not any certificate: the grader verifies strictly, so a leaf or a
   # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
   if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null)"; then
-    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh (kube-agents#3682)." >&2
     exit 1
   fi
 elif [ -s "${FORGE_CA_FILE}" ]; then
@@ -2083,7 +2101,7 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
 else
   STEP_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, sandbox, operator) ==="
-  # One submit, not four. The two agent images share the agent-base chain, so
+  # One build, not four. The two agent images share the agent-base chain, so
   # building them as consecutive steps on one worker lets the second reuse the
   # first's layers instead of rebuilding that chain on a cold daemon; the sandbox
   # and operator builds run alongside them. See the header of cloudbuild-ci.yaml,
@@ -2129,72 +2147,99 @@ else
       "$@"
     fi
   }
-  CLOUD_BUILD_ID=""
-  CLOUD_BUILD_LOG_URL=""
-  CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
-    --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
-    echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
-    exit 1
-  }
-  IFS=$'\t' read -r CLOUD_BUILD_ID CLOUD_BUILD_LOG_URL <<<"${CLOUD_BUILD_SUBMIT_OUT}"
-  if ! [[ "${CLOUD_BUILD_ID}" =~ ${BUILD_ID_RE} ]]; then
-    echo "ERROR: gcloud builds submit printed no build id: ${CLOUD_BUILD_SUBMIT_OUT}" >&2
-    exit 1
-  fi
-  echo "Cloud Build ${CLOUD_BUILD_ID} submitted: ${CLOUD_BUILD_LOG_URL:-no log URL returned}"
-  echo "Polling its status every ${BUILD_POLL_INTERVAL_SECONDS}s, for at most ${BUILD_WAIT_CAP_SECONDS}s"
-  CLOUD_BUILD_DEADLINE=$((SECONDS + BUILD_WAIT_CAP_SECONDS))
-  CLOUD_BUILD_STATUS=""
-  CLOUD_BUILD_OUTCOME=""
-  CLOUD_BUILD_DESCRIBE_ERR="$(mktemp)"
-  CLOUD_BUILD_DESCRIBE_ERRORS=0
+  # A retry gets its own BUILD_WAIT_CAP_SECONDS: the cap bounds one build
+  # (cloudbuild-ci.yaml's timeout plus queueing), and a shared one could cut off
+  # a healthy resubmit of a build that failed late. The job's own timeout still
+  # bounds the pair.
+  CLOUD_BUILD_ATTEMPT=1
   while :; do
-    if CLOUD_BUILD_STATUS="$(with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds describe "${CLOUD_BUILD_ID}" \
-      --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} --format="value(status)" 2>"${CLOUD_BUILD_DESCRIBE_ERR}")"; then
-      CLOUD_BUILD_DESCRIBE_ERRORS=0
-    else
-      CLOUD_BUILD_DESCRIBE_RC=$?
-      CLOUD_BUILD_DESCRIBE_ERRORS=$((CLOUD_BUILD_DESCRIBE_ERRORS + 1))
-      echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited ${CLOUD_BUILD_DESCRIBE_RC} ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
-      CLOUD_BUILD_STATUS=""
-      if [ "${CLOUD_BUILD_DESCRIBE_ERRORS}" -ge "${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS}" ]; then
-        CLOUD_BUILD_OUTCOME="could not be described ${CLOUD_BUILD_DESCRIBE_ERRORS} times in a row"
+    CLOUD_BUILD_ID=""
+    CLOUD_BUILD_LOG_URL=""
+    CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
+      --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
+      --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
+      echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
+      exit 1
+    }
+    IFS=$'\t' read -r CLOUD_BUILD_ID CLOUD_BUILD_LOG_URL <<<"${CLOUD_BUILD_SUBMIT_OUT}"
+    if ! [[ "${CLOUD_BUILD_ID}" =~ ${BUILD_ID_RE} ]]; then
+      echo "ERROR: gcloud builds submit printed no build id: ${CLOUD_BUILD_SUBMIT_OUT}" >&2
+      exit 1
+    fi
+    echo "Cloud Build ${CLOUD_BUILD_ID} submitted: ${CLOUD_BUILD_LOG_URL:-no log URL returned}"
+    echo "Polling its status every ${BUILD_POLL_INTERVAL_SECONDS}s, for at most ${BUILD_WAIT_CAP_SECONDS}s"
+    CLOUD_BUILD_DEADLINE=$((SECONDS + BUILD_WAIT_CAP_SECONDS))
+    CLOUD_BUILD_STATUS=""
+    CLOUD_BUILD_OUTCOME=""
+    CLOUD_BUILD_DESCRIBE_ERR="$(mktemp)"
+    CLOUD_BUILD_DESCRIBE_ERRORS=0
+    while :; do
+      if CLOUD_BUILD_STATUS="$(with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds describe "${CLOUD_BUILD_ID}" \
+        --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} --format="value(status)" 2>"${CLOUD_BUILD_DESCRIBE_ERR}")"; then
+        CLOUD_BUILD_DESCRIBE_ERRORS=0
+      else
+        CLOUD_BUILD_DESCRIBE_RC=$?
+        CLOUD_BUILD_DESCRIBE_ERRORS=$((CLOUD_BUILD_DESCRIBE_ERRORS + 1))
+        echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited ${CLOUD_BUILD_DESCRIBE_RC} ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
+        CLOUD_BUILD_STATUS=""
+        if [ "${CLOUD_BUILD_DESCRIBE_ERRORS}" -ge "${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS}" ]; then
+          CLOUD_BUILD_OUTCOME="could not be described ${CLOUD_BUILD_DESCRIBE_ERRORS} times in a row"
+          break
+        fi
+      fi
+      if [ "${CLOUD_BUILD_STATUS}" = "${BUILD_SUCCESS_STATUS}" ]; then
+        CLOUD_BUILD_OUTCOME="${BUILD_SUCCESS_STATUS}"
         break
       fi
+      case " ${BUILD_FAILED_STATUSES} " in
+        *" ${CLOUD_BUILD_STATUS} "*)
+          CLOUD_BUILD_OUTCOME="ended ${CLOUD_BUILD_STATUS}"
+          break ;;
+      esac
+      if [ "${SECONDS}" -ge "${CLOUD_BUILD_DEADLINE}" ]; then
+        CLOUD_BUILD_OUTCOME="did not reach a terminal state within the ${BUILD_WAIT_CAP_SECONDS}s cap (last status: ${CLOUD_BUILD_STATUS:-unknown})"
+        break
+      fi
+      sleep "${BUILD_POLL_INTERVAL_SECONDS}"
+    done
+    rm -f "${CLOUD_BUILD_DESCRIBE_ERR}"
+    if [ "${CLOUD_BUILD_OUTCOME}" != "${BUILD_SUCCESS_STATUS}" ]; then
+      echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} ${CLOUD_BUILD_OUTCOME}; its log follows (${CLOUD_BUILD_LOG_URL:-no log URL})" >&2
+      # A build this loop gave up on (the cap, or describe failing) may still be
+      # running; cancel it so it stops pushing into a project this run is about
+      # to hand back. A build that ended on its own needs nothing.
+      case "${CLOUD_BUILD_OUTCOME}" in
+        ended\ *) ;;
+        *) with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds cancel "${CLOUD_BUILD_ID}" \
+             --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} >/dev/null \
+             || echo "WARNING: gcloud builds cancel ${CLOUD_BUILD_ID} exited $?; it runs until its own timeout" >&2 ;;
+      esac
+      # Kept as well as printed, for the flightcontrol check below.
+      CLOUD_BUILD_LOG="$(mktemp)"
+      with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds log "${CLOUD_BUILD_ID}" \
+        --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} | tee "${CLOUD_BUILD_LOG}" \
+        || echo "WARNING: gcloud builds log ${CLOUD_BUILD_ID} exited $?; read it at ${CLOUD_BUILD_LOG_URL:-the Cloud Build console}" >&2
+      # Only a build that ended FAILURE is resubmitted. One the loop gave up on
+      # (the cap, or describe failing) is not a flightcontrol flake, and one
+      # that timed out, was cancelled or expired ended for another reason even
+      # when the line is in its log.
+      case "${CLOUD_BUILD_OUTCOME}" in
+        "ended FAILURE")
+          if [ "${CLOUD_BUILD_ATTEMPT}" -lt "${BUILD_MAX_ATTEMPTS}" ] && grep -qF "${BUILD_FLIGHTCONTROL_ERROR}" "${CLOUD_BUILD_LOG}"; then
+            echo "WARNING: Cloud Build ${CLOUD_BUILD_ID} died on '${BUILD_FLIGHTCONTROL_ERROR}', a builder flake (#3911) (attempt ${CLOUD_BUILD_ATTEMPT} of ${BUILD_MAX_ATTEMPTS}); submitting it again" >&2
+            rm -f "${CLOUD_BUILD_LOG}"
+            CLOUD_BUILD_ATTEMPT=$((CLOUD_BUILD_ATTEMPT + 1))
+            continue
+          fi
+          if [ "${CLOUD_BUILD_ATTEMPT}" -ge "${BUILD_MAX_ATTEMPTS}" ] && grep -qF "${BUILD_FLIGHTCONTROL_ERROR}" "${CLOUD_BUILD_LOG}"; then
+            echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} died on '${BUILD_FLIGHTCONTROL_ERROR}' again, on the one resubmit it gets (#3911)" >&2
+          fi ;;
+      esac
+      rm -f "${CLOUD_BUILD_LOG}"
+      exit 1
     fi
-    if [ "${CLOUD_BUILD_STATUS}" = "${BUILD_SUCCESS_STATUS}" ]; then
-      CLOUD_BUILD_OUTCOME="${BUILD_SUCCESS_STATUS}"
-      break
-    fi
-    case " ${BUILD_FAILED_STATUSES} " in
-      *" ${CLOUD_BUILD_STATUS} "*)
-        CLOUD_BUILD_OUTCOME="ended ${CLOUD_BUILD_STATUS}"
-        break ;;
-    esac
-    if [ "${SECONDS}" -ge "${CLOUD_BUILD_DEADLINE}" ]; then
-      CLOUD_BUILD_OUTCOME="did not reach a terminal state within the ${BUILD_WAIT_CAP_SECONDS}s cap (last status: ${CLOUD_BUILD_STATUS:-unknown})"
-      break
-    fi
-    sleep "${BUILD_POLL_INTERVAL_SECONDS}"
+    break
   done
-  rm -f "${CLOUD_BUILD_DESCRIBE_ERR}"
-  if [ "${CLOUD_BUILD_OUTCOME}" != "${BUILD_SUCCESS_STATUS}" ]; then
-    echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} ${CLOUD_BUILD_OUTCOME}; its log follows (${CLOUD_BUILD_LOG_URL:-no log URL})" >&2
-    # A build this loop gave up on (the cap, or describe failing) may still be
-    # running; cancel it so it stops pushing into a project this run is about
-    # to hand back. A build that ended on its own needs nothing.
-    case "${CLOUD_BUILD_OUTCOME}" in
-      ended\ *) ;;
-      *) with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds cancel "${CLOUD_BUILD_ID}" \
-           --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} >/dev/null \
-           || echo "WARNING: gcloud builds cancel ${CLOUD_BUILD_ID} exited $?; it runs until its own timeout" >&2 ;;
-    esac
-    with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds log "${CLOUD_BUILD_ID}" \
-      --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} \
-      || echo "WARNING: gcloud builds log ${CLOUD_BUILD_ID} exited $?; read it at ${CLOUD_BUILD_LOG_URL:-the Cloud Build console}" >&2
-    exit 1
-  fi
   echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 fi
 

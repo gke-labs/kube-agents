@@ -26,9 +26,10 @@ var sessionPodFixture = filepath.Join("..", "..", "k8s-operator", "internal", "c
 
 // TestSpawnedSessionPodsMatchTheAdmissionFixture spawns the session pod in
 // each shape Spawn has (plain, with the bus CA, reused for its conversation,
-// with the cluster view) under the namespace and account names the envtest
-// uses, and compares them with the fixture. Run with -update-session-pods to
-// rewrite it, then run the operator's TestTheGatewayPodPolicy envtest.
+// with the cluster view, with a named harness) and the warm pool's (SpawnWarm)
+// under the namespace and account names the envtest uses, and compares them
+// with the fixture. Run with -update-session-pods to rewrite it, then run the
+// operator's TestTheGatewayPodPolicy envtest.
 func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
 	const ns = "a2a-pod-policy"
 	base := Config{Namespace: ns, WorkerImage: "worker", SessionServiceAccount: "pa-a2a-session", TaskDeadline: 15 * time.Minute}
@@ -53,6 +54,7 @@ func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
 			c.KubeProxyCAConfigMap = "pa-kube-proxy-ca-bundle"
 			c.KubeProxyHostContext = "in-cluster"
 		}},
+		{"harness", func(c *Config, _ *SessionRecord) { c.SessionHarness = "claude-code" }},
 	}
 	var pods []corev1.Pod
 	for _, shape := range shapes {
@@ -74,6 +76,23 @@ func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
 			Spec:       pod.Spec,
 		})
 	}
+	// The warm pool's pod (SpawnWarm), through the same create.
+	warmCfg := base
+	warmCfg.SessionReuse = true
+	cs := k8sfake.NewSimpleClientset()
+	s := &podSpawner{cfg: &warmCfg, client: cs, log: slog.Default()}
+	if err := s.SpawnWarm(context.Background(), "warm"); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	pod, err := cs.CoreV1().Pods(ns).Get(context.Background(), "warm", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	pods = append(pods, corev1.Pod{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+		ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, Labels: pod.Labels, Annotations: pod.Annotations},
+		Spec:       pod.Spec,
+	})
 	got, err := json.MarshalIndent(pods, "", "  ")
 	if err != nil {
 		t.Fatal(err)

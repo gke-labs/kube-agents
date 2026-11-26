@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -74,11 +75,24 @@ const (
 	authModeTokenReview     = "token-review"
 	authModeNone            = "none"
 	upstreamURLEnv          = "KUBE_PROXY_UPSTREAM_URL"
+	upstreamURLFlag         = "upstream-url"
 	denyStreamingEnv        = "KUBE_PROXY_DENY_STREAMING"
 	unauthenticatedUsername = "unauthenticated"
 	binaryName              = "k8s-api-proxy"
+	// The names of the static upstream's file flags, of their environment variables, and of
+	// their attributes in the startup record.
+	upstreamTokenFileEnv    = "KUBE_PROXY_UPSTREAM_TOKEN_FILE" // #nosec G101 -- a variable's name, not a credential
+	upstreamTokenFileFlag   = "upstream-token-file"            // #nosec G101 -- a flag's name, not a credential
+	upstreamCAFileEnv       = "KUBE_PROXY_UPSTREAM_CA_FILE"
+	upstreamCAFileFlag      = "upstream-ca-file"
+	logKeyUpstreamTokenFile = "upstream_token_file" // #nosec G101 -- a log attribute's name, not a credential
+	logKeyUpstreamCAFile    = "upstream_ca_file"
 	// devVersion is what a build without the release's -ldflags reports.
 	devVersion = "dev"
+
+	// unauthenticatedTokenWarning is logged when --auth-mode=none is combined with
+	// --upstream-token-file: the proxy then lends the file's identity to every peer.
+	unauthenticatedTokenWarning = "caller authentication is disabled and an upstream token is attached: a request from any peer that can reach the listen address is forwarded with the token file's identity; bind the listener to loopback or restrict who can reach it" // #nosec G101 -- a log message, not a credential
 
 	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
 	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
@@ -114,6 +128,8 @@ type proxyConfig struct {
 	modeRaw                  string
 	authMode                 string
 	upstreamURL              string
+	upstreamTokenFile        string
+	upstreamCAFile           string
 	denyStreaming            bool
 	hostClusterID            string
 	redactSecrets            bool
@@ -174,7 +190,9 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.StringVar(&cfg.jwtAllowedPartitions, jwtAllowedPartitionsFlag, envOrDefault(jwtAllowedPartitionsEnv, ""), "Comma-separated --"+jwtPartitionClaimFlag+" values admitted (empty admits any)")
 	fs.StringVar(&cfg.jwtCAFile, jwtCAFileFlag, envOrDefault(jwtCAFileEnv, ""), "PEM bundle of the root CAs the JWT issuer's key set and metadata server is verified against, re-read when it changes (empty uses the system roots)")
 	fs.StringVar(&cfg.partitionByCaller, partitionByCallerFlag, envOrDefault(partitionByCallerEnv, partitionByNone), "Share cached responses and coalesced fetches only among callers with the same: none (all callers share), partition (--"+jwtPartitionClaimFlag+"), or username")
-	fs.StringVar(&cfg.upstreamURL, "upstream-url", envOrDefault(upstreamURLEnv, ""), "Static http:// or https:// upstream URL (skips cloud discovery and defaults bare paths to in-cluster)")
+	fs.StringVar(&cfg.upstreamURL, upstreamURLFlag, envOrDefault(upstreamURLEnv, ""), "Static http:// or https:// upstream URL (skips cloud discovery and defaults bare paths to in-cluster)")
+	fs.StringVar(&cfg.upstreamTokenFile, upstreamTokenFileFlag, envOrDefault(upstreamTokenFileEnv, ""), "File holding the bearer token sent to --"+upstreamURLFlag+", which must then be https://; read again when it is rotated (empty sends no credential)")
+	fs.StringVar(&cfg.upstreamCAFile, upstreamCAFileFlag, envOrDefault(upstreamCAFileEnv, ""), "PEM bundle of the root CAs the https:// --"+upstreamURLFlag+" server is verified against, re-read when it changes (empty uses the system roots)")
 	fs.BoolVar(&cfg.denyStreaming, "deny-streaming", envBoolOrDefault(denyStreamingEnv, false), "Refuse watch requests, pod log follow streams, and protocol upgrades")
 	fs.StringVar(&cfg.hostClusterID, "host-cluster-id", envOrDefault(hostClusterIDEnv, ""), "Optional gke_ cluster ID to route through the in-cluster ServiceAccount instead of Google credentials")
 	fs.BoolVar(&cfg.redactSecrets, "redact-secrets", envBoolOrDefault(redactSecretsEnv, true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
@@ -305,6 +323,15 @@ func inClusterConfig(apiServer, caFile, tokenFile string) *rest.Config {
 	}
 }
 
+// upstreamCAReloadError reports a changed --upstream-ca-file that could not be loaded the
+// way main reports a changed server certificate: a warning and the reload failure counter.
+func upstreamCAReloadError(logger *slog.Logger, metrics *k8sapiproxy.Metrics) func(error) {
+	return func(err error) {
+		logger.Warn("verifying the upstream against the previous CA bundle: the changed --"+upstreamCAFileFlag+" could not be loaded", "err", err)
+		metrics.RecordCertificateReloadFailure()
+	}
+}
+
 func parseAllowedCallers(raw string) ([]string, error) {
 	var callers []string
 	for _, entry := range strings.Split(raw, ",") {
@@ -374,6 +401,7 @@ func buildHandler(
 				Audience:        cfg.audience,
 				AllowedCallers:  callers,
 				AudienceCallers: audienceCallers,
+				Logger:          logger,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize TokenReview authenticator: %w", err)
@@ -412,6 +440,11 @@ func buildHandler(
 	var inClusterAlias string
 	var defaultClusterID string
 	staticURL := strings.TrimSpace(cfg.upstreamURL)
+	upstreamTokenFile, upstreamCAFile := strings.TrimSpace(cfg.upstreamTokenFile), strings.TrimSpace(cfg.upstreamCAFile)
+	if staticURL == "" && (upstreamTokenFile != "" || upstreamCAFile != "") {
+		// Ignored, they would leave the operator believing a credential or a CA applied.
+		return nil, errors.New("--" + upstreamTokenFileFlag + " and --" + upstreamCAFileFlag + " require --" + upstreamURLFlag)
+	}
 	if staticURL != "" {
 		if strings.TrimSpace(cfg.hostClusterID) != "" {
 			return nil, errors.New("--upstream-url cannot be combined with --host-cluster-id")
@@ -425,9 +458,20 @@ func buildHandler(
 		if strings.TrimSpace(cfg.scopeFile) != "" || strings.TrimSpace(cfg.holdFile) != "" || strings.TrimSpace(cfg.excludeHostCluster) != "" {
 			return nil, errors.New("--upstream-url cannot be combined with --scope-file, --hold-file or --exclude-host-cluster-id")
 		}
-		st, err := upstream.NewStatic(upstream.StaticConfig{URL: staticURL})
+		st, err := upstream.NewStatic(upstream.StaticConfig{
+			URL:             staticURL,
+			BearerTokenFile: upstreamTokenFile,
+			CAFile:          upstreamCAFile,
+			OnCAReloadError: upstreamCAReloadError(logger, metrics),
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize static upstream transport: %w", err)
+		}
+		if upstreamTokenFile != "" && slices.Contains(modes, authModeNone) {
+			logger.Warn(unauthenticatedTokenWarning, "auth_mode", authModeNone, "listen_addr", cfg.listenAddr, logKeyUpstreamTokenFile, upstreamTokenFile)
+		}
+		if upstreamTokenFile != "" || upstreamCAFile != "" {
+			logger.Info("static upstream configured", logKeyUpstreamTokenFile, upstreamTokenFile, logKeyUpstreamCAFile, upstreamCAFile)
 		}
 		upstreamTransport = st
 		defaultClusterID = k8sapiproxy.InClusterID

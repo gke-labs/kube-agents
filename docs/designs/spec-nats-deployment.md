@@ -658,7 +658,11 @@ Layout:
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for. Amended 9/28: the
+  between calls are named there as what the term does not size for. The supervisor
+  cutoff's stored-time ephemerals (#6466; up to four per gateway or MCP server process, each
+  held about five seconds) are deliberately not in `a2aTasksReservedConsumersFor` and come
+  out of the stream's headroom: an existing `TASKS` stream can't grow to a wider reserve,
+  and the provision check would refuse it on the upgrade. Amended 9/28: the
   replay term scales with the bridge's worker count, which the render reads as
   `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` and, when the operator renders the
   bridge itself, off the operator's `A2A_BRIDGE_CONCURRENCY` setting, read by the same rule
@@ -779,8 +783,7 @@ Layout:
   ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
-  other legitimate destination, save the credential broker on its one port when the
-  operator's `A2A_SESSION_CLUSTER_VIEW` flag is on; see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
+  other legitimate destination, save the credential broker on its one port under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it); see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
   ServiceAccount and a projected bus token, so the reason for the fence's shape changed
   while the fence did not. The kubelet delivers that token through a volume, so the
   credential arrives without the pod dialling anything, and this policy is what withholds
