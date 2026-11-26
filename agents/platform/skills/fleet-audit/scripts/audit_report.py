@@ -12478,7 +12478,19 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
     the full `parse_remediate_commands` gate against the real finding set.
     `all` is not expanded here — it names no specific file to write.
     """
-    targets: set[str] = set()
+    return sorted(remediate_request_times(comments))
+
+
+def remediate_request_times(comments: list[dict]) -> dict[str, str]:
+    """Each id an authorized `/remediate` names, to its newest request's `createdAt`.
+
+    The same reading as `pending_remediate_targets`, with the time kept:
+    `plan_generated_fixes` lets a request newer than a pull request's close
+    or merge set that pull request aside, as `promotion_candidates` does for
+    a human close. An id whose comments carry no time maps to `""`, which
+    never counts as newer than anything (`timestamp_strictly_after`).
+    """
+    times: dict[str, str] = {}
     for comment in comments or []:
         if is_machine_author(comment):
             continue
@@ -12488,11 +12500,14 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         body = strip_block_quotes(
             strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
         )
+        created_at = str(comment.get("createdAt", "") or "")
         for raw in REMEDIATE_RE.findall(body):
             target = raw.strip().strip("`")
-            if target and target != "all":
-                targets.add(target)
-    return sorted(targets)
+            if not target or target == "all":
+                continue
+            if target not in times or newer_timestamp(times[target], created_at):
+                times[target] = created_at
+    return times
 
 
 # --------------------------------------------------------------------------- #
@@ -19622,6 +19637,7 @@ def plan_generated_fixes(
     probe: "_RepositoryProbe",
     audit_id: str = "",
     notes: dict[str, str] | None = None,
+    requested_at: dict[str, str] | None = None,
 ) -> tuple[dict[str, tuple[str, str]], set[str]]:
     """`(planned, answered)`: finding id to `(path, text)` for each fix
     `finish` can write itself, and the ids a pull request already answers.
@@ -19641,12 +19657,27 @@ def plan_generated_fixes(
     candidates with a script and this was the fix it kept leaving `manual`.
     Nothing is written here, so a run that is refused for another fix leaves
     nothing behind.
+
+    `requested_at` is each id a ledger `/remediate` names, to the time of its
+    newest request (`remediate_request_times`). A merged or closed pull
+    request does not answer a finding a person asked for after it closed: the
+    budget is planned again and `promotion_candidates` opens it. Without
+    this, a budget whose first pull request merged and was later removed from
+    the repository stayed `manual` for good, and every `/remediate` on it was
+    refused as not a `manifest` (#7013). A request older than the close
+    leaves the pull request answering, so an old comment never re-proposes
+    a budget a person merged and then removed.
     """
     candidates = {_candidate_identity(entry, candidate): (entry, candidate) for entry, candidate in _candidates(manifest)}
+    asked_at = requested_at or {}
     carried: dict[str, list[dict]] = {}
     for pr in prs:
         if not pr_closed_by_harness(pr):
             for fid in parse_delta_block(pr.get("body")):
+                if str(pr.get("state") or "").upper() != "OPEN" and timestamp_strictly_after(
+                    asked_at.get(fid), str(pr.get("closedAt") or "")
+                ):
+                    continue
                 carried.setdefault(fid, []).append(pr)
     planned: dict[str, tuple[str, str]] = {}
     answered: set[str] = set()
@@ -24958,6 +24989,7 @@ def _plan_remediation_files(
     unlisted: list[str],
     listing_may_refuse: bool = False,
     kcc_index: dict[KccKey, KccDeclaration] | None = None,
+    requested_at: dict[str, str] | None = None,
 ) -> _FixPlan:
     """`finish`'s last step before it publishes: refuse an unwritten fix, then write the fixes it derives.
 
@@ -24970,6 +25002,9 @@ def _plan_remediation_files(
     plan carries the refusal (`listing_refusal`), no proposal, the sweep off,
     and no unwritten-fix refusal, because no fix can be told to exist. The
     store ledger asks for this: its store write is the only record of the run.
+
+    `requested_at` is the ledger's `/remediate` requests with their times, for
+    `plan_generated_fixes`; the store ledger has no thread and passes none.
 
     Last, it adds the route notes to each `manual` remediation
     (`disclose_manual_routes_and_log`) and the Config Connector note to each
@@ -25017,7 +25052,8 @@ def _plan_remediation_files(
     skipped: dict[str, str] = {}
     try:
         planned, answered = plan_generated_fixes(
-            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped
+            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped,
+            requested_at=requested_at,
         )
         # A decline of a budget `finish` can write is not taken: the worker's
         # reason was the shortcut the refusal exists to stop.
@@ -26924,10 +26960,22 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     held_collector_ids = [] if carried_without_manifest else [e["id"] for e in held_entries]
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
+    # Read ahead of the plan, so a budget a person asked for is planned even
+    # when an earlier pull request for it merged or closed
+    # (`plan_generated_fixes`); the requests below parse the same comments.
+    # Only with a manifest, which every budget `finish` writes is built from:
+    # a run without one reads them where it always did. A clean run reads its
+    # own, so nothing is fetched for one.
+    early_comments = (
+        fetch_issue_comments(repo, existing_issue)
+        if findings and existing_issue and answers_remediate and manifest is not None
+        else None
+    )
     fix_plan = _plan_remediation_files(
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
         promised=promised, degraded=degraded, unlisted=unlisted, kcc_index=kcc_index,
+        requested_at=remediate_request_times(early_comments or []),
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     unlinked_paths, file_url, file_ref = fix_plan.unlinked_paths, fix_plan.file_url, fix_plan.file_ref
@@ -27593,7 +27641,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         )
 
     ledger_comments = (
-        fetch_issue_comments(repo, existing_issue)
+        early_comments
+        if early_comments is not None
+        else fetch_issue_comments(repo, existing_issue)
         if existing_issue and answers_remediate
         else []
     )

@@ -950,11 +950,11 @@ resource "google_container_node_pool" "seeded_c_default" {
     # (defects-c.tf) by this label and carries no matching
     # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, so the
     # scheduler places untargeted pods on it until it is full and the
-    # autoscaler's pre-filter then drops them. With this the cluster has no
-    # untainted pool without a class label, which is what lets the
-    # obtainability audit's 3.24 file the untargeted workloads in
-    # defects-c.tf. A label change is an in-place pool update on provider 8.x
-    # (GKE relabels the node without re-creating it); the disk and kubelet
+    # autoscaler's pre-filter (GKE 1.35.6 and later) then drops them. With
+    # this the cluster has no untainted pool without a class label, which is
+    # what lets the obtainability audit's 3.24 file the untargeted workloads
+    # in defects-c.tf. A label change is an in-place pool update on provider
+    # 8.x (GKE relabels the node without re-creating it); the disk and kubelet
     # settings around it stay the drift-pool-outlier fixture.
     # Addressed by the untainted-compute-class-pool role.
     labels = {

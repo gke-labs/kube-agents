@@ -26,7 +26,8 @@ const placeholderKey = "gateway-proxy-owns-the-key"
 // WebSearch does on Claude Code; it works only where the endpoint behind
 // the proxy offers it.
 //
-// The base URL and its proxy wiring come with the model-routing change (#7158).
+// The adapter strips every other model endpoint and credential from this
+// process's environment (a2a/cmd/worker-adapter, startHarnessGateway).
 func buildModel(ctx context.Context, name string, webSearch bool) (adkmodel.LLM, error) {
 	cfg := config.DefaultConfig()
 	cfg.Model.Provider = config.ProviderGemini

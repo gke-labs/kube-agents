@@ -234,15 +234,16 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("nats auth", "err", err)
 		return err
 	}
-	client, err := lib.Connect(ctx, cfg.NATSURL,
+	// The profile supervisor gate (#5301): the cutoff and the profile names,
+	// both unset until the operator renders them from the latched profile
+	// supervisor form. A malformed cutoff reads as latched at this start.
+	gate := lib.ProfileSupervisorGateFromEnv(ctx, os.Getenv, log)
+	client, err := lib.Connect(ctx, cfg.NATSURL, append([]lib.ClientOption{
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
 		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
-		// Unset until the operator renders it from the latched profile
-		// supervisor form (#5301); a malformed value reads as unset.
-		lib.WithProfileSupervisorCutoff(lib.ProfileSupervisorCutoffFromEnv(os.Getenv, log)),
-	)
+	}, gate.ClientOptions()...)...)
 	if err != nil {
 		log.Error("nats connect", "err", err)
 		return err
@@ -258,6 +259,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// relays, the Chat adapter counts its pulls, the Slack adapter reports its
 	// connection, and the metrics listener serves them all (gateway/metrics.go).
 	metrics := gateway.NewMetrics()
+	metrics.SetProfileSupervisorGate(gate, client.ProfileSupervisorDrops)
 	backendAdapters, err := buildBackendAdapters(cfg, metrics, log)
 	if err != nil {
 		log.Error("adapter", "backends", cfg.Backends(), "err", err)
@@ -352,6 +354,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String(),
+		"dmIdleTTL", cfg.DMIdleTTL.String(),
 		"elected", cfg.Elected())
 	if !cfg.Elected() {
 		return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {

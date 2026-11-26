@@ -102,6 +102,9 @@ One field is not a parameter: `intent=confirm` submits the ask as a structured c
 refuses any other; a directive without it sends a typed message. The door takes the confirm only
 where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
 which is infrastructure, since the agent never saw the ask.
+A case with the directive can be side B of a permit pair: a second case puts the same ask and
+checks to the platform agent, `hack/eval/permit-pairs.txt` names the two, and the lint holds them
+equal ([permit-pairs.md](permit-pairs.md)).
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -816,6 +819,8 @@ drift check, so `validate_all()` does not carry it; the lint asserts on
 `sanitization_findings()` in its own right. The same way, it rejects any file committed under
 a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
 or on the dev install, and the case cites the run by its directory name or build id.
+With no path given, it also rejects a line of `hack/eval/permit-pairs.txt` whose two cases are not
+a pair (`permit_pair_problems()`, [permit-pairs.md](permit-pairs.md)).
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

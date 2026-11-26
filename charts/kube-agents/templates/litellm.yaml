@@ -210,9 +210,9 @@
 {{- $generateMasterKey := ne ((.Values.litellm.masterKey | default dict).generate) false }}
 {{- /*
   The caller-key map: digests of the caller keys and their classes, never a
-  key. Nothing in the install writes this Secret yet (the operator is to);
-  until something does, the optional volume is empty and the hook knows no
-  caller key, which leaves every caller keyless.
+  key. The operator writes this Secret (its inference_keys.go); until it
+  does, the optional volume is empty and the hook knows no caller key, so it
+  admits a call only as keyless.
   Mounted as a directory, not subPath, so the kubelet's in-place updates
   reach the file and the hook's re-read sees them without a restart. The
   directory and file name are the hook's DEFAULT_CALLER_KEYS_FILE.

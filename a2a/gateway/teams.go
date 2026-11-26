@@ -241,6 +241,20 @@ type TeamsAdapter struct {
 	// to the global host; serviceURLOrder is its eviction queue.
 	serviceURLs     map[string]string
 	serviceURLOrder []string
+	// recorder is the gateway's feedback desk, nil until it is handed over
+	// (SetFeedbackRecorder): without one no rating controls are drawn.
+	// rated remembers each message posted with them, by its id, so a press
+	// can be recorded with the answer's text and the card redrawn;
+	// ratedOrder is its eviction queue (teams_feedback.go).
+	recorder   FeedbackRecorder
+	rated      map[string]teamsRated
+	ratedOrder []string
+	// rateMu runs the ratings, which are off the pull loop, one at a time,
+	// so a rating and the redraw it causes are never interleaved with
+	// another's. It does not order two presses pulled back to back.
+	rateMu sync.Mutex
+	// rating counts the ratings in flight, for a test to wait on.
+	rating sync.WaitGroup
 
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
@@ -266,6 +280,7 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		log:           log,
 		seen:          map[string]bool{},
 		serviceURLs:   map[string]string{},
+		rated:         map[string]teamsRated{},
 		allowed:       map[string]bool{},
 		countInterval: teamsEventCountInterval,
 	}, nil
@@ -829,17 +844,25 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 // PostMessage and EditMessage post text only: a chat message falls back to
 // its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
-// (teams_press.go); an edit that names no task removes it.
+// (teams_press.go); an edit that names no task removes it. An answer marked
+// for feedback (m.Feedback) carries the rating controls on its card, once
+// the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	if m.Chat == nil && m.Stop != "" {
+	switch {
+	case m.Chat == nil && m.Stop != "":
 		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		return a.postRated(conversation, m)
 	}
 	return postTextOnly(a.Post, conversation, m)
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
-	if m.Chat == nil && m.Stop != "" {
+	switch {
+	case m.Chat == nil && m.Stop != "":
 		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		return a.editRated(conversation, messageID, m)
 	}
 	return editTextOnly(a.Edit, conversation, messageID, m)
 }

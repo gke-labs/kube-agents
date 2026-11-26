@@ -121,6 +121,12 @@ type SessionRecord struct {
 	// which the design of record counts from the last user message; zero on
 	// records written before the field existed.
 	LastUserMessage time.Time `json:"lastUserMessage,omitzero"`
+	// SteeredSession is the BusSession a human last steered a running task
+	// on: a follow-up sent before the answer, which goes to the running task
+	// rather than starting one, so it adds no TaskRef. singleTurnDM reads it
+	// as a second turn for that pod (#2371). Empty on records written before
+	// the field existed, and on a conversation never steered.
+	SteeredSession string `json:"steeredSession,omitempty"`
 	// PodReuse marks PodName as a pod spawned to serve every turn of the
 	// conversation (Config.SessionReuse at spawn). Only such a pod is
 	// handed a later task, and only such a pod's running task is held to
