@@ -50,9 +50,10 @@ const (
 	// recorded, so the user is told rather than left waiting for a card's
 	// answer that cannot arrive. Such a turn ends at its acknowledgement
 	// (only a console, MCP or A2A door turn waits on its cards,
-	// waitsForCardsInTurn),
-	// and most file no card, hence "if".
-	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
+	// waitsForCardsInTurn), and most file no card, hence "any". It is
+	// user text (.agents/rules/chat_ux.md): no card or route, and a next
+	// step, since asking again records the route afresh.
+	routeLostNote = "\n\nI couldn't save this conversation's details, so any answer from work I started in the background won't be posted here. Ask again in a minute."
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name

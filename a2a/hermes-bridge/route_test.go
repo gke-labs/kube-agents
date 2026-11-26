@@ -361,6 +361,20 @@ func TestAPI_ARouteThatCannotBeRecordedIsSaidInTheAnswer(t *testing.T) {
 	}
 }
 
+// The route-lost note is user text: it names none of the bridge's internals
+// (.agents/rules/chat_ux.md, "No plumbing in user text") and says what to do.
+func TestRouteLostNoteIsPlainUserText(t *testing.T) {
+	note := strings.ToLower(routeLostNote)
+	for _, word := range []string{"card", "route", "record", "task", "session", "kanban", "board"} {
+		if strings.Contains(note, word) {
+			t.Errorf("routeLostNote = %q, carries the internal name %q", routeLostNote, word)
+		}
+	}
+	if !strings.Contains(note, "ask again") {
+		t.Errorf("routeLostNote = %q, want it to say what would work instead", routeLostNote)
+	}
+}
+
 // A later task of the same session whose PUT fails, when an earlier task
 // recorded the same route, loses nothing: the store still holds that route,
 // so the answer carries no route-lost note.

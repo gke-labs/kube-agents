@@ -14,6 +14,7 @@ paths:
   - "a2a/gateway/child_waiting.go"
   - "a2a/gateway/stopgate.go"
   - "a2a/hermes-bridge/chat*.go"
+  - "a2a/hermes-bridge/route.go"
   - "a2a/lib/chatmsg/**"
   - "deploy/docker/patches/kanban_notifier.py"
   - "deploy/docker/patches/kanban_progress_lines.py"
