@@ -47,19 +47,20 @@
 # is withdrawn by moving its line from presubmit-cases.txt back to
 # nightly-cases.txt, no roster edit.
 
-reliability-pdb-probe
-capacity-pinned-pool-probe
-security-overgrant-probe
-upgrades-lagging-master-probe
-cost-idle-pool-probe
-consistency-drift-outlier
-obtainability-remediation-proposal
-pdb-remediation-pr
-cluster-agent-crashloop-debug
-cluster-agent-crashloop-misleading-symptom
-cluster-agent-crashloop-evidence-chain
-incident-triage-oom-event-probe
-monitoring-alert-policy-read
-agent-kanban-smoke
-vcs-spent-branch-reuse
-compliance-rbac-overgrant
+# twin-7177: reliability-pdb-probe
+# twin-7177: capacity-pinned-pool-probe
+# twin-7177: security-overgrant-probe
+# twin-7177: upgrades-lagging-master-probe
+# twin-7177: cost-idle-pool-probe
+# twin-7177: consistency-drift-outlier
+# twin-7177: obtainability-remediation-proposal
+# twin-7177: pdb-remediation-pr
+# twin-7177: cluster-agent-crashloop-debug
+# twin-7177: cluster-agent-crashloop-misleading-symptom
+# twin-7177: cluster-agent-crashloop-evidence-chain
+# twin-7177: incident-triage-oom-event-probe
+# twin-7177: monitoring-alert-policy-read
+# twin-7177: agent-kanban-smoke
+# twin-7177: vcs-spent-branch-reuse
+# twin-7177: compliance-rbac-overgrant
+profile-delegates-a-read-and-uses-it
