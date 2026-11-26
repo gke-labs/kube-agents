@@ -488,6 +488,37 @@ func TestTeamsReAskBeforeTheRedrawKeepsItsChoices(t *testing.T) {
 	}
 }
 
+// A bold line sheds the bold pairs inside it, is left plain when wrapping
+// would run into a star of its own, and never reads as a heading or a fence.
+func TestTeamsBoldLine(t *testing.T) {
+	for _, c := range [][2]string{
+		{"Found one thing.", "**Found one thing.**"},
+		{"Why **checkout-gateway** failed", "**Why checkout-gateway failed**"},
+		{"*.yaml files are out of sync", "*.yaml files are out of sync"},
+		{"No match for kube-*", "No match for kube-*"},
+		{"*Warning*", "*Warning*"},
+		{"# **x**", "**# x**"},
+		{"``` **x**", "**``` x**"},
+		{"# No match for kube-*", teamsChatPlainGuard + "# No match for kube-*"},
+		{"``` kube-*", teamsChatPlainGuard + "``` kube-*"},
+		{"the glob **/*.yaml matches", "the glob **/*.yaml matches"},
+	} {
+		if got := teamsBoldLine(c[0]); got != c[1] {
+			t.Errorf("teamsBoldLine(%q) = %q, want %q", c[0], got, c[1])
+		}
+	}
+	m := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Found one thing.", Detail: "## # No match for kube-*\nplain"}
+	layout, err := renderTeamsChat(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(layout.Text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), teamsChatHeading) {
+			t.Errorf("a line still reads as a heading: %q", line)
+		}
+	}
+}
+
 // A code fence a section leaves open is closed where the section ends, so
 // the sections after it are not drawn as code.
 func TestTeamsChatClosesAFenceASectionLeavesOpen(t *testing.T) {

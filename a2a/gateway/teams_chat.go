@@ -52,6 +52,11 @@ const (
 	// builder would draw larger than the bold headline; the renderer
 	// draws it as a bold line, as Google Chat does.
 	teamsChatHeading = "#"
+	// teamsChatPlainGuard fronts a line the renderer leaves plain that
+	// starts like a heading or a code fence: a zero-width space, which
+	// draws as nothing and is not the white space the card builder trims,
+	// so the line is a paragraph to it.
+	teamsChatPlainGuard = "\u200b"
 	// teamsChatIndent sets a plan's steps in from its title: braille
 	// blanks, which draw as space and are not the Unicode white space the
 	// card builder trims from each line.
@@ -127,10 +132,19 @@ func teamsChatHead(m *chatmsg.Message) string {
 	return strings.Join(head, " ")
 }
 
-// teamsBoldLine is text in bold, left as it is when it carries the mark
-// itself, which would otherwise close the bold early.
+// teamsBoldLine is text as one bold line, as slackBoldLine draws it: the
+// bold pairs inside it are shed first, and a text that still holds the
+// mark or starts or ends on a star (`*.yaml`, `kube-*`, edge emphasis) is
+// left plain, since wrapping it would run the added marks into its own. A
+// text left plain that would read as a heading or a code fence is guarded,
+// so the card builder draws it as a line.
 func teamsBoldLine(text string) string {
-	if strings.Contains(text, teamsChatBold) {
+	text = strings.TrimSpace(shedBoldPairs(text))
+	if strings.Contains(mdCodeSpanRE.ReplaceAllString(text, ""), teamsChatBold) ||
+		strings.HasPrefix(text, mdEmphasisStar) || strings.HasSuffix(text, mdEmphasisStar) {
+		if strings.HasPrefix(text, teamsChatHeading) || teamsOpensFence(text) > 0 {
+			return teamsChatPlainGuard + text
+		}
 		return text
 	}
 	return teamsChatBold + text + teamsChatBold
