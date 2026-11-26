@@ -2221,6 +2221,9 @@ func TestInjectReadRouteCarriesTheTasksUsage(t *testing.T) {
 	if addressees := string(plain["childAddressees"]); addressees != "[]" {
 		t.Fatalf("childAddressees = %s on a turn that delegated nothing; want []", addressees)
 	}
+	if count := string(plain["childCount"]); count != "0" {
+		t.Fatalf("childCount = %s on a turn that delegated nothing; want 0", count)
+	}
 	raw, ok := r.probeRaw(t, reply.Conversation, reply.TaskID, asked)["usage"]
 	if !ok {
 		t.Fatalf("no usage on a read that asked for it")
@@ -2256,6 +2259,41 @@ func TestInjectProbeCarriesTheChildAddressees(t *testing.T) {
 	}
 	if got := string(wire["childAddressees"]); got != `["tse","platform"]` {
 		t.Fatalf("childAddressees on the wire = %s, want [\"tse\",\"platform\"]", got)
+	}
+}
+
+// The read route counts the chain's children as childCount beside the
+// addressees, and sends null, not 0, when the read had no task to count for.
+func TestInjectProbeCarriesTheChildCount(t *testing.T) {
+	door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	three := 3
+	for _, tc := range []struct {
+		name  string
+		count *int
+		want  string
+	}{
+		{"counted", &three, "3"},
+		{"unknown", nil, "null"},
+	} {
+		door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
+			return ConversationState{TaskID: "task-1", ChildAddressees: []string{"platform"}, ChildCount: tc.count}, nil
+		})
+		report := door.runProbe(context.Background(), injectKeyPrefix+"delegated", "task-1", false)
+		data, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal(data, &wire); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := wire["childCount"]
+		if !ok || string(got) != tc.want {
+			t.Fatalf("%s: childCount on the wire = %s (present %v), want %s", tc.name, got, ok, tc.want)
+		}
 	}
 }
 

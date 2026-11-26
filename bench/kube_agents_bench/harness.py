@@ -1310,6 +1310,37 @@ _MAX_SILENT_TURNS = 3
 _MAX_TRANSPORT_FAILURES = 3
 
 
+def _predates_run(created_at: int | None, floor: int | None) -> bool:
+    """Whether a card was filed before the run started (``created_at`` under the pod-clock ``floor``).
+
+    Such a card is not this run's: its create was handed an existing card by
+    its idempotency key, most likely an earlier repetition's (#4794), so the
+    repetition that waits on it is not independent.
+    """
+    return created_at is not None and floor is not None and created_at < floor
+
+
+def _vanished_card_error(task_id: str, created_at: int | None, floor: int | None) -> str:
+    """The error for an awaited card the board stopped having a row for.
+
+    For a card that predates the run (:func:`_predates_run`) it says what was
+    checked, and only names the likely cause: a purge that owed an earlier
+    repetition's card deletes it once it stops running, possibly before this
+    wait reads it settled.
+    """
+    message = (
+        f"card {task_id} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+        "dropped from the delegation wait, nothing graded for it"
+    )
+    if _predates_run(created_at, floor):
+        message += (
+            "; it was filed before this run started, so this run did not file it and this repetition "
+            "is not independent (most likely an earlier repetition's card, handed back by its "
+            "idempotency key and deleted by the purge that owed it)"
+        )
+    return message
+
+
 def _append_final(result: AgentResult, sections: list[str]) -> None:
     """Fold delegated deliverables into the run-level final message.
 
@@ -3110,6 +3141,8 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
             )
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
+        if timed_out and settled is not None and settled.fold.child_count is not None:
+            exchange.fold.child_count = settled.fold.child_count
     return timed_out, stop_pending
 
 
@@ -3410,6 +3443,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
         metadata={
             "transport": TRANSPORT_INJECT,
             "child_addressees": None if fold.child_addressees is None else list(fold.child_addressees),
+            "child_count": fold.child_count,
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
@@ -3770,6 +3804,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
             child_addressees=result.metadata.get("child_addressees"),
+            child_count=result.metadata.get("child_count"),
         )
         _write_chat_shape(result)
         return result
@@ -5864,7 +5899,9 @@ class KubeAgentsHarness(AgentHarness):
         :data:`_MAX_AWAITED_TASKS`, and lets a card the session files later
         join the wait. A card the board has no row for on
         :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
-        wait with a line on ``errors``, and nothing is graded for it.
+        wait with a line on ``errors`` (:func:`_vanished_card_error`), and
+        nothing is graded for it. A card filed before the run started
+        (:func:`_predates_run`) is logged as a warning when first read.
 
         Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
         running. Returns ``False``, having changed nothing else, when the store
@@ -5942,6 +5979,14 @@ class KubeAgentsHarness(AgentHarness):
         missing: list[str] = []
         awaited: list[str] = []
         capped = False
+        # Each awaited card's ``created_at`` from the last read that had its row,
+        # and the awaited cards already logged as filed before the run started
+        # (_predates_run): this run did not file them, so it is not independent
+        # whether they settle or leave the board mid-wait (#4794). Logged, not put
+        # on errors, which the scorer reads: what such a run counts for is
+        # #4658's call. A dropped one also gets its errors line.
+        created: dict[str, int | None] = {}
+        predating: set[str] = set()
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(
@@ -5975,14 +6020,21 @@ class KubeAgentsHarness(AgentHarness):
                 None if capped else result,
             )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            # Every card the read has a row for, awaited or past the cap: a card the
+            # cap held back can be deleted before a freed slot promotes it.
+            for t, card in read.cards.items():
+                created[t] = card.get("created_at")
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
+                if t not in predating and _predates_run(created.get(t), self._pod_floor):
+                    predating.add(t)
+                    _log.warning(
+                        "awaited card %s was filed before this run started, so this run did not "
+                        "file it and this repetition is not independent", t,
+                    )
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
-                result.errors.append(
-                    f"card {t} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
-                    "dropped from the delegation wait, nothing graded for it"
-                )
+                result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
             missing.extend(gone)
             awaited = [t for t in awaited if t not in gone]
             return [t for t in awaited if not _is_terminal(t)]

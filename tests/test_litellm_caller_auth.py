@@ -78,6 +78,10 @@ _CALLER_ROUTES = {
     "/v1/model/info",
     "/health",
 }
+# The core-agent worker harness's Gemini-format generation calls: the
+# hook admits the three methods exactly, and the token's allowed_routes carries
+# the wildcard LiteLLM's own route check matches.
+_GEMINI_ROUTE_TEMPLATES = {"/v1beta/models/*"}
 _MASTER = "sk-master-0123456789abcdefghijklmnopqrstuvwxyz0123"
 _AGENT_KEY = "agent-key-not-sk-prefixed-0123456789abcdef"
 _OTHER_KEY = "AIzaSyNotARealKeyButShapedLikeOne0123456789"
@@ -186,7 +190,7 @@ class TestWhoIsAdmitted(_HookTestCase):
         self.assertEqual(token.team_id, "agent-gateway")
         self.assertEqual(token.team_alias, "agent-gateway")
         self.assertEqual(token.user_role, "internal_user")
-        self.assertEqual(set(token.allowed_routes), _CALLER_ROUTES)
+        self.assertEqual(set(token.allowed_routes), _CALLER_ROUTES | _GEMINI_ROUTE_TEMPLATES)
 
     def test_an_sk_prefixed_known_key_is_still_stored_as_its_digest(self):
         key = "sk-" + _AGENT_KEY
@@ -209,7 +213,7 @@ class TestWhoIsAdmitted(_HookTestCase):
                 self.assertEqual(token.api_key, "keyless")
                 self.assertEqual(token.key_alias, "keyless")
                 self.assertEqual(token.team_id, "keyless")
-                self.assertEqual(set(token.allowed_routes), _CALLER_ROUTES)
+                self.assertEqual(set(token.allowed_routes), _CALLER_ROUTES | _GEMINI_ROUTE_TEMPLATES)
 
     def test_every_placeholder_a_caller_sends_is_keyless(self):
         self.assertEqual(set(self.hook.PLACEHOLDER_KEYS), _CALLER_PLACEHOLDERS)
@@ -267,6 +271,36 @@ class TestRoutes(_HookTestCase):
                     refusal = self.refused(key, path)
                     self.assertEqual(refusal.status_code, 401)
                     self.assertEqual(refusal.detail, self.hook.REFUSED_ROUTE_DETAIL)
+
+    def test_the_gemini_generation_routes_admit_keyless_and_known_callers(self):
+        self.write_map({_digest(_AGENT_KEY): "agent-gateway", _digest(_PROBE_KEY): "gateway-probe"})
+        for path in (
+            "/v1beta/models/gemini-3.8-flash:streamGenerateContent",
+            "/v1beta/models/model-default:generateContent",
+            "/v1beta/models/model-default:countTokens",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.call(None, path).key_alias, "keyless")
+                self.assertEqual(self.call(_AGENT_KEY, path).key_alias, "agent-gateway")
+                # The probe key lists models and nothing else.
+                self.assertEqual(self.refused(_PROBE_KEY, path, "POST").status_code, 401)
+
+    def test_other_gemini_paths_are_refused(self):
+        # Only the three generation methods on one model name, matched whole.
+        for path in (
+            "/v1beta/models",
+            "/v1beta/models/model-default",
+            "/v1beta/models/model-default:embedContent",
+            "/v1beta/models/model-default:batchGenerateContent",
+            "/v1beta/models/a/b:generateContent",
+            "/v1beta/models/:generateContent",
+            "/v1beta/models/model-default:generateContentX",
+            "/v1beta/files",
+            "/v1beta/cachedContents",
+        ):
+            with self.subTest(path=path):
+                for key in (None, _AGENT_KEY):
+                    self.assertEqual(self.refused(key, path).status_code, 401)
 
     def test_the_admin_reaches_any_route(self):
         for path in ("/key/generate", "/health/test_connection", "/v1/chat/completions"):

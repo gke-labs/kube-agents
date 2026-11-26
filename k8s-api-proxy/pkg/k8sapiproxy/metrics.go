@@ -181,6 +181,7 @@ var (
 		ReasonExcludeUnreadable:        {},
 		ReasonHeldCluster:              {},
 		ReasonHoldUnreadable:           {},
+		ReasonAuthorizeRefused:         {},
 	}
 
 	knownOutcomes = map[string]struct{}{

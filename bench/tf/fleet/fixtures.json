@@ -6,7 +6,7 @@
   "cluster_slots": {
     "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the declared zonal pool and the pool that names a missing reservation (both at zero nodes), the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
-    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with podPidsLimit 4096 where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
+    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with podPidsLimit 4096 where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, ComputeClass `reserved-ccc` with no pool, which names a reservation that does not exist, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
@@ -1595,6 +1595,34 @@
         }
       ]
     },
+    "state-sync-controller": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/state-sync-controller"],
+      "fixture": "state-sync-controller Deployment (one replica) in seeded-shapes whose container startup argument passes --kube-api-qps=-1 to an inert sleep process, planting a controller with a negative client QPS (client-side rate limit disabled) for control-plane-configmap-lease-write-storm without generating API server write load",
+      "state": [
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the fixture is a running controller Deployment; a scaled-down or unscheduled pod is not an active controller shape"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready while the new pod waits; the controller omits unavailableReplicas when every replica is available"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "spec.template.spec.containers[*].args[*]",
+          "op": "any_eq",
+          "value": "--kube-api-qps=-1",
+          "why": "a negative QPS (--kube-api-qps=-1) disables client-side Kubernetes API rate limiting in client-go, the shape control-plane-configmap-lease-write-storm requires"
+        }
+      ]
+    },
     "scaled-zero-gateway": {
       "cluster_slot": "a",
       "namespace": "seeded-scaled-zero",
@@ -1666,7 +1694,7 @@
           "subject": "instance/startup-fail-*",
           "op": "serial_contains",
           "value": "Script \"startup-script\" failed with error",
-          "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector finds no failure line and files nothing, so gce-startup-script-failure has no finding to grade. Each reconcile resets the VM to print it again"
+          "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector writes a note on the target and files nothing, so gce-startup-script-failure has no finding to grade. Each reconcile resets the VM to print it again"
         }
       ]
     },
@@ -1982,7 +2010,7 @@
         "node?cloud.google.com/compute-class=general-ccc",
         "computeclass/general-ccc"
       ],
-      "fixture": "default-pool labelled cloud.google.com/compute-class=general-ccc with no matching NoSchedule taint, so the scheduler fills it with untargeted pods before the autoscaler's pre-filter drops them; also what gives the cluster no untainted pool without a class label",
+      "fixture": "default-pool labelled cloud.google.com/compute-class=general-ccc with no matching NoSchedule taint, so the scheduler fills it with untargeted pods before the autoscaler's pre-filter (GKE 1.35.6 and later) drops them; also what gives the cluster no untainted pool without a class label",
       "state": [
         {
           "subject": "cluster",
@@ -1990,6 +2018,13 @@
           "op": "eq",
           "value": "general-ccc",
           "why": "the label, read off the pool through clusters describe so a node re-creation never reads as drift; without it the cluster has general capacity again and the obtainability audit's 3.24 files nothing for the untargeted workloads"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].config.machineType",
+          "op": "eq",
+          "value": "e2-standard-2",
+          "why": "the room the slot's workloads schedule into. On an e2-medium the node keeps about 60m of CPU unrequested, and a node replacement can leave kube-dns at two replicas on it with the five seeded-compute-class pods Pending for good, which then reads as drift on the four workload roles. No drift facet reads machine type, so this is what says a project the reconcile has not reached is still on the smaller size; a re-apply restores it in place"
         },
         {
           "subject": "node?cloud.google.com/compute-class=general-ccc",
@@ -2028,6 +2063,90 @@
         }
       ]
     },
+    "missing-reservation-compute-class": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": ["computeclass/reserved-ccc"],
+      "fixture": "ComputeClass reserved-ccc, whose first rule asks for one named reservation (affinity Specific, seeded-absent-reservation) that no reservation of the project carries, and whose second rule is a machine type that GKE can create (e2-standard-4). Node pool auto-creation is on, and no workload selects the class, so GKE makes no node pool for it. The class has one NoSchedule taint (dedicated=reserved-ccc), so the obtainability audit does not count it as a general-purpose class, and a pod with no toleration for the taint gets no node from it. GKE accepts the class and marks it misconfigured: the condition CrdMisconfigured is True with the reason ReservationNotFound, and the stockout audit files that status as dangling-compute-class. The stack plants no reservation; the missing one is the defect",
+      "state": [
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[0].reservations.affinity",
+          "op": "eq",
+          "value": "Specific",
+          "why": "the defect is a rule bound to named reservations; with another affinity the rule can take on-demand capacity, and GKE reports no missing reservation"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[0].reservations.specific[*].name",
+          "op": "eq",
+          "value": "seeded-absent-reservation",
+          "why": "the one name of the rule, which no reservation carries; a class edited to name a real reservation is healed, and a case then grades a class with nothing wrong"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[0].machineType",
+          "op": "eq",
+          "value": "n2-standard-2",
+          "why": "the first rule is of another machine family and another size than the second; with the size or the family of the second rule, the two rules differ in one dimension, and the stockout audit files a second finding on the class, for a class with no fallback"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[1].machineType",
+          "op": "eq",
+          "value": "e2-standard-4",
+          "why": "the second rule is the fallback that GKE can create; without it the stockout audit files a second finding on the class, for a class with no fallback"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.nodePoolAutoCreation.enabled",
+          "op": "eq",
+          "value": true,
+          "why": "with auto-creation on, GKE reports the missing reservation; with it off, GKE reports that no node pool matches, says nothing about the reservation, and the audit files a second finding"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.whenUnsatisfiable",
+          "op": "eq",
+          "value": "DoNotScaleUp",
+          "why": "a pod that asks for the class gets no node outside the two rules of the class"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.nodePoolConfig.taints[*].effect",
+          "op": "eq",
+          "value": "NoSchedule",
+          "why": "the one taint of the class; without it the obtainability audit counts a second general-purpose class on the cluster, and its finding on app-worker-a no longer names general-ccc as the target class"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.nodePoolConfig.taints[*].key",
+          "op": "eq",
+          "value": "dedicated",
+          "why": "a dedication taint that a pod must tolerate before GKE makes a node of the class for it; a taint key that a node controller sets does not take the class out of the general-purpose classes"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "status.conditions[?(@.type=='CrdMisconfigured')].status",
+          "op": "eq",
+          "value": "True",
+          "why": "the finding of the audit is this status. It goes away when a reservation of the name exists, and then the class has nothing wrong"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "status.conditions[?(@.type=='CrdMisconfigured')].reason",
+          "op": "eq",
+          "value": "ReservationNotFound",
+          "why": "the reason is the defect; with another reason the class is misconfigured for a cause that no case expects"
+        },
+        {
+          "subject": "node?cloud.google.com/compute-class=reserved-ccc",
+          "path": "metadata.name",
+          "op": "absent",
+          "why": "auto-creation is on, so a pod that asks for the class and tolerates its taint makes GKE create a paid node pool from the second rule. Nothing in the stack or in a case asks for it; a node with the class label means that something did, and the pool is not in the stack's state"
+        }
+      ]
+    },
     "no-nodelocal-dnscache": {
       "cluster_slot": "c",
       "namespace": null,
@@ -2040,6 +2159,54 @@
           "op": "none_eq",
           "value": true,
           "why": "GKE omits a false boolean from clusters describe, so the off state reads as no value; the networking case that names this cluster needs the add-on off, and anyone turning it on heals the defect"
+        }
+      ]
+    },
+    "unaccepted-gateway-class": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": [
+        "gatewayclass/seeded-unaccepted-gw",
+        "gateway/seeded-unaccepted-gateway",
+        "httproute/seeded-unaccepted-route",
+        "gatewayclass/seeded-envoy"
+      ],
+      "fixture": "GatewayClass seeded-unaccepted-gw referencing example.com/unsupported-controller so no controller accepts it, with Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route in seeded-shapes bound to it; GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as the accepted-class negative control on the same cluster",
+      "state": [
+        {
+          "subject": "gatewayclass/seeded-unaccepted-gw",
+          "path": "spec.controllerName",
+          "op": "eq",
+          "value": "example.com/unsupported-controller",
+          "why": "the defect is the unsupported controller path the audit must name; changing controllerName to a supported GKE controller heals the fixture"
+        },
+        {
+          "subject": "gatewayclass/seeded-unaccepted-gw",
+          "path": "status.conditions[?(@.type=='Accepted')].status",
+          "op": "none_eq",
+          "value": "True",
+          "why": "the defect is a GatewayClass no controller has accepted; an Accepted=True condition means a controller reconciled it and the audit would stay silent"
+        },
+        {
+          "subject": "gateway/seeded-unaccepted-gateway",
+          "path": "spec.gatewayClassName",
+          "op": "eq",
+          "value": "seeded-unaccepted-gw",
+          "why": "the Gateway must remain bound to the unaccepted GatewayClass so the audit reports affected Gateways with no proxy Deployment, Service, or address"
+        },
+        {
+          "subject": "httproute/seeded-unaccepted-route",
+          "path": "spec.parentRefs[*].name",
+          "op": "any_eq",
+          "value": "seeded-unaccepted-gateway",
+          "why": "the HTTPRoute must remain attached to the Gateway on the unaccepted class so the audit reports unprogrammed routes"
+        },
+        {
+          "subject": "gatewayclass/seeded-envoy",
+          "path": "status.conditions[?(@.type=='Accepted')].status",
+          "op": "any_eq",
+          "value": "True",
+          "why": "seeded-envoy is the accepted-class negative control on the same cluster; without Accepted=True, silence on accepted classes cannot be distinguished from flagging every custom GatewayClass"
         }
       ]
     }

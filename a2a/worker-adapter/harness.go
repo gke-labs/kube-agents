@@ -123,7 +123,6 @@ type harnessProc struct {
 	killTimers []*time.Timer
 }
 
-// startHarness is startHarnessWith for Claude Code.
 // oneTurnPerProcess is implemented by a driver whose harness process runs a
 // single turn and reads stdin once (core-agent). A later user message would
 // sit in the pipe unread: the write succeeds, the adapter counts a turn that
@@ -151,6 +150,7 @@ func processEncoder(d Driver) func(string) ([]byte, error) {
 	}
 }
 
+// startHarness is startHarnessWith for Claude Code.
 func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	return startHarnessWith(claudeDriver{}, argv, env, prompt, reapBound, log)
 }
@@ -179,7 +179,9 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
 	stderr := &tailBuffer{max: stderrTailBytes}
-	cmd.Stderr = stderr
+	// The tail is kept for a failed turn's reason; refused tool calls the
+	// harness reports go to the worker's log as well (refusalLines).
+	cmd.Stderr = io.MultiWriter(stderr, &refusalLines{log: log})
 	// WaitDelay bounds every reap. A descendant that left the process group
 	// survives the group kill and can hold stderr open, and Wait reads stderr
 	// to EOF, so without a bound Wait blocks until that descendant exits.
