@@ -2230,6 +2230,64 @@ def test_an_any_of_pattern_that_does_not_compile_is_rejected():
         ReportContainsVerifier(type="report_contains", any_of_patterns=["("])
 
 
+@pytest.mark.parametrize("field", ["required_patterns", "forbidden_patterns", "any_of_patterns"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "KA-7741-ORCHID",
+        r"\bticket KA-\d+",
+        "(?m)^(?:Status|state): ready$",
+        "(?i:ka)-7741-ORCHID",
+        "(?i)ka-(?-i:ORCHID)",
+        "(?=Ready)ready",
+        "(?!Ready)ready",
+        "{cluster:a}: Ready",
+        r"ka-[A-Z]+",
+        r"tier (?:A|B)\b",
+        "class [A]",
+    ],
+)
+def test_a_pattern_with_an_uppercase_literal_is_rejected(field, pattern):
+    """The report is lowercased before a pattern runs, so an uppercase letter
+    outside ``(?i)``, alone or in a class of nothing but such letters, is text
+    no report carries: where the pattern needs it, the required pattern misses
+    on every run and the forbid never fires, and in one branch or a negative
+    lookahead it is dead text."""
+    with pytest.raises(ValueError, match="in upper case"):
+        ReportContainsVerifier(type="report_contains", **{field: [pattern]})
+
+
+def test_an_uppercase_pattern_rejection_names_the_letters_once_each():
+    with pytest.raises(ValueError, match=r"spells 'K', 'A', 'O' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["KA-7741-OAK"])
+    with pytest.raises(ValueError, match=r"spells 'A-F', 'X' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["0x[A-FX]+"])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "report", "status"),
+    [
+        ("ka-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i)KA-7741-ORCHID", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i:KA)-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        (r"\Aticket \S+ is\Z", "Ticket KA-7741-ORCHID is", "pass"),
+        ("(?P<ID>ka-[0-9a-fA-F]+) (?P=ID)", "KA-7F KA-7F", "pass"),
+        ("(?x) ka-7741 # The Ticket", "KA-7741", "pass"),
+        (r"ka-[A-Z0-9]+", "KA-7741", "pass"),
+        (r"ka-[^A-Z]", "KA-7741", "pass"),
+        (r"ka[\WA-Z]\d+", "KA-7741", "pass"),
+    ],
+)
+def test_an_uppercase_letter_that_is_not_a_literal_still_loads(pattern, report, status):
+    """An escape, a group name, a ``(?x)`` comment and a character class
+    with a member a lowercased report carries are not refused, and neither is
+    a letter under ``(?i)``; the verdict is the one the pattern gave before
+    the refusal existed."""
+    v = ReportContainsVerifier(type="report_contains", required_patterns=[pattern])
+    _stash(report)
+    assert v.verify(5.0).status == status
+
+
 # ------------------ the healthy-workload objective's shipped phrase list
 
 # Read the list out of the task file rather than copying it here. It is edited
