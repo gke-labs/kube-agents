@@ -25598,6 +25598,10 @@ def _finish_without_forge(
             since_scheduled=since_scheduled_line(payload, delta_known),
             unread=unread,
             stored=True,
+            # As the line's `summary` below: a noted hold has its own line,
+            # and an object that is visible again is named.
+            noted=noted,
+            cleared=payload.get(NOTED_CLEARED_KEY) or [],
         )
     # A diverted run wrote nothing to the ledger, so when its write fails the
     # stored record of the last published run is still correct.

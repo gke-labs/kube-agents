@@ -36437,6 +36437,123 @@ class TestShadowRun(BaseTestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("shadow run", self.err)
 
+    def noted_finish(self, doc, noted=(), live=False):
+        """One scheduled `finish` with a manifest whose first target notes `noted`.
+
+        `noted` is the `fid` of each object the collector could not see.
+        `live` runs it as a live task; otherwise it is a shadow run.
+        """
+        manifest = _full_manifest()
+        if noted:
+            manifest["clusters"][0]["notes"] = ROTATED_NOTE
+            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                {"check": "netpol-missing", "namespace": "payments", "object": f"Namespace/{fid}"}
+                for fid in noted
+            ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        flag = [] if live else [audit_report.STORE_ONLY_FLAG]
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "false" if live else "true"}):
+            self.start(*flag)
+            path = audit_report.findings_path_for(AUDIT)
+            Path(path).write_text(json.dumps(doc), encoding="utf-8")
+            code = self.run_main(
+                ["finish", "--audit", AUDIT, "--findings-file", path,
+                 "--manifest-file", str(manifest_path), "--scheduled", *flag]
+            )
+        return code
+
+    def shadow_latest(self, repo="acme/gitops"):
+        return json.loads((self.shadow_store(repo=repo) / "latest.json").read_text(encoding="utf-8"))
+
+    def test_a_noted_object_is_on_the_line_and_in_both_summaries(self):
+        self.assertEqual(self.noted_finish(make_doc(findings=[]), noted=["a"]), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(
+            [entry[audit_report.NOTE_TEXT_FIELD] for entry in out[audit_report.NOTES_RESULT_KEY]],
+            [ROTATED_NOTE],
+        )
+        self.assertIs(out[audit_report.NOTED_CHANGED_KEY], True)
+        latest = self.shadow_latest()
+        for summary in (out["summary"], latest[audit_report.SHADOW_SUMMARY_KEY]):
+            self.assertIn(f"{audit_report.NOTES_LEAD}: ", summary)
+            self.assertIn(ROTATED_NOTE, summary)
+        # The report is the summary, which carries the note. The line has no
+        # second copy, and the worker gets no reminder to copy one.
+        self.assertNotIn(audit_report.REPORT_NOTES_KEY, out)
+        self.assertNotIn(audit_report.REPORT_NOTES_REMINDER, self.err)
+        self.assertNotIn(audit_report.REPORT_NOTES_REMINDER_NO_LEDGER, self.err)
+        # The baseline of the shadow stream is its own.
+        self.assertEqual(latest[audit_report.SCHEDULED_NOTED_IDS_KEY], [derived_id(fid="a")])
+
+    def test_the_stored_summary_names_a_noted_hold_and_an_object_visible_again(self):
+        both = make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")])
+        only_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        a_id = derived_id(fid="a")
+        self.assertEqual(self.noted_finish(both), 0, self.err)
+        # The document leaves out `a`, and the collector could not see it.
+        self.assertEqual(self.noted_finish(only_b, noted=["a"]), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["resolved"], 0)
+        latest = self.shadow_latest()
+        self.assertIn(a_id, latest["current_ids"])
+        kept = f"Kept, because {audit_report.NOTED_HOLD_CAUSE}"
+        for summary in (out["summary"], latest[audit_report.SHADOW_SUMMARY_KEY]):
+            [line] = [row for row in summary.splitlines() if row.startswith(kept)]
+            self.assertIn(a_id, line)
+            self.assertNotIn("Still flagged by the collector", summary)
+        # The object is visible again, and the finding is not there.
+        self.assertEqual(self.noted_finish(only_b), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out[audit_report.NOTED_CLEARED_KEY], [a_id])
+        for summary in (out["summary"], self.shadow_latest()[audit_report.SHADOW_SUMMARY_KEY]):
+            [line] = [row for row in summary.splitlines() if row.startswith(audit_report.VISIBLE_AGAIN_LEAD)]
+            self.assertIn(a_id, line)
+
+    def test_a_noted_object_is_not_written_as_resolved(self):
+        both = make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")])
+        self.assertEqual(self.noted_finish(both), 0, self.err)
+        before = (self.shadow_store() / "latest.json").read_bytes()
+        only_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        only_b["resolved_because"] = [
+            {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a",
+             "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+        ]
+        self.assertEqual(self.noted_finish(only_b, noted=["a"]), 2, self.err)
+        self.assertIn("could not see the result", self.err)
+        self.assertEqual((self.shadow_store() / "latest.json").read_bytes(), before)
+
+    def test_a_shadow_run_leaves_the_live_noted_baseline(self):
+        """The two streams are under one store key here, which is the nearest
+        they come: the live run still speaks once about the noted object the
+        shadow run saw first, and the shadow run's baseline is its own."""
+        clean = make_doc(findings=[])
+        live_latest = Path(audit_report.reports_dir_for(AUDIT, audit_report.NO_FORGE_REPO)) / "latest.json"
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch(
+            "gitops_workspace._read_state_text", lambda key: ""
+        ):
+            self.assertEqual(self.noted_finish(clean, live=True), 0, self.err)
+            self.assertEqual(json.loads(live_latest.read_text())[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+            before = live_latest.read_bytes()
+            self.assertEqual(self.noted_finish(clean, noted=["a"]), 0, self.err)
+            self.assertIs(self.stdout_json()[audit_report.NOTED_CHANGED_KEY], True)
+            self.assertEqual(live_latest.read_bytes(), before)
+            self.assertEqual(
+                self.shadow_latest(repo=audit_report.NO_FORGE_REPO)[audit_report.SCHEDULED_NOTED_IDS_KEY],
+                [derived_id(fid="a")],
+            )
+            self.assertEqual(self.noted_finish(clean, noted=["a"], live=True), 0, self.err)
+            live = self.stdout_json()
+            self.assertNotIn(audit_report.SHADOW_KEY, live)
+            self.assertIs(live[audit_report.NOTED_CHANGED_KEY], True)
+            self.assertFalse(live["silent_ok"])
+            # The live baseline moved on the live run, so the next one is quiet.
+            self.assertEqual(self.noted_finish(clean, noted=["a"], live=True), 0, self.err)
+            self.assertTrue(self.stdout_json()["silent_ok"])
+            # The shadow run's own baseline is unchanged, so it has no news either.
+            self.assertEqual(self.noted_finish(clean, noted=["a"]), 0, self.err)
+            self.assertNotIn(audit_report.NOTED_CHANGED_KEY, self.stdout_json())
+
 
 class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
     """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
