@@ -316,11 +316,7 @@ func (b *Bridge) publishTurnUsage(run *taskRun, out *apiChatResponse, took time.
 		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
 			"task", run.origin.TaskID, "fields", dropped)
 	}
-	run.mu.Lock()
-	if run.state == stateRunning {
-		b.publishUsageLocked(run, u)
-	}
-	run.mu.Unlock()
+	b.publishUsage(run, u)
 }
 
 // turnMillis is a turn's wall time for the usage part: whole milliseconds,
