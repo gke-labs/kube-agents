@@ -440,4 +440,9 @@ type TriggerStatusReply struct {
 	// started or timed out with no outcome, never retried). Omitted while there
 	// is no record. The reconciler keeps asking while it reads posting.
 	Delivery string `json:"delivery,omitempty"`
+	// Reason is why a Terminal task ended: the bare token of the executor's
+	// `reason: <token>[ - detail]` terminal message, never its detail, and
+	// only a token the gateway knows (its reason tables). Omitted otherwise.
+	// The reconciler stores it on the run (AgentScheduleRun.reason).
+	Reason string `json:"reason,omitempty"`
 }

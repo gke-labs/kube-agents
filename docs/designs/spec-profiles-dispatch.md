@@ -388,6 +388,8 @@ leave open:
   `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
   the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
   only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  The [unattended write permit](unattended-write-permit.md) design proposes named version-control
+  routes on both lists for a run that holds its permit; the lists are as stated here until then.
   Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
   trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
   binds a trigger at. When the submission's
@@ -553,7 +555,40 @@ leave open:
   subject (`lib.TaskSupervisorSubject`, or the six-token `lib.ProfileSupervisorSubject` when
   the dispatch config's `profileSupervisorForm` is `profile`; readers read both, until a reader
   given `A2A_PROFILE_SUPERVISOR_CUTOFF` stops taking the five-token form as a profile task's
-  terminal when the server stored it after that time; contract addendum 6, #5301), never its `.events`, which stays
+  terminal when the server stored it after that time; contract addendum 6, #5301). The operator
+  renders that env on the gateway and the MCP server once the `ProfileSupervisorForm` condition
+  has latched True, as the condition's `lastTransitionTime` plus ten minutes, in RFC3339 UTC (on
+  an install that latched earlier, that time may already be in the past at the upgrade); an
+  unlatched install renders none, so its readers take both forms and nothing rolls. The gate
+  holds against the gateway, whose grant still reaches the five-token form, so both its inputs
+  are the operator's: which addressees are profiles comes only from the profile names file it
+  renders beside the env (`A2A_PROFILE_NAMES_FILE`, the `<agent>-a2a-profile-names` ConfigMap:
+  the admitted and draining profiles, the same names nats.conf denies the gateway the
+  supervisor subjects of), never from the gateway's session record, `.in` traffic, the
+  console's status lines or the directory. The gateway's Role writes no ConfigMap but its
+  home-channel record and cannot write its own Deployment, and the MCP server has no API
+  access. A reader whose names file has never been read takes every addressee as a profile;
+  the file is re-read every 30 seconds, and a later read that fails keeps the names last read.
+  The gateway's relay doesn't settle a refusal it made before the names were read, since the
+  names may take it: it gives the event back to the stream for 30 seconds, up to 20 times, then
+  settles it with an Error and counts the drop once. The 20 counts only these holds, by stream
+  sequence in the gateway's memory, not the message's deliveries: a give-back after a failed
+  KV write, a rollout's give-back or a lapsed ack wait doesn't spend it. A held event the names then take renders
+  when it comes back, so it can render after later events of the same task; that ordering
+  effect is known and accepted.
+  The stored time is the server's, and only where the server alone writes it: a consumer
+  delivery's metadata, or the API's JSON reply to a message get on a stream without
+  `allow_direct`. Never a direct get's headers: the server appends its `Nats-Time-Stamp` after
+  the publisher's own header block, and a blank line inside that block ends it for the
+  client's parse, hiding the server's stamp behind a forged one. A direct get therefore gives
+  no time; the gateway's busy count and empty read re-read a profile task's five-token subject
+  on a short `DeliverLastPerSubject` consumer for its time, and a time that can't be read is
+  unknown and refused where it would decide. The replay's horizon is the stream's last
+  sequence from `STREAM.INFO`, never a direct get's `Nats-Sequence`, which sits in the same
+  header block. A cutoff that doesn't parse is taken as the Unix
+  epoch, so every five-token terminal on a profile task is refused; it is logged at Error and
+  shown on the gateway's `profile_supervisor_cutoff_timestamp_seconds` series and the MCP
+  server's `/healthz`. The terminal never goes on `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
@@ -569,10 +604,38 @@ leave open:
   admission, and `lease-expired`
   and `deadline-exceeded` while it holds, and on a `canceled` terminal `stopped` (the
   conversation's stop) and `tier-ended` (an administrator ended its tier's drain, #5850). A terminal is retried until it lands, except for a
-  profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
+  profile that has left the install config, and on a latched install a refused terminal (below). A dropped profile's `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
   task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
   an error (#5074).
+  On a latched install (`profileSupervisorForm: profile`) a refused six-token terminal is never
+  written on the five-token form instead: readers past the cutoff don't take that form as a
+  profile task's terminal, so it would free the slot while the requester never saw the end. The
+  terminal is retried, a refusal at admission as well as a held task's. Only a permission refusal
+  counts toward the bound: an attempt during which the server refused the six-token publish for
+  the connection's permissions (nats.go's async `Permissions Violation for Publish to` that
+  subject). Any other failure, such as a disconnect, no responders, a timeout with no refusal or a
+  JetStream API error, restarts the bound, so a NATS or `TASKS` outage of any length is retried and
+  the terminal lands after it. Once refusals have run for `DroppedTerminalGiveUp`, the task is
+  settled without one: tombstoned, its slot freed,
+  its submission settled, an error logged under the reason `terminal-unpublished`, and the
+  dispatcher health line's `supervisorGiveUps` counted. The requester sees no terminal: the
+  gateway ends a task with no events as never started, and holds one with executor events until
+  the user's stop. A refusal needs a grant that never reached the dispatcher's connection; the
+  regrant normally clears that in seconds, well inside the bound. A profile that has left the
+  install config keeps its own give-up and log line above, not `terminal-unpublished`. An
+  unlatched install keeps retrying, as before.
+  A terminal's envelope id is fixed per task, so a retry after a lost ack is a duplicate the stream
+  drops. The duplicate window is keyed on the id alone, whatever the subject, so on the six-token
+  form a duplicate ack is checked: a direct get of the task's six-token subject must find the
+  dispatcher's final status under the terminal's own envelope id, so another tier's or kind's
+  terminal for the same task id doesn't confirm it. With none there, the terminal is published
+  again under a fresh id, kept for the rest of that retry loop so its re-publishes dedupe onto
+  each other. A re-publish that fails is an ordinary failure, retried under the bound above. Only
+  a fresh id taken as a duplicate on its first send takes the `terminal-unpublished` settle at
+  once. A direct get that fails is not taken as the write landing: the terminal is re-published
+  under a fresh id the same way, so a retry whose first write did land can leave two identical
+  terminals, and readers fold past the second.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for

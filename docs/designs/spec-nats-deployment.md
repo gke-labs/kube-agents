@@ -658,7 +658,11 @@ Layout:
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for. Amended 9/28: the
+  between calls are named there as what the term does not size for. The supervisor
+  cutoff's stored-time ephemerals (#6466; up to four per gateway or MCP server process, each
+  held about five seconds) are deliberately not in `a2aTasksReservedConsumersFor` and come
+  out of the stream's headroom: an existing `TASKS` stream can't grow to a wider reserve,
+  and the provision check would refuse it on the upgrade. Amended 9/28: the
   replay term scales with the bridge's worker count, which the render reads as
   `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` and, when the operator renders the
   bridge itself, off the operator's `A2A_BRIDGE_CONCURRENCY` setting, read by the same rule

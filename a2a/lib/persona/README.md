@@ -47,6 +47,12 @@ a server reached around the broker would be outside both.
 - a `SKILL.md` frontmatter key other than `name`, `description`, `license`
   and `metadata`, because Claude Code reads keys such as `allowed-tools`
   and `hooks` from it;
+- a `SKILL.md` whose frontmatter isn't exactly one YAML document between
+  lines that are exactly `---`: it opens on the first line and closes at
+  the next line that is exactly `---`. Any other line in it that holds
+  `---` or starts with `...` or `%` is refused, and so is a byte-order mark
+  or a line break other than LF or CRLF anywhere in the file, and one that
+  never closes is refused too, so where it ends never depends on a parser;
 - an `@` import in `instructions.md` or a skill's markdown that could leave
   the persona. The check fails closed rather than parse imports the way the
   harness does: any `@` token that starts with `/` or `~`, or contains `..`,

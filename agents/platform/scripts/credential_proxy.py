@@ -9101,6 +9101,20 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
 
 _GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE
 
+# `git push --recurse-submodules=on-demand` (or `only`) also pushes inside each
+# submodule, to that submodule's own remote, with the same refspec. The push
+# guard judges the repository that the command names, so it refuses the flag
+# with each value but `no`. git reads more words as off (`false`, `off`, `0`);
+# the guard takes the one word. The flag outranks the `push.recurseSubmodules`
+# pin of `GIT_FORCED_CONFIG`, so this refusal is the control for the flag. The
+# text is fixed.
+GIT_PUSH_RECURSE_SUBMODULES_OPTION = "--recurse-submodules"
+GIT_PUSH_RECURSE_SUBMODULES_OFF = "no"
+GIT_PUSH_RECURSE_SUBMODULES_REFUSAL = (
+    "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+    "inside each submodule too, and the broker judges only the repository that the command names."
+)
+
 # The remote a push is judged against when it names none, or names one that
 # `_detect_repo_default_branch` cannot look up.
 GIT_DEFAULT_REMOTE = "origin"
@@ -9109,6 +9123,28 @@ GIT_DEFAULT_REMOTE = "origin"
 # and the file under `<remote>/` there that records the remote's default branch.
 GIT_REMOTES_REFS_DIR = Path("refs") / "remotes"
 GIT_REMOTE_HEAD_FILE = "HEAD"
+
+# The ref format of a clone, read from the clone's own config file. git writes
+# `refStorage` in the `[extensions]` section of a repository whose format is not
+# `files`; with no such key the format is `files`. A config file of a clone is a
+# few hundred bytes, and one with a section for each of a thousand branches is
+# about 100 KiB; one past the limit is not read, and its format is not known.
+GIT_DIR_NAME = ".git"
+GIT_CONFIG_FILE = "config"
+GIT_CONFIG_MAX_BYTES = 1 << 20
+GIT_REF_FORMAT_SECTION = "extensions"
+GIT_REF_FORMAT_KEY = "refstorage"
+GIT_REF_FORMAT_FILES = "files"
+# The agent can write the config file, and the name goes into a refusal text:
+# a name that is not a short plain word is shown as this one.
+GIT_REF_FORMAT_UNKNOWN = "unknown"
+GIT_REF_FORMAT_NAME_RE = re.compile(r"[a-z0-9-]{1,32}")
+GIT_CONFIG_COMMENT_CHARS = "#;"
+GIT_PUSH_REF_FORMAT_REFUSAL = (
+    "`git push` from a clone that uses the '{ref_format}' ref format is refused: the broker reads "
+    "the remote's default branch from the files ref format only, so it cannot tell a push to "
+    "that branch from another."
+)
 
 # What `_detect_repo_default_branch` accepts as a remote *name*. The
 # `<repository>` slot of `git push` takes a name, a URL, or a filesystem path,
@@ -9290,7 +9326,8 @@ _PROVIDER_RE = re.compile(r"[a-z][a-z0-9]{0,31}")
 # layer. That layer outranks system, global and repo-local config, which is
 # the point: the agent owns the working tree, so `.git/config` is a file it
 # can write, and every key below turns a string in that file into a command
-# the credential holder executes.
+# the credential holder executes. `push.recurseSubmodules` is the one key that
+# is here for another reason; its entry says which.
 #
 #   core.hooksPath   `.git/hooks/pre-commit` is executed by `git commit`, and
 #                    `git commit` is a verb the skills issue nine times.
@@ -9356,6 +9393,23 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
     ("gpg.ssh.defaultKeyCommand", "false"),
     ("gpg.x509.program", "false"),
     ("help.autocorrect", "0"),
+    # This key is here for another reason than the ones above: it runs no command,
+    # it keeps a push in the repository that the push guard judges.
+    # `push.recurseSubmodules = on-demand` (or `only`) and `submodule.recurse =
+    # true` each make a plain `git push` also push inside each submodule, to that
+    # submodule's own remote, with the same refspec; git lets the one that it
+    # reads last decide. The agent can write both keys in `.git/config`, the argv
+    # then has no flag, and the push guard judges the repository that the command
+    # names and nothing below it. git reads this layer after each config file, so
+    # the pin decides. Measured with git 2.56 under this layer: with each of the
+    # two keys set in the repository, the push moved the default branch of the
+    # submodule's remote, and with this pin it did not. `no` is git's own
+    # default, so a push that succeeds today is the same; a repository's own
+    # `check` is turned off too. `-c` and `--config-env` are read after this
+    # layer, and the argv check refuses both. The flag `--recurse-submodules`
+    # also outranks the pin; the push guard refuses it
+    # (`GIT_PUSH_RECURSE_SUBMODULES_REFUSAL`).
+    ("push.recurseSubmodules", "no"),
 )
 
 
@@ -9757,12 +9811,65 @@ def _remote_head_path(remotes_dir: Path, remote: str) -> Path | None:
     return None
 
 
+def _repo_ref_format(repo_dir: Path) -> str:
+    """The ref format of the clone at `repo_dir`, from its own config file, with no git call (#6593).
+
+    `_detect_repo_default_branch` reads a file that only the `files` format
+    keeps. The value of `refStorage` in the `[extensions]` section says which
+    format the clone uses, and with no such key the format is `files`. The file
+    is `.git/config`, or `config` of a bare layout when the first is not there.
+    With no config file, or one that the broker cannot open, the answer is
+    `files`: the refs are then read as files, as before. A file past the size
+    limit is not read, and the format is GIT_REF_FORMAT_UNKNOWN.
+
+    Not read: a clone whose `.git` is a file that points to its git directory
+    (a linked worktree, a submodule, a clone made with `--separate-git-dir`).
+    The answer there is `files`, in each ref format, and a push from there is
+    judged as before this check; `_detect_repo_default_branch` does not follow
+    that pointer either.
+    """
+    repo_root = _find_repo_root(repo_dir) or Path(repo_dir)
+    for config in (repo_root / GIT_DIR_NAME / GIT_CONFIG_FILE, repo_root / GIT_CONFIG_FILE):
+        if not config.is_file():
+            continue
+        # One open and one read with a limit: a size that is asked before the read can be
+        # wrong for the bytes that the read then gets (a file that grows, or a link to a
+        # file whose size reads as 0).
+        try:
+            with open(config, "rb") as handle:
+                raw = handle.read(GIT_CONFIG_MAX_BYTES + 1)
+        except OSError:
+            return GIT_REF_FORMAT_FILES
+        if len(raw) > GIT_CONFIG_MAX_BYTES:
+            return GIT_REF_FORMAT_UNKNOWN
+        text = raw.decode("utf-8", errors="replace")
+        ref_format = GIT_REF_FORMAT_FILES
+        section = ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                header, _, line = line[1:].partition("]")
+                section = header.strip().lower()
+                line = line.strip()
+            # A comment line has its comment character in the key, so it is no key of this name.
+            key, assigned, value = line.partition("=")
+            if assigned and section == GIT_REF_FORMAT_SECTION and key.strip().lower() == GIT_REF_FORMAT_KEY:
+                for comment in GIT_CONFIG_COMMENT_CHARS:
+                    value = value.partition(comment)[0]
+                value = value.strip().strip('"').lower()
+                ref_format = value if GIT_REF_FORMAT_NAME_RE.fullmatch(value) else GIT_REF_FORMAT_UNKNOWN
+        return ref_format
+    return GIT_REF_FORMAT_FILES
+
+
 def _detect_repo_default_branch(
     repo_dir: Path | None, remote: str = GIT_DEFAULT_REMOTE
 ) -> str | None:
     """Best-effort detection of remote default branch from local clone ref metadata (#1498).
 
     Reads refs/remotes/<remote>/HEAD directly without subprocess or network calls.
+    Only the files ref format keeps that file; the caller refuses a push from a
+    clone in another format before it asks here (`_repo_ref_format`).
     On repositories with non-standard default trunks, this local detection acts as a
     cooperative guard against accidental pushes; authoritative protection against
     deliberate workspace ref manipulation comes from a configured base instead:
@@ -9814,7 +9921,8 @@ def _detect_repo_default_branch(
 
 
 def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | None:
-    """Refuse direct pushes to protected rollout or base branches (#1498)."""
+    """Refuse direct pushes to protected rollout or base branches (#1498), and each push
+    from a clone whose ref format hides the remote's default branch from this check (#6593)."""
     if not argv or Path(argv[0]).name != "git":
         return None
 
@@ -9897,14 +10005,22 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
             positional.extend(push_args[idx + 1:])
             break
         if arg.startswith("--"):
-            opt_name, sep, _ = arg.partition("=")
+            opt_name, sep, opt_value = arg.partition("=")
             if (
                 len(opt_name) > 2
                 and any(
                     opt.startswith(opt_name)
-                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules")
+                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", GIT_PUSH_RECURSE_SUBMODULES_OPTION)
                 )
             ):
+                # git takes the value in the same word or in the next one, and takes each
+                # prefix of the name that names one option. A prefix that names two is an
+                # error in git; here it is refused when its value is not `no`.
+                if GIT_PUSH_RECURSE_SUBMODULES_OPTION.startswith(opt_name):
+                    if not sep:
+                        opt_value = push_args[idx + 1] if idx + 1 < len(push_args) else ""
+                    if opt_value != GIT_PUSH_RECURSE_SUBMODULES_OFF:
+                        return GIT_PUSH_RECURSE_SUBMODULES_REFUSAL
                 if sep:
                     idx += 1
                     continue
@@ -9927,6 +10043,11 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
 
     if cwd:
         repo_dir = Path(cwd).resolve()
+        # The detection below reads a file that only the files ref format keeps. In
+        # another format it finds nothing, so the push is refused here, by name.
+        ref_format = _repo_ref_format(repo_dir)
+        if ref_format != GIT_REF_FORMAT_FILES:
+            return GIT_PUSH_REF_FORMAT_REFUSAL.format(ref_format=ref_format)
         detected_default = _detect_repo_default_branch(repo_dir, remote=remote_name)
         if detected_default:
             norm_def = detected_default.strip().lower()
