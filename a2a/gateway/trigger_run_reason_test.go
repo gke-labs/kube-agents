@@ -146,4 +146,10 @@ func TestTheRecoveredPanicTokenReadsInPlainWords(t *testing.T) {
 	if strings.Contains(words, taskguard.ReasonToken) {
 		t.Fatalf("the sentence %q shows the raw token", words)
 	}
+	// The panic can come after the run's work (the scrub, the chat fold, a
+	// publish), so asking again can repeat a write: the sentence says to
+	// check what was done first, never a bare "ask again".
+	if !strings.Contains(words, "check that before you ask again") || strings.HasSuffix(words, "; ask again") {
+		t.Fatalf("the sentence %q doesn't say to check what was done before asking again", words)
+	}
 }

@@ -28,10 +28,14 @@ const (
 // recovered counts the panics Guard recovered in this process.
 var recovered atomic.Int64
 
-// Count is how many panics Guard has recovered in this process.
+// Count is how many panics Guard has recovered in this process. Nothing
+// exports it and nothing limits repeated panics: an operator alerts on the
+// LogMessage record or the Reason in a terminal, not on this count.
 func Count() int64 { return recovered.Load() }
 
-// PanicError is the error Guard returns for a recovered panic.
+// PanicError is the error Guard returns for a recovered panic. Value is the
+// raw panic value, which may have been built from model or user text: it is
+// for errors.As and tests, and is never printed. Error() shows only Summary.
 type PanicError struct {
 	// What names the work that panicked, as the caller gave it to Guard.
 	What string
