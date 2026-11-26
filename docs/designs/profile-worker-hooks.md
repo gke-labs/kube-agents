@@ -175,6 +175,9 @@ Limits of the record:
   agent. If the console reads a profile task's lines, which is a question of the telemetry work
   (#6674), it shows a tool call with its status and without its arguments; the status comes
   from the error flag, not from the result.
+- Proposed on this decided row, for the approver's answer: a bound on the skill's name. The name
+  comes from the tool's input. The adapter writes it only when it is the name of a skill of the
+  task's persona, and it writes `other` for each other value. So the field holds no free text.
 - The metric reads the skill's name from the arguments of the Hermes tool `skill_view` today.
   For a profile task it will read the skill's name field of the adapter's line. That reader
   change is part of this group.
