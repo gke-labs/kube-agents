@@ -26,8 +26,10 @@ Find which symptom a named workload shows, with projected reads, and hand it to 
    | `Pending` with no container or init-container waiting/terminated state                                                                                                                                             | `pod-pending-scheduling` |
    | `ContainerCreating`, `PodInitializing`, `ImagePullBackOff`, `ErrImagePull`, `InvalidImageName`, `ErrImageNeverPull`, `CreateContainerConfigError`, `CreateContainerError` (in `WAITING` or `INIT`)                 | `pod-container-creating` |
    | `PHASE=Succeeded` (all containers exited `0`), controller or pod `NotFound`, no pods returned, `ReplicaFailure=True`, or `readyReplicas < specReplicas` with no unhealthy pod                                      | No focused skill (follow the direct steps below) |
-   | At least one live pod returned, all live pods `Running` and `Ready` (`specReplicas > 0` and `readyReplicas == specReplicas` for a controller), callers report timeouts                                             | `service-connectivity`   |
+   | At least one live pod returned, all live pods `Running` and `Ready` (`specReplicas > 0` and `readyReplicas == specReplicas` for a controller), callers report connection or DNS resolution timeouts (`lookup ... i/o timeout`, `no such host`, `Temporary failure in name resolution`, `SERVFAIL`) | `service-connectivity`   |
    | Any other non-healthy pod or controller state not matched above                                                                                                                                                    | `pod-crashloop-oom`      |
+
+   When callers or workload logs report DNS resolution timeouts or lookup failures (even while the workload's own pods are `Running` and `Ready`, or during rapid node scale-outs), load `service-connectivity` directly to inspect `kube-system` DNS components (`kube-dns`, `kube-dns-autoscaler`, `node-local-dns`) and cluster DNS settings rather than skipping `kube-system`.
 
    For the **No focused skill** row (`PHASE=Succeeded`, `NotFound`, no pods returned, `ReplicaFailure=True`, or `readyReplicas < specReplicas` with no unhealthy pod):
 
