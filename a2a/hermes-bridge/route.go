@@ -48,12 +48,13 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive. Such a turn ends at its acknowledgement
-	// (only a console, MCP or A2A door turn waits on its cards,
-	// waitsForCardsInTurn), and most file no card, hence "any". It is
-	// user text (.agents/rules/chat_ux.md): no card or route, and a next
-	// step, since asking again records the route afresh.
-	routeLostNote = "\n\nI couldn't save this conversation's details, so any answer from work I started in the background won't be posted here. Ask again in a minute."
+	// answer that cannot arrive. A chat turn ends at its acknowledgement and
+	// most file no card, hence "any"; a console turn waits on its cards
+	// (waitsForCardsInTurn), so only one still running is lost, hence "still
+	// running". It is user text (.agents/rules/chat_ux.md): it names no card
+	// or route, and its next step needs no route, since a later turn answers
+	// a question about the work from the board, and files no second card.
+	routeLostNote = "\n\nI couldn't save this conversation's details, so the result of any work I started that's still running won't be posted here on its own. Ask me about it later to get it."
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name

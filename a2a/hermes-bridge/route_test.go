@@ -370,7 +370,7 @@ func TestRouteLostNoteIsPlainUserText(t *testing.T) {
 			t.Errorf("routeLostNote = %q, carries the internal name %q", routeLostNote, word)
 		}
 	}
-	if !strings.Contains(note, "ask again") {
+	if !strings.Contains(note, "ask me about it") {
 		t.Errorf("routeLostNote = %q, want it to say what would work instead", routeLostNote)
 	}
 }
