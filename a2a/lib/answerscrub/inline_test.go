@@ -1,6 +1,7 @@
 package answerscrub
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"syscall"
@@ -938,6 +939,199 @@ func TestScrubProseSecretsAMarkedNounStillNamesTheSecret(t *testing.T) {
 		}
 		if !slices.Contains(seen, "quietpasture") {
 			t.Errorf("scrubProseSecrets(%q) reported %q to the sink; want the value", in, seen)
+		}
+	}
+}
+
+// An env entry's value is read as YAML reads it: a comment after the name
+// or the value is not part of it, a block value keeps its commas and
+// brackets (and is tracked cut at the first of them as well), a flow
+// mapping still ends a value at , } or ], and a quoted value is tracked as
+// written and with its escapes read.
+func TestScrubEnvNameValuePairsReadsTheValueAsYAMLDoes(t *testing.T) {
+	cases := []struct {
+		in, want string
+		tracked  []string
+	}{
+		{"- name: DB_PASSWORD # rotated\n  value: synth-pass-0001\n", "- name: DB_PASSWORD # rotated\n  value: [redacted]\n", []string{"synth-pass-0001"}},
+		// A comment on a credential key's value line that reads as a value
+		// is redacted with it, as a read to the line's end redacted it; only
+		// the value YAML reads is tracked. A bare marker stays.
+		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # rotated monthly\n", "- name: DB_PASSWORD\n  value: [redacted]\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: #synth-old-0002\n", "- name: DB_PASSWORD\n  value: [redacted]\n", nil},
+		{"env: [{name: DB_PASSWORD, value: synth-pass-0001 #synth-old-0002}]", "env: [{name: DB_PASSWORD, value: [redacted]}]", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # none\n", "- name: DB_PASSWORD\n  value: [redacted] # none\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth,pass]0001\n", "- name: DB_PASSWORD\n  value: [redacted]\n", []string{"synth,pass]0001", "synth"}},
+		{"env: [{name: A_PASSWORD, value: synth-a-0001}, {name: B_TOKEN, value: synth-b-0001}]", "env: [{name: A_PASSWORD, value: [redacted]}, {name: B_TOKEN, value: [redacted]}]", []string{"synth-a-0001", "synth-b-0001"}},
+		{`{"name": "DB_PASSWORD", "value": "synth\"pass\"0001"}`, `{"name": "DB_PASSWORD", "value": "[redacted]"}`, []string{`synth\"pass\"0001`, `synth"pass"0001`}},
+		{"- name: DB_PASSWORD\n  value: # none\n", "- name: DB_PASSWORD\n  value: # none\n", nil},
+		{"- name: LOG_LEVEL\n  value: debug # verbose\n", "- name: LOG_LEVEL\n  value: debug # verbose\n", nil},
+		// The value to its line's end does not read as one (a marker in
+		// it, a blank under a name not of the strong class): the value cut
+		// at its first , } or ] is tried next.
+		{"- name: DB_PASSWORD\n  value: synthpass0001abcd, see https://app:[redacted]@db.example/x\n", "- name: DB_PASSWORD\n  value: [redacted], see https://app:[redacted]@db.example/x\n", []string{"synthpass0001abcd"}},
+		{"- name: DB_PASSWORD\n  value: synthpass0001abcd, Bearer [redacted]\n", "- name: DB_PASSWORD\n  value: [redacted], Bearer [redacted]\n", []string{"synthpass0001abcd"}},
+		{"- name: SMTP_PASS\n  value: hunterpass, and SMTP_USER is set the same way\n", "- name: SMTP_PASS\n  value: [redacted], and SMTP_USER is set the same way\n", nil},
+		{"- name: SECRET_KEY_BASE\n  value: synthtoken0001abcd, rotated weekly\n", "- name: SECRET_KEY_BASE\n  value: [redacted], rotated weekly\n", nil},
+		// The whole line reads as the value and is redacted whole; the
+		// value cut at the comma and the pair after it are tracked too.
+		{"- name: API_TOKEN\n  value: synthtoken0001abcd, password: synthpass0002wxyz\n", "- name: API_TOKEN\n  value: [redacted]\n", []string{"synthtoken0001abcd, password: synthpass0002wxyz", "synthtoken0001abcd", "synthpass0002wxyz"}},
+		{"- name: SMTP_PASS\n  value: hunterpass, password: synthpass0002wxyz\n", "- name: SMTP_PASS\n  value: [redacted]\n", []string{"synthpass0002wxyz"}},
+	}
+	var long strings.Builder
+	long.WriteString("env: [")
+	for i := 0; i < 20000; i++ {
+		fmt.Fprintf(&long, "{name: FLAG_%d, value: %d}, ", i, i)
+	}
+	long.WriteString("]")
+	start := time.Now()
+	scrubEnvNameValuePairs(long.String(), nil)
+	// Linear: about 3s under -race with the whole suite running; the
+	// quadratic scan this guards against took minutes on this input.
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("a %d-byte one-line flow list took %v", long.Len(), d)
+	}
+	for _, tc := range cases {
+		var got []string
+		if out := scrubEnvNameValuePairs(tc.in, func(v string) { got = append(got, v) }); out != tc.want {
+			t.Errorf("scrubEnvNameValuePairs(%q)\n got %q\nwant %q", tc.in, out, tc.want)
+		}
+		if strings.Join(got, "\x00") != strings.Join(tc.tracked, "\x00") {
+			t.Errorf("%q: tracked %q, want %q", tc.in, got, tc.tracked)
+		}
+	}
+}
+
+// A tool result's block env value with a note, a URL or another value after
+// a comma is tracked as the value cut there, when the whole line does not
+// read as one.
+func TestSeenSecrets_ABlockEnvValueCutAtACommaIsTracked(t *testing.T) {
+	for in, want := range map[string][]string{
+		"- name: DB_PASSWORD\n  value: synthpass0001abcd, see https://app:synthurl0003@db.example/x\n": {"synthpass0001abcd"},
+		"- name: API_TOKEN\n  value: synthtoken0001abcd, rotated weekly\n":                             {"synthtoken0001abcd"},
+		// Another credential pair after the comma is read as its own.
+		"- name: API_TOKEN\n  value: synthtoken0001abcd, password: synthpass0002wxyz\n": {"synthtoken0001abcd", "synthpass0002wxyz"},
+		// With words after the second value too: it is read in its line
+		// context, not as a line of its own that runs to the end.
+		"- name: DB_PASSWORD\n  value: synthpass0001abcd, password: plumgravy7731kqzx is the old one\n": {"synthpass0001abcd", "plumgravy7731kqzx"},
+		// A pair inside the value before its first cut, or with no cut, is
+		// tracked too: under a name with a comment after it, and under an
+		// ambiguous name, as when the line isn't read as an env value.
+		"- name: DB_DSN # main db\n  value: Server=db;User Id=app;Password=plumgravy7731kqzx\n":   {"plumgravy7731kqzx"},
+		"- name: DB_PASS\n  value: quietpasture; api_key=quietmeadow, token: synthtail0005ghij\n": {"quietmeadow", "synthtail0005ghij"},
+		// A pair in a comment redacted with the value, or in a commented-out
+		// value, is tracked as other rules would have tracked it.
+		"- name: DB_PASSWORD\n  value: synthpass0001abcd # old password=plumgravy7731kqzx\n": {"synthpass0001abcd", "plumgravy7731kqzx"},
+		"- name: DB_PASSWORD\n  value: # was password=quietmeadow99zzk\n":                    {"quietmeadow99zzk"},
+	} {
+		var s Seen
+		s.CollectToolResult(terminalResult(t, in))
+		for _, w := range want {
+			if !s.Has(w) {
+				t.Errorf("%q: %q not tracked; tracked %q", in, w, s.Values())
+			}
+		}
+	}
+}
+
+// A plain word after an auth-scheme word in a table cell is prose, not a
+// value to track: it stays tracked only when token-shaped.
+func TestSeenSecrets_APlainWordAfterASchemeWordInATableIsNotTracked(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, "| Key | Value |\n|---|---|\n| password | Basic authentication |\n"))
+	if s.Has("authentication") {
+		t.Errorf("tracked %q", s.Values())
+	}
+	answer := "The service uses Basic authentication, and authentication fails for user app."
+	if got := Scrub(answer, &s); got != answer {
+		t.Errorf("Scrub = %q, want it unchanged", got)
+	}
+	// A token-shaped value there is still tracked
+	// (TestSeenSecrets_ATableValueAfterASchemeWordIsTrackedWithoutIt), and
+	// so is a value that is not token-shaped but not prose either; a word
+	// naming the scheme's own use is not.
+	var plain Seen
+	plain.CollectToolResult(terminalResult(t, "| Key | Value |\n|---|---|\n| password | Basic `quiet`pasture |\n| client_secret | Basic `quietharbor` |\n| api_token | Bearer `token` |\n"))
+	for _, v := range []string{"quietpasture", "quietharbor"} {
+		if !plain.Has(v) {
+			t.Errorf("%q not tracked; tracked %q", v, plain.Values())
+		}
+	}
+	if plain.Has("token") {
+		t.Errorf("tracked the scheme's own word: %q", plain.Values())
+	}
+}
+
+// A table's value cell is read as a value under a key is: an auth-scheme
+// word stays, and a code-spanned value is bounded by its backticks unless
+// only the whole cell reads as a value. Rows are split both with a pipe
+// inside a code span as content and at every pipe, and both splits'
+// spans are redacted, so backticks pairing across cells cannot move a value
+// out from under its header.
+func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// A short number or a placeholder after the span, under a strong key,
+		// may be the rest of the value: the whole cell goes.
+		{"| Key | Value |\n|---|---|\n| password | `admin` / 12345 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| password | `admin` <x> |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// A code span whose content ends in a blank or a tab, at the cell's
+		// end: no panic, and the value is redacted.
+		{"| Key | Value |\n|---|---|\n| DB password | `synthtoken0001abcd ` |\n", "| Key | Value |\n|---|---|\n| DB password | `[redacted]` |\n"},
+		{"| Key | Value |\n|---|---|\n| DB password | `synthtoken0001abcd\t` |\n", "| Key | Value |\n|---|---|\n| DB password | `[redacted]` |\n"},
+		{"| Key | Value |\n|---|---|\n| api_token | Bearer `synthtoken0001abcd` |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted]` |\n"},
+		{"| Key | Value |\n|---|---|\n| password | `quietpasture` (rotated) |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` (rotated) |\n"},
+		// The every-pipe split also redacts a fragment, as before: fail
+		// closed, the value itself gone either way.
+		{"| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | quietpasture |\n", "| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | [redacted] | [redacted] |\n"},
+		{"| Key | Value | Notes |\n|---|---|---|\n| password | `synth|pass|0001` | rotated |\n", "| Key | Value | Notes |\n|---|---|---|\n| password | [redacted]` | rotated |\n"},
+		// Backticks pairing across cells merge them under the code-aware
+		// split; the every-pipe split still finds the value's column.
+		{"| Note | Password | Extra |\n|---|---|---|\n| see `x | quietpasture | y` |\n", "| Note | Password | Extra |\n|---|---|---|\n| see `x | [redacted] | y` |\n"},
+		// Two code spans in the cell: not the first alone, the whole cell.
+		{"| Key | Value |\n|---|---|\n| password | `appuser` / `quietpasture0001` |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` |\n"},
+		// A code span that does not read as a value, a value after it:
+		// the whole cell is tested and redacted.
+		{"| Key | Value |\n|---|---|\n| password | `none` quietpasture0001 |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// A code-spanned value with punctuation and a note glued after it,
+		// under a bare noun (a value must be token-shaped): the whole cell
+		// does not read as a value, the span does.
+		{"| Name | Token |\n|---|---|\n| ci | `abcd1234efgh5678wxyz`, rotated |\n", "| Name | Token |\n|---|---|\n| ci | `[redacted]`, rotated |\n"},
+		// A code span holding only part of the value, text running on
+		// after it: the whole cell is tested and redacted.
+		{"| Key | Value |\n|---|---|\n| password | `sy`nthpass0001x |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		// An auth-scheme word, then a code span holding part of the value:
+		// the scheme word stays out of the value, under a bare noun and
+		// under a strong key alike.
+		{"| Name | Token |\n|---|---|\n| ci | Bearer `sy`nthtoken0001abcd |\n", "| Name | Token |\n|---|---|\n| ci | Bearer `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| api_token | Bearer `sy`nthtoken0001abcd |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted] |\n"},
+		// One code span with text after it that may be a value (a
+		// token-shaped word, or any word but a state word under a strong
+		// key): the value runs to the cell's end.
+		{"| Key | Value |\n|---|---|\n| password | `appuser` synthtoken0001abcd |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| DB password | `synthtoken0001abcd` (was plumgravy7731kqzx) |\n", "| Key | Value |\n|---|---|\n| DB password | `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| Admin password | `admin` / synthtoken0001abcd |\n", "| Key | Value |\n|---|---|\n| Admin password | `[redacted] |\n"},
+		{"| Key | Value |\n|---|---|\n| password | `appuser` quietpasture |\n", "| Key | Value |\n|---|---|\n| password | `[redacted] |\n"},
+	}
+	for _, tc := range cases {
+		if got := ScrubInline(tc.in); got != tc.want {
+			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Overlapping spans merge to their union: a later span inside an earlier one
+// never shortens it, so a table cell redacted under one row split is not cut
+// back by a shorter span from the other split.
+func TestMergeSpansKeepsTheWidestEnd(t *testing.T) {
+	cases := []struct{ in, want [][2]int }{
+		{[][2]int{{0, 10}, {2, 4}}, [][2]int{{0, 10}}},
+		{[][2]int{{2, 4}, {0, 10}, {12, 14}}, [][2]int{{0, 10}, {12, 14}}},
+		{[][2]int{{0, 4}, {3, 8}}, [][2]int{{0, 8}}},
+		{[][2]int{{0, 4}, {4, 8}}, [][2]int{{0, 4}, {4, 8}}},
+	}
+	for _, c := range cases {
+		if got := mergeSpans(append([][2]int(nil), c.in...)); !slices.Equal(got, c.want) {
+			t.Errorf("mergeSpans(%v) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }

@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gke-labs/kube-agents/a2a/mcp"
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 const (
@@ -763,7 +763,7 @@ func splitUnifiedDiffByFile(diff string) map[string]string {
 		if firstLineEnd >= 0 {
 			firstLine = chunk[:firstLineEnd]
 		}
-		if filePath := mcp.DiffHeaderBSidePath(firstLine); filePath != "" {
+		if filePath := inerttext.DiffHeaderBSidePath(firstLine); filePath != "" {
 			out[filePath] = fullChunk
 		}
 	}
@@ -799,12 +799,12 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 		return ""
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "## 🔀 Pull Request %s#%d\n\n", mcp.InertField(insp.Repo), insp.Number)
+	fmt.Fprintf(&sb, "## 🔀 Pull Request %s#%d\n\n", inerttext.Field(insp.Repo), insp.Number)
 	sb.WriteString(prUntrustedNotice)
-	fmt.Fprintf(&sb, "- **Title**: %s\n", mcp.InertField(insp.Title))
-	fmt.Fprintf(&sb, "- **URL**: %s\n", mcp.InertField(insp.URL))
+	fmt.Fprintf(&sb, "- **Title**: %s\n", inerttext.Field(insp.Title))
+	fmt.Fprintf(&sb, "- **URL**: %s\n", inerttext.Field(insp.URL))
 	fmt.Fprintf(&sb, "- **State**: %s | **Author**: %s | **Branch**: %s → %s\n",
-		mcp.InertField(insp.State), mcp.InertField(insp.Author), mcp.InertField(insp.HeadRef), mcp.InertField(insp.BaseRef))
+		inerttext.Field(insp.State), inerttext.Field(insp.Author), inerttext.Field(insp.HeadRef), inerttext.Field(insp.BaseRef))
 	fmt.Fprintf(&sb, "- **Changes**: `+ %d` / `- %d` across `%d` file(s)\n",
 		insp.Additions, insp.Deletions, insp.ChangedFiles)
 	if insp.DiffFilePath != "" {
@@ -812,7 +812,7 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 			filepath.Base(insp.DiffFilePath), fileSchemePrefix, insp.DiffFilePath)
 	} else if insp.DiffError != "" {
 		fmt.Fprintf(&sb, "- **Unified Diff**: ⚠️ not available — %s. Fetch it locally with `"+ghPRDiffHintFormat+"`.\n",
-			mcp.InertField(insp.DiffError), insp.Number, insp.Repo)
+			inerttext.Field(insp.DiffError), insp.Number, insp.Repo)
 	}
 	if insp.SummaryFilePath != "" {
 		fmt.Fprintf(&sb, "- **Local PR Summary Markdown**: [%s](%s%s)\n",
@@ -822,7 +822,7 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 
 	if strings.TrimSpace(insp.Body) != "" {
 		sb.WriteString("### 📝 PR Description\n\n")
-		mcp.WriteInertBlock(&sb, insp.Body, fenceInfoText, maxPRDescriptionBytes, 0, maxPRProseLineBytes)
+		inerttext.WriteBlock(&sb, insp.Body, fenceInfoText, maxPRDescriptionBytes, 0, maxPRProseLineBytes)
 		sb.WriteString("\n")
 	}
 
@@ -836,21 +836,21 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 				patchLink = fmt.Sprintf("[%s](%s%s)", filepath.Base(f.PatchPath), fileSchemePrefix, f.PatchPath)
 			}
 			fmt.Fprintf(&sb, "| %s | %s | `+%d` | `-%d` | %s |\n",
-				mcp.InertField(f.Path), mcp.InertField(FirstNonEmptyStr(f.Status, "modified")), f.Additions, f.Deletions, patchLink)
+				inerttext.Field(f.Path), inerttext.Field(FirstNonEmptyStr(f.Status, "modified")), f.Additions, f.Deletions, patchLink)
 		}
 		sb.WriteString("\n")
 	}
 	if insp.FilesError != "" || len(insp.Files) < insp.ChangedFiles {
 		fmt.Fprintf(&sb, "⚠️ **Changed files listing is incomplete**: %d of %d file(s) listed", len(insp.Files), insp.ChangedFiles)
 		if insp.FilesError != "" {
-			fmt.Fprintf(&sb, " — %s", mcp.InertField(insp.FilesError))
+			fmt.Fprintf(&sb, " — %s", inerttext.Field(insp.FilesError))
 		}
 		sb.WriteString(".\n\n")
 	}
 
 	if strings.TrimSpace(insp.UnifiedDiff) != "" {
 		sb.WriteString("### 🔍 Unified Diff\n\n")
-		mcp.WriteInertBlock(&sb, insp.UnifiedDiff, fenceInfoDiff, maxInlineDiffBytes, 0, maxPRDiffLineBytes)
+		inerttext.WriteBlock(&sb, insp.UnifiedDiff, fenceInfoDiff, maxInlineDiffBytes, 0, maxPRDiffLineBytes)
 		if len(insp.UnifiedDiff) > maxInlineDiffBytes && insp.DiffFilePath != "" {
 			fmt.Fprintf(&sb, "\nOpen the full diff at %s%s\n", fileSchemePrefix, insp.DiffFilePath)
 		}

@@ -1293,6 +1293,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 5b. Which callers send their inference gateway key on this pass, read
+	// once, before the first render that depends on it (the managed config
+	// below), so every render of the pass agrees (inference_key_callers.go).
+	inferenceKeyCallers, err := r.servedInferenceKeyCallers(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	ctx = withInferenceKeyCallers(ctx, inferenceKeyCallers)
+
 	// 6. Reconcile ConfigMap (config.yaml content)
 	configMapHash, err := r.reconcileConfigMap(ctx, instance, agentPlugins)
 	if err != nil {
@@ -2143,7 +2152,13 @@ func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent 
 		r.kanbanAdmissionWarningsLogged.Delete(key)
 	}
 
-	cm := buildConfigMap(agent, agentPlugins)
+	// The agent's model.api_key reads its inference gateway key from the env
+	// the pod template carries in the same pass (inference_key_callers.go).
+	apiKey := agentPlaceholderAPIKey
+	if inferenceKeyCallersFrom(ctx).sends(inferenceKeyClassAgent) {
+		apiKey = agentInferenceKeyConfigRef
+	}
+	cm := buildConfigMapWith(agent, agentPlugins, apiKey)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
@@ -3134,7 +3149,8 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
-	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled,
+		inferenceKeys: inferenceKeyCallersFrom(ctx)}
 	held, err := r.heldGitHubOrg(ctx, agent)
 	if err != nil {
 		return err
@@ -4473,8 +4489,11 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range existingRoleBindings.Items {
 		rb := &existingRoleBindings.Items[i]
-		// Preserve local and leader bindings during reconciliation
-		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
+		// Preserve local and leader bindings during reconciliation.
+		// kube-proxy's pod-read binding is bound to saName too, and an agent
+		// named with the kubeagents prefix would give it the prefix this
+		// sweep reaps; reconcileKubeProxy applies it every pass.
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName || rb.Name == kubeProxyPodReadName(agent)) {
 			continue
 		}
 		isTargetSA := false

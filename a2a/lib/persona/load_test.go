@@ -132,6 +132,9 @@ func TestLoadRefuses(t *testing.T) {
 		{"a server named like a built-in", func(t *testing.T, d string) {
 			replaceIn(t, d, MCPFile, "servers:", "servers:\n  shell:\n    broker: gke")
 		}, "mcp.yaml: servers.shell: server name is a built-in tool name"},
+		{"the reserved server name", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "servers:", "servers:\n  a2a:\n    broker: gke")
+		}, "mcp.yaml: servers.a2a: server name \"a2a\" is reserved"},
 		{"a backslash in a skill file name", func(t *testing.T, d string) {
 			_ = os.WriteFile(filepath.Join(d, `skills/notes/a\b.md`), []byte("x\n"), 0o644)
 		}, `skills/notes/a\b.md: is not a plain relative path`},

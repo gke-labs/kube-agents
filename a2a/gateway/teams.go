@@ -241,10 +241,31 @@ type TeamsAdapter struct {
 	// to the global host; serviceURLOrder is its eviction queue.
 	serviceURLs     map[string]string
 	serviceURLOrder []string
+	// recorder is the gateway's feedback desk, nil until it is handed over
+	// (SetFeedbackRecorder): without one no rating controls are drawn.
+	// rated remembers each message posted with them, by its id, so a press
+	// can be recorded with the answer's text and the card redrawn;
+	// ratedOrder is its eviction queue (teams_feedback.go).
+	recorder   FeedbackRecorder
+	rated      map[string]teamsRated
+	ratedOrder []string
+	// rateMu runs the ratings, which are off the pull loop, one at a time,
+	// so a rating and the redraw it causes are never interleaved with
+	// another's. It does not order two presses pulled back to back.
+	rateMu sync.Mutex
+	// rating counts the ratings in flight, for a test to wait on.
+	rating sync.WaitGroup
 
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
 	countInterval time.Duration
+	// typing is the conversations with a task running or an ask open,
+	// each with the loop that keeps Teams's typing indicator on while only
+	// the ask is (teams_typing.go);
+	// typingInterval and typingMax pace and bound it (tests shorten both).
+	typing         map[string]*teamsTyping
+	typingInterval time.Duration
+	typingMax      time.Duration
 }
 
 // NewTeamsAdapter builds the adapter against the credential proxy's relay
@@ -258,16 +279,20 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		return nil, fmt.Errorf("teams: relay token path is required")
 	}
 	return &TeamsAdapter{
-		relayURL:      strings.TrimSuffix(relayURL, "/"),
-		tokenPath:     tokenPath,
-		tenantID:      strings.TrimSpace(tenantID),
-		adaptiveCards: adaptiveCards,
-		client:        &http.Client{Timeout: teamsRelayTimeout},
-		log:           log,
-		seen:          map[string]bool{},
-		serviceURLs:   map[string]string{},
-		allowed:       map[string]bool{},
-		countInterval: teamsEventCountInterval,
+		relayURL:       strings.TrimSuffix(relayURL, "/"),
+		tokenPath:      tokenPath,
+		tenantID:       strings.TrimSpace(tenantID),
+		adaptiveCards:  adaptiveCards,
+		client:         &http.Client{Timeout: teamsRelayTimeout},
+		log:            log,
+		seen:           map[string]bool{},
+		serviceURLs:    map[string]string{},
+		rated:          map[string]teamsRated{},
+		allowed:        map[string]bool{},
+		countInterval:  teamsEventCountInterval,
+		typing:         map[string]*teamsTyping{},
+		typingInterval: teamsTypingInterval,
+		typingMax:      teamsTypingMax,
 	}, nil
 }
 
@@ -685,10 +710,13 @@ func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("teams: encoding activity: %w", err)
 	}
+	a.quietTyping(conversation)
 	raw, err := a.apiPost(context.Background(), http.MethodPost, endpoint, payload)
+	a.quietTyping(conversation)
 	if err != nil {
 		return "", err
 	}
+	a.typingShown(conversation, false)
 	var body struct {
 		Response struct {
 			ID string `json:"id"`
@@ -822,24 +850,35 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	if err != nil {
 		return fmt.Errorf("teams: encoding activity update: %w", err)
 	}
-	_, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload)
-	return err
+	if _, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload); err != nil {
+		return err
+	}
+	a.typingShown(conversation, true)
+	return nil
 }
 
 // PostMessage and EditMessage post text only: a chat message falls back to
 // its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
-// (teams_press.go); an edit that names no task removes it.
+// (teams_press.go); an edit that names no task removes it. An answer marked
+// for feedback (m.Feedback) carries the rating controls on its card, once
+// the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	if m.Chat == nil && m.Stop != "" {
+	switch {
+	case m.Chat == nil && m.Stop != "":
 		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		return a.postRated(conversation, m)
 	}
 	return postTextOnly(a.Post, conversation, m)
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
-	if m.Chat == nil && m.Stop != "" {
+	switch {
+	case m.Chat == nil && m.Stop != "":
 		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		return a.editRated(conversation, messageID, m)
 	}
 	return editTextOnly(a.Edit, conversation, messageID, m)
 }

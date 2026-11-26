@@ -26,6 +26,7 @@ import types
 import unittest
 
 import yaml
+from fastapi import HTTPException
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
@@ -516,8 +517,36 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], _RULE_MATCHING_BASE64)
         for mime in ("text/plain", "application/json"):
             text = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": "b24gcHJvZC1ldS0x"}}]}]}
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=mime):
+            with self.assertRaises(HTTPException, msg=mime):
                 self._run(text, "agenerate_content")
+
+    def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
+        # Forms providers accept: the URL-safe alphabet, no padding, and the
+        # common image/jpg label. Each is kept byte for byte as it came.
+        import base64 as b64
+        png = b"\x89PNG\r\n\x1a\n" + bytes([0xFB, 0xFF, 0xFE]) * 4
+        jpeg = b"\xff\xd8\xff\xe0" + bytes([0xFB, 0xFF]) * 4
+        cases = [
+            ("image/png", b64.urlsafe_b64encode(png).decode()),
+            ("image/png", b64.b64encode(png).decode().rstrip("=")),
+            ("image/png", b64.urlsafe_b64encode(png).decode().rstrip("=")),
+            ("image/jpg", b64.b64encode(jpeg).decode()),
+        ]
+        for mime, data in cases:
+            with self.subTest(mime=mime, data=data):
+                req = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": data}}]}]}
+                out = self._run(req, "agenerate_content")
+                self.assertEqual(out["contents"][0]["parts"][0]["inlineData"]["data"], data)
+        # Normalising doesn't loosen the decode: a length that is 1 mod 4, an
+        # '=' inside the data, and over-padding are still not base64.
+        for bad in ("iVBORw0KGgoAA", "iVBO=Rw0KGgo", "iVBORw0KGgo=AAA", "iVBORw0KGgo==="):
+            with self.subTest(bad=bad), self.assertRaises(HTTPException) as refused:
+                self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": bad}}]}]}, "agenerate_content")
+            self.assertEqual(refused.exception.status_code, 400)
+        # A URL-safe payload that isn't the media it claims is still refused.
+        text = b64.urlsafe_b64encode(b"on prod-eu-1, token here").decode().rstrip("=")
+        with self.assertRaises(HTTPException):
+            self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": text}}]}]}, "agenerate_content")
 
     # Provider-opaque fields a provider checks byte for byte: kept as they came
     # at their API positions, even when a rule matches inside them, and
@@ -574,13 +603,32 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(assistant["tool_calls"][0]["provider_specific_fields"]["thought_signature"], self._OPAQUE)
         self.assertNotEqual(out["messages"][1]["provider_specific_fields"]["thought_signature"], self._OPAQUE, "not on a user's message")
 
+    def test_a_refused_request_shape_is_answered_with_400_through_the_hook(self) -> None:
+        # Through the hook LiteLLM calls: a refused shape becomes an
+        # HTTPException with status 400, carrying the refusal text, so a
+        # caller doesn't retry it as it would a 5xx. Other faults stay 500s.
+        data = {"messages": "not a list"}
+        with self.assertRaises(HTTPException) as refused:
+            self._run(data)
+        self.assertEqual(refused.exception.status_code, 400)
+        self.assertIn("refuses a request it cannot walk", str(refused.exception.detail))
+
+    def test_a_fault_in_the_hook_is_not_answered_with_400(self) -> None:
+        # Only a refused shape becomes a 400: any other exception from the
+        # walk surfaces as itself, which LiteLLM answers with a 500.
+        from unittest import mock
+
+        with mock.patch.object(type(self.hook), "redact_request", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._run({"messages": [{"role": "user", "content": "x"}]})
+
     def test_a_refusal_names_a_media_type_only_when_it_is_a_media_type_name(self) -> None:
         def part(media):
             return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{media};base64,AAAA"}}]}]}
-        with self.assertRaises(self.module.UnwalkableRequestError) as named:
+        with self.assertRaises(HTTPException) as named:
             self._run(part("text/plain"))
         self.assertIn("text/plain", str(named.exception))
-        with self.assertRaises(self.module.UnwalkableRequestError) as unnamed:
+        with self.assertRaises(HTTPException) as unnamed:
             self._run(part("deploy key is hunter2-example-pw"))
         self.assertNotIn("hunter2", str(unnamed.exception))
 
@@ -650,9 +698,9 @@ class TestCallback(unittest.TestCase):
             {"type": "image_url", "image_url": {"url": "data:image/png,plain"}},
             {"type": "input_audio", "input_audio": {"format": "wav", "data": "not base64!"}},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
-        with self.assertRaises(self.module.UnwalkableRequestError):
+        with self.assertRaises(HTTPException):
             self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/svg+xml", "data": "PHN2Zz4="}}]}]}, "agenerate_content")
 
     def test_thinking_is_exempt_only_in_the_assistants_own_turn(self) -> None:
@@ -678,13 +726,13 @@ class TestCallback(unittest.TestCase):
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;name=on-prod-eu-1;base64," + _PNG_BASE64}},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},  # bad padding
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo!"}},  # not base64
             {"type": "image", "source": {"type": "base64", "media_type": "video/mp4", "data": text_as_png}},
             {"type": "image", "source": {"type": "base64", "media_type": "image/heic", "data": text_as_png}},
             {"type": "input_audio", "input_audio": {"format": "ogg", "data": text_as_png}},
             {"type": "image", "source": {"type": "base64", "media_type": "audio/x-made-up", "data": _WAV_BASE64}},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
 
     def test_json_in_tool_arguments_is_decoded_and_tool_output_is_redacted(self) -> None:
@@ -740,7 +788,7 @@ class TestCallback(unittest.TestCase):
 
     def test_a_data_url_is_recognised_whatever_its_case_or_spacing(self) -> None:
         for url in ("DATA:text/plain;base64,dG9rZW49eGEyOQ==", " data:text/plain;base64,dG9rZW49eGEyOQ=="):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=url):
+            with self.assertRaises(HTTPException, msg=url):
                 self._run({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]})
 
     def test_a_json_looking_string_under_a_credential_key_is_masked(self) -> None:
@@ -769,7 +817,7 @@ class TestCallback(unittest.TestCase):
             {"model": "m", "messages": ["prod-eu-1"]},
             {"model": "m", "contents": ["on prod-eu-1"]},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError) as raised:
+            with self.assertRaises(HTTPException) as raised:
                 self._run(dict(data), "arerank")
             message = str(raised.exception)
             self.assertIn("refuses a request it cannot walk", message)
@@ -831,7 +879,7 @@ class TestCallback(unittest.TestCase):
             {"type": "file", "file": {"file_data": "data:application/json;base64,e30="}},
             {"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "b24="}},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
 
     def test_a_bad_rule_file_fails_the_import_rather_than_the_request(self) -> None:

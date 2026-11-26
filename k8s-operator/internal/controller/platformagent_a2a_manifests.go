@@ -743,6 +743,13 @@ const (
 	a2aTeamsHomeChannelEnvVar   = "A2A_TEAMS_HOME_CHANNEL"
 	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
 	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
+	// a2aTeamsAnswerFeedbackEnvVar turns answer feedback off on a gateway
+	// that holds the Teams backend: "false" on the controller-manager
+	// Deployment is carried to the gateway under the same name (a2a/gateway's
+	// envTeamsAnswerFeedback), and anything else renders nothing. An operator
+	// switch like a2aTeamsBackendEnvVar, since Teams has no answerFeedback
+	// field on the CR yet.
+	a2aTeamsAnswerFeedbackEnvVar = "A2A_TEAMS_ANSWER_FEEDBACK"
 	// The gateway's rule for a Teams home conversation id
 	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
 	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
@@ -7662,6 +7669,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if teams.AdaptiveCards != nil && !*teams.AdaptiveCards {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAdaptiveCardsEnvVar, Value: strconv.FormatBool(false)})
 		}
+		// Answer feedback is on unless the operator's switch turns it off;
+		// only the off is rendered, as on Chat and Slack.
+		if os.Getenv(a2aTeamsAnswerFeedbackEnvVar) == strconv.FormatBool(false) {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
 		if len(chatVolumes) == 0 {
 			chatMounts, chatVolumes = a2aChatRelayToken()
 		}
@@ -7839,10 +7851,15 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	env = append(env, a2aSessionIdleEnv(agent)...)
 	// The report reader's token and the broker's address, on every install
 	// (a2a_report_reader.go).
 	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
 	env = append(env, reportEnv...)
+	// The profile supervisor gate, once the install has latched (#5301): the
+	// cutoff and the profile names file's path, absent until then, so an
+	// unlatched gateway's template is unchanged.
+	env = append(env, a2aProfileSupervisorCutoffEnv(agent)...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))
@@ -7932,6 +7949,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		},
 	}
 	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
+	withA2AProfileNamesFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
 	return dep
 }
 
@@ -8345,6 +8363,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// return between the two then never leaves a map naming a tier whose
 	// file was not written.
 	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
+		return state, err
+	}
+	// The profile names the gateway and the MCP server take profile-ness
+	// from once latched (#5301): the same names as the bus's per-profile
+	// deny below, from the same call. Optional on both pods, so ordering
+	// against their Deployments doesn't matter.
+	gateProfiles, _, gateErr := dispatcherGrantNamesErr(agent, profiles, draining)
+	if err := r.applyA2AProfileNames(ctx, agent, gateProfiles, gateErr); err != nil {
 		return state, err
 	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
@@ -10088,6 +10114,25 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionIdleEnv renders spec.harness.tuning's session idle times onto the
+// gateway (#2371), each only when set, so an install that sets neither keeps
+// the gateway's defaults (30m, and 5m for a single-turn DM) and its rendered
+// Deployment unchanged. An older gateway ignores A2A_DM_IDLE_TTL.
+func a2aSessionIdleEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.Tuning == nil {
+		return nil
+	}
+	t := agent.Spec.Harness.Tuning
+	var env []corev1.EnvVar
+	if t.SessionIdleMinutes != nil {
+		env = append(env, corev1.EnvVar{Name: "A2A_IDLE_TTL", Value: fmt.Sprintf("%dm", *t.SessionIdleMinutes)})
+	}
+	if t.DMSessionIdleMinutes != nil {
+		env = append(env, corev1.EnvVar{Name: "A2A_DM_IDLE_TTL", Value: fmt.Sprintf("%dm", *t.DMSessionIdleMinutes)})
+	}
+	return env
 }
 
 // a2aSessionHarnessSpec is spec.harness.sessionWorker.type as written, ""

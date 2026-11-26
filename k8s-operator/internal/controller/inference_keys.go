@@ -57,9 +57,10 @@ import (
 // lowercase-hex sha256 of a caller key to the caller class it is admitted
 // as. This file mints one key per class, writes that map, and asks every
 // Ready gateway pod whether it has loaded the map yet, which is the
-// InferenceKeysServed condition. Nothing sends these keys yet: callers are
-// given them only once the condition is True, so a caller never sends a key
-// the gateway would refuse.
+// InferenceKeysServed condition. Callers are given their key only once a
+// pass has found the condition True for a map holding it
+// (inference_key_callers.go), so no caller is given a key before every
+// Ready gateway pod has loaded it.
 //
 // The question is asked with a probe key of its own, in the reserved class
 // gateway-probe, which the hook admits on GET /v1/models alone and no
@@ -80,8 +81,9 @@ import (
 // namespace with a controller reference to the PlatformAgent. A tier's is
 // in the profile namespace, where the workers run, and can't carry an owner
 // reference across namespaces (agentprofile_namespace.go), so it carries
-// this agent's labels and is deleted when no bound profile lists the tier,
-// a draining one included, and on the PlatformAgent's deletion.
+// this agent's labels and is deleted once no bound profile lists the tier
+// and no drain keeps it (drainingInferenceKeyTiers), and on the
+// PlatformAgent's deletion.
 //
 // Whoever creates a Secret writes its labels and owner references, so
 // neither says the operator made it. The operator records the UID of every
@@ -106,7 +108,8 @@ import (
 // Secrets are read by name through the uncached reader: the operator never
 // lists or watches a Secret (tests/test_operator_secrets_grant.py). Nothing
 // here logs, records or reports a key or a key's digest; counts, class names
-// and Secret names only.
+// and Secret names only. The one exception is a key Secret's own served mark
+// (inferenceKeyServedAnnotation), its key's digest on the same Secret.
 const (
 	inferenceKeysServedCondition = "InferenceKeysServed"
 	// Reasons the condition carries.
@@ -418,7 +421,7 @@ func (r *PlatformAgentReconciler) forgetServedCRDAnswer() {
 }
 
 // crdSchemaHasInferenceKeys reports whether crd's schema for version has
-// status.inferenceKeys.
+// status.inferenceKeys, with its tierUnboundAt.
 func crdSchemaHasInferenceKeys(crd *unstructured.Unstructured, version string) bool {
 	versions, _, _ := unstructured.NestedSlice(crd.Object, "spec", "versions")
 	for _, v := range versions {
@@ -426,14 +429,16 @@ func crdSchemaHasInferenceKeys(crd *unstructured.Unstructured, version string) b
 		if !ok || entry["name"] != version {
 			continue
 		}
-		_, found, _ := unstructured.NestedMap(entry, "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys")
+		// The record this step writes needs both fields: an older CRD would
+		// prune tierUnboundAt silently and so lift the bound on kept tiers.
+		_, found, _ := unstructured.NestedMap(entry, "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys", "properties", "tierUnboundAt")
 		return found
 	}
 	return false
 }
 
 // errInferenceKeysStatusPruned is a record write the served CRD dropped.
-var errInferenceKeysStatusPruned = errors.New("the served PlatformAgent CRD has no status.inferenceKeys")
+var errInferenceKeysStatusPruned = errors.New("the served PlatformAgent CRD's status.inferenceKeys schema isn't current")
 
 // recordedSecretUIDs is status.inferenceKeys.secretUIDs, by Secret name.
 func recordedSecretUIDs(agent *agentv1alpha1.PlatformAgent) map[string]types.UID {
@@ -479,6 +484,62 @@ func (r *PlatformAgentReconciler) updateSecretUIDs(ctx context.Context, agent *a
 	return nil
 }
 
+// tierUnboundAt is, for each tier with a recorded key that no bound profile
+// lists, when the operator first found it unbound: the stored time, or now
+// for a tier newly unbound. A bound tier, or one whose key is gone, has no
+// entry. The map is written back to status.inferenceKeys.tierUnboundAt only
+// when it changed. A failed write is logged and the answer still used, so a
+// tier's first pass unbound always keeps its key; the time restarts on the
+// next pass that writes.
+func (r *PlatformAgentReconciler) tierUnboundAt(ctx context.Context, agent *agentv1alpha1.PlatformAgent, haveKey, bound []string) map[string]time.Time {
+	var stored map[string]metav1.Time
+	if agent.Status.InferenceKeys != nil {
+		stored = agent.Status.InferenceKeys.TierUnboundAt
+	}
+	now := metav1.NewTime(time.Now().UTC().Truncate(time.Second))
+	next := map[string]metav1.Time{}
+	out := map[string]time.Time{}
+	for _, tier := range haveKey {
+		if slices.Contains(bound, tier) {
+			continue
+		}
+		at, ok := stored[tier]
+		if !ok {
+			at = now
+		}
+		next[tier] = at
+		out[tier] = at.Time
+	}
+	if len(next) == len(stored) {
+		same := true
+		for tier, at := range next {
+			if prev, ok := stored[tier]; !ok || !prev.Equal(&at) {
+				same = false
+				break
+			}
+		}
+		if same {
+			return out
+		}
+	}
+	patch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	written := agent.DeepCopy()
+	if written.Status.InferenceKeys == nil {
+		written.Status.InferenceKeys = &agentv1alpha1.InferenceKeysStatus{}
+	}
+	written.Status.InferenceKeys.TierUnboundAt = next
+	if len(next) == 0 {
+		written.Status.InferenceKeys.TierUnboundAt = nil
+	}
+	if err := r.Status().Patch(ctx, written, patch); err != nil {
+		logf.FromContext(ctx).Info("could not record when inference gateway key tiers became unbound; the next pass tries again", "failure", apiFailure(err))
+		return out
+	}
+	agent.Status.InferenceKeys = written.Status.InferenceKeys
+	agent.ResourceVersion = written.ResourceVersion
+	return out
+}
+
 // createRecorded creates secret and records its UID. When the record can't
 // be written the Secret is deleted again, by that UID, so the operator never
 // leaves behind a Secret it would itself refuse to use.
@@ -503,7 +564,7 @@ func (r *PlatformAgentReconciler) createRecorded(ctx context.Context, agent *age
 func (r *PlatformAgentReconciler) notWrittenFor(what string, err error) inferenceKeysOutcome {
 	if errors.Is(err, errInferenceKeysStatusPruned) {
 		r.forgetServedCRDAnswer()
-		return notWritten("the served PlatformAgent CRD has no status.inferenceKeys, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
+		return notWritten("the served PlatformAgent CRD's status.inferenceKeys schema isn't current, so the operator can't record the Secrets it creates and creates none; apply the current CRD", false)
 	}
 	if errors.Is(err, errReservedSecretTerminating) {
 		return notWritten(what+" is being deleted; the operator creates its own once it's gone", true)
@@ -514,13 +575,17 @@ func (r *PlatformAgentReconciler) notWrittenFor(what string, err error) inferenc
 	return notWritten(what+" could not be read or written: "+apiFailure(err), true)
 }
 
-// tiersInUse is every tier a bound profile lists, live or draining, sorted.
-func tiersInUse(profiles []agentv1alpha1.AgentProfile) []string {
+// tiersInUse is every tier a bound profile lists, and every draining tier,
+// sorted.
+func tiersInUse(profiles []agentv1alpha1.AgentProfile, draining []string) []string {
 	seen := map[string]bool{}
 	for i := range profiles {
 		for _, tier := range profiles[i].AllowedTierList() {
 			seen[tier] = true
 		}
+	}
+	for _, tier := range draining {
+		seen[tier] = true
 	}
 	out := make([]string, 0, len(seen))
 	for tier := range seen {
@@ -528,6 +593,72 @@ func tiersInUse(profiles []agentv1alpha1.AgentProfile) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// drainingInferenceKeyTiers is every tier the applied dispatch config still
+// lists: live, or draining (a tier a live profile dropped, and every tier of
+// a profile that has left the install, agentprofile_tier_drain.go). A task already running at
+// one still sends its tier's key until the drain ends, so the key stays, in
+// its Secret and in the map, until then. No applied config drains nothing; a
+// read that fails otherwise is an error, so no tier key is deleted on a pass
+// that can't tell.
+//
+// The config only delays a deletion. It is read as dispatchDraining reads it,
+// with the same trust, and no more: only a config controlled by this
+// PlatformAgent counts, a drain whose end has passed or lies beyond
+// a2aDrainingWindow from now keeps nothing, and the caller keeps only tiers
+// that already have a recorded key, so nothing in it mints a key.
+func (r *PlatformAgentReconciler) drainingInferenceKeyTiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (liveListed, draining []string, err error) {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	if ref := metav1.GetControllerOf(cm); ref == nil || ref.UID != agent.UID {
+		return nil, nil, nil
+	}
+	var applied a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
+		// dispatchDraining reports an undecodable config; it drains nothing
+		// there either.
+		return nil, nil, nil
+	}
+	now := time.Now()
+	inWindow := func(until time.Time) bool {
+		return now.Before(until) && !until.After(now.Add(a2aDrainingWindow))
+	}
+	keep := func(out *[]string, tier string) {
+		if isDNS1123LabelToken(tier) {
+			*out = append(*out, tier)
+		}
+	}
+	for _, p := range applied.Profiles {
+		// A tier the config still lists for a profile is kept whether it is
+		// live there or draining. The config is the one the A2A step wrote
+		// on an earlier pass, and this step runs before that one: on the
+		// first pass after a profile leaves or drops a tier, the config
+		// still lists it as live, with no drain written yet, and its tasks
+		// are still running. A zero end is the drain about to start, as
+		// drainingDispatchProfiles reads it.
+		switch {
+		case p.DrainingUntil.IsZero():
+			for _, tier := range p.Tiers {
+				keep(&liveListed, tier)
+			}
+		case inWindow(p.DrainingUntil):
+			for _, tier := range p.Tiers {
+				keep(&draining, tier)
+			}
+		}
+		for _, d := range p.DrainingTiers {
+			if inWindow(d.Until) {
+				keep(&draining, d.Tier)
+			}
+		}
+	}
+	return liveListed, draining, nil
 }
 
 // inferenceKeysCondition is a condition of the type this file writes.
@@ -595,7 +726,7 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		return notWritten("the PlatformAgent CRD could not be read to check it has status.inferenceKeys ("+apiFailure(err)+"); nothing is written on this pass", true)
 	case !has:
 		return inferenceKeysOutcome{condition: inferenceKeysCondition(metav1.ConditionFalse, inferenceKeysReasonCRDOutdated,
-			"the served PlatformAgent CRD has no status.inferenceKeys, so the operator creates no inference gateway key until the current PlatformAgent CRD is applied")}
+			"the served PlatformAgent CRD's status.inferenceKeys schema isn't current, so the operator creates no inference gateway key until the current PlatformAgent CRD is applied")}
 	}
 
 	recorded := recordedSecretUIDs(agent)
@@ -667,9 +798,27 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		if err != nil {
 			return notWritten("the profile namespace could not be read: "+apiFailure(err), true)
 		}
+		liveListed, draining, err := r.drainingInferenceKeyTiers(ctx, agent)
+		if err != nil {
+			return notWritten("the applied dispatch config could not be read for the draining tiers: "+apiFailure(err), true)
+		}
+		// A draining tier only keeps a key it already has. A tier the config
+		// lists as live without any profile binding it is one whose drain
+		// hasn't been written yet: it keeps its key for at most the drain
+		// window from when it was first found unbound, so a config that is
+		// never rewritten can't keep a key indefinitely.
+		haveKey := recordedTiers(agent, recorded)
+		unboundAt := r.tierUnboundAt(ctx, agent, haveKey, tiersInUse(profiles, nil))
+		now := time.Now()
+		for _, tier := range liveListed {
+			if at, ok := unboundAt[tier]; !ok || now.Sub(at) <= a2aDrainingWindow {
+				draining = append(draining, tier)
+			}
+		}
+		draining = slices.DeleteFunc(draining, func(tier string) bool { return !slices.Contains(haveKey, tier) })
 		tiers, tiersKnown, profileNamespaceReady = nil, true, ready
 		if ready {
-			tiers = tiersInUse(profiles)
+			tiers = tiersInUse(profiles, draining)
 		}
 	}
 
@@ -780,7 +929,16 @@ func (r *PlatformAgentReconciler) reconcileInferenceKeys(ctx context.Context, ag
 		log.Info("inference gateway caller keys reconciled", "callerClasses", len(served), "minted", minted, "mapWritten", mapWritten, "removedTiers", removed)
 	}
 
-	return r.probeInferenceKeys(ctx, agent, &gateway, served, keys, doc)
+	outcome := r.probeInferenceKeys(ctx, agent, &gateway, served, keys, doc)
+	// Served: every Ready pod has loaded a map holding each of these keys, so
+	// each class's Secret is marked for the key it holds, and its callers get
+	// it from the next pass on (inference_key_callers.go).
+	if outcome.condition != nil && outcome.condition.Status == metav1.ConditionTrue {
+		if r.markInferenceKeysServed(ctx, agent, served, keys) > 0 && (outcome.requeue == 0 || outcome.requeue > inferenceKeysMarkedRecheck) {
+			outcome.requeue = inferenceKeysMarkedRecheck
+		}
+	}
+	return outcome
 }
 
 // ensureInferenceKey returns c's key, creating its Secret when absent and
