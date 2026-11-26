@@ -31,7 +31,7 @@ const (
 // proxy must start without any of them.
 var hostEnvVars = []string{
 	"HOME", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG", "APPDATA",
-	"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "KUBECONFIG",
+	"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "KUBECONFIG", googleCloudUniverseEnv,
 }
 
 // tlsUpstream is an HTTPS API server that records the Authorization header of each request.

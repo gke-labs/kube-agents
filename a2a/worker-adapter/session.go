@@ -176,12 +176,14 @@ func sessionLoop(ctx context.Context, cfg Config, b *busConns, w *taskWatcher, f
 	for {
 		if out.launched {
 			switch {
-			case out.harnessSession != "" && keepsOnlyCompletedTurns(cfg.driver()) && out.res.State != lib.StateCompleted:
+			case out.harnessSession != "" && keepsOnlyCompletedTurns(cfg.driver()) && out.res.State != lib.StateCompleted && !out.turnCommitted:
 				// This driver's conversation keeps a turn only when it
-				// completes, so a failed or stopped turn added nothing:
-				// the loop stays where it was. Before any turn has
+				// completes, so a task none of whose turns completed added
+				// nothing: the loop stays where it was. Before any turn has
 				// completed that means the next run starts fresh with the
-				// primer; after one, it resumes the same conversation.
+				// primer; after one, it resumes the same conversation. A
+				// task whose earlier turn completed on a process a later one
+				// replaced (turnCommitted) added that turn, and resumes below.
 				log.Warn("the turn did not complete, and this harness keeps only completed turns; the next run starts from the conversation as it was",
 					"task", out.lastTask(cfg), "resume", resume != "")
 			case out.harnessSession != "":

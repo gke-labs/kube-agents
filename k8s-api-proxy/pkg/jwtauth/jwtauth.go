@@ -93,6 +93,11 @@ var defaultSignatureAlgorithms = []jose.SignatureAlgorithm{jose.RS256, jose.ES25
 // NewAuthenticator parses them, for its errors.
 var claimPathFields = []string{"UsernameClaim", "UIDClaim", "GroupsClaim", "PartitionClaim"}
 
+// kubernetesClaim is the private claim the Kubernetes API server puts in every
+// ServiceAccount token it issues: the namespace, the ServiceAccount and, for a projected
+// token, the pod.
+const kubernetesClaim = "kubernetes.io"
+
 var (
 	errNotAuthenticated  = errors.New("the caller's token was not accepted")
 	errEmptyClaimPathKey = errors.New("a claim path cannot have an empty key")
@@ -435,6 +440,12 @@ func (a *authenticator) AuthenticateRequest(r *http.Request) (*k8sapiproxy.Calle
 		return nil, errNotAuthenticated
 	}
 
+	// A Kubernetes ServiceAccount token (it carries the kubernetes.io claim) is the
+	// TokenReview authenticator's to admit, which holds a pod's token to its pod; admitted
+	// here it would skip that check.
+	if _, ok := extra[kubernetesClaim]; ok {
+		return nil, errNotAuthenticated
+	}
 	if !strings.HasPrefix(claims.Subject, a.requiredSubPrefix) {
 		return nil, errNotAuthenticated
 	}

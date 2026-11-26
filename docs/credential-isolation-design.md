@@ -523,7 +523,13 @@ settings cannot be edited by anything holding the volume:
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
-  and a list that compares whole tokens matches nothing; and
+  and a list that compares whole tokens matches nothing;
+- a push stays in the repository the command names. A repository's own
+  configuration can make a plain `git push` also push inside each submodule,
+  to that submodule's own remote, and the check on the pushed branch reads only
+  the repository the command names. The setting is pinned to `no`, which is
+  git's default, and the flag that asks for the same on the command line is
+  refused; and
 - both editors git launches — the message editor and the rebase sequence editor
   — are set to a command that does nothing and fails. They are set through the
   environment for the same reason as the transport allowlist: those two
