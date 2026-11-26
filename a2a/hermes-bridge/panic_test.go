@@ -593,3 +593,26 @@ func TestPanic_TheDoorServerUsesTheQuietLog(t *testing.T) {
 		t.Fatalf("the door's ErrorLog writes to %T, want serverLogWriter", b.activitySrv.ErrorLog.Writer())
 	}
 }
+
+// A card worker's delivery is on the worker's own hermes session, which no
+// run holds, so routing reading the session narrows nothing: a panic after
+// that still marks every run in flight, since the delivery's tool result
+// could carry a secret for any task waiting on a card.
+func TestPanic_RoutingAWorkerSessionsDeliveryMarksEveryRunInFlight(t *testing.T) {
+	logs := &lockedBuffer{}
+	b, r1, r2 := routeTestBridge(t, logs)
+	b.routeHook = func(stage string) {
+		if stage == "session" {
+			panic("injected panic routing a worker's delivery")
+		}
+	}
+	if code := postSigned(t, b, "20990101_120009_worker", "nothing"); code != http.StatusNoContent {
+		t.Fatalf("door answered %d, want 204", code)
+	}
+	if !r1.panicked.Load() || !r2.panicked.Load() {
+		t.Fatalf("marked: run 1 %v, run 2 %v; want both (no run holds a worker's session)", r1.panicked.Load(), r2.panicked.Load())
+	}
+	if out := logs.String(); !strings.Contains(out, `"marked":2`) {
+		t.Fatalf("want marked 2:\n%s", out)
+	}
+}

@@ -1114,8 +1114,8 @@ spec names, not one this sweep fills. Three failure classes:
   reason. A panic in the door's routing, before a delivery is matched to a task, can't say
   which task the delivery was for, and a dropped tool result can carry a secret value a
   task's answer needed scrubbed. So every run it could still have been for fails closed:
-  the runs on its hermes session once routing has read one, and every run in flight before
-  that. The door answers 204, so hermes doesn't retry it, and logs the count of runs marked,
+  the runs on its hermes session once routing has read one that some run holds, and
+  otherwise every run in flight (a card worker's delivery is on the worker's own session). The door answers 204, so hermes doesn't retry it, and logs the count of runs marked,
   never their ids. One bad delivery can so fail several concurrent tasks; that's the
   intended side, since a missed secret is worse than a failed task. Anything `net/http`
   itself still recovers is logged without the panic's value or stack. A panic anywhere

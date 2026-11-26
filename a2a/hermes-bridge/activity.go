@@ -1479,7 +1479,9 @@ func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery
 // routeDeliveryNarrowing is routeDelivery, keeping in *cands, when cands
 // is set, the runs the delivery could still be for as routing narrows
 // them: every run in flight, then, once a pod-wide delivery's session is
-// read, the runs on that session. routeGuarded marks those runs if
+// read and some run is on it, the runs on that session. A card worker's
+// delivery is on the worker's own session, which no run holds, so it
+// narrows nothing. routeGuarded marks those runs if
 // routing panics.
 func (b *Bridge) routeDeliveryNarrowing(sig string, body []byte, cands *[]*taskRun) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
@@ -1555,7 +1557,9 @@ func runsOnSession(runs []*taskRun, session string) []*taskRun {
 // post_tool_call can carry a secret value the answer's scrub needed, so
 // every run it could still have been for is marked panicked (fails closed:
 // each ends failed internal-panic with no answer). That is the runs on its
-// session once routing had read one, and every run in flight before that.
+// session once routing had read one that some run holds, and otherwise
+// every run in flight (a card worker's delivery, or a panic before the
+// session was read).
 // One bad delivery can so fail several concurrent tasks, deliberately: a
 // missed secret is worse than a failed task. The count marked is logged,
 // never their ids or the delivery's text.
@@ -1566,7 +1570,9 @@ func (b *Bridge) routeGuarded(sig string, body []byte) (run *taskRun, decoded *h
 	}) == nil {
 		return run, decoded, runs, true
 	}
-	if cands == nil {
+	if len(cands) == 0 {
+		// Routing panicked before it named any candidate (or named none):
+		// an empty set would fail nothing closed, so every run in flight.
 		cands = b.runsInFlight()
 	}
 	for _, r := range cands {

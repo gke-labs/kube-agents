@@ -15,9 +15,11 @@ import (
 //
 //   - each worker's task: guardTask around runTask;
 //   - a card stop's goroutine: guardTask around cardStop;
-//   - the activity door, for a delivery routed to a task: takeDelivery
+//   - the activity door: its routing, before a delivery is matched to a
+//     task (routeGuarded, which fails closed every run the delivery could
+//     still have been for); for a delivery routed to a task, takeDelivery
 //     (the decode, the tool result's secret collection, the observation),
-//     with observeDelivery recovering the observation itself under run.mu,
+//     with observeDelivery recovering the observation itself under run.mu;
 //     and collectCardWorkerSecrets for a card worker's delivery;
 //   - each heartbeat tick (runActivity).
 //
@@ -28,10 +30,7 @@ import (
 // (accept, a cancel or follow-up delivery, and the finalizes it runs), the
 // deadline and kill-grace timer callbacks, the API executor's recordOrigin
 // goroutine, abortCanceledSessionKanbanCards, the synthesis's closing
-// watcher and the board's action goroutine. The activity door's routing,
-// before a delivery is matched to a task, is guarded too (routeGuarded):
-// a panic there fails closed every run the delivery could still have been
-// for.
+// watcher and the board's action goroutine.
 //
 // Failing closed means the task ends failed with taskguard.Reason and the
 // recovery path publishes no answer: it finalizes with no result, so no
