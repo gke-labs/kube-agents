@@ -2430,6 +2430,70 @@ func TestLoadRecordsSkipsReservedLogAndStateOfBeingFiles(t *testing.T) {
 	}
 }
 
+func TestExternalDocLoaderMapsStableStatusToActive(t *testing.T) {
+	ctx := context.Background()
+	repoDir := t.TempDir()
+	runbookDir := filepath.Join(repoDir, "knowledge", "runbook")
+	if err := os.MkdirAll(runbookDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	stableRunbook := "---\ntype: runbook\ntitle: CoreDNS High Latency Triage\nstatus: stable\n---\n\nCheck upstream DNS forwarder saturation and conntrack table usage.\n"
+	draftRunbook := "---\ntype: runbook\ntitle: Draft Node Drain Checklist\nstatus: draft\n---\n\nDraft node drain notes.\n"
+	if err := os.WriteFile(filepath.Join(runbookDir, "0004-coredns-latency.md"), []byte(stableRunbook), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runbookDir, "0005-draft-drain.md"), []byte(draftRunbook), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, err := LoadSingleRepoExternalDocRecords(repoDir)
+	if err != nil {
+		t.Fatalf("LoadSingleRepoExternalDocRecords: %v", err)
+	}
+	byID := map[string]Record{}
+	for _, r := range recs {
+		byID[r.Meta.ID] = r
+	}
+	stableRec, ok := byID["RUN-0004"]
+	if !ok {
+		t.Fatalf("expected RUN-0004 in loaded external docs, got %+v", recs)
+	}
+	if stableRec.Meta.Type != RecordTypeRunbook || stableRec.Meta.Status != StatusActive {
+		t.Fatalf("expected RUN-0004 type=runbook status=active, got type=%s status=%s", stableRec.Meta.Type, stableRec.Meta.Status)
+	}
+	if !matchesTags(stableRec.Tags(), []string{SharedTag, "status:active"}, "all_strict") {
+		t.Fatalf("expected RUN-0004 tags to include status:active, got %v", stableRec.Tags())
+	}
+	draftRec, ok := byID["RUN-0005"]
+	if !ok || draftRec.Meta.Status != StatusProposed {
+		t.Fatalf("expected RUN-0005 status=proposed, got %+v", draftRec)
+	}
+
+	_, hsSrv := newMockHindsightServer(t)
+	hsClient := NewHindsightClient(hsSrv.URL, DefaultBankID)
+	for _, r := range recs {
+		if err := hsClient.RetainRecord(ctx, "acme/gitops", r); err != nil {
+			t.Fatalf("RetainRecord(%s): %v", r.Meta.ID, err)
+		}
+	}
+	activeHits, err := hsClient.Recall(ctx, "CoreDNS latency", []string{SharedTag, "status:active"}, "all_strict")
+	if err != nil {
+		t.Fatalf("Recall active: %v", err)
+	}
+	foundStable := false
+	for _, h := range activeHits {
+		if h.ID == "RUN-0004" {
+			foundStable = true
+		}
+		if h.ID == "RUN-0005" {
+			t.Fatalf("draft runbook RUN-0005 must not appear in status:active recall: %+v", activeHits)
+		}
+	}
+	if !foundStable {
+		t.Fatalf("expected stable runbook RUN-0004 in status:active recall, got %+v", activeHits)
+	}
+}
+
 func TestCuratorPrometheusMetricsIsolationAndSeries(t *testing.T) {
 	ctx := context.Background()
 	dir1 := t.TempDir()

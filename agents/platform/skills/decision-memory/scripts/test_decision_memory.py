@@ -619,7 +619,20 @@ class FakeHindsight(BaseHTTPRequestHandler):
                 }
             return self._send({"success": True})
         if self.path.endswith("/memories/recall"):
-            res = [{"text": d["text"], "tags": d["tags"], "document_id": d["id"]} for d in FakeHindsight.docs.values()]
+            groups = (body or {}).get("tag_groups") or []
+            res = []
+            for d in FakeHindsight.docs.values():
+                doc_tags = set(d["tags"])
+                if all(
+                    (
+                        set(g.get("tags") or ()).issubset(doc_tags)
+                        if g.get("match") == "all_strict"
+                        else bool(doc_tags & set(g.get("tags") or ()))
+                    )
+                    for g in groups
+                    if g.get("tags")
+                ):
+                    res.append({"text": d["text"], "tags": d["tags"], "document_id": d["id"]})
             return self._send({"results": res})
         self._send({}, 404)
 
@@ -695,6 +708,52 @@ class IndexTests(unittest.TestCase):
         self.r.commit("x")
         rc, out = self.r.run("--hindsight-url", self.url, "check", "--base", "main", "--semantic")
         self.assertEqual([s["id"] for s in out["semantic"]], ["DEC-2026-001"])
+
+    def test_stable_runbook_indexes_as_active_and_surfaces_in_semantic_check(self):
+        self.r.write(
+            "knowledge/runbook/0004-coredns-latency.md",
+            "---\n"
+            "type: runbook\n"
+            "title: CoreDNS High Latency Triage\n"
+            "status: stable\n"
+            "---\n\n"
+            "Check upstream DNS forwarder saturation and conntrack table usage.\n",
+        )
+        self.r.write(
+            "knowledge/runbook/0005-draft-drain.md",
+            "---\n"
+            "type: runbook\n"
+            "title: Draft Node Drain Checklist\n"
+            "status: draft\n"
+            "---\n\n"
+            "Draft node drain notes.\n",
+        )
+        self.r.commit("knowledge: add stable and draft runbooks")
+
+        ext_by_id = {r.id: r for r in dm.load_external_doc_records(self.r.path)}
+        self.assertEqual(ext_by_id["RUN-0004"].status, "active")
+        self.assertEqual(ext_by_id["RUN-0005"].status, "proposed")
+        single_by_id = {r.id: r for r in dm._load_single_repo_external_docs(self.r.path)}
+        self.assertEqual(single_by_id["RUN-0004"].status, "active")
+        self.assertEqual(single_by_id["RUN-0005"].status, "proposed")
+
+        rc_idx, out_idx = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
+        self.assertEqual(rc_idx, 0, out_idx)
+        stable_doc = FakeHindsight.docs["okf:acme/gitops:RUN-0004"]
+        self.assertEqual(stable_doc["document_metadata"]["status"], "active")
+        self.assertIn("status:active", stable_doc["tags"])
+        draft_doc = FakeHindsight.docs["okf:acme/gitops:RUN-0005"]
+        self.assertEqual(draft_doc["document_metadata"]["status"], "proposed")
+        self.assertIn("status:proposed", draft_doc["tags"])
+
+        sh(self.r.path, "checkout", "-q", "-b", "dns-tweak")
+        self.r.write("clusters/prod-eu/dns/coredns.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: coredns\n")
+        self.r.commit("dns: tweak coredns")
+        rc_chk, out_chk = self.r.run("--hindsight-url", self.url, "check", "--base", "main", "--semantic")
+        self.assertEqual(rc_chk, 0, out_chk)
+        semantic_ids = [s["id"] for s in out_chk["semantic"]]
+        self.assertIn("RUN-0004", semantic_ids)
+        self.assertNotIn("RUN-0005", semantic_ids)
 
     def test_index_and_recall_frame_untrusted_records_and_keep_managed_clean(self):
         backfill_lesson = (

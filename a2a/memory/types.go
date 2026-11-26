@@ -106,6 +106,9 @@ const (
 	skippedStateOfBeingFile = "state_of_being.md"
 	skippedTemplateFile     = "template.md"
 	skippedTemplatePrefix   = "0000-"
+	externalStatusAccepted  = "accepted"
+	externalStatusApproved  = "approved"
+	externalStatusStable    = "stable"
 )
 
 // OutcomeKind classifies a learning event processed by the Curator.
@@ -1157,7 +1160,7 @@ func parseExternalDocRecord(text, relPath string) (rec Record, explicitID bool) 
 		if rawStatus, hasStatus := fm["status"]; hasStatus && rawStatus != nil {
 			if stStr, ok := rawStatus.(string); ok {
 				switch strings.ToLower(strings.TrimSpace(stStr)) {
-				case "", "active", "accepted", "approved":
+				case "", string(StatusActive), externalStatusAccepted, externalStatusApproved, externalStatusStable:
 					status = StatusActive
 				case "proposed", "draft":
 					status = StatusProposed
