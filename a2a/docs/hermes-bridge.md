@@ -429,7 +429,7 @@ turn's own call to the API server uses, since session-kv runs in the agent conta
 queued while the pod rolled, or one taken while that container restarts; the session's origin
 record (`PUT /v1/sessions/{id}/origin`, [`proposal-origin.md`](../../docs/designs/proposal-origin.md)
 §2.1) and the pushed-report lookup below retry the same way. Any other failure, a timeout included,
-is not retried. A store refused for a whole window is taken as down: later requests try once, without
+is not retried. A store refused for a whole window while the API server answers is taken as down: later requests try once, without
 the wait, until one reaches it, so a session-kv process that has died costs one window rather than one
 per task. While the API server refuses as well, the agent container is restarting rather than
 session-kv being gone, and the full retry applies again. A Google Chat, Slack, Teams or console conversation is posted back. A console

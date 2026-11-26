@@ -420,7 +420,10 @@ func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(
 		if time.Now().After(giveUp) {
 			// Marked down only with the API server up: a container still
 			// restarting gets the full retry on its next request too.
-			if !b.apiServerRefusing() {
+			if b.apiServerRefusing() {
+				b.cfg.Logger.Info("the session store refused connections for the whole retry window while the agent container restarts; the next request retries in full",
+					"window", b.cfg.APIConnectRetry, "err", err)
+			} else {
 				b.storeDown.Store(true)
 				b.cfg.Logger.Warn("the session store refused connections for the whole retry window; later requests try once until it answers",
 					"window", b.cfg.APIConnectRetry, "err", err)
