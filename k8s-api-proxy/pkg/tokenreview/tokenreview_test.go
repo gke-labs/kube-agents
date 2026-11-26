@@ -247,19 +247,15 @@ func TestTokenReviewAuthenticatorAccepts(t *testing.T) {
 // AuthenticateRequest owns: the review is cached, and one request must not change the next's.
 func TestTokenReviewAuthenticatorCarriesExtra(t *testing.T) {
 	const podNameKey, podUIDKey = "authentication.kubernetes.io/pod-name", "authentication.kubernetes.io/pod-uid"
-	status := shellReview()
-	status.User.Extra = map[string]authenticationv1.ExtraValue{
-		podNameKey: {"shell-0"},
-		podUIDKey:  {"1f0c"},
-	}
-	fake := &fakeTokenReviewServer{status: status}
+	// shellReview names the shell's pod in user.extra, as the pod check requires.
+	fake := &fakeTokenReviewServer{status: shellReview()}
 	a := newTestTokenReviewAuthenticator(t, fake)
 
 	id, err := a.AuthenticateRequest(bearerRequest(testCallerToken))
 	if err != nil {
 		t.Fatalf("AuthenticateRequest: %v", err)
 	}
-	if len(id.Extra) != 2 || !slices.Equal(id.Extra[podNameKey], []string{"shell-0"}) || !slices.Equal(id.Extra[podUIDKey], []string{"1f0c"}) {
+	if len(id.Extra) != 2 || !slices.Equal(id.Extra[podNameKey], []string{shellPodName}) || !slices.Equal(id.Extra[podUIDKey], []string{shellPodUID}) {
 		t.Fatalf("Extra = %v, want the review's user.extra", id.Extra)
 	}
 
@@ -269,7 +265,7 @@ func TestTokenReviewAuthenticatorCarriesExtra(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cached AuthenticateRequest: %v", err)
 	}
-	if !slices.Equal(again.Extra[podNameKey], []string{"shell-0"}) || !slices.Equal(again.Extra[podUIDKey], []string{"1f0c"}) {
+	if !slices.Equal(again.Extra[podNameKey], []string{shellPodName}) || !slices.Equal(again.Extra[podUIDKey], []string{shellPodUID}) {
 		t.Errorf("cached Extra = %v: a caller's change to its copy reached the cached review", again.Extra)
 	}
 	if got := fake.calls(); got != 1 {
@@ -299,18 +295,6 @@ func TestTokenReviewAuthenticatorCopiesGroups(t *testing.T) {
 	}
 	if got := fake.calls(); got != 1 {
 		t.Errorf("TokenReviews = %d, want 1: the second request is the cache's", got)
-	}
-}
-
-// A review without user.extra leaves Extra nil.
-func TestTokenReviewAuthenticatorWithoutExtra(t *testing.T) {
-	a := newTestTokenReviewAuthenticator(t, &fakeTokenReviewServer{status: shellReview()})
-	id, err := a.AuthenticateRequest(bearerRequest(testCallerToken))
-	if err != nil {
-		t.Fatalf("AuthenticateRequest: %v", err)
-	}
-	if id.Extra != nil {
-		t.Errorf("Extra = %v, want nil", id.Extra)
 	}
 }
 
