@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -324,7 +325,7 @@ type resolved struct {
 func nameOrToken(alias, token string) (string, string, error) {
 	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
 		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
-			return "", "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
+			return "", "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", inerttext.Cell(alias))
 		}
 		alias, token = "", alias
 	}
@@ -379,7 +380,7 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 	c.mu.Lock()
 	if _, ok := c.byAlias[alias]; ok {
 		c.mu.Unlock()
-		return "", fmt.Errorf("%w: %s", ErrConversationExists, cell(alias))
+		return "", fmt.Errorf("%w: %s", ErrConversationExists, inerttext.Cell(alias))
 	}
 	t, evicted, err := c.addLocked(alias, description)
 	c.mu.Unlock()
@@ -420,7 +421,7 @@ func (c *Conversations) lookup(alias, token string) (string, bool, error) {
 		c.touchLocked(e)
 		return e.token, true, nil
 	}
-	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", cell(alias))
+	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", inerttext.Cell(alias))
 }
 
 // Forget drops the name holding token, or else alias (a name, or a token in
@@ -1287,9 +1288,6 @@ type turnWatch struct {
 	// each names (its taskId, or the r-<task> of its message id): whether
 	// any said cards are pending. Bounded by maxTurnResults.
 	results map[string]bool
-	// kinds is the bus's record of how its tasks were learned, which
-	// noticedTask and follow write to; nil records nothing.
-	kinds *taskKinds
 }
 
 // maxTurnResults bounds the result frames one turn records; past it a new
@@ -1364,7 +1362,6 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 		stop:         make(chan struct{}),
 		results:      map[string]bool{},
 		resultSeen:   make(chan struct{}, 1),
-		kinds:        &b.kinds,
 	}
 	// Submissions are every addressee's .in traffic, drained by the turn's
 	// matcher and then its follower. A settled turn has neither, and an
@@ -1802,13 +1799,13 @@ func submissionWithCorrelation(m *nats.Msg) (ref TaskRef, a submissionAuthority,
 	if json.Unmarshal(env.Payload, &msg) != nil {
 		return
 	}
-	// No kind: a message on .in is a new session or platform task, or the
-	// gateway's steer into a running task, a profile's included (steerTask),
-	// and the two read alike here. A caller that can tell says so
-	// (taskKinds).
 	return TaskRef{Addressee: parts[submissionAddressee], TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), env.CorrelationID, true
 }
 
+// ownSubmission reports whether m carries this turn: a message in this
+// conversation, not delegated from another task, with this turn's text. A
+// message for a task already running is the gateway sending the text into
+// it, and that task is where the turn's answer is.
 // noticedTask is the task an addressed turn's status line names: a fresh
 // notice (no kind, not an edit) carrying the task's id, the profile it was
 // published to, and this turn's own frame id (InReplyTo). Only the gateway
@@ -1828,17 +1825,9 @@ func (w *turnWatch) noticedTask(m *nats.Msg) (TaskRef, bool) {
 	w.mu.Lock()
 	w.known[f.TaskID] = true
 	w.mu.Unlock()
-	ref := TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}
-	w.kinds.note(ref, TaskKindProfile)
-	return ref, true
+	return TaskRef{Addressee: f.Addressee, TaskID: f.TaskID}, true
 }
 
-// ownSubmission reports whether m carries this turn: a message in this
-// conversation, not delegated from another task, with this turn's text. A
-// message for a task already running is the gateway sending the text into
-// it, and that task is where the turn's answer is. That task can be a
-// profile's (steerTask publishes on its .in), so the match learns no kind,
-// and the directory decides (refIsProfile).
 func (w *turnWatch) ownSubmission(m *nats.Msg) (TaskRef, bool) {
 	ref, a, text, corr, ok := submissionWithCorrelation(m)
 	if !ok || a.Audience.Conversation != w.conversation || a.Via != nil || !slices.Contains(w.texts, text) {
@@ -1877,10 +1866,6 @@ func (w *turnWatch) follow() {
 			if linked && !w.known[ref.TaskID] && len(w.followed) < maxFollowedTasks {
 				w.known[ref.TaskID] = true
 				w.followed = append(w.followed, ref)
-				// A task delegated in the chain and submitted on .in is a
-				// session's or the platform agent's: a profile's child is
-				// submitted on a2a.submit, out of this server's sight.
-				w.kinds.note(ref, TaskKindSession)
 			}
 			w.mu.Unlock()
 		}

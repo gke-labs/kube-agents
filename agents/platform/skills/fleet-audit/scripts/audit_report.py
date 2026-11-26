@@ -378,6 +378,8 @@ AUDITS: dict[str, AuditSpec] = {
             # §4.15, voted by node pool. The roster is the SOP's `####`
             # heading order.
             "boot-disk",
+            # §4.16, the second facet voted by node pool.
+            "kubelet-config",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
@@ -1340,6 +1342,7 @@ CHECK_PHRASES = {
     "image-type": "node image type differs from its peers",
     "database-encryption": "secrets encryption differs from its peers",
     "boot-disk": "{object} node pool has a different boot disk from its peers",
+    "kubelet-config": "{object} node pool has a different kubelet configuration from its peers",
     "no-environment-label": "has no environment label",
     "uncohorted": "differs from its peers on too many settings to compare",
     # AI Workload Security Audit

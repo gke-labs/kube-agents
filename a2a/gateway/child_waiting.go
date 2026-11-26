@@ -128,7 +128,7 @@ func (g *Gateway) childCountable(rec *SessionRecord, ref TaskRef, now time.Time)
 // read with direct gets and no consumer (probeTask), so it holds across a
 // restart and reads no other task's relay state.
 func (g *Gateway) childNotStarted(ctx context.Context, rec *SessionRecord, stream jetstream.Stream, ref TaskRef) bool {
-	probe, err := g.probeTask(ctx, stream, ref.Addressee, ref.ID, g.profileRead(rec, ref.ID, ref.Addressee))
+	probe, err := g.probeTask(ctx, stream, ref.Addressee, ref.ID)
 	return err == nil && probe.empty
 }
 
