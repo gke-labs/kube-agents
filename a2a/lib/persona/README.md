@@ -47,6 +47,12 @@ a server reached around the broker would be outside both.
 - a `SKILL.md` frontmatter key other than `name`, `description`, `license`
   and `metadata`, because Claude Code reads keys such as `allowed-tools`
   and `hooks` from it;
+- a `SKILL.md` whose frontmatter isn't exactly one YAML document between
+  lines that are exactly `---`: it opens on the first line and closes at
+  the next line that is exactly `---`. Any other line in it that holds
+  `---` or starts with `...` or `%` is refused, and so is a byte-order mark
+  or a line break other than LF or CRLF anywhere in the file, and one that
+  never closes is refused too, so where it ends never depends on a parser;
 - an `@` import in `instructions.md` or a skill's markdown that could leave
   the persona. The check fails closed rather than parse imports the way the
   harness does: any `@` token that starts with `/` or `~`, or contains `..`,
@@ -105,8 +111,9 @@ one until every worker it can run under accepts the name.
 
 An adapter maps a loaded persona to a harness and reads nothing else: no
 network, no credentials, no environment. Whatever the pod knows, such as
-the relay's address, the worker passes in as a `Target`. What a harness
-cannot express comes back as a warning, never an error.
+the relay's address, the worker passes in as a `Target`. For Claude Code,
+what the harness cannot express comes back as a warning; the `core-agent`
+adapter refuses it instead (below).
 `render.For(harness)` picks the adapter by the harness the worker is started
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
 `spec.harness.type` (and the gateway sets on session pods from the
@@ -115,7 +122,7 @@ PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
 `core-agent`). A session pod refuses `antigravity` unless
 `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
 unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
-worker refuses both, because neither has a persona adapter yet.
+worker refuses `antigravity`, which has no persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
@@ -138,8 +145,33 @@ worker refuses both, because neither has a persona adapter yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
-- **`core-agent`**: not written yet (it comes with core-agent's persona
-  render, #6713); `render.For` refuses it by name.
+- **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
+  each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
+  for a directory a user other than the harness's writes before the harness
+  runs. The harness takes the instructions as a layer above its own system
+  prompt and lists the skills to the model. When the model loads a skill,
+  its instructions open with the skill's directory on disk and its scripts
+  by absolute path, which is how the shell may run them.
+  `coreagent.Snapshot` reads the directory into memory once, beside its
+  integrity manifest, refusing any other top-level name, a symlink or a
+  special file, so a later change on disk doesn't reach the harness.
+  - Each `mcp.yaml` server the manifest grants runs as the worker's relay to
+    the credential broker, the same command and environment as for Claude
+    Code, with its granted tools listed (`Output.MCPServers`); a whole-server
+    grant takes the server's `include` list.
+  - Tools pass through as the manifest names them, for the harness's tool
+    grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+  - Each `SKILL.md` frontmatter is written back with only the keys the
+    harness reads, read as exactly one YAML document between exact `---`
+    lines.
+  - Refused rather than dropped: a granted server with no relay or no
+    `include` list, a server or tool name the harness would rename, a skill
+    frontmatter key other than `name`, `description`, `license`,
+    `compatibility` and `metadata`, a skill's `allowed-tools`, non-string
+    `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
+    `-` and `/`, and a script when the persona doesn't grant `shell`.
+  - The server name `a2a` is reserved, for every harness, for the worker's
+    own delegate server, which the worker adds per turn.
 
 ## An example
 

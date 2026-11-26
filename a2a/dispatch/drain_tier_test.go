@@ -29,9 +29,10 @@ func TestASubmissionQueuedAtADrainingTierIsRefusedTierWithdrawn(t *testing.T) {
 	if ts.state != lib.StateRejected || !hasReason(ts, ReasonTierWithdrawn) {
 		t.Fatalf("terminal %+v, want rejected %s", ts, ReasonTierWithdrawn)
 	}
-	if ack, num := b.pending(lib.ProfileDurableName("tse", "oncall", lib.SubmitKindTop)); ack != 0 || num != 0 {
-		t.Errorf("the draining tier's durable still holds %d and queues %d", ack, num)
-	}
+	waitFor(t, 5*time.Second, "the draining tier's durable cleared", func() bool {
+		ack, num := b.pending(lib.ProfileDurableName("tse", "oncall", lib.SubmitKindTop))
+		return ack == 0 && num == 0
+	})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-live")
 	if ts := b.waitTerminal("task-live", 10*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("the live tier's task: %+v", ts)

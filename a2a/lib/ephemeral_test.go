@@ -276,8 +276,8 @@ func TestEphemeralCreatesAnswerWithAServerDown(t *testing.T) {
 		t.Fatalf("jetstream: %v", err)
 	}
 	var s jetstream.Stream
-	waitFor(t, 20e9, "a JetStream meta leader", func() bool {
-		sctx, cancel := context.WithTimeout(ctx, time.Second)
+	waitFor(t, clusterMetaWaitTimeout, "a JetStream meta leader", func() bool {
+		sctx, cancel := context.WithTimeout(ctx, clusterStreamAttemptTimeout)
 		defer cancel()
 		s, err = js.CreateOrUpdateStream(sctx, jetstream.StreamConfig{Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Replicas: clusterSize})
 		return err == nil

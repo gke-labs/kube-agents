@@ -151,6 +151,21 @@ func TestAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
 	}
 }
 
+// Teams's name for the switch turns the same flag off.
+func TestTeamsAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
+	setBaseEnv(t)
+	for value, off := range map[string]bool{"": false, "true": false, "false": true, " false ": true} {
+		t.Setenv(envTeamsAnswerFeedback, value)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AnswerFeedbackOff != off {
+			t.Errorf("%q: AnswerFeedbackOff = %v, want %v", value, cfg.AnswerFeedbackOff, off)
+		}
+	}
+}
+
 // TestGchatAnswerFeedbackOffIsReadFromItsEnv: the gateway holds one chat
 // backend, so either backend's off switch turns the one flag off.
 func TestGchatAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
@@ -166,6 +181,7 @@ func TestGchatAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
 		{"true", "true", false},
 		{"", "true", false},
 	} {
+		t.Setenv(envTeamsAnswerFeedback, "")
 		t.Setenv(envSlackAnswerFeedback, tc.slack)
 		t.Setenv(envGchatAnswerFeedback, tc.gchat)
 		cfg, err := FromEnv()
@@ -600,5 +616,33 @@ func TestFeedbackCaseYAMLQuotesTheAsk(t *testing.T) {
 	}
 	if !strings.Contains(got, "#   "+feedbackNoNote) {
 		t.Errorf("a draft without a note says so:\n%s", got)
+	}
+}
+
+// A re-rating that carries no answer, as one on Teams after the gateway
+// restarted, keeps the answer the first rating kept.
+func TestDeskReRatingWithoutAnAnswerKeepsTheKeptAnswer(t *testing.T) {
+	t.Parallel()
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb14", "d-1", "it is OOMKilled")
+	up := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb14",
+		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackUp, Answer: "it is OOMKilled"}
+	if _, err := desk.Rate(up); err != nil {
+		t.Fatal(err)
+	}
+	down := up
+	down.Rating, down.Answer = FeedbackDown, ""
+	if _, err := desk.Rate(down); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := getFeedback(context.Background(), kv, feedbackKey(origin.TaskID, "1001"))
+	if err != nil || rec.Rating != FeedbackDown || rec.Answer != "it is OOMKilled" {
+		t.Fatalf("record = %+v, %v; want the 👎 to keep the answer the 👍 kept", rec, err)
 	}
 }

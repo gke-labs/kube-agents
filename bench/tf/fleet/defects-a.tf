@@ -438,8 +438,9 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
 # file in a GitOps repository declares a member's name; only the parent is a
 # stable object. Each member has burst-ingest's shape (two pause replicas,
 # 10m / 128Mi, a budget, the default-deny policy, the restricted settings), so
-# the cost SOP's 3.1 `overrequest` names each one on memory and no other
-# stream names the namespace. No note declares them: they are findings.
+# the cost SOP's 3.1 `overrequest` files the family on memory, as one finding
+# on the parent, and no other stream names the namespace. No note declares
+# them: they are findings.
 #
 # The names are literals, not `random_uuid` and not `generate_name`. Each
 # pool project then holds the same three names on each apply, with no state
@@ -2634,6 +2635,54 @@ resource "kubernetes_cron_job_v1" "cuda_pinned_trainer" {
   }
 }
 
+# Defect (role state-sync-controller): a controller workload in seeded-shapes
+# whose startup argument disables client-side Kubernetes API rate limiting
+# (--kube-api-qps=-1, a negative QPS), the shape
+# control-plane-configmap-lease-write-storm requires. The container process is
+# an inert sleep that ignores its positional argument and mounts no API token,
+# so the pod runs on the default pool without generating live API server write
+# load.
+resource "kubernetes_deployment_v1" "state_sync_controller" {
+  metadata {
+    name      = "state-sync-controller"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "state-sync-controller" }
+    }
+    template {
+      metadata {
+        labels = { app = "state-sync-controller" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "controller"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "exec sleep infinity"]
+          args    = ["--kube-api-qps=-1"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
 # Fixture (stall watch): a switched-off environment behind an in-cluster
 # gateway. Role `scaled-zero-gateway`. An operator scales the whole
 # environment to zero out of hours: the backend and the gateway's own proxy
@@ -2766,6 +2815,62 @@ resource "kubernetes_manifest" "scaled_zero_gateway_class" {
     kind       = "GatewayClass"
     metadata   = { name = "seeded-envoy" }
     spec       = { controllerName = local.scaled_zero_controller }
+  }
+}
+
+# Defect (role unaccepted-gateway-class, #1982, #7097): a cluster-scoped
+# GatewayClass referencing an unsupported controllerName (RFC 2606 example.com)
+# so no controller accepts it, plus a Gateway and HTTPRoute bound to it in
+# seeded-shapes. Because no controller owns this class, no Gateway Deployment,
+# Service, or cloud load balancer is provisioned, and the HTTPRoute stays
+# unprogrammed with zero pod/CPU footprint. The HTTPRoute carries no
+# backendRefs so obtainability §3.26 (ingress-gateway-healthcheck-mismatch)
+# stays silent on it. Both the Gateway and HTTPRoute carry the stall-watch
+# opt-out annotation (`kubeagents.x-k8s.io/stall-watch: exempt`) so the
+# periodic stall-watch cron does not fire controller-stall alerts on
+# seeded-shapes while the Gateway sits in GKE's default Accepted=Unknown /
+# Programmed=Unknown Pending state. GatewayClass seeded-envoy (Accepted=True
+# written by gateway_status.py below) and GKE's built-in GatewayClasses serve
+# as the accepted-class negative control on the same cluster. Asserted by
+# networking-unaccepted-gatewayclass.
+resource "kubernetes_manifest" "unaccepted_gateway_class" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "GatewayClass"
+    metadata   = { name = "seeded-unaccepted-gw" }
+    spec       = { controllerName = "example.com/unsupported-controller" }
+  }
+}
+
+resource "kubernetes_manifest" "unaccepted_gateway" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "Gateway"
+    metadata = {
+      name        = "seeded-unaccepted-gateway"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
+    }
+    spec = {
+      gatewayClassName = kubernetes_manifest.unaccepted_gateway_class.manifest.metadata.name
+      listeners        = [{ name = "http", protocol = "HTTP", port = 80 }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "unaccepted_route" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "HTTPRoute"
+    metadata = {
+      name        = "seeded-unaccepted-route"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
+    }
+    spec = {
+      parentRefs = [{ name = kubernetes_manifest.unaccepted_gateway.manifest.metadata.name }]
+      rules      = [{ matches = [{ path = { type = "PathPrefix", value = "/" } }] }]
+    }
   }
 }
 

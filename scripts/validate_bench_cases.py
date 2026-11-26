@@ -161,6 +161,30 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
 ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The permit pairs (docs/designs/permit-pairs.md): each line names two cases, side A then
+# side B, that put the same ask and the same checks to the platform agent and to a profile.
+# The pair compare (scripts/eval_front_door_ab.py --pairs) reads run records only, so the rule
+# that the two cases are a pair is held here.
+PERMIT_PAIRS_FILE = eval_rosters.EVAL_DIR / "permit-pairs.txt"
+PERMIT_PAIR_SIDES = 2
+# Side A has no directive, so it names side B's target in words: this sentence, built from the
+# directive's parameters in their order, then side B's ask.
+PAIR_TARGET_PREFIX = "The target of this task: "
+PAIR_TARGET_SEPARATOR = ", "
+PAIR_TARGET_END = "."
+# The top-level keys the two cases of a pair may differ in: the ones that name the case, and
+# `prompt`, which has its own rule. Each other key is equal; `verification_spec` is equal but
+# for its entries' names, which can name the side.
+PAIR_PROMPT_KEY = "prompt"
+PAIR_MAY_DIFFER = frozenset({"id", "name", PAIR_PROMPT_KEY, "expected_output", "owner", "domain"})
+PAIR_CHECKS_KEY = "verification_spec"
+PAIR_ENTRY_NAME_KEY = "name"
+# The lists that place a writer in the second or the third third of the nightly's writers
+# part; a writer on neither runs in the first. The two sides of a pair of writers run in one
+# third: one install, one commit. A pair of cases that are not writers is on neither list,
+# and its sides can run in different shards of the main part.
+WRITERS_THIRD_FILES = (eval_rosters.EVAL_DIR / "nightly-writers-b.txt", eval_rosters.EVAL_DIR / "nightly-writers-c.txt")
+NOT_A_PAIR_ADVICE = "change the other side in the same pull request, or remove the pair's line"
 # The validated-capabilities suite has no roster file: the bare line
 # `suite: validated-capabilities` in a task file registers the case on that lane, and
 # `suite_part: N` puts it in section N. hack/ci-eval-pr.sh reads the
@@ -406,6 +430,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Fixture planted in bench/tf/fleet/defects-a.tf (#7097, #1982); parked
+    # until the postsubmit fleet reconcile applies unaccepted-gateway-class
+    # across the pool projects, after which a follow-up moves it to nightly-cases.txt.
+    "networking-unaccepted-gatewayclass": (
+        "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw, gateway/seeded-unaccepted-gateway, httproute/seeded-unaccepted-route) applied to every pool project by the postsubmit fleet reconcile"
+    ),
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of
     # its own and Config Sync to apply the merge, as a customer's reconciler would.
@@ -740,7 +770,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
-    "delegated_to": ("required_addressees", "forbidden_addressees"),
+    "delegated_to": ("required_addressees", "forbidden_addressees", "min_children", "max_children"),
     "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
@@ -1599,6 +1629,16 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{list(fields)}, so it can only pass"
         )
 
+    # `min_children: 0` holds for every chain, so it populates the field
+    # without asserting anything; alone it can only pass, which the
+    # verifier's model refuses too.
+    if (
+        node_type == "delegated_to"
+        and node.get("min_children") == 0
+        and not any(_populated(node.get(f)) for f in ("required_addressees", "forbidden_addressees", "max_children"))
+    ):
+        problems.append(f"{where}: check 'delegated_to' sets only min_children: 0, so it can only pass")
+
     # The same two rules the verifier's model applies after the cluster lease:
     # the scope needs its check, a name or a list of names; the field is
     # refused, blank or not, under any other scope.
@@ -2426,6 +2466,105 @@ def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
     return found
 
 
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def pair_side_a_prompt(side_b_prompt: str) -> str:
+    """The ask side A of a permit pair must have for this side B: the directive's parameters
+    as one sentence, then side B's ask.
+
+    Raises:
+        ValueError: side B's prompt has no ``[bench:profile ...]`` directive, or a malformed one.
+    """
+    hook = profile_hook_reader()
+    ask = hook.parse(side_b_prompt)
+    if ask is None:
+        raise ValueError(f"no {hook.PROFILE_DIRECTIVE} ...] directive, so it is not addressed to a profile")
+    if not ask.parameters:
+        return _one_line(ask.prompt)
+    target = PAIR_TARGET_SEPARATOR.join(f"{key} {value}" for key, value in ask.parameters.items())
+    return _one_line(f"{PAIR_TARGET_PREFIX}{target}{PAIR_TARGET_END} {ask.prompt}")
+
+
+def _pair_checks(case: dict[str, Any]) -> Any:
+    """The case's verification entries without their names."""
+    entries = case.get(PAIR_CHECKS_KEY)
+    if not isinstance(entries, list):
+        return entries
+    return [{k: v for k, v in entry.items() if k != PAIR_ENTRY_NAME_KEY} if isinstance(entry, dict) else entry for entry in entries]
+
+
+def _not_a_pair(side_a: str, side_b: str, task_files: dict[str, pathlib.Path]) -> list[str]:
+    """Why these two cases are not a permit pair; empty when they are."""
+    cases = []
+    for case_id in (side_a, side_b):
+        if case_id not in task_files:
+            return [f"{case_id} is not a case under bench/tasks/"]
+        try:
+            loaded = _load_yaml(task_files[case_id])
+        except CaseError as exc:
+            return [str(exc)]
+        if not isinstance(loaded, dict):
+            return [f"{case_id}: its task file is not a mapping"]
+        cases.append(loaded)
+    a, b = cases
+    a_prompt, b_prompt = a.get(PAIR_PROMPT_KEY), b.get(PAIR_PROMPT_KEY)
+    if not isinstance(a_prompt, str) or not isinstance(b_prompt, str):
+        return [f"a side has no {PAIR_PROMPT_KEY}"]
+    problems = []
+    hook = profile_hook_reader()
+    if hook.is_profile_ask(a_prompt):
+        problems.append(f"side A {side_a} opens with {hook.PROFILE_DIRECTIVE} ...], so it does not go to the default route")
+    try:
+        expected = pair_side_a_prompt(b_prompt)
+    except ValueError as exc:
+        problems.append(f"side B {side_b}: {exc}")
+    else:
+        if _one_line(a_prompt) != expected:
+            problems.append(f"the asks differ: side A {side_a} must be side B {side_b}'s ask behind its target sentence, which is: {expected!r}")
+    for key in sorted((a.keys() | b.keys()) - PAIR_MAY_DIFFER):
+        if key == PAIR_CHECKS_KEY:
+            if _pair_checks(a) != _pair_checks(b):
+                problems.append(f"`{key}` differs (only an entry's {PAIR_ENTRY_NAME_KEY} may)")
+        elif a.get(key) != b.get(key):
+            problems.append(f"`{key}` differs")
+    return problems
+
+
+def permit_pair_problems(
+    pairs_file: pathlib.Path = PERMIT_PAIRS_FILE,
+    task_files: dict[str, pathlib.Path] | None = None,
+    third_files: tuple[pathlib.Path, ...] = WRITERS_THIRD_FILES,
+) -> list[str]:
+    """One finding for each line of the permit pairs file that does not name a pair: two
+    cases under bench/tasks/ with the same ask and the same checks, each in the file once, and
+    both on the same writers list or on none. None when the tree has no pairs file."""
+    if not pairs_file.exists():
+        return []
+    try:
+        lines = eval_rosters.read_entries(pairs_file)
+        thirds = [set(eval_rosters.read_entries(path)) for path in third_files]
+    except (OSError, ValueError) as exc:
+        return [f"{pairs_file.name}: {exc}"]
+    task_files = bench_cases() if task_files is None else task_files
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        words = line.split()
+        if len(words) != PERMIT_PAIR_SIDES:
+            found.append(f"{pairs_file.name}: {line!r} is not two case ids, side A then side B")
+            continue
+        side_a, side_b = words
+        problems = [f"{case} is in the file twice" for case in words if case in seen]
+        seen.update(words)
+        problems += _not_a_pair(side_a, side_b, task_files)
+        if [side_a in third for third in thirds] != [side_b in third for third in thirds]:
+            problems.append(f"the two sides are in different thirds of the writers part ({', '.join(path.name for path in third_files)})")
+        found += [f"{side_a} / {side_b}: {problem} ({NOT_A_PAIR_ADVICE})" for problem in problems]
+    return found
+
+
 def committed_run_records(tasks_dir: pathlib.Path = TASKS_DIR) -> list[str]:
     """Every file under any case's `evidence/` directory, each a finding."""
     found = []
@@ -2559,6 +2698,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         # Repository-level too: a committed run record is a finding wherever it sits.
         records = committed_run_records()
+        # Each line of the permit pairs file, when the whole tree is checked.
+        not_pairs = [] if args.paths else permit_pair_problems()
     except CaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -2588,6 +2729,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in records:
         failed += 1
         print(f"committed run record: {entry}")
+
+    for entry in not_pairs:
+        failed += 1
+        print(f"not a permit pair: {entry}")
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")

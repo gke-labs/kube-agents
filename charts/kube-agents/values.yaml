@@ -1170,7 +1170,8 @@ platformAgent:
   # sidecar's event-metrics port (9095) and, under its own PodMonitoring that
   # selects the leader label, the chat_metrics plugin serves its on the
   # platform-agent container's chat-metrics port (9097), and the credential proxy, where the
-  # broker serves its own on the metrics-only cred-metrics port (8766), and
+  # broker serves its metrics (and under sizingProfile: auto in-cluster, operator
+  # active-standby handoff endpoints; 404 otherwise) on cred-metrics port (8766), and
   # the A2A gateway, which serves its counters on
   # the metrics-only a2a-metrics port (9096). The operator's policies admit the
   # collector's namespace, gke-gmp-system, and the operator's own pods on those
@@ -1425,6 +1426,18 @@ platformAgent:
       # maxSessions caps the A2A session pods the install runs at once; the
       # operator's default applies when it is unset.
       # maxSessions: 10
+      # sessionIdleMinutes is how long a session pod is kept after the last
+      # message in its conversation (default 30); a running task always keeps
+      # it, and the next message after a reap gets a new pod with the
+      # conversation's history. It also bounds how long a Slack thread stays
+      # live without a fresh mention after its last task.
+      # sessionIdleMinutes: 30
+      # dmSessionIdleMinutes replaces it for a DM conversation with one
+      # message so far (default 5), so a one-question DM frees its slot of
+      # maxSessions sooner; a second message puts the conversation back on
+      # sessionIdleMinutes. A value above sessionIdleMinutes has no effect
+      # beyond it.
+      # dmSessionIdleMinutes: 5
       # sessionResources are the session pods' CPU and memory requests and
       # limits; only cpu and memory are read. Each key you set to a positive
       # value replaces its default (requests 150m / 320Mi, limits 2 / 2Gi) and
@@ -1738,12 +1751,15 @@ platformAgent:
     # The preset the credential proxy, the agent-api-auth sidecar and the shell
     # container start from, forwarded to the CR as spec.deployment.sizingProfile
     # when set: small (the operator's defaults, and what an unset value means),
-    # medium, fleet, or auto, which steps the tier up as the fleet the operator
-    # counts grows, from the tier the CR's status last recorded (a count that
-    # falls never lowers it), holding a step the namespace's ResourceQuota has
-    # no room for or a LimitRange bound refuses, stepping back one tier when
-    # admission refuses the pod a step recreated, and saying so in the CR's
-    # SizingCappedByQuota condition. The three
+    # medium, fleet, or auto, which sets a cluster-count floor (medium at 10
+    # clusters, fleet at 25) and steps up on sustained utilization (>= 75% for 5m)
+    # or steps down one tier at a time to the floor (<= 55% for 25m after a
+    # 30m cooldown). Only auto enables active-standby RollingUpdate on
+    # credential-proxy (default and fixed profiles keep Recreate). Under auto the
+    # operator checks ResourceQuota (including credential-proxy RollingUpdate surge
+    # headroom) and LimitRange bounds on each transition, rolling back a Pending
+    # surge past 2m (SurgeUnschedulable) or admission quota refusal while keeping
+    # the active broker pod running, reporting it in SizingCappedByQuota. The three
     # resources overrides above and in harness.experimental.shellSandbox are
     # applied per key over the preset, so an explicit key always wins. The
     # quota preflight counts medium and fleet at their rows and auto at the
