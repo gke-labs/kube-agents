@@ -62,7 +62,8 @@ const (
 	// DroppedTerminalGiveUp (giveUpTerminal).
 	// The dispatcher can't write it on the task (the write is what failed);
 	// it keys the Error log and the health line's supervisorGiveUps. Nothing
-	// delivers it to the gateway yet, so no conversation hears it (#6884).
+	// delivers it to the gateway, so no conversation hears it; the Error
+	// log is an alert line (terminalUnpublishedAlert, #6884).
 	ReasonTerminalUnpublished = "terminal-unpublished"
 )
 

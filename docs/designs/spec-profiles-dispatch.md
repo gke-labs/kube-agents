@@ -617,7 +617,13 @@ leave open:
   the terminal lands after it. Once refusals have run for `DroppedTerminalGiveUp`, the task is
   settled without one: tombstoned, its slot freed,
   its submission settled, an error logged under the reason `terminal-unpublished`, and the
-  dispatcher health line's `supervisorGiveUps` counted. The requester sees no terminal: the
+  dispatcher health line's `supervisorGiveUps` counted. The error is an alert line: it starts
+  `ALERT dispatcher_terminal_unpublished` and names the profile, tier and task, so a log-based
+  alert matches it (on GKE: `resource.type="k8s_container"
+resource.labels.container_name="dispatcher" jsonPayload.msg:"ALERT dispatcher_terminal_unpublished"`)
+  (#6884). The give-up has no carrier to the gateway, since the refused publish is that channel;
+  a Kubernetes Event, a `PlatformAgent` condition or a metric would each need a new grant or
+  network path the dispatcher doesn't have. The requester sees no terminal: the
   gateway ends a task with no events as never started, and holds one with executor events until
   the user's stop. A refusal needs a grant that never reached the dispatcher's connection; the
   regrant normally clears that in seconds, well inside the bound. A profile that has left the
