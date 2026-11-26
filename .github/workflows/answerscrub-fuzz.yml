@@ -42,6 +42,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "a2a/go.mod"
+          # No cache: the fuzzed package imports only the standard library,
+          # so a cache saves nothing here, and no cache restore can stall
+          # the run.
+          cache: false
 
       - name: Fuzz
         id: fuzz
@@ -67,7 +71,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           title="answerscrub fuzz: ${TARGET} found a crasher"
-          body="The nightly fuzz of \`${TARGET}\` failed: ${RUN_URL}. The crashing input is the run's \`answerscrub-crasher-${TARGET}\` artifact. Copy it into \`a2a/lib/answerscrub/testdata/fuzz/${TARGET}/\` to reproduce with \`go test ./lib/answerscrub -run ${TARGET}\`. A scrub panic ends a bridge task (#7276)."
+          body="The nightly fuzz of \`${TARGET}\` failed: ${RUN_URL}. The crashing input is the run's \`answerscrub-crasher-${TARGET}\` artifact. Copy it into \`a2a/lib/answerscrub/testdata/fuzz/${TARGET}/\`, then reproduce from \`a2a/\` with \`go test ./lib/answerscrub -run ${TARGET}\`. A scrub panic ends a bridge task (#7276)."
           existing=$(gh issue list --repo "$REPO" --state open --search "\"${title}\" in:title" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "Again: ${RUN_URL}"
