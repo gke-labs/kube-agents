@@ -17,7 +17,13 @@ walked whole with the key-aware walk the audit hooks use, so a value is
 redacted wherever it sits -- a tool's input, what a tool returned, a
 per-message field. A tool call's arguments held as JSON in a string (and an
 Anthropic tool input sent as a string) are decoded, walked as a document and
-re-encoded only if a rule changed them, so they stay valid JSON.
+re-encoded only if a rule changed them, so they stay valid JSON. A tool's
+output that is a whole JSON object or array (a chat tool message, an Anthropic
+tool result, a Responses function call output, a string in a Gemini function
+response) is decoded the same way, up to 256 KiB and 64 levels deep, and so is
+whole JSON inside it, three levels in at most; a changed one keeps its indent
+and separators. Past those bounds, or when it is not whole JSON, it is matched
+as text.
 
 Left exactly as they came, and only at the positions the provider APIs
 define (content parts, including a Responses `input` item's and a Responses
@@ -162,6 +168,17 @@ GEMINI_MIME_KEYS = ("mimeType", "mime_type")
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
 # A function response may carry parts of its own (an image a tool returned).
 GEMINI_FUNCTION_RESPONSE_KEYS = ("functionResponse", "function_response")
+GEMINI_RESPONSE_KEY = "response"
+# Tool output that is a whole JSON object or array is walked as the document
+# it encodes, within these bounds; past either it is matched as text.
+TOOL_OUTPUT_MAX_BYTES = 256 * 1024
+TOOL_OUTPUT_MAX_DEPTH = 64
+# A string inside a decoded tool output that is itself whole JSON (a shell
+# result's stdout, say) is decoded too, this many levels in at most.
+TOOL_OUTPUT_MAX_NESTING = 3
+TOOL_ROLE = "tool"
+TEXT_TYPE = "text"
+TEXT_KEY = "text"
 # The binary media types a payload may claim, each with how its bytes start:
 # a payload is kept only if its bytes start that way, so text labelled as one
 # of these is refused rather than kept unread. A type not listed here is
@@ -486,27 +503,30 @@ class KubeAgentsRedactionCallback(CustomLogger):
 
     def _redact_field(self, value: Any, kept: List[tuple], arguments: List[tuple], counts: Dict[str, int]) -> Any:
         """One top-level field: every string redacted, key names counted, the
-        kept fields put back as they came. Tool-call arguments held as JSON in
-        a string are walked as the document they encode and re-encoded only if
-        a rule changed it. The original is left unchanged (the walk returns a
+        kept fields put back as they came. Tool-call arguments and tool output
+        held as JSON in a string are walked as the document they encode and
+        re-encoded only if a rule changed it. The original is left unchanged (the walk returns a
         copy)."""
         if (kept or arguments) and isinstance(value, (dict, list)):
             placeholder = copy.deepcopy(value)
             for path, _ in kept:
                 self._put(placeholder, path, None)
-            for path, _, document in arguments:
+            for path, _, document, _ in arguments:
                 self._put(placeholder, path, copy.deepcopy(document))
         else:
             placeholder = value
         redacted, made = AuditRedactor.redact_counted(placeholder, self._rules)
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
-        for path, source, document in arguments:
+        # Innermost first: a document decoded inside another goes back to its
+        # string before the outer one is compared, so an unchanged inner one
+        # leaves the outer one unchanged too.
+        for path, source, document, style in reversed(arguments):
             walked = self._get(redacted, path)
             # Compared, not counted: a substitution that swaps one marker for
             # another nets zero on the counts but still changed the payload.
             keep = source is not None and walked == document
-            self._put(redacted, path, source if keep else json.dumps(walked, ensure_ascii=False))
+            self._put(redacted, path, source if keep else self._encode(walked, style))
         for path, original in kept:
             self._put(redacted, path, original)
         return redacted
@@ -541,7 +561,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 # A repeated key: the decoder kept one value and the walk never
                 # sees the other, so the string is re-encoded from the document
                 # rather than sent as it came.
-                found.append((path, None if repeated else value, document))
+                found.append((path, None if repeated else value, document, None))
 
         for i, message in enumerate(data.get(MESSAGES_KEY) or []):
             for j, call in enumerate(message.get(TOOL_CALLS_KEY) or []):
@@ -556,6 +576,124 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 for j, part in enumerate(content):
                     if isinstance(part, dict) and part.get(TYPE_KEY) == TOOL_USE_TYPE:
                         take((MESSAGES_KEY, i, CONTENT_KEY, j, TOOL_USE_INPUT_KEY), part.get(TOOL_USE_INPUT_KEY))
+        return found
+
+    @staticmethod
+    def _encode(document: Any, style: Optional[tuple]) -> str:
+        """A changed document back to a string: in the style it came in when
+        that was noted (indent, separators, a trailing line break), else as
+        tool-call arguments always have been."""
+        if style is None:
+            return json.dumps(document, ensure_ascii=False)
+        indent, separators, newline = style
+        return json.dumps(document, ensure_ascii=False, indent=indent, separators=separators) + newline
+
+    @staticmethod
+    def _style(text: str) -> tuple:
+        """How a JSON text is laid out: its indent (None for one line, else
+        the first indented line's leading whitespace), the separators that go
+        with it, and whether it ends with a line break."""
+        body = text.strip()
+        indent: Any = None
+        if "\n" in body:
+            for line in body.split("\n")[1:]:
+                lead = line[: len(line) - len(line.lstrip(" \t"))]
+                if lead:
+                    indent = lead if "\t" in lead else len(lead)
+                    break
+        if indent is not None:
+            separators = (",", ": ")
+        else:
+            colon = re.search(r'"\s*:(\s?)', body)
+            comma = re.search(r'[\]}"0-9el],(\s?)', body)
+            separators = ("," + (comma.group(1) if comma else " "), ":" + (colon.group(1) if colon else " "))
+        return indent, separators, "\n" if text.endswith("\n") else ""
+
+    @staticmethod
+    def _depth(document: Any, limit: int) -> bool:
+        """Whether document nests no deeper than limit, without recursion."""
+        stack = [(document, 1)]
+        while stack:
+            node, level = stack.pop()
+            if isinstance(node, (dict, list)):
+                if level > limit:
+                    return False
+                stack.extend((child, level + 1) for child in (node.values() if isinstance(node, dict) else node))
+        return True
+
+    @classmethod
+    def _decode_output(cls, path: tuple, value: Any, found: List[tuple], level: int = 0) -> None:
+        """Note value as a document to walk when it is a whole JSON object or
+        array within the bounds, then the same for whole-JSON strings inside
+        it. Anything else is left a string and matched as text."""
+        if not isinstance(value, str) or level >= TOOL_OUTPUT_MAX_NESTING:
+            return
+        body = value.strip()
+        if not body or body[0] not in "{[" or len(value.encode("utf-8", "replace")) > TOOL_OUTPUT_MAX_BYTES:
+            return
+        repeated = False
+
+        def pairs(items: List[tuple]) -> Dict[str, Any]:
+            nonlocal repeated
+            keys = [key for key, _ in items]
+            repeated = repeated or len(keys) != len(set(keys))
+            return dict(items)
+
+        try:
+            document = json.loads(value, object_pairs_hook=pairs)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(document, (dict, list)) or not cls._depth(document, TOOL_OUTPUT_MAX_DEPTH):
+            return
+        # A repeated key: the decoder kept one value, so the string is
+        # re-encoded from the document rather than sent as it came.
+        found.append((path, None if repeated else value, document, cls._style(value)))
+        stack = [(path, document)]
+        while stack:
+            where, node = stack.pop()
+            items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+            for key, child in items:
+                if isinstance(child, str):
+                    cls._decode_output(where + (key,), child, found, level + 1)
+                elif isinstance(child, (dict, list)):
+                    stack.append((where + (key,), child))
+
+    @classmethod
+    def _tool_outputs(cls, data: Dict[str, Any]) -> List[tuple]:
+        """(path, string, document, style) for each tool output that is a
+        whole JSON object or array: a chat tool message's content, an
+        Anthropic tool result's content (a string or its text parts), a
+        Responses function call output, and each string in a Gemini function
+        response's response object. The structure rules (key names, Secret
+        data, env pairs) then apply to it as to any mapping."""
+        found: List[tuple] = []
+        for i, message in enumerate(data.get(MESSAGES_KEY) or []):
+            if not isinstance(message, dict):
+                continue
+            content = message.get(CONTENT_KEY)
+            if message.get(ROLE_KEY) == TOOL_ROLE:
+                cls._decode_output((MESSAGES_KEY, i, CONTENT_KEY), content, found)
+            for j, part in enumerate(content if isinstance(content, list) else []):
+                if not isinstance(part, dict) or part.get(TYPE_KEY) != TOOL_RESULT_TYPE:
+                    continue
+                inner = part.get(CONTENT_KEY)
+                where = (MESSAGES_KEY, i, CONTENT_KEY, j, CONTENT_KEY)
+                cls._decode_output(where, inner, found)
+                for k, sub in enumerate(inner if isinstance(inner, list) else []):
+                    if isinstance(sub, dict) and sub.get(TYPE_KEY) == TEXT_TYPE:
+                        cls._decode_output(where + (k, TEXT_KEY), sub.get(TEXT_KEY), found)
+        items = data.get(RESPONSES_INPUT_KEY)
+        for i, item in enumerate(items if isinstance(items, list) else []):
+            if isinstance(item, dict) and item.get(TYPE_KEY) == RESPONSES_FUNCTION_CALL_OUTPUT_TYPE:
+                cls._decode_output((RESPONSES_INPUT_KEY, i, RESPONSES_OUTPUT_KEY), item.get(RESPONSES_OUTPUT_KEY), found)
+        for i, content in enumerate(data.get(CONTENTS_KEY) or []):
+            parts = content.get(PARTS_KEY) if isinstance(content, dict) else None
+            for j, part in enumerate(parts if isinstance(parts, list) else []):
+                for key in GEMINI_FUNCTION_RESPONSE_KEYS:
+                    response = part.get(key) if isinstance(part, dict) else None
+                    body = response.get(GEMINI_RESPONSE_KEY) if isinstance(response, dict) else None
+                    for name, value in (body.items() if isinstance(body, dict) else ()):
+                        cls._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found)
         return found
 
     @staticmethod
@@ -585,13 +723,13 @@ class KubeAgentsRedactionCallback(CustomLogger):
         """
         self._check_shape(data)
         kept = self._carve(data)
-        arguments = self._tool_arguments(data)
+        arguments = self._tool_arguments(data) + self._tool_outputs(data)
         counts: Dict[str, int] = {}
         for key in list(data):
             if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
                 continue
             mine = [(path[1:], value) for path, value in kept if path[0] == key]
-            args = [(path[1:], source, document) for path, source, document in arguments if path[0] == key]
+            args = [(path[1:], source, document, style) for path, source, document, style in arguments if path[0] == key]
             data[key] = self._redact_field(data[key], mine, args, counts)
         return counts
 

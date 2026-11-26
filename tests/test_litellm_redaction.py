@@ -616,6 +616,74 @@ class TestCallback(unittest.TestCase):
              lambda r: r["input"][0]["content"][0]["image_url"][len("data:image/png;base64,"):], "aresponses"),
         ]
 
+    # A value only a key-name rule masks: the text rules don't know "auth".
+    _KEYED = '{"auth":"opaque-value-xyz","name":"web"}'
+    _KEYED_OUT = '{"auth":"[REDACTED_SECRET]","name":"web"}'
+
+    def test_json_tool_output_gets_the_structure_rules_at_each_position(self) -> None:
+        cases = [
+            ({"messages": [{"role": "tool", "tool_call_id": "x", "content": self._KEYED}]},
+             lambda r: r["messages"][0]["content"], "completion"),
+            ({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": self._KEYED}]}]},
+             lambda r: r["messages"][0]["content"][0]["content"], "anthropic_messages"),
+            ({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x",
+                                                         "content": [{"type": "text", "text": self._KEYED}]}]}]},
+             lambda r: r["messages"][0]["content"][0]["content"][0]["text"], "anthropic_messages"),
+            ({"input": [{"type": "function_call_output", "call_id": "c", "output": self._KEYED}]},
+             lambda r: r["input"][0]["output"], "aresponses"),
+            ({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {"output": self._KEYED}}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["functionResponse"]["response"]["output"], "agenerate_content"),
+            ({"contents": [{"role": "user", "parts": [{"function_response": {"name": "t", "response": {"output": self._KEYED}}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["function_response"]["response"]["output"], "agenerate_content"),
+        ]
+        for req, get, call in cases:
+            with self.subTest(call=call, req=json.dumps(req)[:60]):
+                self.assertEqual(get(self._run(req, call)), self._KEYED_OUT)
+
+    def test_a_changed_tool_output_keeps_its_layout_and_an_unchanged_one_its_bytes(self) -> None:
+        secret = {"kind": "Secret", "metadata": {"name": "s"}, "data": {"k": "c2VjcmV0"}}
+        for text in (json.dumps(secret, indent=2) + "\n", json.dumps(secret, indent=4), json.dumps(secret, separators=(",", ":")),
+                     json.dumps(secret, indent="\t")):
+            with self.subTest(text=text[:30]):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                want = json.loads(text)
+                want["data"]["k"] = "[REDACTED_SECRET]"
+                indent = None if "\n" not in text.strip() else ("\t" if "\t" in text else len(text.split("\n")[1]) - len(text.split("\n")[1].lstrip()))
+                separators = (",", ": ") if indent is not None else (",", ":")
+                self.assertEqual(out, json.dumps(want, indent=indent, separators=separators) + ("\n" if text.endswith("\n") else ""))
+        odd = '{"a": "b",   "c": 1}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": odd}]})["messages"][0]["content"]
+        self.assertEqual(out, odd)
+
+    def test_json_inside_a_decoded_tool_output_is_decoded_too(self) -> None:
+        stdout = json.dumps({"kind": "Secret", "data": {"k": "c2VjcmV0"}}, indent=2)
+        output = json.dumps({"exit_code": 0, "stdout": stdout, "stderr": ""})
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
+        out = json.loads(self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]["output"])
+        self.assertEqual(out["exit_code"], 0)
+        self.assertEqual(json.loads(out["stdout"])["data"]["k"], "[REDACTED_SECRET]")
+        self.assertTrue(out["stdout"].startswith('{\n  "kind"'), "the inner document keeps its indent")
+
+    def test_tool_output_past_the_bounds_or_not_whole_json_is_matched_as_text(self) -> None:
+        big = json.dumps({"auth": "opaque-value-xyz", "pad": "x" * (256 * 1024)})
+        deep = '{"auth":"opaque-value-xyz","d":' + "[" * 64 + "1" + "]" * 64 + "}"
+        prefixed = "result: " + self._KEYED
+        for text in (big, deep, prefixed, "[1, 2"):
+            with self.subTest(text=text[:40]):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertEqual(out, text, "left to the text rules, which don't mask a value only its key names")
+        # One level shallower is within the bound.
+        ok = '{"auth":"opaque-value-xyz","d":' + "[" * 62 + "1" + "]" * 62 + "}"
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": ok}]})["messages"][0]["content"]
+        self.assertIn("[REDACTED_SECRET]", out)
+
+    def test_a_tool_output_with_a_repeated_key_is_re_encoded_from_what_was_walked(self) -> None:
+        text = '{"auth":"opaque-value-xyz","auth":"second-value-abc"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertEqual(json.loads(out), {"auth": "[REDACTED_SECRET]"})
+        self.assertNotIn("opaque-value-xyz", out)
+        self.assertNotIn("second-value-abc", out)
+
     def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
         # Forms providers accept: the URL-safe alphabet, no padding, and the
         # common image/jpg label. Each is kept byte for byte as it came.

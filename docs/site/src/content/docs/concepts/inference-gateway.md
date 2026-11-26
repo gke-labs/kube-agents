@@ -284,6 +284,8 @@ Before LiteLLM calls the provider, the hook rewrites every top-level field of th
 
 Each field is walked whole, so a value is redacted wherever it sits: a tool's input, what a tool returned, or an assistant message's other fields. A tool call's arguments held as JSON in a string are decoded first. A key name such as `password` then counts as it does in a mapping, and the arguments stay valid JSON.
 
+A tool's output that is a whole JSON object or array is decoded the same way, so the structure rules apply to it too: key names, a Secret's `data`, and env pairs. That covers a chat tool message, an Anthropic tool result, a Responses function call output and the strings in a Gemini function response, plus whole JSON nested inside one, up to three levels. Output over 256 KiB or more than 64 levels deep, or that isn't whole JSON, is matched as text. Output no rule changed goes on as it came. A changed one keeps its indent and separators, but other spacing becomes standard JSON spacing.
+
 A few fields are left as they came. They are kept only where the provider APIs put them: content parts, a tool result's own content list, the system blocks and Gemini parts. That includes the parts of a Responses `input` item or function call output, and the parts inside a Gemini function response. Beyond those parts, nothing inside a tool's input or output is kept. The kept fields are:
 
 - in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
