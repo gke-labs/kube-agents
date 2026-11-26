@@ -318,7 +318,7 @@ On an `install.sh` install, put the block in the `TF_VAR_extra_helm_values` line
 
 The setting does not reach a job that you or the agent added to the roster. Pause or remove that job with `hermes cron`.
 
-The operator restarts the agent pod when the setting changes for a roster job, and the jobs change state at that start. A suspended job keeps its run history. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
+The operator restarts the agent pod when the setting changes for a roster job, and the jobs change state at that start. A suspended job keeps its run history. If you run a suspended job by hand with `hermes cron run`, Hermes turns the job back on, and it stays on until the next pod restart. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
 
 `suspendAll` also turns off the [helper jobs](#the-helper-jobs), which do work that chat requests depend on:
 
