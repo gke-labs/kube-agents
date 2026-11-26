@@ -158,7 +158,8 @@ NEW_COMPUTE_CLASS_TRIAGE = "new-computeclass"
 # The `needs_triage` marker on a §3.12(b) finding. Its fix changes a node pool or a
 # class (for `TaintMissing`, a `NoSchedule` taint on a pool), and the collector reads
 # nothing about the other Pods on that pool, so the automatic sweep leaves it to
-# `/remediate`. The string matches `TRIAGE_REASONS` in audit_report.py.
+# `/remediate`. A §3.10(b) finding has the same marker: one fix is a new
+# reservation, which is billed. The string matches `TRIAGE_REASONS` in audit_report.py.
 CLASS_STATUS_TRIAGE = "class-status"
 
 # §3.1: the zone span credited to an Autopilot cluster, which has no node

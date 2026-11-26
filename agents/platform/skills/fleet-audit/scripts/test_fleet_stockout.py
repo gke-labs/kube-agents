@@ -917,7 +917,7 @@ class DanglingComputeClassTest(unittest.TestCase):
         excerpt = fs.check_compute_class_status(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))["excerpt"]
         self.assertEqual(excerpt, f"{self.RESERVATION_EXCERPT}; status condition Health is False (Health): Crd is not healthy.")
 
-    def test_the_fixture_shape_is_a_status_hit_and_no_reservation_hit(self):
+    def test_a_class_with_auto_creation_off_is_a_status_hit_and_no_reservation_hit(self):
         cc = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
         self.assertIsNone(fs.check_class_reservation_status(cc))
         self.assertIn("(NapDisabledAndNoMatchingNodegroups)", fs.check_compute_class_status(cc, reservation_filed=False)["excerpt"])
@@ -938,8 +938,8 @@ class DanglingComputeClassTest(unittest.TestCase):
     def test_the_collector_keeps_the_status_finding_for_the_other_conditions(self):
         both = self.class_with_status(self.RESERVATION_NOT_FOUND, self.TAINT_MISSING, self.NOT_HEALTHY)
         self.assertEqual(sorted(c["check"] for c in self.filed_for_class(both)), ["dangling-compute-class", "reservation-mismatch-risk"])
-        fixture = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
-        self.assertEqual([c["check"] for c in self.filed_for_class(fixture)], ["dangling-compute-class"])
+        off = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
+        self.assertEqual([c["check"] for c in self.filed_for_class(off)], ["dangling-compute-class"])
 
     def test_a_non_production_class_keeps_the_status_finding_only(self):
         """§3.10 does not flag non-production."""
@@ -4497,7 +4497,9 @@ class ReservedClassTest(unittest.TestCase):
         return rule
 
     def reserved_class(self, *rules, name="reserved-ccc"):
-        """The fixture shape: auto-creation off, and one rule below."""
+        """Auto-creation off, and one rule below. GKE's status does not name
+        the reservation of such a class. The seeded fleet's class of this name
+        has auto-creation on, so GKE's status names its reservation."""
         return compute_class(name, [*rules, {"machineType": "e2-standard-4"}], node_pool_auto_creation=False)
 
     def filed(self, *classes, reservations=(), swept=("acme",), read=("acme",), **extra):
@@ -4693,8 +4695,8 @@ class ReservedClassTest(unittest.TestCase):
         cluster = next(e for e in manifest["clusters"] if e["name"] == "acme/us-central1/c1")
         return [(c["check"], c["object"]) for c in cluster["candidates"] if c["check"] in (self.SLUG, "dangling-compute-class")], cluster
 
-    def test_the_fleet_files_the_fixture_class_for_both_faults(self):
-        """The fixture shape, as GKE reported it: the status names only the
+    def test_the_fleet_files_a_class_with_auto_creation_off_for_both_faults(self):
+        """Auto-creation off, as GKE reported it: the status names only the
         missing node pool, and the comparison finds the missing reservation."""
         cc = self.reserved_class(self.rule("no-such-reservation"))
         cc["status"] = {"conditions": [
