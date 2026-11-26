@@ -3300,8 +3300,9 @@ answer. The hand-off's answer is a new message, and each new message the adapter
 indicator off for one interval, since a card's answer is posted before its mark settles. The
 indicator stops ten minutes after the ask opened, the newest chain started or ended, or the
 adapter last posted or edited a message in the conversation, whichever is latest
-(`teamsTypingMax`), since only a notify settles an older ask; a later chain or message starts it
-again. A post that fails is dropped and the next
+(`teamsTypingMax`), since only a notify settles an older ask; a later chain, or an edit of a
+message one interval on, starts it again, and a new message does not, since it is usually the
+answer. A post that fails is dropped and the next
 one tries again. Teams accepts the post in every conversation and draws it only in some: a
 live run showed the indicator in a one-to-one chat with the bot and nothing in a channel
 thread, so a channel has the line and the plan alone.

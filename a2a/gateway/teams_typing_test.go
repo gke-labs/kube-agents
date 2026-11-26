@@ -173,8 +173,10 @@ func TestTeamsStopsTypingAtItsBound(t *testing.T) {
 }
 
 // Work that goes on showing itself keeps the indicator past the bound: each
-// message the adapter posts or edits in the conversation restarts it, and
-// one that lands after the bound ended the loop starts it again.
+// message the adapter posts or edits in the conversation restarts it. Once
+// the bound has ended the loop, an edit starts it again and a new message
+// does not: that message is usually the answer, and typing would sit under
+// it.
 func TestTeamsKeepsTypingWhileTheWorkShowsItself(t *testing.T) {
 	a, relay := typingTeamsAdapter(t)
 	a.typingMax = 20 * testTeamsTypingInterval
@@ -191,15 +193,39 @@ func TestTeamsKeepsTypingWhileTheWorkShowsItself(t *testing.T) {
 	before := teamsTypingCount(relay)
 	waitFor(t, "the indicator kept posting past the bound", func() bool { return teamsTypingCount(relay) >= before+2 })
 	settled := teamsTypingSettled(t, relay)
-	if _, err := a.Post(conversation, "a new note"); err != nil {
+	if _, err := a.Post(conversation, "the answer"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "a message after the bound turned the indicator on again", func() bool { return teamsTypingCount(relay) > settled })
+	teamsTypingQuiet(t, relay, "behind a new message after the bound ended the loop")
+	if err := a.Edit(conversation, line, "working again"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an edit after the bound turned the indicator on again", func() bool { return teamsTypingCount(relay) > settled })
 	a.MarkChanged(conversation, "", "")
 	if err := a.Edit(conversation, line, "done"); err != nil {
 		t.Fatal(err)
 	}
 	teamsTypingQuiet(t, relay, "after an edit with no ask open")
+}
+
+// An edit that starts an ended loop again waits one interval before its
+// first post, so a plan's last edit just ahead of the settle posts nothing.
+func TestTeamsRestartedTypingWaitsAnInterval(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 1 })
+	settled := teamsTypingSettled(t, relay)
+	a.typingInterval = time.Hour
+	if err := a.Edit(conversation, "1700000000001", "the last step is done"); err != nil {
+		t.Fatal(err)
+	}
+	a.MarkChanged(conversation, "", "")
+	teamsTypingQuiet(t, relay, "between a restarting edit and the settle just behind it")
+	if now := teamsTypingCount(relay); now != settled {
+		t.Fatalf("typing posts went from %d to %d around the last edit", settled, now)
+	}
 }
 
 // A task that never reports its end is forgotten at the bound, so it does

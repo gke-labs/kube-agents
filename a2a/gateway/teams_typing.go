@@ -39,7 +39,8 @@ import (
 // longer open or teamsTypingMax has passed since the ask opened, the newest
 // task started or ended, or the adapter last posted or edited a message
 // there (typingShown): a card that keeps showing its work keeps the
-// indicator, as Slack keeps a plan until it has gone without a new note. A
+// indicator, as Slack keeps a plan until it has gone without a new note,
+// and an edit after the bound ended the loop starts it again. A
 // new message the adapter posts there holds the indicator off for one
 // interval too (quietTyping). A post that fails is dropped: the indicator
 // is a courtesy, and the next tick tries again.
@@ -132,18 +133,29 @@ func (a *TeamsAdapter) quietTyping(conversation string) {
 	}
 }
 
-// typingShown restarts the bound of conversation's open ask, and its loop
-// if the bound had ended it. The adapter calls it after each message it
-// posts or edits there: the work is still showing itself.
-func (a *TeamsAdapter) typingShown(conversation string) {
+// typingShown restarts the bound of conversation's open ask. The adapter
+// calls it after each message it posts or edits there: the work is still
+// showing itself. An edit also starts the loop again if the bound had ended
+// it, one interval later, so a plan's last edit just ahead of its answer
+// posts nothing; a new message never does, since a message that follows a
+// long silence is usually the answer, and a typing post would sit under it.
+func (a *TeamsAdapter) typingShown(conversation string, edit bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	t := a.typing[conversation]
 	if t == nil || !t.open {
 		return
 	}
-	t.deadline = time.Now().Add(a.typingMax)
-	a.startTypingLocked(conversation, t)
+	running := t.stop != nil
+	if !running && !edit {
+		return
+	}
+	now := time.Now()
+	t.deadline = now.Add(a.typingMax)
+	if !running {
+		t.quietUntil = now.Add(a.typingInterval)
+		a.startTypingLocked(conversation, t)
+	}
 }
 
 // MarkChanged wants the indicator while the conversation's ask is open and

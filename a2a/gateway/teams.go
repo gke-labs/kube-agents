@@ -716,7 +716,7 @@ func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any)
 	if err != nil {
 		return "", err
 	}
-	a.typingShown(conversation)
+	a.typingShown(conversation, false)
 	var body struct {
 		Response struct {
 			ID string `json:"id"`
@@ -853,7 +853,7 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	if _, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload); err != nil {
 		return err
 	}
-	a.typingShown(conversation)
+	a.typingShown(conversation, true)
 	return nil
 }
 
