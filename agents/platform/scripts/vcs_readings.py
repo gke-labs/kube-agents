@@ -173,8 +173,8 @@ CONNECTION_OK = "ok"
 # The forge refused the credential, or no credential could be had for the
 # repository (a failed mint, a missing token file).
 CONNECTION_UNAUTHORIZED = "unauthorized"
-# The forge has no such repository for this credential. On GitHub that is also
-# a private repository the App is not installed on.
+# The forge has no such repository for this credential. A repository a GitHub
+# App cannot see fails earlier, at the mint, and is CONNECTION_UNAUTHORIZED.
 CONNECTION_NOT_FOUND = "not_found"
 # The forge did not answer: a network or TLS fault, a timeout, a 5xx.
 CONNECTION_UNREACHABLE = "unreachable"

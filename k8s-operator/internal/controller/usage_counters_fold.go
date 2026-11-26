@@ -470,6 +470,10 @@ type usageScrapedPod struct {
 	// any pod but a broker's. Not folded either: the poll sums it across the
 	// broker pods read and projects the top rows (usageTopToolsForPoll).
 	ToolPairs map[usageToolPair]usageToolCounts
+	// Forges is the stateful broker's forge connection reading, nil for any
+	// pod but that broker's. Not folded either: the poll projects it into the
+	// ForgeConnected condition as it stands (usageForgesForPoll).
+	Forges *usageForgeReading
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

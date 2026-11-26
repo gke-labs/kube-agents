@@ -98,21 +98,23 @@ The three `kubeagents_vcs_forge_` series say which forge the install's managed r
 - `kubeagents_vcs_forge_connected` is `1` only when every managed repository of the provider answered.
 - `kubeagents_vcs_forge_repositories` counts those repositories by `state`:
 
-| `state`        | The last attempt on the repository                                                                                 |
-| -------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `ok`           | The forge answered the listing of the install's pull requests.                                                     |
-| `unauthorized` | The forge refused the credential or the read, or no credential could be had for the repository.                    |
-| `not_found`    | The forge has no such repository for this credential. On GitHub, also a repository the App cannot see.             |
-| `unreachable`  | The forge did not answer: a network or TLS fault, a timeout or a server error.                                     |
-| `rate_limited` | The forge refused a read for its request quota.                                                                    |
-| `identity`     | The credential cannot say which account it is. Such a repository is not attempted again until the broker restarts. |
-| `other`        | Any other failure, such as a host that no configured forge serves.                                                 |
+| `state`        | The last attempt on the repository                                                                                                                          |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ok`           | The forge answered the listing of the install's pull requests.                                                                                              |
+| `unauthorized` | The forge refused the credential or the read, or no credential could be had for the repository. A repository that a GitHub App cannot see is in this state. |
+| `not_found`    | The forge has no such repository for this credential.                                                                                                       |
+| `unreachable`  | The forge did not answer: a network or TLS fault, a timeout or a server error.                                                                              |
+| `rate_limited` | The forge refused a read for its request quota.                                                                                                             |
+| `identity`     | The credential cannot say which account it is. Such a repository is not attempted again until the broker restarts.                                          |
+| `other`        | Any other failure, such as a host that no configured forge serves.                                                                                          |
 
 The state comes from the first reads of each attempt: the credential, the account and the listing. A later read of one pull request that fails does not change it, except a refusal for the request quota.
 
 A provider's connected and repository series are omitted once its last attempt is more than an hour old. Its age series stays, so a sweep that stopped shows as stale. A provider whose repositories are all in the `identity` state is not attempted again, so its age grows from the time they were found.
 
 Two limits apply. A forge with no managed repository, such as one that holds only context repositories, is not attempted and has no series. The attempt reads the repository; it does not prove that the credential can write to it.
+
+The operator reads these series on its usage poll and sets the `ForgeConnected` condition on the PlatformAgent from them. The condition does not change `Ready`. The [CRD reference](/kube-agents/operator/platformagent-crd/#status) lists its reasons.
 
 The `kind` label of `kubeagents_broker_execution_failures_total`:
 
@@ -276,6 +278,8 @@ The origin fields (`proposalsFromChat` to `proposalsFromOther`) clear on the sam
 | `lastHumanActiveTime`                     | the poll in which a chat message last moved its counter                                                                                                                                                                                   | `lastActiveTime` moves on any counter, the stall-watch cron's commands and the fleet audits' proposals included                                                                                                                                                          |
 
 The same poll reads the watcher's `kubeagents_data_volume_bytes` into `status.storageStatus.capacityBytes` and `freeBytes` and the `DataVolumeNearlyFull` condition. It also reads the labels of the `k8s_event_watcher_cluster_up` series into the `ScopeUndeclared` condition, which names the clusters the reconcile adopted beyond the host while `spec.scope` declares no membership.
+
+The poll reads the broker's three `kubeagents_vcs_forge_` series into the `ForgeConnected` condition. It is `True` when every managed repository on every forge answered the last sweep. It is `False` when one did not, with the worst state as the reason. It is `Unknown` when a forge was last attempted over an hour ago and none reports a failure. [Forge connection](#forge-connection) says what the series cover.
 
 The poll reads the plugin's `kubeagents_kanban_dispatcher_failed_ticks` into the `KanbanDispatcherFailing` condition. It turns `True` with reason `TicksFailing` at 60 failed ticks in a row on a board, about one poll, or at 3 failed ticks in a streak at least one poll old (`kubeagents_kanban_dispatcher_failing_seconds`). It turns `True` with reason `TickStuck` for a board with a tick that ran past 300 s or failed on a lock after a busy timeout (`kubeagents_kanban_dispatcher_stuck_seconds`). A stuck board takes precedence. The message follows the reason, the board it names, the last error class and the count of failing boards; it holds no tick count or duration, which the gauges have.
 

@@ -232,7 +232,7 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr, path string, counter
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume, Dispatcher: reading.Dispatcher}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume, Dispatcher: reading.Dispatcher, Forges: reading.Forges}
 	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
 	if slices.Contains(kinds, usageReadingTopTools) {
 		out.ToolPairs = reading.ToolPairs
@@ -372,6 +372,16 @@ func (s *stubUsageSource) setDispatcher(addr string, failing ...usageDispatcherF
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
 	reading.Dispatcher = &usageDispatcherReading{Failing: failing}
+	s.readings[addr] = reading
+}
+
+// setForges gives addr's reading the broker's forge connection report (none
+// for a broker that names no provider), which set leaves in place.
+func (s *stubUsageSource) setForges(addr string, forges ...usageForge) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Forges = &usageForgeReading{Forges: forges}
 	s.readings[addr] = reading
 }
 
