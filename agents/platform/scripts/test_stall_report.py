@@ -1183,5 +1183,1458 @@ class ClusterMode(unittest.TestCase):
                 self.assertEqual(stall_report.main(["--namespaces", NAMESPACE, "--json"]), 2)
 
 
+class InProcessShimAndParallelCollection(unittest.TestCase):
+    """Tests for in-process credential shim dispatch, parallel collection, and timestamp caching."""
+
+    REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+    def setUp(self):
+        stall_report._SHIM_CACHE.clear()
+        stall_report._parse_time_str.cache_clear()
+
+    def test_run_kubectl_uses_inprocess_shim_across_all_three_shipped_layouts(self):
+        import py_compile
+        import shutil
+        import tempfile
+        import credential_proxy_client
+
+        launcher_src = os.path.join(self.REPO_ROOT, "deploy", "shared", "credential-proxy-exec.py")
+        wrapper_src = os.path.join(self.REPO_ROOT, "deploy", "sandbox", "session-kubectl.sh")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Layout 1: direct copy of credential_proxy_client.py as kubectl on PATH
+            bin1 = os.path.join(tmp, "bin1")
+            os.makedirs(bin1)
+            direct_kubectl = os.path.join(bin1, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, direct_kubectl)
+            os.chmod(direct_kubectl, 0o755)
+
+            # Layout 2: #5806 precompiled credential-proxy-exec launcher symlinked as kubectl
+            libexec = os.path.join(tmp, "libexec")
+            bin2 = os.path.join(tmp, "bin2")
+            os.makedirs(libexec)
+            os.makedirs(bin2)
+            client_copy = os.path.join(libexec, "credential_proxy_client.py")
+            shutil.copyfile(credential_proxy_client.__file__, client_copy)
+            py_compile.compile(client_copy, doraise=True)
+            launcher_dst = os.path.join(libexec, "credential-proxy-exec")
+            shutil.copyfile(launcher_src, launcher_dst)
+            os.chmod(launcher_dst, 0o755)
+            os.symlink(launcher_dst, os.path.join(bin2, "kubectl"))
+
+            # Layout 3: worker session-kubectl.sh delegating CLIENT to launcher
+            bin3 = os.path.join(tmp, "bin3")
+            os.makedirs(bin3)
+            with open(wrapper_src, "r", encoding="utf-8") as handle:
+                wrapper_text = handle.read().replace(
+                    "readonly CLIENT=/opt/credential-proxy/libexec/credential-proxy-exec",
+                    f"readonly CLIENT={launcher_dst}",
+                )
+            wrapper_kubectl = os.path.join(bin3, "kubectl")
+            with open(wrapper_kubectl, "w", encoding="utf-8") as handle:
+                handle.write(wrapper_text)
+            os.chmod(wrapper_kubectl, 0o755)
+
+            for name, bin_dir in (("direct", bin1), ("launcher", bin2), ("session-kubectl", bin3)):
+                with self.subTest(layout=name):
+                    stall_report._SHIM_CACHE.clear()
+                    env = {
+                        "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                        "CREDENTIAL_PROXY_EXEC_URL": "",
+                        "KUBE_PROXY_URL": "",
+                        "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    }
+                    with patch.dict(os.environ, env, clear=False), \
+                         patch.object(
+                             credential_proxy_client,
+                             "execute_captured",
+                             return_value=(0, '{"items":[]}\n', ""),
+                         ) as exec_cap, \
+                         patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                        rc, out, err = stall_report.run_kubectl(["get", "pods", "-o", "json"])
+                    self.assertEqual((0, '{"items":[]}\n', ""), (rc, out, err))
+                    exec_cap.assert_called_once_with(
+                        "http://127.0.0.1:8765", ["kubectl", "get", "pods", "-o", "json"], fallback=None
+                    )
+
+            # Layout 3 with KUBE_PROXY_URL set must NOT bypass session-kubectl.sh -> returns None
+            stall_report._SHIM_CACHE.clear()
+            env_kube_proxy = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "https://k8s-api-proxy.local:8443",
+                "PATH": f"{bin3}:{os.environ.get('PATH', '')}",
+            }
+            with patch.dict(os.environ, env_kube_proxy, clear=False), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                self.assertIsNone(stall_report._shim_client())
+
+    def test_run_kubectl_supports_exec_tier_routing_and_captures_malformed_exec_url_notice(self):
+        import shutil
+        import tempfile
+        import credential_proxy_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_path = os.path.join(tmp, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, shim_path)
+            os.chmod(shim_path, 0o755)
+
+            # 1. Both CREDENTIAL_PROXY_EXEC_URL and CREDENTIAL_PROXY_URL -> primary + fallback
+            env_both = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "http://127.0.0.1:8766",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            with patch.dict(os.environ, env_both, clear=False), \
+                 patch.object(
+                     credential_proxy_client,
+                     "execute_captured",
+                     return_value=(0, '{"items":[]}\n', ""),
+                 ) as exec_cap, \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                rc, out, err = stall_report.run_kubectl(["get", "pods"])
+            self.assertEqual((0, '{"items":[]}\n', ""), (rc, out, err))
+            exec_cap.assert_called_once_with(
+                "http://127.0.0.1:8766",
+                ["kubectl", "get", "pods"],
+                fallback="http://127.0.0.1:8765",
+            )
+
+            # 2. CREDENTIAL_PROXY_EXEC_URL alone (no stateful URL) -> dispatches in-process
+            env_exec_only = {
+                "CREDENTIAL_PROXY_URL": "",
+                "CREDENTIAL_PROXY_EXEC_URL": "http://127.0.0.1:8766",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            with patch.dict(os.environ, env_exec_only, clear=False), \
+                 patch.object(
+                     credential_proxy_client,
+                     "execute_captured",
+                     return_value=(0, "ok\n", ""),
+                 ) as exec_cap, \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                rc, out, err = stall_report.run_kubectl(["get", "pods"])
+            self.assertEqual((0, "ok\n", ""), (rc, out, err))
+            exec_cap.assert_called_once_with(
+                "http://127.0.0.1:8766", ["kubectl", "get", "pods"], fallback=None
+            )
+
+            # 3. Malformed CREDENTIAL_PROXY_EXEC_URL notice captured in returned stderr, not sys.stderr
+            saved_flag = credential_proxy_client._exec_url_notice_written
+            credential_proxy_client._exec_url_notice_written = False
+            proc_err = io.StringIO()
+            env_bad_exec = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "https://bad-scheme.invalid:8766",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            try:
+                with patch.dict(os.environ, env_bad_exec, clear=False), \
+                     patch.object(
+                         credential_proxy_client,
+                         "execute_captured",
+                         return_value=(0, "ok\n", "cmd-warn\n"),
+                     ) as exec_cap, \
+                     patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                     redirect_stderr(proc_err):
+                    rc, out, err = stall_report.run_kubectl(["get", "pods"])
+            finally:
+                credential_proxy_client._exec_url_notice_written = saved_flag
+            self.assertEqual("", proc_err.getvalue())
+            self.assertEqual(0, rc)
+            self.assertEqual("ok\n", out)
+            self.assertIn("CREDENTIAL_PROXY_EXEC_URL", err)
+            self.assertTrue(err.endswith("cmd-warn\n"))
+            exec_cap.assert_called_once_with(
+                "http://127.0.0.1:8765", ["kubectl", "get", "pods"], fallback=None
+            )
+
+    def test_run_kubectl_falls_back_to_subprocess_when_monkeypatched_unset_or_modified_wrapper(self):
+        import shutil
+        import tempfile
+        import credential_proxy_client
+
+        launcher_src = os.path.join(self.REPO_ROOT, "deploy", "shared", "credential-proxy-exec.py")
+        wrapper_src = os.path.join(self.REPO_ROOT, "deploy", "sandbox", "session-kubectl.sh")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_path = os.path.join(tmp, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, shim_path)
+            os.chmod(shim_path, 0o755)
+
+            fake_completed = stall_report.subprocess.CompletedProcess(
+                ["kubectl", "get", "pods"], 0, stdout="sub-out", stderr=""
+            )
+            # 1. Both broker URLs unset -> subprocess.run
+            env_no_url = {
+                "CREDENTIAL_PROXY_URL": "",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            with patch.dict(os.environ, env_no_url, clear=False), \
+                 patch.object(stall_report.subprocess, "run", return_value=fake_completed) as sub_run, \
+                 patch.object(credential_proxy_client, "execute_captured") as exec_cap:
+                rc, out, err = stall_report.run_kubectl(["get", "pods"])
+                self.assertEqual((0, "sub-out", ""), (rc, out, err))
+                sub_run.assert_called_once()
+                exec_cap.assert_not_called()
+
+            # 2. CREDENTIAL_PROXY_URL set, but subprocess.run monkeypatched -> subprocess.run
+            env_with_url = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            with patch.dict(os.environ, env_with_url, clear=False), \
+                 patch.object(stall_report.subprocess, "run", return_value=fake_completed) as sub_run, \
+                 patch.object(credential_proxy_client, "execute_captured") as exec_cap:
+                rc, out, err = stall_report.run_kubectl(["get", "pods"])
+                self.assertEqual((0, "sub-out", ""), (rc, out, err))
+                sub_run.assert_called_once()
+                exec_cap.assert_not_called()
+
+            # 3. Modified launcher body fails closed -> None
+            with open(launcher_src, "r", encoding="utf-8") as handle:
+                modified_launcher = handle.read() + "\nprint('extra')\n"
+            with open(shim_path, "w", encoding="utf-8") as handle:
+                handle.write(modified_launcher)
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env_with_url, clear=False):
+                self.assertIsNone(stall_report._shim_client())
+
+            # 4. Modified session-kubectl.sh (extra top-level statement or .. in CLIENT) fails closed
+            with open(wrapper_src, "r", encoding="utf-8") as handle:
+                base_wrapper = handle.read()
+            for bad_wrapper in (
+                base_wrapper.replace("#!/bin/sh\n", "#!/bin/sh\necho side-effect\n", 1),
+                base_wrapper.replace(
+                    "readonly CLIENT=/opt/credential-proxy/libexec/credential-proxy-exec",
+                    "readonly CLIENT=/opt/../etc/credential-proxy-exec",
+                ),
+                base_wrapper + "\necho trailing\n",
+            ):
+                with open(shim_path, "w", encoding="utf-8") as handle:
+                    handle.write(bad_wrapper)
+                stall_report._SHIM_CACHE.clear()
+                with patch.dict(os.environ, env_with_url, clear=False):
+                    self.assertIsNone(stall_report._shim_client())
+
+    def test_shim_client_size_guard_cache_invalidation_standalone_fallback_and_thread_safety(self):
+        import py_compile
+        import shutil
+        import tempfile
+        import threading
+        import credential_proxy_client
+
+        launcher_src = os.path.join(self.REPO_ROOT, "deploy", "shared", "credential-proxy-exec.py")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_path = os.path.join(tmp, "kubectl")
+
+            # 1. File larger than _MAX_SHIM_BYTES is rejected via stat without open() or os.open()
+            with open(shim_path, "wb") as handle:
+                handle.write(b"x" * (stall_report._MAX_SHIM_BYTES + 10))
+            os.chmod(shim_path, 0o755)
+            stall_report._SHIM_CACHE.clear()
+            with patch("builtins.open", side_effect=AssertionError("open() should not be called on oversized file")), \
+                 patch("os.open", side_effect=AssertionError("os.open() should not be called on oversized file")):
+                self.assertIsNone(stall_report._load_shim_client(shim_path))
+
+            # 2. Cache invalidation when the target file behind a launcher changes on disk
+            libexec = os.path.join(tmp, "libexec")
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(libexec)
+            os.makedirs(bin_dir)
+            client_copy = os.path.join(libexec, "credential_proxy_client.py")
+            shutil.copyfile(credential_proxy_client.__file__, client_copy)
+            py_compile.compile(client_copy, doraise=True)
+            launcher_dst = os.path.join(libexec, "credential-proxy-exec")
+            shutil.copyfile(launcher_src, launcher_dst)
+            os.chmod(launcher_dst, 0o755)
+            os.symlink(launcher_dst, os.path.join(bin_dir, "kubectl"))
+
+            env = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env, clear=False), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                self.assertIs(stall_report._shim_client(), credential_proxy_client)
+                # Mutate the target behind the launcher; watched-file check must invalidate cache
+                with open(client_copy, "wb") as handle:
+                    handle.write(b"#!/usr/bin/env python3\n# replaced\n")
+                self.assertIsNone(stall_report._shim_client())
+
+            # Restore client_copy for standalone fallback and concurrency checks
+            shutil.copyfile(credential_proxy_client.__file__, client_copy)
+            py_compile.compile(client_copy, doraise=True)
+
+            # 3. Standalone fallback loads credential_proxy_client from launcher target when not on sys.path
+            stall_report._SHIM_CACHE.clear()
+            saved_mod = sys.modules.pop("credential_proxy_client", None)
+            try:
+                with patch.object(sys, "path", []):
+                    loaded = stall_report._load_shim_client(os.path.join(bin_dir, "kubectl"))
+                    self.assertIsNotNone(loaded)
+                    self.assertTrue(hasattr(loaded, "execute_captured"))
+                    self.assertTrue(hasattr(loaded, "exec_endpoints"))
+            finally:
+                if saved_mod is not None:
+                    sys.modules["credential_proxy_client"] = saved_mod
+
+            # 4. Concurrent cold-cache calls to _shim_client() across 8 threads
+            stall_report._SHIM_CACHE.clear()
+            barrier = threading.Barrier(8, timeout=5.0)
+            results = [None] * 8
+
+            def worker(idx):
+                barrier.wait()
+                results[idx] = stall_report._shim_client()
+
+            with patch.dict(os.environ, env, clear=False), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=5.0)
+            for res in results:
+                self.assertIs(res, credential_proxy_client)
+
+    def test_parallel_reads_and_parallel_cluster_reads_respect_monkeypatching(self):
+        self.assertTrue(stall_report._parallel_reads())
+        self.assertTrue(stall_report._parallel_cluster_reads())
+        with patch.object(stall_report, "KUBECTL", "/custom/kubectl"):
+            self.assertFalse(stall_report._parallel_reads())
+            self.assertFalse(stall_report._parallel_cluster_reads())
+            self.assertIsNone(stall_report._shim_client())
+        for name in ("run_kubectl", "kubectl_json", "kubectl_names"):
+            with patch.object(stall_report, name, side_effect=getattr(stall_report, name)):
+                self.assertFalse(stall_report._parallel_reads(), name)
+                self.assertFalse(stall_report._parallel_cluster_reads(), name)
+        with patch.object(stall_report.subprocess, "run", side_effect=stall_report.subprocess.run):
+            self.assertFalse(stall_report._parallel_reads())
+            self.assertFalse(stall_report._parallel_cluster_reads())
+        for name in (
+            "warn_lines",
+            "raw_pages",
+            "chunked_listing",
+            "read_kind_cluster_wide",
+            "read_warning_events_cluster_wide",
+        ):
+            with patch.object(stall_report, name, side_effect=getattr(stall_report, name)):
+                self.assertTrue(stall_report._parallel_reads(), name)
+                self.assertFalse(stall_report._parallel_cluster_reads(), name)
+
+    def test_parallel_collect_runs_concurrently_and_preserves_deterministic_order(self):
+        import threading
+        import time
+
+        # 4 resources + 1 events call = 5 concurrent calls (<= MAX_COLLECT_WORKERS=6)
+        barrier = threading.Barrier(5, timeout=5.0)
+
+        def concurrent_kubectl(args):
+            barrier.wait()
+            kind = args[1]
+            # Deliberately stagger completion in reverse order so earlier resources finish last
+            if kind == "deployments":
+                time.sleep(0.03)
+                return 0, '{"items":[{"kind":"Deployment","metadata":{"name":"d1"}}]}', "dep-warn\n"
+            if kind == "pods":
+                time.sleep(0.02)
+                return 1, "", "pods-boom"
+            if kind == "statefulsets":
+                time.sleep(0.01)
+                return 0, '{"items":[{"kind":"StatefulSet","metadata":{"name":"s1"}}]}', "sts-warn\n"
+            if kind == "gateways":
+                return 0, '{"items":[{"kind":"Gateway","metadata":{"name":"g1"}}]}', "gw-warn\n"
+            if kind == "events":
+                return 0, '{"items":[{"kind":"Event","metadata":{"name":"e1"}}]}', "ev-warn\n"
+            raise AssertionError(f"unexpected args: {args}")
+
+        err_buf = io.StringIO()
+        with patch.object(stall_report, "run_kubectl", side_effect=concurrent_kubectl), \
+             patch.object(stall_report, "_parallel_reads", return_value=True), \
+             redirect_stderr(err_buf):
+            objects, events = stall_report.collect(
+                NAMESPACE,
+                "deployments,pods,statefulsets,gateways",
+                workers=stall_report.MAX_COLLECT_WORKERS,
+            )
+
+        self.assertEqual(
+            [(o["kind"], o["metadata"]["name"]) for o in objects],
+            [("Deployment", "d1"), ("StatefulSet", "s1"), ("Gateway", "g1")],
+        )
+        self.assertEqual([e["metadata"]["name"] for e in events], ["e1"])
+
+        stderr_lines = [line.strip() for line in err_buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(
+            stderr_lines,
+            [
+                "warning: dep-warn",
+                "warning: pods-boom",
+                f"warning: pods in {NAMESPACE} not scanned; its objects are missing from the count: kubectl get pods -n {NAMESPACE} --show-managed-fields failed (1): pods-boom",
+                "warning: sts-warn",
+                "warning: gw-warn",
+                "warning: ev-warn",
+            ],
+        )
+
+    def test_parallel_collect_total_failure_raises_without_emitting_events_warning(self):
+        def failing_kubectl(args):
+            kind = args[1]
+            if kind == "events":
+                return 1, "", "events-should-not-be-warned"
+            return 1, "", f"{kind}-failed"
+
+        err_buf = io.StringIO()
+        with patch.object(stall_report, "run_kubectl", side_effect=failing_kubectl), \
+             patch.object(stall_report, "_parallel_reads", return_value=True), \
+             redirect_stderr(err_buf):
+            with self.assertRaises(RuntimeError) as ctx:
+                stall_report.collect(NAMESPACE, "deployments,pods")
+
+        self.assertIn(f"no kind could be read in {NAMESPACE}: deployments, pods", str(ctx.exception))
+        self.assertNotIn("events-should-not-be-warned", err_buf.getvalue())
+        self.assertNotIn("events in", err_buf.getvalue())
+
+    def test_parallel_prefetch_references_preserves_order_refused_sentinel_and_skips_cluster_resolver(self):
+        import threading
+        import time
+
+        gw = obj(
+            "Gateway",
+            "edge",
+            spec={
+                "listeners": [
+                    {"name": "https", "tls": {"certificateRefs": [{"kind": "Secret", "name": "edge-tls"}]}},
+                ]
+            },
+            status={},
+            managed_fields=[managed(45)],
+        )
+        dep = healthy_deployment("web")
+        dep["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [
+            {"configMapRef": {"name": "web-cm"}},
+        ]
+        dep["spec"]["template"]["spec"]["volumes"] = [
+            {"name": "pvc", "persistentVolumeClaim": {"claimName": "web-pvc"}},
+        ]
+        dep["metadata"]["managedFields"] = [managed(45)]
+
+        barrier = threading.Barrier(3, timeout=5.0)
+
+        def concurrent_names_kubectl(args):
+            barrier.wait()
+            resource = args[1]
+            if resource == "secrets":
+                time.sleep(0.03)
+                return 1, "", "Error from server (Forbidden): secrets is forbidden"
+            if resource == "configmaps":
+                time.sleep(0.01)
+                return 0, "configmap/web-cm\n", ""
+            if resource == "persistentvolumeclaims":
+                return 1, "", "transient-503"
+            raise AssertionError(f"unexpected args: {args}")
+
+        resolver = stall_report.NameResolver()
+        err_buf = io.StringIO()
+        with patch.object(stall_report, "run_kubectl", side_effect=concurrent_names_kubectl) as mocked_run, \
+             patch.object(stall_report, "_parallel_reads", return_value=True), \
+             redirect_stderr(err_buf):
+            stall_report.prefetch_references(
+                resolver, [gw, dep], NOW, workers=stall_report.MAX_COLLECT_WORKERS
+            )
+            self.assertEqual(mocked_run.call_count, 3)
+            findings = stall_report.analyze([gw, dep], [], resolver, NOW)
+            self.assertEqual(mocked_run.call_count, 3)
+
+        self.assertEqual(findings, [])
+        self.assertIsInstance(resolver._cache[("secrets", NAMESPACE)], stall_report.ListingRefused)
+        self.assertEqual(resolver._cache[("configmaps", NAMESPACE)], {"web-cm"})
+        self.assertIsNone(resolver._cache[("persistentvolumeclaims", NAMESPACE)])
+
+        stderr_lines = [line.strip() for line in err_buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(
+            stderr_lines,
+            [
+                f"warning: cannot list secrets in {NAMESPACE}; references to secrets are not checked: Error from server (Forbidden): secrets is forbidden",
+                f"warning: cannot list persistentvolumeclaims in {NAMESPACE}; references to persistentvolumeclaims are not checked: transient-503",
+            ],
+        )
+
+        # ClusterNameResolver is skipped by prefetch_references (type(resolver) is not NameResolver)
+        cluster_resolver = stall_report.ClusterNameResolver()
+        with patch.object(stall_report, "run_kubectl") as untouched, \
+             patch.object(stall_report, "_parallel_reads", return_value=True):
+            stall_report.prefetch_references(cluster_resolver, [gw, dep], NOW)
+            untouched.assert_not_called()
+
+        # 0-key and 1-key paths
+        single_resolver = stall_report.NameResolver()
+        with patch.object(stall_report, "run_kubectl") as untouched, \
+             patch.object(stall_report, "_parallel_reads", return_value=True):
+            stall_report.prefetch_references(single_resolver, [healthy_deployment("clean")], NOW)
+            untouched.assert_not_called()
+
+        with patch.object(
+            stall_report, "run_kubectl", return_value=(0, "secret/edge-tls\n", "")
+        ) as one_call, patch.object(stall_report, "_parallel_reads", return_value=True):
+            stall_report.prefetch_references(single_resolver, [gw], NOW)
+            one_call.assert_called_once_with(["get", "secrets", "-n", NAMESPACE, "-o", "name"])
+        self.assertEqual(single_resolver._cache[("secrets", NAMESPACE)], {"edge-tls"})
+
+    def test_parallel_collect_cluster_runs_concurrently_and_preserves_deterministic_warnings_and_fallback(self):
+        import threading
+        import time
+
+        # 3 network-reading kinds (deployments raw, pods raw-fail, gateways chunked-fail) + events raw = 4 concurrent calls;
+        # deployments/single is a kind/name that returns None without calling kubectl.
+        barrier = threading.Barrier(4, timeout=5.0)
+
+        def concurrent_cluster_kubectl(args):
+            barrier.wait()
+            if "--raw" in args:
+                raw_url = args[args.index("--raw") + 1]
+                if raw_url.startswith("/apis/apps/v1/deployments"):
+                    time.sleep(0.03)
+                    return 0, json.dumps({"items": [{"metadata": {"name": "web", "namespace": NAMESPACE}}], "metadata": {}}), ""
+                if raw_url.startswith("/api/v1/pods"):
+                    time.sleep(0.02)
+                    return 1, "", "pods-raw-err\n"
+                if raw_url.startswith("/api/v1/events"):
+                    return 0, json.dumps({"items": [{"metadata": {"name": "ev1", "namespace": NAMESPACE}}], "metadata": {}}), ""
+            if args[1] == GATEWAYS:
+                time.sleep(0.01)
+                return 1, "", "gateways-chunk-err\n"
+            raise AssertionError(f"unexpected args: {args}")
+
+        err_buf = io.StringIO()
+        with patch.object(stall_report, "run_kubectl", side_effect=concurrent_cluster_kubectl), \
+             patch.object(stall_report, "_parallel_cluster_reads", return_value=True), \
+             redirect_stderr(err_buf):
+            objects, events, fallback = stall_report.collect_cluster(
+                ["deployments", "pods", GATEWAYS, "deployments/single"],
+                workers=stall_report.MAX_COLLECT_WORKERS,
+            )
+
+        self.assertEqual(list(objects.keys()), ["deployments"])
+        self.assertEqual([o["metadata"]["name"] for o in objects["deployments"][NAMESPACE]], ["web"])
+        self.assertEqual([e["metadata"]["name"] for e in events[NAMESPACE]], ["ev1"])
+        self.assertEqual(fallback, ["pods", GATEWAYS, "deployments/single"])
+
+        stderr_lines = [line.strip() for line in err_buf.getvalue().splitlines() if line.strip()]
+        self.assertEqual(
+            stderr_lines,
+            [
+                "warning: pods-raw-err",
+                "warning: /api/v1/pods page failed (1); read per namespace instead",
+                "warning: gateways-chunk-err",
+                f"warning: {GATEWAYS} across every namespace failed (1); read per namespace instead",
+            ],
+        )
+
+    def test_late_binding_and_monkeypatch_guards_for_resolvers(self):
+        # 1. NameResolver() with no args picks up post-import patch on kubectl_names
+        with patch.object(stall_report, "kubectl_names", return_value={"patched-secret"}) as patched_names:
+            resolver = stall_report.NameResolver()
+            self.assertTrue(resolver.exists("Secret", NAMESPACE, "patched-secret"))
+            patched_names.assert_called_once_with("secrets", NAMESPACE)
+
+        # 2. ScaleResolver() with no args picks up post-import patch on kubectl_json
+        with patch.object(stall_report, "kubectl_json", return_value={"items": []}) as patched_json:
+            scale = stall_report.ScaleResolver()
+            self.assertEqual(scale._items("get", "deployments"), [])
+            patched_json.assert_called_once_with(["get", "deployments"])
+
+        # 3. ClusterNameResolver() with no args picks up post-import patch on kubectl_names_cluster_wide
+        with patch.object(
+            stall_report, "kubectl_names_cluster_wide", return_value={(NAMESPACE, "cm1")}
+        ) as patched_cluster:
+            cluster_resolver = stall_report.ClusterNameResolver()
+            self.assertTrue(cluster_resolver.exists("ConfigMap", NAMESPACE, "cm1"))
+            patched_cluster.assert_called_once_with("configmaps")
+
+        # 4. Patching NameResolver.exists disables prefetch_references
+        gw = obj(
+            "Gateway",
+            "edge",
+            spec={
+                "listeners": [
+                    {"name": "https", "tls": {"certificateRefs": [{"kind": "Secret", "name": "edge-tls"}]}},
+                ]
+            },
+            status={},
+            managed_fields=[managed(45)],
+        )
+        resolver = stall_report.NameResolver()
+        with patch.object(stall_report.NameResolver, "exists", return_value=True), \
+             patch.object(stall_report, "run_kubectl") as mocked_run:
+            stall_report.prefetch_references(resolver, [gw], NOW)
+            mocked_run.assert_not_called()
+
+    def test_parse_kubectl_json_rejects_non_dict_json(self):
+        for payload in ("[1, 2, 3]", "null", '"string"', "42"):
+            with self.subTest(payload=payload):
+                with self.assertRaises(RuntimeError) as ctx:
+                    stall_report._parse_kubectl_json(["get", "pods"], 0, payload, "")
+                self.assertIn("returned non-object JSON", str(ctx.exception))
+
+    def test_parse_time_str_lru_cache_hits_and_edge_cases(self):
+        stall_report._parse_time_str.cache_clear()
+        ts = "2026-09-09T12:00:00Z"
+        first = stall_report.parse_time(ts)
+        second = stall_report.parse_time(ts)
+        self.assertEqual(first, NOW)
+        self.assertIs(first, second)
+        info = stall_report._parse_time_str.cache_info()
+        self.assertEqual(info.hits, 1)
+        self.assertEqual(info.misses, 1)
+
+        self.assertIsNone(stall_report.parse_time(""))
+        self.assertIsNone(stall_report.parse_time(None))
+        self.assertIsNone(stall_report.parse_time(12345))
+        self.assertIsNone(stall_report._parse_time_str(""))
+
+        self.assertIsNone(stall_report.parse_time("not-a-timestamp"))
+        self.assertIsNone(stall_report.parse_time("not-a-timestamp"))
+        self.assertEqual(stall_report._parse_time_str.cache_info().hits, 2)
+
+        naive = stall_report.parse_time("2026-09-09T12:00:00")
+        self.assertEqual(naive, NOW)
+
+    def test_session_kubectl_parser_rejects_elif_else_compound_fi_and_whitespace_kube_proxy_url(self):
+        import shutil
+        import tempfile
+        import credential_proxy_client
+
+        launcher_src = os.path.join(self.REPO_ROOT, "deploy", "shared", "credential-proxy-exec.py")
+        wrapper_src = os.path.join(self.REPO_ROOT, "deploy", "sandbox", "session-kubectl.sh")
+        with open(wrapper_src, "r", encoding="utf-8") as handle:
+            base_wrapper = handle.read()
+
+        self.assertEqual(
+            stall_report._session_kubectl_client_path(base_wrapper.encode("utf-8")),
+            "/opt/credential-proxy/libexec/credential-proxy-exec",
+        )
+        closing_marker = '\nfi\nif [ -n "${CREDENTIAL_PROXY_URL:-}" ]'
+        self.assertIn(closing_marker, base_wrapper)
+        adversarial_variants = {
+            "elif_at_depth_1": base_wrapper.replace(
+                closing_marker,
+                '\nelif [ -n "${CUSTOM_MODE:-}" ]; then\n  exit 41' + closing_marker,
+                1,
+            ),
+            "else_block_at_depth_1": base_wrapper.replace(
+                closing_marker,
+                "\nelse\n  exit 42" + closing_marker,
+                1,
+            ),
+            "else_inline_at_depth_1": base_wrapper.replace(
+                closing_marker,
+                "\nelse exit 42" + closing_marker,
+                1,
+            ),
+            "fi_semicolon_cmd": base_wrapper.replace(
+                closing_marker,
+                '\nfi; exit 99\nif [ -n "${CREDENTIAL_PROXY_URL:-}" ]',
+                1,
+            ),
+            "fi_and_cmd": base_wrapper.replace(
+                closing_marker,
+                '\nfi && exit 99\nif [ -n "${CREDENTIAL_PROXY_URL:-}" ]',
+                1,
+            ),
+            "cmd_then_fi": base_wrapper.replace(
+                closing_marker,
+                '\ntrue; fi\nif [ -n "${CREDENTIAL_PROXY_URL:-}" ]',
+                1,
+            ),
+            "compound_if": base_wrapper.replace(
+                closing_marker,
+                '\ntrue; if false; then\n  true\nfi' + closing_marker,
+                1,
+            ),
+            "elif_subshell_paren": base_wrapper.replace(
+                closing_marker,
+                '\nelif(true); then\n  exit 41' + closing_marker,
+                1,
+            ),
+            "else_subshell_paren": base_wrapper.replace(
+                closing_marker,
+                "\nelse(exit 42)" + closing_marker,
+                1,
+            ),
+            "fi_subshell_paren": base_wrapper.replace(
+                closing_marker,
+                '\nfi(exit 99)\nif [ -n "${CREDENTIAL_PROXY_URL:-}" ]',
+                1,
+            ),
+            "if_subshell_paren": base_wrapper.replace(
+                closing_marker,
+                '\nif(false); then\n  true\nfi' + closing_marker,
+                1,
+            ),
+        }
+        for label, bad_text in adversarial_variants.items():
+            with self.subTest(variant=label):
+                self.assertIsNone(stall_report._session_kubectl_client_path(bad_text.encode("utf-8")))
+
+        # Whitespace-only KUBE_PROXY_URL is non-empty in POSIX sh ([ -n "${KUBE_PROXY_URL:-}" ])
+        # and must not bypass session-kubectl.sh.
+        with tempfile.TemporaryDirectory() as tmp:
+            libexec = os.path.join(tmp, "libexec")
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(libexec)
+            os.makedirs(bin_dir)
+            shutil.copyfile(credential_proxy_client.__file__, os.path.join(libexec, "credential_proxy_client.py"))
+            launcher_dst = os.path.join(libexec, "credential-proxy-exec")
+            shutil.copyfile(launcher_src, launcher_dst)
+            os.chmod(launcher_dst, 0o755)
+            wrapper_dst = os.path.join(bin_dir, "kubectl")
+            with open(wrapper_dst, "w", encoding="utf-8") as handle:
+                handle.write(
+                    base_wrapper.replace(
+                        "readonly CLIENT=/opt/credential-proxy/libexec/credential-proxy-exec",
+                        f"readonly CLIENT={launcher_dst}",
+                    )
+                )
+            os.chmod(wrapper_dst, 0o755)
+
+            env_ws = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": " ",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env_ws, clear=False), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                self.assertIsNone(stall_report._shim_client())
+
+    def test_session_kubectl_parser_rejects_multiline_quotes_heredocs_and_continuations(self):
+        tail = (
+            'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then\n'
+            'exec "$CLIENT" kubectl "$@"\n'
+            "fi\n"
+            'exec "$REAL_KUBECTL" "$@"\n'
+        )
+        header = (
+            "#!/bin/sh\n"
+            "readonly CLIENT=/opt/credential-proxy/libexec/credential-proxy-exec\n"
+        )
+        # Positive check: real shipped wrapper (with valid blank-bounded backslash
+        # continuations, single-line ${...}, $((...)), and comments containing quotes/backticks)
+        # still parses cleanly.
+        wrapper_src = os.path.join(self.REPO_ROOT, "deploy", "sandbox", "session-kubectl.sh")
+        with open(wrapper_src, "rb") as handle:
+            self.assertEqual(
+                stall_report._session_kubectl_client_path(handle.read()),
+                "/opt/credential-proxy/libexec/credential-proxy-exec",
+            )
+
+        spoofs = {
+            "multiline_double_quote": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + '  echo "a\n'
+                + 'if b" >&2\n'
+                + "fi\n"
+                + "some_top_level_command\n"
+                + 'echo "x\n'
+                + "fi\n"
+                + '#" >/dev/null\n'
+                + tail
+            ),
+            "multiline_double_quote_escaped_trailing_quote": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + '  echo "a\\"\n'
+                + 'if b"\n'
+                + "fi\n"
+                + "some_top_level_command\n"
+                + 'echo "x\\"\n'
+                + "fi\n"
+                + '#"\n'
+                + tail
+            ),
+            "multiline_single_quote": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  echo 'a\n"
+                + "if b' >&2\n"
+                + "fi\n"
+                + "some_top_level_command\n"
+                + "echo 'x\n"
+                + "fi\n"
+                + "#' >/dev/null\n"
+                + tail
+            ),
+            "heredoc_in_kube_proxy_block": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  cat <<EOF\n"
+                + "if [ -n x ]; then\n"
+                + "EOF\n"
+                + "fi\n"
+                + "some_top_level_command\n"
+                + "cat <<EOF\n"
+                + "fi\n"
+                + "EOF\n"
+                + tail
+            ),
+            "heredoc_in_helper_function": (
+                header
+                + "helper() {\n"
+                + "  cat <<EOF\n"
+                + "}\n"
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "EOF\n"
+                + "}\n"
+                + "some_top_level_command\n"
+                + "fi\n"
+                + tail
+            ),
+            "multiline_single_quote_in_helper_function": (
+                header
+                + "helper() {\n"
+                + "  x='\n"
+                + "}\n"
+                + "'\n"
+                + "}\n"
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  true\n"
+                + "fi\n"
+                + tail
+            ),
+            "backslash_split_fi": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  true\n"
+                + "f\\\n"
+                + "i\n"
+                + "some_top_level_command\n"
+                + "fi\n"
+                + tail
+            ),
+            "backslash_continuation_hiding_if_and_fi": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  echo \\\n"
+                + "if [ -n x ]; then\n"
+                + "fi\n"
+                + "some_top_level_command\n"
+                + "echo \\\n"
+                + "fi\n"
+                + tail
+            ),
+            "backslash_continuation_inside_double_quote": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + '  echo "a \\\n'
+                + 'if b"\n'
+                + "fi\n"
+                + tail
+            ),
+            "backslash_continuation_hiding_func_close": (
+                header
+                + "helper() {\n"
+                + "  echo \\\n"
+                + "}\n"
+                + "}\n"
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  true\n"
+                + "fi\n"
+                + tail
+            ),
+            "backslash_split_heredoc": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  cat <\\\n"
+                + "<EOF\n"
+                + "EOF\n"
+                + "fi\n"
+                + tail
+            ),
+            "multiline_param_expansion": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  echo ${x:-\n"
+                + "if y}\n"
+                + "fi\n"
+                + tail
+            ),
+            "command_substitution_in_kube_proxy_block": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  echo $(true)\n"
+                + "fi\n"
+                + tail
+            ),
+            "backtick_in_kube_proxy_block": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  echo `true`\n"
+                + "fi\n"
+                + tail
+            ),
+            "case_pattern_with_if_keyword": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + '  case "$x" in\n'
+                + "  if )\n"
+                + "    true\n"
+                + "    ;;\n"
+                + "  esac\n"
+                + "fi\n"
+                + "some_top_level_command\n"
+                + "fi\n"
+                + tail
+            ),
+            "trailing_pipe_continuation": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + '  case "$x" in\n'
+                + "  a |\n"
+                + "  esac\n"
+                + "  )\n"
+                + "    ;;\n"
+                + "  esac\n"
+                + "fi\n"
+                + tail
+            ),
+            "carriage_return_line_desync": (
+                header
+                + 'if [ -n "${KUBE_PROXY_URL:-}" ]; then\n'
+                + "  # comment\rfi\n"
+                + "fi\n"
+                + tail
+            ),
+        }
+        for label, bad_text in spoofs.items():
+            with self.subTest(spoof=label):
+                self.assertIsNone(stall_report._session_kubectl_client_path(bad_text.encode("utf-8")))
+
+    def test_shim_client_rejects_fifo_world_writable_inplace_overwrite_and_comment_spoofing(self):
+        import shutil
+        import tempfile
+        import threading
+        import credential_proxy_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. FIFO (direct and simulated TOCTOU past pre-open stat) returns None without blocking
+            fifo_path = os.path.join(tmp, "kubectl")
+            os.mkfifo(fifo_path)
+            result_box: list[object] = ["pending"]
+
+            def probe_fifo():
+                direct = stall_report._read_bounded(fifo_path)
+                # Simulate TOCTOU: pass a regular-file stat_result while opening the FIFO
+                reg_file = os.path.join(tmp, "regular.py")
+                with open(reg_file, "wb") as handle:
+                    handle.write(b"ok\n")
+                fake_reg_info = os.stat(reg_file)
+                toctou = stall_report._read_bounded(fifo_path, fake_reg_info)
+                result_box[0] = (direct, toctou)
+
+            t = threading.Thread(target=probe_fifo, daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+            self.assertFalse(t.is_alive(), "_read_bounded blocked on FIFO")
+            self.assertEqual(result_box[0], (None, None))
+            os.unlink(fifo_path)
+
+            # 2. World-writable shim file is rejected
+            shim_path = os.path.join(tmp, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, shim_path)
+            os.chmod(shim_path, 0o777)
+            env = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env, clear=False), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                self.assertIsNone(stall_report._shim_client())
+            os.chmod(shim_path, 0o755)
+
+            # 3. In-place overwrite (same inode) of an already-loaded standalone module is rejected
+            #    both for non-shim content and for altered content that keeps _SHIM_HEADER.
+            saved_mod = sys.modules.pop("credential_proxy_client", None)
+            try:
+                stall_report._SHIM_CACHE.clear()
+                with patch.dict(os.environ, env, clear=False), \
+                     patch.object(sys, "path", []), \
+                     patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                    loaded = stall_report._shim_client()
+                    self.assertIsNotNone(loaded)
+                    orig_ino = os.stat(shim_path).st_ino
+
+                    # Overwrite in place with non-shim text (same inode)
+                    with open(shim_path, "wb") as handle:
+                        handle.write(b"#!/bin/sh\necho hi\n")
+                    self.assertEqual(os.stat(shim_path).st_ino, orig_ino)
+                    self.assertIsNone(stall_report._shim_client())
+
+                    # Overwrite in place with different Python that keeps _SHIM_HEADER (same inode)
+                    with open(shim_path, "wb") as handle:
+                        handle.write(
+                            stall_report._SHIM_HEADER
+                            + b"\ndef execute_captured(*a, **k): return (0, '', '')\n"
+                            + b"def exec_endpoints(*a, **k): return (None, None)\n"
+                        )
+                    self.assertEqual(os.stat(shim_path).st_ino, orig_ino)
+                    self.assertIsNone(stall_report._shim_client())
+            finally:
+                sys.modules.pop("credential_proxy_client", None)
+                if saved_mod is not None:
+                    sys.modules["credential_proxy_client"] = saved_mod
+
+            # 4. Comment-only markers must fail AST check without executing top-level code
+            sentinel = os.path.join(tmp, "pwned.txt")
+            spoof_path = os.path.join(tmp, "spoof_kubectl")
+            with open(spoof_path, "wb") as handle:
+                handle.write(
+                    stall_report._SHIM_HEADER
+                    + b"# def execute_captured( def exec_endpoints(\n"
+                    + f"open({sentinel!r}, 'w').write('executed')\n".encode("utf-8")
+                )
+            os.chmod(spoof_path, 0o755)
+            saved_mod = sys.modules.pop("credential_proxy_client", None)
+            try:
+                stall_report._SHIM_CACHE.clear()
+                with patch.object(sys, "path", []):
+                    self.assertIsNone(stall_report._load_shim_client(spoof_path))
+                self.assertFalse(os.path.exists(sentinel), "AST guard allowed top-level execution")
+            finally:
+                sys.modules.pop("credential_proxy_client", None)
+                if saved_mod is not None:
+                    sys.modules["credential_proxy_client"] = saved_mod
+
+            # 5. Forged UNCHECKED_HASH .pyc alongside a symlinked shim is never executed
+            import importlib.util
+            import py_compile
+
+            pyc_dir = os.path.join(tmp, "pyc_attack")
+            os.makedirs(pyc_dir)
+            real_client = os.path.join(tmp, "real_client.py")
+            shutil.copyfile(credential_proxy_client.__file__, real_client)
+            os.chmod(real_client, 0o644)
+            symlink_kubectl = os.path.join(pyc_dir, "kubectl")
+            os.symlink(real_client, symlink_kubectl)
+
+            pyc_sentinel = os.path.join(tmp, "pyc_pwned.txt")
+            poison_src = os.path.join(tmp, "poison.py")
+            with open(poison_src, "w", encoding="utf-8") as handle:
+                handle.write(
+                    f"open({pyc_sentinel!r}, 'w').write('pyc')\n"
+                    "def execute_captured(*a, **k): return (0, '', '')\n"
+                    "def exec_endpoints(*a, **k): return (None, None)\n"
+                )
+            forged_pyc = importlib.util.cache_from_source(symlink_kubectl)
+            os.makedirs(os.path.dirname(forged_pyc), exist_ok=True)
+            py_compile.compile(
+                poison_src,
+                cfile=forged_pyc,
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            saved_mod = sys.modules.pop("credential_proxy_client", None)
+            try:
+                stall_report._SHIM_CACHE.clear()
+                with patch.object(sys, "path", []):
+                    loaded = stall_report._load_shim_client(symlink_kubectl)
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded.__file__, os.path.realpath(real_client))
+                self.assertFalse(os.path.exists(pyc_sentinel), "forged .pyc was executed")
+            finally:
+                sys.modules.pop("credential_proxy_client", None)
+                if saved_mod is not None:
+                    sys.modules["credential_proxy_client"] = saved_mod
+
+    def test_shim_client_single_load_cold_start_and_cache_invalidation_edge_cases(self):
+        import shutil
+        import tempfile
+        import types
+        import credential_proxy_client
+
+        launcher_src = os.path.join(self.REPO_ROOT, "deploy", "shared", "credential-proxy-exec.py")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Cold start loads the standalone module ONCE across 3 calls (no Call 2 double-load)
+            bin_cold = os.path.join(tmp, "bin_cold")
+            os.makedirs(bin_cold)
+            direct_kubectl = os.path.join(bin_cold, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, direct_kubectl)
+            os.chmod(direct_kubectl, 0o755)
+
+            env_cold = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{bin_cold}:{os.environ.get('PATH', '')}",
+            }
+            saved_mod = sys.modules.pop("credential_proxy_client", None)
+            try:
+                stall_report._SHIM_CACHE.clear()
+                with patch.dict(os.environ, env_cold, clear=False), \
+                     patch.object(sys, "path", []), \
+                     patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                     patch.object(
+                         stall_report,
+                         "_load_shim_client_with_watch",
+                         wraps=stall_report._load_shim_client_with_watch,
+                     ) as spy_load:
+                    m1 = stall_report._shim_client()
+                    m2 = stall_report._shim_client()
+                    m3 = stall_report._shim_client()
+                self.assertIsNotNone(m1)
+                self.assertIs(m1, m2)
+                self.assertIs(m2, m3)
+                self.assertEqual(spy_load.call_count, 1)
+
+                # 2. Replacing sys.modules["credential_proxy_client"] with an in-memory module
+                #    (__file__=None) must invalidate the cache rather than colliding with Call 1.
+                sys.modules["credential_proxy_client"] = types.ModuleType("credential_proxy_client")
+                with patch.dict(os.environ, env_cold, clear=False), \
+                     patch.object(sys, "path", []), \
+                     patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                    self.assertIsNone(stall_report._shim_client())
+            finally:
+                sys.modules.pop("credential_proxy_client", None)
+                if saved_mod is not None:
+                    sys.modules["credential_proxy_client"] = saved_mod
+
+            # 3. Repointing kubectl symlink to a hard-linked launcher in a different directory
+            #    (same st_dev/st_ino/st_size/st_mtime_ns) must invalidate cache via realpath.
+            dir_a = os.path.join(tmp, "dir_a")
+            dir_b = os.path.join(tmp, "dir_b")
+            bin_link = os.path.join(tmp, "bin_link")
+            os.makedirs(dir_a)
+            os.makedirs(dir_b)
+            os.makedirs(bin_link)
+            shutil.copyfile(credential_proxy_client.__file__, os.path.join(dir_a, "credential_proxy_client.py"))
+            with open(os.path.join(dir_b, "credential_proxy_client.py"), "wb") as handle:
+                handle.write(b"#!/usr/bin/env python3\n# different client\n")
+            launcher_a = os.path.join(dir_a, "credential-proxy-exec")
+            launcher_b = os.path.join(dir_b, "credential-proxy-exec")
+            shutil.copyfile(launcher_src, launcher_a)
+            os.chmod(launcher_a, 0o755)
+            os.link(launcher_a, launcher_b)
+            self.assertEqual(os.stat(launcher_a).st_ino, os.stat(launcher_b).st_ino)
+
+            kubectl_link = os.path.join(bin_link, "kubectl")
+            os.symlink(launcher_a, kubectl_link)
+            env_link = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{bin_link}:{os.environ.get('PATH', '')}",
+            }
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env_link, clear=False), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run):
+                self.assertIs(stall_report._shim_client(), credential_proxy_client)
+                # 4. chmod 0o777 on a watched target behind the launcher (preserving mtime/size)
+                #    must invalidate _SHIM_CACHE via st_mode in _stat_sig.
+                target_a = os.path.join(dir_a, "credential_proxy_client.py")
+                orig_stat = os.stat(target_a)
+                os.chmod(target_a, 0o777)
+                os.utime(target_a, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+                self.assertIsNone(stall_report._shim_client())
+                os.chmod(target_a, 0o644)
+                os.utime(target_a, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+                self.assertIs(stall_report._shim_client(), credential_proxy_client)
+
+                os.unlink(kubectl_link)
+                os.symlink(launcher_b, kubectl_link)
+                self.assertIsNone(stall_report._shim_client())
+
+    def test_parallel_collect_and_collect_cluster_emit_malformed_exec_url_notice_deterministically(self):
+        import shutil
+        import tempfile
+        import threading
+        import time
+        import credential_proxy_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_path = os.path.join(tmp, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, shim_path)
+            os.chmod(shim_path, 0o755)
+            env = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "https://bad-scheme.invalid:8766",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            saved_flag = credential_proxy_client._exec_url_notice_written
+            try:
+                # 1. Across 5 concurrent collect() runs with staggered completion, the notice
+                #    always lands deterministically at stderr line 0.
+                for run_idx in range(5):
+                    credential_proxy_client._exec_url_notice_written = False
+                    stall_report._SHIM_CACHE.clear()
+                    barrier = threading.Barrier(6, timeout=5.0)
+
+                    def fake_exec(endpoint, argv, *, fallback=None):
+                        kind = argv[2]
+                        if kind in ("k1", "k2", "k3", "k4", "k5", "k6"):
+                            barrier.wait()
+                            if kind == "k1":
+                                time.sleep(0.02)
+                            return 0, '{"items":[]}', f"{kind}-warn\n"
+                        return 0, '{"items":[]}', ""
+
+                    err_buf = io.StringIO()
+                    with patch.dict(os.environ, env, clear=False), \
+                         patch.object(credential_proxy_client, "execute_captured", side_effect=fake_exec), \
+                         patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                         redirect_stderr(err_buf):
+                        stall_report.collect(
+                            NAMESPACE,
+                            "k1,k2,k3,k4,k5,k6",
+                            workers=stall_report.MAX_COLLECT_WORKERS,
+                        )
+                    lines = [l.strip() for l in err_buf.getvalue().splitlines() if l.strip()]
+                    self.assertTrue(
+                        lines and "CREDENTIAL_PROXY_EXEC_URL" in lines[0],
+                        f"run {run_idx}: expected notice at line 0, got {lines!r}",
+                    )
+                    self.assertEqual(lines[1:], [f"warning: k{i}-warn" for i in range(1, 7)])
+
+                # 2. On total failure in collect(), the notice is still emitted at line 0 (never dropped).
+                credential_proxy_client._exec_url_notice_written = False
+                stall_report._SHIM_CACHE.clear()
+                err_buf = io.StringIO()
+                with patch.dict(os.environ, env, clear=False), \
+                     patch.object(
+                         credential_proxy_client,
+                         "execute_captured",
+                         return_value=(1, "", "boom"),
+                     ), \
+                     patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                     redirect_stderr(err_buf):
+                    with self.assertRaises(RuntimeError):
+                        stall_report.collect(NAMESPACE, "deployments,pods")
+                lines = [l.strip() for l in err_buf.getvalue().splitlines() if l.strip()]
+                self.assertTrue(lines and "CREDENTIAL_PROXY_EXEC_URL" in lines[0], lines)
+
+                # 3. collect_cluster() emits the notice deterministically at line 0.
+                credential_proxy_client._exec_url_notice_written = False
+                stall_report._SHIM_CACHE.clear()
+                err_buf = io.StringIO()
+                with patch.dict(os.environ, env, clear=False), \
+                     patch.object(
+                         credential_proxy_client,
+                         "execute_captured",
+                         return_value=(0, '{"items":[],"metadata":{}}', ""),
+                     ), \
+                     patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                     redirect_stderr(err_buf):
+                    stall_report.collect_cluster(["deployments", "pods"])
+                lines = [l.strip() for l in err_buf.getvalue().splitlines() if l.strip()]
+                self.assertEqual(len(lines), 1)
+                self.assertIn("CREDENTIAL_PROXY_EXEC_URL", lines[0])
+            finally:
+                credential_proxy_client._exec_url_notice_written = saved_flag
+
+    def test_workers_one_disables_thread_pool_while_keeping_inprocess_shim(self):
+        import shutil
+        import tempfile
+        import threading
+        import credential_proxy_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_path = os.path.join(tmp, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, shim_path)
+            os.chmod(shim_path, 0o755)
+            env = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            lock = threading.Lock()
+            in_flight = 0
+            peak_in_flight = 0
+            seen_argvs: list[list[str]] = []
+
+            def fake_exec(endpoint, argv, *, fallback=None):
+                nonlocal in_flight, peak_in_flight
+                with lock:
+                    in_flight += 1
+                    peak_in_flight = max(peak_in_flight, in_flight)
+                    seen_argvs.append(list(argv))
+                try:
+                    if "-o" in argv and argv[argv.index("-o") + 1] == "name":
+                        return 0, "", ""
+                    return 0, '{"items":[],"metadata":{}}', ""
+                finally:
+                    with lock:
+                        in_flight -= 1
+
+            def forbid_pool(*args, **kwargs):
+                raise AssertionError("ThreadPoolExecutor must not be constructed when workers=1")
+
+            dep_with_refs = obj(
+                "Deployment",
+                "web",
+                spec={
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "envFrom": [
+                                        {"configMapRef": {"name": "missing-cm"}},
+                                        {"secretRef": {"name": "missing-sec"}},
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                managed_fields=[managed(60)],
+            )
+
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env, clear=False), \
+                 patch.object(credential_proxy_client, "execute_captured", side_effect=fake_exec), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                 patch.object(stall_report, "ThreadPoolExecutor", side_effect=forbid_pool):
+                objects, events = stall_report.collect(NAMESPACE, "deployments,pods,services", workers=1)
+                self.assertEqual((objects, events), ([], []))
+
+                c_objects, c_events, c_fallback = stall_report.collect_cluster(
+                    ["deployments", "pods", "services"], workers=1
+                )
+                self.assertEqual(c_fallback, [])
+                self.assertEqual(c_events, {})
+                self.assertEqual(set(c_objects), {"deployments", "pods", "services"})
+
+                findings = stall_report.analyze(
+                    [dep_with_refs], [], stall_report.NameResolver(), NOW, workers=1
+                )
+                self.assertEqual(len(findings), 2)
+
+            self.assertEqual(peak_in_flight, 1)
+            # 4 collect calls + 4 collect_cluster calls + 2 lazy NameResolver calls
+            self.assertEqual(len(seen_argvs), 10)
+
+    def test_workers_flag_clamping_validation_and_pool_sizing(self):
+        import concurrent.futures
+        import shutil
+        import tempfile
+        import credential_proxy_client
+
+        # Default stays within broker session (2) and half of profile (4) caps;
+        # _effective_workers clamps into [MIN_COLLECT_WORKERS, MAX_COLLECT_WORKERS].
+        self.assertEqual(stall_report.DEFAULT_COLLECT_WORKERS, 2)
+        self.assertEqual(stall_report.MAX_COLLECT_WORKERS, 6)
+        self.assertEqual(stall_report._effective_workers(-5), stall_report.MIN_COLLECT_WORKERS)
+        self.assertEqual(stall_report._effective_workers(0), stall_report.MIN_COLLECT_WORKERS)
+        self.assertEqual(stall_report._effective_workers(1), 1)
+        self.assertEqual(stall_report._effective_workers(3), 3)
+        self.assertEqual(stall_report._effective_workers(99), stall_report.MAX_COLLECT_WORKERS)
+
+        # CLI rejects values < 1
+        for bad in ("0", "-1"):
+            with self.subTest(workers=bad), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    stall_report.main(["--namespace", NAMESPACE, "--workers", bad, "--json"])
+                self.assertEqual(ctx.exception.code, 2)
+
+        # CLI defaults to DEFAULT_COLLECT_WORKERS (2) when omitted
+        with patch.object(stall_report, "collect", return_value=([], [])) as mock_collect, \
+             patch.object(stall_report, "analyze", return_value=[]) as mock_analyze, \
+             redirect_stdout(io.StringIO()):
+            rc = stall_report.main(["--namespace", NAMESPACE, "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_collect.call_args.kwargs["workers"], stall_report.DEFAULT_COLLECT_WORKERS)
+        self.assertEqual(mock_analyze.call_args.kwargs["workers"], stall_report.DEFAULT_COLLECT_WORKERS)
+
+        # CLI clamps > MAX_COLLECT_WORKERS and threads workers to collect/analyze/report_cluster
+        with patch.object(stall_report, "collect", return_value=([], [])) as mock_collect, \
+             patch.object(stall_report, "analyze", return_value=[]) as mock_analyze, \
+             redirect_stdout(io.StringIO()):
+            rc = stall_report.main(["--namespace", NAMESPACE, "--workers", "99", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_collect.call_args.kwargs["workers"], stall_report.MAX_COLLECT_WORKERS)
+        self.assertEqual(mock_analyze.call_args.kwargs["workers"], stall_report.MAX_COLLECT_WORKERS)
+
+        cluster_out = {"namespaces": {NAMESPACE: {"namespace": NAMESPACE, "stalled_resources": 0, "findings": []}}, "fallback": [], "events_fallback": False}
+        with patch.object(stall_report, "report_cluster", return_value=cluster_out) as mock_rc, \
+             redirect_stdout(io.StringIO()):
+            rc = stall_report.main(["--namespaces", NAMESPACE, "--workers", "1", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_rc.call_args.kwargs["workers"], 1)
+
+        # ThreadPoolExecutor receives max_workers=2 by default and max_workers=3 when workers=3
+        observed_max_workers: list[int] = []
+        real_pool = concurrent.futures.ThreadPoolExecutor
+
+        def tracking_pool(*, max_workers):
+            observed_max_workers.append(max_workers)
+            return real_pool(max_workers=max_workers)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shim_path = os.path.join(tmp, "kubectl")
+            shutil.copyfile(credential_proxy_client.__file__, shim_path)
+            os.chmod(shim_path, 0o755)
+            env = {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "CREDENTIAL_PROXY_EXEC_URL": "",
+                "KUBE_PROXY_URL": "",
+                "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+            }
+            dep_with_refs = obj(
+                "Deployment",
+                "web",
+                spec={
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "envFrom": [
+                                        {"configMapRef": {"name": "cm-a"}},
+                                        {"secretRef": {"name": "sec-a"}},
+                                    ]
+                                }
+                            ],
+                            "volumes": [
+                                {"name": "data", "persistentVolumeClaim": {"claimName": "pvc-a"}},
+                            ],
+                        }
+                    }
+                },
+                managed_fields=[managed(60)],
+            )
+            stall_report._SHIM_CACHE.clear()
+            with patch.dict(os.environ, env, clear=False), \
+                 patch.object(
+                     credential_proxy_client,
+                     "execute_captured",
+                     return_value=(0, '{"items":[],"metadata":{}}', ""),
+                 ), \
+                 patch.object(stall_report, "_ORIG_SUBPROCESS_RUN", stall_report.subprocess.run), \
+                 patch.object(stall_report, "ThreadPoolExecutor", side_effect=tracking_pool):
+                stall_report.collect(NAMESPACE, "deployments,pods,services,jobs")
+                stall_report.collect_cluster(["deployments", "pods", "services", "jobs"])
+                stall_report.prefetch_references(stall_report.NameResolver(), [dep_with_refs], NOW)
+                stall_report.collect(NAMESPACE, "deployments,pods,services,jobs", workers=3)
+                stall_report.collect_cluster(["deployments", "pods", "services", "jobs"], workers=3)
+                stall_report.prefetch_references(stall_report.NameResolver(), [dep_with_refs], NOW, workers=3)
+        self.assertEqual(observed_max_workers, [2, 2, 2, 3, 3, 3])
+
+
 if __name__ == "__main__":
     unittest.main()

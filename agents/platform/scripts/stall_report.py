@@ -50,19 +50,160 @@ Usage::
     stall_report.py --namespace payments
     stall_report.py --namespace payments --kind gateways,httproutes
     stall_report.py --namespace payments --threshold-minutes 60 --json
+    stall_report.py --namespace payments --workers 6
     stall_report.py --namespaces payments,billing --kind deployments --extra-kinds billing=sqlinstances.sql.cnrm.cloud.google.com --json
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+import functools
+import io
 import json
+import os
+import re
+import shutil
+import stat
 import subprocess
 import sys
+import threading
+import types
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+import weakref
 
-KUBECTL = "kubectl"
+_DEFAULT_KUBECTL = "kubectl"
+KUBECTL = _DEFAULT_KUBECTL
+_ORIG_SUBPROCESS_RUN = subprocess.run
+_SHIM_LOCK = threading.Lock()
+_SHIM_CACHE: dict[
+    tuple, tuple[object, tuple[tuple[str, str, int, int, int, int, int, int], ...], object]
+] = {}
+_SHIM_LOADED_SIGS: weakref.WeakKeyDictionary[object, tuple[int, int, int, int, int, int]] = (
+    weakref.WeakKeyDictionary()
+)
+# Bounded entry cap for the shim validation cache keyed by PATH/stat/module state.
+_SHIM_CACHE_MAX = 64
+# Upper bound on shim/wrapper source size read during in-process validation (512 KiB).
+_MAX_SHIM_BYTES = 512 * 1024
+_SHIM_MODULE_NAME = "credential_proxy_client"
+_SHIM_EXECUTE_CAPTURED_ATTR = "execute_captured"
+_SHIM_EXEC_ENDPOINTS_ATTR = "exec_endpoints"
+_SHIM_FILE_ATTR = "__file__"
+_SHIM_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+_SHIM_READ_MODE = "rb"
+_SHIM_TEXT_ENCODING = "utf-8"
+_SHIM_COMPILE_MODE = "exec"
+_MISSING_STAT_SIG = (-1, -1, -1, -1, -1, -1)
+_DOCSTRING_DELIM = '"""'
+_COMMENT_PREFIX = "#"
+_SHIM_HEADER = (
+    b'#!/usr/bin/env python3\n'
+    b'"""Submit a supported CLI argv vector to the paired credential proxy."""\n'
+)
+_LAUNCHER_HEADER = (
+    b'#!/usr/bin/env python3\n'
+    b'"""Start the credential proxy client from its module.\n'
+)
+_LAUNCHER_BODY = (
+    "import os",
+    "import sys",
+    "sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))",
+    "from credential_proxy_client import main",
+    "main()",
+)
+_LAUNCHER_CLIENT_NAME = "credential_proxy_client.py"
+_SESSION_KUBECTL_SHEBANG = "#!/bin/sh"
+_SESSION_KUBECTL_SHEBANG_BYTES = b"#!/bin/sh\n"
+_SESSION_KUBECTL_CLIENT_VAR = "CLIENT"
+_SESSION_KUBECTL_KUBE_PROXY_IF = 'if [ -n "${KUBE_PROXY_URL:-}" ]; then'
+_SESSION_KUBECTL_BROKER_TAIL = (
+    'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then',
+    'exec "$CLIENT" kubectl "$@"',
+    "fi",
+    'exec "$REAL_KUBECTL" "$@"',
+)
+_SHELL_FUNC_CLOSE = "}"
+_SH_NEWLINE = "\n"
+_SH_CARRIAGE_RETURN = "\r"
+_SH_NUL = "\x00"
+_SH_BLANKS = " \t"
+_SH_SINGLE_QUOTE = "'"
+_SH_DOUBLE_QUOTE = '"'
+_SH_BACKSLASH = "\\"
+_SH_BACKTICK = "`"
+_SH_DOLLAR = "$"
+_SH_HEREDOC_OP = "<<"
+_SH_PARAM_PREFIX = "${"
+_SH_ARITH_PREFIX = "$(("
+_SH_ARITH_SUFFIX = "))"
+_SH_CMDSUB_PREFIX = "$("
+_SH_OPEN_PAREN = "("
+_SH_CLOSE_PAREN = ")"
+_SH_OPEN_BRACE = "{"
+_SH_CLOSE_BRACE = "}"
+_SH_SEMICOLON = ";"
+_SH_PIPE = "|"
+_SH_AMP = "&"
+_SH_CASE_END = ";;"
+_SH_ESCAPE_LEN = 2
+_SH_QUOTED_PLACEHOLDER = "_"
+_SH_WORD_DELIMITERS = frozenset((" ", "\t", ";", "&", "|", "(", ")", "<", ">"))
+_SH_PARAM_FORBIDDEN = frozenset(('"', "'", "\\", "$", "`", "{", "(", ")"))
+_SH_ARITH_FORBIDDEN = frozenset(('"', "'", "\\", "`", "{", "}", ";", "("))
+_SH_TRAILING_CONTINUATION_OPS = (_SH_PIPE, _SH_AMP)
+_SH_BLOCK_IF = "if"
+_SH_BLOCK_CASE = "case"
+_SH_ELSE_WORD = "else"
+_SH_FI_WORD = "fi"
+_SH_ESAC_WORD = "esac"
+_SH_CONTROL_WORDS = frozenset(
+    ("if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do", "done")
+)
+_PARENT_DIR_SEGMENT = ".."
+_POSIX_PATH_SEP = "/"
+_SAFE_READONLY_RE = re.compile(r"^readonly ([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9._/@:+-]+)\Z")
+_SHELL_FUNC_START_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{\Z")
+_SAFE_ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/@+-]+\Z")
+_SH_WORD_SPLIT_RE = re.compile(r"[ \t;&|<>]+")
+_SH_IF_OR_ELIF_THEN_RE = re.compile(r"^(if|elif)[ \t]+([^;)]+);[ \t]*then\Z")
+_SH_CASE_IN_RE = re.compile(r"^case[ \t]+([^ \t;&|()]+)[ \t]+in\Z")
+_CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
+_CREDENTIAL_PROXY_EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
+_KUBE_PROXY_URL_ENV = "KUBE_PROXY_URL"
+_NAME_RESOLVER_EXISTS_ATTR = "exists"
+_K8S_ITEMS_KEY = "items"
+_K8S_KIND_KEY = "kind"
+_K8S_SPEC_KEY = "spec"
+_K8S_METADATA_KEY = "metadata"
+_K8S_NAMESPACE_KEY = "namespace"
+_ARGS_SEPARATOR = " "
+_NON_OBJECT_JSON_ERROR = "kubectl {args} returned non-object JSON ({rc}): {kind}"
+# Caps memoized RFC 3339 timestamps per process across repeated managedFields,
+# condition transitions, and event spans without unbounded growth.
+_PARSE_TIME_CACHE_MAX = 4096
+# Default concurrent kubectl reads for standalone scans: matches
+# credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS (2, immediate
+# non-retried 503 past the cap) and half of
+# credential_proxy.DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS (4, matching
+# workload_triage.FALLBACK_CONCURRENCY) so one scan leaves profile and pool
+# slots free for sibling workers. Callers with higher budgets may pass
+# --workers up to MAX_COLLECT_WORKERS; callers that already parallelize
+# across clusters (such as stall_watch.py under BROKER_SLOTS) pass
+# --workers 1 so nested pools do not multiply concurrent calls.
+DEFAULT_COLLECT_WORKERS = 2
+MIN_COLLECT_WORKERS = 1
+MAX_COLLECT_WORKERS = 6
+COLLECT_WORKERS = DEFAULT_COLLECT_WORKERS
+WORKERS_FLAG = "--workers"
+_WORKERS_HELP = (
+    f"maximum concurrent kubectl reads per scan (clamped to "
+    f"{MIN_COLLECT_WORKERS}..{MAX_COLLECT_WORKERS}, default {DEFAULT_COLLECT_WORKERS})"
+)
+_WORKERS_MIN_ERROR = f"{WORKERS_FLAG} must be at least {MIN_COLLECT_WORKERS}"
 # The kubectl vocabulary this script uses. --show-managed-fields matters: kubectl
 # strips managedFields from -o json by default, and the generation-lag and
 # dangling-reference ages are read from them.
@@ -387,8 +528,655 @@ REFUSED = ListingRefused()
 # --------------------------------------------------------------------------
 
 
+def _has_broker_url() -> bool:
+    return bool(
+        os.environ.get(_CREDENTIAL_PROXY_URL_ENV, "").strip()
+        or os.environ.get(_CREDENTIAL_PROXY_EXEC_URL_ENV, "").strip()
+    )
+
+
+def _is_owned_regular_file(info: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and 0 < info.st_size <= _MAX_SHIM_BYTES
+        and info.st_uid in (0, os.geteuid())
+        and not (info.st_mode & stat.S_IWOTH)
+    )
+
+
+def _stat_sig(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_uid, info.st_mode)
+
+
+def _watch_entry(
+    path: str, info: os.stat_result | None
+) -> tuple[str, str, int, int, int, int, int, int]:
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        real = ""
+    if info is None:
+        return (path, real, *_MISSING_STAT_SIG)
+    return (path, real, *_stat_sig(info))
+
+
+def _watched_unchanged(
+    watched: tuple[tuple[str, str, int, int, int, int, int, int], ...],
+) -> bool:
+    for watch_path, real, dev, ino, size, mtime_ns, uid, mode in watched:
+        try:
+            cur_real = os.path.realpath(watch_path)
+            sig = _stat_sig(os.stat(watch_path))
+        except OSError:
+            cur_real = ""
+            sig = _MISSING_STAT_SIG
+        if dev == -1:
+            if sig != _MISSING_STAT_SIG:
+                return False
+            continue
+        if cur_real != real or sig != (dev, ino, size, mtime_ns, uid, mode):
+            return False
+    return True
+
+
+def _read_bounded(
+    path: str, info: os.stat_result | None = None
+) -> tuple[os.stat_result, bytes] | None:
+    try:
+        if info is None:
+            info = os.stat(path)
+        if not _is_owned_regular_file(info):
+            return None
+        fd = os.open(path, _SHIM_OPEN_FLAGS)
+    except OSError:
+        return None
+    try:
+        handle = os.fdopen(fd, _SHIM_READ_MODE)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    try:
+        with handle:
+            fd_info = os.fstat(handle.fileno())
+            if not _is_owned_regular_file(fd_info):
+                return None
+            raw = handle.read(_MAX_SHIM_BYTES + 1)
+    except OSError:
+        return None
+    if not raw or len(raw) > _MAX_SHIM_BYTES:
+        return None
+    return fd_info, raw
+
+
+def _is_launcher_script(raw: bytes) -> bool:
+    """Whether `raw` is the precompiled shim launcher (`credential-proxy-exec.py`)."""
+    if not raw.startswith(_LAUNCHER_HEADER):
+        return False
+    try:
+        text = raw.decode(_SHIM_TEXT_ENCODING)
+    except UnicodeDecodeError:
+        return False
+    doc_start = text.find(_DOCSTRING_DELIM)
+    if doc_start < 0:
+        return False
+    doc_end = text.find(_DOCSTRING_DELIM, doc_start + len(_DOCSTRING_DELIM))
+    if doc_end < 0:
+        return False
+    body_lines = []
+    for line in text[doc_end + len(_DOCSTRING_DELIM) :].splitlines():
+        code = line.split(_COMMENT_PREFIX, 1)[0].strip()
+        if code:
+            body_lines.append(code)
+    return tuple(body_lines) == _LAUNCHER_BODY
+
+
+def _scan_sh_param_expansion(line: str, start: int) -> int | None:
+    """Scan a single-line `${...}` parameter expansion starting after `${`."""
+    pos = start
+    length = len(line)
+    while pos < length:
+        ch = line[pos]
+        if ch == _SH_CLOSE_BRACE:
+            return pos + 1 if pos > start else None
+        if ch in _SH_PARAM_FORBIDDEN:
+            return None
+        pos += 1
+    return None
+
+
+def _scan_sh_arith_expansion(line: str, start: int) -> int | None:
+    """Scan a single-line `$((...))` arithmetic expansion starting after `$((`."""
+    pos = start
+    length = len(line)
+    while pos < length:
+        ch = line[pos]
+        if ch == _SH_CLOSE_PAREN:
+            if pos > start and line.startswith(_SH_ARITH_SUFFIX, pos):
+                return pos + len(_SH_ARITH_SUFFIX)
+            return None
+        if ch in _SH_ARITH_FORBIDDEN:
+            return None
+        pos += 1
+    return None
+
+
+def _scan_sh_double_quote(line: str, start: int) -> int | None:
+    """Scan a single-line `"..."` string starting after the opening `"`."""
+    pos = start
+    length = len(line)
+    while pos < length:
+        ch = line[pos]
+        if ch == _SH_DOUBLE_QUOTE:
+            return pos + 1
+        if ch == _SH_BACKSLASH:
+            if pos + 1 >= length:
+                return None
+            pos += _SH_ESCAPE_LEN
+            continue
+        if ch == _SH_BACKTICK:
+            return None
+        if ch == _SH_DOLLAR:
+            if line.startswith(_SH_CMDSUB_PREFIX, pos):
+                return None
+            if line.startswith(_SH_PARAM_PREFIX, pos):
+                next_pos = _scan_sh_param_expansion(line, pos + len(_SH_PARAM_PREFIX))
+                if next_pos is None:
+                    return None
+                pos = next_pos
+                continue
+        pos += 1
+    return None
+
+
+def _scan_sh_logical_line(
+    lines: list[str], start_index: int, *, allow_arith: bool
+) -> tuple[str, int] | None:
+    """Scan one logical POSIX `/bin/sh` line, rejecting multi-line quotes/heredocs/subshells.
+
+    Replaces balanced quoted strings, escapes, and single-line `${...}` / `$((...))`
+    expansions with `_SH_QUOTED_PLACEHOLDER` and strips `#` comments at word start so
+    subsequent control-flow checks see only unquoted shell syntax. Joins unquoted
+    trailing-backslash continuations only at blank token boundaries.
+    """
+    code_chars: list[str] = []
+    has_non_blank = False
+    at_word_start = True
+    idx = start_index
+    continued = True
+    while continued:
+        if idx >= len(lines):
+            return None
+        line = lines[idx]
+        idx += 1
+        continued = False
+        pos = 0
+        length = len(line)
+        while pos < length:
+            ch = line[pos]
+            if ch == _COMMENT_PREFIX and at_word_start:
+                break
+            if ch == _SH_SINGLE_QUOTE:
+                end = line.find(_SH_SINGLE_QUOTE, pos + 1)
+                if end < 0:
+                    return None
+                code_chars.append(_SH_QUOTED_PLACEHOLDER)
+                has_non_blank = True
+                at_word_start = False
+                pos = end + 1
+                continue
+            if ch == _SH_DOUBLE_QUOTE:
+                next_pos = _scan_sh_double_quote(line, pos + 1)
+                if next_pos is None:
+                    return None
+                code_chars.append(_SH_QUOTED_PLACEHOLDER)
+                has_non_blank = True
+                at_word_start = False
+                pos = next_pos
+                continue
+            if ch == _SH_BACKSLASH:
+                if pos + 1 >= length:
+                    if not has_non_blank or pos == 0 or line[pos - 1] not in _SH_BLANKS:
+                        return None
+                    continued = True
+                    break
+                code_chars.append(_SH_QUOTED_PLACEHOLDER)
+                has_non_blank = True
+                at_word_start = False
+                pos += _SH_ESCAPE_LEN
+                continue
+            if ch == _SH_BACKTICK or line.startswith(_SH_HEREDOC_OP, pos):
+                return None
+            if ch in (_SH_OPEN_PAREN, _SH_OPEN_BRACE, _SH_CLOSE_BRACE):
+                return None
+            if ch == _SH_DOLLAR:
+                if line.startswith(_SH_PARAM_PREFIX, pos):
+                    next_pos = _scan_sh_param_expansion(line, pos + len(_SH_PARAM_PREFIX))
+                    if next_pos is None:
+                        return None
+                    code_chars.append(_SH_QUOTED_PLACEHOLDER)
+                    has_non_blank = True
+                    at_word_start = False
+                    pos = next_pos
+                    continue
+                if line.startswith(_SH_ARITH_PREFIX, pos):
+                    if not allow_arith:
+                        return None
+                    next_pos = _scan_sh_arith_expansion(line, pos + len(_SH_ARITH_PREFIX))
+                    if next_pos is None:
+                        return None
+                    code_chars.append(_SH_QUOTED_PLACEHOLDER)
+                    has_non_blank = True
+                    at_word_start = False
+                    pos = next_pos
+                    continue
+                if line.startswith(_SH_CMDSUB_PREFIX, pos):
+                    return None
+            code_chars.append(ch)
+            if ch not in _SH_BLANKS:
+                has_non_blank = True
+            at_word_start = ch in _SH_WORD_DELIMITERS
+            pos += 1
+    return "".join(code_chars), idx
+
+
+def _sh_has_control_word(code: str) -> bool:
+    """Whether `code` contains any POSIX shell control keyword as a standalone word."""
+    return any(token in _SH_CONTROL_WORDS for token in _SH_WORD_SPLIT_RE.split(code))
+
+
+def _session_kubectl_client_path(raw: bytes) -> str | None:
+    """Extract `CLIENT` from the worker image's `session-kubectl.sh` wrapper.
+
+    Fail-closed: accepts only the known wrapper grammar (shebang, comments,
+    `readonly` assignments, shell helper functions, the `KUBE_PROXY_URL` block,
+    and the exact broker fallback tail) so any unfamiliar wrapper falls back to
+    `subprocess.run`.
+    """
+    try:
+        text = raw.decode(_SHIM_TEXT_ENCODING)
+    except UnicodeDecodeError:
+        return None
+    if _SH_CARRIAGE_RETURN in text or _SH_NUL in text:
+        return None
+    lines = text.split(_SH_NEWLINE)
+    if not lines or lines[0] != _SESSION_KUBECTL_SHEBANG:
+        return None
+    readonly_vars: dict[str, str] = {}
+    index = 1
+    in_func = False
+    found_kube_proxy_if = False
+    while index < len(lines):
+        line = lines[index]
+        if in_func:
+            if line == _SHELL_FUNC_CLOSE:
+                in_func = False
+                index += 1
+                continue
+            scanned = _scan_sh_logical_line(lines, index, allow_arith=True)
+            if scanned is None:
+                return None
+            code, index = scanned
+            if code.strip(_SH_BLANKS).endswith(_SH_TRAILING_CONTINUATION_OPS):
+                return None
+            continue
+        stripped = line.strip(_SH_BLANKS)
+        index += 1
+        if not stripped or stripped.startswith(_COMMENT_PREFIX):
+            continue
+        if stripped == _SESSION_KUBECTL_KUBE_PROXY_IF:
+            found_kube_proxy_if = True
+            break
+        match = _SAFE_READONLY_RE.match(stripped)
+        if match:
+            name, value = match.groups()
+            if name in readonly_vars:
+                return None
+            readonly_vars[name] = value
+            continue
+        if _SHELL_FUNC_START_RE.match(line):
+            in_func = True
+            continue
+        return None
+    if in_func or not found_kube_proxy_if:
+        return None
+    block_stack = [_SH_BLOCK_IF]
+    while index < len(lines) and block_stack:
+        scanned = _scan_sh_logical_line(lines, index, allow_arith=False)
+        if scanned is None:
+            return None
+        code, index = scanned
+        code = code.strip(_SH_BLANKS)
+        if not code:
+            continue
+        if code.endswith(_SH_TRAILING_CONTINUATION_OPS):
+            return None
+        if code == _SH_FI_WORD:
+            if block_stack[-1] != _SH_BLOCK_IF:
+                return None
+            block_stack.pop()
+            continue
+        if code == _SH_ELSE_WORD:
+            if len(block_stack) <= 1 or block_stack[-1] != _SH_BLOCK_IF:
+                return None
+            continue
+        if code == _SH_ESAC_WORD:
+            if block_stack[-1] != _SH_BLOCK_CASE:
+                return None
+            block_stack.pop()
+            continue
+        if code == _SH_CASE_END:
+            if block_stack[-1] != _SH_BLOCK_CASE:
+                return None
+            continue
+        if_match = _SH_IF_OR_ELIF_THEN_RE.match(code)
+        if if_match:
+            keyword, cond = if_match.groups()
+            if _sh_has_control_word(cond):
+                return None
+            if keyword == _SH_BLOCK_IF:
+                block_stack.append(_SH_BLOCK_IF)
+            elif len(block_stack) <= 1 or block_stack[-1] != _SH_BLOCK_IF:
+                return None
+            continue
+        case_match = _SH_CASE_IN_RE.match(code)
+        if case_match:
+            if case_match.group(1) in _SH_CONTROL_WORDS:
+                return None
+            block_stack.append(_SH_BLOCK_CASE)
+            continue
+        if _SH_CLOSE_PAREN in code:
+            if (
+                block_stack[-1] != _SH_BLOCK_CASE
+                or code.count(_SH_CLOSE_PAREN) != 1
+                or not code.endswith(_SH_CLOSE_PAREN)
+                or _SH_SEMICOLON in code
+                or _sh_has_control_word(code[:-1])
+            ):
+                return None
+            continue
+        if _sh_has_control_word(code):
+            return None
+    if block_stack:
+        return None
+    tail = tuple(
+        line.strip(_SH_BLANKS)
+        for line in lines[index:]
+        if line.strip(_SH_BLANKS) and not line.strip(_SH_BLANKS).startswith(_COMMENT_PREFIX)
+    )
+    if tail != _SESSION_KUBECTL_BROKER_TAIL:
+        return None
+    client = readonly_vars.get(_SESSION_KUBECTL_CLIENT_VAR)
+    if not client or not _SAFE_ABS_PATH_RE.match(client) or _PARENT_DIR_SEGMENT in client.split(_POSIX_PATH_SEP):
+        return None
+    return client
+
+
+def _resolve_shim_target(
+    path: str, path_info: os.stat_result, kube_proxy_active: bool
+) -> tuple[
+    str | None,
+    os.stat_result | None,
+    bytes | None,
+    tuple[tuple[str, str, int, int, int, int, int, int], ...],
+    os.stat_result | None,
+]:
+    bounded = _read_bounded(path, path_info)
+    if bounded is None:
+        return None, None, None, (), None
+    path_fd_info, raw = bounded
+    if raw.startswith(_SHIM_HEADER):
+        return path, path_fd_info, raw, (), path_fd_info
+    if _is_launcher_script(raw):
+        target_path = os.path.join(os.path.dirname(os.path.realpath(path)), _LAUNCHER_CLIENT_NAME)
+        target_bounded = _read_bounded(target_path)
+        if target_bounded is None:
+            return None, None, None, (_watch_entry(target_path, None),), path_fd_info
+        target_info, target_raw = target_bounded
+        watch = (_watch_entry(target_path, target_info),)
+        if target_raw.startswith(_SHIM_HEADER):
+            return target_path, target_info, target_raw, watch, path_fd_info
+        return None, None, None, watch, path_fd_info
+    if not kube_proxy_active and raw.startswith(_SESSION_KUBECTL_SHEBANG_BYTES):
+        client_path = _session_kubectl_client_path(raw)
+        if client_path is None:
+            return None, None, None, (), path_fd_info
+        client_bounded = _read_bounded(client_path)
+        if client_bounded is None:
+            return None, None, None, (_watch_entry(client_path, None),), path_fd_info
+        client_info, client_raw = client_bounded
+        client_watch = _watch_entry(client_path, client_info)
+        if client_raw.startswith(_SHIM_HEADER):
+            return client_path, client_info, client_raw, (client_watch,), path_fd_info
+        if _is_launcher_script(client_raw):
+            target_path = os.path.join(
+                os.path.dirname(os.path.realpath(client_path)), _LAUNCHER_CLIENT_NAME
+            )
+            target_bounded = _read_bounded(target_path)
+            if target_bounded is None:
+                return (
+                    None,
+                    None,
+                    None,
+                    (client_watch, _watch_entry(target_path, None)),
+                    path_fd_info,
+                )
+            target_info, target_raw = target_bounded
+            target_watch = _watch_entry(target_path, target_info)
+            if target_raw.startswith(_SHIM_HEADER):
+                return (
+                    target_path,
+                    target_info,
+                    target_raw,
+                    (client_watch, target_watch),
+                    path_fd_info,
+                )
+            return None, None, None, (client_watch, target_watch), path_fd_info
+        return None, None, None, (client_watch,), path_fd_info
+    return None, None, None, (), path_fd_info
+
+
+def _loaded_module_key(loaded: object) -> tuple | None:
+    if loaded is None:
+        return None
+    mod_file = getattr(loaded, _SHIM_FILE_ATTR, None)
+    if not mod_file:
+        return (id(loaded), None, None)
+    try:
+        mstat = os.stat(mod_file)
+        return (id(loaded), os.path.realpath(mod_file), *_stat_sig(mstat))
+    except OSError:
+        return (id(loaded), mod_file, None)
+
+
+def _parse_shim_ast(target_raw: bytes, filename: str) -> ast.Module | None:
+    try:
+        tree = ast.parse(target_raw, filename=filename)
+    except (SyntaxError, ValueError):
+        return None
+    top_level_funcs = {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    if _SHIM_EXECUTE_CAPTURED_ATTR not in top_level_funcs or _SHIM_EXEC_ENDPOINTS_ATTR not in top_level_funcs:
+        return None
+    return tree
+
+
+def _shim_client():
+    """The credential_proxy_client module when `kubectl` on PATH dispatches to it.
+
+    Covers all three layouts shipped by kube-agents:
+    1. `kubectl` on PATH is a copy/symlink of `credential_proxy_client.py`;
+    2. `kubectl` resolves to the precompiled module launcher (`credential-proxy-exec`);
+    3. `kubectl` is the worker image's `session-kubectl.sh` wrapper with `KUBE_PROXY_URL`
+       unset, delegating directly to `CLIENT` (`credential-proxy-exec`).
+
+    When verified, calling `execute_captured` in-process runs the shim's own code
+    minus a Python interpreter start per call. Anything else -- stock kubectl,
+    `KUBE_PROXY_URL` active under `session-kubectl.sh`, a modified wrapper, a
+    different shim version, no broker URL -- returns None and falls back to
+    `subprocess.run`.
+    """
+    if KUBECTL != _DEFAULT_KUBECTL or subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        return None
+    if not _has_broker_url():
+        return None
+    path = shutil.which(KUBECTL)
+    if not path:
+        return None
+    kube_proxy_active = bool(os.environ.get(_KUBE_PROXY_URL_ENV, ""))
+    with _SHIM_LOCK:
+        try:
+            path_real = os.path.realpath(path)
+            info = os.stat(path)
+        except OSError:
+            return None
+        if not _is_owned_regular_file(info):
+            return None
+        loaded = sys.modules.get(_SHIM_MODULE_NAME)
+        key = (path, path_real, *_stat_sig(info), kube_proxy_active, _loaded_module_key(loaded))
+        cached = _SHIM_CACHE.get(key)
+        if cached is not None:
+            mod, watched, cached_loaded = cached
+            if cached_loaded is loaded and _watched_unchanged(watched):
+                return mod
+        if len(_SHIM_CACHE) >= _SHIM_CACHE_MAX:
+            _SHIM_CACHE.clear()
+        mod, watched, path_fd_info = _load_shim_client_with_watch(path, info, kube_proxy_active)
+        if path_fd_info is not None and _stat_sig(path_fd_info) == _stat_sig(info):
+            try:
+                post_real = os.path.realpath(path)
+            except OSError:
+                post_real = ""
+            if post_real == path_real:
+                post_loaded = sys.modules.get(_SHIM_MODULE_NAME)
+                post_key = (
+                    path,
+                    path_real,
+                    *_stat_sig(path_fd_info),
+                    kube_proxy_active,
+                    _loaded_module_key(post_loaded),
+                )
+                _SHIM_CACHE[post_key] = (mod, watched, post_loaded)
+        return mod
+
+
+def _load_shim_client(
+    path: str, path_info: os.stat_result | None = None, *, kube_proxy_active: bool = False
+):
+    mod, _watched, _path_fd_info = _load_shim_client_with_watch(path, path_info, kube_proxy_active)
+    return mod
+
+
+def _load_shim_client_with_watch(
+    path: str, path_info: os.stat_result | None, kube_proxy_active: bool
+) -> tuple[
+    object, tuple[tuple[str, str, int, int, int, int, int, int], ...], os.stat_result | None
+]:
+    try:
+        if path_info is None:
+            path_info = os.stat(path)
+    except OSError:
+        return None, (), None
+    if not _is_owned_regular_file(path_info):
+        return None, (), None
+    target_path, target_info, target_raw, watched, path_fd_info = _resolve_shim_target(
+        path, path_info, kube_proxy_active
+    )
+    if target_path is None or target_info is None or target_raw is None:
+        return None, watched, path_fd_info
+    try:
+        import credential_proxy_client  # noqa: PLC0415 - only when the shim is in use
+    except ImportError:
+        credential_proxy_client = None
+    if credential_proxy_client is not None:
+        module_file = getattr(credential_proxy_client, _SHIM_FILE_ATTR, None)
+        if (
+            not module_file
+            or not hasattr(credential_proxy_client, _SHIM_EXECUTE_CAPTURED_ATTR)
+            or not hasattr(credential_proxy_client, _SHIM_EXEC_ENDPOINTS_ATTR)
+        ):
+            return None, watched, path_fd_info
+        mod_bounded = _read_bounded(module_file)
+        if mod_bounded is None:
+            return None, watched, path_fd_info
+        mod_info, mod_raw = mod_bounded
+        try:
+            recorded_sig = _SHIM_LOADED_SIGS.get(credential_proxy_client)
+        except TypeError:
+            return None, watched, path_fd_info
+        if recorded_sig is not None and recorded_sig != _stat_sig(mod_info):
+            return None, watched, path_fd_info
+        if target_raw != mod_raw:
+            return None, watched, path_fd_info
+        try:
+            _SHIM_LOADED_SIGS[credential_proxy_client] = _stat_sig(mod_info)
+        except TypeError:
+            return None, watched, path_fd_info
+        return credential_proxy_client, watched, path_fd_info
+    # Fallback when running under `python3 -I -` (stall_watch.py) or from the
+    # persona skill directory where credential_proxy_client.py is not on sys.path.
+    target_real = os.path.realpath(target_path)
+    tree = _parse_shim_ast(target_raw, target_real)
+    if tree is None:
+        return None, watched, path_fd_info
+    try:
+        mod = types.ModuleType(_SHIM_MODULE_NAME)
+        mod.__file__ = target_real
+        mod.__package__ = ""
+        sys.modules[_SHIM_MODULE_NAME] = mod
+        try:
+            # Always execute the already-read, AST-validated tree so no untrusted
+            # __pycache__/*.pyc or post-read TOCTOU swap can run in-process.
+            exec(compile(tree, target_real, _SHIM_COMPILE_MODE), mod.__dict__)
+        except Exception:  # noqa: BLE001
+            sys.modules.pop(_SHIM_MODULE_NAME, None)
+            return None, watched, path_fd_info
+    except Exception:  # noqa: BLE001
+        return None, watched, path_fd_info
+    if hasattr(mod, _SHIM_EXECUTE_CAPTURED_ATTR) and hasattr(mod, _SHIM_EXEC_ENDPOINTS_ATTR):
+        _SHIM_LOADED_SIGS[mod] = _stat_sig(target_info)
+        return mod, watched, path_fd_info
+    sys.modules.pop(_SHIM_MODULE_NAME, None)
+    return None, watched, path_fd_info
+
+
+def _prime_shim_before_parallel() -> str:
+    """Warm `_SHIM_CACHE` and resolve any one-time `CREDENTIAL_PROXY_EXEC_URL`
+    notice on the main thread before spawning parallel worker threads."""
+    if run_kubectl is not _ORIG_RUN_KUBECTL:
+        return ""
+    client = _shim_client()
+    if client is None or not _has_broker_url():
+        return ""
+    notice_buf = io.StringIO()
+    try:
+        client.exec_endpoints(err=notice_buf)
+    except Exception:  # noqa: BLE001 - run_kubectl reports endpoint errors per call
+        return ""
+    return notice_buf.getvalue()
+
+
 def run_kubectl(args: list[str]) -> tuple[int, str, str]:
     """Run kubectl and return (rc, stdout, stderr). Never raises."""
+    client = _shim_client()
+    if client is not None and _has_broker_url():
+        endpoint_err = io.StringIO()
+        try:
+            endpoint, fallback = client.exec_endpoints(err=endpoint_err)
+        except Exception as exc:  # noqa: BLE001 - never raises, as below
+            return 1, "", endpoint_err.getvalue() + str(exc)
+        if endpoint and endpoint.strip():
+            try:
+                rc, stdout, stderr = client.execute_captured(
+                    endpoint, [KUBECTL, *args], fallback=fallback
+                )
+            except Exception as exc:  # noqa: BLE001 - never raises, as below
+                return 1, "", endpoint_err.getvalue() + str(exc)
+            prefix = endpoint_err.getvalue()
+            return rc, stdout, (prefix + stderr) if prefix else stderr
     try:
         res = subprocess.run([KUBECTL, *args], capture_output=True, text=True, check=False)
     except OSError as exc:
@@ -396,10 +1184,17 @@ def run_kubectl(args: list[str]) -> tuple[int, str, str]:
     return res.returncode, res.stdout, res.stderr
 
 
-def warn_lines(stderr: str) -> None:
+_ORIG_RUN_KUBECTL = run_kubectl
+
+
+def warn_lines(stderr: str, *, err: io.TextIOBase | None = None) -> None:
+    err_stream = sys.stderr if err is None else err
     for line in stderr.splitlines():
         if line.strip():
-            sys.stderr.write(f"{WARNING_PREFIX}{line}\n")
+            err_stream.write(f"{WARNING_PREFIX}{line}\n")
+
+
+_ORIG_WARN_LINES = warn_lines
 
 
 def kubectl_json(args: list[str]) -> dict:
@@ -410,15 +1205,30 @@ def kubectl_json(args: list[str]) -> dict:
     and the failure is a warning; only unparseable output is an error.
     """
     rc, stdout, stderr = run_kubectl([*args, OUTPUT_FLAG, OUTPUT_JSON])
+    return _parse_kubectl_json(args, rc, stdout, stderr)
+
+
+def _parse_kubectl_json(args: list[str], rc: int, stdout: str, stderr: str) -> dict:
+    """kubectl_json's handling of one finished `kubectl ... -o json` call."""
     warn_lines(stderr)
     if not stdout.strip():
         if rc != 0:
             raise RuntimeError(f"kubectl {' '.join(args)} failed ({rc}): {stderr.strip()}")
-        return {"items": []}
+        return {_K8S_ITEMS_KEY: []}
     try:
-        return json.loads(stdout)
+        parsed = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"kubectl {' '.join(args)} returned unparseable output ({rc}): {exc}")
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            _NON_OBJECT_JSON_ERROR.format(
+                args=_ARGS_SEPARATOR.join(args), rc=rc, kind=type(parsed).__name__
+            )
+        )
+    return parsed
+
+
+_ORIG_KUBECTL_JSON = kubectl_json
 
 
 def listing_refused(stderr: str) -> bool:
@@ -435,9 +1245,18 @@ def kubectl_names(resource: str, namespace: str) -> set[str] | ListingRefused | 
     `-o name` carries no object bodies, which is what keeps Secret contents
     out of this script.
     """
-    rc, stdout, stderr = run_kubectl(
-        [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, OUTPUT_FLAG, OUTPUT_NAME]
-    )
+    rc, stdout, stderr = run_kubectl(_names_args(resource, namespace))
+    return _parse_kubectl_names(resource, namespace, rc, stdout, stderr)
+
+
+def _names_args(resource: str, namespace: str) -> list[str]:
+    return [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, OUTPUT_FLAG, OUTPUT_NAME]
+
+
+def _parse_kubectl_names(
+    resource: str, namespace: str, rc: int, stdout: str, stderr: str
+) -> set[str] | ListingRefused | None:
+    """kubectl_names' handling of one finished `kubectl get -o name` call."""
     if rc != 0:
         sys.stderr.write(
             f"{WARNING_PREFIX}cannot list {resource} in {namespace}; references to "
@@ -447,6 +1266,27 @@ def kubectl_names(resource: str, namespace: str) -> set[str] | ListingRefused | 
     return {
         line.split(RESOURCE_NAME_SEPARATOR, 1)[-1] for line in stdout.splitlines() if line.strip()
     }
+
+
+_ORIG_KUBECTL_NAMES = kubectl_names
+
+
+def _effective_workers(workers: int) -> int:
+    """Clamp worker width into [MIN_COLLECT_WORKERS, MAX_COLLECT_WORKERS]."""
+    return max(MIN_COLLECT_WORKERS, min(MAX_COLLECT_WORKERS, workers))
+
+
+def _parallel_reads() -> bool:
+    """Whether kubectl reads may be issued concurrently: only through this
+    module's own functions, so a replaced one (a test's fake fed in call
+    order) still sees every call in the order it always did."""
+    return (
+        KUBECTL == _DEFAULT_KUBECTL
+        and run_kubectl is _ORIG_RUN_KUBECTL
+        and kubectl_json is _ORIG_KUBECTL_JSON
+        and kubectl_names is _ORIG_KUBECTL_NAMES
+        and subprocess.run is _ORIG_SUBPROCESS_RUN
+    )
 
 
 def namespaced_resources() -> list[str]:
@@ -475,8 +1315,8 @@ def namespaced_resources() -> list[str]:
 class NameResolver:
     """Answers "does Kind/name exist in namespace" from `-o name` listings, cached."""
 
-    def __init__(self, lister=kubectl_names):
-        self._lister = lister
+    def __init__(self, lister=None):
+        self._lister = kubectl_names if lister is None else lister
         self._cache: dict[tuple[str, str], set[str] | ListingRefused | None] = {}
 
     def exists(self, kind: str, namespace: str, name: str) -> bool | None:
@@ -493,13 +1333,16 @@ class NameResolver:
         return name in names
 
 
+_ORIG_NAME_RESOLVER_EXISTS = NameResolver.exists
+
+
 class ScaleResolver:
     """Answers whether a Gateway's in-cluster proxy is scaled to zero, from
     listings read on first use and cached. A read that fails, or an answer it
     cannot give, counts as not scaled to zero."""
 
-    def __init__(self, reader=kubectl_json):
-        self._reader = reader
+    def __init__(self, reader=None):
+        self._reader = kubectl_json if reader is None else reader
         self._cache: dict[tuple[str, ...], list[dict] | None] = {}
 
     def _items(self, *args: str) -> list[dict] | None:
@@ -544,9 +1387,9 @@ class ScaleResolver:
 # --------------------------------------------------------------------------
 
 
-def parse_time(value) -> datetime | None:
-    """Parse a Kubernetes RFC 3339 timestamp; None when absent or malformed."""
-    if not value or not isinstance(value, str):
+@functools.lru_cache(maxsize=_PARSE_TIME_CACHE_MAX)
+def _parse_time_str(value: str) -> datetime | None:
+    if not value:
         return None
     text = value[:-1] + UTC_OFFSET if value.endswith(ZULU_SUFFIX) else value
     try:
@@ -556,6 +1399,13 @@ def parse_time(value) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def parse_time(value) -> datetime | None:
+    """Parse a Kubernetes RFC 3339 timestamp; None when absent or malformed."""
+    if not value or not isinstance(value, str):
+        return None
+    return _parse_time_str(value)
 
 
 def format_duration(seconds: float) -> str:
@@ -881,8 +1731,10 @@ def analyze(
     now: datetime,
     override_minutes: int | None = None,
     scale: ScaleResolver | None = None,
+    workers: int = DEFAULT_COLLECT_WORKERS,
 ) -> list[dict]:
     """Apply every heuristic to every object; pure apart from the resolvers."""
+    prefetch_references(resolver, objects, now, override_minutes, workers=workers)
     events_by_object = index_events(events)
     scale = scale or ScaleResolver()
     findings: list[dict] = []
@@ -907,6 +1759,73 @@ def analyze(
 
 def stalled_object_count(findings: list[dict]) -> int:
     return len({(f["namespace"], f["object"]) for f in findings})
+
+
+def prefetch_references(
+    resolver,
+    objects: list[dict],
+    now: datetime,
+    override_minutes: int | None = None,
+    workers: int = DEFAULT_COLLECT_WORKERS,
+) -> None:
+    """Read, concurrently, the `-o name` listings analyze() will look up.
+
+    Exactly the (resource, namespace) pairs check_dangling_references asks
+    the resolver about, in the order it first asks, so the listings and any
+    warnings are the ones a sequential analyze() reads. A resolver that is not
+    this module's NameResolver over kubectl_names is left alone.
+    """
+    worker_limit = _effective_workers(workers)
+    if (
+        worker_limit <= MIN_COLLECT_WORKERS
+        or type(resolver) is not NameResolver
+        or resolver._lister is not _ORIG_KUBECTL_NAMES
+        or NameResolver.exists is not _ORIG_NAME_RESOLVER_EXISTS
+        or _NAME_RESOLVER_EXISTS_ATTR in resolver.__dict__
+        or not _parallel_reads()
+    ):
+        return
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set(resolver._cache)
+    for obj in objects:
+        kind = obj.get(_K8S_KIND_KEY, "")
+        if kind in SKIPPED_OBJECT_KINDS or is_terminal_pod(obj) or is_finished(obj):
+            continue
+        spec = obj.get(_K8S_SPEC_KEY)
+        if not isinstance(spec, dict):
+            continue
+        written = spec_write_time(obj)
+        if written is None or now - written < threshold_for(kind, override_minutes):
+            continue
+        own_namespace = (obj.get(_K8S_METADATA_KEY) or {}).get(_K8S_NAMESPACE_KEY, "")
+        for _path, ref_kind, _name, namespace, optional in iter_references(spec):
+            if optional:
+                continue
+            resource = REFERENT_RESOURCES.get(ref_kind)
+            if resource is None:
+                continue
+            key = (resource, namespace or own_namespace)
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    if not keys:
+        return
+    if len(keys) == 1:
+        resource, namespace = keys[0]
+        rc, stdout, stderr = run_kubectl(_names_args(resource, namespace))
+        resolver._cache[(resource, namespace)] = _parse_kubectl_names(
+            resource, namespace, rc, stdout, stderr
+        )
+        return
+    notice = _prime_shim_before_parallel()
+    if notice:
+        warn_lines(notice)
+    with ThreadPoolExecutor(max_workers=min(worker_limit, len(keys))) as pool:
+        results = list(pool.map(lambda key: run_kubectl(_names_args(*key)), keys))
+    for (resource, namespace), (rc, stdout, stderr) in zip(keys, results):
+        resolver._cache[(resource, namespace)] = _parse_kubectl_names(
+            resource, namespace, rc, stdout, stderr
+        )
 
 
 # --------------------------------------------------------------------------
@@ -934,7 +1853,9 @@ def render_table(findings: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
+def collect(
+    namespace: str, kinds: str | None, workers: int = DEFAULT_COLLECT_WORKERS
+) -> tuple[list[dict], list[dict]]:
     """Objects of every requested kind in the namespace, and its Warning events.
 
     One kubectl call per kind, not one for the namespace. In the Cluster
@@ -949,13 +1870,49 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
     resources = [r for r in (kinds.split(",") if kinds else namespaced_resources()) if r]
     if not resources:
         return [], []
+    events_args = [
+        KUBECTL_GET,
+        EVENTS_RESOURCE,
+        NAMESPACE_FLAG,
+        namespace,
+        FIELD_SELECTOR_FLAG,
+        WARNING_EVENTS_SELECTOR,
+    ]
+    worker_limit = _effective_workers(workers)
+    if worker_limit <= MIN_COLLECT_WORKERS or not _parallel_reads():
+        return _collect_listings(namespace, resources, events_args, kubectl_json, kubectl_json)
+    # The reads are independent: issue them together, then handle each result
+    # in the order the sequential scan reads them, so warnings, errors and
+    # object order are exactly what it produces.
+    notice = _prime_shim_before_parallel()
+    if notice:
+        warn_lines(notice)
+    with ThreadPoolExecutor(max_workers=min(worker_limit, len(resources) + 1)) as pool:
+        listing_futures = deque(
+            pool.submit(run_kubectl, [*_listing_args(resource, namespace), OUTPUT_FLAG, OUTPUT_JSON])
+            for resource in resources
+        )
+        events_future = pool.submit(run_kubectl, [*events_args, OUTPUT_FLAG, OUTPUT_JSON])
+
+        def read_listing(args: list[str]) -> dict:
+            return _parse_kubectl_json(args, *listing_futures.popleft().result())
+
+        def read_events(args: list[str]) -> dict:
+            return _parse_kubectl_json(args, *events_future.result())
+
+        return _collect_listings(namespace, resources, events_args, read_listing, read_events)
+
+
+def _listing_args(resource: str, namespace: str) -> list[str]:
+    return [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
+
+
+def _collect_listings(namespace, resources, events_args, read_listing, read_events):
     objects: list[dict] = []
     unread: list[str] = []
     for resource in resources:
         try:
-            listing = kubectl_json(
-                [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
-            )
+            listing = read_listing(_listing_args(resource, namespace))
         except RuntimeError as exc:
             unread.append(resource)
             sys.stderr.write(
@@ -968,16 +1925,7 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
     if len(unread) == len(resources):
         raise RuntimeError(f"no kind could be read in {namespace}: {', '.join(unread)}")
     try:
-        events = kubectl_json(
-            [
-                KUBECTL_GET,
-                EVENTS_RESOURCE,
-                NAMESPACE_FLAG,
-                namespace,
-                FIELD_SELECTOR_FLAG,
-                WARNING_EVENTS_SELECTOR,
-            ]
-        ).get("items")
+        events = read_events(events_args).get(_K8S_ITEMS_KEY)
     except RuntimeError as exc:
         sys.stderr.write(
             f"{WARNING_PREFIX}events in {namespace} not read; {HEURISTIC_EVENTS} is not "
@@ -1005,12 +1953,18 @@ def by_namespace(items: list[dict]) -> dict[str, list[dict]]:
     return split
 
 
-def raw_pages(collection: tuple[str, str, str], field_selector: str | None = None) -> list[dict] | None:
+def raw_pages(
+    collection: tuple[str, str, str],
+    field_selector: str | None = None,
+    *,
+    err: io.TextIOBase | None = None,
+) -> list[dict] | None:
     """Every object of one raw collection, `PAGE_SIZE` a page, each item
     stamped with its kind and apiVersion; None, with a warning, when a page
     failed, could not be parsed, or was cut at the smallest page this script
     asks for. A cut page is asked for again at half the size: the continue
     token names where the page starts, not how long it is."""
+    err_stream = sys.stderr if err is None else err
     path, kind, api_version = collection
     items: list[dict] = []
     token = ""
@@ -1028,21 +1982,27 @@ def raw_pages(collection: tuple[str, str, str], field_selector: str | None = Non
             if size // RAW_PAGE_HALVING >= RAW_PAGE_SIZE_MIN:
                 size //= RAW_PAGE_HALVING
                 continue
-            warn_lines(stderr)
-            sys.stderr.write(f"{WARNING_PREFIX}{path} cut at a page of {size}; read per namespace instead\n")
+            if err is None:
+                warn_lines(stderr)
+            else:
+                warn_lines(stderr, err=err_stream)
+            err_stream.write(f"{WARNING_PREFIX}{path} cut at a page of {size}; read per namespace instead\n")
             return None
         if rc != 0 or not stdout.strip():
-            warn_lines(stderr)
-            sys.stderr.write(f"{WARNING_PREFIX}{path} page failed ({rc}); read per namespace instead\n")
+            if err is None:
+                warn_lines(stderr)
+            else:
+                warn_lines(stderr, err=err_stream)
+            err_stream.write(f"{WARNING_PREFIX}{path} page failed ({rc}); read per namespace instead\n")
             return None
         try:
             page = json.loads(stdout)
         except json.JSONDecodeError as exc:
-            sys.stderr.write(f"{WARNING_PREFIX}{path} page is not JSON ({exc}); read per namespace instead\n")
+            err_stream.write(f"{WARNING_PREFIX}{path} page is not JSON ({exc}); read per namespace instead\n")
             return None
         page_items = page.get("items") if isinstance(page, dict) else None
         if not isinstance(page_items, list):
-            sys.stderr.write(f"{WARNING_PREFIX}{path} page has no items list; read per namespace instead\n")
+            err_stream.write(f"{WARNING_PREFIX}{path} page has no items list; read per namespace instead\n")
             return None
         for item in page_items:
             if isinstance(item, dict):
@@ -1054,36 +2014,51 @@ def raw_pages(collection: tuple[str, str, str], field_selector: str | None = Non
         if not token:
             return items
         if token in seen_tokens:
-            sys.stderr.write(f"{WARNING_PREFIX}{path} repeated a continue token; read per namespace instead\n")
+            err_stream.write(f"{WARNING_PREFIX}{path} repeated a continue token; read per namespace instead\n")
             return None
         seen_tokens.add(token)
-    sys.stderr.write(f"{WARNING_PREFIX}{path} ran past {RAW_MAX_PAGES} pages; read per namespace instead\n")
+    err_stream.write(f"{WARNING_PREFIX}{path} ran past {RAW_MAX_PAGES} pages; read per namespace instead\n")
     return None
 
 
-def chunked_listing(args: list[str]) -> list[dict] | None:
+_ORIG_RAW_PAGES = raw_pages
+
+
+def chunked_listing(args: list[str], *, err: io.TextIOBase | None = None) -> list[dict] | None:
     """One `kubectl get ... --all-namespaces --chunk-size=N -o json` reply's
     items; None, with a warning, when the broker cut the reply or the read
     failed. Partial output of a failed read is not kept: across every
     namespace, the objects past the failure would read as absent."""
+    err_stream = sys.stderr if err is None else err
     rc, stdout, stderr = run_kubectl([*args, OUTPUT_FLAG, OUTPUT_JSON])
     if reply_cut(rc, stderr):
-        warn_lines(stderr)
-        sys.stderr.write(f"{WARNING_PREFIX}{args[1]} across every namespace was cut; read per namespace instead\n")
+        if err is None:
+            warn_lines(stderr)
+        else:
+            warn_lines(stderr, err=err_stream)
+        err_stream.write(f"{WARNING_PREFIX}{args[1]} across every namespace was cut; read per namespace instead\n")
         return None
     if rc != 0 or not stdout.strip():
-        warn_lines(stderr)
-        sys.stderr.write(f"{WARNING_PREFIX}{args[1]} across every namespace failed ({rc}); read per namespace instead\n")
+        if err is None:
+            warn_lines(stderr)
+        else:
+            warn_lines(stderr, err=err_stream)
+        err_stream.write(f"{WARNING_PREFIX}{args[1]} across every namespace failed ({rc}); read per namespace instead\n")
         return None
     try:
         listing = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        sys.stderr.write(f"{WARNING_PREFIX}{args[1]} across every namespace returned unparseable output ({exc}); read per namespace instead\n")
+        err_stream.write(f"{WARNING_PREFIX}{args[1]} across every namespace returned unparseable output ({exc}); read per namespace instead\n")
         return None
     return list(listing.get("items") or []) if isinstance(listing, dict) else None
 
 
-def read_kind_cluster_wide(resource: str) -> dict[str, list[dict]] | None:
+_ORIG_CHUNKED_LISTING = chunked_listing
+
+
+def read_kind_cluster_wide(
+    resource: str, *, err: io.TextIOBase | None = None
+) -> dict[str, list[dict]] | None:
     """Every object of one kind, by namespace; None when the kind is left to
     the per-namespace read: a `kind/name` (one object, in one namespace), a
     raw collection whose pages could not all be read, or a chunked read the
@@ -1092,19 +2067,42 @@ def read_kind_cluster_wide(resource: str) -> dict[str, list[dict]] | None:
         return None
     collection = RAW_COLLECTIONS.get(resource)
     if collection is not None:
-        items = raw_pages(collection)
+        items = raw_pages(collection) if err is None else raw_pages(collection, err=err)
         return None if items is None else by_namespace(items)
-    items = chunked_listing([KUBECTL_GET, resource, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, SHOW_MANAGED_FIELDS_FLAG])
+    args = [KUBECTL_GET, resource, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, SHOW_MANAGED_FIELDS_FLAG]
+    items = chunked_listing(args) if err is None else chunked_listing(args, err=err)
     return None if items is None else by_namespace(items)
 
 
-def read_warning_events_cluster_wide() -> dict[str, list[dict]] | None:
+_ORIG_READ_KIND_CLUSTER_WIDE = read_kind_cluster_wide
+
+
+def read_warning_events_cluster_wide(*, err: io.TextIOBase | None = None) -> dict[str, list[dict]] | None:
     """Every Warning event, by namespace: the raw collection paged, else one
     chunked read; None when neither could read them whole."""
-    items = raw_pages(EVENTS_COLLECTION, WARNING_EVENTS_SELECTOR)
+    items = (
+        raw_pages(EVENTS_COLLECTION, WARNING_EVENTS_SELECTOR)
+        if err is None
+        else raw_pages(EVENTS_COLLECTION, WARNING_EVENTS_SELECTOR, err=err)
+    )
     if items is None:
-        items = chunked_listing([KUBECTL_GET, EVENTS_RESOURCE, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, FIELD_SELECTOR_FLAG, WARNING_EVENTS_SELECTOR])
+        args = [KUBECTL_GET, EVENTS_RESOURCE, ALL_NAMESPACES_FLAG, CHUNK_SIZE_ARG, FIELD_SELECTOR_FLAG, WARNING_EVENTS_SELECTOR]
+        items = chunked_listing(args) if err is None else chunked_listing(args, err=err)
     return None if items is None else by_namespace(items)
+
+
+_ORIG_READ_WARNING_EVENTS_CLUSTER_WIDE = read_warning_events_cluster_wide
+
+
+def _parallel_cluster_reads() -> bool:
+    return (
+        _parallel_reads()
+        and warn_lines is _ORIG_WARN_LINES
+        and raw_pages is _ORIG_RAW_PAGES
+        and chunked_listing is _ORIG_CHUNKED_LISTING
+        and read_kind_cluster_wide is _ORIG_READ_KIND_CLUSTER_WIDE
+        and read_warning_events_cluster_wide is _ORIG_READ_WARNING_EVENTS_CLUSTER_WIDE
+    )
 
 
 def kubectl_names_cluster_wide(resource: str) -> set[tuple[str, str]] | None:
@@ -1147,9 +2145,9 @@ class ClusterNameResolver(NameResolver):
     in the next namespace: one namespace's bad moment must not clear a
     dangling-reference row in another."""
 
-    def __init__(self, lister=kubectl_names_cluster_wide, namespace_lister=kubectl_names):
+    def __init__(self, lister=None, namespace_lister=None):
         super().__init__(lister=namespace_lister)
-        self._cluster_lister = lister
+        self._cluster_lister = kubectl_names_cluster_wide if lister is None else lister
         self._names: dict[str, set[tuple[str, str]] | None] = {}
         self._unlistable: set[str] = set()
 
@@ -1170,19 +2168,53 @@ class ClusterNameResolver(NameResolver):
         return answer
 
 
-def collect_cluster(kinds: list[str]) -> tuple[dict[str, dict[str, list[dict]]], dict[str, list[dict]] | None, list[str]]:
+def collect_cluster(
+    kinds: list[str], workers: int = DEFAULT_COLLECT_WORKERS
+) -> tuple[dict[str, dict[str, list[dict]]], dict[str, list[dict]] | None, list[str]]:
     """Every object of every kind in `kinds`, by kind and namespace, the
     Warning events by namespace (None when they could not be read whole),
     and the kinds left to the per-namespace read."""
     objects: dict[str, dict[str, list[dict]]] = {}
     fallback: list[str] = []
-    for resource in kinds:
-        split = read_kind_cluster_wide(resource)
-        if split is None:
-            fallback.append(resource)
-        else:
-            objects[resource] = split
-    return objects, read_warning_events_cluster_wide(), fallback
+    worker_limit = _effective_workers(workers)
+    if not kinds or worker_limit <= MIN_COLLECT_WORKERS or not _parallel_cluster_reads():
+        for resource in kinds:
+            split = read_kind_cluster_wide(resource)
+            if split is None:
+                fallback.append(resource)
+            else:
+                objects[resource] = split
+        return objects, read_warning_events_cluster_wide(), fallback
+
+    def read_kind_buffered(resource: str) -> tuple[dict[str, list[dict]] | None, str]:
+        buf = io.StringIO()
+        return read_kind_cluster_wide(resource, err=buf), buf.getvalue()
+
+    def read_events_buffered() -> tuple[dict[str, list[dict]] | None, str]:
+        buf = io.StringIO()
+        return read_warning_events_cluster_wide(err=buf), buf.getvalue()
+
+    # The cluster-wide kind reads and Warning events read are independent:
+    # issue them concurrently, buffering each worker's warnings so stderr,
+    # objects, and fallback match the sequential scan in exact order.
+    notice = _prime_shim_before_parallel()
+    if notice:
+        warn_lines(notice)
+    with ThreadPoolExecutor(max_workers=min(worker_limit, len(kinds) + 1)) as pool:
+        kind_futures = [pool.submit(read_kind_buffered, resource) for resource in kinds]
+        events_future = pool.submit(read_events_buffered)
+        for resource, future in zip(kinds, kind_futures):
+            split, warnings_text = future.result()
+            if warnings_text:
+                sys.stderr.write(warnings_text)
+            if split is None:
+                fallback.append(resource)
+            else:
+                objects[resource] = split
+        events, events_warnings = events_future.result()
+        if events_warnings:
+            sys.stderr.write(events_warnings)
+    return objects, events, fallback
 
 
 def parse_extra_kinds(values: list[str]) -> dict[str, list[str]]:
@@ -1204,6 +2236,7 @@ def report_cluster(
     override_minutes: int | None = None,
     resolver: NameResolver | None = None,
     scale: ScaleResolver | None = None,
+    workers: int = DEFAULT_COLLECT_WORKERS,
 ) -> dict:
     """The cluster report: per named namespace, the report the namespace
     read gives for the kinds asked there (`kinds`, every namespaced kind
@@ -1214,7 +2247,7 @@ def report_cluster(
     base = [r for r in (kinds.split(KINDS_SEPARATOR) if kinds is not None else namespaced_resources()) if r]
     asked = {ns: list(dict.fromkeys(base + list(extra.get(ns) or []))) for ns in namespaces}
     every = list(dict.fromkeys(r for ns in namespaces for r in asked[ns]))
-    objects, events, fallback = collect_cluster(every)
+    objects, events, fallback = collect_cluster(every, workers=workers)
     resolver = resolver or ClusterNameResolver()
     scale = scale or ScaleResolver()
     reports: dict[str, dict] = {}
@@ -1222,7 +2255,15 @@ def report_cluster(
         # The objects in the order the per-namespace read lists them: kind
         # by kind as asked, each kind in the order the server gave.
         here = [o for r in asked[namespace] if r in objects for o in objects[r].get(namespace, [])]
-        findings = analyze(here, events.get(namespace, []) if events is not None else [], resolver, now, override_minutes, scale)
+        findings = analyze(
+            here,
+            events.get(namespace, []) if events is not None else [],
+            resolver,
+            now,
+            override_minutes,
+            scale,
+            workers=workers,
+        )
         reports[namespace] = {REPORT_NAMESPACE_KEY: namespace, REPORT_COUNT_KEY: stalled_object_count(findings), REPORT_FINDINGS_KEY: findings}
     return {REPORT_NAMESPACES_KEY: reports, REPORT_FALLBACK_KEY: fallback, REPORT_EVENTS_FALLBACK_KEY: events is None}
 
@@ -1253,8 +2294,17 @@ def main(argv: list[str] | None = None) -> int:
         help=f"stall age for every kind, replacing the default of "
         f"{DEFAULT_STALL_MINUTES} and the per-kind table {STALL_MINUTES_BY_KIND}",
     )
+    parser.add_argument(
+        WORKERS_FLAG,
+        type=int,
+        default=DEFAULT_COLLECT_WORKERS,
+        help=_WORKERS_HELP,
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args(argv)
+    if args.workers < MIN_COLLECT_WORKERS:
+        parser.error(_WORKERS_MIN_ERROR)
+    workers = _effective_workers(args.workers)
 
     if args.namespaces is not None:
         if not args.json:
@@ -1264,7 +2314,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--namespaces names no namespace")
         try:
             extra = parse_extra_kinds(args.extra_kinds)
-            report = report_cluster(namespaces, args.kind, extra, datetime.now(timezone.utc), args.threshold_minutes)
+            report = report_cluster(
+                namespaces,
+                args.kind,
+                extra,
+                datetime.now(timezone.utc),
+                args.threshold_minutes,
+                workers=workers,
+            )
         except (RuntimeError, ValueError) as exc:
             sys.stderr.write(f"error: {exc}\n")
             return EXIT_ERROR
@@ -1274,13 +2331,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--extra-kinds goes with --namespaces")
 
     try:
-        objects, events = collect(args.namespace, args.kind)
+        objects, events = collect(args.namespace, args.kind, workers=workers)
     except RuntimeError as exc:
         sys.stderr.write(f"error: {exc}\n")
         return EXIT_ERROR
 
     findings = analyze(
-        objects, events, NameResolver(), datetime.now(timezone.utc), args.threshold_minutes
+        objects,
+        events,
+        NameResolver(),
+        datetime.now(timezone.utc),
+        args.threshold_minutes,
+        workers=workers,
     )
     count = stalled_object_count(findings)
     if args.json:

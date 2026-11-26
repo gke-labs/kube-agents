@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -289,7 +290,11 @@ _REFUSAL_VERB_WORDS = 3
 # broker takes its place. No "credential proxy" prefix, for the same reason as
 # EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
 EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
+_EXEC_URL_NOTICE_LOCK = threading.Lock()
 _exec_url_notice_written = False
+# Fallback stderr line when an unexpected exception escapes `execute()` under
+# `execute_captured()`, mirroring a crashed shim process.
+_CAPTURED_EXEC_ERROR_LINE = "credential proxy: {kind}: {exc}\n"
 # A connection that closed once the request was sent: the command may have run,
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
@@ -549,7 +554,7 @@ class BrokerUnreachable(OSError):
     """No connection to the broker could be made, so no request reached it."""
 
 
-def exec_endpoints() -> tuple[str | None, str | None]:
+def exec_endpoints(*, err: io.TextIOBase | None = None) -> tuple[str | None, str | None]:
     """The broker an exec-role call goes to, and the one it falls back on.
 
     The exec tier when the operator set a well-formed URL, with the stateful
@@ -573,9 +578,11 @@ def exec_endpoints() -> tuple[str | None, str | None]:
             # reported when the call is made, as before this check.
             return exec_url, stateful or None
         global _exec_url_notice_written
-        if not _exec_url_notice_written:
-            print(EXEC_URL_IGNORED_NOTICE.format(name=EXEC_URL_ENV, reason=reason), file=sys.stderr)
-            _exec_url_notice_written = True
+        with _EXEC_URL_NOTICE_LOCK:
+            if not _exec_url_notice_written:
+                err_stream = sys.stderr if err is None else err
+                print(EXEC_URL_IGNORED_NOTICE.format(name=EXEC_URL_ENV, reason=reason), file=err_stream)
+                _exec_url_notice_written = True
         return stateful, None
     return stateful, None
 
@@ -1183,7 +1190,7 @@ def _replace_file(path: Path, text: str) -> None:
         raise
 
 
-def record_shell_context(context: str) -> bool:
+def record_shell_context(context: str, *, err: io.TextIOBase | None = None) -> bool:
     """Make `context` this command line's default for a kubectl naming no cluster.
 
     What gcloud does on a workstation -- the cluster you just fetched is
@@ -1197,6 +1204,7 @@ def record_shell_context(context: str) -> bool:
     convenience, not the command, so it is reported and not raised. The pin is
     recorded only in a folder that the caller owns (`_claim_callers_folder`).
     """
+    err_stream = sys.stderr if err is None else err
     keys = _shell_keys()
     if not keys:
         return False
@@ -1208,7 +1216,7 @@ def record_shell_context(context: str) -> bool:
         _claim_callers_folder(directory)
         _replace_file(path, context)
     except OSError as exc:
-        print(f"credential proxy: could not record the shell's context in {path}: {exc}", file=sys.stderr)
+        print(f"credential proxy: could not record the shell's context in {path}: {exc}", file=err_stream)
         # An earlier fetch's pin in this shell would otherwise stay in force
         # while the caller says the line reads the host.
         try:
@@ -1451,10 +1459,18 @@ def _record_registered_context(
     _replace_file(marker, "\n".join([*kept, f"{context} {file_digest} {env_digest}"]) + "\n")
 
 
-def _report_unopenable_lock(lock_path: Path, kubeconfig: Path, context: str, reason: OSError) -> None:
+def _report_unopenable_lock(
+    lock_path: Path,
+    kubeconfig: Path,
+    context: str,
+    reason: OSError,
+    *,
+    err: io.TextIOBase | None = None,
+) -> None:
     """Say that the kubeconfig's owner could not open its lock. Before the owner check came first
     in the merge, a root `kubectl --context` left a lock the agent user could not open, and the
     merge returned without a word."""
+    err_stream = sys.stderr if err is None else err
     try:
         owner = KUBECONFIG_LOCK_OWNER_NOTE.format(uid=lock_path.lstat().st_uid)
     except OSError:
@@ -1463,7 +1479,7 @@ def _report_unopenable_lock(lock_path: Path, kubeconfig: Path, context: str, rea
         KUBECONFIG_LOCK_UNOPENABLE_NOTICE.format(
             lock=lock_path, owner=owner, reason=reason.strerror or reason, context=context, kubeconfig=kubeconfig
         ),
-        file=sys.stderr,
+        file=err_stream,
     )
 
 
@@ -1473,6 +1489,8 @@ def _merge_context_into_kubeconfig_file(
     proxy_url: str,
     ca_file: str,
     token_file: str,
+    *,
+    err: io.TextIOBase | None = None,
 ) -> None:
     import fcntl
     import yaml
@@ -1508,7 +1526,10 @@ def _merge_context_into_kubeconfig_file(
     try:
         lock_fd = os.open(lock_path, lock_flags, KUBECONFIG_LOCK_MODE)
     except OSError as exc:
-        _report_unopenable_lock(lock_path, path, context, exc)
+        if err is None:
+            _report_unopenable_lock(lock_path, path, context, exc)
+        else:
+            _report_unopenable_lock(lock_path, path, context, exc, err=err)
         return
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -1613,7 +1634,7 @@ def _merge_context_into_kubeconfig_file(
             pass
 
 
-def merge_context_into_default_kubeconfig(context: str) -> None:
+def merge_context_into_default_kubeconfig(context: str, *, err: io.TextIOBase | None = None) -> None:
     """Register `context` in the default kubeconfig while preserving `current-context`."""
     proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
     if not proxy_url:
@@ -1631,9 +1652,14 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         if path in seen:
             continue
         seen.add(path)
-        _merge_context_into_kubeconfig_file(
-            path, context, proxy_url, ca_file, token_file
-        )
+        if err is None:
+            _merge_context_into_kubeconfig_file(
+                path, context, proxy_url, ca_file, token_file
+            )
+        else:
+            _merge_context_into_kubeconfig_file(
+                path, context, proxy_url, ca_file, token_file, err=err
+            )
 
 
 def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
@@ -1666,7 +1692,7 @@ def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
             )
 
 
-def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
+def rewrite_kubeconfig_for_kube_proxy(generated: str, *, err: io.TextIOBase | None = None) -> str:
     """Rewrite a `get-credentials` kubeconfig to route through `k8s-api-proxy`."""
     proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip()
     if not proxy_url:
@@ -1675,11 +1701,14 @@ def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
     target = parse_gke_context(context) if context else None
     if target is None:
         return generated
-    merge_context_into_default_kubeconfig(target.context_name)
+    if err is None:
+        merge_context_into_default_kubeconfig(target.context_name)
+    else:
+        merge_context_into_default_kubeconfig(target.context_name, err=err)
     return build_kube_proxy_kubeconfig(target.context_name, proxy_url=proxy_url)
 
 
-def land_implicit_kubeconfig(generated: str) -> None:
+def land_implicit_kubeconfig(generated: str, *, err: io.TextIOBase | None = None) -> None:
     """File a context-less get-credentials' kubeconfig, and say how to use it.
 
     gcloud on a workstation would have written the default kubeconfig and made
@@ -1698,6 +1727,7 @@ def land_implicit_kubeconfig(generated: str) -> None:
 
     Never changes the exit code: gcloud succeeded.
     """
+    err_stream = sys.stderr if err is None else err
     context = read_current_context(generated)
     target = parse_gke_context(context) if context else None
     if target is None:
@@ -1711,10 +1741,14 @@ def land_implicit_kubeconfig(generated: str) -> None:
     except OSError as exc:
         written = False
         refused = isinstance(exc, NotTheCallersFolder)
-        print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
+        print(f"credential proxy: could not write {path}: {exc}", file=err_stream)
     pinned = False
     if not os.environ.get("KUBE_PROXY_URL", "").strip():
-        pinned = record_shell_context(target.context_name)
+        pinned = (
+            record_shell_context(target.context_name)
+            if err is None
+            else record_shell_context(target.context_name, err=err_stream)
+        )
     lines = ["credential proxy: no --kubeconfig or KUBECONFIG was given."]
     if written:
         lines.append(f"  Credentials for {target.context_name} are in {path}.")
@@ -1735,10 +1769,10 @@ def land_implicit_kubeconfig(generated: str) -> None:
         lines.extend(OWN_KUBECONFIG_ADVICE_LINES)
     else:
         lines.append(f"    kubectl --context={target.context_name} ...")
-    print("\n".join(lines), file=sys.stderr)
+    print("\n".join(lines), file=err_stream)
 
 
-def report_task_kubeconfig(generated: str) -> None:
+def report_task_kubeconfig(generated: str, *, err: io.TextIOBase | None = None) -> None:
     """Say, in one line, what a get-credentials in a profile task did.
 
     Nothing is filed and no shell context is recorded: in a task neither is
@@ -1746,6 +1780,7 @@ def report_task_kubeconfig(generated: str) -> None:
     cluster and project), and `land_implicit_kubeconfig`'s advice -- the
     host cluster for later commands, `export KUBECONFIG` -- would be false.
     """
+    err_stream = sys.stderr if err is None else err
     context = read_current_context(generated)
     target = parse_gke_context(context) if context else None
     if target is None:
@@ -1753,7 +1788,7 @@ def report_task_kubeconfig(generated: str) -> None:
     print(
         f"credential proxy: credentials for {target.context_name} fetched; this profile task's kubectl and "
         "gcloud calls already target its cluster, so there is nothing to export.",
-        file=sys.stderr,
+        file=err_stream,
     )
 
 
@@ -1864,7 +1899,12 @@ def get_credentials_local_target(argv: list[str]) -> ClusterTarget | None:
 
 
 def answer_get_credentials_locally(
-    argv: list[str], destination: Path | None, implicit_destination: bool, endpoint: str
+    argv: list[str],
+    destination: Path | None,
+    implicit_destination: bool,
+    endpoint: str,
+    *,
+    err: io.TextIOBase | None = None,
 ) -> int | None:
     """Answer a get-credentials without the broker when the kube-api proxy is in use.
 
@@ -1886,6 +1926,7 @@ def answer_get_credentials_locally(
     own, so it costs at most GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS before
     `execute`'s own retries and fallback take the call.
     """
+    err_stream = sys.stderr if err is None else err
     if not os.environ.get("KUBE_PROXY_URL", "").strip():
         return None
     target = get_credentials_local_target(argv)
@@ -1905,17 +1946,23 @@ def answer_get_credentials_locally(
     # no endpoint yet; the broker's gcloud prints those.
     if not isinstance(cluster, dict) or cluster.get("status") != GET_CREDENTIALS_RUNNING_STATUS:
         return None
-    merge_context_into_default_kubeconfig(target.context_name)
+    if err is None:
+        merge_context_into_default_kubeconfig(target.context_name)
+    else:
+        merge_context_into_default_kubeconfig(target.context_name, err=err_stream)
     generated = build_kube_proxy_kubeconfig(target.context_name)
-    print(GET_CREDENTIALS_FETCHING_LINE, file=sys.stderr)
-    print(GET_CREDENTIALS_GENERATED_LINE.format(cluster=target.cluster), file=sys.stderr)
+    print(GET_CREDENTIALS_FETCHING_LINE, file=err_stream)
+    print(GET_CREDENTIALS_GENERATED_LINE.format(cluster=target.cluster), file=err_stream)
     if implicit_destination:
-        land_implicit_kubeconfig(generated)
+        if err is None:
+            land_implicit_kubeconfig(generated)
+        else:
+            land_implicit_kubeconfig(generated, err=err_stream)
     if destination is not None:
         try:
             _replace_file(destination, generated)
         except OSError as exc:
-            print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
+            print(f"credential proxy: could not write {destination}: {exc}", file=err_stream)
             return 1
     return 0
 
@@ -2027,7 +2074,14 @@ def _exit_status(exit_code: int) -> int:
     return _SIGNAL_EXIT_BASE - exit_code if exit_code < 0 else exit_code
 
 
-def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
+def record_write_refusal(
+    status: int,
+    payload,
+    route: str,
+    verb_words,
+    *,
+    err: io.TextIOBase | None = None,
+) -> None:
     """Append the worker's record of a definitive write refusal, when this answer is one.
 
     Only a 403 whose body carries the broker's ``write_refusal`` mark as true
@@ -2041,7 +2095,10 @@ def record_write_refusal(status: int, payload, route: str, verb_words) -> None:
     rule = payload.get(REFUSAL_RECORD_RULE)
     if not isinstance(rule, str) or not _REFUSAL_RULE_RE.match(rule):
         return
-    _append_refusal_record(rule, verb_words, route)
+    if err is None:
+        _append_refusal_record(rule, verb_words, route)
+    else:
+        _append_refusal_record(rule, verb_words, route, err=err)
 
 
 def record_kubectl_write_attempt(argv: list[str], exit_code: int) -> None:
@@ -2068,8 +2125,15 @@ def record_kubectl_write_attempt(argv: list[str], exit_code: int) -> None:
     _append_refusal_record(WRITE_ATTEMPT_RULE, list(verb), KUBE_PROXY_ROUTE)
 
 
-def _append_refusal_record(rule: str, verb_words, route: str) -> None:
+def _append_refusal_record(
+    rule: str,
+    verb_words,
+    route: str,
+    *,
+    err: io.TextIOBase | None = None,
+) -> None:
     """Append one write-refusal record to the file REFUSAL_FILE_ENV names, if set."""
+    err_stream = sys.stderr if err is None else err
     target = os.environ.get(REFUSAL_FILE_ENV, "").strip()
     if not target:
         return
@@ -2093,39 +2157,48 @@ def _append_refusal_record(rule: str, verb_words, route: str) -> None:
     try:
         fd = os.open(target, flags)
     except OSError as exc:
-        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=err_stream)
         return
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            print("credential proxy: the write refusal was not recorded (not a regular file)", file=sys.stderr)
+            print("credential proxy: the write refusal was not recorded (not a regular file)", file=err_stream)
             return
         # One write of one short line: an O_APPEND write lands whole.
         os.write(fd, line)
     except OSError as exc:
-        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=sys.stderr)
+        print(f"credential proxy: the write refusal was not recorded ({exc.strerror or type(exc).__name__})", file=err_stream)
     finally:
         os.close(fd)
 
 
-def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
+def _exec_refused(
+    exc: urllib.error.HTTPError,
+    payload: dict | None,
+    *,
+    err: io.TextIOBase | None = None,
+) -> int:
     """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
+    err_stream = sys.stderr if err is None else err
     if payload is None:
         # A traceback here would turn a transient sidecar blip into a shim
         # crash the agent cannot read.
         print(
             f"credential proxy error (HTTP {exc.code}): {NON_JSON_RESPONSE_TEXT}",
-            file=sys.stderr,
+            file=err_stream,
         )
         return 1
     # The far side composes the payload: a `code` that is not a string (a
     # list, an object) is not a refusal code, and must not raise out of here.
     if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
-        record_write_refusal(exc.code, payload, EXEC_ROUTE, payload.get("verb"))
+        if err is None:
+            record_write_refusal(exc.code, payload, EXEC_ROUTE, payload.get("verb"))
+        else:
+            record_write_refusal(exc.code, payload, EXEC_ROUTE, payload.get("verb"), err=err_stream)
         print(
             payload.get("message", "Command blocked for security reasons."),
-            file=sys.stderr,
+            file=err_stream,
         )
-        print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+        print(f"policy rule: {payload.get('rule', 'unknown')}", file=err_stream)
         # The verb the policy resolved and whether this was a local render:
         # the agent runtime's refusal stop reads these two lines.
         if isinstance(payload.get("verb"), list) and payload["verb"]:
@@ -2134,11 +2207,11 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
             # `verb` that is not a list has no words (a text would give its
             # letters, one for each word).
             words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
-            print(f"policy verb: {' '.join(words)}", file=sys.stderr)
+            print(f"policy verb: {' '.join(words)}", file=err_stream)
         if payload.get("local_render"):
-            print("policy render: local", file=sys.stderr)
+            print("policy render: local", file=err_stream)
         return EXIT_SECURITY_POLICY_BLOCKED
-    print(payload.get("error", str(exc)), file=sys.stderr)
+    print(payload.get("error", str(exc)), file=err_stream)
     return 1
 
 
@@ -2290,26 +2363,41 @@ def refusal_text(payload) -> str:
     return NON_JSON_RESPONSE_TEXT
 
 
-def report_retry(status: int, text: str, attempts_made: int, delay: float) -> None:
+def report_retry(
+    status: int,
+    text: str,
+    attempts_made: int,
+    delay: float,
+    *,
+    err: io.TextIOBase | None = None,
+) -> None:
     """One stderr line per wait, so the agent sees the shim is waiting, not hung.
 
     The attempt is numbered without a total: the deadline, not the count, ends
     a run of waited refusals, so "of 5" would promise attempts that cannot
     start.
     """
+    err_stream = sys.stderr if err is None else err
     next_attempt = attempts_made + 1
     print(
         f"credential proxy busy (HTTP {status}): {text}; retrying in {delay:.1f}s (attempt {next_attempt})",
-        file=sys.stderr,
+        file=err_stream,
     )
 
 
-def report_throttled(status: int, text: str, attempts_made: int) -> None:
+def report_throttled(
+    status: int,
+    text: str,
+    attempts_made: int,
+    *,
+    err: io.TextIOBase | None = None,
+) -> None:
     """The line the agent reads when the retries are spent, by count or by deadline."""
+    err_stream = sys.stderr if err is None else err
     noun = "attempt" if attempts_made == 1 else "attempts"
     print(
         f"credential proxy throttled: gave up after {attempts_made} {noun} (HTTP {status}): {text}",
-        file=sys.stderr,
+        file=err_stream,
     )
 
 
@@ -2322,7 +2410,14 @@ def execute(
     sleep_fn=time.sleep,
     rng=random,
     clock=time.monotonic,
+    out: io.TextIOBase | None = None,
+    err: io.TextIOBase | None = None,
 ) -> int:
+    # `out` and `err` default to this process's streams, read at call time;
+    # `execute_captured` passes buffers so an in-process caller gets the
+    # command's output back instead of it landing on sys.stdout/sys.stderr.
+    out_stream = sys.stdout if out is None else out
+    err_stream = sys.stderr if err is None else err
     # No `cwd`. The broker resolves a path against its own filesystem, and it
     # has no view of this one — so a directory sent from here would name either
     # nothing or, worse, a same-named directory of the broker's. Every command
@@ -2353,7 +2448,7 @@ def execute(
             print(
                 f"credential proxy: {', '.join(ignored)} not honoured for a profile task; "
                 "the task's cluster and project are used",
-                file=sys.stderr,
+                file=err_stream,
             )
     get_credentials = False
     try:
@@ -2374,13 +2469,17 @@ def execute(
             elif argv[0] == "kubectl" and not flag_pinned and not in_task:
                 context = implicit_kubectl_context(argv)
     except KubeconfigUnreadable as exc:
-        print(f"credential proxy: {exc}", file=sys.stderr)
+        print(f"credential proxy: {exc}", file=err_stream)
         return 1
     # With the kube-api proxy in use, a get-credentials that names its cluster
     # in full needs no broker call; a profile task's stays with the broker,
     # which holds the task's cluster.
     if get_credentials and not in_task:
-        answered = answer_get_credentials_locally(argv, destination, implicit_destination, endpoint)
+        answered = (
+            answer_get_credentials_locally(argv, destination, implicit_destination, endpoint)
+            if err is None
+            else answer_get_credentials_locally(argv, destination, implicit_destination, endpoint, err=err_stream)
+        )
         if answered is not None:
             return answered
 
@@ -2408,7 +2507,7 @@ def execute(
     except TokenUnavailable as exc:
         # Sending the request anyway would earn an undifferentiated 401 and
         # hide the real fault, which is a broken token projection.
-        print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
+        print(f"credential proxy token unavailable: {exc}", file=err_stream)
         return 1
     targets = [endpoint] + ([fallback] if fallback and fallback != endpoint else [])
     # The body, and the requestId in it, is built once: a fallback or a retry
@@ -2432,10 +2531,10 @@ def execute(
             # A URL with no scheme, such as a bare Service name: nothing was
             # sent, so a fallback is safe.
             if len(targets) > 1:
-                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                print(EXEC_FALLBACK_NOTICE, file=err_stream)
                 targets = targets[1:]
                 continue
-            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
+            print(f"credential proxy unavailable: {exc}", file=err_stream)
             return 1
         try:
             with open_broker_request(request) as response:
@@ -2447,23 +2546,23 @@ def execute(
                 except (ValueError, RecursionError):
                     print(
                         _UNREADABLE_ANSWER_LINE.format(status=response.status, what=NON_JSON_RESPONSE_TEXT),
-                        file=sys.stderr,
+                        file=err_stream,
                     )
                     return 1
                 if not isinstance(payload, dict):
                     shape = _NOT_AN_OBJECT_TEXT.format(type=type(payload).__name__)
-                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=sys.stderr)
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=shape), file=err_stream)
                     return 1
                 # Before anything of the answer is written.
                 unusable = _unusable_exec_answer(payload)
                 if unusable is not None:
-                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=unusable), file=sys.stderr)
+                    print(_UNREADABLE_ANSWER_LINE.format(status=response.status, what=unusable), file=err_stream)
                     return 1
             break
         except urllib.error.HTTPError as exc:
             payload = _refusal_payload(exc)
             if exc.shim_dropped:
-                print(_DROPPED_LINE.format(cause="while the refusal was read"), file=sys.stderr)
+                print(_DROPPED_LINE.format(cause="while the refusal was read"), file=err_stream)
                 return 1
             if exec_refusal_retryable(exc.code, exc.headers, payload):
                 # Refused before the command ran, so sending it again runs
@@ -2478,18 +2577,24 @@ def execute(
                     attempts_made, started, exc.headers.get(RETRY_AFTER_HEADER), rng, clock, deadline=deadline
                 )
                 if delay is None:
-                    report_throttled(exc.code, text, attempts_made)
+                    if err is None:
+                        report_throttled(exc.code, text, attempts_made)
+                    else:
+                        report_throttled(exc.code, text, attempts_made, err=err_stream)
                     return 1
-                report_retry(exc.code, text, attempts_made, delay)
+                if err is None:
+                    report_retry(exc.code, text, attempts_made, delay)
+                else:
+                    report_retry(exc.code, text, attempts_made, delay, err=err_stream)
                 sleep_fn(delay)
                 continue
-            return _exec_refused(exc, payload)
+            return _exec_refused(exc, payload) if err is None else _exec_refused(exc, payload, err=err_stream)
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, BrokerUnreachable) and len(targets) > 1:
-                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                print(EXEC_FALLBACK_NOTICE, file=err_stream)
                 targets = targets[1:]
                 continue
-            print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
+            print(f"credential proxy unavailable: {exc.reason}", file=err_stream)
             return 1
         except (http.client.InvalidURL, UnicodeEncodeError) as exc:
             # Raised while the connection, the request line or the Host header
@@ -2497,33 +2602,43 @@ def execute(
             # is safe. A reply is decoded, never encoded, so a UnicodeEncodeError
             # here is the request's own.
             if len(targets) > 1:
-                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                print(EXEC_FALLBACK_NOTICE, file=err_stream)
                 targets = targets[1:]
                 continue
-            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
+            print(f"credential proxy unavailable: {exc}", file=err_stream)
             return 1
         except (http.client.HTTPException, OSError) as exc:
             # The request was sent and the connection dropped: the command may
             # have run, so it is never sent again.
-            print(_DROPPED_LINE.format(cause=f"after the request was sent ({exc!r})"), file=sys.stderr)
+            print(_DROPPED_LINE.format(cause=f"after the request was sent ({exc!r})"), file=err_stream)
             return 1
 
-    sys.stdout.write(payload.get("stdout", ""))
-    sys.stderr.write(payload.get("stderr", ""))
+    out_stream.write(payload.get("stdout", ""))
+    err_stream.write(payload.get("stderr", ""))
     truncated = bool(payload.get("truncated"))
     # The exit code is for a cut payload. A broker older than the field says
     # only that a stream was cut, and that is read as the payload.
     stdout_cut = bool(payload.get("stdoutTruncated", truncated))
     if truncated:
-        print(_truncated_marker(payload, stdout_cut), file=sys.stderr)
+        print(_truncated_marker(payload, stdout_cut), file=err_stream)
     generated = payload.get("kubeconfig")
     if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
-        generated = rewrite_kubeconfig_for_kube_proxy(generated)
+        generated = (
+            rewrite_kubeconfig_for_kube_proxy(generated)
+            if err is None
+            else rewrite_kubeconfig_for_kube_proxy(generated, err=err_stream)
+        )
     if implicit_destination and generated:
         if in_task:
-            report_task_kubeconfig(generated)
+            if err is None:
+                report_task_kubeconfig(generated)
+            else:
+                report_task_kubeconfig(generated, err=err_stream)
         else:
-            land_implicit_kubeconfig(generated)
+            if err is None:
+                land_implicit_kubeconfig(generated)
+            else:
+                land_implicit_kubeconfig(generated, err=err_stream)
     if destination is not None and generated:
         # gcloud's own output, written where gcloud would have written it had it
         # run here. The agent never runs a command against this file — a later
@@ -2533,13 +2648,50 @@ def execute(
         try:
             _replace_file(destination, generated)
         except OSError as exc:
-            print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
+            print(f"credential proxy: could not write {destination}: {exc}", file=err_stream)
             return 1
     if stdout_cut:
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
     return _exit_status(payload[_EXEC_EXIT_CODE_FIELD])
+
+
+def execute_captured(
+    endpoint: str,
+    argv: list[str],
+    stdin: str | None = None,
+    *,
+    fallback: str | None = None,
+    sleep_fn=time.sleep,
+    rng=random,
+    clock=time.monotonic,
+) -> tuple[int, str, str]:
+    """`execute` for an in-process caller: (exit code, stdout, stderr).
+
+    What the shim would have printed is returned rather than written, so
+    concurrent callers in one process (stall_report's collector threads) never
+    share sys.stdout or sys.stderr. Never raises: an unexpected failure is exit
+    code 1 with the error on stderr, as the shim process would have exited.
+    """
+    out = io.StringIO()
+    err = io.StringIO()
+    try:
+        code = execute(
+            endpoint,
+            argv,
+            stdin,
+            fallback=fallback,
+            sleep_fn=sleep_fn,
+            rng=rng,
+            clock=clock,
+            out=out,
+            err=err,
+        )
+    except Exception as exc:  # noqa: BLE001 - mirror a crashed shim process
+        err.write(_CAPTURED_EXEC_ERROR_LINE.format(kind=type(exc).__name__, exc=exc))
+        code = 1
+    return code, out.getvalue(), err.getvalue()
 
 
 def _truncated_marker(payload: dict, stdout_cut: bool) -> str:

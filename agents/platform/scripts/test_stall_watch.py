@@ -3452,6 +3452,40 @@ class Knobs(Base):
             (stall_report.EXEMPT_ANNOTATION, stall_report.EXEMPT_VALUE, stall_report.EXEMPT_FIELD),
         )
 
+    def test_the_report_commands_pin_stall_report_to_one_worker(self):
+        self.assertEqual(stall_watch.REPORT_WORKERS_FLAG, stall_report.WORKERS_FLAG)
+        self.assertEqual(stall_watch.REPORT_WORKERS, stall_report.MIN_COLLECT_WORKERS)
+        self.assertEqual(stall_watch.SCAN_WORKERS * stall_watch.REPORT_WORKERS, stall_watch.SCAN_WORKERS)
+
+        for argv in (
+            stall_watch.report_argv("payments"),
+            stall_watch.report_argv("payments", "deployments"),
+            stall_watch.cluster_report_argv(["payments", "billing"], "deployments", {"billing": ["jobs"]}),
+        ):
+            idx = argv.index(stall_watch.REPORT_WORKERS_FLAG)
+            self.assertEqual(argv[idx + 1], str(stall_watch.REPORT_WORKERS), argv)
+
+        # Verify both cluster mode and per-namespace fallback emit --workers 1
+        # and stall_report.main() parses both argv forms cleanly.
+        _, fake = self.run_tick({"c": {"payments": [], "billing": ([DEADLINE_ROW], None)}}, fallback=["deployments"])
+        report_calls = [c[0] for c in fake.calls if c[0][0] == stall_watch.PYTHON_EXECUTABLE]
+        self.assertGreaterEqual(len(report_calls), 2)
+        for argv in report_calls:
+            idx = argv.index(stall_watch.REPORT_WORKERS_FLAG)
+            self.assertEqual(argv[idx + 1], str(stall_watch.REPORT_WORKERS), argv)
+
+        with patch.object(stall_report, "collect", return_value=([], [])) as mock_collect, \
+             patch.object(stall_report, "analyze", return_value=[]), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(stall_report.main(stall_watch.report_argv("payments", "deployments")[3:]), 0)
+        self.assertEqual(mock_collect.call_args.kwargs["workers"], 1)
+
+        cluster_out = {"namespaces": {"payments": {"namespace": "payments", "stalled_resources": 0, "findings": []}}, "fallback": [], "events_fallback": False}
+        with patch.object(stall_report, "report_cluster", return_value=cluster_out) as mock_rc, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(stall_report.main(stall_watch.cluster_report_argv(["payments"], "deployments", {})[3:]), 0)
+        self.assertEqual(mock_rc.call_args.kwargs["workers"], 1)
+
 
 class Output(Base):
     def test_a_dry_run_raises_no_alert_and_says_what_it_would_do(self):

@@ -6,7 +6,7 @@ f54367e57dcf160497961eb2595ac4243af552f5e2446f4c150b8a092ceff634  ./mcp.yaml
 fee36a13d34c4c7744a29947aee0edd3e790ff2b4a2e6a839bda9dd2cd6e5ae4  ./skills/gke-observability/SKILL.md
 6564450ff060d17e347fffd05faf7846c033dba4f0ca37d00c29307f7863c312  ./skills/gke-reliability/SKILL.md
 b108dbe5c87332f2502c9d60502df529b2ba99f2e5544cbe6cff64ef2ba3cfda  ./skills/gke-stall-detection/SKILL.md
-834acc85d7b85f897f66c91b073dc25002899f6c470bd7d1e69255f838fc8b3b  ./skills/gke-stall-detection/scripts/stall_report.py
+67467af7a07b6c968c7c3b997ee8d55aae39a32fb6e06a7d873985a924e07b62  ./skills/gke-stall-detection/scripts/stall_report.py
 597bbc7ed1a97e69f3b1d92fd264a5eb6f02a2bb337a414c94bb747a71322789  ./skills/gke-storage/SKILL.md
 93a3f54aea10abe919884fe3445a7f02b65cc0660ca52846d2d5cc447e87821d  ./skills/gke-workload-scaling/SKILL.md
 3d34287518a4fd9aa257fea48abd572b88462dbc3b324ee188877c81778618f4  ./skills/gke-workload-scaling/assets/hpa-example.yaml
