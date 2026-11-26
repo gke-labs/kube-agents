@@ -3,6 +3,7 @@ package hermesbridge
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -427,5 +428,37 @@ func TestPanic_CardWorkerCollectionMarksTheRunAndNamesItsTask(t *testing.T) {
 	out := logs.String()
 	if !strings.Contains(out, `"msg":"`+taskguard.LogMessage+`"`) || !strings.Contains(out, `"task":"task-card-panic"`) {
 		t.Fatalf("the recovery's Error record doesn't name the task:\n%s", out)
+	}
+}
+
+// The door's observation runs under run.mu, and a panic in it marks the run
+// before the lock is released (observeDelivery's own guard): a finalize
+// waiting on run.mu then sees the mark and publishes no answer. Without
+// that inner guard the deferred unlock runs first and the outer guard
+// marks the run only after, so a finalize that takes the lock in between
+// publishes the answer. Here a goroutine waits on run.mu in finalize's
+// place and reads the mark the moment it gets the lock.
+func TestPanic_ObservationMarksTheRunBeforeReleasingItsLock(t *testing.T) {
+	for i := range 20 {
+		b := &Bridge{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: make(map[string]*taskRun)}
+		run := &taskRun{origin: &lib.Envelope{TaskID: "task-observe-window"}, state: stateRunning}
+		run.act.Store(newActivityState(false))
+		saw := make(chan bool, 1)
+		b.observe = func(*activityState, hookDelivery) (ActivityEntry, bool, []stepmsg.Step) {
+			waiting := make(chan struct{})
+			go func() {
+				close(waiting)
+				run.mu.Lock()
+				defer run.mu.Unlock()
+				saw <- run.panicked.Load()
+			}()
+			<-waiting
+			time.Sleep(10 * time.Millisecond) // the goroutine is now blocked on run.mu
+			panic("injected panic in the door's observation")
+		}
+		b.takeDelivery(run, nil, &hookDelivery{Event: hookPreToolCall, SessionID: "a2a-observe-window"})
+		if !<-saw {
+			t.Fatalf("iteration %d: run.mu was released before the run was marked panicked; a finalize waiting on it would publish the answer", i)
+		}
 	}
 }

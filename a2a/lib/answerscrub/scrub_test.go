@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Synthetic values only: none of these is, or was copied from, a real
@@ -603,6 +604,117 @@ func TestSeenSecrets_RawSecretListItemsAreSecrets(t *testing.T) {
 	}
 }
 
+// A raw SecretList whose keys are sorted (jq -S), so its kind comes after
+// its items, still has its items read as Secrets when the text it starts
+// does not parse whole (output after it); a token Secret cut before its type has its
+// namespace left out, since it may be a service-account token's.
+func TestSeenSecrets_JSONKeyOrderDoesNotDecideWhatIsRead(t *testing.T) {
+	sorted := fmt.Sprintf(`{"apiVersion":"v1","items":[`+
+		`{"data":{"password":%q},"metadata":{"name":"app-db","namespace":"prod"},"type":"Opaque"}],`+
+		`"kind":"SecretList","metadata":{"resourceVersion":"1"}}`, b64(synthSecretPlain))
+	var s Seen
+	s.CollectToolResult(terminalResult(t, sorted+"\nsecret/app-db listed"))
+	if !s.Has(synthSecretPlain) {
+		t.Error("a sorted SecretList's kind-less item was not read as a Secret")
+	}
+
+	list := fmt.Sprintf(`{"apiVersion":"v1","items":[`+
+		`{"apiVersion":"v1","data":{"password":%q},"kind":"Secret","metadata":{"name":"app-db"},"type":"Opaque"},`+
+		`{"apiVersion":"v1","data":{"ca.crt":%q,"namespace":%q,"token":"c3ludGhldGlj`,
+		b64(synthSecretPlain), b64(synthSecretPlain2), b64(synthSANamespace))
+	var c Seen
+	c.CollectToolResult(terminalResult(t, list))
+	if !c.Has(synthSecretPlain2) {
+		t.Error("the cut item's whole pairs were not read")
+	}
+	if c.Has(synthSANamespace) {
+		t.Error("a Secret cut before its type had its namespace tracked")
+	}
+}
+
+// A comment line inside a YAML list item, at any column, does not end the
+// item: its data block after the comment is still read.
+func TestSeenSecrets_ACommentLineDoesNotEndAYAMLListItem(t *testing.T) {
+	doc := "apiVersion: v1\nkind: List\nitems:\n- apiVersion: v1\n  kind: Secret\n# the app's database login\n  metadata:\n    name: app-db\n  data:\n    password: " + b64(synthSecretPlain) + "\n"
+	var s Seen
+	s.CollectToolResult(terminalResult(t, doc))
+	if !s.Has(synthSecretPlain) {
+		t.Error("a comment line ended the list item before its data block")
+	}
+}
+
+// A data value with a trailing newline (a file's, echo's) is tracked as
+// its trimmed value's base64 too: an answer re-encoding the value has it.
+func TestSeenSecrets_ATrimmedDataValuesOwnBase64IsTracked(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain + "\n"})))
+	for _, v := range []string{b64(synthSecretPlain + "\n"), synthSecretPlain, b64(synthSecretPlain)} {
+		if !s.Has(v) {
+			t.Errorf("%q is not tracked", v)
+		}
+	}
+}
+
+// A JSON tool result's lines are not read as one run of text: a value at
+// a line's end does not run on into the next line, and a key does not take
+// the escape's n, so nothing tracked holds an escaped line break.
+func TestSeenSecrets_RawJSONIsNotReadAsOneLine(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, "status: ok\nsvc1_token: "+synthSecretPlain+"\nregion: us-east4\n"))
+	if !s.Has(synthSecretPlain) {
+		t.Fatal("the line's own value is not tracked")
+	}
+	for _, v := range s.Values() {
+		if strings.Contains(v, `\n`) || strings.Contains(v, "us-east4") {
+			t.Errorf("tracked a run-on value %q", v)
+		}
+	}
+}
+
+// A JSON env value whose escaped line break trails it is still paired with
+// its name, so an answer quoting it in that escaped spelling is redacted, as
+// it was before the raw JSON text stopped being read as one line. A value
+// with a break inside it is still not read across the break.
+func TestSeenSecrets_AnEnvValueWithATrailingEscapedBreakIsStillPaired(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"env":[{"name":"API_TOKEN","value":"`+synthSecretPlain+`\n"}]}`))
+	answer := `It is ` + synthSecretPlain + ` and "` + synthSecretPlain + `\n" here.`
+	if got := Scrub(answer, &s); strings.Contains(got, synthSecretPlain) {
+		t.Errorf("Scrub = %q, want both spellings redacted", got)
+	}
+	var inner Seen
+	inner.CollectToolResult(terminalResult(t, `{"env":[{"name":"API_TOKEN","value":"`+synthSecretPlain+`\nregion: us-east4"}]}`))
+	for _, v := range inner.Values() {
+		if strings.Contains(v, "us-east4") {
+			t.Errorf("tracked a run-on value %q", v)
+		}
+	}
+}
+
+// The pairing scan reads JSON in its own key order: an env-like entry
+// whose other keys sort between name and value is still paired, and a long
+// one-line result is scanned in linear time.
+func TestSeenSecrets_JSONPairingKeepsKeyOrderAndScalesLinearly(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"env":[{"name":"DB_PASSWORD","value":"`+synthSecretPlain+`","type":"literal"}],"note":"a\nb"}`))
+	if !s.Has(synthSecretPlain) {
+		t.Error("an env entry with a key sorting between name and value was not paired")
+	}
+	var env []map[string]any
+	for i := 0; i < 16000; i++ {
+		env = append(env, map[string]any{"name": fmt.Sprintf("FLAG_%d", i), "value": i%2 == 0})
+	}
+	b, _ := json.Marshal(map[string]any{"env": env})
+	start := time.Now()
+	var big Seen
+	big.CollectToolResult(terminalResult(t, string(b)+"\nnote: done"))
+	// Linear is a second or two even under -race; the quadratic scan this
+	// guards against took 7s on a quarter of this input without -race.
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("a %d-byte one-line result took %v", len(b), d)
+	}
+}
+
 // A quoted stringData value is read with its YAML escapes: a double-quoted
 // one's backslash escapes, a single-quoted one's doubled quotes.
 func TestSeenSecrets_QuotedYAMLStringDataIsUnescaped(t *testing.T) {
@@ -810,5 +922,103 @@ func TestSeenSecrets_AnExactJSONValueAlsoTracksItsTrimmedForm(t *testing.T) {
 		if got := Scrub(in, &s); got != want {
 			t.Errorf("answer %q = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// A table cell under a strong key whose value follows an auth-scheme word
+// and opens with a partial code span is tracked without the scheme word
+// (the seen set keeps no value with a blank in it, so a value taken with
+// "Bearer " in front would never be tracked), and with its markdown taken
+// out as well as written.
+func TestSeenSecrets_ATableValueAfterASchemeWordIsTrackedWithoutIt(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, "| Key | Value |\n|---|---|\n| api_token | Bearer `sy`nthtoken0001abcd |\n"))
+	if !s.Has("synthtoken0001abcd") || !s.Has("sy`nthtoken0001abcd") {
+		t.Fatalf("the value was not tracked; tracked: %q", s.Values())
+	}
+}
+
+// A credential-named env value after an auth-scheme word, with an escape in
+// it, is tracked as its escapes read as well as written, without the scheme
+// word either way.
+func TestSeenSecrets_AnEnvValueAfterASchemeWordIsTrackedAsItsEscapesRead(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"name": "API_TOKEN", "value": "Bearer synth\"token\"0001abcd"}`))
+	if !s.Has(`synth"token"0001abcd`) || !s.Has(`synth\"token\"0001abcd`) {
+		t.Fatalf("tracked: %q", s.Values())
+	}
+}
+
+// The trimmed value's own base64 is a spare form: tracking it never costs a
+// result a value it would have kept without it. One result's first Secret
+// value stays tracked after 22 more Secrets with two newline-ended values
+// each (44 such values, more than a third of the result's allowance).
+func TestSeenSecrets_TheTrimmedFormNeverEvictsAValue(t *testing.T) {
+	items := []string{fmt.Sprintf(`{"apiVersion":"v1","kind":"Secret","metadata":{"name":"first"},"type":"Opaque","data":{"password":%q}}`, b64("quietpasture-harbor"))}
+	for i := 0; i < 22; i++ {
+		items = append(items, fmt.Sprintf(`{"apiVersion":"v1","kind":"Secret","metadata":{"name":"s%d"},"type":"Opaque","data":{"a":%q,"b":%q}}`,
+			i, b64(fmt.Sprintf("synthfilevalue-a-%04d\n", i)), b64(fmt.Sprintf("synthfilevalue-b-%04d\n", i))))
+	}
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"apiVersion":"v1","kind":"List","items":[`+strings.Join(items, ",")+`]}`))
+	want := "The app logs in to the database with [redacted] today."
+	if got := Scrub("The app logs in to the database with quietpasture-harbor today.", &s); got != want {
+		t.Errorf("Scrub = %q, want %q", got, want)
+	}
+}
+
+// A value held only as a spare whose own add the target pool refuses stays
+// tracked as the spare: the spare is dropped only once the add succeeds.
+func TestSeenSecrets_ARefusedAddKeepsTheSpare(t *testing.T) {
+	var s Seen
+	for i := 0; i < seenShapePoolEntries/2; i++ {
+		s.AddShape(fmt.Sprintf("synthshapefill-%04d", i)) // the value and its base64
+	}
+	s.addEncoded(b64("synthfilevalue-0001\n"), s.newGen())
+	spare := b64("synthfilevalue-0001")
+	if !s.Has(spare) {
+		t.Fatalf("the spare form is not tracked; tracked %q", s.Values())
+	}
+	refused := s.refused
+	s.AddShape(spare) // the shape pool is full of earlier results' entries
+	if s.refused == refused {
+		t.Fatal("the shape pool did not refuse the add")
+	}
+	if !s.Has(spare) {
+		t.Error("a refused add dropped the spare: the value is tracked in neither form")
+	}
+}
+
+// Room for a later result is taken from earlier results' spares only:
+// every value those results would hold with no spare form stays tracked.
+func TestSeenSecrets_OnlySparesOfEarlierResultsAreEvicted(t *testing.T) {
+	var s Seen
+	a := s.newGen()
+	var aVals []string
+	for i := 0; i < 40; i++ {
+		v := fmt.Sprintf("synthfilevalue-a-%04d", i)
+		s.addEncoded(b64(v+"\n"), a)
+		aVals = append(aVals, v, b64(v+"\n"))
+	}
+	var others []string
+	for _, r := range []string{"b", "c"} {
+		g := s.newGen()
+		for i := 0; i < seenSecretResultEntries/2; i++ {
+			v := fmt.Sprintf("synthvalue-%s-%04d", r, i)
+			s.addPlain(v, true, g)
+			others = append(others, v, b64(v))
+		}
+	}
+	d := s.newGen()
+	for i := 0; i < seenSecretResultEntries/2; i++ {
+		s.addPlain(fmt.Sprintf("synthvalue-d-%04d", i), true, d)
+	}
+	for _, v := range append(aVals, others...) {
+		if !s.Has(v) {
+			t.Errorf("%q, a value kept with no spare form, was evicted", v)
+		}
+	}
+	if s.Has(b64("synthfilevalue-a-0000")) {
+		t.Error("no spare was evicted to make room: the test does not exercise eviction")
 	}
 }
