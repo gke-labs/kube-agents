@@ -1198,6 +1198,12 @@
 # as consistency-drift-outlier.
 ./tasks/consistency-kubelet-config-pool-outlier/task.yaml
 
+# Completed generated-name Job family grouping (#2900, #3005, #6955, #7098):
+# expected_fail: true until #6955 groups finished Jobs (`reindex-<uuid>` in
+# `seeded-family`, role `generated-name-job-family`) into one family finding
+# with parent-template `ttlSecondsAfterFinished` cleanup. deployer: noop.
+./tasks/cost-finished-job-family-grouped/task.yaml
+
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst
 # windows and GPU duty-cycle metrics delivered via GitOps PR. deployer: noop.
