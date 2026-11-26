@@ -67,6 +67,7 @@ const (
 
 	watcherStatusWatching    = "watching"
 	watcherStatusStarting    = "starting"
+	watcherStatusDegraded    = "degraded"
 	watcherStatusDisabled    = "disabled"
 	watcherStatusUnreachable = "unreachable"
 
@@ -420,10 +421,17 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 		}
 	}
 
+	unmanagedProfiles := map[string]bool{}
+	for _, u := range raw.Unmanaged {
+		if u.Profile != "" {
+			unmanagedProfiles[u.Profile] = true
+		}
+	}
+
 	identByProfile := map[string]upstreamProfileIdentity{}
 	identByProject := map[string][]upstreamProfileIdentity{}
 	for _, id := range raw.ProfileIdentities {
-		if id.Profile == "" || id.Project == "" || id.Cluster == "" {
+		if id.Profile == "" || id.Project == "" || id.Cluster == "" || unmanagedProfiles[id.Profile] {
 			continue
 		}
 		identByProfile[id.Profile] = id
@@ -432,7 +440,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 
 	profilesByProject := map[string][]string{}
 	for prof, proj := range raw.Profiles {
-		if prof == "" || proj == "" {
+		if prof == "" || proj == "" || unmanagedProfiles[prof] {
 			continue
 		}
 		profilesByProject[proj] = append(profilesByProject[proj], prof)
@@ -528,7 +536,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	extraProfsByProj := map[string][]string{}
 	for _, id := range raw.ProfileIdentities {
 		triple := [3]string{id.Project, id.Location, id.Cluster}
-		if seenClusters[triple] || skippedProjects[id.Project] || id.Project == "" || id.Cluster == "" {
+		if seenClusters[triple] || skippedProjects[id.Project] || unmanagedProfiles[id.Profile] || id.Project == "" || id.Cluster == "" {
 			continue
 		}
 		seenClusters[triple] = true
@@ -699,10 +707,15 @@ func buildWatcherStatus(ew *upstreamEventWatcher, scopeFetched, gatewayHealthy b
 				if ew.DiscoveryErrors > 0 {
 					detail += fmt.Sprintf(watcherDiscoveryErrorsFmt, ew.DiscoveryErrors, pluralWord(ew.DiscoveryErrors, wordError, wordErrors))
 				}
+				healthy := ew.ClustersTotal == 0 || ew.ClustersUp > 0
+				status := watcherStatusWatching
+				if !healthy {
+					status = watcherStatusDegraded
+				}
 				return scopeWatcherStatus{
 					Enabled:         true,
-					Healthy:         true,
-					Status:          watcherStatusWatching,
+					Healthy:         healthy,
+					Status:          status,
 					WatchSetReady:   true,
 					ClustersUp:      ew.ClustersUp,
 					ClustersTotal:   ew.ClustersTotal,
@@ -712,7 +725,7 @@ func buildWatcherStatus(ew *upstreamEventWatcher, scopeFetched, gatewayHealthy b
 			}
 			return scopeWatcherStatus{
 				Enabled:         true,
-				Healthy:         true,
+				Healthy:         false,
 				Status:          watcherStatusStarting,
 				WatchSetReady:   false,
 				ClustersUp:      ew.ClustersUp,

@@ -5853,26 +5853,26 @@
         }
         return projects
           .map((p) => {
-            const projID = p.id || p.project || "unknown";
+            const projID = p.id || "unknown";
             const projVia = Array.isArray(p.via)
               ? p.via.join(", ")
               : p.via || "scope";
             const pClusters = Array.isArray(p.cluster_rows)
               ? p.cluster_rows
-              : Array.isArray(p.clusters)
-                ? p.clusters
-                : [];
+              : [];
+            const discoveredCount =
+              typeof p.clusters === "number" ? p.clusters : 0;
+            const emptyClustersText =
+              discoveredCount > 0
+                ? `${discoveredCount} ${discoveredCount === 1 ? "cluster" : "clusters"} discovered, profiles pending (${p.outcome || "unknown"}).`
+                : `No clusters active in this project (${p.outcome || "unknown"}).`;
             const clustersHtml = pClusters.length
               ? pClusters
                   .map((c) => {
                     const idLine = [c.project, c.location, c.name]
                       .filter(Boolean)
                       .join(" / ");
-                    const profName =
-                      c.profile || c.slug || `cluster-${c.name || "default"}`;
-                    const cVia = Array.isArray(c.via)
-                      ? c.via.join(", ")
-                      : c.via || projVia || "scope";
+                    const profName = c.profile || "none yet";
                     const watchLabel = c.watching
                       ? " · Event watcher active"
                       : "";
@@ -5882,15 +5882,15 @@
                         : "";
                     return `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border-subtle, rgba(128,128,128,0.18));">
                       <div class="roster-card-head">
-                        <span class="roster-handle" style="font-size:12px;">${escapeHtml(idLine || c.name || profName)}</span>
+                        <span class="roster-handle" style="font-size:12px;">${escapeHtml(idLine || c.name || c.profile || "cluster")}</span>
                         ${scopeOutcomeBadgeHtml(c.outcome || p.outcome)}
                       </div>
-                      <div class="roster-status">Profile: ${escapeHtml(profName)} · via ${escapeHtml(cVia)}${escapeHtml(watchLabel)}</div>
+                      <div class="roster-status">Profile: ${escapeHtml(profName)} · via ${escapeHtml(projVia)}${escapeHtml(watchLabel)}</div>
                       ${rem}
                     </div>`;
                   })
                   .join("")
-              : `<div class="roster-status" style="margin-top:4px;">No clusters active in this project (${escapeHtml(p.outcome || "unknown")}).</div>`;
+              : `<div class="roster-status" style="margin-top:4px;">${escapeHtml(emptyClustersText)}</div>`;
             const projRem =
               p.outcome !== "ok" && p.remediation
                 ? `<div class="roster-status" style="margin-top:6px;color:var(--warn-fg, #b45309);">Onboarding hint: ${escapeHtml(p.remediation)}</div>`
@@ -5917,33 +5917,45 @@
       }
 
       function renderAlertsEmptyStateHtml(scopeData) {
-        const ew = (scopeData && scopeData.event_watcher) || {};
+        const hasWatcher = Boolean(scopeData && scopeData.event_watcher);
+        const ew = (hasWatcher && scopeData.event_watcher) || {};
         const sch = (scopeData && scopeData.schedule) || {};
         const isWatching =
-          Boolean(ew.watch_set_ready) ||
-          (ew.status === "watching" && Boolean(ew.healthy));
+          hasWatcher && ew.status === "watching" && Boolean(ew.healthy);
         const isStarting =
+          hasWatcher &&
           !isWatching &&
           Boolean(ew.enabled) &&
-          (ew.status === "starting" || Boolean(ew.reachable));
-        const ewBadgeCls = isWatching
-          ? "badge-green"
-          : ew.enabled
-            ? "badge-amber"
-            : "badge-grey";
-        const ewBadgeLabel = isWatching
-          ? "Watching"
-          : ew.enabled
-            ? isStarting
-              ? "Starting"
-              : "Unreachable"
-            : "Disabled";
+          ew.status === "starting";
+        const isDegraded =
+          hasWatcher &&
+          !isWatching &&
+          Boolean(ew.enabled) &&
+          ew.status === "degraded";
+        const ewBadgeCls = !hasWatcher
+          ? "badge-grey"
+          : isWatching
+            ? "badge-green"
+            : ew.enabled
+              ? "badge-amber"
+              : "badge-grey";
+        const ewBadgeLabel = !hasWatcher
+          ? "Loading"
+          : isWatching
+            ? "Watching"
+            : ew.enabled
+              ? isStarting
+                ? "Starting"
+                : isDegraded
+                  ? "Degraded"
+                  : "Unreachable"
+              : "Disabled";
         const ewDetail =
           ew.detail ||
           "Kubernetes Event Watcher streams Warning events into # alerts as they occur.";
         const nextName = sch.next_audit_name || "Daily fleet audit";
         const nextAt = sch.next_audit_at || "";
-        const windowUtc = sch.window_utc || sch.daily_window_utc || "";
+        const windowUtc = sch.window_utc || "";
         let nextTimeText = windowUtc
           ? `Daily window ${windowUtc}`
           : "Daily window 06:20–09:20 UTC";
