@@ -6,7 +6,8 @@
 # the PR's images and deploys the kube-agents chart onto that cluster.
 #
 # Setting RC_COMMIT_SHA switches it to the release-candidate path: no build at
-# all, and the chart's published GHCR images at that commit instead. Section 2a
+# all, and the candidate's published images at that commit instead, from the
+# registry get_registry_prefix names (GHCR unless told otherwise). Section 2a
 # is the whole of the difference, and with the variable unset nothing below
 # behaves differently from the day this line was added.
 #
@@ -990,12 +991,16 @@ eval_run_tags_helm_args
 # hack/resolve-rc-target.sh produces the value and documents why the caller, not
 # this script, checks the tree out at that commit.
 #
-# The two paths differ in registry AND in image name: Artifact Registry carries
-# `kube-agents-operator`, the published one is `k8s-operator`. That is why the
-# RC path drops the repository overrides rather than rewriting them — the chart
-# already defaults every image to the published GHCR path, so only the tag has
-# to be said. The same drop is what carries the credential-proxy sidecar across:
-# it is not a chart value at all, the operator derives it from the agent image by
+# The two paths differ in registry AND in image name: the leased project's
+# Artifact Registry carries `kube-agents-operator`, the published one is
+# `k8s-operator`. That is why the RC path drops the repository overrides rather
+# than rewriting them — the chart already defaults every image to its published
+# name on GHCR, so only the tag has to be said. When the registry the candidate
+# was published to is not that default (whatever get_registry_prefix returns
+# that is not DEFAULT_REGISTRY_PREFIX), the RC path says the registry once, as global.imageRegistry, which the chart puts in
+# front of every first-party image's published name; the names stay the
+# chart's. The same drop is what carries the credential-proxy sidecar across:
+# it is not a chart value this lane sets, the operator derives it from the agent image by
 # rewriting the trailing path element and keeping the tag
 # (resolveCredentialProxyImage in k8s-operator/internal/controller/
 # platformagent_manifests.go), so it follows whichever repository the agent uses
@@ -1067,6 +1072,12 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     # one, so the tag is the whole of it.
     --set-string "webConsole.image.tag=${TAG}"
   )
+  # Only when the candidate's registry is not the chart's default: the check
+  # above asked RC_REGISTRY_PREFIX, so the install has to pull from it too, or
+  # the run verifies one registry and installs from another.
+  if [ "${RC_REGISTRY_PREFIX}" != "${DEFAULT_REGISTRY_PREFIX}" ]; then
+    IMAGE_ARGS+=(--set-string "global.imageRegistry=${RC_REGISTRY_PREFIX}")
+  fi
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
   IMAGE_ARGS=(
@@ -1503,7 +1514,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
   # A CA, not any certificate: the grader verifies strictly, so a leaf or a
   # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
   if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null)"; then
-    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh (kube-agents#3682)." >&2
     exit 1
   fi
 elif [ -s "${FORGE_CA_FILE}" ]; then

@@ -1,13 +1,15 @@
 // Package tokenreview is a k8sapiproxy.CallerAuthenticator that admits a caller whose bearer
-// token a Kubernetes TokenReview accepts for a configured audience. It lives outside the core
-// package so an embedder that authenticates callers another way does not import client-go or
-// the API server's authenticator and token-cache packages.
+// token a Kubernetes TokenReview accepts for a configured audience, from the pod the token was
+// issued to (podbinding.go). It lives outside the core package so an embedder that
+// authenticates callers another way does not import client-go or the API server's
+// authenticator and token-cache packages.
 package tokenreview
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"k8s.io/apiserver/pkg/authentication/token/cache"
 	"k8s.io/apiserver/pkg/authentication/user"
 	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
@@ -41,7 +44,8 @@ var errNotAuthenticated = errors.New("the caller's token was not accepted")
 // Config configures NewAuthenticator.
 type Config struct {
 	// Kubernetes reaches the API server that reviews caller tokens, as the proxy's own
-	// identity, which needs create on tokenreviews. Required; rest.InClusterConfig in a pod.
+	// identity, which needs create on tokenreviews, and get on pods in every namespace whose
+	// pods call the proxy (see podBinder). Required; rest.InClusterConfig in a pod.
 	Kubernetes *rest.Config
 	// Audience is the audience a caller's token must be issued for. Set it to one the API
 	// server does not accept, so a token sent to the proxy cannot be used against the API
@@ -56,20 +60,27 @@ type Config struct {
 	// AudienceCallers binds additional audiences to their own allowed caller usernames, so a
 	// caller admitted for one audience cannot authenticate with another audience's token.
 	AudienceCallers map[string][]string
-	// CacheTTL is how long a review is reused; defaultTokenReviewCacheTTL when zero.
+	// CacheTTL is how long a review is reused; defaultTokenReviewCacheTTL when zero. A
+	// caller pod's addresses are reused for the same time, at most maxPodLookupTTL.
 	CacheTTL time.Duration
+	// Logger receives the line that says the proxy may not read a caller's pod; slog.Default()
+	// when nil.
+	Logger *slog.Logger
 }
 
 type tokenReviewAuthenticator struct {
 	audiences         authenticator.Audiences
 	allowedByAudience map[string]sets.Set[string]
 	bearer            authenticator.Request
+	pods              *podBinder
 }
 
 // NewAuthenticator returns a k8sapiproxy.CallerAuthenticator that accepts a bearer token in
 // the Authorization header when a TokenReview finds it valid for a configured audience and
-// its user is in that audience's allowed caller set. Reviews that accept or refuse the
-// token are cached for cfg.CacheTTL; a review that fails is not.
+// its user is in that audience's allowed caller set, and the request comes from the pod the
+// token was issued to: the TokenReview names the pod, and the request's direct peer has to be
+// one of that pod's addresses (podBinder). A token that names no pod is refused. Reviews that
+// accept or refuse the token are cached for cfg.CacheTTL; a review that fails is not.
 func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 	if cfg.Kubernetes == nil {
 		return nil, errors.New("tokenreview: Config.Kubernetes is required")
@@ -179,11 +190,16 @@ func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tokenreview: TokenReview client: %w", err)
 	}
+	pods, err := corev1client.NewForConfig(kc)
+	if err != nil {
+		return nil, fmt.Errorf("tokenreview: pod client: %w", err)
+	}
 	review := &tokenReviewer{reviews: client.TokenReviews()}
 	return &tokenReviewAuthenticator{
 		audiences:         audiences,
 		allowedByAudience: allowedByAudience,
 		bearer:            bearertoken.New(cache.New(review, false, ttl, ttl)),
+		pods:              newPodBinder(pods, ttl, cfg.Logger),
 	}, nil
 }
 
@@ -206,6 +222,12 @@ func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapi
 	}
 	if !allowed {
 		return nil, fmt.Errorf("caller %q is not allowed", name)
+	}
+	// Refused like an unknown token, a 401, whatever the cause: an API error here must not
+	// become a 503 the caller retries past. Final in a chain: the token is a pod's, accepted
+	// by the TokenReview, and no other authenticator may admit it from somewhere else.
+	if err := a.pods.check(r.Context(), r.RemoteAddr, resp.User); err != nil {
+		return nil, fmt.Errorf("%w: caller %q: %w", k8sapiproxy.ErrCallerRefused, name, err)
 	}
 	return &k8sapiproxy.CallerIdentity{Username: name, UID: resp.User.GetUID(), Groups: resp.User.GetGroups()}, nil
 }
@@ -235,8 +257,15 @@ func (t *tokenReviewer) AuthenticateToken(ctx context.Context, token string) (*a
 		return nil, false, nil
 	}
 	u := result.Status.User
+	var extra map[string][]string
+	if len(u.Extra) > 0 {
+		extra = make(map[string][]string, len(u.Extra))
+		for k, v := range u.Extra {
+			extra[k] = []string(v)
+		}
+	}
 	return &authenticator.Response{
-		User:      &user.DefaultInfo{Name: u.Username, UID: u.UID, Groups: u.Groups},
+		User:      &user.DefaultInfo{Name: u.Username, UID: u.UID, Groups: u.Groups, Extra: extra},
 		Audiences: got,
 	}, true, nil
 }

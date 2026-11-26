@@ -360,6 +360,38 @@ no worker has as running, and the inject door hands every edit to the eval harne
 fallback post would be worse again, since both read every unedited post of a task as its
 output.
 
+**The waiting notice.** A delegated child's line gets the same kind of notice from the reap
+scan, since a child is minted by the session and no turn is there to count for it. It is for a
+single child of an AgentProfile (one with a tier) that holds the conversation's active task:
+a fan-out child doesn't hold the active task (a status ask lists it as `waiting to start`), and a platform child has no profile queue to
+wait in. A child whose line is still at submitted between 30 seconds after its submission and
+the first-event grace, with nothing on its stream (probeTask, the never-started test), has its
+own line edited to "⏳ **waiting** — the cluster agent hasn't started on this yet", with "; N
+other requests sent through me are waiting for it too" when there are others. The scan runs
+every minute, so the notice lands 30 to 90 seconds in. It claims no cause: busy workers, a
+dispatcher queue, a cold pod and a dispatcher that is down all look the same from the gateway,
+which sees only an empty stream. The line leaves out the "(delegated to …)" note the relay
+renders, since it names the profile already; the relay's first render past submitted puts it
+back. N is this gateway's other children for the same profile and tier, single or fan-out,
+not cancelled or ended, inside their own grace (`A2A_FIRST_EVENT_GRACE`, or the fan-out
+queue allowance below), with empty streams. The grace filter matters: past it an empty
+stream is a child that never started and was released, or one whose events aged out of the
+stream, and session records keep both for a week. It is counted once per profile and tier per
+reap pass from the session records and the stream, not from relay state. The record is marked
+(`waitingNoticeAt`, with the count) before the edit, and the line is edited again only when the
+count or the line changes. The edit is made under the conversation's session lock and only
+while the line is still submitted, and sets the relay's `busyShown` so its own submitted render
+doesn't replace it; its first edit past submitted does. A restart drops the relay's render
+state; since the stream was just read empty, a child with none is taken as still submitted
+and given fresh state as the relay would give it, so the notice and the close below survive a
+rollout. Doors that read the line as data (`busyNoticeBackend`, by the delegating turn's
+backend) get none. At the first-event grace, a line that carries the notice is closed in place
+to "⚠️ **didn't start** — the cluster agent didn't start on this in 10 minutes; ask again to
+start a new request" instead of the grace's separate post, so no
+⏳ is left on a line nothing will move. A child first seen past the grace, after an outage, gets
+no notice and the grace's post as before. The grace itself, its marker and its release are
+unchanged, and nothing is published.
+
 ## The Delegate flow (added 8/31)
 
 A turn starting with the word "delegate" plus a separator routes that one task to a
@@ -717,7 +749,9 @@ entry of the chain), and never names the child or the wake: no start, accept, de
 terminal under either id. The turn that delegated ends quietly, and the root's one deliverable and
 terminal come at the chain's end - the wake's result, then the wake's terminal, in that order; when
 no wake runs, the root ends `canceled` for a requester's `stop` and `failed` with
-`reason: wake-not-started - …` otherwise, with nothing delivered. The hand-off line
+`reason: wake-not-started - …` otherwise, with nothing delivered. The gateway logs the
+wake-not-started end as a second `task terminal` line under the root's id: its `state` is `failed`
+and its `source` is `gateway-chain-end`, a source only the log carries. The hand-off line
 (`delegated to <addressee>`) is never a deliverable: a session turn whose stream carries a delegate
 request and which minted no child ends the root `failed`, with nothing delivered -
 `reason: delegation-refused - <the room's notice>` when the gateway refused it, and
@@ -772,11 +806,45 @@ in the KV only) and its pseudonymized attribution, so a child minted later and t
 it run under the turn that asked. Working
 state richer than the transcript primer rehydrate builds today - what the session has
 discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
-conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
-paid.
+conversation is a resumed agent.
+
+A new conversation's first turn takes a warm pod when one is ready, so it skips scheduling and
+the image pull; every later turn pays the harness start as before. On the session route the
+leader gateway keeps `A2A_WARM_SESSIONS` warm pods (`spec.harness.tuning.warmSessions`, default 1,
+0 off; the operator renders the variable only where the install resolves to the session route,
+so on platform no warm pod runs), at most
+the cap less one and fewer while live sessions fill the cap (`a2a/gateway/warm_pool.go`). A warm
+pod is the session pod `Spawn` builds, created through the same CREATE-only path and admission
+policy, with no task or conversation annotation and an `a2a.kubeagents.dev/warm` mark. It has a
+freshly minted name, never one `TASKS` holds anything for (a minted name can repeat an earlier
+pod's within the stream's retention, so the pool mints again), and its adapter starts without
+`TASK_ID` (`A2A_SESSION_WARM`), opens its task watcher on its own `…in` subjects reading only
+what is published from then on, and reports Ready once the watcher's consumer exists,
+from a loopback endpoint that keeps answering for the pod's life. It carries a digest of the
+spec it was made with (`a2a.kubeagents.dev/warm-shape`), so after a release or a config change
+the old pods are never claimed and the pool replaces them. A
+session pod's bus identity is its name, so the gateway claims a warm pod by setting the
+record's bus session and addressee to the pod's name instead of minting one. Nothing is
+re-bound: the capability names the pod, and its grants are what a fresh spawn under that
+name gets, so an unclaimed pod can run nothing. Only a session-routed conversation with no
+earlier turn claims one (a warm pod has no primer, which is read once at start), never a
+one-shot Delegate, and with none ready the turn spawns cold. A pod `TASKS` holds anything for
+on its subjects (anything published within the stream's retention) is never claimed, whatever
+the claim index says, and counts as a live session. The gateway cannot patch the
+pod, so the claim goes in the session-state bucket (`warm.<pod>` naming the conversation),
+and the cap count, the cap eviction and both sweeps read the claim in place of the
+annotations; an unclaimed warm pod holds no cap slot and is no stranded orphan. The pool
+replaces an unclaimed pod at 25 minutes; its adapter exits unclaimed at 30, which is what
+frees it under a gateway that predates the pool, whose sweep deletes an ended pod with no
+task annotations. A claimed pod has no such bound there: it lasts until its conversation is
+reaped or its deadline, and that gateway's cap counts it but its eviction can't choose it, since
+the pod carries no session key and the gateway can't patch one on. A warm pod's deadline is
+that 30 minutes plus a reused pod's lifetime, and a claimed pod takes turns only as long as one
+spawned at the claim would (`podClaimedAt` on the record). Each warm pod takes one `TASKS` consumer and one pod in the session quota, and warm pods use only consumers the session cap leaves spare (`status.effectiveWarmSessions`): the cap is fitted as before, and a stream with none spare runs without a warm pod rather than losing a session. A new `TASKS` is created with room for them. Recycling is quiet: the readiness probe waits out the adapter's start rather than failing during it, and the pool and the sweep log at info and record no Event. On Autopilot without Pod bursting a warm pod is billed at the per-Pod minimum of 250m and 512Mi.
 
 What this costs is pods: one per live conversation, bounded by the session cap and the
-idle TTL. That is the figure to measure before the default flips.
+idle TTL, and the warm pods, one session pod's requests each. That is the figure to measure
+before the default flips.
 
 ## Routing to AgentProfiles (added 10/28)
 
@@ -856,14 +924,24 @@ head may start one child of its own profile; when its target lies outside the pa
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
 (`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
-contradicts the parent's carried chain (`delegation.parent-chain-mismatch`). A parent that runs at `unattended`
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent's profile doesn't delegate
+(`delegation.profile-not-delegating`: its card lacks `delegates`, from AgentProfile `spec.delegates`, so an operator's card
+from before the field fails closed). A parent that runs at `unattended`
 (a scheduled run) may delegate (#6744): its children are minted at `read`, as fresh roots held to the
 parent's scope by the checks above, and carry no trigger, so only the parent writes under the schedule's
 trigger. A child below a scheduled run, at any depth, goes only to a profile whose card lists `unattended`
 (`delegation.unattended-child`): its owner has agreed to scheduled work. The check reads a `scheduled` mark the
 child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
-end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
-reads while it waits open, and the parent holds the conversation again, so a stop or a steer
+end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
+`delegationRefused` one (#4860), which the parent reads while it waits open. Every request the gateway handles
+for a profile task uses one of its delegation rounds, minted or refused, and a request once the task has used
+them is refused (`delegation.rounds`), with a notice that says how many it used, on its `.in` with `round` set
+to the round it would have been. It mints nothing, records nothing, and ends none of the wait on the earlier
+request's children. The rounds are `A2A_DELEGATION_ROUNDS_MAX`, 1 by default and 1 at most for now: the
+gateway clamps anything above 1 to 1 at startup and logs a warning naming the variable, saying rounds above 1
+are not supported yet, until a profile task's later rounds ship. The operator renders it onto the gateway
+explicitly at 1, and refuses any other value it carries, in its startup log; the chart's
+`operator.delegation.roundsMax` takes only 1. At the default, the parent's second request is the one refused. The parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
 chain's end, delegated or not. A stop while the child runs cancels the child and every profile
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
@@ -875,7 +953,26 @@ queued runs when a slot frees, or is refused at its queue timeout. The cards are
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
-cards, for the delegate tool the worker adapter serves to name in its addressee description. The
+cards, for the delegate tool the worker adapter serves to name in its addressee description. So
+does a delegating profile's own task (#6789): a submission to a profile whose card says it
+delegates, that is neither a child nor a wake, carries the profiles the delegation would accept from
+it and the width (`A2A_DELEGATION_WIDTH_MAX`, the setting a wider batch is refused under), and the rounds
+(`roundsMax`, from `A2A_DELEGATION_ROUNDS_MAX`) when they are over one. The list
+runs the delegation's own checks on each profile, so it doesn't offer one the delegation refuses
+whatever cluster it is given: not `platform`, not a profile outside a cluster-scoped parent's
+cluster, only profiles that run at `read` and list `unattended` for a parent below a scheduled run,
+and nobody for a parent refused outright, such as one at the depth cap. The checks that depend on
+the cluster the worker picks for a profile that takes a target (that it is in scope, and a profile
+pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the delegation, which
+still refuses there. A scheduled run of a delegating profile carries the list too, built
+the same way when the trigger ingress submits it. Beside the list, under the same gate, rides the
+`scopeClusters` part (`spec-a2a-payloads.md`): one page of the clusters a `cluster` child would be
+accepted for, from the resolved scope's `clusters` map, each held to the delegation's own scope check
+and the parent's scope (a profile's tiers and pins are left to the delegation), with the count, a
+reserved empty cursor, the projects in scope whose clusters are listed elsewhere (explicit and
+management projects, members not yet listed), and `unknown` with `truncated` when the document
+isn't `ok` or carries no map (dropped for its 900 KiB budget, or absent), or when the scope draws no boundary. The
+delegate tool names the page once in its own description when an agent on the list takes a cluster. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
@@ -886,15 +983,6 @@ whether its card declares them or not.
 
 The session manager is the demo's chatops code generalized from one-shot workers to
 long-lived sessions. Four operations:
-
-The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
-operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
-to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
-the operator or the gateway doesn't know falls back to that default rather than stopping the shared
-gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
-error at start. Every session
-pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
-on the worker's isolation waiver.
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 150m/320Mi requests by default, set by
@@ -926,6 +1014,15 @@ never started, its lifetime has no room left for a whole task, or the read that 
 fails. The old pod is retired as before. `A2A_SESSION_REUSE=false` on the gateway turns reuse off,
 for running pods too, and every turn spawns.
 
+The session pod's harness follows the PlatformAgent's `spec.harness.sessionWorker.type`. The
+operator renders a value it supports on the gateway as `A2A_SESSION_HARNESS`, and the gateway passes it
+to each session pod as `A2A_HARNESS`; unset adds nothing and the worker runs Claude Code. A value
+the operator or the gateway doesn't know falls back to that default rather than stopping the shared
+gateway: the operator writes the `SessionHarness` condition and a Warning event, and the gateway logs an
+error at start. Every session
+pod also carries `A2A_HARNESS_UNISOLATED` set empty, so a worker image's own environment can't turn
+on the worker's isolation waiver.
+
 **Stream.** The shim consumes envelopes addressed to its session, feeds them to the
 harness, and maps the stream-json output to `status-update` and `artifact-update` events.
 The gateway relays events to the conversation. The gateway never parses harness output;
@@ -951,9 +1048,10 @@ session, or a task that ended without its terminal reaching the bus, ends the pr
 waiting for the next task: the pod reaches a terminal phase, Sweep closes what is owed, and the
 next turn starts cold with the primer.
 
-**Reap.** Idle TTL since the last user message (30 minutes, config-backed). The record's
+**Reap.** Idle TTL since the last user message (30 minutes, config-backed; `spec.harness.tuning.sessionIdleMinutes`). A single-turn DM, a `dm` conversation whose current pod has taken at most one human turn and no steer (a delegation's wake is not a turn; a follow-up steered into the running task is), is reaped at the shorter DM idle TTL instead (5 minutes, `dmSessionIdleMinutes`, never longer than the idle TTL; #2371): under sessions by default most DMs are one question, and each would otherwise hold a pod and a cap slot for the full TTL after its answer. The record's
 `lastUserMessage` is the clock: every verified turn moves it, and the answer to that turn does
-not. Reaping is deleting the pod. Nothing is saved first, because
+not, except under the DM idle TTL, where the clock starts at the later of the message and the
+answer, so a task that ran longer than that TTL still leaves time to follow up. Reaping is deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
 The KV entry stays while active, holding the `contextId`. To bound bucket growth, an
 idle session whose pod has been reaped and whose last activity is older than `A2A_SESSION_TTL`
@@ -998,12 +1096,13 @@ first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one lin
 conversation saying so. Both subjects, not just `…events`: the fold reads them together,
 and assertion 9 exists because a task whose only event is its supervisor's terminal is not
 empty, unless that terminal is a five-token one on a profile task stored after the
-install's `A2A_PROFILE_SUPERVISOR_CUTOFF`, which is not folded, so the task is empty. That release publishes no terminal: age alone is not
+install's `A2A_PROFILE_SUPERVISOR_CUTOFF`, or at a time the server doesn't give, which is not folded, so the task is empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
 named here rather than papered over. A human who waits rather than writes is told too: the reap scan
 posts one line once the grace has passed with nothing on the stream, naming the task and
-saying the next message starts a new task. It marks the active-task record before it
+saying the next message starts a new task (a delegated child's line that carries the waiting
+notice above is closed in place instead). It marks the active-task record before it
 posts, so the line goes out at most once per task, across gateway restarts, and it
 releases nothing; the release stays with the next turn, which reads the stream again
 first. The line is for a placeholder somebody may still be watching, so it has a ceiling:
@@ -1558,7 +1657,7 @@ terminal status message the bridge and the worker adapter write as `reason: <tok
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
-`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `internal-panic`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-cli-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
@@ -2923,7 +3022,7 @@ one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the 
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
 (`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
-escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat adapter draws it too (below); Discord and the console ignore it. A tap is never a turn,
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat and Teams adapters draw it too (below, and "The Teams adapter"); Discord and the console ignore it. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -2953,7 +3052,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
+member id, Google Chat email or Teams sender id, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -3075,6 +3174,9 @@ turns it off with `spec.integration.googleChat.answerFeedback: false` (default `
 operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. Either name is
 one switch for every backend the gateway holds (`AnswerFeedbackOff`); a tap or note
 click on a Google Chat message already posted is logged and acked and changes nothing.
+Teams has no CR field yet: `A2A_TEAMS_ANSWER_FEEDBACK=false` on the controller-manager Deployment
+is carried to a gateway that holds Teams under the same name (`a2aTeamsAnswerFeedbackEnvVar`),
+and is the same one switch.
 
 ## The Teams adapter (added 11/16)
 
@@ -3163,6 +3265,24 @@ and the answer on the line are the ones "Who may press Stop" and "The Stop butto
 plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`
 is the way to stop there. A typed `stop` on a task with a line is answered on the line as a
 press is (`isChatTypedStop`), so a line never keeps a live button beside a posted "cancel sent".
+
+An answer the relay marked for feedback carries its rating controls on the same card
+(`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
+like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
+alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
+the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
+give, nor Google Chat's private card; so a 👎 is recorded when it
+is sent, with a note or without one, and has no Cancel. The adapter checks the presser as the
+gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the pull loop, and
+redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
+rating because the card is the conversation's; a card the line would push past the activity
+budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
+The form's kept-for line is drawn before any press, so it always names the question. It remembers a bounded number of rated messages
+(`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
+recorded without the answer's text and without the redraw, and a re-rating that carries no
+answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
+names a post (`postKindOf`), so an alert its triage edits stays as it was.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
@@ -3584,23 +3704,27 @@ canonical for what an operator reads off these series; this section is the desig
 value comes from a closed list, never from a task, a conversation or an executor's
 text, so nothing a chat user or an executor sends can mint a series:
 
-| Metric                                                      | Labels                                                                                                                                                                                                   | Counts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kubeagents_a2a_gateway_task_terminals_total`               | `state`: `completed`, `failed`, `canceled`, `rejected`, `other`; `source`: `executor`, `supervisor`, `gateway`, `gateway-never-started`, `other`                                                         | Each task terminal the gateway delivers to a conversation, counted once where every terminal path converges (`observeTaskTerminal`), by its final state and by whose word it is (`TerminalSource`): the executor's on the events subject, the supervisor's on the supervisor subject, or the gateway's own for a task whose submission never reached the bus (`gateway`) or that no executor took inside `A2A_FIRST_EVENT_GRACE` (`gateway-never-started`). A delegation chain is counted once under its root; a session turn that asked to delegate but started no child counts as `failed` even when the executor reported `completed`. The operator's usage poller reads `failed` and `rejected` into `status.usage.chatTurnsErroredTotal`. |
-| `kubeagents_a2a_gateway_gchat_events_received_total`        | none                                                                                                                                                                                                     | Google Chat events pulled from the broker's relay, before parsing or classification. A payload that does not parse, or an event that is not a turn, still counts.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `kubeagents_a2a_gateway_gchat_pulls_total`                  | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the Chat relay: one that returned an event, one that returned nothing, one that failed (the relay refused or did not answer, or the pull was never made or could not be read). The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `kubeagents_a2a_gateway_gchat_api_request_duration_seconds` | `method`: `spaces.messages.create`, `spaces.messages.patch`, `spaces.messages.get`, `spaces.members.list`, `spaces.findDirectMessage`, `spaces.setup`, `other`; `outcome`: `ok`, `rate_limited`, `error` | A histogram of each Chat API call the Google Chat adapter makes through the relay's passthrough (`apiCallContext`), from the request to the end of the relay's response body. `outcome` is `ok` for the relay's 200, `rate_limited` for a Chat API 429 as the relay's answer carries it, and `error` for any other status, a 429 of the relay's own included, or no response.                                                                                                                                                                                                                                                                                                                                                                  |
-| `kubeagents_a2a_gateway_gchat_api_rate_limited_total`       | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `kubeagents_a2a_gateway_teams_events_received_total`        | none                                                                                                                                                                                                     | Microsoft Teams activities pulled from the broker's Teams queue, before parsing or classification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `kubeagents_a2a_gateway_teams_pulls_total`                  | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the broker's Teams queue: one that carried an activity, one that came back empty, one that failed (the broker refused or did not answer, or the pull was never made or could not be read).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `kubeagents_a2a_gateway_teams_api_request_duration_seconds` | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `kubeagents_a2a_gateway_teams_api_rate_limited_total`       | `method`: as above                                                                                                                                                                                       | Each Bot Framework call Microsoft answered 429, as the broker carries its status under `teams.status`; the identity provider's 429 on the token the call needed arrives the same way and counts too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `kubeagents_a2a_gateway_teams_ingress_lag_seconds`          | none                                                                                                                                                                                                     | A histogram of the time from an activity's own `timestamp` to the gateway's receipt of it, for an activity it takes as a turn; a negative lag is observed as 0 and an activity with no parseable `timestamp` is not observed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `kubeagents_a2a_gateway_chat_messages_total`                | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
-| `kubeagents_a2a_gateway_notify_marks_dropped_total`         | none                                                                                                                                                                                                     | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `kubeagents_a2a_gateway_messages_inbound_total`             | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`                                                                                                                                | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google, a2a-entra) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                        |
-| `kubeagents_a2a_gateway_answer_feedback_total`              | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`                                                           | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
-| `kubeagents_a2a_gateway_post_feedback_total`                | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `kind`: `alert`, `report`, `other`                                                           | Each rating change a verified sender made on a home post the agent made on its own, counted as `answer_feedback_total` counts and apart from it: `alert` for a keyed home post (the event watcher's alert, rewritten in place by its triage), `report` for any other (a scheduled or audit report, a digest).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Metric                                                               | Labels                                                                                                                                                                                                   | Counts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_a2a_gateway_task_terminals_total`                        | `state`: `completed`, `failed`, `canceled`, `rejected`, `other`; `source`: `executor`, `supervisor`, `gateway`, `gateway-never-started`, `other`                                                         | Each task terminal the gateway delivers to a conversation, counted once where every terminal path converges (`observeTaskTerminal`), by its final state and by whose word it is (`TerminalSource`): the executor's on the events subject, the supervisor's on the supervisor subject, or the gateway's own for a task whose submission never reached the bus (`gateway`) or that no executor took inside `A2A_FIRST_EVENT_GRACE` (`gateway-never-started`). A delegation chain is counted once under its root; a session turn that asked to delegate but started no child counts as `failed` even when the executor reported `completed`. The operator's usage poller reads `failed` and `rejected` into `status.usage.chatTurnsErroredTotal`. |
+| `kubeagents_a2a_gateway_gchat_events_received_total`                 | none                                                                                                                                                                                                     | Google Chat events pulled from the broker's relay, before parsing or classification. A payload that does not parse, or an event that is not a turn, still counts.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `kubeagents_a2a_gateway_gchat_pulls_total`                           | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the Chat relay: one that returned an event, one that returned nothing, one that failed (the relay refused or did not answer, or the pull was never made or could not be read). The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `kubeagents_a2a_gateway_gchat_api_request_duration_seconds`          | `method`: `spaces.messages.create`, `spaces.messages.patch`, `spaces.messages.get`, `spaces.members.list`, `spaces.findDirectMessage`, `spaces.setup`, `other`; `outcome`: `ok`, `rate_limited`, `error` | A histogram of each Chat API call the Google Chat adapter makes through the relay's passthrough (`apiCallContext`), from the request to the end of the relay's response body. `outcome` is `ok` for the relay's 200, `rate_limited` for a Chat API 429 as the relay's answer carries it, and `error` for any other status, a 429 of the relay's own included, or no response.                                                                                                                                                                                                                                                                                                                                                                  |
+| `kubeagents_a2a_gateway_gchat_api_rate_limited_total`                | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `kubeagents_a2a_gateway_teams_events_received_total`                 | none                                                                                                                                                                                                     | Microsoft Teams activities pulled from the broker's Teams queue, before parsing or classification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `kubeagents_a2a_gateway_teams_pulls_total`                           | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the broker's Teams queue: one that carried an activity, one that came back empty, one that failed (the broker refused or did not answer, or the pull was never made or could not be read).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `kubeagents_a2a_gateway_teams_api_request_duration_seconds`          | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_teams_api_rate_limited_total`                | `method`: as above                                                                                                                                                                                       | Each Bot Framework call Microsoft answered 429, as the broker carries its status under `teams.status`; the identity provider's 429 on the token the call needed arrives the same way and counts too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_teams_ingress_lag_seconds`                   | none                                                                                                                                                                                                     | A histogram of the time from an activity's own `timestamp` to the gateway's receipt of it, for an activity it takes as a turn; a negative lag is observed as 0 and an activity with no parseable `timestamp` is not observed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `kubeagents_a2a_gateway_chat_messages_total`                         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
+| `kubeagents_a2a_gateway_notify_marks_dropped_total`                  | none                                                                                                                                                                                                     | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `kubeagents_a2a_gateway_messages_inbound_total`                      | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`                                                                                                                                | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google, a2a-entra) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                        |
+| `kubeagents_a2a_gateway_answer_feedback_total`                       | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`                                                           | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
+| `kubeagents_a2a_gateway_post_feedback_total`                         | `platform`: `googlechat`, `slack`, `teams`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `kind`: `alert`, `report`, `other`                                                           | Each rating change a verified sender made on a home post the agent made on its own, counted as `answer_feedback_total` counts and apart from it: `alert` for a keyed home post (the event watcher's alert, rewritten in place by its triage), `report` for any other (a scheduled or audit report, a digest).                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `kubeagents_a2a_gateway_profile_supervisor_cutoff_timestamp_seconds` | `source`: `env`, `malformed`, `unset`                                                                                                                                                                    | The profile supervisor cutoff the gateway runs with (`A2A_PROFILE_SUPERVISOR_CUTOFF`, #5301), in Unix seconds, 0 when unset. `malformed` is a value that did not parse, read as the Unix epoch, so every five-token supervisor terminal on a profile task is refused (`lib.MalformedCutoff`).                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `kubeagents_a2a_gateway_profile_names_loaded`                        | none                                                                                                                                                                                                     | 1 once the operator's profile names file (`A2A_PROFILE_NAMES_FILE`) has been read, 0 before; with a cutoff and no names read, every addressee reads as a profile, and the relay gives a refused five-token event back to the stream every 30 seconds rather than settling it, up to 20 times, then settles it with an Error. A held event the names then take can render after later events of its task.                                                                                                                                                                                                                                                                                                                                       |
+| `kubeagents_a2a_gateway_profile_names_last_load_timestamp_seconds`   | none                                                                                                                                                                                                     | When the names file was last read, changed or not, in Unix seconds, 0 when never (`lib.ProfileNames.LoadedAt`). It is re-read every 30 seconds and a failed read keeps the names last read, so a value that stops moving is reads failing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `kubeagents_a2a_gateway_profile_supervisor_drops_total`              | none                                                                                                                                                                                                     | Each five-token supervisor message a read refused as a profile task's terminal (`lib.Client.ProfileSupervisorDrops`); one message read three times counts three. The relay counts a refusal it holds while the names are unloaded once, when it settles it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
@@ -3718,7 +3842,7 @@ Calls for [@bnaylor]:
 
 - ~~**Payload spec amendment.**~~ Ratified 8/24; the payload spec has carried it since
   0.3.
-- ~~**Idle TTL.**~~ Decided 8/24: 30 minutes, config-backed.
+- ~~**Idle TTL.**~~ Decided 8/24: 30 minutes, config-backed. Amended 11/16 (#2371): 5 minutes for a single-turn DM, also config-backed.
 - ~~**Rehydration horizon.**~~ Decided 8/24: retention is the horizon. The compacted
   transcript topic stays the named fix if real users disagree.
 - ~~**Discord test tenancy.**~~ Decided 8/24: I own the test server; the bot token is a

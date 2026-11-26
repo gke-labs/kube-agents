@@ -1313,7 +1313,27 @@ class C1IsolationIsStructural(unittest.TestCase):
         other left empty.
         """
         spawner = h.text("a2a_spawner")
-        body = h.go_function_body(spawner, "Spawn")
+        # Every session pod's spec, a fresh spawn's and a warm pod's alike, is
+        # built by sessionPodSpec (#6533), so that is the body the identity
+        # checks read. The two creates must build through it, and neither may
+        # touch the token mount or the projections after it: otherwise a pod
+        # could leave with a token this test never saw.
+        for create in ("Spawn", "SpawnWarm"):
+            with self.subTest(create=create):
+                create_body = h.go_function_body(spawner, create)
+                self.assertIn(
+                    "s.sessionPodSpec(",
+                    create_body,
+                    f"{create} no longer builds its pod through sessionPodSpec, so the "
+                    "identity checks below no longer read the pod it creates",
+                )
+                for token_field in ("AutomountServiceAccountToken", "ServiceAccountToken", "ServiceAccountName"):
+                    self.assertNotIn(
+                        token_field,
+                        create_body,
+                        f"{create} sets {token_field} after sessionPodSpec, outside the body this test reads",
+                    )
+        body = h.go_function_body(spawner, "sessionPodSpec")
 
         self.assertIn(
             "AutomountServiceAccountToken: ptr.To(false)",

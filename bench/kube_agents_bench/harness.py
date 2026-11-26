@@ -191,7 +191,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -459,18 +459,42 @@ _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
 # the top-level ``total`` too (:func:`_fold_worker_total`), so ``total`` is
 # everything the run billed, as on the api transport, while ``input`` and
 # ``output`` stay the front door's own and ``front_door`` keeps its buckets.
-# A run whose chain reported no usage keeps a null total whatever its
+# A run that holds no usage for the chain keeps a null total whatever its
 # workers billed, so the scorer's liveness rung still reads the task's
 # terminal there rather than passing on the workers' spend alone.
+# The buckets are also null when the harness holds no usage because the read
+# was not made, was skipped, or failed; the cause clause of that exchange's note
+# (``_INJECT_TOKENS_CAUSE_NOTES``) says which.
 _INJECT_TOKENS_NOTE = (
     "the inject transport's input and output buckets are the front door's turns as the "
     "gateway reported them: input counts cached reads too, and cached and reasoning are "
-    "null since Hermes reports no split; they are null when the gateway reported no usage; "
+    "null since Hermes reports no split; they are null when the harness holds no usage "
+    "for the front door; "
     "tokens.children holds the chain's child tasks (the platform router), and "
     "tokens.workers the delegated workers' counts when the delegation wait read them; "
     "total adds both to the front door's, as on the api transport, and stays null when "
-    "the chain reported no usage"
+    "the harness holds no usage for the chain"
 )
+# Appended to the note when the exchange holds no usage for the front door:
+# why, by how the usage read went (``Fold.usage_read``).
+_INJECT_TOKENS_CAUSE_PREFIX = "; no front door usage on this exchange: "
+_INJECT_TOKENS_CAUSE_NOTES = {
+    inject.USAGE_READ_NOT_MADE: (
+        "the exchange had no terminal from an executor, so the harness made no usage read"
+    ),
+    inject.USAGE_READ_SKIPPED: (
+        "the harness skipped the usage read, since the deadline of the wait, or of the "
+        "cancel's settle, had passed"
+    ),
+    inject.USAGE_READ_FAILED: "the usage read failed",
+    inject.USAGE_READ_UNANSWERED: "the gateway's answer to the usage read did not cover the task",
+    inject.USAGE_READ_ANSWERED: (
+        "the gateway answered the usage read with no count for the front door"
+    ),
+    inject.USAGE_READ_CANCEL_UNCONFIRMED: (
+        "no terminal confirmed the cancel after the timeout, so no usage read followed it"
+    ),
+}
 # Appended to the note when the gateway could not read a link of the chain.
 _INJECT_TOKENS_PARTIAL_NOTE = (
     "; partial: the gateway could not read every link of the chain, so the counts are "
@@ -1284,6 +1308,37 @@ _MAX_SILENT_TURNS = 3
 # abandoned. An idle keepalive dropping between turns is not a broken agent, and
 # retrying costs one poll interval against the whole delegated result.
 _MAX_TRANSPORT_FAILURES = 3
+
+
+def _predates_run(created_at: int | None, floor: int | None) -> bool:
+    """Whether a card was filed before the run started (``created_at`` under the pod-clock ``floor``).
+
+    Such a card is not this run's: its create was handed an existing card by
+    its idempotency key, most likely an earlier repetition's (#4794), so the
+    repetition that waits on it is not independent.
+    """
+    return created_at is not None and floor is not None and created_at < floor
+
+
+def _vanished_card_error(task_id: str, created_at: int | None, floor: int | None) -> str:
+    """The error for an awaited card the board stopped having a row for.
+
+    For a card that predates the run (:func:`_predates_run`) it says what was
+    checked, and only names the likely cause: a purge that owed an earlier
+    repetition's card deletes it once it stops running, possibly before this
+    wait reads it settled.
+    """
+    message = (
+        f"card {task_id} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+        "dropped from the delegation wait, nothing graded for it"
+    )
+    if _predates_run(created_at, floor):
+        message += (
+            "; it was filed before this run started, so this run did not file it and this repetition "
+            "is not independent (most likely an earlier repetition's card, handed back by its "
+            "idempotency key and deleted by the purge that owed it)"
+        )
+    return message
 
 
 def _append_final(result: AgentResult, sections: list[str]) -> None:
@@ -2423,7 +2478,7 @@ def _fold_worker_total(tokens: dict[str, Any]) -> None:
     door's own buckets are copied under ``front_door`` first (its ``total``
     the front door's alone, without the chain's children). The other
     top-level buckets stay the front door's (:func:`_inject_tokens`). A run
-    whose chain reported no usage keeps its null ``total``: folding the
+    that holds no usage for the chain keeps its null ``total``: folding the
     workers in would let the scorer's liveness rung pass on the workers'
     spend alone, where it reads the task's terminal today.
     """
@@ -3076,6 +3131,14 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
             exchange.fold.usage = settled.fold.usage
             exchange.fold.child_usage = settled.fold.child_usage
             exchange.fold.usage_partial = settled.fold.usage_partial
+        if timed_out:
+            # Why the buckets are null, when they are: the settle's read if
+            # it made one, and otherwise the cancel no terminal confirmed.
+            exchange.fold.usage_read = (
+                settled.fold.usage_read
+                if settled is not None and settled.fold.usage_read != inject.USAGE_READ_NOT_MADE
+                else inject.USAGE_READ_CANCEL_UNCONFIRMED
+            )
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
     return timed_out, stop_pending
@@ -3338,8 +3401,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     ``tool_called`` checks with no ``result`` pattern aside then, or when
     the marker reports a loss).
     Tokens are the front door's usage as the probe reported it, null when
-    it reported none (:func:`_inject_tokens`), and ``metadata`` says which
-    buckets mean what. ``identity`` is the run, case
+    the harness holds none (:func:`_inject_tokens`), and ``metadata`` says which
+    buckets mean what and why they are null (:func:`_inject_tokens_note`).
+    ``identity`` is the run, case
     and repetition the key and message id were built from,
     stored beside the task id so the record joins to the gateway's ingress
     log.
@@ -3377,10 +3441,19 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             # the ``a2a.activity`` entry in the trajectory.
             "activity": fold.activity_summary,
             "progress": fold.progress or None,
-            "tokens_note": _INJECT_TOKENS_NOTE
-            + (_INJECT_TOKENS_PARTIAL_NOTE if fold.usage_partial else ""),
+            "tokens_note": _inject_tokens_note(fold),
         },
     )
+
+
+def _inject_tokens_note(fold: inject.Fold) -> str:
+    """What the record's buckets mean, and why the front door's are null when they are."""
+    note = _INJECT_TOKENS_NOTE
+    if _usage_buckets(fold.usage) is None:
+        note += _INJECT_TOKENS_CAUSE_PREFIX + _INJECT_TOKENS_CAUSE_NOTES[fold.usage_read]
+    if fold.usage_partial:
+        note += _INJECT_TOKENS_PARTIAL_NOTE
+    return note
 
 
 def _execute_slack(prompt: str) -> AgentResult:
@@ -3637,6 +3710,51 @@ class KubeAgentsHarness(AgentHarness):
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
+        if delegating_profile.PLACEHOLDER in prompt:
+            return self._run_with_delegating_profile(prompt, workspace_path, started_at)
+        return self._run_expanded(prompt, workspace_path, started_at)
+
+    def _run_with_delegating_profile(self, prompt: str, workspace_path: Path | None, started_at: float) -> AgentResult:
+        """:meth:`run` for a prompt naming the throwaway delegating profile
+        (:mod:`delegating_profile`, #6789): make the profile, run the ask
+        against it, and tear it down whatever the run did.
+
+        A setup that fails is infrastructure and sends nothing. The teardown
+        is in a ``finally`` (SIGTERM raises for its duration, so a stopped
+        run reaches it too); one it cannot confirm turns the run into an
+        infrastructure failure, whatever the agent answered.
+        """
+        transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
+        if transport != TRANSPORT_INJECT:
+            # Only the inject door addresses a profile ([bench:profile ...]).
+            transcript.set("", [], prompt=prompt, started_at=started_at)
+            return AgentResult.errored(
+                f"{delegating_profile.PLACEHOLDER} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
+        kubectl, namespace = delegating_profile.from_env()
+        with delegating_profile.signals_raise():
+            try:
+                profile = delegating_profile.setup(kubectl, namespace, log=_log.info)
+            except delegating_profile.DelegatingProfileError as exc:
+                transcript.set("", [], prompt=prompt, started_at=started_at)
+                return _infra_failure(f"the throwaway delegating profile could not be set up: {exc}")
+            result: AgentResult | None = None
+            try:
+                result = self._run_expanded(
+                    prompt.replace(delegating_profile.PLACEHOLDER, profile.name), workspace_path, started_at
+                )
+            finally:
+                try:
+                    delegating_profile.teardown(kubectl, profile, log=_log.info)
+                except delegating_profile.DelegatingProfileError as exc:
+                    _log.error("the throwaway delegating profile was not torn down: %s", exc)
+                    if result is not None:
+                        result = _infra_failure(f"the throwaway delegating profile was not torn down: {exc}")
+        assert result is not None
+        return result
+
+    def _run_expanded(self, prompt: str, workspace_path: Path | None, started_at: float) -> AgentResult:
+        """The rest of :meth:`run`, on a prompt with every placeholder written in."""
         # The GitOps wait uses it as a lower bound on PR creation time: a rerun
         # that reuses a cluster name reuses the run branch, and the previous
         # run's merged PR is still listed against it.
@@ -5753,7 +5871,9 @@ class KubeAgentsHarness(AgentHarness):
         :data:`_MAX_AWAITED_TASKS`, and lets a card the session files later
         join the wait. A card the board has no row for on
         :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
-        wait with a line on ``errors``, and nothing is graded for it.
+        wait with a line on ``errors`` (:func:`_vanished_card_error`), and
+        nothing is graded for it. A card filed before the run started
+        (:func:`_predates_run`) is logged as a warning when first read.
 
         Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
         running. Returns ``False``, having changed nothing else, when the store
@@ -5831,6 +5951,14 @@ class KubeAgentsHarness(AgentHarness):
         missing: list[str] = []
         awaited: list[str] = []
         capped = False
+        # Each awaited card's ``created_at`` from the last read that had its row,
+        # and the awaited cards already logged as filed before the run started
+        # (_predates_run): this run did not file them, so it is not independent
+        # whether they settle or leave the board mid-wait (#4794). Logged, not put
+        # on errors, which the scorer reads: what such a run counts for is
+        # #4658's call. A dropped one also gets its errors line.
+        created: dict[str, int | None] = {}
+        predating: set[str] = set()
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(
@@ -5864,14 +5992,21 @@ class KubeAgentsHarness(AgentHarness):
                 None if capped else result,
             )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            # Every card the read has a row for, awaited or past the cap: a card the
+            # cap held back can be deleted before a freed slot promotes it.
+            for t, card in read.cards.items():
+                created[t] = card.get("created_at")
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
+                if t not in predating and _predates_run(created.get(t), self._pod_floor):
+                    predating.add(t)
+                    _log.warning(
+                        "awaited card %s was filed before this run started, so this run did not "
+                        "file it and this repetition is not independent", t,
+                    )
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
-                result.errors.append(
-                    f"card {t} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
-                    "dropped from the delegation wait, nothing graded for it"
-                )
+                result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
             missing.extend(gone)
             awaited = [t for t in awaited if t not in gone]
             return [t for t in awaited if not _is_terminal(t)]

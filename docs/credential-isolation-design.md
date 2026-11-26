@@ -134,7 +134,9 @@ operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, th
 kubectl cost table the shell's admission charges, which the operator passes only as a short
 lowercase word, before either reaches that Pod. The tier also goes, normalised the same way, to
 the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
-kubectl runs the same admission. The three
+kubectl runs the same admission, and to the credential broker (stateful and exec tiers), whose
+kubectl admission charges profile workers' cluster-wide reads from the same table; it is reserved
+there, so `spec.deployment.env` cannot pass a raw value through. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -521,7 +523,13 @@ settings cannot be edited by anything holding the volume:
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
-  and a list that compares whole tokens matches nothing; and
+  and a list that compares whole tokens matches nothing;
+- a push stays in the repository the command names. A repository's own
+  configuration can make a plain `git push` also push inside each submodule,
+  to that submodule's own remote, and the check on the pushed branch reads only
+  the repository the command names. The setting is pinned to `no`, which is
+  git's default, and the flag that asks for the same on the command line is
+  refused; and
 - both editors git launches — the message editor and the rebase sequence editor
   — are set to a command that does nothing and fails. They are set through the
   environment for the same reason as the transport allowlist: those two

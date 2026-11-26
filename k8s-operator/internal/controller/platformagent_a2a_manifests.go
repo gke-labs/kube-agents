@@ -535,6 +535,18 @@ const (
 	// control, rendered at the gateway's default (a2aCardStopTimeout).
 	a2aCardStopEnvVar        = "A2A_CARD_STOP"
 	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aDelegationRoundsMaxEnvVar is a controller-read setting rendered onto
+	// the gateway under the same name: how many delegate requests one
+	// profile task may make (the gateway's delegation.rounds rule, #6789).
+	// The chart sets it from operator.delegation.roundsMax. Rendered
+	// explicitly at 1, the only value supported until a profile task's later
+	// rounds land: the operator refuses any other value, logging why at
+	// startup (ValidateA2ADelegationRoundsMax) and rendering 1, and the
+	// gateway clamps one over 1 the same way.
+	a2aDelegationRoundsMaxEnvVar = "A2A_DELEGATION_ROUNDS_MAX"
+	// a2aDelegationRoundsSupported is the one value a2aDelegationRoundsMax
+	// renders until rounds past the first are supported.
+	a2aDelegationRoundsSupported = 1
 	// a2aCardStopTimeout is the gateway's default wait for a card-stop
 	// control, rendered explicitly: above the bridge's worst case for one
 	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
@@ -731,6 +743,13 @@ const (
 	a2aTeamsHomeChannelEnvVar   = "A2A_TEAMS_HOME_CHANNEL"
 	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
 	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
+	// a2aTeamsAnswerFeedbackEnvVar turns answer feedback off on a gateway
+	// that holds the Teams backend: "false" on the controller-manager
+	// Deployment is carried to the gateway under the same name (a2a/gateway's
+	// envTeamsAnswerFeedback), and anything else renders nothing. An operator
+	// switch like a2aTeamsBackendEnvVar, since Teams has no answerFeedback
+	// field on the CR yet.
+	a2aTeamsAnswerFeedbackEnvVar = "A2A_TEAMS_ANSWER_FEEDBACK"
 	// The gateway's rule for a Teams home conversation id
 	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
 	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
@@ -1350,6 +1369,14 @@ const (
 	// route the install resolved to, so a fallback to platform, which counts
 	// fewer per session, cannot feed back into the fit that caused it.
 	a2aTasksConsumersPerSessionOnSessionRoute = a2aSessionConsumersPerSession + a2aTasksReplaySessionAsks
+	// a2aTasksConsumersPerWarmSession is one unclaimed warm session pod's
+	// share of TASKS: its task watcher's origin consumer and nothing else,
+	// since no conversation asks after it until it is claimed, and a
+	// claimed one is a session counted above.
+	a2aTasksConsumersPerWarmSession = 1
+	// a2aWarmSessionsEnvVar carries the warm pool's size to the gateway
+	// (Config.WarmSessions in a2a/gateway).
+	a2aWarmSessionsEnvVar = "A2A_WARM_SESSIONS"
 	// a2aSessionsFitUnbounded is a2aSessionsFit's answer for a stream with no
 	// consumer limit (max_consumers -1): more sessions than maxSessions'
 	// Maximum allows, so the effective cap is maxSessions. The provision
@@ -1581,6 +1608,36 @@ func a2aCardStop() string {
 		return "true"
 	}
 	return "false"
+}
+
+// a2aDelegationRoundsMax renders the gateway's A2A_DELEGATION_ROUNDS_MAX: the
+// operator's own setting when it is the supported value, and that value
+// otherwise. Unset, malformed and over the supported value all render 1;
+// ValidateA2ADelegationRoundsMax says why at startup.
+func a2aDelegationRoundsMax() string {
+	return strconv.Itoa(a2aDelegationRoundsSupported)
+}
+
+// ValidateA2ADelegationRoundsMax refuses an A2A_DELEGATION_ROUNDS_MAX on the
+// operator other than unset or 1, naming the variable and the reason. The
+// operator logs it at startup and renders 1 (a2aDelegationRoundsMax), rather
+// than stopping every install's reconcile over a setting the gateway would
+// clamp anyway.
+func ValidateA2ADelegationRoundsMax() error {
+	v := strings.TrimSpace(os.Getenv(a2aDelegationRoundsMaxEnvVar))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return fmt.Errorf("%s %q refused: need an integer, and only %d is supported; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	if n > a2aDelegationRoundsSupported {
+		return fmt.Errorf("%s %q refused: rounds above %d are not supported yet; rendering %d onto the gateway",
+			a2aDelegationRoundsMaxEnvVar, v, a2aDelegationRoundsSupported, a2aDelegationRoundsSupported)
+	}
+	return nil
 }
 
 // renderA2ANATSDebug is the bus's debug line, present only while the
@@ -3950,7 +4007,8 @@ fi`
 	fitsInRefusal := `  fits=$(( (live_consumers - ` + reserve + `) / ` + perSession + ` ))
 `
 	if a2aSpecDefaultRoute(agent) == agentv1alpha1.DefaultRouteSession {
-		liveConsumersRead, fitsInRefusal = a2aProvisionSessionsFitBlock(reserveN, perSessionN), ""
+		liveConsumersRead, fitsInRefusal = a2aProvisionSessionsFitBlock(reserveN, perSessionN,
+			a2aFitWarmSessions(resolveA2ADefaultRoute(agent), agent), resolveA2AMaxSessions(agent)), ""
 	}
 	// What a session's share is, said as the refusal says it: the named
 	// consumers it creates, and on the session route the replays of its
@@ -3976,7 +4034,15 @@ fi`
 	// its asks and its look-ahead, each with a tail.
 	fixedReserve := strconv.Itoa(a2aTasksReservedConsumersFor(0))
 	perWorker := strconv.Itoa(a2aTasksReplayTailFactor * (a2aTasksReplayAsk + a2aTasksReplayLookAhead))
-	oneWorker := strconv.Itoa(maxSessionsN*perSessionN + a2aTasksReservedConsumersFor(1))
+	// The warm pods the budget counts beside the sessions (resolveA2AWarmSessions).
+	warmN := resolveA2AWarmSessions(agent) * a2aTasksConsumersPerWarmSession
+	warmNote := ""
+	if warmN > 0 {
+		warmNote = `  echo "  plus ` + strconv.Itoa(warmN) + ` for the warm session pods (spec.harness.tuning.warmSessions; 0 turns them off)," >&2
+  echo "  which use only consumers the session cap leaves spare: this stream funds ${warm_fits} at the cap it fits," >&2
+`
+	}
+	oneWorker := strconv.Itoa(maxSessionsN*perSessionN + warmN + a2aTasksReservedConsumersFor(1))
 	oneAndOne := strconv.Itoa(perSessionN + a2aTasksReservedConsumersFor(1))
 	bridgeAboveDefault := bridgeWorkersN > a2aBridgeDefaultConcurrency
 
@@ -4061,7 +4127,7 @@ echo "  read it, set it in env as a literal, which the kubelet lets override env
   fi
 `
 	if bridgeAboveDefault {
-		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*perSessionN) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
+		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*perSessionN+warmN) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
 `
 		oneSessionAt = ` at ` + bridgeWorkers + ` bridge workers`
 		thatLeaves = ""
@@ -4486,7 +4552,7 @@ fi
 ` + liveConsumersRead + `if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
   echo "  ` + sessionsIs + `, each session ` + perSessionWhat + `," >&2
-  echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
+` + warmNote + `  echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
 ` + bridgeNote + `  echo "Provisioning does not change this limit on an existing stream, and it could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
@@ -4555,13 +4621,48 @@ echo "a2a provisioning complete"
 // TestTheProvisionScriptFitsWhatTheOperatorFits runs this block under bash
 // against the Go function, so the operator's fitted cap and the number the
 // refusal tells an operator to lower maxSessions to cannot drift apart.
-func a2aProvisionSessionsFitBlock(reserve, perSession int) string {
+func a2aProvisionSessionsFitBlock(reserve, perSession, warm, maxSessions int) string {
+	r, p := strconv.Itoa(reserve), strconv.Itoa(perSession)
+	warmFit := ""
+	if warm > 0 {
+		// a2aWarmSessionsFit at the cap the operator fits from ${fits}:
+		// the consumers it leaves spare, held to the warm pods asked for and
+		// to the cap less one.
+		warmFit = `cap_fit="${fits}"
+if [ "${cap_fit}" -gt ` + strconv.Itoa(maxSessions) + ` ]; then
+  cap_fit=` + strconv.Itoa(maxSessions) + `
+fi
+if [ "${cap_fit}" -lt 0 ]; then
+  cap_fit=0
+fi
+warm_fits=` + strconv.Itoa(warm) + `
+if [ "$((cap_fit - 1))" -lt "${warm_fits}" ]; then
+  warm_fits=$((cap_fit - 1))
+fi
+if [ "${live_consumers}" != "-1" ] && [ "$(( (live_consumers - ` + r + ` - cap_fit * ` + p + `) / ` + strconv.Itoa(a2aTasksConsumersPerWarmSession) + ` ))" -lt "${warm_fits}" ]; then
+  warm_fits=$(( (live_consumers - ` + r + ` - cap_fit * ` + p + `) / ` + strconv.Itoa(a2aTasksConsumersPerWarmSession) + ` ))
+fi
+if [ "${warm_fits}" -lt 0 ]; then
+  warm_fits=0
+fi
+`
+	}
 	return a2aProvisionLiveConsumersRead + `if [ "${live_consumers}" = "-1" ]; then
   fits=` + strconv.Itoa(a2aSessionsFitUnbounded) + `
 else
-  fits=$(( (live_consumers - ` + strconv.Itoa(reserve) + `) / ` + strconv.Itoa(perSession) + ` ))
+  fits=$(( (live_consumers - ` + r + `) / ` + p + ` ))
 fi
-`
+` + warmFit
+}
+
+// a2aFitWarmSessions is the warm pod count the fit funds from spare
+// consumers (a2aWarmSessionsFit): the requested count on the session route,
+// where a warm pool runs, and none on the platform route.
+func a2aFitWarmSessions(route string, agent *agentv1alpha1.PlatformAgent) int {
+	if route != agentv1alpha1.DefaultRouteSession {
+		return 0
+	}
+	return resolveA2AWarmSessionsRequested(agent)
 }
 
 // a2aProvisionLiveConsumersRead is the provision script's read of TASKS'
@@ -5549,6 +5650,65 @@ func resolveA2AEffectiveSessions(agent *agentv1alpha1.PlatformAgent) int {
 	return min(configured, *agent.Status.EffectiveSessionCap)
 }
 
+// resolveA2AWarmSessionsRequested is spec.harness.tuning.warmSessions, or
+// DefaultWarmSessions when it is absent: the warm pods asked for, before the
+// cap and the route bound them (resolveA2AWarmSessions).
+func resolveA2AWarmSessionsRequested(agent *agentv1alpha1.PlatformAgent) int {
+	if limits := agentTuning(agent); limits != nil && limits.WarmSessions != nil {
+		return max(*limits.WarmSessions, 0)
+	}
+	return agentv1alpha1.DefaultWarmSessions
+}
+
+// a2aWarmSessionsAt is how many warm pods a session cap of sessions keeps
+// when warm are asked for: never the cap's last slot, so at most the cap less
+// one, and none below a cap of two. The gateway sizes its pool by the same
+// rule against the cap it is rendered (warmPoolSize in a2a/gateway), and
+// further by the conversations live at the time.
+func a2aWarmSessionsAt(warm, sessions int) int {
+	return max(0, min(warm, sessions-1))
+}
+
+// resolveA2AWarmSessions is the warm pod count the operator renders: the
+// gateway's A2A_WARM_SESSIONS, a consumer each in the TASKS budget
+// (a2aTasksConsumerBudget) and a pod each in the session quota. On the
+// session route it is status.effectiveWarmSessions (the spare consumers the
+// fit found, a2aWarmSessionsFit), held to the requested count and the
+// effective cap in case either was lowered since. With none stored it is
+// what a new stream is created with room for (a2aWarmSessionsAt at the
+// effective cap) only on a bus never provisioned (a2aBusExisted), whose
+// TASKS the provision Job will create at that width; on a bus that exists
+// and whose width hasn't been read it is 0, since that stream may fund
+// none. On the platform route no conversation is a session by default, so
+// it is 0.
+func resolveA2AWarmSessions(agent *agentv1alpha1.PlatformAgent) int {
+	if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
+		return 0
+	}
+	at := a2aWarmSessionsAt(resolveA2AWarmSessionsRequested(agent), resolveA2AEffectiveSessions(agent))
+	if stored := agent.Status.EffectiveWarmSessions; stored != nil {
+		return max(0, min(*stored, at))
+	}
+	if a2aBusExisted(agent) {
+		return 0
+	}
+	return at
+}
+
+// a2aWarmSessionsEnv is the gateway's A2A_WARM_SESSIONS: the warm pool's
+// size (resolveA2AWarmSessions), the number the TASKS budget and the session
+// quota count. Rendered only where the install resolves to the session route,
+// as the provision script's session-route fit is: on the platform route,
+// where the warm pool is inert, the variable is absent and the gateway's own
+// default is no pool, so a platform install's gateway is what it was before
+// the field.
+func a2aWarmSessionsEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if resolveA2ADefaultRoute(agent) != agentv1alpha1.DefaultRouteSession {
+		return nil
+	}
+	return []corev1.EnvVar{{Name: a2aWarmSessionsEnvVar, Value: strconv.Itoa(resolveA2AWarmSessions(agent))}}
+}
+
 // a2aDefaultAddresseeEnv is the A2A_DEFAULT_ADDRESSEE entry both containers
 // carry.
 func a2aDefaultAddresseeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
@@ -6505,7 +6665,8 @@ func a2aTasksReserve(agent *agentv1alpha1.PlatformAgent) int {
 // so an install whose cap was fitted to a narrower stream passes the check
 // rather than refusing on a stream it already fits.
 func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
-	return resolveA2AEffectiveSessions(agent)*a2aTasksConsumersPerSession(agent) + a2aTasksReserve(agent)
+	return resolveA2AEffectiveSessions(agent)*a2aTasksConsumersPerSession(agent) +
+		resolveA2AWarmSessions(agent)*a2aTasksConsumersPerWarmSession + a2aTasksReserve(agent)
 }
 
 // a2aTasksConsumersPerSession is the multiplier the session cap takes in the
@@ -6547,12 +6708,33 @@ func a2aSessionCapWords(agent *agentv1alpha1.PlatformAgent) (is, eq string) {
 // the provision script's shell arithmetic, so the two agree on every width
 // (TestTheProvisionScriptFitsWhatTheOperatorFits). A negative answer is a
 // stream narrower than its reserve. live == -1 is a stream with no consumer
-// limit, and the answer is a2aSessionsFitUnbounded.
+// limit, and the answer is a2aSessionsFitUnbounded. Warm session pods do not
+// enter it: they are funded from what the cap leaves (a2aWarmSessionsFit),
+// so they never cost a session.
 func a2aSessionsFit(liveMaxConsumers, reserve, perSession int) int {
 	if liveMaxConsumers == -1 {
 		return a2aSessionsFitUnbounded
 	}
 	return (liveMaxConsumers - reserve) / perSession
+}
+
+// a2aWarmSessionsFit is how many warm session pods a TASKS stream of
+// liveMaxConsumers funds beside reserve and sessions sessions at perSession
+// each, when warm are asked for: the consumers left spare, at
+// a2aTasksConsumersPerWarmSession each, never more than asked and never the
+// cap's last slot (a2aWarmSessionsAt), floored at 0. So a warm pod never
+// pushes an install past its live width, and a width with nothing spare runs
+// without one. The provision script computes the same (warm_fits in
+// a2aProvisionSessionsFitBlock; TestTheProvisionScriptFitsWhatTheOperatorFits
+// holds them equal). A stream with no consumer limit funds every warm pod
+// asked for.
+func a2aWarmSessionsFit(liveMaxConsumers, reserve, perSession, sessions, warm int) int {
+	at := a2aWarmSessionsAt(warm, sessions)
+	if liveMaxConsumers == -1 {
+		return at
+	}
+	spare := (liveMaxConsumers - reserve - sessions*perSession) / a2aTasksConsumersPerWarmSession
+	return max(0, min(at, spare))
 }
 
 // a2aProfileDurablesAllowed is PROFILE_SUBMITS's max_consumers: one durable
@@ -6569,7 +6751,13 @@ const a2aProfileDurablesAllowed = 16 * 2 * 2
 // so a stream recreated on a fitted install comes back wide enough for
 // maxSessions rather than as narrow as the one it replaced.
 func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
-	budget := resolveA2AMaxSessions(agent)*a2aTasksConsumersPerSessionOn(a2aSpecDefaultRoute(agent)) + a2aTasksReserve(agent)
+	configured := resolveA2AMaxSessions(agent)
+	route := a2aSpecDefaultRoute(agent)
+	warm := 0
+	if route == agentv1alpha1.DefaultRouteSession {
+		warm = a2aWarmSessionsAt(resolveA2AWarmSessionsRequested(agent), configured)
+	}
+	budget := configured*a2aTasksConsumersPerSessionOn(route) + warm*a2aTasksConsumersPerWarmSession + a2aTasksReserve(agent)
 	if budget > a2aTasksMaxConsumersFloor {
 		return budget
 	}
@@ -6686,7 +6874,9 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AEffectiveSessions(agent)) + a2aQuotaHeadroom(agent)
+	// The warm pods count here like any pod, so the headroom above the cap
+	// stays what it was with the pool running.
+	limit := int64(resolveA2AEffectiveSessions(agent)) + int64(resolveA2AWarmSessions(agent)) + a2aQuotaHeadroom(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -7479,6 +7669,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if teams.AdaptiveCards != nil && !*teams.AdaptiveCards {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAdaptiveCardsEnvVar, Value: strconv.FormatBool(false)})
 		}
+		// Answer feedback is on unless the operator's switch turns it off;
+		// only the off is rendered, as on Chat and Slack.
+		if os.Getenv(a2aTeamsAnswerFeedbackEnvVar) == strconv.FormatBool(false) {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
 		if len(chatVolumes) == 0 {
 			chatMounts, chatVolumes = a2aChatRelayToken()
 		}
@@ -7506,6 +7701,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.PeopleSeen != nil && !*agent.Spec.Telemetry.PeopleSeen {
 		env = append(env, corev1.EnvVar{Name: a2aPeopleSeenEnvVar, Value: strconv.FormatBool(false)})
 	}
+	env = append(env, a2aWarmSessionsEnv(agent)...)
 	env = append(env, []corev1.EnvVar{
 		// Always on (see a2aConsoleDoorEnvVar): the gateway starts
 		// on the console door when the install configures no chat
@@ -7581,6 +7777,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// bound beside the switch.
 		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
 		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
+		// The delegation rounds a profile task may use,
+		// rendered explicitly at the one value supported
+		// (a2aDelegationRoundsMax), so a reader of the live
+		// Deployment sees the bound, and lifting it is an
+		// edit to a value already there.
+		{Name: a2aDelegationRoundsMaxEnvVar, Value: a2aDelegationRoundsMax()},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS
@@ -7649,10 +7851,15 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// The election (a2a/gateway/election.go): the Lease the gateway
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
+	env = append(env, a2aSessionIdleEnv(agent)...)
 	// The report reader's token and the broker's address, on every install
 	// (a2a_report_reader.go).
 	reportVolumes, reportMounts, reportEnv := a2aReportsGatewayAccess(agent)
 	env = append(env, reportEnv...)
+	// The profile supervisor gate, once the install has latched (#5301): the
+	// cutoff and the profile names file's path, absent until then, so an
+	// unlatched gateway's template is unchanged.
+	env = append(env, a2aProfileSupervisorCutoffEnv(agent)...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))
@@ -7742,6 +7949,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		},
 	}
 	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
+	withA2AProfileNamesFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
 	return dep
 }
 
@@ -8155,6 +8363,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// return between the two then never leaves a map naming a tier whose
 	// file was not written.
 	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
+		return state, err
+	}
+	// The profile names the gateway and the MCP server take profile-ness
+	// from once latched (#5301): the same names as the bus's per-profile
+	// deny below, from the same call. Optional on both pods, so ordering
+	// against their Deployments doesn't matter.
+	gateProfiles, _, gateErr := dispatcherGrantNamesErr(agent, profiles, draining)
+	if err := r.applyA2AProfileNames(ctx, agent, gateProfiles, gateErr); err != nil {
 		return state, err
 	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
@@ -9898,6 +10114,25 @@ func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
 // without a restart; the gateway reads it per routed task.
 func a2aGatewayScopeMount() corev1.VolumeMount {
 	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
+}
+
+// a2aSessionIdleEnv renders spec.harness.tuning's session idle times onto the
+// gateway (#2371), each only when set, so an install that sets neither keeps
+// the gateway's defaults (30m, and 5m for a single-turn DM) and its rendered
+// Deployment unchanged. An older gateway ignores A2A_DM_IDLE_TTL.
+func a2aSessionIdleEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Harness == nil || agent.Spec.Harness.Tuning == nil {
+		return nil
+	}
+	t := agent.Spec.Harness.Tuning
+	var env []corev1.EnvVar
+	if t.SessionIdleMinutes != nil {
+		env = append(env, corev1.EnvVar{Name: "A2A_IDLE_TTL", Value: fmt.Sprintf("%dm", *t.SessionIdleMinutes)})
+	}
+	if t.DMSessionIdleMinutes != nil {
+		env = append(env, corev1.EnvVar{Name: "A2A_DM_IDLE_TTL", Value: fmt.Sprintf("%dm", *t.DMSessionIdleMinutes)})
+	}
+	return env
 }
 
 // a2aSessionHarnessSpec is spec.harness.sessionWorker.type as written, ""

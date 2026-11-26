@@ -1,0 +1,88 @@
+name: "Answer scrub: nightly fuzz"
+
+# Fuzzes the answer scrub's entry points (a2a/lib/answerscrub) for panics.
+# The bridge runs the scrub on model and user text, and a panic there ends
+# the task (#7276). The seed corpus already runs in every PR's
+# `go test -race ./...`; this job explores beyond it. It is not a required
+# check and never runs on a pull request, so a crasher it finds can't turn an
+# unrelated PR red. A crasher is uploaded as an artifact and reported on a
+# tracking issue (opened, or commented on if one is already open).
+
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: answerscrub-fuzz
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  fuzz:
+    name: Fuzz the answer scrub
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out the code
+      issues: write # open or comment on the crasher's tracking issue
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzScrub, FuzzCollectToolResult]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "a2a/go.mod"
+          # No cache: the fuzzed package imports only the standard library,
+          # and no cache restore can stall the run. Go keeps the corpus it
+          # generates in its build cache, so each night starts again from
+          # the seeds rather than building on the last.
+          cache: false
+
+      - name: Fuzz
+        id: fuzz
+        working-directory: a2a
+        env:
+          TARGET: ${{ matrix.target }}
+        run: go test ./lib/answerscrub -run '^$' -fuzz "^${TARGET}\$" -fuzztime 10m
+
+      # Go writes a crashing input under testdata/fuzz/<target>/. A failure
+      # without one (a compile error, a toolchain download, a runner OOM) is
+      # not a crasher, and reports nothing.
+      - name: Upload the crasher
+        if: failure() && steps.fuzz.outcome == 'failure' && hashFiles(format('a2a/lib/answerscrub/testdata/fuzz/{0}/*', matrix.target)) != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: answerscrub-crasher-${{ matrix.target }}
+          path: a2a/lib/answerscrub/testdata/fuzz/
+          if-no-files-found: warn
+
+      - name: Report the crasher
+        if: failure() && steps.fuzz.outcome == 'failure' && hashFiles(format('a2a/lib/answerscrub/testdata/fuzz/{0}/*', matrix.target)) != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          title="answerscrub fuzz: ${TARGET} found a crasher"
+          body="The nightly fuzz of \`${TARGET}\` failed: ${RUN_URL}. The crashing input is the run's \`answerscrub-crasher-${TARGET}\` artifact. Copy it into \`a2a/lib/answerscrub/testdata/fuzz/${TARGET}/\`, then reproduce from \`a2a/\` with \`go test ./lib/answerscrub -run ${TARGET}\`. A scrub panic ends a bridge task (#7276)."
+          # Only an open issue this workflow opened, with exactly this title:
+          # an issue anyone else opens can't capture the reports.
+          existing=$(TITLE="$title" gh issue list --repo "$REPO" --state open --limit 100 \
+            --search "author:app/github-actions \"${title}\" in:title" \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)][0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Again: ${RUN_URL}"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

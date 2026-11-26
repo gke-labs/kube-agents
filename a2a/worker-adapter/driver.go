@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
@@ -172,6 +173,29 @@ func DriverFor(h persona.Harness) (Driver, error) {
 		return claudeDriver{}, nil
 	case persona.Antigravity:
 		return agyDriver{}, nil
+	case persona.CoreAgent:
+		return newCoreAgentDriver(), nil
 	}
-	return nil, fmt.Errorf("unknown harness %q (want %q or %q)", h, persona.ClaudeCode, persona.Antigravity)
+	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
+}
+
+// turnRestarter is implemented by a driver whose harness takes one user
+// turn per process: the adapter ends the process at each turn boundary and
+// starts the next turn on a fresh one that resumes the conversation, so
+// nothing the last turn started is still running when the driver prepares
+// the next (Driver.PrepareTurn).
+type turnRestarter interface {
+	RestartsPerTurn() bool
+}
+
+func restartsPerTurn(d Driver) bool {
+	r, ok := d.(turnRestarter)
+	return ok && r.RestartsPerTurn()
+}
+
+// turnBudgeter is implemented by a driver whose argv carries a wall-clock
+// bound for the harness, so a fresh process for a later turn gets the time
+// left on the task rather than the whole of it.
+type turnBudgeter interface {
+	WithTurnBudget(argv []string, left time.Duration) []string
 }
