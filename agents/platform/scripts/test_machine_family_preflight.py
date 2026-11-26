@@ -1165,13 +1165,26 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         )
         self.assertEqual(code_cluster_and_wrapper, preflight.EXIT_READ_ERROR)
 
-        code_live_and_wrapper, _ = preflight.run_preflight(
+        unexpected_calls: list[list[str]] = []
+
+        def unexpected_runner(argv: list[str]) -> tuple[int, str, str]:
+            unexpected_calls.append(argv)
+            return 0, "{}", ""
+
+        code_live_and_wrapper, report_live_and_wrapper = preflight.run_preflight(
             cluster_name="live-cluster",
             location="us-central1",
             node_pool_json_sources=[json.dumps(wrapper_b)],
             target_specs=["n4"],
+            run=unexpected_runner,
         )
         self.assertEqual(code_live_and_wrapper, preflight.EXIT_READ_ERROR)
+        self.assertEqual(unexpected_calls, [])
+        self.assertEqual(len(report_live_and_wrapper["errors"]), 1)
+        self.assertIn(
+            "cluster wrapper in --node-pool-json",
+            report_live_and_wrapper["errors"][0]["message"],
+        )
 
     def test_cvm_pool_with_local_ssd_targeting_c3_reports_combined_conflict(self):
         """Confidential VM on c3 rejects localNvmeSsdBlockConfig while allowing c3-standard-*-lssd with ephemeralStorageLocalSsdConfig."""

@@ -2251,7 +2251,7 @@ def run_preflight(
 
     if not cluster_json_source:
         if cluster_name and location:
-            if cluster_doc is None:
+            if cluster_doc is None and not errors:
                 raw_live_cluster, err = _describe_cluster_live(
                     resolved_project,
                     location,
@@ -2283,7 +2283,7 @@ def run_preflight(
                 }
             )
 
-    if cluster_doc is not None and not pools_to_check:
+    if not errors and cluster_doc is not None and not pools_to_check:
         raw_cluster_pools = _first_present(
             cluster_doc,
             FIELD_NODE_POOLS,

@@ -8,6 +8,16 @@
 # `shielded-secure-boot-disabled`) before generating any ComputeClass or
 # NodePool YAML.
 #
+# `the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers` uses
+# `fold_decoration: true` with line-anchored `forbidden_patterns` so prose that
+# contrasts the two verdicts ("VERDICT: INCOMPATIBLE rather than VERDICT:
+# COMPATIBLE") or explains why ComputeClass/NodePool YAML was withheld passes,
+# while a standalone `VERDICT: COMPATIBLE` line or a generated `kind:
+# ComputeClass`, `kind: ContainerNodePool`, or Terraform
+# `resource "google_container_node_pool"` block fails.
+# bench/tests/test_compute_class_machine_family_preflight_verdict.py pins both
+# sides.
+#
 # On main, `machine_family_preflight.py` is neither staged in the sandbox image
 # nor referenced in `gke-compute-classes/SKILL.md`, so both the `worker_commands`
 # objective (`the-machine-family-preflight-validator-ran`) and the rule-ID
@@ -76,6 +86,7 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
       required_phrases:
         - "VERDICT: INCOMPATIBLE"
         - "shielded-vtpm-disabled"
@@ -83,8 +94,10 @@ verification_spec:
         - "disk-type-pd-on-hyperdisk-only"
         - "local-ssd-unsupported-on-n4"
         - "hyperdisk-balanced"
-      forbidden_phrases:
-        - "VERDICT: COMPATIBLE"
+      forbidden_patterns:
+        - '(?m)^\s*verdict:\s*compatible\s*$'
+        - '(?m)^\s*kind:\s*(?:computeclass|containernodepool)(?:\s*#.*)?$'
+        - '(?m)^\s*resource\s+"google-container-node-pool"(?:\s+"[^"\n]+")?\s*\{'
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic
