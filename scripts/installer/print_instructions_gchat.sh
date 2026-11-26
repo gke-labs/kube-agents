@@ -64,6 +64,9 @@ fi
 if [ -n "${GCHAT_STEPS_CHAT_MANAGE_PROJECT+set}" ]; then
   CHAT_MANAGE_PROJECT="${GCHAT_STEPS_CHAT_MANAGE_PROJECT:-}"
 fi
+if [ -n "${GCHAT_STEPS_CHAT_PROJECT_NUMBER+set}" ]; then
+  CHAT_PROJECT_NUMBER="${GCHAT_STEPS_CHAT_PROJECT_NUMBER:-}"
+fi
 # An empty subscription name is one the tfvars generator derives from the
 # topic, as an install.env that turned Google Chat on in the Day-2 menu has.
 if [ -n "${CHAT_TOPIC_NAME:-}" ] && [ -z "${CHAT_SUB_NAME:-}" ]; then
@@ -115,8 +118,10 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   agent_gsa_email="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID:-<PROJECT_ID>}.iam.gserviceaccount.com"
   if [ -n "${CHAT_PROJECT_ID:-}" ] && [ "${CHAT_PROJECT_ID}" != "${PROJECT_ID:-}" ]; then
     subscriber_sa_email="${CROSS_PROJECT_CHAT_GSA_NAME}@${chat_project}.iam.gserviceaccount.com"
+    chat_project_number="${CHAT_PROJECT_NUMBER:-}"
   else
     subscriber_sa_email="$agent_gsa_email"
+    chat_project_number="${CHAT_PROJECT_NUMBER:-${PROJECT_NUMBER:-}}"
   fi
 
   echo -e "${C_CYAN}${C_BOLD}--- [Google Chat Integration Instructions] ---${C_RESET}"
@@ -132,7 +137,7 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
     echo -e "  gcloud pubsub topics create ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>}"
     echo -e "  gcloud pubsub subscriptions create ${CHAT_SUB_NAME} --topic=${CHAT_TOPIC_NAME} --ack-deadline=${CHAT_SUB_ACK_DEADLINE_SECONDS} --project=${chat_project:-<CHAT_PROJECT_ID>}"
     echo -e "  gcloud pubsub topics add-iam-policy-binding ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${CHAT_API_PUSH_SA}\" --role=\"${ROLE_PUBSUB_PUBLISHER}\""
-    echo -e "  gcloud pubsub topics add-iam-policy-binding ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:service-<CHAT_PROJECT_NUMBER>@${WORKSPACE_ADDONS_SA_DOMAIN}\" --role=\"${ROLE_PUBSUB_PUBLISHER}\""
+    echo -e "  gcloud pubsub topics add-iam-policy-binding ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:service-${chat_project_number:-<CHAT_PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}\" --role=\"${ROLE_PUBSUB_PUBLISHER}\""
     echo -e "  gcloud pubsub subscriptions add-iam-policy-binding ${CHAT_SUB_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${subscriber_sa_email}\" --role=\"${ROLE_PUBSUB_SUBSCRIBER}\""
     echo -e "  gcloud pubsub subscriptions add-iam-policy-binding ${CHAT_SUB_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${subscriber_sa_email}\" --role=\"${ROLE_PUBSUB_VIEWER}\""
     echo -e ""
@@ -144,17 +149,17 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   echo -e "       - Connection Settings: Select ${C_BOLD}Cloud Pub/Sub${C_RESET}"
   echo -e "       - Pub/Sub Topic Name: ${C_GREEN}projects/${chat_project}/topics/${CHAT_TOPIC_NAME}${C_RESET}"
   echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
-  sa_display_format="service-${PROJECT_NUMBER:-<PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
+  sa_display_format="service-${chat_project_number:-<PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
   echo -e "       - After saving, refresh the page and verify the Workspace Add-ons ${C_BOLD}Service account email${C_RESET} appears under Connection settings"
   echo -e "         ${C_CYAN}(format: ${C_GREEN}${sa_display_format}${C_CYAN}; it is not the agent's ${C_YELLOW}${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}${C_CYAN}).${C_RESET}"
   echo -e "         ${C_CYAN}(This field only exists when \"Build this Chat app as a Workspace add-on\" is checked — the default, locked-on state for new apps).${C_RESET}"
   echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
   echo -e ""
   next_step=2
-  if [ -n "${PROJECT_NUMBER:-}" ]; then
+  if [ -n "${chat_project_number:-}" ]; then
     next_step=3
     echo -e "[ ] 2. Direct DM Link to Bot on Google Chat:"
-    echo -e "       ${C_WHITE}https://chat.google.com/dm/${PROJECT_NUMBER}${C_RESET}"
+    echo -e "       ${C_WHITE}https://chat.google.com/dm/${chat_project_number}${C_RESET}"
     echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
     echo -e ""
   else

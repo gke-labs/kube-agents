@@ -1295,6 +1295,12 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         vertex_at = text.find('export VERTEX_MANAGE_SERVING_PROJECT=""')
         self.assertNotEqual(vertex_at, -1, "uninstall.sh must blank VERTEX_MANAGE_SERVING_PROJECT")
         self.assertLess(vertex_at, call_at)
+        # The Chat project and its management switch likewise: the generator
+        # refuses a misspelt CHAT_MANAGE_PROJECT and variables.tf validates
+        # chat_project_id, while the destroy removes what is in state either way.
+        chat_proj_at = text.find('export CHAT_PROJECT_ID="" CHAT_MANAGE_PROJECT=""')
+        self.assertNotEqual(chat_proj_at, -1, "uninstall.sh must blank CHAT_PROJECT_ID and CHAT_MANAGE_PROJECT")
+        self.assertLess(chat_proj_at, call_at)
         # The release's upgrade_install switch too: the generator refuses a
         # misspelt HELM_UPGRADE_INSTALL, and a teardown must not stop on it.
         helm_at = text.find('export HELM_UPGRADE_INSTALL=""')

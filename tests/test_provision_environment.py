@@ -795,6 +795,7 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "WEB_CONSOLE_ENABLED": "--enable-web-console",
         "ENABLE_DRIFT_DETECTOR": "--enable-drift-detector",
         "VERTEX_MANAGE_SERVING_PROJECT": "--vertex-manage-serving-project",
+        "CHAT_MANAGE_PROJECT": "--chat-manage-project",
     }
 
     def _install_call(self, tmp_dir):

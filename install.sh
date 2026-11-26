@@ -1430,10 +1430,14 @@ parse_args() {
         PARAM_SLACK_HOME_CHANNEL_POLICY="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_POLICY
         shift ;;
-      --chat-project-id=*) PARAM_CHAT_PROJECT_ID="${1#*=}"; shift ;;
+      --chat-project-id=*)
+        PARAM_CHAT_PROJECT_ID="${1#*=}"
+        note_install_env_flag CHAT_PROJECT_ID "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_CHAT_PROJECT_ID
+        shift ;;
       --chat-manage-project|--chat-manage-project=*)
         PARAM_CHAT_MANAGE_PROJECT="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_CHAT_MANAGE_PROJECT"
+        note_install_env_flag CHAT_MANAGE_PROJECT "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_BOOL" PARAM_CHAT_MANAGE_PROJECT DEFAULT_CHAT_MANAGE_PROJECT
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
@@ -2163,7 +2167,7 @@ warn_unrecorded_interview_answers() {
   local key recorded current drifted=""
   local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
-    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
+    CHAT_PROJECT_ID CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
     LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
     USER_PROFILE_ENABLED ENABLE_STOCKOUT_INVESTIGATOR GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
@@ -2586,7 +2590,7 @@ record_gitops_forge_keys() {
 install_env_toggle_companions() {
   case "${1:-}" in
     SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
-    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_HOME_CHANNEL_POLICY GOOGLE_CHAT_MODE" ;;
+    GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_PROJECT_ID CHAT_MANAGE_PROJECT CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_HOME_CHANNEL_POLICY GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
 }
@@ -7272,9 +7276,10 @@ run_menu_system() {
         # The DM link in the Google Chat checklist is this project's number,
         # read here rather than inherited: install.env never records it.
         if is_truthy "$google_chat_enabled"; then
-          project_number="$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
+          local menu_chat_project="${chat_project_id:-$project_id}"
+          project_number="$(gcloud projects describe "$menu_chat_project" --format="value(projectNumber)" 2>/dev/null || echo "")"
         fi
-        PROJECT_NUMBER="$project_number" print_chat_setup_checklists
+        PROJECT_NUMBER="$project_number" CHAT_PROJECT_NUMBER="$project_number" print_chat_setup_checklists
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
           # Unlike main(), this apply does not wait for a rollout, and the menu
           # redrawn below would push the checklist off screen. The A2A gateway
@@ -9651,9 +9656,16 @@ main() {
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"
+  local chat_summary_project="${chat_project_id:-$project_id}"
+  local chat_summary_project_number="$project_number"
   if [ "${google_chat_enabled:-false}" = "true" ]; then
-    echo -e "  • ${C_CYAN}Google Chat Direct Bot Link:${C_RESET} ${C_UNDERLINE}https://chat.google.com/dm/${project_number}${C_RESET}"
-    echo -e "  • ${C_CYAN}Google Chat App Console:${C_RESET} ${C_UNDERLINE}https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${project_id}${C_RESET}"
+    if [ -n "${chat_project_id:-}" ] && [ "$chat_project_id" != "$project_id" ]; then
+      chat_summary_project_number="$(gcloud projects describe "$chat_project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
+    fi
+    if [ -n "$chat_summary_project_number" ]; then
+      echo -e "  • ${C_CYAN}Google Chat Direct Bot Link:${C_RESET} ${C_UNDERLINE}https://chat.google.com/dm/${chat_summary_project_number}${C_RESET}"
+    fi
+    echo -e "  • ${C_CYAN}Google Chat App Console:${C_RESET} ${C_UNDERLINE}https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${chat_summary_project}${C_RESET}"
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo -e "  • ${C_CYAN}Slack App Link:${C_RESET} ${C_UNDERLINE}https://app.slack.com/client${C_RESET}"
@@ -9682,6 +9694,7 @@ main() {
     echo -e "  • ${C_CYAN}GKE Stockout Investigator:${C_RESET} Disabled (enable with ${C_BOLD}--enable-stockout-investigator${C_RESET}, ENABLE_STOCKOUT_INVESTIGATOR=true in install.env, or ./install.sh --menu)"
   fi
 
+  export CHAT_PROJECT_NUMBER="$chat_summary_project_number"
   print_chat_setup_checklists
   # Repeated here, where the checklists above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().

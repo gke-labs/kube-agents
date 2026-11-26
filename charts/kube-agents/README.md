@@ -865,8 +865,11 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   topic/subscription names (defaults match the `chat-pubsub` Terraform
   module). Requires the Chat Pub/Sub backend to exist
   (`terraform/modules/chat-pubsub`); `projectId`
-  is taken from `platformAgent.harness.projectId`. Restrict access via
-  `allowedUsers` (empty = everyone).
+  defaults to `platformAgent.harness.projectId` when empty, and
+  `serviceAccountEmail` optionally names the dedicated Chat service account
+  (`kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com`) impersonated
+  by the credential broker when the Chat project differs from the GKE host
+  project. Restrict access via `allowedUsers` (empty = everyone).
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
   tokens are read from the credentials Secret's `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).

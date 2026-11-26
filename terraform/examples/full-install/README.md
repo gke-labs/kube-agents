@@ -58,6 +58,16 @@ install without the interview.
   and create the topic and subscription with their publisher and subscriber IAM
   bindings (see [`scripts/installer/print_instructions_gchat.sh`](../../../scripts/installer/print_instructions_gchat.sh)
   or the [ChatOps guide](../../../docs/site/src/content/docs/concepts/chatops.md)).
+  Decide `chat_manage_project = false` at the first apply: turning it off later on an
+  install whose earlier apply created the Chat project resources destroys the topic,
+  subscription, `kubeagents-chat-gsa` service account, and IAM bindings on the next
+  apply unless you remove them from state first:
+
+  ```bash
+  terraform state rm 'module.chat_pubsub[0]' \
+    'google_project_service.chat_project'
+  ```
+
 - Optionally (`enable_github_minter = true`) the GitHub token minter backend
   ([`github-minter`](../../modules/github-minter) module): minter service
   account plus a KMS key ring and signing key.
@@ -922,9 +932,12 @@ not covered by master-authorized-networks.
 ### Google Chat, Slack, and GitHub integrations
 
 With `enable_google_chat = true` the composition provisions the GCP backend
-(topic, subscription, IAM) **and** enables the CR's `googleChat` integration
-with the created topic/subscription — restrict access with
-`google_chat_allowed_users` (empty = everyone).
+(topic, subscription, IAM, and, when `chat_project_id` differs from
+`project_id`, the `kubeagents-chat-gsa` service account and token-creator grant
+unless `chat_manage_project = false`) **and** enables the CR's `googleChat`
+integration with the created topic, subscription, `projectId`, and
+`serviceAccountEmail` — restrict access with `google_chat_allowed_users`
+(empty = everyone).
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 

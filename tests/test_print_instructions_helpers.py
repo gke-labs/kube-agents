@@ -371,7 +371,7 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
             self._env()
             + "PROJECT_ID=gke-host-proj\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
         )
-        out = self._run(env)
+        out = self._run(env, {"PROJECT_NUMBER": "111111111111", "CHAT_PROJECT_NUMBER": "222222222222"})
         self.assertIn("?project=workspace-chat-proj", out)
         self.assertIn("projects/workspace-chat-proj/topics/file-topic", out)
         self.assertIn("CHAT_MANAGE_PROJECT=false: have an administrator of 'workspace-chat-proj' run:", out)
@@ -384,6 +384,9 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
             "member=\"serviceAccount:kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com\" --role=\"roles/pubsub.subscriber\"",
             out,
         )
+        self.assertIn("https://chat.google.com/dm/222222222222", out)
+        self.assertIn("service-222222222222@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertNotIn("111111111111", out)
 
 
 class ChatSetupChecklistsTest(unittest.TestCase):
@@ -429,6 +432,7 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         return proc.stdout + proc.stderr, printed
 
     _CHAT = {"GOOGLE_CHAT_ENABLED": "true", "GOOGLE_CHAT_HOME_CHANNEL": "", "ALLOWED_USERS": "a@example.com",
+             "CHAT_PROJECT_ID": "chat-proj", "CHAT_MANAGE_PROJECT": "false", "CHAT_PROJECT_NUMBER": "987654321098",
              "CHAT_TOPIC_NAME": "t", "CHAT_SUB_NAME": "t-sub", "PROJECT_NUMBER": "123456789012",
              "NAMESPACE": "custom-ns"}
 
@@ -439,6 +443,9 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         handoff = printed["print_instructions_gchat"]
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "GCHAT_STEPS_GOOGLE_CHAT_ENABLED=true",
+                     "GCHAT_STEPS_CHAT_PROJECT_ID=chat-proj",
+                     "GCHAT_STEPS_CHAT_MANAGE_PROJECT=false",
+                     "GCHAT_STEPS_CHAT_PROJECT_NUMBER=987654321098",
                      "GCHAT_STEPS_HOME_CHANNEL=\n", "GCHAT_STEPS_ALLOWED_USERS=a@example.com",
                      "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012"):
             with self.subTest(line=line):

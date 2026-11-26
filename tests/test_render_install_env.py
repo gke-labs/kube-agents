@@ -318,9 +318,13 @@ class DefaultOnKeysAreRefusableTest(unittest.TestCase):
         # process environment. Provisions nothing either way, so an environment
         # that cannot override it loses no cloud resource by the omission.
         "PERSIST_SECRETS_ON_DISK",
-        # Acts on a separate Chat project only when CHAT_PROJECT_ID is set and
-        # GOOGLE_CHAT_ENABLED is true; an environment that leaves CHAT_PROJECT_ID
-        # unset provisions in PROJECT_ID as before.
+        # Gates Google Chat API enablement, service account creation, and
+        # Pub/Sub provisioning only when GOOGLE_CHAT_ENABLED is true (which is
+        # default-false and in REQUIRED_STRICT, so an environment that says
+        # nothing provisions no Chat resource). Mapping it in
+        # render_install_env.sh requires exporting CHAT_MANAGE_PROJECT in
+        # .github/workflows/deploy-environment.yml
+        # (DeployEnvironmentCarriesTheInstallSettingsTest).
         "CHAT_MANAGE_PROJECT",
     }
 

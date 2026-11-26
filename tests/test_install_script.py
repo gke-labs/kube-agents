@@ -9048,7 +9048,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     # integration's settings and nothing in the test exported them.
     _EMPTY_COMPANIONS = {
         "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\n",
-        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_PROJECT_ID=''\nCHAT_MANAGE_PROJECT=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
     }
 
     def _check(self, tmp, content, flags, extra_env=None):
@@ -9437,6 +9437,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-home-channel-name", "SLACK_HOME_CHANNEL_NAME", "#gke alerts"),
                 ("--slack-home-channel-policy", "SLACK_HOME_CHANNEL_POLICY", "manual"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
+                ("--chat-project-id", "CHAT_PROJECT_ID", "workspace-chat-proj"),
+                ("--chat-manage-project", "CHAT_MANAGE_PROJECT", "false"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
                 ("--google-chat-home-channel-policy", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
                 ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
@@ -9499,10 +9501,12 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ),
                 (
                     "--enable-google-chat",
-                    "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
+                    "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_PROJECT_ID=chat-proj "
+                    "CHAT_MANAGE_PROJECT=false CHAT_TOPIC_NAME=my-topic "
                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual "
                     "GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
-                    ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
+                    ["ALLOWED_USERS=a@example.com", "CHAT_PROJECT_ID=chat-proj",
+                     "CHAT_MANAGE_PROJECT=false", "CHAT_TOPIC_NAME=my-topic",
                      "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual",
                      "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
                     ("CHAT_SUB_NAME",),
@@ -9627,7 +9631,14 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     def test_the_menu_refuses_a_chat_flag_it_would_drop(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for flag in ("--enable-slack", "--enable-google-chat=false", "--slack-allowed-users=U1", "--chat-topic-name=t"):
+            for flag in (
+                "--enable-slack",
+                "--enable-google-chat=false",
+                "--slack-allowed-users=U1",
+                "--chat-topic-name=t",
+                "--chat-project-id=chat-proj",
+                "--chat-manage-project=false",
+            ):
                 with self.subTest(flag=flag):
                     proc = self._run(
                         f'run_menu_system() {{ echo "MENU RAN"; }}; print_banner() {{ :; }}; main --menu {flag}',
