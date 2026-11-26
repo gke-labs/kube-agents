@@ -5,8 +5,8 @@
 #
 # Planted defect: seeded-c's default-pool sets kubeletConfig.podPidsLimit to
 # 4096 where every other pool in the stack sets none of the five keys
-# (bench/tf/fleet/main.tf, seeded_c_default). Ten Linux pools vote, nine
-# agree: 0.90, so the ladder takes no step and the base-major finding stands.
+# (bench/tf/fleet/main.tf, seeded_c_default). Eleven Linux pools vote, ten
+# agree: 0.91, so the ladder takes no step and the base-major finding stands.
 # A cluster-level vote could not grade this: three clusters of four is 0.75,
 # two steps, and only a base-critical facet survives that.
 #
