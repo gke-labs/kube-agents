@@ -1,4 +1,4 @@
-package main
+package proxyserver
 
 import (
 	"bufio"
@@ -298,7 +298,7 @@ func withLocalFiles(t *testing.T, args []string) []string {
 	return out
 }
 
-// buildFromArgs parses args and reads the environment as the binary's main does, and
+// buildFromArgs parses args and reads the environment as Run does, and
 // builds its handler from them, which makes every check the binary makes of its
 // configuration before it listens. It returns the configuration as the example wrote it,
 // and the error the binary would stop with.
