@@ -989,8 +989,10 @@ func (d *Dispatcher) followHolder(ctx context.Context, log *slog.Logger, del lib
 // written the refusal stands, so its terminal is owed even to a stop, for up
 // to reportAfterStop; one still unpublished then (or lost to a crash) stays
 // unpublished, since the redelivery finds the tombstone and is acked as a
-// replay. A repeat terminal is a duplicate the stream drops (its envelope id
-// is fixed).
+// replay. A repeat terminal after a lost ack is a duplicate the stream drops
+// on the five-token form (its envelope id is fixed per task); on the
+// six-token form, whose id is drawn again after a failed send, it can be a
+// second identical final status, which readers fold past.
 func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, ref *refusal) {
 	d.endUnstarted(ctx, log, del, hk, lib.StateRejected, ref)
 }
@@ -1678,9 +1680,8 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 				"state", state, "reason", reason, "after", d.cfg.DroppedTerminalGiveUp, "err", err)
 			return true
 		}
-		// A dropped profile's refusals are its own bound's, above; only a
-		// planted duplicate gives it up early.
-		if !listed && !errors.Is(err, errTerminalUnpublished) {
+		// A dropped profile's refusals are its own bound's, above.
+		if !listed {
 			refused.since = time.Time{}
 		} else if d.terminalGivenUp(log, &refused, err, state, reason) {
 			return true
@@ -1694,11 +1695,11 @@ func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger,
 
 // terminalRefusal is one terminal's retry state across its attempts: the
 // start of its run of permission refusals, for terminalGivenUp's bound, and
-// the fresh envelope id its duplicate re-publishes go under
-// (confirmDuplicateTerminal), so they dedupe onto each other.
+// the six-token terminal's envelope id (sixTokenTerminalID), drawn on the
+// first attempt and again after any attempt that fails (publishTerminal).
 type terminalRefusal struct {
-	since   time.Time
-	freshID string
+	since time.Time
+	id    string
 }
 
 // terminalGivenUp decides, after a failed terminal publish, whether to stop
@@ -1713,18 +1714,15 @@ type terminalRefusal struct {
 // while every failed attempt is one. Any other failure (a disconnect, no
 // responders, a timeout with no refusal, a JetStream API error) resets it, so
 // a NATS or TASKS outage of any length is retried and the terminal lands
-// after it. A duplicate that isn't the task's terminal (errTerminalUnpublished)
-// gives up at once. An unlatched install keeps retrying, as it always has.
+// after it. An unlatched install keeps retrying, as it always has. A
+// duplicate ack is never a failure: the six-token terminal's id is random per
+// retry loop (sixTokenTerminalID), so a duplicate is that loop's own send.
 //
 // Giving up is loud: the Error log names ReasonTerminalUnpublished, and the
 // health line counts it (supervisorGiveUps). The requester sees no terminal;
 // the gateway ends a task with no events as never started, and holds one with
 // executor events until the user's stop.
 func (d *Dispatcher) terminalGivenUp(log *slog.Logger, r *terminalRefusal, err error, state lib.TaskState, reason string) bool {
-	if errors.Is(err, errTerminalUnpublished) {
-		d.giveUpTerminal(log, state, reason, 0, err)
-		return true
-	}
 	if d.src.Config().ProfileSupervisorForm != lib.ProfileSupervisorFormProfile || !errors.Is(err, errSupervisorPublishRefused) {
 		r.since = time.Time{}
 		return false

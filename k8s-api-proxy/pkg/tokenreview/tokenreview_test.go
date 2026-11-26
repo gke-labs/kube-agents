@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
@@ -28,6 +30,13 @@ const (
 	testCallerToken       = "caller-token"
 	shellUsername         = "system:serviceaccount:agents:shell"
 	tokenReviewPath       = "/apis/authentication.k8s.io/v1/tokenreviews"
+	podsPathPrefix        = "/api/v1/namespaces/"
+	// The shell's pod, which shellReview names, at the address httptest.NewRequest gives
+	// every request's peer.
+	shellPodNamespace = "agents"
+	shellPodName      = "shell-0"
+	shellPodUID       = "pod-uid-1"
+	shellPodIP        = "192.0.2.1"
 	// The Basic credentials are fake. This package's tests build their Basic headers at run
 	// time with basicAuthHeader, so no literal in this package reads as a credential to a
 	// secret scanner.
@@ -38,18 +47,27 @@ const (
 // jsonContent makes the client send JSON, which the fake decodes; it defaults to protobuf.
 var jsonContent = rest.ContentConfig{ContentType: testContentTypeJSON}
 
-// fakeTokenReviewServer answers TokenReviews with status and records each request.
+// fakeTokenReviewServer answers TokenReviews with status and records each request. It also
+// answers a GET of a pod in pods (keyed namespace/name), or with podCode when that is set;
+// shellPod when pods is nil.
 type fakeTokenReviewServer struct {
 	mu       sync.Mutex
 	status   authenticationv1.TokenReviewStatus
 	code     int
 	reviews  []authenticationv1.TokenReview
 	authzHdr []string
+	pods     map[string]*corev1.Pod
+	podCode  int
+	podGets  int
 }
 
 func (f *fakeTokenReviewServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, podsPathPrefix) {
+		f.servePod(w, r)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.Path != tokenReviewPath {
 		http.NotFound(w, r)
 		return
@@ -70,6 +88,39 @@ func (f *fakeTokenReviewServer) ServeHTTP(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(review)
 }
 
+// servePod answers GET /api/v1/namespaces/<namespace>/pods/<name>.
+func (f *fakeTokenReviewServer) servePod(w http.ResponseWriter, r *http.Request) {
+	f.podGets++
+	if f.podCode != 0 {
+		w.WriteHeader(f.podCode)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, podsPathPrefix), "/")
+	if len(parts) != 3 || parts[1] != "pods" {
+		http.NotFound(w, r)
+		return
+	}
+	pods := f.pods
+	if pods == nil {
+		pods = map[string]*corev1.Pod{shellPodNamespace + "/" + shellPodName: shellPod()}
+	}
+	pod, ok := pods[parts[0]+"/"+parts[2]]
+	if !ok {
+		w.Header().Set(testHeaderContentType, testContentTypeJSON)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)
+		return
+	}
+	w.Header().Set(testHeaderContentType, testContentTypeJSON)
+	_ = json.NewEncoder(w).Encode(pod)
+}
+
+func (f *fakeTokenReviewServer) podCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.podGets
+}
+
 func (f *fakeTokenReviewServer) calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -80,8 +131,34 @@ func shellReview() authenticationv1.TokenReviewStatus {
 	return authenticationv1.TokenReviewStatus{
 		Authenticated: true,
 		Audiences:     []string{testAudience},
-		User:          authenticationv1.UserInfo{Username: shellUsername, UID: "uid-1", Groups: []string{"system:serviceaccounts"}},
+		User: authenticationv1.UserInfo{
+			Username: shellUsername, UID: "uid-1", Groups: []string{"system:serviceaccounts"},
+			Extra: podExtra(shellPodName, shellPodUID),
+		},
 	}
+}
+
+// podExtra is the user.extra a TokenReview fills for a token issued to the pod name/uid.
+func podExtra(name, uid string) map[string]authenticationv1.ExtraValue {
+	return map[string]authenticationv1.ExtraValue{extraPodName: {name}, extraPodUID: {uid}}
+}
+
+// shellPod is the running pod shellReview names, with shellPodIP.
+func shellPod() *corev1.Pod {
+	return testPod(shellPodNamespace, shellPodName, shellPodUID, corev1.PodRunning, shellPodIP)
+}
+
+func testPod(namespace, name, uid string, phase corev1.PodPhase, ips ...string) *corev1.Pod {
+	pod := &corev1.Pod{}
+	pod.Namespace, pod.Name, pod.UID = namespace, name, types.UID(uid)
+	pod.Status.Phase = phase
+	for _, ip := range ips {
+		pod.Status.PodIPs = append(pod.Status.PodIPs, corev1.PodIP{IP: ip})
+	}
+	if len(ips) > 0 {
+		pod.Status.PodIP = ips[0]
+	}
+	return pod
 }
 
 func newTestTokenReviewAuthenticator(t *testing.T, fake *fakeTokenReviewServer) k8sapiproxy.CallerAuthenticator {
@@ -297,7 +374,10 @@ func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
 		status: authenticationv1.TokenReviewStatus{
 			Authenticated: true,
 			Audiences:     []string{profileAudience},
-			User:          authenticationv1.UserInfo{Username: profileUsername, UID: "uid-p"},
+			User:          authenticationv1.UserInfo{Username: profileUsername, UID: "uid-p", Extra: podExtra("sre-worker-0", "uid-pod-p")},
+		},
+		pods: map[string]*corev1.Pod{
+			"agents-profile-sre/sre-worker-0": testPod("agents-profile-sre", "sre-worker-0", "uid-pod-p", corev1.PodRunning, shellPodIP),
 		},
 	}
 	srv := httptest.NewServer(fake)
