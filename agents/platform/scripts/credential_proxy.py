@@ -1617,12 +1617,17 @@ LOG_MSEC_FORMAT = "%s.%03dZ"
 # k8s-event-watcher readiness from its metrics port on loopback.
 AGENT_API_SCOPE_PATH = "/api/scope"
 AGENT_API_FLEET_SCOPE_FILE = "fleet_scope.json"
+AGENT_API_WORKSPACE_ROOT_ENV = "CREDENTIAL_PROXY_WORKSPACE_ROOT"
+AGENT_API_HERMES_HOME_ENV = "HERMES_HOME"
+AGENT_API_DEFAULT_WORKSPACE_ROOT = "/opt/data"
 AGENT_API_PROFILES_DIR = "profiles"
-AGENT_API_CLUSTER_PROFILE_PREFIX = "cluster-"
+AGENT_API_RESERVED_PROFILES = frozenset({"default", "platform", "tse"})
 AGENT_API_PROFILE_CONFIG_FILE = "config.yaml"
+AGENT_API_PROFILE_SCAFFOLD_FILE = "profile.yaml"
 AGENT_API_PROFILE_USER_MD_FILE = "USER.md"
 AGENT_API_CLUSTER_IDENTITY_KEY = "cluster_identity"
 AGENT_API_EVENT_WATCHER_ENABLED_ENV = "EVENT_WATCHER_ENABLED"
+AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT = "true"
 AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV = "EVENT_WATCHER_METRICS_PORT"
 AGENT_API_EVENT_WATCHER_DEFAULT_METRICS_PORT = 9095
 AGENT_API_EVENT_WATCHER_METRICS_HOST = "127.0.0.1"
@@ -1632,6 +1637,9 @@ AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES = 1024 * 1024
 AGENT_API_WATCH_SET_READY_METRIC = "k8s_event_watcher_watch_set_ready"
 AGENT_API_CLUSTER_UP_METRIC = "k8s_event_watcher_cluster_up"
 AGENT_API_DISCOVERY_ERRORS_METRIC = "k8s_event_watcher_cluster_discovery_errors_total"
+AGENT_API_METRIC_CLUSTER_LABEL = "cluster"
+AGENT_API_METRIC_PROJECT_LABEL = "project"
+AGENT_API_METRIC_LOCATION_LABEL = "location"
 AGENT_API_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
 _PROMETHEUS_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 
@@ -7267,9 +7275,9 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         root = Path(
             workspace_root
             or getattr(cls, "workspace_root", "")
-            or os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
-            or os.getenv("HERMES_HOME")
-            or "/opt/data"
+            or os.getenv(AGENT_API_WORKSPACE_ROOT_ENV)
+            or os.getenv(AGENT_API_HERMES_HOME_ENV)
+            or AGENT_API_DEFAULT_WORKSPACE_ROOT
         )
         snapshot: dict[str, Any] = {}
         snapshot_path = root / AGENT_API_FLEET_SCOPE_FILE
@@ -7308,7 +7316,11 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             yaml = None
         entries: list[dict[str, Any]] = []
         for entry in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
-            if not entry.is_dir() or not entry.name.startswith(AGENT_API_CLUSTER_PROFILE_PREFIX):
+            if (
+                not entry.is_dir()
+                or entry.name.startswith(".")
+                or entry.name in AGENT_API_RESERVED_PROFILES
+            ):
                 continue
             config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
             if not config_path.is_file():
@@ -7316,13 +7328,17 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             identity = cls._parse_cluster_identity(config_path, yaml)
             if not identity:
                 continue
+            is_ready = (
+                (entry / AGENT_API_PROFILE_SCAFFOLD_FILE).is_file()
+                and (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file()
+            )
             entries.append(
                 {
                     "profile": entry.name,
-                    "project": identity["project"],
-                    "cluster": identity["cluster"],
-                    "location": identity["location"],
-                    "ready": (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file(),
+                    "project": identity[AGENT_API_METRIC_PROJECT_LABEL],
+                    "cluster": identity[AGENT_API_METRIC_CLUSTER_LABEL],
+                    "location": identity[AGENT_API_METRIC_LOCATION_LABEL],
+                    "ready": is_ready,
                 }
             )
         return entries
@@ -7341,16 +7357,23 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if isinstance(data, dict):
                 ident = data.get(AGENT_API_CLUSTER_IDENTITY_KEY)
                 if isinstance(ident, dict):
-                    project = str(ident.get("project") or "").strip()
-                    cluster = str(ident.get("cluster") or "").strip()
-                    location = str(ident.get("location") or "").strip()
+                    project = str(ident.get(AGENT_API_METRIC_PROJECT_LABEL) or "").strip()
+                    cluster = str(ident.get(AGENT_API_METRIC_CLUSTER_LABEL) or "").strip()
+                    location = str(ident.get(AGENT_API_METRIC_LOCATION_LABEL) or "").strip()
                     if project and cluster and location:
-                        return {"project": project, "cluster": cluster, "location": location}
+                        return {
+                            AGENT_API_METRIC_PROJECT_LABEL: project,
+                            AGENT_API_METRIC_CLUSTER_LABEL: cluster,
+                            AGENT_API_METRIC_LOCATION_LABEL: location,
+                        }
         return None
 
     @classmethod
     def _read_event_watcher_status(cls) -> dict[str, Any]:
-        raw_enabled = os.getenv(AGENT_API_EVENT_WATCHER_ENABLED_ENV, "true").strip().lower()
+        raw_enabled = os.getenv(
+            AGENT_API_EVENT_WATCHER_ENABLED_ENV,
+            AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT,
+        ).strip().lower()
         enabled = raw_enabled not in AGENT_API_FALSEY_ENV_VALUES
         if not enabled:
             return {
@@ -7458,16 +7481,22 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     clusters_up += 1
                 clusters.append(
                     {
-                        "cluster": labels.get("cluster", ""),
-                        "project": labels.get("project", ""),
-                        "location": labels.get("location", ""),
+                        AGENT_API_METRIC_CLUSTER_LABEL: labels.get(AGENT_API_METRIC_CLUSTER_LABEL, ""),
+                        AGENT_API_METRIC_PROJECT_LABEL: labels.get(AGENT_API_METRIC_PROJECT_LABEL, ""),
+                        AGENT_API_METRIC_LOCATION_LABEL: labels.get(AGENT_API_METRIC_LOCATION_LABEL, ""),
                         "up": up,
                     }
                 )
             elif name == AGENT_API_DISCOVERY_ERRORS_METRIC:
                 if val > 0:
                     discovery_errors += int(val)
-        clusters.sort(key=lambda c: (c["project"], c["location"], c["cluster"]))
+        clusters.sort(
+            key=lambda c: (
+                c[AGENT_API_METRIC_PROJECT_LABEL],
+                c[AGENT_API_METRIC_LOCATION_LABEL],
+                c[AGENT_API_METRIC_CLUSTER_LABEL],
+            )
+        )
         return {
             "enabled": True,
             "reachable": True,

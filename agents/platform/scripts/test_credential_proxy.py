@@ -1106,14 +1106,27 @@ class AgentAPIProxyTest(unittest.TestCase):
             "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
             encoding="utf-8",
         )
+        (prof_ready / "profile.yaml").write_text("name: cluster-proj-host-c1-us-central1\n", encoding="utf-8")
         (prof_ready / "USER.md").write_text("# Cluster Agent Context\n", encoding="utf-8")
 
+        # Profile with USER.md but missing profile.yaml (not registered with Hermes) must report ready=False.
         prof_unready = root / "profiles" / "cluster-proj-host-c2-us-east1"
         prof_unready.mkdir(parents=True)
         (prof_unready / "config.yaml").write_text(
             "cluster_identity:\n  project: proj-host\n  cluster: c2\n  location: us-east1\n",
             encoding="utf-8",
         )
+        (prof_unready / "USER.md").write_text("# Unregistered skeleton\n", encoding="utf-8")
+
+        # Reserved profiles (platform, default, tse) are ignored even if they have config.yaml.
+        prof_reserved = root / "profiles" / "platform"
+        prof_reserved.mkdir(parents=True)
+        (prof_reserved / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_reserved / "profile.yaml").write_text("name: platform\n", encoding="utf-8")
+        (prof_reserved / "USER.md").write_text("# Platform\n", encoding="utf-8")
 
         metrics_body = (
             "# HELP k8s_event_watcher_watch_set_ready ready\n"

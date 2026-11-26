@@ -41,8 +41,8 @@ import (
 const (
 	scopeTimeout = 5 * time.Second
 
-	scopePath   = "/api/scope"
-	healthPath  = "/health"
+	scopePath    = "/api/scope"
+	healthPath   = "/health"
 	stateInScope = "in-scope"
 
 	outcomeOK          = "ok"
@@ -51,23 +51,47 @@ const (
 	outcomeAPIDisabled = "api-disabled"
 	outcomeOverCap     = "over-cap"
 
-	remediationDenied      = "Grant roles/container.viewer (and roles/compute.viewer) to the Platform Agent's Google Cloud service account on this project so cluster_agent_reconcile.py can list and fetch credentials for its clusters."
-	remediationUnreachable = "The GKE API or control plane did not answer within the reconcile budget. Check VPC egress, firewall rules, Private Google Access, or control-plane authorized networks."
-	remediationAPIDisabled = "Enable the Kubernetes Engine API (container.googleapis.com) in this project (`gcloud services enable container.googleapis.com --project=<project>`), or add the project to spec.scope.exclude.projects."
-	remediationOverCap     = "This project sits past spec.scope.maxProjects (default 100) and gets no new Cluster Agent profiles. Raise spec.scope.maxProjects on the PlatformAgent or narrow spec.scope."
+	remediationDenied            = "Grant roles/container.viewer (and roles/compute.viewer) to the Platform Agent's Google Cloud service account on this project so cluster_agent_reconcile.py can list and fetch credentials for its clusters."
+	remediationUnreachable       = "The GKE API or control plane did not answer within the reconcile budget. Check VPC egress, firewall rules, Private Google Access, or control-plane authorized networks."
+	remediationAPIDisabled       = "Enable the Kubernetes Engine API (container.googleapis.com) in this project (`gcloud services enable container.googleapis.com --project=<project>`), or add the project to spec.scope.exclude.projects."
+	remediationOverCap           = "This project sits past spec.scope.maxProjects (default 100) and gets no new Cluster Agent profiles. Raise spec.scope.maxProjects on the PlatformAgent or narrow spec.scope."
+	remediationUnknownPrefix     = "Check cluster_agent_reconcile.py logs on the platform-agent pod for details on outcome "
+	remediationUnknownSuffix     = "."
+	remediationProfileIncomplete = "Cluster Agent profile scaffold is incomplete (profile.yaml, kubeconfig.yaml, or USER.md missing); the next cluster_agent_reconcile.py tick will retry get-credentials."
 
 	viaManagement = "management"
-	viaExplicit   = "explicit"
+	viaProfile    = "profile"
+
+	placeholderNoClusters      = "(no clusters discovered)"
+	placeholderDiscoveryFailed = "(cluster discovery failed)"
+	placeholderDiscoveredFmt   = "(%d %s discovered)"
+
+	gatewayUnreachablePrefix = "agent gateway unreachable: "
+	gatewayAnsweredHTTPFmt   = "agent gateway answered HTTP %d"
 
 	watcherStatusWatching    = "watching"
 	watcherStatusStarting    = "starting"
 	watcherStatusDisabled    = "disabled"
 	watcherStatusUnreachable = "unreachable"
 
-	alertsStarterPrompt = "Run an on-demand cluster health and security posture check across the fleet and summarise any failing pods, recent warning events, or RBAC risks."
+	watcherDisabledDetail            = "k8s-event-watcher is disabled by configuration (EVENT_WATCHER_ENABLED=false)."
+	watcherWatchingFmt               = "Watching %d of %d %s for Kubernetes Warning events"
+	watcherActiveNoClustersDetail    = "Active and listening for Kubernetes Warning events"
+	watcherDiscoveryErrorsFmt        = " (%d profile discovery %s)"
+	watcherStartingDetail            = "Assembling initial cluster watch set"
+	watcherMetricsUnreachableDetail  = "k8s-event-watcher metrics listener on loopback is unreachable"
+	watcherMetricsErrorFmt           = "k8s-event-watcher metrics unreachable (%s)"
+	watcherFallbackHealthyDetail     = "Agent gateway reachable; k8s-event-watcher opens an #alerts thread when a Warning event arrives"
+	watcherFallbackUnreachableDetail = "Agent gateway unreachable"
 
-	minutesPerHour = 60
-	hoursPerDay    = 24
+	wordCluster  = "cluster"
+	wordClusters = "clusters"
+	wordError    = "error"
+	wordErrors   = "errors"
+	utcSuffix    = " UTC"
+	enDash       = "–"
+
+	alertsStarterPrompt = "Run an on-demand cluster health and security posture check across the fleet and summarise any failing pods, recent warning events, or RBAC risks."
 )
 
 // dailyAuditSlot is one daily fleet audit from agents/platform/cron/jobs.json,
@@ -298,7 +322,7 @@ func outcomeRemediation(outcome string) string {
 	case outcomeOverCap:
 		return remediationOverCap
 	default:
-		return "Check cluster_agent_reconcile.py logs on the platform-agent pod for details on outcome " + outcome + "."
+		return remediationUnknownPrefix + outcome + remediationUnknownSuffix
 	}
 }
 
@@ -341,7 +365,7 @@ func nextDailyAudit(now time.Time) scopeScheduleInfo {
 
 	firstLabel := dailyAuditRoster[0].TimeLabel
 	lastLabel := dailyAuditRoster[len(dailyAuditRoster)-1].TimeLabel
-	windowUTC := strings.TrimSuffix(firstLabel, " UTC") + "–" + lastLabel
+	windowUTC := strings.TrimSuffix(firstLabel, utcSuffix) + enDash + lastLabel
 
 	return scopeScheduleInfo{
 		NextAuditID:     chosen.ID,
@@ -380,11 +404,11 @@ func (s *server) readScope(ctx context.Context, now time.Time) scopeResponse {
 		hResp, hErr := s.hermes(ctx, http.MethodGet, healthPath, nil)
 		switch {
 		case hErr != nil:
-			gatewayDetail = "agent gateway unreachable: " + hErr.Error()
+			gatewayDetail = gatewayUnreachablePrefix + hErr.Error()
 		default:
 			drainAndClose(hResp)
 			gatewayHealthy = hResp.StatusCode == http.StatusOK
-			gatewayDetail = fmt.Sprintf("agent gateway answered HTTP %d", hResp.StatusCode)
+			gatewayDetail = fmt.Sprintf(gatewayAnsweredHTTPFmt, hResp.StatusCode)
 		}
 	}
 
@@ -424,11 +448,20 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	projects := make([]scopeProjectRow, 0, len(raw.Projects))
 	allClusters := []scopeClusterRow{}
 	seenClusters := map[[3]string]bool{}
+	seenProjects := map[string]bool{}
 
 	for _, p := range raw.Projects {
 		if p.ID == "" {
 			continue
 		}
+		state := p.State
+		if state == "" {
+			state = stateInScope
+		}
+		if state != stateInScope {
+			continue
+		}
+		seenProjects[p.ID] = true
 		via := p.Via
 		if via == nil {
 			via = []string{}
@@ -436,10 +469,6 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 		outcome := p.Outcome
 		if outcome == "" {
 			outcome = outcomeOK
-		}
-		state := p.State
-		if state == "" {
-			state = stateInScope
 		}
 		remedy := outcomeRemediation(outcome)
 
@@ -462,7 +491,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 		var projClusters []scopeClusterRow
 		for _, profName := range profs {
 			if id, ok := identByProfile[profName]; ok {
-				row := makeClusterRow(id.Project, id.Location, id.Cluster, id.Profile, outcome, id.Ready, remedy, watchByTriple)
+				row := makeClusterRow(cfg, id.Project, id.Location, id.Cluster, id.Profile, outcome, id.Ready, remedy, watchByTriple)
 				projClusters = append(projClusters, row)
 				triple := [3]string{row.Project, row.Location, row.Name}
 				if !seenClusters[triple] {
@@ -491,16 +520,16 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 		// yet, surface a project-level row in allClusters so the cluster table
 		// shows why its clusters could not be onboarded.
 		if len(projClusters) == 0 {
-			placeholderName := "(no clusters discovered)"
+			placeholderName := placeholderNoClusters
 			if p.Clusters != nil && *p.Clusters > 0 {
-				placeholderName = fmt.Sprintf("(%d %s discovered)", *p.Clusters, pluralWord(*p.Clusters, "cluster", "clusters"))
+				placeholderName = fmt.Sprintf(placeholderDiscoveredFmt, *p.Clusters, pluralWord(*p.Clusters, wordCluster, wordClusters))
 			} else if outcome != outcomeOK {
-				placeholderName = "(cluster discovery failed)"
+				placeholderName = placeholderDiscoveryFailed
 			}
 			if cfg.ClusterName != "" && p.ID == cfg.ProjectID {
 				placeholderName = cfg.ClusterName
 			}
-			row := makeClusterRow(p.ID, cfg.Location, placeholderName, "", outcome, outcome == outcomeOK, remedy, watchByTriple)
+			row := makeClusterRow(cfg, p.ID, cfg.Location, placeholderName, "", outcome, outcome == outcomeOK, remedy, watchByTriple)
 			if p.ID != cfg.ProjectID {
 				row.Location = ""
 			}
@@ -526,15 +555,48 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	}
 
 	// Include any profile identities whose project was not in raw.Projects
-	// (for example before the first reconcile snapshot is written).
+	// (for example before the first reconcile snapshot is written), grouping
+	// them into synthetic project rows so projects and allClusters stay in step.
+	var extraProjIDs []string
+	extraClustersByProj := map[string][]scopeClusterRow{}
+	extraProfsByProj := map[string][]string{}
 	for _, id := range raw.ProfileIdentities {
 		triple := [3]string{id.Project, id.Location, id.Cluster}
 		if seenClusters[triple] || id.Project == "" || id.Cluster == "" {
 			continue
 		}
 		seenClusters[triple] = true
-		row := makeClusterRow(id.Project, id.Location, id.Cluster, id.Profile, outcomeOK, id.Ready, "", watchByTriple)
+		row := makeClusterRow(cfg, id.Project, id.Location, id.Cluster, id.Profile, outcomeOK, id.Ready, "", watchByTriple)
 		allClusters = append(allClusters, row)
+		if !seenProjects[id.Project] {
+			if _, exists := extraClustersByProj[id.Project]; !exists {
+				extraProjIDs = append(extraProjIDs, id.Project)
+			}
+			extraClustersByProj[id.Project] = append(extraClustersByProj[id.Project], row)
+			if id.Profile != "" {
+				extraProfsByProj[id.Project] = append(extraProfsByProj[id.Project], id.Profile)
+			}
+		}
+	}
+	sort.Strings(extraProjIDs)
+	for _, projID := range extraProjIDs {
+		rows := extraClustersByProj[projID]
+		profs := extraProfsByProj[projID]
+		sort.Strings(profs)
+		count := len(rows)
+		via := []string{viaProfile}
+		if projID == cfg.ProjectID {
+			via = []string{viaManagement}
+		}
+		projects = append(projects, scopeProjectRow{
+			ID:          projID,
+			Via:         via,
+			Outcome:     outcomeOK,
+			State:       stateInScope,
+			Clusters:    &count,
+			Profiles:    profs,
+			ClusterRows: rows,
+		})
 	}
 
 	// Fallback when neither fleet_scope.json nor profile directories exist yet:
@@ -543,7 +605,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	if len(projects) == 0 && (cfg.ProjectID != "" || cfg.ClusterName != "") {
 		projID := cfg.ProjectID
 		if projID == "" {
-			projID = "management"
+			projID = viaManagement
 		}
 		outcome := outcomeOK
 		if !gatewayHealthy {
@@ -553,7 +615,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 		count := 1
 		var projClusters []scopeClusterRow
 		if cfg.ClusterName != "" {
-			row := makeClusterRow(projID, cfg.Location, cfg.ClusterName, "", outcome, gatewayHealthy, remedy, watchByTriple)
+			row := makeClusterRow(cfg, projID, cfg.Location, cfg.ClusterName, "", outcome, gatewayHealthy, remedy, watchByTriple)
 			projClusters = append(projClusters, row)
 			allClusters = append(allClusters, row)
 		} else {
@@ -618,7 +680,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	}
 }
 
-func makeClusterRow(project, location, name, profile, projectOutcome string, profileReady bool, projectRemedy string, watchByTriple map[[3]string]bool) scopeClusterRow {
+func makeClusterRow(cfg config, project, location, name, profile, projectOutcome string, profileReady bool, projectRemedy string, watchByTriple map[[3]string]bool) scopeClusterRow {
 	outcome := projectOutcome
 	if outcome == "" {
 		outcome = outcomeOK
@@ -626,13 +688,17 @@ func makeClusterRow(project, location, name, profile, projectOutcome string, pro
 	remedy := projectRemedy
 	if outcome == outcomeOK && profile != "" && !profileReady {
 		outcome = outcomeUnreachable
-		remedy = "Cluster Agent profile scaffold is incomplete (kubeconfig.yaml or USER.md missing); the next cluster_agent_reconcile.py tick will retry get-credentials."
+		remedy = remediationProfileIncomplete
 	}
+	isHostCluster := (project == "" || cfg.ProjectID == "" || project == cfg.ProjectID) &&
+		(cfg.ClusterName == "" || name == cfg.ClusterName)
 	var watching *bool
 	if up, ok := watchByTriple[[3]string{project, location, name}]; ok {
 		watching = &up
-	} else if up, ok := watchByTriple[[3]string{"", "", name}]; ok {
-		watching = &up
+	} else if isHostCluster {
+		if up, ok := watchByTriple[[3]string{"", "", name}]; ok {
+			watching = &up
+		}
 	}
 	return scopeClusterRow{
 		Project:     project,
@@ -653,18 +719,18 @@ func buildWatcherStatus(ew *upstreamEventWatcher, scopeFetched, gatewayHealthy b
 				Enabled: false,
 				Healthy: false,
 				Status:  watcherStatusDisabled,
-				Detail:  "k8s-event-watcher is disabled by configuration (EVENT_WATCHER_ENABLED=false).",
+				Detail:  watcherDisabledDetail,
 			}
 		}
 		if ew.Reachable {
 			if ew.WatchSetReady {
-				detail := fmt.Sprintf("Watching %d of %d %s for Kubernetes Warning events",
-					ew.ClustersUp, ew.ClustersTotal, pluralWord(ew.ClustersTotal, "cluster", "clusters"))
+				detail := fmt.Sprintf(watcherWatchingFmt,
+					ew.ClustersUp, ew.ClustersTotal, pluralWord(ew.ClustersTotal, wordCluster, wordClusters))
 				if ew.ClustersTotal == 0 {
-					detail = "Active and listening for Kubernetes Warning events"
+					detail = watcherActiveNoClustersDetail
 				}
 				if ew.DiscoveryErrors > 0 {
-					detail += fmt.Sprintf(" (%d profile discovery %s)", ew.DiscoveryErrors, pluralWord(ew.DiscoveryErrors, "error", "errors"))
+					detail += fmt.Sprintf(watcherDiscoveryErrorsFmt, ew.DiscoveryErrors, pluralWord(ew.DiscoveryErrors, wordError, wordErrors))
 				}
 				return scopeWatcherStatus{
 					Enabled:         true,
@@ -685,21 +751,18 @@ func buildWatcherStatus(ew *upstreamEventWatcher, scopeFetched, gatewayHealthy b
 				ClustersUp:      ew.ClustersUp,
 				ClustersTotal:   ew.ClustersTotal,
 				DiscoveryErrors: ew.DiscoveryErrors,
-				Detail:          "Assembling initial cluster watch set",
+				Detail:          watcherStartingDetail,
 			}
 		}
-		// Watcher is enabled in the sidecar, but its metrics port was not
-		// reachable (or not configured). When the gateway itself answered
-		// /api/scope, report it as running with metrics unavailable.
 		if scopeFetched {
-			detail := "Active in gateway pod (metrics listener not reachable)"
+			detail := watcherMetricsUnreachableDetail
 			if ew.Error != "" {
-				detail = "Active in gateway pod (" + ew.Error + ")"
+				detail = fmt.Sprintf(watcherMetricsErrorFmt, ew.Error)
 			}
 			return scopeWatcherStatus{
 				Enabled: true,
-				Healthy: true,
-				Status:  watcherStatusWatching,
+				Healthy: false,
+				Status:  watcherStatusUnreachable,
 				Detail:  detail,
 			}
 		}
@@ -710,10 +773,10 @@ func buildWatcherStatus(ew *upstreamEventWatcher, scopeFetched, gatewayHealthy b
 			Enabled: true,
 			Healthy: true,
 			Status:  watcherStatusWatching,
-			Detail:  "Agent gateway reachable; k8s-event-watcher opens an #alerts thread when a Warning event arrives",
+			Detail:  watcherFallbackHealthyDetail,
 		}
 	}
-	detail := "Agent gateway unreachable"
+	detail := watcherFallbackUnreachableDetail
 	if gatewayDetail != "" {
 		detail = gatewayDetail
 	}
