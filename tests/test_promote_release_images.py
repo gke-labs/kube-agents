@@ -373,7 +373,10 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
 
     def _promote(self, candidate_registry, images, additional_registry=None):
         """Runs the script against a registry holding `images`; returns the
-        process and the (target, source) pair of each tag it created, in order."""
+        process and the (target, source) pair of each version tag it created,
+        in order. The `latest` tags it moved are kept apart, in
+        `self.latest_moved`, with the position of the first among all tags in
+        `self.first_latest_position`."""
         _, log_path = create_mock_docker_binary(self.bin_dir, image_digests=images)
         # No Google credential, so the Artifact Registry probe cannot ask and
         # docker, which the release job logs in, answers.
@@ -391,11 +394,22 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
             cwd=self.repo_dir,
         )
         created = []
+        self.latest_moved = []
+        self.first_latest_position = None
         log = pathlib.Path(log_path)
+        position = 0
         for line in log.read_text().splitlines() if log.exists() else []:
             words = line.split()
-            if "create" in words:
-                created.append((words[words.index("--tag") + 1], words[-1]))
+            if "create" not in words:
+                continue
+            pair = (words[words.index("--tag") + 1], words[-1])
+            if pair[0].endswith(":latest"):
+                self.latest_moved.append(pair)
+                if self.first_latest_position is None:
+                    self.first_latest_position = position
+            else:
+                created.append(pair)
+            position += 1
         return proc, created
 
     def test_each_image_is_tagged_in_the_candidate_registry_then_published(self):
@@ -512,6 +526,52 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
         self.assertIn(self._additional_ref(first), proc.stderr)
         self.assertEqual(len(created), 2 * len(MOCK_REQUIRED_RELEASE_IMAGES), "the registry prefix is whole")
         self.assertNotIn(MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX, " ".join(target for target, _ in created))
+
+    def _latest_refs(self, registry):
+        return [
+            (f"{registry}/{img}:latest", self._candidate_ref(img, self.candidate)) for img in MOCK_REQUIRED_RELEASE_IMAGES
+        ]
+
+    def test_the_newest_release_moves_latest_in_each_release_registry_and_not_in_the_candidate_registry(self):
+        """After that registry holds every image under the version, from the
+        same source; the registry prefix first."""
+        proc, created = self._promote(
+            MOCK_AR_REGISTRY_PREFIX, self._candidate_sources(), additional_registry=MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self.latest_moved,
+            self._latest_refs(MOCK_DEFAULT_REGISTRY_PREFIX) + self._latest_refs(MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX),
+        )
+        self.assertEqual(self.first_latest_position, 2 * len(MOCK_REQUIRED_RELEASE_IMAGES))
+        self.assertIn(f"{MOCK_DEFAULT_REGISTRY_PREFIX}: latest is {MOCK_TARGET_RELEASE_TAG}", proc.stdout)
+
+    def test_latest_moves_off_whatever_it_named(self):
+        """Unlike a version, `latest` is meant to move: a `latest` on another
+        image is replaced, not refused."""
+        images = self._candidate_sources()
+        for img in MOCK_REQUIRED_RELEASE_IMAGES:
+            images[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:latest"] = self._OTHER_DIGEST
+        proc, _ = self._promote(MOCK_AR_REGISTRY_PREFIX, images)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.latest_moved, self._latest_refs(MOCK_DEFAULT_REGISTRY_PREFIX))
+
+    def test_a_patch_of_an_older_line_leaves_latest_alone(self):
+        """A higher version is already tagged, so this release is not the newest."""
+        subprocess.run(["git", "tag", "9.0.0", "HEAD"], cwd=self.repo_dir, check=True, capture_output=True)
+        proc, created = self._promote(MOCK_AR_REGISTRY_PREFIX, self._candidate_sources())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(created), 2 * len(MOCK_REQUIRED_RELEASE_IMAGES))
+        self.assertEqual(self.latest_moved, [])
+        self.assertNotIn("latest is", proc.stdout)
+
+    def test_a_refused_version_moves_no_latest(self):
+        images = self._candidate_sources()
+        first = MOCK_REQUIRED_RELEASE_IMAGES[0]
+        images[self._release_ref(first)] = self._OTHER_DIGEST
+        proc, _ = self._promote(MOCK_AR_REGISTRY_PREFIX, images)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.latest_moved, [])
 
     def test_the_source_commit_is_found_by_its_images_in_the_candidate_registry(self):
         """A tag whose commit is not a stamp commit resolves by where the

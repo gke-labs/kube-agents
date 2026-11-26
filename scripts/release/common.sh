@@ -2447,6 +2447,17 @@ resolve_source_image_commit() {
   return 1
 }
 
+# Whether a version is the newest GA release the repository's tags know: the
+# highest X.Y.Z tag is the version itself. The GA tag is pushed before the
+# images are promoted, so a release cut from main answers yes and a patch cut
+# from an older release line, with a higher version already tagged, answers no.
+# A version with no tag of its own is not the newest: nothing says it was
+# released.
+release_is_newest_ga() {
+  local version="${1:-}"
+  [ -n "${version}" ] && [ "$(get_latest_ga_tag)" = "${version}" ]
+}
+
 # Gives one image a second tag without rebuilding: target_image names what
 # source_image names, in the same registry or another. A target that already
 # names the source is left alone, so a re-run resumes; one that names anything
@@ -2488,7 +2499,9 @@ promote_image_tag() {
 # whole. When the candidate registry is not the registry prefix it gets the
 # version tag too, before the registry prefix does: rollback_environment.sh
 # looks for the previous release's version in the registry an environment is
-# installed from.
+# installed from. Each release registry's `latest` then moves to the version
+# when it is the newest GA release (release_is_newest_ga); the candidate
+# registry's `latest` is not a release's to move.
 promote_release_images() {
   local commit_sha="${1:-}"
   local release_version="${2:-}"
@@ -2536,6 +2549,11 @@ promote_release_images() {
     return 1
   fi
 
+  local moves_latest="false"
+  if release_is_newest_ga "${release_version}"; then
+    moves_latest="true"
+  fi
+
   local release_prefixes=() release_prefix release_prefix_lines
   release_prefix_lines="$(release_registry_prefixes)" || return 1
   while IFS= read -r release_prefix; do release_prefixes+=("${release_prefix}"); done <<<"${release_prefix_lines}"
@@ -2556,5 +2574,17 @@ promote_release_images() {
         echo "    ✅ Promoted ${img} to ${release_version}"
       fi
     done
+
+    # `latest` in a release registry is the newest release, moved here once
+    # the registry holds every image of the version. A patch from an older
+    # release line leaves it where it is.
+    if [ "${moves_latest}" = "true" ]; then
+      for img in "${images[@]}"; do
+        docker buildx imagetools create --prefer-index=false \
+          --tag "${release_prefix}/${img}:${DEFAULT_IMAGE_REFERENCE}" \
+          "${candidate_prefix}/${img}:${resolved_commit}" || return 1
+      done
+      echo "  • ${release_prefix}: ${DEFAULT_IMAGE_REFERENCE} is ${release_version}"
+    fi
   done
 }
