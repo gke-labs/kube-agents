@@ -56,10 +56,9 @@ const clusterHandBackRounds = 50
 // redelivery or subscription drain after Stop.
 const clusterHandBackWait = 5 * time.Second
 
-// clusterTasksStream, clusterTasksSubjects, and clusterTasksMaxAge match the
-// TASKS stream configuration used by held-delivery tests.
+// clusterTasksSubjects and clusterTasksMaxAge match the TASKS stream
+// configuration used by held-delivery tests.
 const (
-	clusterTasksStream   = "TASKS"
 	clusterTasksSubjects = "a2a.tasks.>"
 	clusterTasksMaxAge   = 72 * time.Hour
 )
@@ -217,7 +216,7 @@ func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 		sctx, cancel := context.WithTimeout(ctx, clusterStreamAttemptTimeout)
 		defer cancel()
 		_, err := js.CreateOrUpdateStream(sctx, jetstream.StreamConfig{
-			Name: clusterTasksStream, Subjects: []string{clusterTasksSubjects}, Retention: jetstream.LimitsPolicy,
+			Name: TasksStream, Subjects: []string{clusterTasksSubjects}, Retention: jetstream.LimitsPolicy,
 			MaxAge: clusterTasksMaxAge, Replicas: clusterSize,
 		})
 		return err == nil
@@ -239,7 +238,7 @@ func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 		}); err != nil {
 			return false
 		}
-		cons, err := js.Consumer(cctx, clusterTasksStream, c.Durable)
+		cons, err := js.Consumer(cctx, TasksStream, c.Durable)
 		if err != nil {
 			return false
 		}
