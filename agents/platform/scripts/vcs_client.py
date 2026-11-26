@@ -252,7 +252,8 @@ CLONE_ANSWER_UNUSABLE_TEXT = "the broker's answer has no usable `{field}`; the w
 #: is checked. A JSON value rather than a prefixed line, so a pipeline that
 #: merges stderr into `jq` reads one more document instead of failing.
 #: The claim is the one-time token the broker issues with each proposal it opens
-#: (`CLAIM_TOKEN_FIELD`), which the hook presents back to the broker: `call()`
+#: for a caller outside the profile role (`CLAIM_TOKEN_FIELD`), which the hook
+#: presents back to the broker: `call()`
 #: takes it out of the answer, so it never reaches what a caller prints, and a
 #: line without a valid claim counts nothing. The plugin holds the same names;
 #: its test reads these to keep them equal.
@@ -334,7 +335,8 @@ def _say_opened(answer: object, claim: object = None, target: dict | None = None
     """Write the `PROPOSAL_OPENED_KEY` record for the proposal in `answer`, if it names one.
 
     `claim` is the token `call()` took from the answer's top level. An answer
-    with none -- a broker older than the token -- still records the proposal,
+    with none -- a broker older than the token, or an answer to the profile
+    role -- still records the proposal,
     with the `claim` field absent rather than null. `repo` comes from the
     answer's top level too (`REPO_FIELD`), and is absent when the answer has
     no such string.

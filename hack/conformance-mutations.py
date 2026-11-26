@@ -199,6 +199,16 @@ MUTATIONS: list[Mutation] = [
         "the permit says a change was asked for -- though not which one",
     ),
     Mutation(
+        "A3-profile-create-claim-token",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    return verb == PROPOSAL_CREATE_VERB and role != CALLER_ROLE_PROFILE\n",
+         "    return verb == PROPOSAL_CREATE_VERB\n"),
+        "test_A3_a_profile_callers_proposal_create_answer_carries_no_claim_token",
+        "mint the claim token for every role again, since the profile role has no "
+        "proposal-claim verb to spend it on -- which hands a task a token that a "
+        "caller with the verb can spend",
+    ),
+    Mutation(
         "A3-profile-reads-another-verb",
         "agents/platform/scripts/credential_proxy.py",
         ('            "issue-view",\n            "publish",\n',

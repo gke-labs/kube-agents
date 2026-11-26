@@ -82,15 +82,15 @@ Nothing connects an AgentPlugin to an AgentProfile worker.
   the tool calls of a profile task. The adapter writes no file for a tool call.
 - The broker's records. An `/v1/exec` call leaves a start record and an outcome record, each
   with the task id and the credential's id in its principal and with no argument. An MCP relay
-  call leaves two lines. For a `/v1/vcs/` call that succeeds, only a metric and the HTTP request
-  line were found, with no task and no repository. The broker keeps in memory which task made
+  call leaves two lines. A `/v1/vcs/` call that succeeds leaves a metric and the HTTP request
+  line, with no task and no repository; a profile task's `publish`, `proposal-create` or
+  `proposal-update` also leaves the line of row 6. The broker keeps in memory which task made
   which branch and proposal; only its own checks read that record, and a restart loses it.
 - The opened pull request. The broker adds a one-time claim token to a `proposal-create` answer
-  that names the proposal's url and number, for each role. The version-control client in the
-  worker image prints the token on stderr in the `proposal-opened` line, and nothing in the
-  worker removes it, so the model reads it when the harness returns stderr. The profile role has
-  no `proposal-claim` verb. The gateway renders a `notice` artifact ("a PR it opened"); nothing
-  produces one.
+  that names the proposal's url and number, for each role but the profile role (row 7). The
+  version-control client in the worker image prints the `proposal-opened` line on stderr, with
+  no token for a profile task. The profile role has no `proposal-claim` verb. The gateway
+  renders a `notice` artifact ("a PR it opened"); nothing produces one.
 - Telemetry. A worker pod emits no trace and no metric. Its one structured per-tool log is the
   record of row 2.
 - The second harness. The AgentProfile accepts the harness type `claude-code` only, and the
@@ -176,8 +176,8 @@ Limits of the record:
   result.
 - The harness reports it. The harness and each tool run as one user, so treat a line as one
   that a process in the worker can omit or forge. For a `/v1/exec` call and an MCP relay call,
-  the broker's record is the one that counts. For a `/v1/vcs/` call the broker has no record
-  with the task today; row 6 adds one for each write verb, and a read verb still leaves none.
+  the broker's record is the one that counts. For a `/v1/vcs/` call the broker's record is the
+  line of row 6, for each write verb that succeeds; a read verb leaves none.
   On the platform agent, the tool commands run in a different pod and cannot write
   `audit.jsonl`.
 - The admin console and the skill-invocation metric read the `audit.jsonl` of the platform

@@ -938,6 +938,65 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 self.assertEqual(403, replies[0][0], replies)
                 self.assertEqual(cp.PROPOSAL_NOT_THIS_TASKS_CODE, replies[0][1]["code"])
 
+    def test_A3_a_profile_callers_proposal_create_answer_carries_no_claim_token(self) -> None:
+        # A claim token lets the caller that presents it record the proposal
+        # it names as one the broker opened. The profile role has no
+        # `proposal-claim` verb, so a token in its answer is one that only
+        # another caller could spend. Driven through the handler's own
+        # dispatch, for the profile role and for the shell: the shell's answer
+        # carries the token, so the row cannot pass on a broker that mints none.
+        cp = h.credential_proxy
+        repo = "acme/infra"
+        opened = {"proposal": {"number": 9, "url": f"https://github.com/{repo}/pull/9"}}
+
+        class Vcs(types.SimpleNamespace):
+            def __getattr__(self, name):
+                return lambda payload: {}
+
+        vcs = Vcs(
+            registry=types.SimpleNamespace(resolve=lambda named: (types.SimpleNamespace(name="github"), repo)),
+            snapshot_source=lambda named: (named, None),
+            require_agent_proposal=lambda verb, payload: None,
+            proposal_create=lambda payload: json.loads(json.dumps(opened)),
+        )
+        task = types.SimpleNamespace(task="task-1", expires=4_000_000_000, permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        profile = dataclasses.replace(
+            cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u"), task=task
+        )
+        shell = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_SHELL)
+        record = cp.ProfileTaskWrites()
+        key = cp.task_repository_key(types.SimpleNamespace(name="github"), repo)
+        allowed, _ = record.claim_branch("task-1", 4_000_000_000, key, "platform-agent/mine", lambda: False)
+        self.assertTrue(allowed)
+
+        def create(principal) -> tuple[list, object]:
+            body = json.dumps(
+                {"repository": f"https://github.com/{repo}", "source": "platform-agent/mine", "title": "t", "target": "main"}
+            ).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs, handler.profile_task_writes = principal, vcs, record
+            handler.claim_tokens = cp.ClaimTokens()
+            handler.headers = email.message.Message()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+            handler.max_request_bytes = 1 << 20
+            handler._session_slot = lambda role: contextlib.nullcontext()
+            handler._request_slot = lambda klass=None: contextlib.nullcontext()
+            handler._repository_is_permitted = lambda repository, forge: True
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._dispatch_vcs_post("proposal-create")
+            return replies, handler.claim_tokens
+
+        replies, tokens = create(shell)
+        self.assertEqual(200, replies[0][0], replies)
+        self.assertIn(cp.CLAIM_TOKEN_FIELD, replies[0][1], "the shell's answer must carry the token, or this row proves nothing")
+        self.assertEqual(1, len(tokens))
+        replies, tokens = create(profile)
+        self.assertEqual(200, replies[0][0], replies)
+        self.assertEqual(opened, replies[0][1], "a profile caller's proposal-create answer carried more than the proposal")
+        self.assertEqual(0, len(tokens), "the broker minted a claim token for a profile caller")
+
     def test_A3_only_a_profile_learns_the_managed_list_from_identity(self) -> None:
         # #6389: a profile task that names no repository may ask `identity` with
         # none and learn the managed repositories' names, the list every profile

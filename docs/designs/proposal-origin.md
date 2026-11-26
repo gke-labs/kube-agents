@@ -134,7 +134,7 @@ Three things change in the hook. **The worker gate lifts for the count.** Today 
 at once outside a kanban worker, so a scheduled fleet audit, which opens its proposals inline
 in the cron run, or an api_server turn, would never reach the ledger. The check and the ledger write now run in every process that has the terminal, on every profile that does (the platform profile, the Cluster Agent profiles, the front door), where today the hook is enabled on the platform profile alone; the card event and the removal of the whole record line stay worker-only, so what the model reads in any other session changes only by the token field the hook strips. **The record binds to the call that opened the proposal.** The forge check proves the pull request
 is the agent's, not that this process opened it, so a worker that echoed another session's fresh
-record line could claim that proposal for its own origin. The broker therefore mints a one-time claim token with each `proposal-create` answer and keeps it
+record line could claim that proposal for its own origin. The broker therefore mints a one-time claim token with each `proposal-create` answer, except an answer to the profile role, and keeps it
 with the url for the window; `vcs_client` takes the token out of the answer it returns and prints
 (so `vcs.py`'s stdout never carries it) and puts it on the stderr record line alone; the hook
 presents each token it sees to a new `proposal-claim` verb, addressed to the record line's `repo`
