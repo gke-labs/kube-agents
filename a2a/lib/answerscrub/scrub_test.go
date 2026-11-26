@@ -671,6 +671,26 @@ func TestSeenSecrets_RawJSONIsNotReadAsOneLine(t *testing.T) {
 	}
 }
 
+// A JSON env value whose escaped line break trails it is still paired with
+// its name, so an answer quoting it in that escaped spelling is redacted, as
+// it was before the raw JSON text stopped being read as one line. A value
+// with a break inside it is still not read across the break.
+func TestSeenSecrets_AnEnvValueWithATrailingEscapedBreakIsStillPaired(t *testing.T) {
+	var s Seen
+	s.CollectToolResult(terminalResult(t, `{"env":[{"name":"API_TOKEN","value":"`+synthSecretPlain+`\n"}]}`))
+	answer := `It is ` + synthSecretPlain + ` and "` + synthSecretPlain + `\n" here.`
+	if got := Scrub(answer, &s); strings.Contains(got, synthSecretPlain) {
+		t.Errorf("Scrub = %q, want both spellings redacted", got)
+	}
+	var inner Seen
+	inner.CollectToolResult(terminalResult(t, `{"env":[{"name":"API_TOKEN","value":"`+synthSecretPlain+`\nregion: us-east4"}]}`))
+	for _, v := range inner.Values() {
+		if strings.Contains(v, "us-east4") {
+			t.Errorf("tracked a run-on value %q", v)
+		}
+	}
+}
+
 // The pairing scan reads JSON in its own key order: an env-like entry
 // whose other keys sort between name and value is still paired, and a long
 // one-line result is scanned in linear time.

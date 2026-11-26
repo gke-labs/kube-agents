@@ -570,10 +570,12 @@ func (c *toolResultCollector) text(t string, depth int) {
 
 // blankMultilineJSONStrings is JSON text t for the shape rules that pair
 // sibling fields (an env entry's name and value, a flag and its value in an
-// args list): every string token holding an escaped line break is emptied
-// in place, since c.value already reads it as text of its own and its \n
-// would run one line's value into the next. Keys keep their order; a
-// string cut short at the end of t is left as it is.
+// args list): every string token holding an escaped line break inside it is
+// emptied in place, since c.value already reads it as text of its own and
+// its \n would run one line's value into the next. A string whose escaped
+// breaks all trail it ("value\n") is kept: nothing follows the break to run
+// into, and an answer may quote the value in that escaped spelling. Keys
+// keep their order; a string cut short at the end of t is left as it is.
 func blankMultilineJSONStrings(t string) string {
 	if !strings.Contains(t, `\n`) && !strings.Contains(t, `\r`) {
 		return t
@@ -600,7 +602,7 @@ func blankMultilineJSONStrings(t string) string {
 			sb.WriteString(t[i:])
 			break
 		}
-		if multiline {
+		if multiline && !onlyTrailingBreaks(t[i+1:end]) {
 			sb.WriteString(`""`)
 		} else {
 			sb.WriteString(t[i : end+1])
@@ -608,6 +610,27 @@ func blankMultilineJSONStrings(t string) string {
 		i = end + 1
 	}
 	return sb.String()
+}
+
+// onlyTrailingBreaks reports whether the escaped JSON string body b holds
+// its escaped line breaks (\n, \r) only at its end, after some other text.
+func onlyTrailingBreaks(b string) bool {
+	trimmed := b
+	for {
+		if t, ok := strings.CutSuffix(trimmed, `\n`); ok {
+			trimmed = t
+			continue
+		}
+		if t, ok := strings.CutSuffix(trimmed, `\r`); ok {
+			trimmed = t
+			continue
+		}
+		break
+	}
+	if trimmed == "" || strings.HasSuffix(trimmed, `\`) {
+		return false
+	}
+	return !strings.Contains(trimmed, `\n`) && !strings.Contains(trimmed, `\r`)
 }
 
 // shapeScan runs the shape rules over scan, within what is left of the

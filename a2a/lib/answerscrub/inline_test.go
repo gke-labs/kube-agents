@@ -954,7 +954,13 @@ func TestScrubEnvNameValuePairsReadsTheValueAsYAMLDoes(t *testing.T) {
 		tracked  []string
 	}{
 		{"- name: DB_PASSWORD # rotated\n  value: synth-pass-0001\n", "- name: DB_PASSWORD # rotated\n  value: [redacted]\n", []string{"synth-pass-0001"}},
-		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # rotated monthly\n", "- name: DB_PASSWORD\n  value: [redacted] # rotated monthly\n", []string{"synth-pass-0001"}},
+		// A comment on a credential key's value line that reads as a value
+		// is redacted with it, as a read to the line's end redacted it; only
+		// the value YAML reads is tracked. A bare marker stays.
+		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # rotated monthly\n", "- name: DB_PASSWORD\n  value: [redacted]\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: #synth-old-0002\n", "- name: DB_PASSWORD\n  value: [redacted]\n", nil},
+		{"env: [{name: DB_PASSWORD, value: synth-pass-0001 #synth-old-0002}]", "env: [{name: DB_PASSWORD, value: [redacted]}]", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # none\n", "- name: DB_PASSWORD\n  value: [redacted] # none\n", []string{"synth-pass-0001"}},
 		{"- name: DB_PASSWORD\n  value: synth,pass]0001\n", "- name: DB_PASSWORD\n  value: [redacted]\n", []string{"synth,pass]0001", "synth"}},
 		{"env: [{name: A_PASSWORD, value: synth-a-0001}, {name: B_TOKEN, value: synth-b-0001}]", "env: [{name: A_PASSWORD, value: [redacted]}, {name: B_TOKEN, value: [redacted]}]", []string{"synth-a-0001", "synth-b-0001"}},
 		{`{"name": "DB_PASSWORD", "value": "synth\"pass\"0001"}`, `{"name": "DB_PASSWORD", "value": "[redacted]"}`, []string{`synth\"pass\"0001`, `synth"pass"0001`}},
@@ -1099,6 +1105,23 @@ func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
 	for _, tc := range cases {
 		if got := ScrubInline(tc.in); got != tc.want {
 			t.Errorf("ScrubInline(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Overlapping spans merge to their union: a later span inside an earlier one
+// never shortens it, so a table cell redacted under one row split is not cut
+// back by a shorter span from the other split.
+func TestMergeSpansKeepsTheWidestEnd(t *testing.T) {
+	cases := []struct{ in, want [][2]int }{
+		{[][2]int{{0, 10}, {2, 4}}, [][2]int{{0, 10}}},
+		{[][2]int{{2, 4}, {0, 10}, {12, 14}}, [][2]int{{0, 10}, {12, 14}}},
+		{[][2]int{{0, 4}, {3, 8}}, [][2]int{{0, 8}}},
+		{[][2]int{{0, 4}, {4, 8}}, [][2]int{{0, 4}, {4, 8}}},
+	}
+	for _, c := range cases {
+		if got := mergeSpans(append([][2]int(nil), c.in...)); !slices.Equal(got, c.want) {
+			t.Errorf("mergeSpans(%v) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }

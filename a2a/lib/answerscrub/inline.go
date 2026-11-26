@@ -1057,28 +1057,43 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			// line end, then its first , } or ] (a note, a URL or another
 			// value after it on the line).
 			var ends []int
+			// segs[i] is where ends[i]'s line text stops, a comment after the
+			// value included: on a credential key's line a comment that
+			// reads as a value is redacted with it (commentReadsAsValue).
+			var segs []int
 			cutAt, rest := -1, "" // an unquoted value's first , } or ], and the text after it
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
 				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
 				ends = []int{hi}
+				segs = []int{hi}
 			} else {
 				if strings.HasPrefix(s[lo:hi], "#") {
+					// YAML reads no value here, but a commented-out value on
+					// a credential key's line is still redacted, as a
+					// line-end read redacted it. Nothing is tracked: it is
+					// not the value YAML reads.
+					if commentReadsAsValue(name, s[lo:hi]) {
+						spans = append(spans, [2]int{lo, hi})
+					}
 					continue
 				}
 				ends = []int{lo + envUnquotedValue(s[lo:hi])}
+				segs = []int{lo + len(strings.TrimRight(s[lo:hi], " \t"))}
 				if cut := strings.IndexAny(s[lo:hi], ",}]"); cut >= 0 {
 					ends = append(ends, lo+envUnquotedValue(s[lo:lo+cut]))
+					segs = append(segs, lo+len(strings.TrimRight(s[lo:lo+cut], " \t")))
 					cutAt, rest = lo+cut, s[lo+cut+1:hi]
 				}
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
 				lo += sloc[1] // the scheme word stays, as under a key
 			}
-			var reads []int // the candidate ends that read as a value, in order
-			for _, end := range ends {
+			var reads, readSegs []int // the candidate ends that read as a value, in order, and their line text's stops
+			for i, end := range ends {
 				if end > lo && !strings.Contains(s[lo:end], Redacted[:len(Redacted)-1]) && classValueRedacted(secretKeyClassOf(name), s[lo:end], false) {
 					reads = append(reads, end)
+					readSegs = append(readSegs, segs[i])
 				}
 			}
 			if len(reads) == 0 {
@@ -1086,7 +1101,11 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			}
 			hi = reads[0]
 			v := s[lo:hi]
-			spans = append(spans, [2]int{lo, hi})
+			redactHi := hi
+			if after := strings.TrimLeft(s[hi:readSegs[0]], " \t"); strings.HasPrefix(after, "#") && commentReadsAsValue(name, after) {
+				redactHi = readSegs[0]
+			}
+			spans = append(spans, [2]int{lo, redactHi})
 			if keyClearlyNamesSecret(name) {
 				sink.emit(v)
 				// The value cut at its first , } or ] is tracked too when
@@ -1131,6 +1150,16 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 var scrubEnvRest func(s string, sink secretSink) string
 
 func init() { scrubEnvRest = scrubInlineTo }
+
+// commentReadsAsValue reports whether comment, a YAML comment ("# ...") on
+// credential key name's value line, reads as a value under that key: its
+// text past the # is what the key's class redacts. A commented-out or
+// annotated value is then redacted, as it is when the line is read to its
+// end; a bare marker ("# none") is not.
+func commentReadsAsValue(name, comment string) bool {
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(comment), "#"))
+	return text != "" && classValueRedacted(secretKeyClassOf(name), text, false)
+}
 
 // envUnquotedValue is the length of an unquoted env value with a trailing
 // comment (a # after a blank, or one opening the value) and the blanks
