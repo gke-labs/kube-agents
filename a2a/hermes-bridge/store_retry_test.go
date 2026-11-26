@@ -226,3 +226,47 @@ func TestThePushedReportLookupRetriesALateSessionStore(t *testing.T) {
 		t.Fatalf("lookups that reached the store = %d, want 1", hits.Load())
 	}
 }
+
+// A store marked down is retried in full again while the API server also
+// refuses: that is the agent container restarting, and the store is about to
+// come back. A task taken then keeps its route.
+func TestAMarkedStoreIsRetriedWhileTheContainerRestarts(t *testing.T) {
+	addr := freeLoopbackAddr(t)
+	b := retryBridge(addr, time.Minute)
+	b.cfg.APIURL = "http://" + freeLoopbackAddr(t) + "/v1/chat/completions" // refusing, as during a restart
+	b.storeDown.Store(true)
+	store := &routeStore{status: http.StatusOK}
+	startRouteStoreAt(t, store, addr, 1500*time.Millisecond)
+
+	route := conversationRoute{Platform: lib.NotifyPlatformSlack, Conversation: "slack:dm/D1"}
+	if err := b.putRoute(testCtx(t), "a2a-ctx-restart", route); err != nil {
+		t.Fatalf("putRoute during a container restart = %v, want the route recorded once the store is back", err)
+	}
+	if b.storeDown.Load() {
+		t.Fatal("store still marked down after the restart")
+	}
+	if puts := store.seen(); len(puts) != 1 {
+		t.Fatalf("route PUTs = %d, want 1", len(puts))
+	}
+}
+
+// A store marked down while the API server answers is a dead session-kv in a
+// running container: one try, no wait.
+func TestAMarkedStoreIsTriedOnceWhileTheAPIServerAnswers(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(api.Close)
+	b := retryBridge(freeLoopbackAddr(t), time.Minute)
+	b.cfg.APIURL = api.URL + "/v1/chat/completions"
+	b.storeDown.Store(true)
+	start := time.Now()
+	err := b.putRoute(testCtx(t), "a2a-ctx-dead", conversationRoute{Platform: lib.NotifyPlatformSlack, Conversation: "slack:dm/D1"})
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("putRoute = %v, want the refusal", err)
+	}
+	if took := time.Since(start); took > apiConnectRetryInterval {
+		t.Fatalf("putRoute took %s, want one try", took)
+	}
+	if !b.storeDown.Load() {
+		t.Fatal("mark cleared while the store still refuses and the API server answers")
+	}
+}

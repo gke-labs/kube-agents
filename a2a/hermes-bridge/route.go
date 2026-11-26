@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -382,7 +383,9 @@ func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) er
 // a timeout included, is returned at once. A store refused for a whole
 // window is marked down (Bridge.storeDown), and requests then try once until
 // one reaches it, so a store that has died while the container runs on
-// costs one window rather than one per task. The caller closes the body and
+// costs one window rather than one per task; while the API server refuses
+// as well, the container is restarting and the retry goes on as before
+// (apiServerRefusing). The caller closes the body and
 // then calls the returned cancel.
 func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(context.Context) (*http.Request, error)) (*http.Response, context.CancelFunc, error) {
 	giveUp := time.Now().Add(b.cfg.APIConnectRetry)
@@ -405,7 +408,14 @@ func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(
 			return nil, nil, err
 		}
 		if b.storeDown.Load() {
-			return nil, nil, err
+			if !b.apiServerRefusing() {
+				return nil, nil, err
+			}
+			// The API server, which starts after the store in the same
+			// container, refuses too: the container is restarting, so the
+			// store is coming back, not dead.
+			b.storeDown.Store(false)
+			b.cfg.Logger.Info("the agent container is restarting; retrying the session store")
 		}
 		if time.Now().After(giveUp) {
 			b.storeDown.Store(true)
@@ -419,6 +429,24 @@ func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(
 		case <-time.After(apiConnectRetryInterval):
 		}
 	}
+}
+
+// apiServerRefusing reports whether a connection to the API server is
+// refused, which tells a restarting agent container (the store and the API
+// server both down) from a session-kv process that died while the container
+// runs on (the API server up). Anything else, an unparsable URL included,
+// reads as not refusing.
+func (b *Bridge) apiServerRefusing() bool {
+	u, err := url.Parse(b.cfg.APIURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, apiConnectRetryInterval)
+	if err == nil {
+		_ = conn.Close()
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // The session's origin (docs/designs/proposal-origin.md §2.1): before a task's

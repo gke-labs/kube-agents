@@ -402,8 +402,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// by one timeout, not two. The deadline leaves room for storeDo's retry
 	// of a store that is not listening yet, which refuses at once; while the
 	// container starts it costs the turn nothing, since the API server the
-	// turn waits on starts after the store. A store that stays down costs one
-	// retry window, once (Bridge.storeDown).
+	// turn waits on starts after the store. A store that stays down while
+	// the API server answers costs one retry window, once (Bridge.storeDown);
+	// a restarting container gets the full retry again.
 	recordCtx, cancelRecord := context.WithTimeout(taskCtx, b.cfg.APIConnectRetry+routeTimeout)
 	originDone := make(chan struct{})
 	go func() {

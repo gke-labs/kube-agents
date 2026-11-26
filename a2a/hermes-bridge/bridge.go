@@ -523,7 +523,8 @@ type Bridge struct {
 	// storeDown is set once a session-kv request has been refused for a
 	// whole APIConnectRetry window, and cleared by the next request that
 	// reaches the store; while it is set, storeDo tries once instead of
-	// retrying, so a store that has died costs one window, not one per task.
+	// retrying, so a store that has died costs one window, not one per task,
+	// unless the API server refuses too (a restarting container).
 	storeDown atomic.Bool
 	// routesMu guards routes, the route each session last recorded
 	// (route.go), so a failed PUT that would have written the same route
