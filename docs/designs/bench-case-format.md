@@ -783,7 +783,9 @@ entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixtu
 pull request that lands the fixture leaves it there, because merging puts nothing on a
 cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
 request moves it to the nightly file, citing a reconcile report that visited every pool
-project and a scan that reads the role healthy on all of them.
+project and a scan that reads the role healthy on all of them. A parked case of the
+Validated Capabilities suite returns by its `suite:` line instead, with its `suite_part:`
+line for a section other than 1: a suite case is never in the nightly file.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly

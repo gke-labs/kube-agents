@@ -428,7 +428,9 @@ KNOWN_UNREGISTERED = {
 # blocks, runs in the nightly and shows that on its record. Every reason names
 # the issue; the entry stays through the pull request that lands the fixture
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
-# later pull request that moves the case to the nightly file.
+# later pull request that moves the case to the nightly file, or, for a case
+# of the validated-capabilities suite, restores its `suite:` line (a suite case
+# is never in a roster file).
 FIXTURE_NOT_READY = {
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of
