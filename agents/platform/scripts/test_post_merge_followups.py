@@ -154,6 +154,14 @@ class FollowupsTest(unittest.TestCase):
         self.assertIn("revert: xxx", self.comments[0][1])
         self.assertEqual(self.row(2)["followup_state"], "retry", "the record behind it still ran")
 
+    def test_a_long_answer_keeps_the_step_down_pull_request(self):
+        # The dial follows the deny rule by this field (#6953); a revert refused with a long reason must not drop it.
+        answer = {"action": "stepped-down", "revert": None, "stepDown": f"{REPO}/pull/12",
+                  "refused": {"revert": "the revert does not apply: " + "z" * 600}}
+        detail = pmf._detail(answer)
+        self.assertLessEqual(len(detail), pmf.DETAIL_CHARS)
+        self.assertEqual(json.loads(detail)["stepDown"], f"{REPO}/pull/12")
+
     def test_a_detail_that_is_not_json_still_gives_up(self):
         add_record(self.conn, 1, followup_state="retry", followup_attempts=pmf.FOLLOWUP_ATTEMPTS,
                    followup_detail='{"action": "retry", "reason": "cut')

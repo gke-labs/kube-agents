@@ -903,6 +903,19 @@ MAX_READ_LINES = 256
 MAX_READ_CHARS_FACTOR = 6
 MAX_READ_CHARS_FLOOR = 65536
 READ_COST_CHARS = 16
+# A line that holds a simple command longer than this is withheld with no
+# read. The readers take a command's words from `shlex`, which builds a word
+# one character at a time and copies it each time, so one very long word (a
+# file body in one quoted argument, an unclosed quote over many lines) costs
+# each reader quadratic time. A simple command is at least as long as its
+# longest word, so the limit bounds that cost for the pieces that the cut
+# gives, with the line's comments and without them. The readers of the token
+# and environment rule cut a line with a quote model of their own, so a quote
+# in a quoted substitution, or a blank that only `str.strip` takes as one, can
+# still give them a longer word. The limit is the floor of the read budget
+# above, and a line with a simple command past it is decided as a call past
+# its budget is.
+MAX_SIMPLE_COMMAND_CHARS = MAX_READ_CHARS_FLOOR
 # A script that stood in double quotes keeps the backslash ahead of a `$` or a
 # backtick; the shell that runs the script reads them as a substitution's
 # start. A backslash that another backslash escapes is no such backslash: in
@@ -2797,8 +2810,26 @@ def _command_reads_a_secret(command: str, depth: int) -> bool:
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))
 
 
+def _holds_a_long_simple_command(command: str) -> bool:
+    """Whether a simple command of the line is longer than `MAX_SIMPLE_COMMAND_CHARS`.
+
+    The line is cut two times, as it is and with its comments off, because
+    the first read takes the comments off before it cuts: a quote character
+    in a comment moves the cut.
+    """
+    if len(command) <= MAX_SIMPLE_COMMAND_CHARS:
+        return False
+    return any(
+        len(simple) > MAX_SIMPLE_COMMAND_CHARS
+        for text in (command, strip_shell_comments(command))
+        for simple in split_shell_commands(fold_shell_continuations(text))
+    )
+
+
 def command_reads_a_secret(command: str) -> bool:
     """Whether the shell line `command` prints a secret's value, deciding closed where it cannot tell."""
+    if _holds_a_long_simple_command(command):
+        return True
     return _command_reads_a_secret(command, 0) or script_prints_token_or_environment(command, 0)
 
 

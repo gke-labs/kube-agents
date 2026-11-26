@@ -4977,7 +4977,7 @@ unit_cost_hint() {
     # The same full drift audit as consistency-drift-outlier, graded on
     # another finding of the same ledger. Priced with it, not measured on a
     # lane yet.
-    consistency-boot-disk-pool-outlier) echo 600 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 600 ;;
     # On the blocking roster since 2026-11-02 (#4095), the presubmit's one
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
@@ -5160,6 +5160,11 @@ unit_cost_hint() {
     # priced in that band so a deadline cut does not take it first.
     # Unmeasured until its first nights.
     chat-stop-halts-delegated-remediation) echo 1100 ;;
+    # Nightly only. The harness waits idle_seconds=480 between the opening
+    # and the reply (idle_reply.py), so a repetition is never under 480s,
+    # plus two turns. Priced above that so a deadline cut does not take it
+    # first.
+    session-recalls-context-after-idle-reap) echo 700 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -5271,7 +5276,7 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
-    consistency-boot-disk-pool-outlier) echo 3000 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;

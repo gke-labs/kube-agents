@@ -138,6 +138,7 @@ type triggerStatusReplyWire struct {
 	EndedAt  string              `json:"endedAt,omitempty"`
 	Refused  *triggerRefusalWire `json:"refused,omitempty"`
 	Delivery string              `json:"delivery,omitempty"`
+	Reason   string              `json:"reason,omitempty"`
 }
 
 // errTriggerStopRefused is a stop the gateway refused for good: the stop
@@ -267,6 +268,7 @@ func (s *natsScheduleSubmitter) State(ctx context.Context, sched *agentv1alpha1.
 	state := ScheduleTaskState{Found: reply.Found, Terminal: reply.Terminal, Delivery: reply.Delivery}
 	if reply.Terminal {
 		state.Outcome = scheduleOutcomeFor(reply.State)
+		state.Reason = reply.Reason
 		state.CompletedAt = s.now()
 		if t, err := time.Parse(time.RFC3339Nano, reply.EndedAt); err == nil {
 			state.CompletedAt = t

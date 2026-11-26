@@ -1732,6 +1732,124 @@ def get_context_github_repo_entries() -> list[dict]:
     return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True, enterprise=True)
 
 
+def _canonical_repo_id(repo: str) -> str:
+    """Return a lowercase host-qualified repository identifier for deduplication."""
+    host, path = split_host(repo) if repo else ("", "")
+    if not host:
+        return f"{repo_ref.GITHUB_CANONICAL_HOST}/{repo}".lower()
+    return f"{host}/{path}".lower()
+
+
+def get_context_repo_specs() -> list[dict[str, str | None]]:
+    """Return `context_repos` across all supported VCS providers in ConfigMap order.
+
+    Each item has the shape `{"repo": <verb_name>, "ref": <optional_ref>}`.
+    This function skips entries with `refused_ref` and excludes repositories
+    that appear in `get_managed_repos()`. It raises `RuntimeError` if the
+    state file cannot be read.
+    """
+    entries = get_context_repo_entries()
+    if not entries:
+        return []
+    managed = get_managed_repos()
+    try:
+        managed_entries = get_managed_repo_entries()
+    except Exception:  # noqa: BLE001 - `get_managed_repos` already succeeded
+        managed_entries = mounted_repo_entries(MANAGED_REPOS_KEY)
+
+    pool = list(entries) + list(managed_entries)
+    multi_vcs = any(str(e.get("type") or "") != GITHUB_REPO_TYPE for e in pool) or any(
+        split_host(m)[0] not in ("", repo_ref.GITHUB_CANONICAL_HOST) for m in managed
+    )
+    sendable = sendable_github_slugs(pool) if multi_vcs else {}
+    served = set(FORGE_PROPOSAL_NOUNS)
+    install_host = github_host()
+    managed_ids = {_canonical_repo_id(m) for m in managed}
+
+    specs: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        kind = str(entry.get("type") or "")
+        url = entry.get("url", "")
+        if kind not in served:
+            LOGGER.warning(
+                "Skipping %s repository %r: no provider for type %r.",
+                CONTEXT_REPOS_KEY,
+                url,
+                entry.get("type"),
+            )
+            continue
+        if kind == GITHUB_REPO_TYPE:
+            slug = extract_github_slug(url)
+            enterprise = None if slug else github_enterprise_ref(url, install_host)
+            if enterprise is not None:
+                name = "/".join(enterprise)
+            elif slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
+                _warn_not_on_install_host(CONTEXT_REPOS_KEY, url, install_host)
+                continue
+            elif slug:
+                name = (
+                    slug
+                    if (not multi_vcs or slug.lower() in sendable)
+                    else f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}"
+                )
+            else:
+                LOGGER.warning(
+                    "Skipping %s repository %r: not a GitHub repository URL.",
+                    CONTEXT_REPOS_KEY,
+                    url,
+                )
+                continue
+        else:
+            if _names_a_port(url) and (kind != GITEA_REPO_TYPE or "://" not in str(url)):
+                if kind == GITEA_REPO_TYPE:
+                    LOGGER.warning(
+                        "Skipping %s repository %r: write a Gitea repository with a port "
+                        "as a full URL (scheme://host:port/owner/repo), or omit the port.",
+                        CONTEXT_REPOS_KEY,
+                        url,
+                    )
+                else:
+                    LOGGER.warning(
+                        "Skipping %s repository %r: a host with a port is not supported; "
+                        "the broker serves a forge on its standard HTTPS port only.",
+                        CONTEXT_REPOS_KEY,
+                        url,
+                    )
+                continue
+            parsed = repo_ref.try_parse(url)
+            if parsed is None or not parsed.host or not HOSTNAME_RE.fullmatch(parsed.host):
+                LOGGER.warning(
+                    "Skipping %s repository %r: no host and path to name it by. "
+                    "Register a %s repository by its URL (https://<host>/<path>), "
+                    "with a fully qualified hostname.",
+                    CONTEXT_REPOS_KEY,
+                    url,
+                    kind,
+                )
+                continue
+            if len(parsed.segments) < MIN_REPOSITORY_DEPTH:
+                LOGGER.warning(
+                    "Skipping %s repository %r: it names a group or namespace, not a "
+                    "repository; register each repository in it by its own URL.",
+                    CONTEXT_REPOS_KEY,
+                    url,
+                )
+                continue
+            name = f"{parsed.host}/{parsed.path}"
+
+        canon = _canonical_repo_id(name)
+        if canon in seen:
+            continue
+        seen.add(canon)
+        if entry.get(CONTEXT_REF_REFUSED_KEY) is not None:
+            continue
+        if canon in managed_ids:
+            continue
+        specs.append({"repo": name, CONTEXT_REF_KEY: entry.get(CONTEXT_REF_KEY)})
+    return specs
+
+
 def gitops_repo_key_text() -> str:
     """The raw value of the `gitops_repo` key, stripped; "" when the key is absent.
 

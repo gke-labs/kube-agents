@@ -37,6 +37,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -124,6 +126,13 @@ const (
 		"A fix you are only asked to propose is not a change: write it in your reply."
 )
 
+// warmReadyPoll paces warmReady's asks of the status endpoint, and bounds
+// each one.
+const warmReadyPoll = 250 * time.Millisecond
+
+// warmStatusHost is the loopback address the warm status endpoint binds.
+const warmStatusHost = "127.0.0.1"
+
 func main() {
 	os.Exit(run())
 }
@@ -157,6 +166,12 @@ func run() int {
 			return 1
 		}
 		return 0
+	}
+	// `worker-adapter warm-ready` is a warm session pod's readiness probe:
+	// exit 0 once the adapter's loopback status endpoint answers, which it
+	// does from when its task watcher's consumer exists (workeradapter.runWarm).
+	if len(os.Args) > 1 && os.Args[1] == lib.SessionWarmReadyCommand {
+		return warmReady(warmStatusURL(), lib.SessionWarmReadyWaitSeconds*time.Second)
 	}
 	// `worker-adapter mcp` forwards the session's one delegate tool call to
 	// this adapter process over a unix socket (worker-adapter/mcp.go).
@@ -297,12 +312,18 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")
 	natsURL := os.Getenv("NATS_URL")
-	// A profile worker learns each task from the dispatcher's offer, so it
-	// starts with no TASK_ID.
+	// A profile worker learns each task from the dispatcher's offer, and a
+	// warm session pod from the first task addressed to it, so neither
+	// starts with a TASK_ID.
 	profileWorker := os.Getenv(lib.EnvProfileWorker) == "true"
-	if (taskID == "" && !profileWorker) || profile == "" || natsURL == "" {
-		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker needs no TASK_ID")
+	warm := os.Getenv(lib.EnvSessionWarm) == "true"
+	if (taskID == "" && !profileWorker && !warm) || profile == "" || natsURL == "" {
+		log.Error("TASK_ID, PROFILE, and NATS_URL are required (spec-subagent-profiles.md env contract); a profile worker or a warm session pod needs no TASK_ID")
 		return workeradapter.Config{}, false
+	}
+	warmStatusAddr := ""
+	if warm {
+		warmStatusAddr = warmStatusHostPort()
 	}
 
 	// The scope arrives resolved and already validated -- the gateway's
@@ -353,6 +374,20 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
 	log.Info("harness selected", "harness", string(harness))
+	// Every harness runs its tools as the adapter's user, so the adapter is
+	// made non-dumpable before any turn: those processes then can't read its
+	// environment or memory, open its /proc fds (the harness's pipes, where a
+	// forged event line could be written), or attach to it. A harness
+	// process is unaffected: exec makes it dumpable again. Where it fails,
+	// a harness that depends on isolation (core-agent, Antigravity) is
+	// refused; Claude Code runs as it did before, with a warning.
+	if err := protectAdapter(); err != nil {
+		if harness == persona.CoreAgent || harness == persona.Antigravity {
+			log.Error("the adapter could not be made non-dumpable; refusing the harness", "harness", string(harness), "err", err)
+			return workeradapter.Config{}, false
+		}
+		log.Warn("the adapter could not be made non-dumpable", "harness", string(harness), "err", err)
+	}
 
 	originSeq, originSeqStated := originSeq(log)
 	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
@@ -403,7 +438,57 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		// Literal "true" only, like EnvClusterView; a profile pod never
 		// serves a second task, and validate refuses the pair.
 		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
+		// Literal "true" only, like EnvSessionReuse; validate refuses it
+		// without reuse or beside a TASK_ID.
+		Warm:           warm,
+		WarmIdle:       envDurationOrZero(lib.EnvSessionWarmIdleSeconds),
+		WarmStatusAddr: warmStatusAddr,
 	}, true
+}
+
+// warmStatusHostPort is where a warm pod's adapter serves its status: the
+// loopback interface only.
+func warmStatusHostPort() string {
+	return net.JoinHostPort(warmStatusHost, strconv.Itoa(lib.SessionWarmStatusPort))
+}
+
+func warmStatusURL() string {
+	return "http://" + warmStatusHostPort() + lib.SessionWarmReadyPath
+}
+
+// warmReady is the warm pod's readiness probe: 0 once url answers 200,
+// waiting up to wait for it (lib.SessionWarmReadyWaitSeconds says why), 1 if
+// it never does.
+func warmReady(url string, wait time.Duration) int {
+	client := &http.Client{Timeout: warmReadyPoll}
+	deadline := time.Now().Add(wait)
+	for {
+		if resp, err := client.Get(url); err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return 0
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return 1
+		}
+		time.Sleep(warmReadyPoll)
+	}
+}
+
+// envDurationOrZero reads a positive whole number of seconds from key, or
+// zero when it is unset or not one.
+func envDurationOrZero(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		fmt.Fprintf(os.Stderr, "ignoring bad %s=%q\n", key, v)
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
 
 // sessionWriteRefusalDir is where a session pod with the cluster view keeps
@@ -741,6 +826,9 @@ func selfPath() string {
 // the harness's stream driver and argv builder. A value the worker doesn't
 // know is an error, never a fall back to Claude Code: a typo would otherwise
 // run the wrong harness without a word.
+// protectAdapter is workeradapter.ProtectProcess, swapped in tests.
+var protectAdapter = workeradapter.ProtectProcess
+
 func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
 	h := persona.Harness(getenv(lib.EnvHarness))
 	if h == "" && getenv(lib.EnvProfileWorker) == "true" {
