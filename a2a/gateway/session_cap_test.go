@@ -45,6 +45,7 @@ func capRig(t *testing.T, limit int, idle ...string) (*Gateway, *k8sfake.Clients
 		cfg:          &Config{MaxSessions: limit},
 		spawner:      &podSpawner{cfg: &Config{Namespace: "test-ns"}, client: cs, log: slog.Default()},
 		reg:          r.g.reg,
+		client:       r.client,
 		adapter:      r.adapter,
 		log:          slog.Default(),
 		sessionLocks: map[string]*sessionLockEntry{},

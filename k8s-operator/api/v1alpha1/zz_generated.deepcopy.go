@@ -893,6 +893,11 @@ func (in *AgentStatus) DeepCopyInto(out *AgentStatus) {
 		*out = new(int)
 		**out = **in
 	}
+	if in.EffectiveWarmSessions != nil {
+		in, out := &in.EffectiveWarmSessions, &out.EffectiveWarmSessions
+		*out = new(int)
+		**out = **in
+	}
 	if in.InferenceKeys != nil {
 		in, out := &in.InferenceKeys, &out.InferenceKeys
 		*out = new(InferenceKeysStatus)
@@ -1837,6 +1842,13 @@ func (in *InferenceKeysStatus) DeepCopyInto(out *InferenceKeysStatus) {
 		*out = make(map[string]string, len(*in))
 		for key, val := range *in {
 			(*out)[key] = val
+		}
+	}
+	if in.TierUnboundAt != nil {
+		in, out := &in.TierUnboundAt, &out.TierUnboundAt
+		*out = make(map[string]metav1.Time, len(*in))
+		for key, val := range *in {
+			(*out)[key] = *val.DeepCopy()
 		}
 	}
 }
@@ -2922,6 +2934,16 @@ func (in *TuningSpec) DeepCopyInto(out *TuningSpec) {
 		*out = new(int)
 		**out = **in
 	}
+	if in.SessionIdleMinutes != nil {
+		in, out := &in.SessionIdleMinutes, &out.SessionIdleMinutes
+		*out = new(int32)
+		**out = **in
+	}
+	if in.DMSessionIdleMinutes != nil {
+		in, out := &in.DMSessionIdleMinutes, &out.DMSessionIdleMinutes
+		*out = new(int32)
+		**out = **in
+	}
 	if in.SessionResources != nil {
 		in, out := &in.SessionResources, &out.SessionResources
 		*out = new(v1.ResourceRequirements)
@@ -2930,6 +2952,11 @@ func (in *TuningSpec) DeepCopyInto(out *TuningSpec) {
 	if in.DefaultRoute != nil {
 		in, out := &in.DefaultRoute, &out.DefaultRoute
 		*out = new(string)
+		**out = **in
+	}
+	if in.WarmSessions != nil {
+		in, out := &in.WarmSessions, &out.WarmSessions
+		*out = new(int)
 		**out = **in
 	}
 	if in.BusReplicas != nil {

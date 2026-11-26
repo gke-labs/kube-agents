@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 // The turn tools: send a turn as a console user, and read or stop its task.
@@ -268,7 +269,7 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 			"had arrived by then (%d); %s.\n", len(out.Reports), later)
 	case reportsNoCards:
 		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no cards were left pending, "+
-			"so gathering stopped at once; %s.\n", cell(out.Root.TaskID), later)
+			"so gathering stopped at once; %s.\n", inerttext.Cell(out.Root.TaskID), later)
 	case reportsNoCardSignal:
 		fmt.Fprintf(sb, "\nThe turn's tasks ended with no handoff or card subtask seen on them, and no result from the gateway "+
 			"had been heard yet, so gathering stopped at once; %s.\n", later)
@@ -303,19 +304,19 @@ func cardsLine(out TurnOutcome) string {
 // writeEventHead is a buffered frame's heading line: label, then its message
 // id, the task it reports on, and its state, each an inert cell.
 func writeEventHead(sb *strings.Builder, label string, f EventFrame) {
-	fmt.Fprintf(sb, "%s (message %s", label, cell(f.MessageID))
+	fmt.Fprintf(sb, "%s (message %s", label, inerttext.Cell(f.MessageID))
 	if f.ReplyTo != "" {
-		fmt.Fprintf(sb, ", on task %s", cell(f.ReplyTo))
+		fmt.Fprintf(sb, ", on task %s", inerttext.Cell(f.ReplyTo))
 	}
 	if f.TaskID != "" {
 		task := f.TaskID
 		if f.Addressee != "" {
 			task = f.Addressee + taskRefSep + task
 		}
-		fmt.Fprintf(sb, ", task %s", cell(task))
+		fmt.Fprintf(sb, ", task %s", inerttext.Cell(task))
 	}
 	if f.State != "" {
-		fmt.Fprintf(sb, ", %s", cell(f.State))
+		fmt.Fprintf(sb, ", %s", inerttext.Cell(f.State))
 	}
 	if f.Edited {
 		sb.WriteString(", updated")
@@ -580,7 +581,7 @@ func writeConversation(sb *strings.Builder, alias, token string, byToken bool) {
 	if alias == "" {
 		alias = DefaultConversation
 	}
-	fmt.Fprintf(sb, "Conversation %s (token `%s`).\n\n", cell(alias), token)
+	fmt.Fprintf(sb, "Conversation %s (token `%s`).\n\n", inerttext.Cell(alias), token)
 }
 
 // writeNotices quotes each notice whole, line breaks and all: for a settled
@@ -618,7 +619,7 @@ func writeTask(sb *strings.Builder, ref TaskRef, t *lib.Task) {
 			sb.WriteString("\n")
 		}
 	} else if p := artifactText(t, lib.ArtifactProgress); p != "" && !t.Final {
-		fmt.Fprintf(sb, "Progress: %s\n", cell(lastLine(p)))
+		fmt.Fprintf(sb, "Progress: %s\n", inerttext.Cell(lastLine(p)))
 	}
 }
 
@@ -651,7 +652,7 @@ func writeFollowed(sb *strings.Builder, followed []FollowedTask) {
 	for _, f := range followed {
 		switch {
 		case f.Err != nil:
-			fmt.Fprintf(sb, "- `%s`: not read (%s)\n", f.Ref, cell(f.Err.Error()))
+			fmt.Fprintf(sb, "- `%s`: not read (%s)\n", f.Ref, inerttext.Cell(f.Err.Error()))
 		case f.Task == nil:
 			fmt.Fprintf(sb, "- `%s`: no events yet\n", f.Ref)
 		default:

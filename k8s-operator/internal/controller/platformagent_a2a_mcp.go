@@ -196,7 +196,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 		}
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, a2aMCPComponent)},
 		Spec: appsv1.DeploymentSpec{
@@ -251,7 +251,9 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Command: []string{a2aMCPCommand},
 						// Distroless, run as 1000: see buildA2AConsoleDeployment.
 						WorkingDir: "/",
-						Env: []corev1.EnvVar{
+						// The profile supervisor gate's env rides last, and
+						// only once the install has latched (#5301).
+						Env: append([]corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							a2aNATSCAFileEnvVar(),
 							{Name: a2aMCPEnvBusUser, Value: a2aConsoleMCPUser},
@@ -261,7 +263,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							{Name: a2aMCPEnvAgent, Value: agent.Name},
 							{Name: a2aMCPEnvNamespace, Value: agent.Namespace},
 							{Name: a2aMCPEnvGoMemLimit, Value: a2aMCPGoMemLimit()},
-						},
+						}, a2aProfileSupervisorCutoffEnv(agent)...),
 						Ports: []corev1.ContainerPort{{Name: a2aMCPPortName, ContainerPort: a2aMCPPort}},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: a2aMCPBusKeyVolume, MountPath: a2aMCPBusKeyMountDir, ReadOnly: true},
@@ -299,6 +301,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 			},
 		},
 	}
+	withA2AProfileNamesFile(agent, &dep.Spec.Template.Spec, a2aMCPContainer)
+	return dep
 }
 
 // buildA2AMCPService is what `kubectl port-forward svc/...` names.

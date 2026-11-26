@@ -9,7 +9,9 @@ with `curl` or `kubectl` replaced by a stub on PATH that answers from a JSON
 state file and logs every call, then asserts on the exit status, the calls
 made, and the state left behind. run-gitops-pilot.sh is run from its TASK/CASE
 resolution and its leaked-pin and pinned-base refusals, through its agent state reset, to its
-base-mode decision (step 2), and stops at the token read that follows; its post-run pull-request listing is
+base-mode decision (step 2), and stops at the token read that follows, or, when the state answers that
+read, goes on to the devops-bench call, whose token environment is recorded and whose stub fails, and
+through the post-run steps with the leak check skipped; its post-run pull-request listing is
 gitops-run-prs.sh, run here with `gh` stubbed. The three scripts read the
 repository through gitops_repo.py, which these tests run through them. The
 stack's plan-time preconditions on the run branch are evaluated over its
@@ -107,9 +109,10 @@ sys.stdout.write(str(code))
 # waits) is answered and the applied PlatformAgent kept, its freshness report
 # answers fresh, any other `exec` (gitops-run-repo.sh check) succeeds, and the
 # secret read records the default-branch switch the wrapper exported before
-# it, then stops the wrapper.
+# it, then stops the wrapper, or answers with a stub value when the state sets
+# token_read_answers.
 _STUB_KUBECTL = """\
-import json, os, sys
+import base64, json, os, sys
 path = os.environ["STUB_STATE"]
 state = json.load(open(path))
 args = sys.argv[1:]
@@ -273,7 +276,9 @@ elif verb == "exec":
 elif verb == "get" and target == "secret":
     state["switch_at_token_read"] = os.environ.get("TF_VAR_gitops_switch_default_branch")
     save()
-    sys.exit(%(stop)d)
+    if not state.get("token_read_answers"):
+        sys.exit(%(stop)d)
+    print(base64.b64encode(b"stub-secret-value").decode())
 elif verb == "rollout" and target == "status":
     if state.get("rollout_sets_base") is not None:
         set_base(state.pop("rollout_sets_base"))
@@ -303,10 +308,16 @@ def _platform_agent(base="", alias=False, gitops_repository=_REPO, forge=None):
 # uv as run-gitops-pilot.sh calls it up to its base-mode decision: `uv sync`
 # succeeds, case_var's `uv run --no-sync python - <task.yaml> <name>` runs the
 # real snippet, the HOLD_SUPPORTED probe (the same call with no arguments)
-# answers no, and anything else stops the wrapper.
+# answers no, and anything else stops the wrapper. The devops-bench call (step
+# 4) first records the grading-token environment the harness would start with.
 _STUB_UV = """\
-import os, sys
+import json, os, sys
 args = sys.argv[1:]
+if args[:3] == ["run", "--no-sync", "devops-bench"]:
+    path = os.environ["STUB_STATE"]
+    state = json.load(open(path))
+    state["harness_token_env"] = {name: os.environ.get(name) for name in ("BENCH_GITHUB_TOKEN_FILE", "BENCH_GITHUB_TOKEN")}
+    json.dump(state, open(path, "w"))
 if args[:1] == ["sync"]:
     sys.exit(0)
 if args[:4] == ["run", "--no-sync", "python", "-"] and len(args) == 6 and args[4].endswith("task.yaml"):
@@ -1176,6 +1187,33 @@ class WrapperCaseSelectionTest(_StubbedScriptTest):
         self.assertEqual(proc.returncode, _KUBECTL_STOP, proc.stderr)
         self.assertIn("==> base branch via repository default", proc.stdout)
         self.assertEqual(self.state()["switch_at_token_read"], "true")
+
+    def test_an_ambient_token_file_does_not_reach_the_harness(self):
+        """The harness reads BENCH_GITHUB_TOKEN_FILE before BENCH_GITHUB_TOKEN, so a
+        token file the caller's shell exports would grade the private repository
+        with another account's credential. The wrapper drops it and hands the
+        harness the stack's token."""
+        ambient = self.tmp / "ambient-token"
+        ambient.write_text("ghp_ambient\n")
+        # A copy of the wrapper, so its post-run steps read an empty results
+        # directory and no pull-request listing.
+        case = "b-0022b-gitops"
+        text = (_WRAPPER.parents[1] / "tasks" / case / "task.yaml").read_text()
+        self.given_cr(_platform_agent(), token_read_answers=True)
+        proc = self.run_wrapper(
+            wrapper=self.wrapper_with_case(case, text),
+            CASE=case,
+            BENCH_GITHUB_TOKEN_FILE=str(ambient),
+            BENCH_GITHUB_TOKEN="ghp_ambient",
+            # Skips the leak check, which reads GitHub and gcloud.
+            BENCH_NO_TEARDOWN="true",
+        )
+        self.assertEqual(proc.returncode, _UV_STOP, proc.stderr)
+        self.assertIn("==> devops-bench", proc.stdout)
+        self.assertEqual(
+            self.state()["harness_token_env"],
+            {"BENCH_GITHUB_TOKEN_FILE": None, "BENCH_GITHUB_TOKEN": "ghp_test"},
+        )
 
     def test_a_case_that_turns_the_switch_off_and_pins_nothing_is_refused(self):
         pinned = (_WRAPPER.parents[1] / "tasks" / "b-0022b-gitops-pinned-base" / "task.yaml").read_text()

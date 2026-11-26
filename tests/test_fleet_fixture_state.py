@@ -472,7 +472,7 @@ def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> di
     return doc
 
 
-def _cluster_c(*, disk: int = 50, pids_limit: str | None = "4096", created: str | None = None) -> dict:
+def _cluster_c(*, disk: int = 50, pids_limit: str | None = "4096", machine: str = "e2-standard-2", created: str | None = None) -> dict:
     """Slot c's cluster document: no authorized-networks block, and the
     default pool bench/tf/fleet/main.tf plants as the pool-level outlier, a
     50 GB disk with podPidsLimit 4096 (a string, as gcloud prints an int64).
@@ -481,7 +481,7 @@ def _cluster_c(*, disk: int = 50, pids_limit: str | None = "4096", created: str 
     # Since the ComputeClass fixtures (defects-c.tf): the pool carries the
     # class label and the NodeLocal DNSCache add-on is off (GKE omits the
     # false boolean, so the block is empty).
-    config: dict = {"diskSizeGb": disk, "labels": {"cloud.google.com/compute-class": "general-ccc"}}
+    config: dict = {"diskSizeGb": disk, "machineType": machine, "labels": {"cloud.google.com/compute-class": "general-ccc"}}
     if pids_limit is not None:
         config["kubeletConfig"] = {"podPidsLimit": pids_limit}
     return {
@@ -1793,6 +1793,18 @@ class PassTest(_Harness):
         assert set(files) == {"drift-outlier"}, (files, done.stderr)
         assert "cluster createTime age_hours_ge 24: observed" in files["drift-outlier"], files["drift-outlier"]
         assert "2.0 hours old" in files["drift-outlier"]
+
+    def test_a_default_pool_on_the_smaller_machine_is_drift(self):
+        # An e2-medium node keeps about 60m of CPU unrequested, and a node
+        # replacement can leave the slot's workloads Pending on it; no drift
+        # facet reads machine type, so the pool's own role says it.
+        world = _healthy_world()
+        world["describe"]["seeded-c"] = _cluster_c(machine="e2-medium")
+        done = self.run_script(world)
+        files = self.drift_files()
+        assert set(files) == {"untainted-compute-class-pool"}, (files, done.stderr)
+        assert "nodePools[?(@.name=='default-pool')].config.machineType eq \"e2-standard-2\": observed \"e2-medium\"" in files["untainted-compute-class-pool"], files
+        assert "1 drifted" in done.stderr, done.stderr
 
     def test_a_default_pool_matching_its_peers_is_drift(self):
         # The pool-level outlier is a separate role from drift-outlier: a

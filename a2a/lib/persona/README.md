@@ -47,6 +47,12 @@ a server reached around the broker would be outside both.
 - a `SKILL.md` frontmatter key other than `name`, `description`, `license`
   and `metadata`, because Claude Code reads keys such as `allowed-tools`
   and `hooks` from it;
+- a `SKILL.md` whose frontmatter isn't exactly one YAML document between
+  lines that are exactly `---`: it opens on the first line and closes at
+  the next line that is exactly `---`. Any other line in it that holds
+  `---` or starts with `...` or `%` is refused, and so is a byte-order mark
+  or a line break other than LF or CRLF anywhere in the file, and one that
+  never closes is refused too, so where it ends never depends on a parser;
 - an `@` import in `instructions.md` or a skill's markdown that could leave
   the persona. The check fails closed rather than parse imports the way the
   harness does: any `@` token that starts with `/` or `~`, or contains `..`,
@@ -111,10 +117,11 @@ cannot express comes back as a warning, never an error.
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
 `spec.harness.type` (and the gateway sets on session pods from the
 PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
-`PROFILE_HARNESS` when that is unset (`claude-code` or `antigravity`). A session
-pod refuses `antigravity` unless `A2A_HARNESS_UNISOLATED=allow` and
-`A2A_HARNESS_PATH` are set, until #6710 lands; a profile worker refuses it
-because it has no persona adapter yet.
+`PROFILE_HARNESS` when that is unset (`claude-code`, `antigravity` or
+`core-agent`). A session pod refuses `antigravity` unless
+`A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
+unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
+worker refuses both, because neither has a persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
@@ -137,6 +144,8 @@ because it has no persona adapter yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
+- **`core-agent`**: not written yet (it comes with core-agent's persona
+  render, #6713); `render.For` refuses it by name.
 
 ## An example
 

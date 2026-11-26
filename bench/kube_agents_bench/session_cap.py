@@ -263,7 +263,7 @@ def refused_at_cap(entries: Iterable[Mapping[str, Any]]) -> str:
     queue's red."""
     for entry in entries:
         text = str(entry.get("text") or "")
-        if entry.get("kind") == "post" and _CAP_REFUSAL.search(text):
+        if entry.get("kind") == "post" and entry.get("report") is not True and _CAP_REFUSAL.search(text):
             return text
     return ""
 
@@ -277,7 +277,10 @@ def assess(entries: Iterable[Mapping[str, Any]], task_id: str, detail: str = "")
     answer). ``error`` otherwise, with why; ``detail`` is added to the
     reason, for what the harness saw that the entries do not say.
     """
-    entries = [e for e in entries if isinstance(e, Mapping) and isinstance(e.get("seq"), int)]
+    # A relayed card report (the door's `report` posts) is never the turn's
+    # notice, refusal or answer.
+    entries = [e for e in entries if isinstance(e, Mapping) and isinstance(e.get("seq"), int)
+               and e.get("report") is not True]
     entries.sort(key=lambda e: e["seq"])
     notice = next((e["seq"] for e in entries if e.get("kind") == "post" and _QUEUED.search(str(e.get("text") or ""))), None)
     task = next((e["seq"] for e in entries if task_id and e.get("kind") == "task" and e.get("taskId") == task_id), None)
