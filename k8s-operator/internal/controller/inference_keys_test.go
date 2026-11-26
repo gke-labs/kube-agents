@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -114,7 +116,10 @@ func litellmGatewayPod(agent *agentv1alpha1.PlatformAgent, name, ip string) *cor
 func platformAgentCRDObject(withField bool) *unstructured.Unstructured {
 	statusProps := map[string]any{"phase": map[string]any{"type": "string"}}
 	if withField {
-		statusProps["inferenceKeys"] = map[string]any{"type": "object"}
+		statusProps["inferenceKeys"] = map[string]any{"type": "object", "properties": map[string]any{
+			"secretUIDs":    map[string]any{"type": "object"},
+			"tierUnboundAt": map[string]any{"type": "object"},
+		}}
 	}
 	crd := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"versions": []any{map[string]any{
@@ -438,7 +443,9 @@ func TestTheProbeGateNeedsEveryPodToAdmitTheProbeKey(t *testing.T) {
 		}}
 		r.inferenceKeyProbe = prober
 		out := r.reconcileInferenceKeys(ctx, agent)
-		if out.condition.Status != metav1.ConditionTrue || out.requeue != 0 {
+		// The Served pass marks the keys and asks for the pass that renders
+		// their callers (inference_key_callers.go).
+		if out.condition.Status != metav1.ConditionTrue || out.requeue != inferenceKeysMarkedRecheck {
 			t.Fatalf("outcome %+v", out)
 		}
 		if got := prober.probes.Load(); got != 2 {
@@ -597,6 +604,195 @@ func TestATiersKeyGoesWithTheTierAndTheAgent(t *testing.T) {
 	if err := cl.Get(ctx, readTier, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("a tier key survived the deletion: %v", err)
 	}
+}
+
+// appliedDispatchConfigObject is an applied dispatch config ConfigMap
+// holding profiles, as the operator writes it.
+func appliedDispatchConfigObject(t *testing.T, agent *agentv1alpha1.PlatformAgent, profiles ...a2aDispatchProfile) *corev1.ConfigMap {
+	t.Helper()
+	body, err := json.Marshal(a2aDispatchConfig{Profiles: profiles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent),
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+				Name: agent.Name, UID: agent.UID, Controller: ptr.To(true)}}},
+		Data: map[string]string{a2aDispatchConfigKey: string(body)},
+	}
+}
+
+// A tier that drains keeps its key, in its Secret and in the map, until the
+// drain ends: work already running at it still sends that key. That holds
+// for a tier a live profile dropped and for every tier of a profile that
+// has left the install.
+func TestADrainingTierKeepsItsKeyUntilTheDrainEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		drained func(until time.Time) a2aDispatchProfile
+		profile func(p *agentv1alpha1.AgentProfile) bool // false: delete it
+		// firstPass: the applied entry carries no drain yet; the drain-ends
+		// leg then writes an ended drain for the tier.
+		firstPass bool
+	}{
+		{
+			name: "dropped from allowedTiers",
+			drained: func(until time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead},
+					DrainingTiers: []a2aDrainingTier{{Tier: agentv1alpha1.AgentProfileTierUnattended, Mode: "unattended", Until: until}}}
+			},
+			profile: func(p *agentv1alpha1.AgentProfile) bool {
+				p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+				return true
+			},
+		},
+		{
+			name: "profile left the install",
+			drained: func(until time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}, DrainingUntil: until}
+			},
+			profile: func(*agentv1alpha1.AgentProfile) bool { return false },
+		},
+		// The first pass after the change, before the A2A step has written
+		// the drain: the applied config still lists the tier as live.
+		{
+			name:      "dropped from allowedTiers, drain not written yet",
+			firstPass: true,
+			drained: func(time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}}
+			},
+			profile: func(p *agentv1alpha1.AgentProfile) bool {
+				p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+				return true
+			},
+		},
+		{
+			name:      "profile left the install, drain not written yet",
+			firstPass: true,
+			drained: func(time.Time) a2aDispatchProfile {
+				return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}}
+			},
+			profile: func(*agentv1alpha1.AgentProfile) bool { return false },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, cl, agent := inferenceKeysFixture(t)
+			ctx := context.Background()
+			r.reconcileInferenceKeys(ctx, agent)
+			unattended := tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret
+			before := readInferenceKey(t, cl, unattended).Data[inferenceKeyDataKey]
+
+			profile := &agentv1alpha1.AgentProfile{}
+			if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+				t.Fatal(err)
+			}
+			if tc.profile(profile) {
+				if err := cl.Update(ctx, profile); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := cl.Delete(ctx, profile); err != nil {
+				t.Fatal(err)
+			}
+			applied := appliedDispatchConfigObject(t, agent, tc.drained(time.Now().Add(time.Hour).UTC().Truncate(time.Second)))
+			if err := cl.Create(ctx, applied); err != nil {
+				t.Fatal(err)
+			}
+
+			r.reconcileInferenceKeys(ctx, agent)
+			if got := readInferenceKey(t, cl, unattended).Data[inferenceKeyDataKey]; string(got) != string(before) {
+				t.Error("the draining tier's key was replaced")
+			}
+			entries, _ := readCallerKeysMap(t, cl, agent)
+			if !slices.Contains(slices.Collect(maps.Values(entries)), "tier-unattended") {
+				t.Error("the map dropped the draining tier while its work still sends the key")
+			}
+
+			// The drain over, the key goes.
+			past := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+			endedEntry := tc.drained(past)
+			if tc.firstPass {
+				endedEntry = a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead},
+					DrainingTiers: []a2aDrainingTier{{Tier: agentv1alpha1.AgentProfileTierUnattended, Mode: "unattended", Until: past}}}
+				if !tc.profile(&agentv1alpha1.AgentProfile{}) {
+					endedEntry = a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}, DrainingUntil: past}
+				}
+			}
+			ended := appliedDispatchConfigObject(t, agent, endedEntry)
+			applied.Data = ended.Data
+			if err := cl.Update(ctx, applied); err != nil {
+				t.Fatal(err)
+			}
+			r.reconcileInferenceKeys(ctx, agent)
+			if err := cl.Get(ctx, unattended, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+				t.Errorf("the tier's key outlived its drain: %v", err)
+			}
+		})
+	}
+}
+
+// The applied dispatch config only delays a tier key's deletion, and only
+// when this PlatformAgent controls it and the drain's end is one the
+// operator could have written. It never mints a key for a tier it alone
+// names.
+func TestADrainKeepsATierKeyOnlyOnTrustedTerms(t *testing.T) {
+	soon := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	dropUnattended := func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	}
+	drain := func(tier string, until time.Time) a2aDispatchProfile {
+		return a2aDispatchProfile{Name: "auditor", Tiers: []string{agentv1alpha1.AgentProfileTierRead},
+			DrainingTiers: []a2aDrainingTier{{Tier: tier, Mode: "unattended", Until: until}}}
+	}
+	for _, tc := range []struct {
+		name    string
+		applied func(t *testing.T, agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap
+	}{
+		{"not controlled by this agent", func(t *testing.T, agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+			cm := appliedDispatchConfigObject(t, agent, drain(agentv1alpha1.AgentProfileTierUnattended, soon))
+			cm.OwnerReferences = nil
+			return cm
+		}},
+		{"a drain end past the window", func(t *testing.T, agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+			return appliedDispatchConfigObject(t, agent, drain(agentv1alpha1.AgentProfileTierUnattended, time.Now().Add(a2aDrainingWindow+time.Hour).UTC()))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, cl, agent := inferenceKeysFixture(t)
+			ctx := context.Background()
+			r.reconcileInferenceKeys(ctx, agent)
+			profile := &agentv1alpha1.AgentProfile{}
+			if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+				t.Fatal(err)
+			}
+			dropUnattended(profile)
+			if err := cl.Update(ctx, profile); err != nil {
+				t.Fatal(err)
+			}
+			if err := cl.Create(ctx, tc.applied(t, agent)); err != nil {
+				t.Fatal(err)
+			}
+			r.reconcileInferenceKeys(ctx, agent)
+			if err := cl.Get(ctx, tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+				t.Errorf("the config kept the dropped tier's key: %v", err)
+			}
+		})
+	}
+
+	t.Run("a tier only the config names", func(t *testing.T) {
+		r, cl, agent := inferenceKeysFixture(t)
+		ctx := context.Background()
+		if err := cl.Create(ctx, appliedDispatchConfigObject(t, agent, drain("phantom", soon))); err != nil {
+			t.Fatal(err)
+		}
+		r.reconcileInferenceKeys(ctx, agent)
+		if err := cl.Get(ctx, tierInferenceKeyClass(agent, "phantom").secret, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Errorf("a key was minted for a tier only the dispatch config names: %v", err)
+		}
+		entries, _ := readCallerKeysMap(t, cl, agent)
+		if slices.Contains(slices.Collect(maps.Values(entries)), "tier-phantom") {
+			t.Error("the map names a tier only the dispatch config names")
+		}
+	})
 }
 
 // A tier key of the same name that this agent didn't label as its own is
@@ -1224,6 +1420,127 @@ func TestAnOlderCRDWritesNothing(t *testing.T) {
 		t.Error("a Secret at a reserved name was replaced under an older CRD")
 	}
 	assertNoInferenceKeysBut(t, cl, agent, inferenceKeyClassAgent)
+}
+
+// A CRD that serves status.inferenceKeys but not its tierUnboundAt would
+// prune the time a tier's bound runs from: it counts as an older CRD.
+func TestACRDWithoutTierUnboundAtIsOutdated(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(crdGVK)
+	if err := cl.Get(ctx, types.NamespacedName{Name: servedPlatformAgentCRDName}, crd); err != nil {
+		t.Fatal(err)
+	}
+	partial := platformAgentCRDObject(true)
+	versions, _, _ := unstructured.NestedSlice(partial.Object, "spec", "versions")
+	unstructured.RemoveNestedField(versions[0].(map[string]any), "schema", "openAPIV3Schema", "properties", "status", "properties", "inferenceKeys", "properties", "tierUnboundAt")
+	_ = unstructured.SetNestedSlice(partial.Object, versions, "spec", "versions")
+	crd.Object["spec"] = partial.Object["spec"]
+	if err := cl.Update(ctx, crd); err != nil {
+		t.Fatal(err)
+	}
+	if out := r.reconcileInferenceKeys(ctx, agent); out.condition.Reason != inferenceKeysReasonCRDOutdated {
+		t.Errorf("condition %+v, want CRDOutdated for a CRD without tierUnboundAt", out.condition)
+	}
+	assertNoInferenceKeys(t, cl, agent)
+}
+
+// A tier the applied config lists as live, with no profile binding it, keeps
+// its key from the pass it is first found unbound, for at most the drain
+// window from then; a profile binding it again clears that time.
+func TestALiveListedTierKeepsItsKeyOnlyWithinTheWindow(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	unattended := tierInferenceKeyClass(agent, agentv1alpha1.AgentProfileTierUnattended).secret
+	profile := &agentv1alpha1.AgentProfile{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	// The A2A step never rewrites the config: the tier stays listed as live.
+	if err := cl.Create(ctx, appliedDispatchConfigObject(t, agent, a2aDispatchProfile{Name: "auditor",
+		Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}})); err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now().Add(-time.Second)
+	r.reconcileInferenceKeys(ctx, agent)
+	if err := cl.Get(ctx, unattended, &corev1.Secret{}); err != nil {
+		t.Fatalf("the tier's key went on its first pass unbound: %v", err)
+	}
+	at, ok := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]
+	if !ok || at.Time.Before(before) {
+		t.Fatalf("tierUnboundAt = %v, want the unattended tier at this pass", agent.Status.InferenceKeys.TierUnboundAt)
+	}
+
+	// Inside the window the time stands and the key stays.
+	r.reconcileInferenceKeys(ctx, agent)
+	if got := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]; !got.Equal(&at) {
+		t.Errorf("tierUnboundAt moved from %v to %v while the tier stayed unbound", at, got)
+	}
+	if err := cl.Get(ctx, unattended, &corev1.Secret{}); err != nil {
+		t.Fatalf("the tier's key went inside the window: %v", err)
+	}
+
+	// Past the window the key goes, though the config still lists the tier.
+	stale := agent.DeepCopy()
+	stale.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended] = metav1.NewTime(time.Now().Add(-a2aDrainingWindow - time.Minute))
+	if err := cl.Status().Update(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	if err := cl.Get(ctx, unattended, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Errorf("a live-listed tier kept its key past the drain window: %v", err)
+	}
+	// The pass after the deletion forgets the tier.
+	r.reconcileInferenceKeys(ctx, agent)
+	if _, ok := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]; ok {
+		t.Error("tierUnboundAt still names a tier whose key is gone")
+	}
+}
+
+// A tier bound again loses its tierUnboundAt entry, so a later unbinding
+// starts a fresh window.
+func TestARebondTierClearsItsUnboundTime(t *testing.T) {
+	r, cl, agent := inferenceKeysFixture(t)
+	ctx := context.Background()
+	r.reconcileInferenceKeys(ctx, agent)
+	profile := &agentv1alpha1.AgentProfile{}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}
+	if err := cl.Get(ctx, key, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, appliedDispatchConfigObject(t, agent, a2aDispatchProfile{Name: "auditor",
+		Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}})); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	if _, ok := agent.Status.InferenceKeys.TierUnboundAt[agentv1alpha1.AgentProfileTierUnattended]; !ok {
+		t.Fatal("no tierUnboundAt for the unbound tier")
+	}
+	if err := cl.Get(ctx, key, profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+	if err := cl.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	r.reconcileInferenceKeys(ctx, agent)
+	if len(agent.Status.InferenceKeys.TierUnboundAt) != 0 {
+		t.Errorf("tierUnboundAt = %v after the tier was bound again", agent.Status.InferenceKeys.TierUnboundAt)
+	}
 }
 
 // assertNoInferenceKeysBut is assertNoInferenceKeys with one class's Secret

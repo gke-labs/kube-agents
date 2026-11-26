@@ -579,11 +579,17 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if addressee == "" || !run.Published {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	task, err := g.replayForTerminal(ctx, addressee, q.TaskID, g.taskIsProfile(rec, q.TaskID, addressee))
+	task, err := g.replayForTerminal(ctx, addressee, q.TaskID)
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	reply := lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	// A completed run has no reason to record: only a run that ended
+	// otherwise (failed, rejected, canceled) carries one.
+	if task.Final && task.State != lib.StateCompleted && task.FinalMessage != nil {
+		reply.Reason = runReasonToken(joinTextParts(task.FinalMessage.Parts))
+	}
+	return reply
 }
 
 // triggerAuthority is the authority a trigger's task rides: the trigger as
@@ -658,7 +664,7 @@ func (g *Gateway) handleTriggerStop(ctx context.Context, subject string, data []
 	if !held {
 		return lib.TriggerStopReply{Result: lib.TriggerStopUnknownRun}
 	}
-	if task, err := g.replayForTerminal(ctx, ref.Addressee, q.TaskID, ref.Tier != ""); err == nil && task != nil && task.Final {
+	if task, err := g.replayForTerminal(ctx, ref.Addressee, q.TaskID); err == nil && task != nil && task.Final {
 		return lib.TriggerStopReply{Result: lib.TriggerStopAlreadyFinal}
 	}
 	if ref.Canceled {

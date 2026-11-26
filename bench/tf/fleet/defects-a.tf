@@ -438,8 +438,9 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
 # file in a GitOps repository declares a member's name; only the parent is a
 # stable object. Each member has burst-ingest's shape (two pause replicas,
 # 10m / 128Mi, a budget, the default-deny policy, the restricted settings), so
-# the cost SOP's 3.1 `overrequest` names each one on memory and no other
-# stream names the namespace. No note declares them: they are findings.
+# the cost SOP's 3.1 `overrequest` files the family on memory, as one finding
+# on the parent, and no other stream names the namespace. No note declares
+# them: they are findings.
 #
 # The names are literals, not `random_uuid` and not `generate_name`. Each
 # pool project then holds the same three names on each apply, with no state

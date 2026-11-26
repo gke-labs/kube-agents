@@ -206,8 +206,9 @@ func TestTheSessionRouteCountsTheAsksPerSession(t *testing.T) {
 			t.Errorf("maxSessions=%d: the reserve moved with the route (%d vs %d); the bridge's rows stay, since platform is reachable by handle",
 				sessions, a2aTasksReserve(session), a2aTasksReserve(platform))
 		}
-		if got, want := a2aTasksConsumerBudget(session)-a2aTasksConsumerBudget(platform), sessions*perSessionAsks; got != want {
-			t.Errorf("maxSessions=%d: the session route adds %d to the budget, want %d (the asks per session times the cap)", sessions, got, want)
+		warm := a2aWarmSessionsAt(agentv1alpha1.DefaultWarmSessions, sessions) * a2aTasksConsumersPerWarmSession
+		if got, want := a2aTasksConsumerBudget(session)-a2aTasksConsumerBudget(platform), sessions*perSessionAsks+warm; got != want {
+			t.Errorf("maxSessions=%d: the session route adds %d to the budget, want %d (the asks per session times the cap, and the warm pod's consumer)", sessions, got, want)
 		}
 		if a2aTasksMaxConsumers(session) < a2aTasksConsumerBudget(session) {
 			t.Errorf("maxSessions=%d: TASKS renders at %d, below the session route's budget %d", sessions, a2aTasksMaxConsumers(session), a2aTasksConsumerBudget(session))
@@ -215,13 +216,14 @@ func TestTheSessionRouteCountsTheAsksPerSession(t *testing.T) {
 	}
 	// Pinned at the defaults, so the arithmetic above cannot drift together
 	// with the constants: 10 sessions at 3+2*2, plus the reserve of 80 at the
-	// rendered bridge's 10 workers; the platform route keeps its 110.
+	// rendered bridge's 10 workers, plus the default warm pod's 1; the
+	// platform route keeps its 110.
 	def := defaultRouteAgent(ptr.To(agentv1alpha1.DefaultRouteSession))
-	if got := a2aTasksConsumerBudget(def); got != 150 {
-		t.Errorf("session route at the defaults: budget %d, want 150", got)
+	if got := a2aTasksConsumerBudget(def); got != 151 {
+		t.Errorf("session route at the defaults: budget %d, want 151", got)
 	}
-	if got := a2aTasksMaxConsumers(def); got != 150 {
-		t.Errorf("session route at the defaults: TASKS renders at %d, want 150 (above the floor)", got)
+	if got := a2aTasksMaxConsumers(def); got != 151 {
+		t.Errorf("session route at the defaults: TASKS renders at %d, want 151 (above the floor)", got)
 	}
 	if got := a2aTasksConsumerBudget(defaultRouteAgent(nil)); got != 110 {
 		t.Errorf("platform route at the defaults: budget %d, want 110, the figure before the field", got)
@@ -239,6 +241,7 @@ func TestTheProvisionRefusalReadsTheSessionRouteShare(t *testing.T) {
 	for _, want := range []string{
 		"required_consumers=" + strconv.Itoa(a2aTasksConsumerBudget(session)) + "\n",
 		"fits=$(( (live_consumers - " + strconv.Itoa(a2aTasksReserve(session)) + ") / " + per + " ))",
+		"plus " + strconv.Itoa(agentv1alpha1.DefaultWarmSessions) + " for the warm session pods",
 		"each session needs " + per + " consumers on TASKS",
 		"the rest going " + per + " to a session",
 	} {

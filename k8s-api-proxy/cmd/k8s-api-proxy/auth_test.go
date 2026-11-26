@@ -51,14 +51,20 @@ const (
 	testForeignIssuer   = "https://kubernetes.default.svc"
 )
 
-// proxyEnvVars are the variables registerFlags reads for the flags these tests set, cleared
-// so a developer's environment cannot change what a test parses.
+// proxyEnvVars are the KUBE_PROXY_ and CREDENTIAL_PROXY_ variables the binary reads, cleared
+// so a developer's environment cannot change what a test parses. The examples test refuses
+// a manifest that sets a variable under those prefixes that is not listed here.
 var proxyEnvVars = []string{
-	listenAddrEnv, authModeEnv, upstreamURLEnv, denyStreamingEnv, allowedCallersEnv, audienceEnv,
-	hostClusterIDEnv, scopeFileEnv, excludeHostClusterEnv, cacheMaxBytesEnv, cacheResourceTTLEnv,
+	listenAddrEnv, metricsPortEnv, tlsCertFileEnv, tlsKeyFileEnv, modeEnv, hostClusterIDEnv,
+	redactSecretsEnv, allowUpgradesEnv, kubeAPIServerEnv, kubeCAFileEnv, kubeTokenFileEnv,
+	audienceEnv, allowedCallersEnv, cacheMaxBytesEnv, cacheMaxEntryBytesEnv, cacheResourceTTLEnv,
+	cacheDiscoveryTTLEnv, scopeFileEnv, holdFileEnv, excludeHostClusterEnv, wifServiceAccountEnv,
+	wifTokenFileEnv, wifAudienceEnv, sessionAudienceEnv, sessionCallersEnv, maxInFlightEnv,
+	authModeEnv, upstreamURLEnv, denyStreamingEnv, upstreamTokenFileEnv, upstreamCAFileEnv,
+	universeDomainEnv, containerAPIURLEnv, scopedPoolFlagEnv, scopedPoolFileEnv,
 	jwtIssuerEnv, jwtKeySetURLEnv, jwtAudiencesEnv, jwtUsernameClaimEnv, jwtUIDClaimEnv,
 	jwtGroupsClaimEnv, jwtPartitionClaimEnv, jwtRequiredSubPrefixEnv, jwtAllowedPartitionsEnv,
-	jwtCAFileEnv, partitionByCallerEnv, upstreamTokenFileEnv, upstreamCAFileEnv,
+	jwtCAFileEnv, partitionByCallerEnv,
 }
 
 func clearProxyEnv(t *testing.T) {

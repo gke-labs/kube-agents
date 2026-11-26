@@ -3785,7 +3785,7 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("twelve §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("thirteen §4 facets marked _Standard cohorts only_", text)
         self.assertIn("reads as complete at eight of eight", text)
         self.assertIn("logging-components", text)
         self.assertIn("monitoring-components", text)
@@ -3828,6 +3828,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "logging-components",
                 "monitoring-components",
                 "boot-disk",
+                "kubelet-config",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
@@ -13018,6 +13019,23 @@ class TestAMachineCannotAuthorizeItself(BaseTestCase):
         self.assertEqual(
             audit_report.pending_remediate_targets([collaborator_bot]), []
         )
+
+    def test_request_times_keep_each_ids_newest_authorized_request(self):
+        """What `plan_generated_fixes` weighs against a closed pull request: the
+        same requests `start` reports, each with its newest time."""
+        comments = [
+            comment("/remediate a", node_id="IC_1", created_at="2026-10-01T00:00:00Z"),
+            comment("/remediate a\n/remediate b", node_id="IC_2", created_at="2026-10-03T00:00:00Z"),
+            comment("/remediate a", node_id="IC_3", created_at="2026-10-02T00:00:00Z"),
+            comment("/remediate c", association="NONE", login="drive-by", node_id="IC_4"),
+            self.bot("/remediate d", association="MEMBER"),
+            comment("/remediate all", node_id="IC_5"),
+        ]
+        self.assertEqual(
+            audit_report.remediate_request_times(comments),
+            {"a": "2026-10-03T00:00:00Z", "b": "2026-10-03T00:00:00Z"},
+        )
+        self.assertEqual(audit_report.pending_remediate_targets(comments), ["a", "b"])
 
     def test_a_collaborator_bot_is_still_refused_promotion(self):
         collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
@@ -23325,7 +23343,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     SELECTOR = {"matchLabels": {"app": "a"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}]}
 
-    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False):
+    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False, requested_at=None):
         manifest = self.manifest()
         manifest["clusters"][0]["candidates"][0].update(
             {"pod_selector": selector, "namespace": "web", "namespace_pdbs": list(namespace_pdbs)}
@@ -23341,7 +23359,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 # As the Config Connector scan does before planning.
                 probe.broker()
             planned, self.answered = audit_report.plan_generated_fixes(
-                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT
+                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT,
+                requested_at=requested_at,
             )
             probe.close()
             audit_report.write_generated_fixes(findings, planned, self.workspace)
@@ -23422,6 +23441,35 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(written, [])
                 # Answered, so `finish` does not refuse over it either.
                 self.assertEqual(self.answered, {"a"})
+
+    def test_a_request_after_the_carrying_pull_request_closed_plans_the_budget_again(self):
+        """#7013: a budget's pull request merged, a person later removed the file, and every
+        `/remediate` on the finding was refused as not a `manifest`. A request newer than the
+        merge or close sets that pull request aside; an older or untimed one leaves it answering,
+        so an old comment never re-proposes a budget a person removed."""
+        delta = audit_report.delta_block(["a"])
+        for state, fields in {
+            "merged": {"state": "MERGED", "mergedAt": "2026-10-01T00:00:00Z", "closedAt": "2026-10-01T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            carrying = {**fields, "headRefName": "x", "body": delta}
+            for asked, planned in {
+                "2026-10-02T00:00:00Z": ["a"],
+                "2026-09-30T00:00:00Z": [],
+                "": [],
+            }.items():
+                with self.subTest(state, asked=asked or "untimed"):
+                    self.unclone()
+                    self.workspace.mkdir(parents=True, exist_ok=True)
+                    written, finding = self.generate(prs=[carrying], requested_at={"a": asked})
+                    self.assertEqual(written, planned)
+                    self.assertEqual(self.answered, set() if planned else {"a"})
+                    self.assertEqual(finding["remediation"]["kind"], "manifest" if planned else "manual")
+        # An open pull request is live work, whenever the request came.
+        live = {"state": "OPEN", "headRefName": "x", "body": delta}
+        written, _ = self.generate(prs=[live], requested_at={"a": "2026-10-02T00:00:00Z"})
+        self.assertEqual(written, [])
+        self.assertEqual(self.answered, {"a"})
 
     def test_a_pull_request_carrying_a_fix_finish_cannot_build_answers_it(self):
         """No usable selector, so the worker wrote it by hand once; its pull
@@ -40066,6 +40114,50 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["superseded"], [])
         self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
+
+    def finish_over_a_merged_budget(self, asked_at):
+        """`finish` on the finding whose budget merged on 2026-07-15 and is gone
+        again, with a ledger `/remediate` for it written at `asked_at` (#7013)."""
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        merged = {
+            **pr(8, branch, state="MERGED", body=audit_report.delta_block([self.fid()])),
+            "closedAt": "2026-07-15T00:00:00Z",
+            "mergedAt": "2026-07-15T00:00:00Z",
+            "labels": [],
+        }
+        request = comment(f"/remediate {self.fid()}", created_at=asked_at)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": proposals_view([merged]),
+            "*-view comments": comments_view({"comments": [request]}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/11"),
+        }
+        self.record_run(context=["acme/fleet"], audit=self.STREAM)
+        return self.run_finish(
+            searched_doc(findings=[self.finding()]),
+            ["--manifest-file", self.manifest_file()],
+            audit=self.STREAM,
+        )
+
+    def test_a_ledger_request_after_the_budget_merged_opens_it_again(self):
+        """The budget's pull request merged, a person removed the file, and a
+        `/remediate` written after the merge was refused as not a `manifest`
+        on every run. Written after the merge, it now plans and opens the budget."""
+        self.assertEqual(self.finish_over_a_merged_budget("2026-07-20T00:00:00Z"), 0, self.err)
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1, self.err)
+        for body in self.harness.bodies_for("issue-comment"):
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+
+    def test_a_ledger_request_older_than_the_merge_leaves_it_answered(self):
+        """An old comment never re-proposes a budget a person merged and then removed."""
+        self.assertEqual(self.finish_over_a_merged_budget("2026-07-10T00:00:00Z"), 0, self.err)
+        self.assertNotIn("GENERATED: " + self.fid(), self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        refusals = [b for b in self.harness.bodies_for("issue-comment") if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1)
 
     def test_a_withheld_selector_is_not_planned(self):
         manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())

@@ -1437,7 +1437,7 @@ func isSessionWorkerTask(t *swarmTaskView) bool {
 		t.addr != "" && t.addr != swarmMemberPlatform && t.addr != swarmMemberGateway
 }
 
-// swarmText applies cell()'s rules without the code span: control
+// swarmText applies inerttext.Cell()'s rules without the code span: control
 // characters become spaces, format characters (bidi overrides, zero-width)
 // are removed, whitespace runs collapse, backticks become quotes, and the
 // result is capped in runes. "@" becomes a fullwidth at sign so untrusted
