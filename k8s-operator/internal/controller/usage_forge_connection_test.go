@@ -395,3 +395,26 @@ func TestForgeConnection_AWriteOverAChangedCRIsLeftForTheNextPoll(t *testing.T) 
 		t.Fatal("the other writer's condition was lost by the next write")
 	}
 }
+
+// Providers the operator does not know merge into one "other". A stale one
+// among them is not hidden by a fresh one beside it: the group is Unknown, and
+// False when the fresh one fails.
+func TestForgeCondition_AStaleProviderMergedIntoOtherIsNotHidden(t *testing.T) {
+	agent := githubAliasAgent()
+	for name, forges := range map[string][]usageForge{
+		"the stale one first": {staleForge("a-newer-forge"), connectedForge("b-newer-forge", 2)},
+		"the fresh one first": {connectedForge("a-newer-forge", 2), staleForge("b-newer-forge")},
+	} {
+		cond := forgeCondition(agent, &usageForgeReading{Forges: forges})
+		if cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != forgeReasonSweepStale ||
+			!strings.HasPrefix(cond.Message, "other: last attempted over an hour ago. ") {
+			t.Errorf("%s: condition %+v, want Unknown SweepStale naming other", name, cond)
+		}
+	}
+	cond := forgeCondition(agent, &usageForgeReading{Forges: []usageForge{
+		staleForge("a-newer-forge"), failingForge("b-newer-forge", map[string]int64{vcsConnectionUnreachable: 1}),
+	}})
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != forgeReasonUnreachable {
+		t.Errorf("a failing entry beside a stale one: condition %+v, want False Unreachable", cond)
+	}
+}

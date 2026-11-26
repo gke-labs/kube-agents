@@ -188,9 +188,12 @@ func forgeRepositories(n int64) string {
 // entries that name it: an entry a newer broker labels with a provider the
 // operator does not know joins the "other" one.
 type forgeProviderSummary struct {
-	provider     string
-	connected    bool
-	hasState     bool
+	provider  string
+	connected bool
+	hasState  bool
+	// stale is set when an entry merged here has no state: the broker last
+	// attempted it over an hour ago. A fresh entry beside it does not hide it.
+	stale        bool
 	repositories map[string]int64
 }
 
@@ -204,6 +207,7 @@ func forgeSummaries(reading *usageForgeReading) []forgeProviderSummary {
 			byProvider[name] = summary
 		}
 		if !forge.HasState {
+			summary.stale = true
 			continue
 		}
 		summary.hasState = true
@@ -267,14 +271,14 @@ func forgeCondition(agent *agentv1alpha1.PlatformAgent, reading *usageForgeReadi
 	for _, summary := range summaries {
 		label := forgeLabel(summary.provider, hosts)
 		switch {
-		case !summary.hasState:
-			stale = append(stale, label)
-		case !summary.connected:
+		case summary.hasState && !summary.connected:
 			clause, state := forgeFailing(summary)
 			failing = append(failing, fmt.Sprintf(forgeFailingFormat, label, clause))
 			if worst == "" || slices.Index(vcsConnectionStates, state) < slices.Index(vcsConnectionStates, worst) {
 				worst = state
 			}
+		case summary.stale:
+			stale = append(stale, label)
 		default:
 			count := summary.repositories[vcsConnectionOk]
 			verb := forgeAnswerVerb
