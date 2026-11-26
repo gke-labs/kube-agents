@@ -98,15 +98,15 @@ The three `kubeagents_vcs_forge_` series say which forge the install's managed r
 - `kubeagents_vcs_forge_connected` is `1` only when every managed repository of the provider answered.
 - `kubeagents_vcs_forge_repositories` counts those repositories by `state`:
 
-| `state`        | The last attempt on the repository                                                                                 |
-| -------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `ok`           | The forge answered the listing of the install's pull requests.                                                     |
-| `unauthorized` | The forge refused the credential or the read, or no credential could be had for the repository.                    |
-| `not_found`    | The forge has no such repository for this credential. On GitHub, also a repository the App cannot see.             |
-| `unreachable`  | The forge did not answer: a network or TLS fault, a timeout or a server error.                                     |
-| `rate_limited` | The forge refused a read for its request quota.                                                                    |
-| `identity`     | The credential cannot say which account it is. Such a repository is not attempted again until the broker restarts. |
-| `other`        | Any other failure, such as a host that no configured forge serves.                                                 |
+| `state`        | The last attempt on the repository                                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ok`           | The forge answered the listing of the install's pull requests.                                                                                                                                                |
+| `unauthorized` | The forge refused the credential or the read, or no credential could be had for the repository. On GitHub, a repository that does not exist, or that the App installation does not include, is in this state. |
+| `not_found`    | The forge has no such repository for this credential.                                                                                                                                                         |
+| `unreachable`  | The forge did not answer: a network or TLS fault, a timeout or a server error.                                                                                                                                |
+| `rate_limited` | The forge refused a read for its request quota.                                                                                                                                                               |
+| `identity`     | The credential cannot say which account it is. Such a repository is not attempted again until the broker restarts.                                                                                            |
+| `other`        | Any other failure, such as a host that no configured forge serves.                                                                                                                                            |
 
 The state comes from the first reads of each attempt: the credential, the account and the listing. A later read of one pull request that fails does not change it, except a refusal for the request quota.
 
