@@ -52,9 +52,9 @@ var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
 	// kindLocation is the spec.harness.location a kind install sets (with
-	// "kind" for projectId and clusterName as well). No GKE location looks like
-	// this. It means: there is no GKE cluster to fetch credentials for, use the
-	// cluster the pod runs in.
+	// "kind" for projectId as well). No GKE location looks like this. It means:
+	// there is no GKE cluster to fetch credentials for, use the cluster the pod
+	// runs in.
 	kindLocation = "kind"
 	// inClusterContextName is the kubectl context the credential proxy and the
 	// agent use on kind.
@@ -91,8 +91,9 @@ const (
 	// it admits from that limit, so the limit is the CR's knob and the admitted
 	// count follows it; the two caps stay the operator's constants, and a CR
 	// override of either would detach them from the limit again.
-	credentialProxyMaxOutputBytes        = "8388608"
-	credentialProxyMaxConcurrentCommands = "8"
+	credentialProxyMaxOutputBytes           = "8388608"
+	credentialProxyMaxConcurrentCommands    = "8"
+	credentialProxyMaxConcurrentCommandsEnv = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS" // #nosec G101 -- Environment variable name, not a credential
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -4924,10 +4925,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
-		// The most brokered commands that run at once; the child memory budget
-		// decides how many of them the limit admits. The broker's own default
-		// is the same figure; setting it here is what makes it the operator's.
-		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
+		// The most brokered commands that run at once: default/fixed profiles
+		// stay pinned at 8, while sizingProfile=auto steps 8 small, 12 medium,
+		// 16 fleet; the child memory budget further caps admission if a custom
+		// override lowers memory. Setting it here pins it as the operator's
+		// value rather than an overridable spec.deployment.env key.
+		{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxySlotCapForAgent(agent, renderedSizingTier(agent))},
 		// The container's own memory limit, for the broker's child memory
 		// budget. See credentialProxyMemoryLimitEnv for why it is a
 		// resourceFieldRef and why it is reserved.
@@ -5437,10 +5440,14 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	} {
 		reserved[name] = struct{}{}
 	}
-	// The audit-report store's names (auditReportStoreEnvNames).
+	// The audit-report store's names (auditReportStoreEnvNames) and broker
+	// active-standby control env vars.
 	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
+	reserved[credentialProxyStandbyEnv] = struct{}{}
+	reserved[credentialProxyControlFileEnv] = struct{}{}
+	reserved[credentialProxyPeerHealthURLEnv] = struct{}{}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {

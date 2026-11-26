@@ -83,7 +83,15 @@ Field contracts assumed of `gcloud ... --format=json` output:
   cost the project its other check — but it does subtract from coverage: the
   instances that could not be read are named in the target's `limitations`,
   and a project where *every* RUNNING instance refused the read lists the slug
-  in `checks_unevaluated` rather than reporting a clean fleet.
+  in `checks_unevaluated` rather than reporting a clean fleet. The body is
+  what is left in a ring buffer of about 1 MiB, and the guest prints its
+  startup-script lines once per boot, so a console that holds no line opening
+  a run (`STARTUP_RUN_PATTERN`) on an instance known to run a script is not
+  a clean result. It is not a coverage gap either, because every VM that runs
+  for some weeks reaches that state: the target's `notes` names it
+  (`ROTATED_SERIAL_NOTE`), which `finish` shows and does not count as a gap,
+  and `noted_objects` lists it, so `finish` refuses to resolve a previous
+  finding on it.
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
   `sourceDisk` appears in the wild in both forms, so both are indexed.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
@@ -268,9 +276,23 @@ STARTUP_FAILURE_PATTERN = re.compile(
     r"|startup-script(?:-url)? exit status [1-9]\d*"
     r"|Finished running startup scripts with error"
 )
-# What `google_metadata_script_runner` prints as each startup-script run
-# begins, on old and current guest agents alike.
-STARTUP_RUN_MARKER = "Starting startup scripts"
+# The lines that open one startup-script run. The guest agent on the fleet
+# stack's Debian 12 VM (20260715.00, its 2026-10-07 boot read 2026-11-09) prints
+# `Running metadata script runner (version <v>) for "startup" event`; the
+# older agents print `Starting startup scripts`; and systemd prints `Starting
+# google-startup-scripts.service` before the unit's runner starts, whichever
+# agent runs in it.
+STARTUP_RUN_PATTERN = re.compile(
+    r"Starting startup scripts"
+    r'|Running metadata script runner \(version [^)]*\) for "startup" event'
+    r"|Starting google-startup-scripts\.service"
+)
+# systemd's line, the one start marker the runner does not print. As the last
+# start with no runner output after it, it means the run is in progress
+# (`_run_starts`). The runner tags its lines with its name; older agents
+# tagged them `GCEMetadataScripts`.
+SYSTEMD_START_MARKER = "Starting google-startup-scripts.service"
+RUNNER_OUTPUT_PATTERN = re.compile(r"google_metadata_script_runner|GCEMetadataScripts")
 
 # §2.5's threshold. Measured against the snapshot's own `creationTimestamp`,
 # which is what this collector can see; §2.5 words the condition as the source
@@ -403,9 +425,9 @@ CONNTRACK_IMPACT = (
     "The kernel dropped new connections on these nodes because the connection tracking "
     "table was full. Pods there kept reading Ready while requests to and from them failed."
 )
-# How a GKE node pool and a single instance are named in a finding.
+# How a GKE node pool is named in a finding. A single instance takes §2.1's
+# form, INSTANCE_OBJECT_FORMAT.
 NODE_POOL_OBJECT = "NodePool/{location}/{cluster}/{pool}"
-INSTANCE_OBJECT = "ComputeInstance/{zone}/{name}"
 # The zone of a log entry that names none; the API sets one on every entry of
 # a `gce_instance`, so this is the word for a changed contract.
 UNKNOWN_ZONE = "unknown-zone"
@@ -585,6 +607,32 @@ UNREAD_SERIAL_LIMITATION = (
     "enumerated, not examined."
 )
 
+# A console was read, but it holds no line that opens a startup-script run
+# (`STARTUP_RUN_PATTERN`) and no failure line: the boot that ran the script
+# has rotated out of the ring buffer (`startup_run_visible`). That is the
+# ordinary state of any VM that has run for some weeks, so it is neither a
+# limitation nor an unevaluated check: either would be a coverage gap that
+# holds every GCE finding open until someone reboots the VM. It is a note,
+# which `finish` shows on the target and does not count as a gap, so the run
+# never claims these instances were cleared. At most ROTATED_NOTE_NAMES names.
+ROTATED_SERIAL_NOTE = (
+    "gce-startup-script-status: the startup-script status of {count} RUNNING "
+    "instance(s) that run a startup script is not visible. Their serial "
+    "console was read, but the boot that ran the script has rotated out of "
+    "the serial buffer (about 1 MiB), so neither a failure nor a clean run "
+    "could be seen: {names}."
+)
+ROTATED_NOTE_NAMES = 10
+ROTATED_NOTE_MORE = ", and {more} more"
+# The manifest key that holds the target's notes.
+NOTES_KEY = "notes"
+# The manifest key that lists every instance the note covers, with no limit,
+# as `{check, object, command}`, `command` being the instance's own read. `finish` refuses a `resolved_because` for one of
+# them: the audit did not see that finding go away.
+NOTED_OBJECTS_KEY = "noted_objects"
+# An instance's finding identity (`check_startup_script`).
+INSTANCE_OBJECT_FORMAT = "ComputeInstance/{zone}/{name}"
+
 # §2.6's structural case, the counterpart of NO_INSTANCES_REASON: the read ran
 # and no RUNNING instance is a GKE node, so there is no node whose table could
 # be full.
@@ -601,9 +649,9 @@ EXCLUDED_GKE_NODES_REASON = (
     "declared scope leaves out ({total} node(s)), so §2.6 has no node in scope whose "
     "connection tracking table could be full. Structural, not a missed read."
 )
-# The four `checks_unevaluated` cases for §2.6. In each, nothing was read about
-# the nodes' tables, so a stale finding must not be called fixed on the
-# strength of this run.
+# The `checks_unevaluated` cases for §2.6: a read of this run failed, so
+# nothing was read about the nodes' tables and a stale finding must not be
+# called fixed on the strength of this run.
 UNREAD_GKE_NODES_REASON = (
     "§2.6 could not list this project's GKE nodes, so it read nothing about their "
     "connection tracking tables: {error}"
@@ -612,21 +660,9 @@ UNREAD_SERIAL_LOGGING_REASON = (
     "§2.6 reads a node's serial console log in Cloud Logging, and the read of which of "
     "the {total} RUNNING GKE node(s) on this project send that log there failed: {error}"
 )
-NO_SERIAL_LOGGING_REASON = (
-    "§2.6 reads a node's serial console log in Cloud Logging, and none of the {total} "
-    "RUNNING GKE node(s) on this project sets `serial-port-logging-enable` to `true`, so "
-    "a full connection tracking table on them writes nothing that this check can read."
-)
 UNREAD_CONNTRACK_LOG_REASON = (
     "§2.6's read of the serial console log in Cloud Logging failed, so no line of the "
     "{total} RUNNING GKE node(s) on this project was read: {error}"
-)
-NO_SERIAL_ENTRIES_REASON = (
-    "§2.6 found no kernel line, and no serial console entry at all of a GKE node of this "
-    "project is in Cloud Logging for the last {days} days. So nothing shows that this log "
-    "reaches Cloud Logging here (a log exclusion, a sink to another project or an "
-    "organization policy can keep it out), and a clean result for the {total} RUNNING GKE "
-    "node(s) would rest on nothing."
 )
 UNREAD_SERIAL_CONTROL_REASON = (
     "§2.6 found no kernel line, and its control read of the serial console log failed, so "
@@ -636,13 +672,26 @@ UNREAD_SERIAL_CONTROL_REASON = (
 CONNTRACK_UNEVALUATED_LIMITATION = (
     "node-conntrack-saturation could not be evaluated on this project: {reason}"
 )
-# Some nodes send their serial console to Cloud Logging and some do not. The
-# check keeps its verdict for the first; this names the rest as passed over
-# rather than cleared, as PARTIAL_SERIAL_LIMITATION does for §2.1.
-PARTIAL_SERIAL_LOGGING_LIMITATION = (
-    "node-conntrack-saturation covers {covered} of the {total} RUNNING GKE node(s) on this "
-    "project. The rest do not set `serial-port-logging-enable` to `true`, so the check "
-    "passed them over rather than cleared them: {names}."
+# The standing states in which §2.6 ran and could not see: nodes that do not
+# send their serial console to Cloud Logging, and a project that keeps none of
+# that log. Each is a customer's setting that lasts, so it is a note and not a
+# limitation or an unevaluated check: either of those is a coverage gap that
+# would hold every finding of this stream open for as long as the setting
+# stands. A note is shown and counted as no gap, and `noted_objects` names the
+# node pools it covers, so `finish` does not call an earlier finding on one of
+# them resolved: the run did not see it go away.
+SERIAL_LOGGING_OFF_NOTE = (
+    "node-conntrack-saturation: a full connection tracking table is not visible on {count} "
+    "of the {total} RUNNING GKE node(s) on this project. They do not set "
+    "`serial-port-logging-enable` to `true`, so their serial console does not reach Cloud "
+    "Logging, where the check reads the kernel's line: {names}."
+)
+NO_SERIAL_ENTRIES_NOTE = (
+    "node-conntrack-saturation: a full connection tracking table is not visible on this "
+    "project. The check found no kernel line, and no serial console entry at all of a GKE "
+    "node of this project is in Cloud Logging for the last {days} days, so nothing shows "
+    "that this log reaches Cloud Logging here (a log exclusion, a sink to another project "
+    "or an organization policy can keep it out)."
 )
 CONNTRACK_FULL_PAGE_LIMITATION = (
     "node-conntrack-saturation read the newest {limit} serial console entries with the "
@@ -661,6 +710,9 @@ TRIAGE_RETENTION_HOLD = "retention-hold"
 
 # Both GKE node-pool MIG spellings: `gke-` for Standard, `gk3-` for Autopilot.
 GKE_MIG_PREFIXES = ("gke-", "gk3-")
+# A GKE node instance carries its node pool's MIG prefix. §2.1's universe
+# excludes GKE nodes, so a rotated console on one is not noted.
+GKE_INSTANCE_PREFIXES = GKE_MIG_PREFIXES
 
 REDACTED = "[REDACTED]"
 # Serial console output is untrusted text from inside the guest, and §2.1's
@@ -979,11 +1031,11 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     lines = serial_text.splitlines()
     # The console buffer outlives a guest reboot, so a failure an operator has
     # since fixed is still in it. Only the last startup-script run counts.
-    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_MARKER in line]
+    starts = _run_starts(lines)
     for line in lines[starts[-1] if starts else 0 :]:
         if STARTUP_FAILURE_PATTERN.search(line):
             return {
-                "object": f"ComputeInstance/{zone}/{instance_name}",
+                "object": INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name),
                 "excerpt": redact(line.strip()),
                 "impact": (
                     f"Instance {instance_name} failed initialization and may be in a "
@@ -992,6 +1044,61 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
                 "needs_triage": TRIAGE_GKE_NODE,
             }
     return None
+
+
+def startup_run_visible(serial_text: str) -> bool:
+    """Does the console still hold the start of a startup-script run?
+
+    `get-serial-port-output` returns what is left in a ring buffer of about
+    1 MiB, and the guest prints its startup-script lines once, at boot. A VM
+    that logs every few minutes pushes them out: the fleet's planted VM, which
+    prints two guest-agent errors an hour because it has no service account,
+    lost its boot lines about three weeks after it booted. A console with no
+    run marker and no failure line is therefore no evidence of a clean run.
+    The caller lists such an instance as passed over, not cleared.
+    """
+    return bool(_run_starts(serial_text.splitlines()))
+
+
+def _raw_run_starts(lines: list[str]) -> list[int]:
+    """The indices of every line that opens a startup-script run."""
+    return [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
+
+
+def _run_starts(lines: list[str]) -> list[int]:
+    """The indices of the lines that open a startup-script run.
+
+    Less a last start that is systemd's line with no runner output after it:
+    a read in the boot window, after systemd starts the unit and before the
+    runner prints, holds no run yet, so it is not the visible run. The
+    previous run counts instead.
+    """
+    starts = _raw_run_starts(lines)
+    if (
+        starts
+        and SYSTEMD_START_MARKER in lines[starts[-1]]
+        and not any(RUNNER_OUTPUT_PATTERN.search(line) for line in lines[starts[-1] + 1 :])
+    ):
+        starts.pop()
+    return starts
+
+
+def startup_boot_window(serial_text: str) -> bool:
+    """Is the console inside a boot window with no previous run to read?
+
+    systemd has started the unit, the runner has not printed, and no earlier
+    run is left in the buffer — a new VM read seconds after boot. The run
+    has not started, so the console is evidence of nothing: not a clean run,
+    not a failure, and not a rotated buffer. The caller files no candidate
+    and writes no note, as on a console whose run is visible; the next read,
+    after the runner prints, grades the run. Without this, a healthy new VM
+    was noted "rotated out" at first read and woke the channel twice: once
+    for the note, once more when it cleared. A console whose earlier run is
+    still in the buffer is not this shape (`_run_starts` keeps the earlier
+    start), and a buffer with no start marker at all is the rotated one.
+    """
+    lines = serial_text.splitlines()
+    return bool(_raw_run_starts(lines)) and not _run_starts(lines)
 
 
 def _metadata_keys(payload: dict, field: str) -> set[str]:
@@ -1353,6 +1460,20 @@ def instance_keys(listed: list) -> set[tuple[str, str]]:
     return keys
 
 
+def node_objects(nodes: dict[tuple[str, str], dict], keys) -> list[str]:
+    """The finding identities of the nodes `keys` names, sorted and without
+    repeats: a node pool for a node whose pool is labelled, else the instance,
+    as `check_conntrack_saturation` names them."""
+    objects = set()
+    for zone, name in keys:
+        node = nodes[(zone, name)]
+        if node["pool"]:
+            objects.add(NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"]))
+        else:
+            objects.add(INSTANCE_OBJECT_FORMAT.format(zone=zone, name=name))
+    return sorted(objects)
+
+
 def _stamp(timestamp: str) -> str:
     """An entry's timestamp cut to the second, for an excerpt."""
     return f"{timestamp[:STAMP_SECONDS_CHARS]}{STAMP_UTC_SUFFIX}" if timestamp else UNKNOWN_TIME_TEXT
@@ -1397,7 +1518,7 @@ def check_conntrack_saturation(
             obj = NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"])
         else:
             node = None
-            obj = INSTANCE_OBJECT.format(zone=zone or UNKNOWN_ZONE, name=name)
+            obj = INSTANCE_OBJECT_FORMAT.format(zone=zone or UNKNOWN_ZONE, name=name)
         group = groups.setdefault(obj, {"node": node, "zone": zone or UNKNOWN_ZONE, "name": name, "lines": {}, "stamps": []})
         group["lines"][name] = group["lines"].get(name, 0) + 1
         stamp = str(entry.get(LOG_TIMESTAMP_KEY) or "")
@@ -1542,6 +1663,11 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     not_applicable: list[dict] = []
     unevaluated: list[dict] = []
     limitations: list[str] = []
+    # Information for the reader that is not a coverage gap
+    # (ROTATED_SERIAL_NOTE); the manifest's `notes`.
+    notes: list[str] = []
+    # The objects the notes cover (NOTED_OBJECTS_KEY).
+    noted_objects: list[dict] = []
 
     def gated(argv: list[str], slug: str) -> list:
         parsed, result = run_and_gate(argv, run=run)
@@ -1602,7 +1728,16 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             if project_wide
             else running_instances(instances, require_startup_script=True)
         )
+        scripted = set(running_instances(instances, require_startup_script=True))
+        # The instances a script is known to run on: its own metadata sets
+        # one, or the common metadata read succeeded and sets one. Only on
+        # these does a console with no run marker mean the run rotated out.
+        # The fallback after a failed `project-info` read also reads consoles
+        # with no script behind them, where no marker is the expected shape.
+        common_script = isinstance(info_parsed, dict) and project_wide
         unread: list[str] = []
+        rotated: list[str] = []
+        rotated_objects: list[tuple[str, str]] = []
         for instance_name, zone in targets:
             argv = _serial_argv(instance_name, zone, project)
             result = run(argv)
@@ -1617,6 +1752,21 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(argv), result)
             if hit:
                 candidates.append(_emit(STARTUP_SLUG, hit, shlex.join(argv)))
+            elif (
+                (common_script or (instance_name, zone) in scripted)
+                and not instance_name.startswith(GKE_INSTANCE_PREFIXES)
+                and not startup_run_visible(result.stdout)
+                # A first boot read in its boot window is not a rotated
+                # console: the run has not started (`startup_boot_window`).
+                and not startup_boot_window(result.stdout)
+            ):
+                # The console was read, but the boot that ran the script is
+                # no longer in it. No failure line here proves nothing, so the
+                # note below says so; GKE nodes are outside §2.1's universe.
+                rotated.append(f"{instance_name} ({zone})")
+                rotated_objects.append(
+                    (INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name), shlex.join(argv))
+                )
 
         if not instances:
             not_applicable.append(
@@ -1655,6 +1805,18 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                     names=", ".join(sorted(unread)),
                 )
             )
+        if rotated:
+            shown = sorted(rotated)[:ROTATED_NOTE_NAMES]
+            names = ", ".join(shown)
+            if len(rotated) > len(shown):
+                names += ROTATED_NOTE_MORE.format(more=len(rotated) - len(shown))
+            notes.append(ROTATED_SERIAL_NOTE.format(count=len(rotated), names=names))
+            # Each with its own read: the slug's joined `commands` record can
+            # be clipped before this instance's read.
+            noted_objects += [
+                {"check": STARTUP_SLUG, "object": obj, "command": command}
+                for obj, command in sorted(rotated_objects)
+            ]
 
         # --- 2.2 MIG convergence -------------------------------------------- #
         migs = gated(
@@ -1801,76 +1963,87 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 SERIAL_LOGGING_FILTER, SERIAL_LOGGING_FORMAT,
             ]
             logged, logged_result = run_and_gate(logging_argv, run=run)
-            covered = instance_keys(logged) & set(nodes) if isinstance(logged, list) else set()
-            uncovered = sorted(f"{name} ({zone})" for zone, name in nodes if (zone, name) not in covered)
             conntrack_reason = ""
             if not isinstance(logged, list):
                 conntrack_reason = UNREAD_SERIAL_LOGGING_REASON.format(
                     total=len(nodes), error=_failure_text(logging_argv, logged_result)
                 )
-            elif not covered:
-                conntrack_reason = NO_SERIAL_LOGGING_REASON.format(total=len(nodes))
             else:
-                reads[CONNTRACK_SLUG].add(shlex.join(logging_argv), logged_result)
-                read_argv = [
-                    GCLOUD, "logging", "read", CONNTRACK_LOG_FILTER,
-                    "--project", project, "--freshness", CONNTRACK_FRESHNESS,
-                    "--limit", str(CONNTRACK_LOG_LIMIT), "--format", "json",
-                ]
-                read_result = run_logging_read(
-                    read_argv, run=run, project=project, filter_text=CONNTRACK_LOG_FILTER,
-                    freshness=datetime.timedelta(hours=CONNTRACK_FRESHNESS_HOURS), limit=CONNTRACK_LOG_LIMIT,
-                )
-                entries = _json_list(read_result)
-                if entries is None:
-                    conntrack_reason = UNREAD_CONNTRACK_LOG_REASON.format(
-                        total=len(nodes), error=_failure_text(read_argv, read_result)
+                switch_command = shlex.join(logging_argv)
+                reads[CONNTRACK_SLUG].add(switch_command, logged_result)
+                covered = instance_keys(logged) & set(nodes)
+                uncovered = sorted(set(nodes) - covered)
+                # The node pools this run could not see, with the read that says so.
+                unseen: dict[str, str] = {}
+                if uncovered:
+                    names = [f"{name} ({zone})" for zone, name in uncovered]
+                    shown = ", ".join(names[:CONNTRACK_NODES_SHOWN])
+                    if len(names) > CONNTRACK_NODES_SHOWN:
+                        shown += CONNTRACK_MORE_NODES.format(more=len(names) - CONNTRACK_NODES_SHOWN)
+                    notes.append(SERIAL_LOGGING_OFF_NOTE.format(count=len(uncovered), total=len(nodes), names=shown))
+                    unseen.update(dict.fromkeys(node_objects(nodes, uncovered), switch_command))
+                found: set[str] = set()
+                if covered:
+                    read_argv = [
+                        GCLOUD, "logging", "read", CONNTRACK_LOG_FILTER,
+                        "--project", project, "--freshness", CONNTRACK_FRESHNESS,
+                        "--limit", str(CONNTRACK_LOG_LIMIT), "--format", "json",
+                    ]
+                    read_result = run_logging_read(
+                        read_argv, run=run, project=project, filter_text=CONNTRACK_LOG_FILTER,
+                        freshness=datetime.timedelta(hours=CONNTRACK_FRESHNESS_HOURS), limit=CONNTRACK_LOG_LIMIT,
                     )
-                else:
-                    read_command = shlex.join(read_argv)
-                    reads[CONNTRACK_SLUG].add(read_command, read_result)
-                    if not entries:
-                        # A clean day. Lines would have shown that the log
-                        # reaches Cloud Logging; with none, the control asks.
-                        control_argv = [
-                            GCLOUD, "logging", "read", SERIAL_CONTROL_FILTER,
-                            "--project", project, "--freshness", SERIAL_CONTROL_FRESHNESS,
-                            "--limit", str(SERIAL_CONTROL_LIMIT), "--format", "json",
-                        ]
-                        control_result = run_logging_read(
-                            control_argv, run=run, project=project, filter_text=SERIAL_CONTROL_FILTER,
-                            freshness=datetime.timedelta(days=SERIAL_CONTROL_FRESHNESS_DAYS),
-                            limit=SERIAL_CONTROL_LIMIT,
+                    entries = _json_list(read_result)
+                    if entries is None:
+                        conntrack_reason = UNREAD_CONNTRACK_LOG_REASON.format(
+                            total=len(nodes), error=_failure_text(read_argv, read_result)
                         )
-                        control = _json_list(control_result)
-                        if control is None:
-                            conntrack_reason = UNREAD_SERIAL_CONTROL_REASON.format(
-                                total=len(nodes), error=_failure_text(control_argv, control_result)
+                    else:
+                        read_command = shlex.join(read_argv)
+                        reads[CONNTRACK_SLUG].add(read_command, read_result)
+                        full_page = len(entries) >= CONNTRACK_LOG_LIMIT
+                        for hit in check_conntrack_saturation(entries, nodes, skip=left_out, at_least=full_page):
+                            candidates.append(_emit(CONNTRACK_SLUG, hit, read_command))
+                            found.add(hit["object"])
+                        if full_page:
+                            limitations.append(
+                                CONNTRACK_FULL_PAGE_LIMITATION.format(
+                                    limit=CONNTRACK_LOG_LIMIT, freshness=CONNTRACK_FRESHNESS
+                                )
                             )
-                        elif not control:
-                            conntrack_reason = NO_SERIAL_ENTRIES_REASON.format(
-                                days=SERIAL_CONTROL_FRESHNESS_DAYS, total=len(nodes)
+                        if not entries:
+                            # A clean day. Lines would have shown that the log
+                            # reaches Cloud Logging; with none, the control asks.
+                            control_argv = [
+                                GCLOUD, "logging", "read", SERIAL_CONTROL_FILTER,
+                                "--project", project, "--freshness", SERIAL_CONTROL_FRESHNESS,
+                                "--limit", str(SERIAL_CONTROL_LIMIT), "--format", "json",
+                            ]
+                            control_result = run_logging_read(
+                                control_argv, run=run, project=project, filter_text=SERIAL_CONTROL_FILTER,
+                                freshness=datetime.timedelta(days=SERIAL_CONTROL_FRESHNESS_DAYS),
+                                limit=SERIAL_CONTROL_LIMIT,
                             )
-                        else:
-                            reads[CONNTRACK_SLUG].add(shlex.join(control_argv), control_result)
-                    full_page = len(entries) >= CONNTRACK_LOG_LIMIT
-                    for hit in check_conntrack_saturation(entries, nodes, skip=left_out, at_least=full_page):
-                        candidates.append(_emit(CONNTRACK_SLUG, hit, read_command))
-                    if uncovered and not conntrack_reason:
-                        shown = ", ".join(uncovered[:CONNTRACK_NODES_SHOWN])
-                        if len(uncovered) > CONNTRACK_NODES_SHOWN:
-                            shown += CONNTRACK_MORE_NODES.format(more=len(uncovered) - CONNTRACK_NODES_SHOWN)
-                        limitations.append(
-                            PARTIAL_SERIAL_LOGGING_LIMITATION.format(
-                                covered=len(covered), total=len(nodes), names=shown
-                            )
-                        )
-                    if full_page:
-                        limitations.append(
-                            CONNTRACK_FULL_PAGE_LIMITATION.format(
-                                limit=CONNTRACK_LOG_LIMIT, freshness=CONNTRACK_FRESHNESS
-                            )
-                        )
+                            control = _json_list(control_result)
+                            if control is None:
+                                conntrack_reason = UNREAD_SERIAL_CONTROL_REASON.format(
+                                    total=len(nodes), error=_failure_text(control_argv, control_result)
+                                )
+                            else:
+                                control_command = shlex.join(control_argv)
+                                reads[CONNTRACK_SLUG].add(control_command, control_result)
+                                if not control:
+                                    notes.append(NO_SERIAL_ENTRIES_NOTE.format(days=SERIAL_CONTROL_FRESHNESS_DAYS))
+                                    for obj in node_objects(nodes, covered):
+                                        unseen.setdefault(obj, control_command)
+                if not conntrack_reason:
+                    # A pool with a finding this run was seen; the rest of the
+                    # unseen pools keep an earlier finding from being resolved.
+                    noted_objects += [
+                        {"check": CONNTRACK_SLUG, "object": obj, "command": command}
+                        for obj, command in sorted(unseen.items())
+                        if obj not in found
+                    ]
             if conntrack_reason:
                 unevaluated.append({"check": CONNTRACK_SLUG, "reason": conntrack_reason})
                 limitations.append(CONNTRACK_UNEVALUATED_LIMITATION.format(reason=conntrack_reason))
@@ -1908,6 +2081,10 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         entry["checks_unevaluated"] = unevaluated
     if limitations:
         entry["limitations"] = "; ".join(limitations)
+    if notes:
+        entry[NOTES_KEY] = "; ".join(notes)
+    if noted_objects:
+        entry[NOTED_OBJECTS_KEY] = noted_objects
     return entry
 
 
