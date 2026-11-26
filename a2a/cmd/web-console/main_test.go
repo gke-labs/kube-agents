@@ -2156,3 +2156,112 @@ const rowSlots = arr => arr.map(c => c.dataset && c.dataset.localRow === "1"
 		t.Errorf("local slash command busy-guard result = %s, want %s", got, want)
 	}
 }
+
+func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) {
+	script := pageJS(t,
+		"escapeHtml",
+		"lastInsights",
+		"lastScope",
+		"scopeOutcomeBadgeHtml",
+		"renderScopeRosterHtml",
+	) + `
+const html = renderScopeRosterHtml({
+  projects: [
+    {
+      project: "proj-a",
+      outcome: "ok",
+      via: "scope",
+      remediation: "Connected and reconciled.",
+      clusters: [
+        {
+          slug: "cluster-prod-a",
+          project: "proj-a",
+          location: "us-central1",
+          name: "prod-a",
+          via: "scope",
+          outcome: "ok",
+          watching: true,
+        },
+        {
+          slug: "cluster-stage-a",
+          project: "proj-a",
+          location: "us-central1",
+          name: "stage-a",
+          via: "scope",
+          outcome: "over-cap",
+          remediation: "Increase max_clusters cap.",
+        },
+      ],
+    },
+    {
+      project: "proj-b",
+      outcome: "denied",
+      via: "iam",
+      remediation: "Grant roles/container.ClusterViewer on proj-b.",
+      clusters: [],
+    },
+    {
+      project: "proj-c",
+      outcome: "api-disabled",
+      via: "iam",
+      remediation: "Enable container.googleapis.com on proj-c.",
+      clusters: [],
+    },
+    {
+      project: "proj-d",
+      outcome: "unreachable",
+      via: "scope",
+      remediation: "Verify network reachability for proj-d.",
+      clusters: [],
+    },
+  ],
+});
+console.log(JSON.stringify({
+  hasProjA: html.includes("Project: proj-a"),
+  hasClusterProdA: html.includes("proj-a / us-central1 / prod-a"),
+  hasWatcherActive: html.includes("Event watcher active"),
+  hasOverCapBadge: html.includes("over-cap") && html.includes("Increase max_clusters cap."),
+  hasDeniedHint: html.includes("Grant roles/container.ClusterViewer on proj-b."),
+  hasApiDisabledHint: html.includes("Enable container.googleapis.com on proj-c."),
+  hasUnreachableHint: html.includes("Verify network reachability for proj-d."),
+}));
+`
+	want := `{"hasProjA":true,"hasClusterProdA":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("renderScopeRosterHtml output checks = %s, want %s", got, want)
+	}
+}
+
+func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
+	script := pageJS(t,
+		"escapeHtml",
+		"CHANNELS",
+		"renderAlertsEmptyStateHtml",
+	) + `
+const html = renderAlertsEmptyStateHtml({
+  event_watcher: {
+    enabled: true,
+    reachable: true,
+    watch_set_ready: true,
+    detail: "Watching 2 cluster(s) for Kubernetes Warning events",
+  },
+  schedule: {
+    next_audit_name: "Cluster security posture audit",
+    next_audit_at: "2099-03-15T06:20:00Z",
+    daily_window_utc: "06:20–09:20 UTC",
+    starter_prompt: "@platform Run an on-demand cluster health and security posture check now",
+  },
+});
+console.log(JSON.stringify({
+  hasEmptyHeadline: html.includes(CHANNELS.alerts.empty),
+  hasWatcherDetail: html.includes("Watching 2 cluster(s) for Kubernetes Warning events"),
+  hasWatchingBadge: html.includes("Watching") && html.includes("badge-green"),
+  hasNextAudit: html.includes("Cluster security posture audit at 2099-03-15T06:20:00Z"),
+  hasStarterPrompt: html.includes('data-starter-prompt="@platform Run an on-demand cluster health and security posture check now"'),
+}));
+`
+	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasNextAudit":true,"hasStarterPrompt":true}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("renderAlertsEmptyStateHtml output checks = %s, want %s", got, want)
+	}
+}
