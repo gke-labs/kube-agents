@@ -18,12 +18,79 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDailyAuditRosterMatchesPlatformCronJobsJSON(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "agents", "platform", "cron", "jobs.json"))
+	if err != nil {
+		t.Fatalf("read agents/platform/cron/jobs.json: %v", err)
+	}
+	var parsed struct {
+		Jobs []struct {
+			ID       string   `json:"id"`
+			Name     string   `json:"name"`
+			Skills   []string `json:"skills"`
+			Enabled  bool     `json:"enabled"`
+			Schedule struct {
+				Kind string `json:"kind"`
+				Expr string `json:"expr"`
+			} `json:"schedule"`
+		} `json:"jobs"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("unmarshal jobs.json: %v", err)
+	}
+
+	var expected []dailyAuditSlot
+	for _, j := range parsed.Jobs {
+		if !j.Enabled || j.Schedule.Kind != "cron" || !slices.Contains(j.Skills, "fleet-audit") {
+			continue
+		}
+		fields := strings.Fields(j.Schedule.Expr)
+		if len(fields) != 5 || fields[2] != "*" || fields[3] != "*" || fields[4] != "*" {
+			continue
+		}
+		minUTC, err1 := strconv.Atoi(fields[0])
+		hourUTC, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		expected = append(expected, dailyAuditSlot{
+			ID:        j.ID,
+			Name:      j.Name,
+			HourUTC:   hourUTC,
+			MinuteUTC: minUTC,
+			CronExpr:  j.Schedule.Expr,
+			TimeLabel: fmt.Sprintf("%02d:%02d UTC", hourUTC, minUTC),
+		})
+	}
+	sort.Slice(expected, func(i, j int) bool {
+		if expected[i].HourUTC != expected[j].HourUTC {
+			return expected[i].HourUTC < expected[j].HourUTC
+		}
+		return expected[i].MinuteUTC < expected[j].MinuteUTC
+	})
+
+	if len(dailyAuditRoster) != len(expected) {
+		t.Fatalf("len(dailyAuditRoster) = %d, want %d from jobs.json", len(dailyAuditRoster), len(expected))
+	}
+	for i := range expected {
+		if dailyAuditRoster[i] != expected[i] {
+			t.Errorf("dailyAuditRoster[%d] = %+v, want %+v from jobs.json", i, dailyAuditRoster[i], expected[i])
+		}
+	}
+}
 
 func TestOutcomeRemediationCoversAllReconcileStates(t *testing.T) {
 	if got := outcomeRemediation(outcomeOK); got != "" {
@@ -179,6 +246,14 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				State:    "in-scope",
 				Clusters: &zeroCount,
 			},
+			{
+				ID:          "proj-retiring",
+				Via:         []string{"explicit"},
+				Outcome:     "ok",
+				State:       "retiring",
+				AbsentSince: "2026-11-26T05:00:00Z",
+				Clusters:    &zeroCount,
+			},
 		},
 		Profiles: map[string]string{
 			"cluster-proj-host-c1-us-central1": "proj-host",
@@ -241,7 +316,7 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	got := decode[scopeResponse](t, rec)
 
 	if got.Summary.TotalProjects != 5 || got.Summary.OKProjects != 1 || got.Summary.ErrorProjects != 4 {
-		t.Errorf("project summary = %+v, want total=5 ok=1 error=4", got.Summary)
+		t.Errorf("project summary = %+v, want total=5 ok=1 error=4 (retiring project excluded)", got.Summary)
 	}
 	if !got.EventWatcher.Enabled || !got.EventWatcher.Healthy || got.EventWatcher.Status != watcherStatusWatching || got.EventWatcher.ClustersUp != 1 {
 		t.Errorf("EventWatcher = %+v", got.EventWatcher)
@@ -250,6 +325,9 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	byProject := map[string]scopeProjectRow{}
 	for _, p := range got.Projects {
 		byProject[p.ID] = p
+	}
+	if _, exists := byProject["proj-retiring"]; exists {
+		t.Errorf("retiring project should not be included in active scope projects")
 	}
 	if len(byProject["proj-host"].ClusterRows) != 2 {
 		t.Fatalf("proj-host cluster rows = %+v, want 2", byProject["proj-host"].ClusterRows)
@@ -260,7 +338,7 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	if c1.Name != "c1" || c1.Outcome != outcomeOK || c1.Watching == nil || !*c1.Watching {
 		t.Errorf("c1 row = %+v", c1)
 	}
-	if c2.Name != "c2" || c2.Outcome != outcomeUnreachable || !strings.Contains(c2.Remediation, "kubeconfig.yaml or USER.md missing") {
+	if c2.Name != "c2" || c2.Outcome != outcomeUnreachable || !strings.Contains(c2.Remediation, "kubeconfig.yaml, or USER.md missing") {
 		t.Errorf("c2 unready row = %+v", c2)
 	}
 	if !strings.Contains(byProject["proj-denied"].Remediation, "roles/container.viewer") {
@@ -274,6 +352,74 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	}
 	if !strings.Contains(byProject["proj-overcap"].Remediation, "spec.scope.maxProjects") {
 		t.Errorf("proj-overcap remediation = %q", byProject["proj-overcap"].Remediation)
+	}
+}
+
+func TestBuildScopeResponseGroupsOrphanProfileIdentitiesAndScopesInClusterWatch(t *testing.T) {
+	cfg := config{
+		ProjectID:   "proj-host",
+		Location:    "us-central1",
+		ClusterName: "prod",
+	}
+	raw := upstreamScopePayload{
+		ProfileIdentities: []upstreamProfileIdentity{
+			{
+				Profile:  "cluster-proj-host-prod-us-central1",
+				Project:  "proj-host",
+				Cluster:  "prod",
+				Location: "us-central1",
+				Ready:    true,
+			},
+			{
+				Profile:  "cluster-proj-other-prod-europe-west1",
+				Project:  "proj-other",
+				Cluster:  "prod",
+				Location: "europe-west1",
+				Ready:    true,
+			},
+		},
+		EventWatcher: &upstreamEventWatcher{
+			Enabled:       true,
+			Reachable:     true,
+			WatchSetReady: true,
+			ClustersUp:    1,
+			ClustersTotal: 1,
+			Clusters: []upstreamEventWatcherTarget{
+				// Unabsorbed --in-cluster metric entry carries empty project and location.
+				{Cluster: "prod", Project: "", Location: "", Up: true},
+			},
+		},
+	}
+
+	got := buildScopeResponse(cfg, raw, true, true, "", time.Date(2026, 11, 26, 5, 0, 0, 0, time.UTC))
+	if len(got.Projects) != 2 || got.Summary.TotalProjects != 2 || got.Summary.TotalClusters != 2 {
+		t.Fatalf("Projects = %+v, Summary = %+v; want 2 projects and 2 clusters", got.Projects, got.Summary)
+	}
+	byProj := map[string]scopeProjectRow{}
+	for _, p := range got.Projects {
+		byProj[p.ID] = p
+	}
+	hostCluster := byProj["proj-host"].ClusterRows[0]
+	if hostCluster.Watching == nil || !*hostCluster.Watching {
+		t.Errorf("host cluster Watching = %v, want true from --in-cluster fallback", hostCluster.Watching)
+	}
+	otherCluster := byProj["proj-other"].ClusterRows[0]
+	if otherCluster.Watching != nil {
+		t.Errorf("non-host cluster with same bare name Watching = %v, want nil", *otherCluster.Watching)
+	}
+}
+
+func TestBuildWatcherStatusReportsUnreachableWhenMetricsListenerRefuses(t *testing.T) {
+	got := buildWatcherStatus(&upstreamEventWatcher{
+		Enabled:   true,
+		Reachable: false,
+		Error:     "k8s-event-watcher metrics unreachable: ConnectionRefusedError",
+	}, true, true, "")
+	if got.Healthy || got.Status != watcherStatusUnreachable {
+		t.Errorf("buildWatcherStatus with unreachable metrics = %+v, want Healthy=false Status=unreachable", got)
+	}
+	if !strings.Contains(got.Detail, "ConnectionRefusedError") {
+		t.Errorf("Detail = %q, want ConnectionRefusedError", got.Detail)
 	}
 }
 

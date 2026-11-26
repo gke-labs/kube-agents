@@ -1453,7 +1453,7 @@ The operator renders the block as `scope.json` in the agent's config ConfigMap, 
 
 ### What a reconcile run records
 
-Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume:
+Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume (read by `fleet_scope_targets.py` and by `agent-api-auth`'s `GET /api/scope` endpoint for the web console):
 
 | Entry             | What it holds                                                                                                                                                                                                                                                      |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -2378,7 +2378,8 @@ the reconcile a declaration the agent authored. Its readers are `agents/platform
 - the platform MCP server's `fleet_scope` tool;
 - the Platform Agent's `upgrade-readiness-watch` and `upgrade-readiness-weekly-review` jobs, which learn from it whether the install declares a scope before handing the readiness report script the resolved scope beside each project it reads;
 - the `sa-role-watch` job, which reads the IAM policy of each project in the resolved scope;
-- the onboarding inventory scan (`agents/chat/scripts/bootstrap_scan_gate.py`), which leaves the declaration's excluded clusters out of the sweep it files.
+- the onboarding inventory scan (`agents/chat/scripts/bootstrap_scan_gate.py`), which leaves the declaration's excluded clusters out of the sweep it files;
+- the `agent-api-auth` sidecar's `GET /api/scope` handler (`agents/platform/scripts/credential_proxy.py`), which reads `fleet_scope.json` directly for the web console's **Scoped Projects & Clusters** roster.
 
 The fifth is `RECONCILE_PROJECT=`, pinned empty. The reconcile reads that variable as the management
 project ahead of the metadata server, and a management project that changes identity retires the

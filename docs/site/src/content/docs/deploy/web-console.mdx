@@ -135,7 +135,9 @@ The console pod runs outside the gVisor sandbox, so `kubectl port-forward` works
 
 ## Triage cluster alerts
 
-When the Event Watcher hands a Kubernetes warning event to the agent, the incident appears in `# alerts`. The Planning Agent opens a kanban card for the cluster's specialist agent. Once the investigation finishes, the diagnosis lands in the incident thread with an **`A2A report`** card tag (live delegated replies in **Threads** first appear as **`Specialist report`**, and render as **`A2A report`** on reload). The `# scheduled` channel is reserved for daily scheduled checks once scheduled report relay creates gateway sessions.
+When the Event Watcher hands a Kubernetes warning event to the agent, the incident appears in `# alerts`. The Planning Agent opens a kanban card for the cluster's specialist agent. Once the investigation finishes, the diagnosis lands in the incident thread with an **`A2A report`** card tag (live delegated replies in **Threads** first appear as **`Specialist report`**, and render as **`A2A report`** on reload).
+
+When `# alerts` has no open incidents, the empty state shows **Kubernetes Event Watcher** readiness and the next scheduled daily fleet audit run time (`06:20`–`09:20 UTC`). Select **Run on-demand health check now** to start an immediate posture check in **Threads**. The `# scheduled` channel is reserved for daily scheduled checks once scheduled report relay creates gateway sessions.
 
 ![Web console alerts feed and incident thread pane](../../../assets/web-console/web-console-alerts-thread.png)
 
@@ -151,7 +153,7 @@ If the Planning Agent delegates work to specialist kanban cards, the console wai
 
 ![Web console conversation thread and skill catalog drawer](../../../assets/web-console/web-console-chat-skills.png)
 
-To run a specific runbook, type `$` in the message box for autocomplete or open **Skills** in the header to browse the platform skill catalog and insert `$skill-name`. Open **Agents** in the header to inspect `@platform` turn status, the install cluster, built-in components, and specialists seen in opened threads; the console does not track live Cluster Agent presence. Use **Export** to save or copy a conversation transcript.
+To run a specific runbook, type `$` in the message box for autocomplete or open **Skills** in the header to browse the platform skill catalog and insert `$skill-name`. Open **Agents** in the header to inspect `@platform` turn status, the install cluster, built-in components, and specialists seen in opened threads. That drawer also lists the **Scoped Projects & Clusters** connectivity roster (`ok`, `denied`, `unreachable`, `api-disabled`, `over-cap`), per-cluster profile readiness, and Event Watcher status; `@cluster-<name>` turn activity itself is not tracked. Use **Export** to save or copy a conversation transcript.
 
 From the header bar, you can also test a model against the cluster's inference gateway and record a preferred model or reasoning level. Saving updates the console banner and writes `kubeagents.x-k8s.io/active-model`, `kubeagents.x-k8s.io/active-model-target`, and `kubeagents.x-k8s.io/reasoning-level` on the `PlatformAgent` resource.
 
@@ -191,4 +193,4 @@ Because `kubectl port-forward` carries no end-user identity, the console has no 
 
 Anyone who can open the console can read `# alerts`, `# scheduled`, and threads started in the console, including replies posted to an incident thread from Slack or Google Chat. Conversations started directly in Slack, Google Chat, or the A2A bridge (`a2a-ctx-*`) are listed by title only in the left rail and cannot be opened.
 
-**About this agent** shows the agent's Kubernetes service account alongside the Google Cloud service account and host-project roles passed into `webConsole.agentIdentity` at install time. Access granted in other projects or folders ([Multiple GCP projects](/kube-agents/deploy/multi-project/)) is not listed, and the console does not read IAM. Host-project roles granted or removed later appear only after the next install or upgrade updates the values.
+**About this agent** shows the agent's Kubernetes service account alongside the Google Cloud service account and host-project roles passed into `webConsole.agentIdentity` at install time. It also renders the **Scoped Projects & Clusters** section from `/api/scope`, showing each project's discovery source, reconcile outcome, and onboarding remediation hints. The console does not read Cloud IAM policy bindings directly; host-project roles granted or removed later appear in the identity card only after the next install or upgrade updates the values.
