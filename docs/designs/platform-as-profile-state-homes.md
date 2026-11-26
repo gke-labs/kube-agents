@@ -316,6 +316,8 @@ For #6669:
 - No existing findings data is lost: the data did not move, or a migration test shows the move.
 - If the findings routes use the listener of the report store, `fleet-audit-report-store.md` says
   so.
+- A person's accept, snooze and dismiss of a finding, given in chat, reach the queue after the
+  findings tools move, with a test. This holds for each answer to question 6.
 
 What these lines need from other work: the built-in table ships no row today, so the third and
 fourth lines need a row of our own there, agreed with the owner of that table, and the script run of
