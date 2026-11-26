@@ -37,10 +37,12 @@ type HindsightClient struct {
 
 // HindsightRecallResult represents one retrieved memory chunk from Hindsight.
 type HindsightRecallResult struct {
-	ID         string   `json:"id"`
-	DocumentID string   `json:"document_id"`
-	Text       string   `json:"text"`
-	Tags       []string `json:"tags"`
+	ID              string   `json:"id"`
+	DocumentID      string   `json:"document_id"`
+	Text            string   `json:"text"`
+	Tags            []string `json:"tags"`
+	Untrusted       bool     `json:"untrusted,omitempty"`
+	UntrustedSource string   `json:"untrusted_source,omitempty"`
 }
 
 // HindsightDocument represents one document summary from GET /documents.

@@ -476,12 +476,14 @@ class TestScrubStepText(unittest.TestCase):
             "redis-cli -a pre{run} S3cretValue9",
             "curl https://admin:pre{run} S3cretValue9@host/x",
         )
-        # Known limits, the same on main and pinned so a fix flips them: the
-        # URL userinfo rules stop at a literal backslash (run 2 and more
-        # leaves one), and inside a quoted `bash -c "…"` script the short and
-        # user:pass flag rules do not run (`sub_shell_segments`).
+        # Known limits, pinned so a fix flips them: the URL userinfo rules
+        # stop at a literal backslash the redactor can't read as a JSON escape
+        # (an even run leaves one before the space; an odd run's pairs now
+        # read as escapes, so the password is masked), and inside a quoted
+        # `bash -c "…"` script the short and user:pass flag rules do not run
+        # (`sub_shell_segments`).
         def known_limit(shape, run, wrapper):
-            if "https://admin:" in shape and run > 1:
+            if "https://admin:" in shape and run > 1 and run % 2 == 0:
                 return True
             return wrapper == "bash -c" and any(f in shape for f in ("-u admin:", "-ppre", "-a pre"))
 
@@ -1905,6 +1907,73 @@ class TestTokenPrinterReadKeepsItsVerdict(unittest.TestCase):
             with self.subTest(words=words[:3]):
                 start = time.process_time()
                 self.assertEqual(walk(words), withheld)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
+class TestLongSimpleCommandIsWithheld(unittest.TestCase):
+    """A line that holds a simple command longer than `MAX_SIMPLE_COMMAND_CHARS`
+    is withheld with no read: one very long shell word costs each reader
+    quadratic time in `shlex`. A line of many short commands and no comment,
+    however long, keeps its verdict. The line is cut as it is and with its
+    comments off."""
+
+    LIMIT = worker_transcript.MAX_SIMPLE_COMMAND_CHARS
+    UNIT = "gh ab cde oc "
+
+    def test_the_limit_is_on_one_simple_command_and_is_strict(self):
+        at_the_limit = "echo " + "a" * (self.LIMIT - len("echo "))
+        self.assertEqual(self.LIMIT, 65536)
+        self.assertEqual(len(at_the_limit), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(at_the_limit))
+        self.assertTrue(worker_transcript.command_reads_a_secret(at_the_limit + "a"))
+        # The wrapper that the feed, the bench record and the replay proxy call gives the same verdict.
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": at_the_limit + "a"})))
+        # One long simple command among short ones withholds the line; one at the limit does not.
+        self.assertTrue(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "a" + "; pwd"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "; pwd"))
+        # A separator inside quotes ends no simple command: the quoted body is one piece.
+        quoted_body = "printf '%s' '" + "one line; of a body\n" * (self.LIMIT // 20 + 1) + "' > notes.txt"
+        self.assertTrue(worker_transcript.command_reads_a_secret(quoted_body))
+        # A line longer than the limit, of simple commands that are each short, is read.
+        many_short = "\n".join(["echo ok"] * (self.LIMIT // 4))
+        self.assertGreater(len(many_short), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_short))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_short + "\nprintenv"))
+
+    def test_a_command_of_a_real_size_is_served(self):
+        # Commands of 11 KB and of 37 KB, well below the limit, are served.
+        for command in (
+            "echo " + self.UNIT * 850,
+            "printf '%s' '" + self.UNIT * 2850 + "' > notes.txt",
+        ):
+            with self.subTest(length=len(command)):
+                self.assertLess(len(command), self.LIMIT)
+                self.assertFalse(worker_transcript.command_reads_a_secret(command))
+
+    def test_a_very_long_word_is_decided_in_linear_time(self):
+        # 270 KB to 1 MB in one shell word: quoted, with the quote not closed,
+        # a quoted body with line breaks, with no quote, behind a comment with
+        # an apostrophe, and short commands behind such a comment. With no
+        # limit, `shlex` needs 1 s to 8 s of CPU time for each; the limit
+        # decides each after one or two cuts of the line, in 0.1 s or less. The
+        # bound is on CPU time, as in the other linear-time tests of this file.
+        import time
+
+        for command in (
+            "echo '" + self.UNIT * 80000 + "'",
+            "echo '" + self.UNIT * 80000,
+            "cat > notes.txt <<< '" + "line of a file body\n" * 52000 + "'",
+            "echo " + "ghabcdeoc/" * 40000,
+            # An apostrophe in a comment: the cut of the line as it is gives short
+            # pieces, and the cut with the comments off gives the long quoted body.
+            "echo ok # don't stop\nprintf '%s' '" + "reset the dataset; abc def\n" * 10000 + "' > notes.txt",
+            # Short commands behind that comment: only the cut of the line as it
+            # is gives the long piece, because the apostrophe opens a quote there.
+            "echo ok # don't stop\n" + "\n".join(["echo ok"] * 70000),
+        ):
+            with self.subTest(command=command[:24]):
+                start = time.process_time()
+                self.assertTrue(worker_transcript.command_reads_a_secret(command))
                 self.assertLess(time.process_time() - start, 1.0)
 
 

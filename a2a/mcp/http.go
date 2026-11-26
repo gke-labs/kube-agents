@@ -69,6 +69,16 @@ type HandlerOption func(*handlerConfig)
 
 type handlerConfig struct {
 	swarm *swarmHandler
+	// gate is the profile supervisor gate's health, nil when not served.
+	gate func() ProfileSupervisorHealth
+}
+
+// WithProfileSupervisorHealth adds the profile supervisor gate the server
+// runs with (NATSBus.ProfileSupervisorHealth) to the health probe's answer,
+// under profileSupervisorGate, so which cutoff it reads with shows outside its
+// log (#5301).
+func WithProfileSupervisorHealth(health func() ProfileSupervisorHealth) HandlerOption {
+	return func(c *handlerConfig) { c.gate = health }
 }
 
 // WithSwarm serves POST SwarmPath, the workstation bridge's swarm view, from
@@ -89,7 +99,11 @@ func Handler(s *Server, tokenFile string, log *slog.Logger, opts ...HandlerOptio
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+HealthPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(headerContentType, contentTypeJSON)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "name": ServerName, "version": ServerVersion})
+		body := map[string]any{"status": "ok", "name": ServerName, "version": ServerVersion}
+		if cfg.gate != nil {
+			body["profileSupervisorGate"] = cfg.gate()
+		}
+		_ = json.NewEncoder(w).Encode(body)
 	})
 	mux.Handle("POST "+Path, guarded(tokenFile, tl, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The transport has clients name their revision on every request

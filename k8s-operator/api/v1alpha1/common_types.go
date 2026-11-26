@@ -179,6 +179,28 @@ func A2ACredentialSecretNames(agentName string) []string {
 	}
 }
 
+// inferenceKeySecretInfix sits between the agent's name and the class in an
+// inference gateway caller-key Secret's name.
+const inferenceKeySecretInfix = "-inference-key-"
+
+// InferenceCallerKeysSecretName is the Secret holding the inference gateway's
+// caller-key map, which the gateway mounts. The operator writes it.
+const InferenceCallerKeysSecretName = "litellm-caller-keys" // #nosec G101 -- Secret name, not a credential
+
+// IsInferenceKeySecretName reports whether name is one of the Secrets the
+// operator writes the inference gateway's caller keys into for a PlatformAgent
+// of that name: <agent>-inference-key-<class>, each class's key (a probe key
+// among them), or the caller-key map. A caller is given its own class's key
+// by the operator's render alone; the webhook refuses a user volume that
+// mounts any of them.
+func IsInferenceKeySecretName(agentName, name string) bool {
+	if name == InferenceCallerKeysSecretName {
+		return true
+	}
+	class, ok := strings.CutPrefix(name, agentName+inferenceKeySecretInfix)
+	return ok && class != ""
+}
+
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
 // overridden by user Deployment specs or injected into the credential proxy.
 //
@@ -1126,6 +1148,31 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// SessionIdleMinutes is how long a session pod is kept after the last
+	// message in its conversation before the gateway reaps it (A2A_IDLE_TTL).
+	// A running task always keeps its pod, and the next message after a reap
+	// gets a new pod with the conversation's history. Unset, the gateway's
+	// default of 30 applies. It also bounds how long a Slack thread stays live
+	// without a fresh mention after its last task. A session pod also ends at
+	// its 4-hour maximum lifetime, so above 240 the value only lengthens that
+	// Slack thread liveness.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10080
+	// +optional
+	SessionIdleMinutes *int32 `json:"sessionIdleMinutes,omitempty"`
+
+	// DMSessionIdleMinutes replaces SessionIdleMinutes for a DM conversation
+	// with one message so far (A2A_DM_IDLE_TTL): most DMs are a single
+	// question, and a session pod held for the full idle time after its answer
+	// takes a slot of maxSessions. A delegation the pod makes to answer doesn't
+	// count as a message. A second message puts the conversation back
+	// on SessionIdleMinutes. Unset, the gateway's default of 5 applies. A
+	// value above SessionIdleMinutes has no effect beyond it.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10080
+	// +optional
+	DMSessionIdleMinutes *int32 `json:"dmSessionIdleMinutes,omitempty"`
 
 	// SessionResources are the A2A session pods' CPU and memory requests and
 	// limits (#2371). Each of requests.cpu, requests.memory, limits.cpu and
@@ -3142,6 +3189,13 @@ type InferenceKeysStatus struct {
 	// the PlatformAgent's namespace.
 	// +optional
 	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
+	// TierUnboundAt maps a tier whose key Secret is recorded to when the
+	// operator first found no bound profile listing it. While the applied
+	// dispatch config still lists such a tier as live, its key is kept for at
+	// most the drain window from then. An entry goes when a bound profile
+	// lists the tier again, and on the pass after its key is deleted.
+	// +optional
+	TierUnboundAt map[string]metav1.Time `json:"tierUnboundAt,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was

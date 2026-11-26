@@ -308,10 +308,10 @@ func (l *loader) skill(rel, name string) (Skill, bool) {
 		l.add(rel, "", "has no %s", SkillFile)
 		return s, false
 	}
-	front, ok := frontmatter(s.Files[i].Data)
+	front, problem := frontmatter(s.Files[i].Data)
 	file := path.Join(rel, SkillFile)
-	if !ok {
-		l.add(file, "", "does not open with --- frontmatter")
+	if problem != "" {
+		l.add(file, "", "%s", problem)
 		return s, false
 	}
 	var meta map[string]any
@@ -422,18 +422,38 @@ func importEscapes(target string) bool {
 // IsMarkdown reports whether a path names a markdown file, in any case.
 func IsMarkdown(p string) bool { return strings.EqualFold(path.Ext(p), ".md") }
 
-// frontmatter returns the YAML between a leading "---" line and the next.
-func frontmatter(data []byte) ([]byte, bool) {
+// frontmatter returns the YAML between a first line that is exactly "---"
+// and the next line that is exactly "---", or a problem. Inside that block,
+// any other line holding "---" (anywhere in it) or starting with "..." (a
+// YAML document end) or "%" (a directive) is refused, and so is, anywhere in the file, a
+// byte-order mark, a carriage return outside a CRLF line ending, or another
+// character a YAML parser may read as a line break: the block checked is
+// exactly one YAML document, whichever parser reads it next.
+func frontmatter(data []byte) ([]byte, string) {
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	if !strings.HasPrefix(text, "---\n") {
-		return nil, false
+	switch {
+	case strings.Contains(text, "\ufeff"):
+		return nil, "has a byte-order mark"
+	case strings.ContainsAny(text, "\r\u0085\u2028\u2029"):
+		return nil, "has a line break other than LF or CRLF"
 	}
-	rest := text[len("---\n"):]
-	end := strings.Index(rest, "\n---")
-	if end < 0 {
-		return nil, false
+	lines := strings.Split(text, "\n")
+	if lines[0] != "---" {
+		return nil, "does not open with --- frontmatter"
 	}
-	return []byte(rest[:end]), true
+	for i := 1; i < len(lines); i++ {
+		switch {
+		case lines[i] == "---":
+			return []byte(strings.Join(lines[1:i], "\n")), ""
+		case strings.Contains(lines[i], "---"):
+			return nil, "has a frontmatter line holding --- that isn't exactly ---"
+		case strings.HasPrefix(lines[i], "..."):
+			return nil, "has a frontmatter line starting with ... (a YAML document end)"
+		case strings.HasPrefix(lines[i], "%"):
+			return nil, "has a frontmatter line starting with % (a YAML directive)"
+		}
+	}
+	return nil, "does not close its --- frontmatter"
 }
 
 // mcp decodes mcp.yaml strictly: an unknown key, at any level, or a

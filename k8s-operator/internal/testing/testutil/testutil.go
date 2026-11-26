@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
@@ -415,6 +416,33 @@ func redactGeneratedPublicKeys(containers []corev1.Container) {
 	}
 }
 
+// latchTimePlaceholder replaces the profile supervisor cutoff in golden
+// files.
+const latchTimePlaceholder = "<LATCH_TIME_PLUS_MARGIN_FOR_TESTS>"
+
+// latchTimeEnvs are the env vars whose value is a time the operator derives
+// from a condition's LastTransitionTime: A2A_PROFILE_SUPERVISOR_CUTOFF, the
+// ProfileSupervisorForm latch's time plus a margin (#5301), which a settled
+// render reaches and which differs on every run.
+var latchTimeEnvs = map[string]bool{"A2A_PROFILE_SUPERVISOR_CUTOFF": true}
+
+// redactLatchTimes replaces each latchTimeEnvs value with a placeholder,
+// asserting first that it is an RFC3339 UTC time, as the readers parse it.
+func redactLatchTimes(t *testing.T, containers []corev1.Container) {
+	for i := range containers {
+		for j := range containers[i].Env {
+			env := &containers[i].Env[j]
+			if !latchTimeEnvs[env.Name] {
+				continue
+			}
+			if at, err := time.Parse(time.RFC3339, env.Value); err != nil || at.Location() != time.UTC {
+				t.Errorf("env %s = %q on container %s, want an RFC3339 UTC time", env.Name, env.Value, containers[i].Name)
+			}
+			env.Value = latchTimePlaceholder
+		}
+	}
+}
+
 // CleanAndMarshalResources cleans up volatile runtime fields and marshals objects to a multi-doc YAML string
 func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 	generated := generatedValues(resources)
@@ -431,6 +459,7 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 		case *appsv1.Deployment:
 			redactHashAnnotations(t, obj.Spec.Template.Annotations)
 			redactGeneratedPublicKeys(obj.Spec.Template.Spec.Containers)
+			redactLatchTimes(t, obj.Spec.Template.Spec.Containers)
 		case *appsv1.StatefulSet:
 			redactHashAnnotations(t, obj.Spec.Template.Annotations)
 		case *corev1.ConfigMap:
