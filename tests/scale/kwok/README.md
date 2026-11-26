@@ -63,7 +63,8 @@ cache, default `~/.kwok`), `BASELINE_SKIP_BUILD` (reuse the binaries from an ear
 
 The lists run through the CLI, so its own JSON handling dominates the wall time. Every list is
 therefore measured twice, straight at the kwok API server with the admin kubeconfig and through the
-proxy with a caller token, and the proxy's overhead is the difference between the two columns.
+proxy, and the proxy's overhead is the difference between the two columns. The proxy runs
+`--auth-mode=none` on loopback: the lane measures its list path, not caller authentication.
 
 ## Profiles
 

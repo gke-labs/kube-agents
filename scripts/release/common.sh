@@ -50,15 +50,28 @@ readonly GIT_FETCH_HEAD_REF="FETCH_HEAD"
 readonly REQUIRED_RELEASE_IMAGES_PATH="scripts/release/common.sh"
 readonly REQUIRED_RELEASE_IMAGES_NAME="REQUIRED_RELEASE_IMAGES"
 
-# The registry the docker-free existence probe below knows how to query, and the
-# manifest media types that probe must accept. Omitting the OCI types gets a
-# MANIFEST_UNKNOWN carrying "Accept header does not support OCI manifests" — a
-# 404 that reads as a missing image rather than as a wrong header.
+# The registry the anonymous docker-free existence probe below queries, and the
+# manifest media types it and the Artifact Registry probe must accept. Omitting
+# the OCI types gets a MANIFEST_UNKNOWN carrying "Accept header does not support
+# OCI manifests" — a 404 that reads as a missing image rather than as a wrong
+# header.
 export GHCR_REGISTRY_HOST="ghcr.io"
 export GHCR_MANIFEST_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
-# The two registry answers ghcr_image_status tells apart; anything else is an error.
+# The two registry answers ghcr_image_status and ar_image_status tell apart;
+# anything else is an error.
 readonly HTTP_STATUS_OK="200"
 readonly HTTP_STATUS_NOT_FOUND="404"
+# An Artifact Registry Docker host, whole (us-docker.pkg.dev,
+# us-central1-docker.pkg.dev): the registry the second docker-free probe queries,
+# with the caller's Google credentials. Anchored at both ends and held to host
+# characters, because the probe sends an access token to whatever host matches:
+# `evil.example?x-docker.pkg.dev` ends the right way and is another host.
+readonly AR_REGISTRY_HOST_PATTERN='^[a-z0-9-]+-docker\.pkg\.dev$'
+# curl's spelling of "read this header from stdin", which keeps the access token
+# out of argv.
+readonly CURL_HEADER_FROM_STDIN="@-"
+# The reference a registry reads into an image named with no tag and no digest.
+readonly DEFAULT_IMAGE_REFERENCE="latest"
 
 # Declarative registry of all required release container images
 export REQUIRED_RELEASE_IMAGES=(
@@ -612,6 +625,27 @@ get_registry_prefix() {
   fi
 }
 
+# Resolves the registry a release reads a commit's built images from:
+# CANDIDATE_REGISTRY_PREFIX when set, else the registry prefix itself, so one
+# registry holds both the commit images and the release, as before the variable
+# existed. Only the release's own reads take it (the eligibility check, the
+# source-commit resolution and the promotion); every other caller of
+# check_commit_images_exist installs from get_registry_prefix and checks there.
+get_candidate_registry_prefix() {
+  if [ -n "${CANDIDATE_REGISTRY_PREFIX:-}" ]; then
+    echo "${CANDIDATE_REGISTRY_PREFIX%/}"
+  else
+    get_registry_prefix
+  fi
+}
+
+# Whether a registry host is an Artifact Registry Docker host
+# (AR_REGISTRY_HOST_PATTERN).
+# Arguments: $1 = registry host
+is_artifact_registry_host() {
+  [[ "${1:-}" =~ ${AR_REGISTRY_HOST_PATTERN} ]]
+}
+
 # Checks whether one fully-qualified image reference exists in its registry.
 #
 # `docker manifest inspect` is the preferred probe and the only one here that
@@ -619,8 +653,10 @@ get_registry_prefix() {
 # docker: the Prow job image has none — hack/ci-deploy.sh builds through
 # `gcloud builds submit` for exactly that reason — and an unguarded call there
 # fails for every image, so the caller reports a publish outage when the real
-# problem is a missing binary. The fallback is the GHCR registry API, which
-# needs only curl and answers anonymously for a public package.
+# problem is a missing binary. The fallbacks are the two registry APIs this
+# file speaks with curl alone: GHCR, which answers anonymously for a public
+# package, and Artifact Registry (ar_image_status), asked as the caller's
+# Google identity.
 registry_image_exists() {
   local img="$1"
 
@@ -632,6 +668,18 @@ registry_image_exists() {
     # instead of getting a 1 back.
     if docker manifest inspect "${img}" >/dev/null 2>&1; then
       return 0
+    fi
+    return 1
+  fi
+
+  if is_artifact_registry_host "${img%%/*}"; then
+    local ar_status
+    ar_status="$(ar_image_status "${img}")"
+    if [ "${ar_status}" = "present" ]; then
+      return 0
+    fi
+    if [ "${ar_status}" != "absent" ]; then
+      echo "⚠️ Warning: cannot probe ${img}: no docker on PATH, and Artifact Registry could not be asked (no gcloud, no access token, or it refused the request)." >&2
     fi
     return 1
   fi
@@ -729,6 +777,89 @@ ghcr_image_status() {
     "${HTTP_STATUS_NOT_FOUND}") echo "absent" ;;
     *) echo "error" ;;
   esac
+}
+
+# Splits an image path (a reference with its registry host removed) into the
+# repository and the tag or digest, one per line, the way the registry API
+# does: a digest separates on `@`, a tag on the last `:` when that colon comes
+# after the last `/`, and a path with neither is read at DEFAULT_IMAGE_REFERENCE.
+# Arguments: $1 = image path
+image_repository_and_reference() {
+  local path="${1:-}"
+  local last_segment="${path##*/}"
+  if [ "${path}" != "${path#*@}" ]; then
+    printf '%s\n%s\n' "${path%%@*}" "${path#*@}"
+  elif [ "${last_segment}" != "${last_segment%:*}" ]; then
+    printf '%s\n%s\n' "${path%:*}" "${path##*:}"
+  else
+    printf '%s\n%s\n' "${path}" "${DEFAULT_IMAGE_REFERENCE}"
+  fi
+}
+
+# Whether an Artifact Registry image is there, with ghcr_image_status's three
+# answers: `present`, `absent` (the registry said 404) or `error` (no gcloud, no
+# access token, or any other answer, a 401 or 403 included). The registry is
+# asked over its API as the caller's Google identity (`gcloud auth
+# print-access-token`), so this works where docker is absent and against a
+# private repository. The token reaches curl on stdin, never in argv, and only
+# for a host is_artifact_registry_host accepts. In a project the caller can
+# read, a repository that does not exist answers 404 as a missing image does,
+# so a mistyped repository reads `absent`; in a project it cannot read the
+# answer is 403, which is `error`. Always exits 0 and prints one word.
+# Arguments: $1 = image reference on an Artifact Registry Docker host
+ar_image_status() {
+  local img="${1:-}"
+  local host="${img%%/*}"
+
+  if ! is_artifact_registry_host "${host}"; then
+    echo "error"
+    return 0
+  fi
+
+  local repo reference
+  {
+    IFS= read -r repo
+    IFS= read -r reference
+  } < <(image_repository_and_reference "${img#*/}")
+
+  # No gcloud and a gcloud with no credential end the same way: no token.
+  local token
+  token="$(gcloud auth print-access-token 2>/dev/null || true)"
+  if [ -z "${token}" ]; then
+    echo "error"
+    return 0
+  fi
+
+  local http_code
+  if ! http_code="$(curl -sS -o /dev/null -I -w '%{http_code}' \
+    -H "${CURL_HEADER_FROM_STDIN}" \
+    -H "Accept: ${GHCR_MANIFEST_ACCEPT}" \
+    "https://${host}/v2/${repo}/manifests/${reference}" 2>/dev/null <<<"Authorization: Bearer ${token}")"; then
+    echo "error"
+    return 0
+  fi
+  case "${http_code}" in
+    "${HTTP_STATUS_OK}") echo "present" ;;
+    "${HTTP_STATUS_NOT_FOUND}") echo "absent" ;;
+    *) echo "error" ;;
+  esac
+}
+
+# `present`, `absent` or `error` for an image on either registry the two
+# functions above speak; `error` for any other registry, which neither can ask.
+# Arguments: $1 = image reference
+registry_image_status() {
+  local img="${1:-}"
+
+  local host="${img%%/*}"
+
+  if [ "${host}" = "${GHCR_REGISTRY_HOST}" ]; then
+    ghcr_image_status "${img}"
+  elif is_artifact_registry_host "${host}"; then
+    ar_image_status "${img}"
+  else
+    echo "error"
+  fi
 }
 
 # ─── Required images, as the candidate lists them ─────────────────────────────
@@ -833,13 +964,15 @@ required_release_images_for_release() {
   required_release_images_at "${release_commit}"
 }
 
-# Checks if all required candidate container images exist in GHCR for a specific
-# commit SHA: the images the commit's own scripts/release/common.sh lists
+# Checks if all required candidate container images exist in the registry
+# (the second argument, else get_registry_prefix) for a specific commit SHA: the images the commit's own scripts/release/common.sh lists
 # (required_release_images_at), since those are what its publish run built.
 check_commit_images_exist() {
   local sha="$1"
-  local registry_prefix
-  registry_prefix="$(get_registry_prefix)"
+  local registry_prefix="${2:-}"
+  if [ -z "${registry_prefix}" ]; then
+    registry_prefix="$(get_registry_prefix)"
+  fi
 
   local images=() img
   while IFS= read -r img; do images+=("${img}"); done < <(required_release_images_at "${sha}")
@@ -2257,11 +2390,13 @@ resolve_source_image_commit() {
     local parent_commit=""
     if parent_commit="$(git rev-parse --verify "${tag_commit}^" 2>/dev/null)"; then
       if is_ci_pipeline && command -v docker >/dev/null 2>&1; then
-        if check_commit_images_exist "${tag_commit}" 2>/dev/null; then
+        local candidate_prefix
+        candidate_prefix="$(get_candidate_registry_prefix)"
+        if check_commit_images_exist "${tag_commit}" "${candidate_prefix}" 2>/dev/null; then
           echo "${tag_commit}"
           return 0
         fi
-        if check_commit_images_exist "${parent_commit}" 2>/dev/null; then
+        if check_commit_images_exist "${parent_commit}" "${candidate_prefix}" 2>/dev/null; then
           echo "${parent_commit}"
           return 0
         fi
@@ -2282,7 +2417,44 @@ resolve_source_image_commit() {
   return 1
 }
 
-# Clean Promotion: Tags verified container images in GHCR without rebuilding
+# Gives one image a second tag without rebuilding: target_image names what
+# source_image names, in the same registry or another. A target that already
+# names the source is left alone, so a re-run resumes; one that names anything
+# else is refused.
+promote_image_tag() {
+  local source_image="${1:-}"
+  local target_image="${2:-}"
+  local commit_sha="${3:-}"
+
+  # Safety Guard: Check if target image tag already exists in registry
+  local target_digest=""
+  if target_digest="$(get_image_manifest_digest "${target_image}")"; then
+    local source_digest=""
+    if ! source_digest="$(get_image_manifest_digest "${source_image}")"; then
+      echo "❌ ERROR: Target image '${target_image}' already exists in registry, but failed to inspect source image '${source_image}'!" >&2
+      return 1
+    fi
+
+    local raw_target=""
+    if [ "${target_digest}" = "${source_digest}" ] || \
+       ( [ -n "${source_digest}" ] && raw_target="$(docker buildx imagetools inspect --raw "${target_image}" 2>/dev/null)" && grep -q "${source_digest}" <<<"${raw_target}" ); then
+      echo "    ℹ️ Target image '${target_image}' already exists in registry and matches source image (${commit_sha:0:7}). Skipping duplicate promotion."
+      return 0
+    fi
+    echo "❌ ERROR: Target image '${target_image}' already exists in registry (digest: ${target_digest}) but does NOT match source image '${source_image}' (digest: ${source_digest})!" >&2
+    echo "Release promotion blocked to prevent artifact mismatch across commits." >&2
+    return 1
+  fi
+
+  docker buildx imagetools create --prefer-index=false --tag "${target_image}" "${source_image}"
+}
+
+# Clean Promotion: tags a commit's verified container images with the release
+# version without rebuilding. The images are read from the candidate registry
+# (get_candidate_registry_prefix) and published to the registry prefix. When
+# those are two registries the candidate registry gets the version tag too,
+# first: rollback_environment.sh looks for the previous release's version in
+# the registry an environment is installed from.
 promote_release_images() {
   local commit_sha="${1:-}"
   local release_version="${2:-}"
@@ -2309,8 +2481,9 @@ promote_release_images() {
   local resolved_commit
   resolved_commit="$(git rev-parse --verify "${commit_sha}^{commit}" 2>/dev/null || echo "${commit_sha}")"
 
-  local registry_prefix
+  local registry_prefix candidate_prefix
   registry_prefix="$(get_registry_prefix)"
+  candidate_prefix="$(get_candidate_registry_prefix)"
 
   echo "🚀 Promoting verified container images (${resolved_commit:0:7}) -> (${release_version})..."
 
@@ -2330,32 +2503,12 @@ promote_release_images() {
   fi
 
   for img in "${images[@]}"; do
-    local source_image="${registry_prefix}/${img}:${resolved_commit}"
-    local target_image="${registry_prefix}/${img}:${release_version}"
+    local source_image="${candidate_prefix}/${img}:${resolved_commit}"
     echo "  • Promoting ${img}..."
-
-    # Safety Guard: Check if target image tag already exists in registry
-    local target_digest=""
-    if target_digest="$(get_image_manifest_digest "${target_image}")"; then
-      local source_digest=""
-      if ! source_digest="$(get_image_manifest_digest "${source_image}")"; then
-        echo "❌ ERROR: Target image '${target_image}' already exists in registry, but failed to inspect source image '${source_image}'!" >&2
-        return 1
-      fi
-
-      local raw_target=""
-      if [ "${target_digest}" = "${source_digest}" ] || \
-         ( [ -n "${source_digest}" ] && raw_target="$(docker buildx imagetools inspect --raw "${target_image}" 2>/dev/null)" && grep -q "${source_digest}" <<<"${raw_target}" ); then
-        echo "    ℹ️ Target image '${target_image}' already exists in registry and matches source image (${resolved_commit:0:7}). Skipping duplicate promotion."
-        continue
-      else
-        echo "❌ ERROR: Target image '${target_image}' already exists in registry (digest: ${target_digest}) but does NOT match source image '${source_image}' (digest: ${source_digest})!" >&2
-        echo "Release promotion blocked to prevent artifact mismatch across commits." >&2
-        return 1
-      fi
+    if [ "${candidate_prefix}" != "${registry_prefix}" ]; then
+      promote_image_tag "${source_image}" "${candidate_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
     fi
-
-    docker buildx imagetools create --prefer-index=false --tag "${target_image}" "${source_image}"
+    promote_image_tag "${source_image}" "${registry_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
     echo "    ✅ Promoted ${img} to ${release_version}"
   done
 }

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -465,4 +467,310 @@ func artifactTextOf(task *lib.Task, name string) string {
 		}
 	}
 	return b.String()
+}
+
+// The same suite on a claimed warm pod (warm_pool.go). A warm pod is started
+// before any conversation under a freshly minted name, and a new
+// conversation's first turn is addressed to that name instead of a minted
+// one, so the capability the gateway mints names the warm pod as its
+// delegate exactly as it names a spawned one. Each test below runs the real
+// worker-adapter in its warm mode (no TASK_ID: it takes its first task off its
+// own subjects), started and reporting ready before the turn is sent, as on
+// an install. A claimed warm pod passes the positive control and fails the
+// same refusal cases, with the same rules, as a freshly spawned pod; and an
+// unclaimed one refuses whatever reaches its subjects without a capability
+// minted for it.
+
+// startWarmSessionCapRig is startSessionCapRig with a warm pool.
+func startWarmSessionCapRig(t *testing.T) (*rig, *fakeSpawner) {
+	t.Helper()
+	r, spawn := startRigWithSpawnerCap(t, RouteSession, 0, func(c *Config) {
+		c.AuthorityScope = gatewayAuthorityScope
+		c.SessionReuse = true
+		c.WarmSessions = 1
+	})
+	startCapVerifier(t, r.url)
+	return r, spawn
+}
+
+// countingHarness is a harness whose first act is to append a line to runs,
+// so a test can count how many times one started, and which then reports its
+// session (so a reused pod stays for the next task) and answers success.
+func countingHarness(t *testing.T, runs string) []string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "harness.sh")
+	body := fmt.Sprintf(`#!/bin/bash
+echo started >> %q
+echo '{"type":"system","subtype":"init","session_id":"sess-warm"}'
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":%q}'
+`, runs, harnessAnswer)
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write harness: %v", err)
+	}
+	return []string{"/bin/bash", path}
+}
+
+func harnessRuns(t *testing.T, runs string) int {
+	t.Helper()
+	b, err := os.ReadFile(runs)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(b), "started")
+}
+
+// startWarmSessionPod runs a warm session pod's real worker-adapter under
+// name, checking capabilities against scope, waits until it reports ready
+// (its task watcher is live), and only then lists it Ready in the rig's
+// spawner, as the pod's readiness probe would. The adapter stops at cleanup.
+func startWarmSessionPod(t *testing.T, r *rig, spawn *fakeSpawner, name string, scope capability.Scope, harness []string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := ln.Addr().String()
+	_ = ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := workeradapter.Run(ctx, workeradapter.Config{
+			NATSURL:        r.url,
+			Profile:        sessionPodProfile,
+			Session:        name,
+			Scope:          scope,
+			HarnessCommand: harness,
+			HarnessEnv:     os.Environ(),
+			TaskDeadline:   sessionPodTaskDeadline,
+			KillGrace:      sessionPodKillGrace,
+			SessionReuse:   true,
+			Warm:           true,
+			WarmStatusAddr: ready,
+		})
+		done <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(sessionPodRunBound):
+			t.Errorf("the warm pod %s did not stop", name)
+		}
+	})
+	waitFor(t, "the warm pod "+name+" ready", func() bool {
+		resp, err := http.Get("http://" + ready + lib.SessionWarmReadyPath)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+	spawn.setWarm(readyWarm(name))
+}
+
+// claimedWarmTurn sends a plain turn into conv and returns the submission the
+// gateway published to the warm pod pod, after checking no pod was spawned
+// for it.
+func claimedWarmTurn(t *testing.T, r *rig, spawn *fakeSpawner, conv, text, pod string) *lib.Envelope {
+	t.Helper()
+	before := len(spawn.calls())
+	say(r, conv, "m-"+conv, text)
+	origin := r.awaitTask(t, pod)
+	if got := envText(t, origin); !strings.Contains(got, text) {
+		t.Fatalf("the submission on %s reads %q; want the plain turn %q", pod, got, text)
+	}
+	if n := len(spawn.calls()); n != before {
+		t.Fatalf("%d pod(s) spawned for a turn the warm pod %s should have taken", n-before, pod)
+	}
+	return origin
+}
+
+// awaitFinal waits for taskID's terminal on the stream and returns the fold.
+func awaitFinal(t *testing.T, r *rig, session, taskID string) *lib.Task {
+	t.Helper()
+	var task *lib.Task
+	waitFor(t, "the terminal of "+taskID, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), busCallBound)
+		defer cancel()
+		got, err := r.bus.TasksGet(ctx, session, taskID)
+		if err == nil && got.Final {
+			task = got
+			return true
+		}
+		return false
+	})
+	return task
+}
+
+// assertRefusedOnTheStream asserts taskID ended terminal rejected with exactly
+// the capability rule wantRule and never reached working.
+func assertRefusedOnTheStream(t *testing.T, r *rig, session, taskID, wantRule string) {
+	t.Helper()
+	task := awaitFinal(t, r, session, taskID)
+	if task.State != lib.StateRejected {
+		t.Fatalf("%s ended %q; want it refused", taskID, task.State)
+	}
+	if text, want := finalText(task), capRefusalPrefix+wantRule; text != want {
+		t.Fatalf("terminal reason = %q, want %q", text, want)
+	}
+	for _, s := range task.StatusHistory {
+		if s == lib.StateWorking {
+			t.Fatalf("the refused turn reached working: %v", task.StatusHistory)
+		}
+	}
+}
+
+// The positive control on a claimed warm pod: the capability the gateway
+// minted for the claimed pod runs the turn.
+func TestAClaimedWarmPodRunsAPlainTurnOnTheCapabilityTheGatewayMinted(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmSessionCapRig(t)
+	const pod = "chat-otter-c0aa"
+	runs := filepath.Join(t.TempDir(), "runs")
+	startWarmSessionPod(t, r, spawn, pod, gatewayAuthorityScope, countingHarness(t, runs))
+	origin := claimedWarmTurn(t, r, spawn, "discord:g1/t-warm-cap-ok", "what pods are failing", pod)
+	gatewayGrants(t, r, origin, pod)
+
+	task := awaitFinal(t, r, pod, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("the gateway-minted turn on the claimed warm pod ended %q; want completed", task.State)
+	}
+	if got := artifactTextOf(task, lib.ArtifactResult); got != harnessAnswer {
+		t.Fatalf("result artifact = %q, want the harness's answer", got)
+	}
+	if n := harnessRuns(t, runs); n != 1 {
+		t.Fatalf("the harness started %d time(s), want once", n)
+	}
+}
+
+// The refusals on a claimed warm pod: the conversation's own turn runs, and
+// the same turn republished on the pod with its capability missing, forged,
+// or at a revision the gateway never wrote is refused before a harness
+// starts, with the same rule as on a spawned pod.
+func TestAClaimedWarmPodRefusesAPlainTurnWithoutTheGatewaysCapability(t *testing.T) {
+	t.Parallel()
+	for i, tc := range []struct {
+		name     string
+		grants   func(minted capability.Ref, taskID string) json.RawMessage
+		wantRule string
+	}{
+		{
+			name:     "no capability at all",
+			grants:   func(capability.Ref, string) json.RawMessage { return json.RawMessage("null") },
+			wantRule: noCapabilityRule,
+		},
+		{
+			name:     "a forged reference the gateway never wrote",
+			wantRule: capability.WalkRefused,
+			grants: func(_ capability.Ref, taskID string) json.RawMessage {
+				return grantsFor(t, capability.Ref{Key: "root." + taskID + forgedKeySuffix, Revision: forgedRevision})
+			},
+		},
+		{
+			name:     "the gateway's own key at a revision it never wrote",
+			wantRule: capability.WalkRefused,
+			grants: func(minted capability.Ref, _ string) json.RawMessage {
+				minted.Revision++
+				return grantsFor(t, minted)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, spawn := startWarmSessionCapRig(t)
+			pod := fmt.Sprintf("chat-otter-c1a%d", i)
+			runs := filepath.Join(t.TempDir(), "runs")
+			startWarmSessionPod(t, r, spawn, pod, gatewayAuthorityScope, countingHarness(t, runs))
+			origin := claimedWarmTurn(t, r, spawn, "discord:g1/t-warm-cap-refuse", "what pods are failing", pod)
+			var minted AuthorityGrants
+			if err := json.Unmarshal(gatewayGrants(t, r, origin, pod), &minted); err != nil {
+				t.Fatal(err)
+			}
+			if task := awaitFinal(t, r, pod, origin.TaskID); task.State != lib.StateCompleted {
+				t.Fatalf("the conversation's own turn ended %q; want completed", task.State)
+			}
+			taskID := refusedTaskPrefix + origin.TaskID
+			republishWithGrants(t, r, origin, pod, taskID, tc.grants(minted.Capability, origin.TaskID))
+			assertRefusedOnTheStream(t, r, pod, taskID, tc.wantRule)
+			if n := harnessRuns(t, runs); n != 1 {
+				t.Fatalf("the harness started %d time(s), want once: only for the conversation's own turn", n)
+			}
+		})
+	}
+}
+
+// A delegate mismatch onto a claimed warm pod: X's capability, from a pod
+// spawned fresh for another conversation, is refused on the warm pod Y.
+func TestACapabilityMintedForAnotherSessionPodIsRefusedOnAClaimedWarmPod(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmSessionCapRig(t)
+	sessionX, originX := plainSessionTurn(t, r, spawn, 0, "discord:g1/t-warm-cap-x", "what pods are failing")
+	grantsX := gatewayGrants(t, r, originX, sessionX)
+
+	const podY = "chat-otter-c2aa"
+	runs := filepath.Join(t.TempDir(), "runs")
+	startWarmSessionPod(t, r, spawn, podY, gatewayAuthorityScope, countingHarness(t, runs))
+	originY := claimedWarmTurn(t, r, spawn, "discord:g1/t-warm-cap-y", "what nodes are cordoned", podY)
+	gatewayGrants(t, r, originY, podY)
+	if task := awaitFinal(t, r, podY, originY.TaskID); task.State != lib.StateCompleted {
+		t.Fatalf("Y's own turn ended %q; want completed", task.State)
+	}
+	taskID := refusedTaskPrefix + originY.TaskID
+	republishWithGrants(t, r, originY, podY, taskID, grantsX)
+	assertRefusedOnTheStream(t, r, podY, taskID, capability.WalkRefused)
+	if n := harnessRuns(t, runs); n != 1 {
+		t.Fatalf("the harness started %d time(s), want once: only for Y's own turn", n)
+	}
+}
+
+// A scope mismatch on a claimed warm pod: configured with a namespace beside
+// the gateway's, it refuses the capability minted for it by the scope rule.
+func TestAClaimedWarmPodRefusesTheGatewaysCapabilityOutsideItsOwnScope(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmSessionCapRig(t)
+	const pod = "chat-otter-c3aa"
+	runs := filepath.Join(t.TempDir(), "runs")
+	startWarmSessionPod(t, r, spawn, pod, siblingScope, countingHarness(t, runs))
+	origin := claimedWarmTurn(t, r, spawn, "discord:g1/t-warm-cap-scope", "what pods are failing", pod)
+	gatewayGrants(t, r, origin, pod)
+	assertRefusedOnTheStream(t, r, pod, origin.TaskID, outsideScopeRule)
+	if n := harnessRuns(t, runs); n != 0 {
+		t.Fatalf("the harness started %d time(s) outside the pod's scope", n)
+	}
+}
+
+// An unclaimed warm pod: nothing the gateway sends reaches it, and a task
+// published to its subjects anyway, with no capability or with one the
+// gateway minted for another pod, is refused before a harness starts.
+func TestAnUnclaimedWarmPodRefusesATaskWithNoCapabilityMintedForIt(t *testing.T) {
+	t.Parallel()
+	r, spawn := startWarmSessionCapRig(t)
+	sessionX, originX := plainSessionTurn(t, r, spawn, 0, "discord:g1/t-warm-unclaimed-x", "what pods are failing")
+	grantsX := gatewayGrants(t, r, originX, sessionX)
+
+	const pod = "chat-otter-c4aa"
+	runs := filepath.Join(t.TempDir(), "runs")
+	// Started after X's turn, so X's conversation could not have claimed it.
+	startWarmSessionPod(t, r, spawn, pod, gatewayAuthorityScope, countingHarness(t, runs))
+	for _, tc := range []struct {
+		taskID   string
+		grants   json.RawMessage
+		wantRule string
+	}{
+		{refusedTaskPrefix + "unclaimed-null", json.RawMessage("null"), noCapabilityRule},
+		{refusedTaskPrefix + "unclaimed-x", grantsX, capability.WalkRefused},
+	} {
+		republishWithGrants(t, r, originX, pod, tc.taskID, tc.grants)
+		assertRefusedOnTheStream(t, r, pod, tc.taskID, tc.wantRule)
+	}
+	if n := harnessRuns(t, runs); n != 0 {
+		t.Fatalf("the harness started %d time(s) on an unclaimed warm pod", n)
+	}
+	if claims := warmClaims(t, r); len(claims) != 0 {
+		t.Fatalf("the warm pod was claimed: %v", claims)
+	}
 }

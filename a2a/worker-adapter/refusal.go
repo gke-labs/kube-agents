@@ -7,14 +7,16 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"syscall"
 )
 
-// A profile task's harness is stopped at its first definitive write refusal
-// (spec-subagent-profiles.md, "Stopped at a write refusal"). The signal is
-// the credential broker's refusal as the in-pod broker client saw it, never
-// a tool's output: tool output carries cluster data (pod logs, ConfigMap
+// A profile task's harness, and a session pod's turn, is stopped at its first
+// definitive write refusal (spec-subagent-profiles.md, "Stopped at a write
+// refusal"). The signal is a record the in-pod broker client writes, from the
+// broker's refusal on a profile pod and from the kubectl wrapper's argv and
+// exit code on a session pod (below), never a tool's output: tool output carries cluster data (pod logs, ConfigMap
 // values, events), and text planted there must not be able to end a task.
 //
 // The broker marks a definitive write refusal in its 403 body
@@ -60,6 +62,18 @@ import (
 //   - git is local-only (deploy/shared/worker-gitconfig), and the harness's
 //     file, search and web tools reach no write the broker governs.
 //
+// A session pod's kubectl reaches the cluster through <agent>-kube-proxy, not
+// the broker, so no broker answer marks its refusal. Its kubectl wrapper
+// (deploy/sandbox/session-kubectl.sh) has the client record a write attempt
+// (credential_proxy_client.record_kubectl_write_attempt, rule
+// writeAttemptRule) when kubectl exits non-zero, the gateway has passed a
+// read-only KUBE_PROXY_MODE, and the argv tries a change that mode refuses.
+// The adapter makes the file empty in Config.WriteRefusalDir (the workdir's
+// .kube-agents) before each turn, and counts only that rule there
+// (readWriteRefusalFor). Stock /usr/local/libexec/kubectl run directly, or
+// curl at kube-proxy with the pod's token, meets kube-proxy's 403 and writes
+// no record, which fails safe the same way.
+//
 // So no tool output is read for refusals at all. A record lost or never
 // written fails safe: the task runs on, and the broker refuses every further
 // write regardless. The stop is for an honest, early report, not enforcement.
@@ -72,7 +86,8 @@ const (
 	EnvWriteRefusalFile = "CREDENTIAL_PROXY_REFUSAL_FILE"
 	// EnvWriteRefusalTask is the task id the client puts in each record.
 	EnvWriteRefusalTask = "CREDENTIAL_PROXY_REFUSAL_TASK"
-	// writeRefusalFileName is the record file's name beside the task token.
+	// writeRefusalFileName is the record file's name, beside a profile task's
+	// token or in a session pod's per-turn directory.
 	writeRefusalFileName = "write-refusals"
 	// maxWriteRefusalBytes bounds what is read of the file: a record is a
 	// line of well under a KiB, and only the first valid one counts.
@@ -82,20 +97,23 @@ const (
 var (
 	// The rule ids and verbs a record may carry: the broker's own vocabulary.
 	refusalRuleShape = regexp.MustCompile(`\A[a-z0-9][a-z0-9.-]{0,63}\z`)
-	// stopRules are the broker's rules whose refusal of a write stops a task:
-	// the read-only rule and the profile caller's flag rule. The record file
-	// is the harness's to write, and the reason reaches a delegating parent,
-	// so a record naming any other rule, or a verb no kubectl write has, is
-	// skipped.
-	stopRules = map[string]bool{kubernetesReadOnlyRule: true, callerKubectlFlagRule: true}
-	// stopVerbShape is a kubectl write's verb as the broker names it: one
-	// word, or two for the verbs whose second word decides.
+	// stopRules are the broker's rules whose refusal of a write stops a
+	// profile task: the read-only rule and the profile caller's flag rule.
+	// sessionStopRules is a session pod's: the kubectl wrapper's write
+	// attempt alone. The record file is the harness's to write, and the
+	// reason reaches a delegating parent or the chat, so a record naming any
+	// other rule, or a verb no kubectl write has, is skipped.
+	stopRules        = map[string]bool{kubernetesReadOnlyRule: true, callerKubectlFlagRule: true}
+	sessionStopRules = map[string]bool{writeAttemptRule: true}
+	// stopVerbShape is a kubectl write's verb as the broker or the wrapper
+	// names it: one word, or two for the verbs whose second word decides.
 	stopVerbShape    = regexp.MustCompile(`\A[a-z]+(?: [a-z]+)?\z`)
 	refusalVerbShape = regexp.MustCompile(`\A[A-Za-z0-9_.:@/-]{1,64}(?: [A-Za-z0-9_.:@/-]{1,64}){0,2}\z`)
 )
 
-// writeRefusal is the first definitive refusal a task met: the broker's rule
-// and the verb it refused, and nothing else.
+// writeRefusal is the first definitive refusal a task met: the rule (the
+// broker's, or the session wrapper's writeAttemptRule) and the verb, and
+// nothing else.
 type writeRefusal struct {
 	rule string
 	verb string
@@ -119,6 +137,15 @@ type writeRefusalRecord struct {
 // earlier process on a pool pod, never counts, and with no task id nothing
 // does.
 func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
+	return readWriteRefusalFor(path, taskID, false)
+}
+
+// readWriteRefusalFor is readWriteRefusal, and with sessionOnly it counts only
+// the session kubectl wrapper's own record: writeAttemptRule, with a verb of
+// one or two lowercase words. The file is the harness's to write, so on a
+// session pod, where the reason's verb is shown in chat, a record claiming
+// another rule, or a verb no kubectl write has, is skipped.
+func readWriteRefusalFor(path, taskID string, sessionOnly bool) (*writeRefusal, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) // #nosec G304 -- the worker's own per-task file
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -147,7 +174,11 @@ func readWriteRefusal(path, taskID string) (*writeRefusal, error) {
 		if taskID == "" || rec.Task != taskID {
 			continue
 		}
-		if !stopRules[rec.Rule] || !stopVerbShape.MatchString(rec.Verb) {
+		rules := stopRules
+		if sessionOnly {
+			rules = sessionStopRules
+		}
+		if !rules[rec.Rule] || !stopVerbShape.MatchString(rec.Verb) {
 			continue
 		}
 		return &writeRefusal{rule: rec.Rule, verb: rec.Verb}, nil
@@ -164,11 +195,42 @@ const kubernetesReadOnlyRule = "kubernetes.read-only"
 // flag before the read-only rule reads them.
 const callerKubectlFlagRule = "caller.kubectl-flag"
 
+// writeAttemptRule is a session pod's kubectl write attempt, recorded by the
+// kubectl wrapper from the argv and a non-zero exit while kube-proxy is
+// read-only (deploy/sandbox/session-kubectl.sh,
+// credential_proxy_client.record_kubectl_write_attempt). The wrapper does not
+// see which side refused, so its reason says the change was attempted and not
+// made, not that a server refused it.
+const writeAttemptRule = "kube-proxy.write-attempt"
+
+// makeTurnWriteRefusalFile makes a session turn's record file empty in dir,
+// replacing any earlier turn's, and returns its path.
+func makeTurnWriteRefusalFile(dir string) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, writeRefusalFileName)
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- the adapter's own per-turn file
+	if err != nil {
+		return "", err
+	}
+	return path, f.Close()
+}
+
 // writeRefusedReason is the terminal message of a task stopped at a write
 // refusal, in the `reason: <token> - <detail>` shape.
 func writeRefusedReason(r *writeRefusal) string {
-	// Facts only: the rule, the verb, and that the change was not made. The
-	// reason reaches a delegating parent model, so it carries no advice.
+	// Facts only: the rule or the attempt, the verb, and that the change was
+	// not made. The reason reaches a delegating parent model or the chat, so
+	// it carries no advice.
+	if r.rule == writeAttemptRule {
+		return "reason: write-refused" + reasonDetailSeparator +
+			"the turn stopped after it attempted a change: kubectl " + r.verb +
+			" was not made; writes are refused here."
+	}
 	return "reason: write-refused" + reasonDetailSeparator +
 		"the task stopped after a write refusal: the credential broker's " + r.rule + " rule refused the verb " + r.verb +
 		"; the change was not made."

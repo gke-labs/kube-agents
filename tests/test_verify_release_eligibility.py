@@ -13,6 +13,7 @@ import unittest
 from tests.testing.common import MOCK_DEFAULT_REGISTRY_PREFIX, get_isolated_test_env
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_AR_REGISTRY_PREFIX,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_COLLIDING_RELEASE_TAG,
     MOCK_EMERGENCY_OVERRIDE_REASON,
@@ -416,6 +417,38 @@ exit {docker_exit}
             self.assertIn(f"lists at {candidate[:7]}", proc.stderr)
         finally:
             temp_dir.cleanup()
+
+    def test_the_image_check_reads_the_candidate_registry(self):
+        """With CANDIDATE_REGISTRY_PREFIX set, the commit's images are looked
+        for there, where the promotion will read them, and not where the
+        release is published."""
+        for holding, eligible in ((MOCK_AR_REGISTRY_PREFIX, True), (MOCK_DEFAULT_REGISTRY_PREFIX, False)):
+            with self.subTest(images_in=holding):
+                temp_dir, repo_dir, git, _, bin_dir = self._create_mock_repo()
+                try:
+                    candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+                    git("tag", "-a", MOCK_LATEST_STAGING_TAG, candidate, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
+                    create_mock_docker_binary(
+                        bin_dir,
+                        existing_images=[f"{holding}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+                    )
+                    proc = self._run_verify_script(
+                        repo_dir,
+                        args=[MOCK_TARGET_RELEASE_TAG, candidate],
+                        env={
+                            "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                            "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX,
+                        },
+                        bin_dir=bin_dir,
+                    )
+                    if eligible:
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        self.assertIn("ELIGIBLE: Found staging promotion tag", proc.stdout)
+                    else:
+                        self.assertNotEqual(proc.returncode, 0)
+                        self.assertIn("do not exist in registry", proc.stderr)
+                finally:
+                    temp_dir.cleanup()
 
     def test_blocked_when_no_staging_promotion_tag(self):
         temp_dir, repo_dir, _, commit_sha, bin_dir = self._create_mock_repo()

@@ -1279,8 +1279,7 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
-        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
-        the operator's cluster-view flag, kube-proxy on 8443 and the credential
+        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under the session pods' cluster view, kube-proxy on 8443 and the credential
         broker on 8765) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
@@ -1296,8 +1295,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         - Automount stays off, so the default-audience token -- the one the API
           server accepts -- is never mounted.
         - Every token that is mounted is a projected token naming an audience
-          that is not the API server's: the bus, and, under the operator's
-          A2A_SESSION_CLUSTER_VIEW flag, the session audience accepted by
+          that is not the API server's: the bus, and, under the session pods'
+          cluster view (the session route's default, or the operator's
+          A2A_SESSION_CLUSTER_VIEW=true), the session audience accepted by
           kube-proxy and the credential broker. The API server refuses both for
           anything else, so neither is a cluster credential even though both
           are Kubernetes ones; TokenReview and each proxy's per-audience policy
@@ -1313,7 +1313,27 @@ class C1IsolationIsStructural(unittest.TestCase):
         other left empty.
         """
         spawner = h.text("a2a_spawner")
-        body = h.go_function_body(spawner, "Spawn")
+        # Every session pod's spec, a fresh spawn's and a warm pod's alike, is
+        # built by sessionPodSpec (#6533), so that is the body the identity
+        # checks read. The two creates must build through it, and neither may
+        # touch the token mount or the projections after it: otherwise a pod
+        # could leave with a token this test never saw.
+        for create in ("Spawn", "SpawnWarm"):
+            with self.subTest(create=create):
+                create_body = h.go_function_body(spawner, create)
+                self.assertIn(
+                    "s.sessionPodSpec(",
+                    create_body,
+                    f"{create} no longer builds its pod through sessionPodSpec, so the "
+                    "identity checks below no longer read the pod it creates",
+                )
+                for token_field in ("AutomountServiceAccountToken", "ServiceAccountToken", "ServiceAccountName"):
+                    self.assertNotIn(
+                        token_field,
+                        create_body,
+                        f"{create} sets {token_field} after sessionPodSpec, outside the body this test reads",
+                    )
+        body = h.go_function_body(spawner, "sessionPodSpec")
 
         self.assertIn(
             "AutomountServiceAccountToken: ptr.To(false)",
@@ -1337,7 +1357,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "bus credential moved, this test has to move with it",
         )
         # The audiences a session pod may hold, by constant name: the bus, and
-        # the broker's session audience that the cluster-view flag projects.
+        # the broker's session audience that the cluster view projects.
         # Anything else is a token for a destination the fence never admitted.
         permitted_audiences = ("lib.BusTokenAudience", "credentialProxySessionAudience")
         for projection in projections:
@@ -1900,6 +1920,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
@@ -1925,6 +1946,15 @@ class C1IsolationIsStructural(unittest.TestCase):
                     re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
                     "the shim no longer reads %s by that name" % name,
                 )
+
+        # KUBE_PROXY_MODE gates the session kubectl wrapper's write-attempt
+        # record: the spawner sets it, the wrapper and the client read it. A
+        # rename on either side records nothing, and no session turn stops.
+        with self.subTest(env="KUBE_PROXY_MODE"):
+            self._one_match(r'Name:\s*"KUBE_PROXY_MODE"', spawner, "the spawner's render of KUBE_PROXY_MODE")
+            self.assertRegex(shim, r'KUBE_PROXY_MODE_ENV\s*=\s*"KUBE_PROXY_MODE"', "the client no longer reads KUBE_PROXY_MODE")
+            wrapper = (h.REPO_ROOT / "deploy" / "sandbox" / "session-kubectl.sh").read_text(encoding="utf-8")
+            self.assertIn("${KUBE_PROXY_MODE:-}", wrapper, "the kubectl wrapper no longer reads KUBE_PROXY_MODE")
 
     def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
         """The platform agent's allowlists cross the same boundary, fail-open.
@@ -2907,6 +2937,41 @@ class C2FailClosed(unittest.TestCase):
                     check(configured, (reported, True))
         check("universe.example.test", ("universe.example.test", True))
         check("universe.example.test", (None, True))
+
+    def test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts(self) -> None:
+        """A start with no answer from the metadata server does not leave the value unchecked.
+
+        With no answer at its start the broker serves with the environment's
+        value. It asks the metadata server again until it answers, and an
+        answer that differs stops the broker with the error of the start check:
+        the credential must not go on to that domain's hosts. An answer that
+        agrees, and a host with no universe route, stop nothing.
+        """
+        proxy = h.credential_proxy
+
+        def recheck(configured, later):
+            stopped: list[str] = []
+            answers = [(None, False), later]
+            original = proxy.probe_gce_universe_domain_answer
+            proxy.probe_gce_universe_domain_answer = lambda *_a, **_k: answers.pop(0)
+            try:
+                proxy.recheck_universe_domain(configured, sleep=lambda _s: None, stop=stopped.append)
+            finally:
+                proxy.probe_gce_universe_domain_answer = original
+            return stopped
+
+        for configured, reported in (
+            ("clients6.google.com", "googleapis.com"),
+            ("universe.example.test", "googleapis.com"),
+            ("googleapis.com", "universe.example.test"),
+        ):
+            with self.subTest(configured=configured, reported=reported):
+                stopped = recheck(configured, (reported, True))
+                self.assertEqual(1, len(stopped))
+                self.assertIn(repr(configured), stopped[0])
+                self.assertIn(repr(reported), stopped[0])
+        self.assertEqual([], recheck("universe.example.test", ("universe.example.test", True)))
+        self.assertEqual([], recheck("universe.example.test", (None, True)))
 
 
 class C3UntrustedByDefault(unittest.TestCase):

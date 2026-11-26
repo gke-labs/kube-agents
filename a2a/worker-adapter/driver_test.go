@@ -141,6 +141,10 @@ func TestTheClaudeDriverKeepsTheHarnessContract(t *testing.T) {
 // "A <tool>", "OK <text>" and "ERR <token> <text>".
 type toyDriver struct {
 	hold bool
+	// restart makes it a driver that takes one user turn per process
+	// (turnRestarter), and budget one with a wall-clock bound
+	// (turnBudgeter, as --left <duration>).
+	restart, budget bool
 	// prepare, if set, runs for each PrepareTurn call, numbered from 1.
 	prepare func(n int, dirs TurnDirs) error
 
@@ -183,6 +187,15 @@ func (d *toyDriver) PrepareTurn(_ context.Context, dirs TurnDirs) error {
 }
 
 func (d *toyDriver) HoldsSteers() bool { return d.hold }
+
+func (d *toyDriver) RestartsPerTurn() bool { return d.restart }
+
+func (d *toyDriver) WithTurnBudget(argv []string, left time.Duration) []string {
+	if !d.budget {
+		return argv
+	}
+	return append(append([]string(nil), argv...), "--left", left.Round(time.Second).String())
+}
 
 func (d *toyDriver) prepared() (int, []TurnDirs) {
 	d.mu.Lock()
@@ -624,7 +637,8 @@ sleep 30
 
 // productionDriverToolSteps is, for each driver a task can run on, a
 // recorded stream of known tool steps. A driver added to the registry adds
-// its row here (the agy driver with #6745), so the write-refusal stop, which
+// its row here (the agy driver with #6745, core-agent with its driver), so
+// the write-refusal stop, which
 // runs on EventToolResult, applies to it.
 var productionDriverToolSteps = []struct {
 	name   string
@@ -644,12 +658,25 @@ var productionDriverToolSteps = []struct {
 	// turns, and one that ends ERROR when headless approval was refused.
 	{"agy done", agyDriver{}, agyFixtureLines("tool"), 1},
 	{"agy error", agyDriver{}, agyFixtureLines("deny"), 1},
+	// core-agent-harness as recorded (testdata/coreagent/README.md): a
+	// step that succeeds, one whose command exits nonzero, one the policy
+	// refuses, a call to a tool the turn wasn't offered, and a turn with
+	// no tool at all.
+	{"core-agent tool-step", newCoreAgentDriver(), fixtureLines("coreagent", "tool-step"), 1},
+	{"core-agent tool-error", newCoreAgentDriver(), fixtureLines("coreagent", "tool-error"), 1},
+	{"core-agent tool-refused", newCoreAgentDriver(), fixtureLines("coreagent", "tool-refused"), 1},
+	{"core-agent unknown-tool", newCoreAgentDriver(), fixtureLines("coreagent", "unknown-tool"), 1},
+	{"core-agent text-only", newCoreAgentDriver(), fixtureLines("coreagent", "text-only"), 0},
 }
 
 // agyFixtureLines is testdata/agy/<name>.jsonl's lines, read when the table
 // is built.
-func agyFixtureLines(name string) []string {
-	raw, err := os.ReadFile(filepath.Join("testdata", "agy", name+".jsonl"))
+func agyFixtureLines(name string) []string { return fixtureLines("agy", name) }
+
+// fixtureLines is testdata/<dir>/<name>.jsonl's lines, read when the table
+// is built.
+func fixtureLines(dir, name string) []string {
+	raw, err := os.ReadFile(filepath.Join("testdata", dir, name+".jsonl"))
 	if err != nil {
 		panic(err)
 	}
@@ -686,5 +713,54 @@ func TestEveryDriverEmitsOneToolResultPerToolStep(t *testing.T) {
 				t.Fatalf("%d EventToolResult for %d tool steps", got, tc.steps)
 			}
 		})
+	}
+}
+
+// oneTurnToyDriver is toyDriver for a harness that runs one turn per process.
+type oneTurnToyDriver struct{ *toyDriver }
+
+func (oneTurnToyDriver) OneTurnPerProcess() {}
+
+// A steer held during the only turn a one-turn process runs is refused, and
+// the turn's result is the task's: the steer is not written into a pipe the
+// harness never reads again, which used to count a turn that never ran and
+// end the task stream-ended-without-result.
+func TestAOneTurnProcessRefusesAHeldSteerAndKeepsItsResult(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-toy-g7", "task-toy-oneturn"
+	origin := submit(t, c, session, taskID, "opening")
+	dir := t.TempDir()
+	started, steered := filepath.Join(dir, "started"), filepath.Join(dir, "steered")
+	// Like core-agent-harness: one message read, the result written while
+	// stdin is still open, then a moment's cleanup and a clean exit.
+	harness := stub(t, fmt.Sprintf(`
+echo 'S toy-oneturn'
+read first || exit 1
+: > %q
+for i in $(seq 1 50); do [ -e %q ] && break; sleep 0.1; done
+sleep 0.5
+echo 'OK turn one'
+sleep 1
+exit 0
+`, started, steered))
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.Driver = oneTurnToyDriver{&toyDriver{hold: true}}
+	done := runAdapter(context.Background(), cfg)
+	waitPath(t, started, "the harness never started its turn")
+	publishSteerFor(t, c, origin, session, "STEERWORD late")
+	if err := os.WriteFile(steered, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := waitOutcome(t, done, waitDeadline)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	if got := artifactText(foldTask(t, c, session, taskID), lib.ArtifactResult); got != "turn one" {
+		t.Errorf("result %q, want the turn's own", got)
+	}
+	if refusalBeforeTerminal(t, url, session, taskID) < 0 {
+		t.Error("the held steer was not refused")
 	}
 }

@@ -25,7 +25,7 @@
 # gives, and the recommended remedy are the judge's, against `expected_output`.
 # The rule prints one note per pool the template can land on, and
 # cgroup-blind-jvm names no pool, so slot a's note column carries one per pool
-# of the cluster (default-pool, idle-batch-pool and pinned-inference-pool),
+# of the cluster (a pool that holds no node gets its note too),
 # each reading `cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm
 # container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre (JDK
 # 8u302, below 8u372) on pool <pool>, already on cgroup v2; not an upgrade
@@ -113,8 +113,8 @@ expected_output: >-
   Deployment seeded-shapes/cgroup-blind-jvm container jvm runs
   docker.io/library/eclipse-temurin:8u302-b08-jre (JDK 8u302, below 8u372) on
   pool default-pool, already on cgroup v2; not an upgrade risk", followed on
-  the same line, after "; ", by the same note for idle-batch-pool and
-  pinned-inference-pool as the report prints them, and for seeded-b, seeded-c
+  the same line, after "; ", by the same note for each other pool of the
+  cluster as the report prints them, and for seeded-b, seeded-c
   and seeded-d "cgroup-v2-runtime: none". It cites no CVE identifiers and
   changes nothing.
 infrastructure:

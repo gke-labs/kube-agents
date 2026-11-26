@@ -46,10 +46,11 @@ type Health struct {
 	// DroppedAnswers counts worker answers for tasks they don't hold that
 	// were dropped over a pod's budget, since start.
 	DroppedAnswers int64
-	// SupervisorFallbacks counts terminals written on the five-token
-	// supervisor subject because the configured six-token one failed: a grant
-	// that hasn't reached this connection yet, or was taken away (#5301).
-	SupervisorFallbacks int64
+	// SupervisorGiveUps counts profile tasks settled without a terminal on a
+	// latched install (#5301): the six-token terminal refused by the server's
+	// permissions for DroppedTerminalGiveUp (a grant that never reached this
+	// connection). Each is logged at Error as ReasonTerminalUnpublished.
+	SupervisorGiveUps int64
 	// OpenBreakers are the (profile, tier) pairs, as profile/tier, whose
 	// breaker is open, holding every new submission queued, and
 	// HalfOpenBreakers those past the cooldown, trying one task at a time
@@ -104,7 +105,7 @@ func (d *Dispatcher) Health() Health {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	h := Health{Running: map[string]int{}, Offering: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{}, Breaker: map[string]int{}, HandOffFailed: map[string]int{},
-		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load(), SupervisorFallbacks: d.supervisorFallbacks.Load()}
+		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load(), SupervisorGiveUps: d.supervisorGiveUps.Load()}
 	// offering is the tasks out on offer: a waiting entry for one is not
 	// forgotten while its offer round runs, however long the accept
 	// timeouts make it.
@@ -151,7 +152,7 @@ func (d *Dispatcher) Health() Health {
 func (d *Dispatcher) logHealth() {
 	h := d.Health()
 	d.log.Info("dispatcher health", "running", h.Running, "offering", h.Offering, "waiting", h.Waiting, "noWorker", h.NoWorker,
-		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers, "supervisorFallbacks", h.SupervisorFallbacks)
+		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers, "supervisorGiveUps", h.SupervisorGiveUps)
 	if h.JobAdmission != "" {
 		d.log.Warn(jobRefusedHint, "err", h.JobAdmission)
 	}
