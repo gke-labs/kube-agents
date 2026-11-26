@@ -3353,9 +3353,10 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # one-file pull request, for a person who knows to add the selector to it.
 #
 # The stockout collector also sets `reserved-pool` on a §3.10(d) finding, a
-# node pool whose named reservation is in none of its zones. Each fix creates
+# node pool whose named reservation is in none of its zones, and on a §3.11
+# finding for `scale.up.error.reservation.not.found`. Each fix creates
 # a reservation, which is billed from the moment it exists, or replaces the
-# pool. The SOP has that finding published as `manual`, and the marker keeps a
+# pool. The SOP has each finding published as `manual`, and the marker keeps a
 # `manifest` the model wrote anyway out of the sweep.
 #
 # The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)

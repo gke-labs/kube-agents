@@ -40,7 +40,9 @@ pinned by `test_fleet_stockout.py` against captured responses:
   `jsonPayload.resultInfo.results[].errorMsg.{messageId, parameters[]}` is a
   scale-up that was attempted and failed — the live sample carried
   `scale.up.error.out.of.resources` with the affected instance group in
-  `parameters[0]`. `jsonPayload.noDecisionStatus.noScaleUp
+  `parameters[0]`, and an entry that a throwaway cluster (GKE 1.35.8) logged
+  on 2026-11-18 carries `scale.up.error.reservation.not.found` in the same
+  shape. `jsonPayload.noDecisionStatus.noScaleUp
   .unhandledPodGroups[].napFailureReasons[].messageId` is the
   node-auto-provisioning side, which never gets as far as an attempt. Healthy
   ticks carry neither and write `jsonPayload.status` instead.
@@ -649,7 +651,8 @@ MISSING_RESERVATION_IMPACT = (
     "pool's zones, so the pool cannot add a node; with autoscaling on, the autoscaler reports "
     "`scale.up.error.reservation.not.found`."
 )
-# The `needs_triage` marker on a §3.10(d) finding: each fix creates billed
+# The `needs_triage` marker on a §3.10(d) finding, and on a §3.11 finding for
+# `scale.up.error.reservation.not.found`: each fix creates billed
 # capacity or replaces the node pool, so the automatic sweep opens no pull
 # request for it even if the published remediation is a manifest. Read by
 # `triage_markers` in audit_report.py, as `NEW_COMPUTE_CLASS_TRIAGE` is.
@@ -658,6 +661,7 @@ RESERVED_POOL_TRIAGE = "reserved-pool"
 # removes them: a cluster's pools bound to named reservations, and a project's
 # `{reservation name: zones}`.
 RESERVED_POOLS_KEY = "_reserved_pools"
+RESERVATION_ZONES_KEY = "_reservation_zones"
 # §3.11 for `scale.up.error.reservation.not.found`: the sentence of this id,
 # since the check's own sentence is about supply, quota and pod IPs.
 RESERVATION_NOT_FOUND_IMPACT = (
@@ -671,7 +675,6 @@ SCALE_UP_ERROR_KIND = "ScaleUpError"
 # `collect_fleet`, which removes it: §3.10(d) files the same fault on the
 # node pool, and one fault is one finding.
 RESERVATION_SIGN_GROUPS_KEY = "_reservation_sign_groups"
-RESERVATION_ZONES_KEY = "_reservation_zones"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
@@ -2184,10 +2187,10 @@ def reservations_argv(project: str) -> list[str]:
 
 
 def reserved_pool(pool: dict, project: str) -> dict | None:
-    """The zones and the `(owner project, name)` reservations of a production
-    node pool that consumes only named reservations (§3.10(d)); None for every
-    other pool. Run inside `collect_cluster`, so a value it cannot read costs
-    that cluster and not the fleet."""
+    """The zones, the `(owner project, name)` reservations and the instance
+    groups of a production node pool that consumes only named reservations
+    (§3.10(d)); None for every other pool. Run inside `collect_cluster`, so a
+    value it cannot read costs that cluster and not the fleet."""
     config = pool.get("config") or {}
     affinity = config.get("reservationAffinity") or {}
     if affinity.get("consumeReservationType") != POOL_SPECIFIC_RESERVATION:
@@ -2242,7 +2245,11 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
 
     Run by `collect_fleet` after the cluster reads and the project reads, since
     each holds one half. `zones_by_project` has the projects whose reservations
-    were read; `swept` has every project of the run."""
+    were read; `swept` has every project of the run.
+
+    It also removes the entry's §3.11 candidate for
+    `scale.up.error.reservation.not.found` when each instance group that the
+    autoscaler named is of a pool filed here."""
     slug = "reservation-mismatch-risk"
     unread: list[str] = []
     outside: list[str] = []
@@ -2399,6 +2406,9 @@ def check_autoscaler_out_of_resources(
     them: the fix is then a new class, not an edit to one, and a finding
     naming no group, or one this cannot place, is marked too, since the
     create case is the one the sweep must not open unattended.
+
+    A `reservation.not.found` finding carries its own impact sentence and is
+    marked `RESERVED_POOL_TRIAGE`, class-backed or not.
     """
     hits = []
     for message_id in sorted(message_ids):
