@@ -965,7 +965,14 @@ and nobody for a parent refused outright, such as one at the depth cap. The chec
 the cluster the worker picks for a profile that takes a target (that it is in scope, and a profile
 pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the delegation, which
 still refuses there. A scheduled run of a delegating profile carries the list too, built
-the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
+the same way when the trigger ingress submits it. Beside the list, under the same gate, rides the
+`scopeClusters` part (`spec-a2a-payloads.md`): one page of the clusters a `cluster` child would be
+accepted for, from the resolved scope's `clusters` map, each held to the delegation's own scope check
+and the parent's scope (a profile's tiers and pins are left to the delegation), with the count, a
+reserved empty cursor, the projects in scope whose clusters are listed elsewhere (explicit and
+management projects, members not yet listed), and `unknown` with `truncated` when the document
+isn't `ok` or carries no map (dropped for its 900 KiB budget, or absent), or when the scope draws no boundary. The
+delegate tool names the page once in its own description when an agent on the list takes a cluster. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
@@ -3015,7 +3022,7 @@ one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the 
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
 (`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
-escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat adapter draws it too (below); Discord and the console ignore it. A tap is never a turn,
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat and Teams adapters draw it too (below, and "The Teams adapter"); Discord and the console ignore it. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -3045,7 +3052,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
+member id, Google Chat email or Teams sender id, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -3167,6 +3174,9 @@ turns it off with `spec.integration.googleChat.answerFeedback: false` (default `
 operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. Either name is
 one switch for every backend the gateway holds (`AnswerFeedbackOff`); a tap or note
 click on a Google Chat message already posted is logged and acked and changes nothing.
+Teams has no CR field yet: `A2A_TEAMS_ANSWER_FEEDBACK=false` on the controller-manager Deployment
+is carried to a gateway that holds Teams under the same name (`a2aTeamsAnswerFeedbackEnvVar`),
+and is the same one switch.
 
 ## The Teams adapter (added 11/16)
 
@@ -3255,6 +3265,24 @@ and the answer on the line are the ones "Who may press Stop" and "The Stop butto
 plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`
 is the way to stop there. A typed `stop` on a task with a line is answered on the line as a
 press is (`isChatTypedStop`), so a line never keeps a live button beside a posted "cancel sent".
+
+An answer the relay marked for feedback carries its rating controls on the same card
+(`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
+like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
+alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
+the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
+give, nor Google Chat's private card; so a 👎 is recorded when it
+is sent, with a note or without one, and has no Cancel. The adapter checks the presser as the
+gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the pull loop, and
+redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
+rating because the card is the conversation's; a card the line would push past the activity
+budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
+The form's kept-for line is drawn before any press, so it always names the question. It remembers a bounded number of rated messages
+(`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
+recorded without the answer's text and without the redraw, and a re-rating that carries no
+answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
+names a post (`postKindOf`), so an alert its triage edits stays as it was.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object

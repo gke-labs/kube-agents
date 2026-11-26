@@ -1018,6 +1018,19 @@ source "{_COMMON_SH}"
         proc = self._run_common_func('get_registry_prefix', env={"REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX})
         self.assertEqual(proc.stdout.strip(), MOCK_CUSTOM_REGISTRY_PREFIX)
 
+    def test_get_candidate_registry_prefix(self):
+        """Unset or empty, a release reads commit images where it is published."""
+        registry = {"REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX}
+        for unset in ({}, {"CANDIDATE_REGISTRY_PREFIX": ""}):
+            proc = self._run_common_func('get_candidate_registry_prefix', env={**registry, **unset})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), MOCK_CUSTOM_REGISTRY_PREFIX)
+
+        for value in (MOCK_AR_REGISTRY_PREFIX, MOCK_AR_REGISTRY_PREFIX + "/"):
+            proc = self._run_common_func('get_candidate_registry_prefix', env={**registry, "CANDIDATE_REGISTRY_PREFIX": value})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), MOCK_AR_REGISTRY_PREFIX)
+
     def test_required_release_images_registry(self):
         cmd = 'echo "IMAGES=${REQUIRED_RELEASE_IMAGES[*]}"'
         proc = self._run_common_func(cmd)
@@ -2474,6 +2487,25 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
             existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{sha}" for img in images],
         )
         return str(bin_dir)
+
+    def test_the_gate_looks_in_the_registry_it_is_given(self):
+        """A second argument names the registry; without one it is the registry
+        prefix. CANDIDATE_REGISTRY_PREFIX alone moves no check: only a release's
+        own reads pass it, so a caller that installs from the registry prefix
+        keeps checking there."""
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+        )
+        env = {**self._REGISTRY, "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX}
+
+        given = self._run(f'check_commit_images_exist "{candidate}" "{MOCK_AR_REGISTRY_PREFIX}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
+        self.assertEqual(given.returncode, 0, given.stderr)
+        default = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
+        self.assertEqual(default.returncode, 1, default.stderr)
 
     def test_the_gate_accepts_a_candidate_with_every_image_its_own_list_names(self):
         """Red before the fix: the gate asked for this checkout's longer list."""

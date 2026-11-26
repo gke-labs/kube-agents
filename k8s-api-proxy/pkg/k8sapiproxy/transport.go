@@ -25,6 +25,12 @@ type CallerIdentity struct {
 // telling the caller its credential is wrong.
 var ErrAuthenticationUnavailable = errors.New("caller authentication is unavailable")
 
+// ErrCallerRefused is the error a CallerAuthenticator wraps when it identified the caller's
+// credential as its own kind and refused it, such as a pod's ServiceAccount token sent from
+// another address. The handler answers 401 as for any refusal; a chain of authenticators
+// stops there and does not offer the credential to the next one.
+var ErrCallerRefused = errors.New("caller refused")
+
 // CallerAuthenticator identifies the caller of a request, returning an error when it is not
 // an authorized sandbox. The caller gets a fixed 401, or a fixed 503 when the error wraps
 // ErrAuthenticationUnavailable, never the error's text.
