@@ -2,28 +2,15 @@ name: Copy Images to the Candidate Repository
 
 # Copies a published commit's images (not rebuilt) from GHCR into the candidate
 # repository in Artifact Registry, under the same `:<sha>` tags and at the same
-# digests, once "Publish Images to GHCR" has finished successfully for it.
+# digests, for a commit that is on GHCR and not there.
 #
-# Its own workflow, not a job of the publish: a publish run holds a concurrency
-# group that keeps one pending run, so anything that lengthens it costs commits
-# on `main` their images, and autopush-deploy.yml starts on that run's
-# conclusion. Here a copy that fails is this workflow's own red run and touches
-# neither. Unsigned on purpose: the signatures are on the GHCR references.
-#
-# It starts on its own for `main` alone: a `workflow_run` job that takes a
-# cloud credential runs for the default branch's runs only. A dispatch copies
-# one commit by hand, whatever line it is on: a `release/<X.Y>` publish, a copy
-# that failed, or a commit published before this workflow existed.
+# "Publish Images to GHCR" pushes every commit it builds to both registries, so
+# nothing starts this on its own. A dispatch copies one commit by hand: one
+# published by a release line whose own copy of the publish workflow pushes to
+# GHCR alone, or one published before the publish workflow pushed to both.
+# Unsigned on purpose: the signatures are on the GHCR references.
 
 on:
-  # zizmor: ignore[dangerous-triggers]
-  workflow_run:
-    workflows:
-      - "Publish Images to GHCR"
-    types:
-      - completed
-    branches:
-      - main
   #checkov:skip=CKV_GHA_7:A hand-started copy has to name the commit whose images it copies
   workflow_dispatch:
     inputs:
@@ -38,25 +25,16 @@ permissions:
 # One group per commit: a copy is never displaced by another commit's, and two
 # for the same commit run one after the other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || inputs.commit_sha }}
+  group: ${{ github.workflow }}-${{ inputs.commit_sha }}
   cancel-in-progress: false
 
 jobs:
   copy:
     name: Copy Images to the Candidate Repository
     runs-on: ubuntu-latest
-    # Only a push's publish on `main`, from this repository, that succeeded.
-    # The head_branch check repeats the trigger's `branches:` filter in the
-    # place a job's gate is read. A dispatch for a commit that was never
-    # published is not an error: the script says it has nothing to copy.
-    if: |
-      github.repository == 'gke-labs/kube-agents' &&
-      (github.event_name == 'workflow_dispatch' || (
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_repository.full_name == github.repository &&
-        github.event.workflow_run.event == 'push' &&
-        github.event.workflow_run.head_branch == 'main'
-      ))
+    # A dispatch for a commit that was never published is not an error: the
+    # script says it has nothing to copy.
+    if: github.repository == 'gke-labs/kube-agents'
     # Room for a first copy with no layer in the destination yet; a commit
     # after it shares most of its layers and takes a fraction of this.
     timeout-minutes: 45
@@ -64,7 +42,7 @@ jobs:
       contents: read
       id-token: write
     env:
-      COMMIT_SHA: ${{ github.event.workflow_run.head_sha || inputs.commit_sha }}
+      COMMIT_SHA: ${{ inputs.commit_sha }}
       CANDIDATE_REGISTRY_PREFIX: us-docker.pkg.dev/kube-agents-prow/kube-agents-candidates
     steps:
       # The scripts are the default branch's, on a dispatch from another ref
