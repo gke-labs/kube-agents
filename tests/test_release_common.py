@@ -2543,6 +2543,9 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
             bin_dir,
             existing_images=[f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
         )
+        # No Google credential, so the Artifact Registry probe cannot ask and
+        # docker, which the release job logs in, answers.
+        create_mock_gcloud_token_binary(bin_dir, token="")
         env = {**self._REGISTRY, "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX}
 
         given = self._run(f'check_commit_images_exist "{candidate}" "{MOCK_AR_REGISTRY_PREFIX}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
