@@ -142,10 +142,10 @@ The requester keys follow
 Decided by bnaylor on 2026-11-26
 ([#7308](https://github.com/gke-labs/kube-agents/issues/7308)): one line for a tool call.
 
-The adapter's per-tool line is the one line for a tool call. The hooks design (pull request
-[#7253](https://github.com/gke-labs/kube-agents/pull/7253), open, not merged) owns its source and
-its fields; this design owns its task keys and how it ships. This line is the trail of this
-design, and the adapter copies no activity entry to stderr.
+The adapter's per-tool line is the one line for a tool call. The hooks design
+([`profile-worker-hooks.md`](profile-worker-hooks.md)) owns its source and its fields; this design
+owns its task keys and how it ships. This line is the trail of this design, and the adapter copies
+no activity entry to stderr.
 
 Rows 2 and 3 of the hooks design give the line, which that design calls the per-tool record. The
 adapter writes it at the start of a tool call and at its result, with the task id, a call id, the
@@ -218,8 +218,8 @@ bus.
 
 - Usage measurement: the usage counters and their poller, the chat metrics, the outcome counts
   and the attribution tag.
-- The hook and plugin mechanism for profile workers (#6671; its design is pull request
-  [#7253](https://github.com/gke-labs/kube-agents/pull/7253)).
+- The hook and plugin mechanism for profile workers (#6671; its design is
+  [`profile-worker-hooks.md`](profile-worker-hooks.md)).
 - The sidecar, the plugins and the hook of the platform agent's pod. They stay until that pod
   retires.
 - A collector of our own, and a change of the endpoint ladder.
@@ -285,4 +285,4 @@ For #6674:
 
 What these lines need from other work: the broker lines and the log-read line change
 `credential_proxy.py`, so they take their turn in the order of work on that file. The per-tool line
-waits for the hooks design (pull request #7253, open, not merged).
+waits for the work of the hooks design ([`profile-worker-hooks.md`](profile-worker-hooks.md)).
