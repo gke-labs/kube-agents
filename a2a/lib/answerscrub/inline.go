@@ -1158,9 +1158,10 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 	return redactSpans(s, spans)
 }
 
-// scrubEnvRest is scrubInlineTo, run over the text after an env value's
-// first , } or ] for what it tracks; set in init, since the rules include
-// scrubEnvNameValuePairs itself.
+// scrubEnvRest is scrubInlineTo, run for what it tracks over env value text
+// the env rule redacted whole: an unquoted value read to its line's end, a
+// quoted value's content, or a commented-out value; set in init, since the
+// rules include scrubEnvNameValuePairs itself.
 var scrubEnvRest func(s string, sink secretSink) string
 
 func init() { scrubEnvRest = scrubInlineTo }
