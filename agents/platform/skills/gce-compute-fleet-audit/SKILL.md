@@ -21,7 +21,7 @@ python3 /opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/compu
 
 ## 2. Evaluate Findings Against SOP Checks
 
-Read the manifest and follow `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `checks_unevaluated`, `limitations` and `candidates`:
+Read the manifest and follow `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2, which owns the copy rules for `commands`, `checks_not_applicable`, `checks_unevaluated`, `limitations` and `candidates`, and governs `notes` and `noted_objects` too — `finish` adopts those two from the manifest itself, so you copy nothing from them:
 
 All four roster checks are collector-verified; none is yours to hand-run.
 

@@ -126,8 +126,11 @@ func seenSecretKeySkipped(key string, saToken bool) bool {
 // number only). So neither pool can flush the other, and no result, a
 // forged or huge one included, can flush what earlier results carried; a
 // task whose results hold more values than the pools keep tracks the
-// earliest ones. A value both pools would hold is kept in the Secret pool
-// when it can take the value, else in the shape pool: in exactly one.
+// earliest ones. A spare form of a value (addSpareLocked) is the one
+// exception: it takes only free room, and any result's spare is dropped
+// before another entry when room is needed. A value both pools would
+// hold is kept in the Secret pool when it can take the value, else in the
+// shape pool: in exactly one.
 type Seen struct {
 	mu      sync.Mutex
 	set     map[string]bool // value -> held in the Secret pool
@@ -148,6 +151,9 @@ type seenPool struct {
 type seenEntry struct {
 	v   string
 	gen uint64
+	// spare: an extra form of a value (addSpareLocked), dropped before any
+	// other entry whenever room is needed.
+	spare bool
 }
 
 type seenCharge struct {
@@ -192,8 +198,12 @@ func (s *Seen) addPlain(v string, fromSecret bool, gen uint64) {
 }
 
 // addEncoded tracks a Secret data value: the base64 form as given, and the
-// decoded value when it decodes to text. A value that decodes to fewer
-// than seenSecretMinBytes is not tracked in either form.
+// decoded value when it decodes to text, trimmed, with that trimmed value's
+// own base64 when trimming changed it (a file's or echo's trailing newline
+// gone, as a re-encoding of the value would have it). That third form is a
+// spare (addSpareLocked): it never takes the place of another value. A
+// value that decodes to fewer than seenSecretMinBytes is not tracked in
+// either form.
 func (s *Seen) addEncoded(b64 string, gen uint64) {
 	b64 = strings.TrimSpace(b64)
 	raw, err := base64.StdEncoding.DecodeString(b64)
@@ -206,7 +216,39 @@ func (s *Seen) addEncoded(b64 string, gen uint64) {
 	if err != nil || !utf8.Valid(raw) {
 		return
 	}
-	s.addLocked(strings.TrimSpace(string(raw)), true, gen)
+	trimmed := strings.TrimSpace(string(raw))
+	s.addLocked(trimmed, true, gen)
+	if trimmed != string(raw) {
+		s.addSpareLocked(base64.StdEncoding.EncodeToString([]byte(trimmed)), gen)
+	}
+}
+
+// addSpareLocked tracks v in the Secret pool for generation gen only while
+// gen's allowance and the pool both have room for it, evicting nothing,
+// and as a spare: the first entry dropped when another value needs room.
+// So the Secret pool's other entries are exactly what they would be with
+// no spare form tracked at all.
+func (s *Seen) addSpareLocked(v string, gen uint64) {
+	if s.closed || !seenSecretSized(v) || strings.Contains(v, Redacted) {
+		return
+	}
+	if _, held := s.set[v]; held {
+		return
+	}
+	if s.set == nil {
+		s.set = make(map[string]bool)
+		s.charge = make(map[seenCharge]seenUse)
+	}
+	p, maxEntries, maxBytes, allowEntries, allowBytes := s.pool(true)
+	key := seenCharge{gen, true}
+	u := s.charge[key]
+	if u.entries+1 > allowEntries || u.bytes+len(v) > allowBytes || len(p.entries)+1 > maxEntries || p.bytes+len(v) > maxBytes {
+		return
+	}
+	p.entries = append(p.entries, seenEntry{v, gen, true})
+	p.bytes += len(v)
+	s.set[v] = true
+	s.charge[key] = seenUse{u.entries + 1, u.bytes + len(v)}
 }
 
 func seenSecretSized(v string) bool {
@@ -223,6 +265,12 @@ func (s *Seen) addLocked(v string, fromSecret bool, gen uint64) {
 		s.charge = make(map[seenCharge]seenUse)
 	}
 	inSecret, held := s.set[v]
+	// Held only as a spare: added as if not held, the spare dropped only
+	// once the add is sure to succeed, so a refused add keeps it tracked.
+	spare := held && inSecret && s.secret.holdsSpare(v)
+	if spare {
+		inSecret, held = false, false
+	}
 	if held && (!fromSecret || inSecret) {
 		return
 	}
@@ -235,30 +283,54 @@ func (s *Seen) addLocked(v string, fromSecret bool, gen uint64) {
 	if allowEntries < 1 || len(v) > allowBytes {
 		return
 	}
+	// Other results' spares can be dropped for it too.
+	for _, e := range p.entries {
+		if e.spare && e.gen != gen {
+			own.entries++
+			own.bytes += len(e.v)
+		}
+	}
 	if len(p.entries)-own.entries+1 > maxEntries || p.bytes-own.bytes+len(v) > maxBytes {
 		s.refused++
 		return
+	}
+	if spare {
+		s.removeLocked(&s.secret, true, func(e seenEntry) bool { return e.spare && e.v == v })
 	}
 	if held {
 		// A shape-caught value a Secret also holds moves to the Secret pool.
 		s.removeLocked(&s.shape, false, func(e seenEntry) bool { return e.v == v })
 	}
+	// A spare goes first, its own result's within the allowance and any
+	// result's within the pool, then gen's own oldest entry.
 	for u := s.charge[key]; u.entries+1 > allowEntries || u.bytes+len(v) > allowBytes; u = s.charge[key] {
-		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
+		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen && e.spare }) &&
+			!s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
 			return // nothing of its own left to replace: refused
 		}
 	}
 	for len(p.entries)+1 > maxEntries || p.bytes+len(v) > maxBytes {
-		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
+		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.spare }) &&
+			!s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
 			s.refused++
 			return
 		}
 	}
-	p.entries = append(p.entries, seenEntry{v, gen})
+	p.entries = append(p.entries, seenEntry{v, gen, false})
 	p.bytes += len(v)
 	s.set[v] = fromSecret
 	u := s.charge[key]
 	s.charge[key] = seenUse{u.entries + 1, u.bytes + len(v)}
+}
+
+// holdsSpare says whether v is one of p's spares.
+func (p *seenPool) holdsSpare(v string) bool {
+	for _, e := range p.entries {
+		if e.spare && e.v == v {
+			return true
+		}
+	}
+	return false
 }
 
 // removeLocked drops the oldest entry of p that match says, and says
@@ -483,7 +555,7 @@ func (c *toolResultCollector) text(t string, depth int) {
 		var v any
 		if json.Unmarshal([]byte(trimmed), &v) == nil {
 			c.value(v, depth+1)
-			c.shapeScan(scan)
+			c.shapeScan(blankMultilineJSONStrings(scan))
 			return
 		}
 		if strings.Contains(trimmed, "Secret") {
@@ -494,6 +566,71 @@ func (c *toolResultCollector) text(t string, depth int) {
 		c.yamlSecrets(scan)
 	}
 	c.shapeScan(scan)
+}
+
+// blankMultilineJSONStrings is JSON text t for the shape rules that pair
+// sibling fields (an env entry's name and value, a flag and its value in an
+// args list): every string token holding an escaped line break inside it is
+// emptied in place, since c.value already reads it as text of its own and
+// its \n would run one line's value into the next. A string whose escaped
+// breaks all trail it ("value\n") is kept: nothing follows the break to run
+// into, and an answer may quote the value in that escaped spelling. Keys
+// keep their order; a string cut short at the end of t is left as it is.
+func blankMultilineJSONStrings(t string) string {
+	if !strings.Contains(t, `\n`) && !strings.Contains(t, `\r`) {
+		return t
+	}
+	var sb strings.Builder
+	sb.Grow(len(t))
+	for i := 0; i < len(t); {
+		if t[i] != '"' {
+			sb.WriteByte(t[i])
+			i++
+			continue
+		}
+		end, multiline := i+1, false
+		for end < len(t) && t[end] != '"' {
+			if t[end] == '\\' && end+1 < len(t) {
+				if t[end+1] == 'n' || t[end+1] == 'r' {
+					multiline = true
+				}
+				end++
+			}
+			end++
+		}
+		if end >= len(t) {
+			sb.WriteString(t[i:])
+			break
+		}
+		if multiline && !onlyTrailingBreaks(t[i+1:end]) {
+			sb.WriteString(`""`)
+		} else {
+			sb.WriteString(t[i : end+1])
+		}
+		i = end + 1
+	}
+	return sb.String()
+}
+
+// onlyTrailingBreaks reports whether the escaped JSON string body b holds
+// its escaped line breaks (\n, \r) only at its end, after some other text.
+func onlyTrailingBreaks(b string) bool {
+	trimmed := b
+	for {
+		if t, ok := strings.CutSuffix(trimmed, `\n`); ok {
+			trimmed = t
+			continue
+		}
+		if t, ok := strings.CutSuffix(trimmed, `\r`); ok {
+			trimmed = t
+			continue
+		}
+		break
+	}
+	if trimmed == "" || strings.HasSuffix(trimmed, `\`) {
+		return false
+	}
+	return !strings.Contains(trimmed, `\n`) && !strings.Contains(trimmed, `\r`)
 }
 
 // shapeScan runs the shape rules over scan, within what is left of the
@@ -549,7 +686,11 @@ func (c *toolResultCollector) trackShape(v string) {
 // read before it was one (kubectl get secrets -o json, cut short); a
 // single Secret cut there, with no kind read at all, is not read. An item
 // of a SecretList's items is a Secret: the API server's list (kubectl get
-// --raw, a curl through the API proxy) leaves kind off its items.
+// --raw, a curl through the API proxy) leaves kind off its items. When
+// the list's own kind comes after its items (keys sorted: jq -S, a
+// re-marshalled map), a kind-less item is held until the list settles. An
+// object cut before its type was read may be a service-account token, so
+// its namespace is not taken.
 func (c *toolResultCollector) jsonSecretScan(t string) {
 	type pair struct {
 		key, value string
@@ -561,19 +702,44 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 		haveKey    bool
 		kind       string
 		saToken    bool
+		typeSeen   bool
 		owner      *frame // a data block's object
 		parent     *frame
 		stringData bool
 		pairs      []pair
 		// an array's items read whole so far: Secrets, and anything else
 		secretItems, otherItems int
+		// kind-less items of this object's items, held until its kind is known
+		deferred []*frame
 	}
 	var stack []*frame
+	take := func(f *frame, cut bool) {
+		saToken := f.saToken || cut && !f.typeSeen
+		for _, p := range f.pairs {
+			switch {
+			case seenSecretKeySkipped(p.key, saToken):
+			case p.stringData:
+				c.addSecret(p.value)
+			default:
+				c.addSecretEncoded(p.value)
+			}
+		}
+	}
 	settle := func(f *frame, cut bool) {
 		if !f.object || f.owner != nil {
 			return
 		}
+		if f.kind == "SecretList" {
+			for _, d := range f.deferred {
+				take(d, false)
+			}
+		}
+		f.deferred = nil
 		kind := f.kind
+		if p := f.parent; !cut && kind == "" && p != nil && !p.object && p.parent != nil && p.parent.key == "items" && p.parent.kind == "" {
+			p.parent.deferred = append(p.parent.deferred, f)
+			return
+		}
 		if p := f.parent; kind == "" && p != nil && !p.object && p.parent != nil && p.parent.kind == "SecretList" && p.parent.key == "items" {
 			kind = "Secret" // the API server's SecretList leaves kind off its items
 		}
@@ -590,15 +756,7 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 		if kind != "Secret" {
 			return
 		}
-		for _, p := range f.pairs {
-			switch {
-			case seenSecretKeySkipped(p.key, f.saToken):
-			case p.stringData:
-				c.addSecret(p.value)
-			default:
-				c.addSecretEncoded(p.value)
-			}
-		}
+		take(f, cut)
 	}
 	valueDone := func() {
 		if n := len(stack); n > 0 {
@@ -663,8 +821,9 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 					top.owner.pairs = append(top.owner.pairs, pair{top.key, str, top.stringData})
 				case top.key == "kind":
 					top.kind = str
-				case top.key == "type" && str == "kubernetes.io/service-account-token":
-					top.saToken = true
+				case top.key == "type":
+					top.typeSeen = true
+					top.saToken = str == "kubernetes.io/service-account-token"
 				}
 			}
 			top.haveKey = false
@@ -702,7 +861,8 @@ func (c *toolResultCollector) yamlSecrets(t string) {
 			col := m[1] - 1 // the item's own keys start here
 			item := []string{line[col:]}
 			for _, next := range lines[i+1:] {
-				if strings.TrimSpace(next) == "" {
+				// A blank or comment line, at any column, does not end it.
+				if t := strings.TrimSpace(next); t == "" || strings.HasPrefix(t, "#") {
 					item = append(item, "")
 					continue
 				}

@@ -34,6 +34,7 @@ import socket
 import socketserver
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -9101,6 +9102,20 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
 
 _GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE
 
+# `git push --recurse-submodules=on-demand` (or `only`) also pushes inside each
+# submodule, to that submodule's own remote, with the same refspec. The push
+# guard judges the repository that the command names, so it refuses the flag
+# with each value but `no`. git reads more words as off (`false`, `off`, `0`);
+# the guard takes the one word. The flag outranks the `push.recurseSubmodules`
+# pin of `GIT_FORCED_CONFIG`, so this refusal is the control for the flag. The
+# text is fixed.
+GIT_PUSH_RECURSE_SUBMODULES_OPTION = "--recurse-submodules"
+GIT_PUSH_RECURSE_SUBMODULES_OFF = "no"
+GIT_PUSH_RECURSE_SUBMODULES_REFUSAL = (
+    "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+    "inside each submodule too, and the broker judges only the repository that the command names."
+)
+
 # The remote a push is judged against when it names none, or names one that
 # `_detect_repo_default_branch` cannot look up.
 GIT_DEFAULT_REMOTE = "origin"
@@ -9130,6 +9145,16 @@ GIT_PUSH_REF_FORMAT_REFUSAL = (
     "`git push` from a clone that uses the '{ref_format}' ref format is refused: the broker reads "
     "the remote's default branch from the files ref format only, so it cannot tell a push to "
     "that branch from another."
+)
+# A linked worktree, a submodule and a clone made with `--separate-git-dir` have a `.git`
+# that is a file with the path of the git directory, and a `.git` can be a symbolic link.
+# The guard follows neither, so it refuses each push from such a place, by name. The text
+# is fixed: it shows no path and no byte of a file that the agent can write.
+GIT_PUSH_LAYOUT_REFUSAL = (
+    "`git push` is refused: `.git` at the working directory or at a folder above it is not a "
+    "folder (a linked worktree, a submodule, a clone with a separate git directory, or a file or "
+    "a link named `.git`). The broker reads the remote's default branch only under a `.git` "
+    "folder and follows no file or link, so here it cannot tell a push to that branch from another."
 )
 
 # What `_detect_repo_default_branch` accepts as a remote *name*. The
@@ -9312,7 +9337,8 @@ _PROVIDER_RE = re.compile(r"[a-z][a-z0-9]{0,31}")
 # layer. That layer outranks system, global and repo-local config, which is
 # the point: the agent owns the working tree, so `.git/config` is a file it
 # can write, and every key below turns a string in that file into a command
-# the credential holder executes.
+# the credential holder executes. `push.recurseSubmodules` is the one key that
+# is here for another reason; its entry says which.
 #
 #   core.hooksPath   `.git/hooks/pre-commit` is executed by `git commit`, and
 #                    `git commit` is a verb the skills issue nine times.
@@ -9378,6 +9404,23 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
     ("gpg.ssh.defaultKeyCommand", "false"),
     ("gpg.x509.program", "false"),
     ("help.autocorrect", "0"),
+    # This key is here for another reason than the ones above: it runs no command,
+    # it keeps a push in the repository that the push guard judges.
+    # `push.recurseSubmodules = on-demand` (or `only`) and `submodule.recurse =
+    # true` each make a plain `git push` also push inside each submodule, to that
+    # submodule's own remote, with the same refspec; git lets the one that it
+    # reads last decide. The agent can write both keys in `.git/config`, the argv
+    # then has no flag, and the push guard judges the repository that the command
+    # names and nothing below it. git reads this layer after each config file, so
+    # the pin decides. Measured with git 2.56 under this layer: with each of the
+    # two keys set in the repository, the push moved the default branch of the
+    # submodule's remote, and with this pin it did not. `no` is git's own
+    # default, so a push that succeeds today is the same; a repository's own
+    # `check` is turned off too. `-c` and `--config-env` are read after this
+    # layer, and the argv check refuses both. The flag `--recurse-submodules`
+    # also outranks the pin; the push guard refuses it
+    # (`GIT_PUSH_RECURSE_SUBMODULES_REFUSAL`).
+    ("push.recurseSubmodules", "no"),
 )
 
 
@@ -9779,6 +9822,44 @@ def _remote_head_path(remotes_dir: Path, remote: str) -> Path | None:
     return None
 
 
+def _git_entry_is_not_a_folder(repo_dir: Path) -> bool:
+    """Is a `.git` at `repo_dir`, or at a folder above it, something other than a folder (#7072)?
+
+    `repo_dir` is absolute; the caller resolves it.
+
+    git itself makes such a `.git`: a file with the path of the git directory, in a
+    linked worktree, a submodule and a clone made with `--separate-git-dir`. The
+    refs and the config are then in another directory, and the two reads of the
+    push guard (`_repo_ref_format`, `_detect_repo_default_branch`) look under a
+    `.git` folder or at the root of a bare layout. The caller refuses a push from
+    such a place. This test does not follow the file: it opens no file, and no
+    path that the file names.
+
+    The test is `lstat`, so a symbolic link to a folder is not a folder: a read
+    under it would be a read under the link's target. A `.git` that cannot be
+    examined counts as not a folder too.
+
+    The walk does not stop at a `.git` folder and goes to the root of the file
+    system, which is wider than git's own search. git goes past a `.git` folder
+    that it does not take as a repository, so a walk that stops at the first
+    `.git` folder can be hidden by one. The cost: one `.git` that is not a folder
+    refuses each push from each clone below it, also where git itself uses the
+    clone's own `.git` folder.
+    """
+    current = Path(repo_dir)
+    while True:
+        try:
+            if not stat.S_ISDIR(os.lstat(current / GIT_DIR_NAME).st_mode):
+                return True
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+
 def _repo_ref_format(repo_dir: Path) -> str:
     """The ref format of the clone at `repo_dir`, from its own config file, with no git call (#6593).
 
@@ -9792,9 +9873,10 @@ def _repo_ref_format(repo_dir: Path) -> str:
 
     Not read: a clone whose `.git` is a file that points to its git directory
     (a linked worktree, a submodule, a clone made with `--separate-git-dir`).
-    The answer there is `files`, in each ref format, and a push from there is
-    judged as before this check; `_detect_repo_default_branch` does not follow
-    that pointer either.
+    The answer there is `files`, in each ref format, and
+    `_detect_repo_default_branch` does not follow that pointer either. The push
+    guard asks `_git_entry_is_not_a_folder` first and refuses a push from such a
+    place, so neither answer decides a push there (#7072).
     """
     repo_root = _find_repo_root(repo_dir) or Path(repo_dir)
     for config in (repo_root / GIT_DIR_NAME / GIT_CONFIG_FILE, repo_root / GIT_CONFIG_FILE):
@@ -9890,7 +9972,8 @@ def _detect_repo_default_branch(
 
 def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | None:
     """Refuse direct pushes to protected rollout or base branches (#1498), and each push
-    from a clone whose ref format hides the remote's default branch from this check (#6593)."""
+    from a clone in another ref format than `files` (#6593) or from a place whose `.git`
+    is not a folder (#7072): there this check does not read the remote's default branch."""
     if not argv or Path(argv[0]).name != "git":
         return None
 
@@ -9973,14 +10056,22 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
             positional.extend(push_args[idx + 1:])
             break
         if arg.startswith("--"):
-            opt_name, sep, _ = arg.partition("=")
+            opt_name, sep, opt_value = arg.partition("=")
             if (
                 len(opt_name) > 2
                 and any(
                     opt.startswith(opt_name)
-                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules")
+                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", GIT_PUSH_RECURSE_SUBMODULES_OPTION)
                 )
             ):
+                # git takes the value in the same word or in the next one, and takes each
+                # prefix of the name that names one option. A prefix that names two is an
+                # error in git; here it is refused when its value is not `no`.
+                if GIT_PUSH_RECURSE_SUBMODULES_OPTION.startswith(opt_name):
+                    if not sep:
+                        opt_value = push_args[idx + 1] if idx + 1 < len(push_args) else ""
+                    if opt_value != GIT_PUSH_RECURSE_SUBMODULES_OFF:
+                        return GIT_PUSH_RECURSE_SUBMODULES_REFUSAL
                 if sep:
                     idx += 1
                     continue
@@ -10003,6 +10094,11 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
 
     if cwd:
         repo_dir = Path(cwd).resolve()
+        # Where `.git` is a file, the two reads below do not find the git directory and
+        # would say nothing; where it is a link, they would read under the link's target.
+        # The push is refused here, by name.
+        if _git_entry_is_not_a_folder(repo_dir):
+            return GIT_PUSH_LAYOUT_REFUSAL
         # The detection below reads a file that only the files ref format keeps. In
         # another format it finds nothing, so the push is refused here, by name.
         ref_format = _repo_ref_format(repo_dir)

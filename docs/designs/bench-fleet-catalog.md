@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Fifty-seven fixtures: fifty across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Fifty-nine fixtures: fifty-two across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the sixteen seeded namespaces `seeded-debug`,
@@ -104,6 +104,7 @@ fixtures are on slot `a`, across the sixteen seeded namespaces `seeded-debug`,
 defect node pools, the declared zonal pool and the pool that names a missing reservation. Slot `c` is the configuration outlier, on its control plane and on its default
 pool, and since the ComputeClass fixtures (`defects-c.tf`) also the one cluster whose only pool
 carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool,
+ComputeClass `reserved-ccc` with no pool, which names a reservation that does not exist,
 three small running workloads in `seeded-compute-class`, NodeLocal DNSCache off, and no
 NetworkPolicy anywhere, because two nightly cases read slot `c` as the cluster whose namespaces have
 none. A finding id on that cluster carries the substring `seeded-c`; the drift cases that require
@@ -155,6 +156,7 @@ its roles are never published.
 | `no-ephemeral-limit-workload`       | c       | 0   | `batch-worker-a` again: its container sets no ephemeral-storage request or limit, the defect the object carries; GKE Standard admission adds none                                                                                                                                                                                             |
 | `untainted-compute-class-pool`      | c       | 0   | `default-pool` labelled `cloud.google.com/compute-class=general-ccc` with no matching taint                                                                                                                                                                                                                                                   |
 | `manual-pools-compute-class`        | c       | 0   | ComputeClass `general-ccc`: a `nodepools` rule `default-pool` backs, two `machineFamily` rules nothing backs, auto-creation off                                                                                                                                                                                                               |
+| `missing-reservation-compute-class` | c       | 0   | ComputeClass `reserved-ccc`: a first rule that asks for the named reservation `seeded-absent-reservation`, which does not exist, a second rule `e2-standard-4`, auto-creation on, one `NoSchedule` taint, no workload; GKE marks the class misconfigured (`ReservationNotFound`)                                                              |
 | `no-nodelocal-dnscache`             | c       | 0   | The NodeLocal DNSCache add-on off on slot c, where GKE turns it on by default and every other cluster in the project has it on                                                                                                                                                                                                                |
 | `drift-peer-a`                      | a       | 1   | Nothing planted: slot `a`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                                                                                                                             |
 | `drift-peer-b`                      | b       | 1   | Nothing planted: slot `b`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                                                                                                                             |
@@ -179,6 +181,7 @@ its roles are never published.
 | `multi-process-container`           | a       | 0   | `deployment/multi-process-worker` in `seeded-shapes`, two forked workers under one 32Mi limit                                                                                                                                                                                                                                                 |
 | `node-image-coupled-agent`          | a       | 0   | `daemonset/cni-shaped-agent` in `seeded-shapes`, host networking plus `/etc/cni/net.d` mounted read-only                                                                                                                                                                                                                                      |
 | `cuda-pinned-gpu-job`               | a       | 0   | `cronjob/cuda-pinned-trainer` in `seeded-shapes`, suspended, one `nvidia.com/gpu` on an `nvidia-l4` selector with a CUDA 12.2 image                                                                                                                                                                                                           |
+| `state-sync-controller`             | a       | 0   | `deployment/state-sync-controller` in `seeded-shapes`, one replica passing `--kube-api-qps=-1` to an inert sleep process                                                                                                                                                                                                                      |
 | `scaled-zero-gateway`               | a       | 0   | `deployment/storefront` and its Gateway's proxy Deployment in `seeded-scaled-zero` at replicas 0, Gateway `storefront-edge` reporting Programmed=False (NoResources), no controller                                                                                                                                                           |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
@@ -300,13 +303,13 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` (or, for a finished Job, on `status.completionTime`) returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-five of the fifty are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Forty-seven of the fifty-two are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `cpu-burst-and-flat`, `declared-single-zone-pool`, `missing-reservation-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
-`cuda-pinned-gpu-job`), `default-pool-headroom`, `config-connector-namespaced`, `scaled-zero-gateway` and the seven roles of the ComputeClass fixtures on slot `c` (`untargeted-compute-class-workload`, `compute-class-affinity-workload`, `compute-class-toleration-workload`, `untainted-compute-class-pool`, `manual-pools-compute-class`, `no-nodelocal-dnscache`, `no-ephemeral-limit-workload`), covering
+`cuda-pinned-gpu-job`), `state-sync-controller`, `default-pool-headroom`, `config-connector-namespaced`, `scaled-zero-gateway` and the eight roles of the ComputeClass fixtures on slot `c` (`untargeted-compute-class-workload`, `compute-class-affinity-workload`, `compute-class-toleration-workload`, `untainted-compute-class-pool`, `manual-pools-compute-class`, `missing-reservation-compute-class`, `no-nodelocal-dnscache`, `no-ephemeral-limit-workload`), covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
 API deprecation, zonal skew, the upgrade-failure shapes and the stall watch between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
