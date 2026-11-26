@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -488,6 +489,36 @@ func TestTeamsReAskBeforeTheRedrawKeepsItsChoices(t *testing.T) {
 	}
 }
 
+// A card pushed out of the remembered ring takes its question with it: a
+// typed message in its conversation is then a turn of its own, with no
+// answered line posted for a card the adapter can no longer draw.
+func TestTeamsEvictedCardClosesItsQuestion(t *testing.T) {
+	a, relay := askedTeamsAdapter(t)
+	plain := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "A report."}
+	for i := 0; i < uxCap; i++ {
+		a.trackQuestion(fmt.Sprintf("other-%d", i), "teams:"+testTeamsDM, plain, &teamsChatCard{text: "a card"})
+	}
+	a.mu.Lock()
+	ux := a.uxLocked()
+	_, card := ux.cards[testTeamsPosted]
+	_, question := ux.questions[testTeamsPosted]
+	open := ux.open["teams:"+testTeamsChannel]
+	a.mu.Unlock()
+	if card || question || open == testTeamsPosted {
+		t.Fatalf("after the ring turned over: card %v, question %v, open %q; want all gone", card, question, open)
+	}
+	before := teamsCallCount(relay)
+	msg, reason := a.classify(decodeTeamsActivity(t, testTeamsActivity("f:50", "<at>Kage</at> yes please")))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != before {
+		t.Fatalf("%d calls after a typed message on an evicted question, want none", n-before)
+	}
+}
+
 // A bold line sheds the bold pairs inside it, is left plain when wrapping
 // would run into a star of its own, and never reads as a heading or a fence.
 func TestTeamsBoldLine(t *testing.T) {
@@ -498,7 +529,12 @@ func TestTeamsBoldLine(t *testing.T) {
 		{"No match for kube-*", "No match for kube-*"},
 		{"*Warning*", "*Warning*"},
 		{"# **x**", "**# x**"},
-		{"``` **x**", "**``` x**"},
+		{"``` **x**", teamsChatPlainGuard + "``` x"},
+		{"``` **/*.yaml files", teamsChatPlainGuard + "``` **/*.yaml files"},
+		{"see ``` for **/*.yaml", "see ``` for **/*.yaml"},
+		{"* Note", teamsChatPlainGuard + "* Note"},
+		{"- flag for kube-*", teamsChatPlainGuard + "- flag for kube-*"},
+		{"- a plain item", "**- a plain item**"},
 		{"# No match for kube-*", teamsChatPlainGuard + "# No match for kube-*"},
 		{"``` kube-*", teamsChatPlainGuard + "``` kube-*"},
 		{"the glob **/*.yaml matches", "the glob **/*.yaml matches"},

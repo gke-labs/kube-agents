@@ -143,7 +143,13 @@ func (a *TeamsAdapter) trackQuestion(id, conversation string, m *chatmsg.Message
 		}
 	} else {
 		ux.cards[id] = *card
-		remember(&ux.cardsOrder, id, func(k string) { delete(ux.cards, k) })
+		// A card pushed out of the ring takes its question with it: the
+		// adapter can no longer draw it answered, so it no longer asks.
+		remember(&ux.cardsOrder, id, func(k string) {
+			delete(ux.cards, k)
+			ux.dropQuestionLocked(k)
+			forget(&ux.questionsOrder, k)
+		})
 	}
 	ux.forgetPendingLocked(id)
 	if m == nil || len(m.Choices) == 0 {

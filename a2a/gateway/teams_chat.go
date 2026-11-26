@@ -135,14 +135,18 @@ func teamsChatHead(m *chatmsg.Message) string {
 // teamsBoldLine is text as one bold line, as slackBoldLine draws it: the
 // bold pairs inside it are shed first, and a text that still holds the
 // mark or starts or ends on a star (`*.yaml`, `kube-*`, edge emphasis) is
-// left plain, since wrapping it would run the added marks into its own. A
-// text left plain that would read as a heading or a code fence is guarded,
-// so the card builder draws it as a line.
+// left plain, since wrapping it would run the added marks into its own. So
+// is a text that holds a triple backtick: the bold check reads an unclosed
+// one as code to the end of the line and would miss a mark behind it. A
+// text left plain that the card builder would read as a heading, a code
+// fence or a bullet (teamsMarkdownToCard) is guarded, so it draws as a line.
 func teamsBoldLine(text string) string {
 	text = strings.TrimSpace(shedBoldPairs(text))
-	if strings.Contains(mdCodeSpanRE.ReplaceAllString(text, ""), teamsChatBold) ||
+	if strings.Contains(text, teamsCodeFence) ||
+		strings.Contains(mdCodeSpanRE.ReplaceAllString(text, ""), teamsChatBold) ||
 		strings.HasPrefix(text, mdEmphasisStar) || strings.HasSuffix(text, mdEmphasisStar) {
-		if strings.HasPrefix(text, teamsChatHeading) || teamsOpensFence(text) > 0 {
+		if strings.HasPrefix(text, teamsChatHeading) || strings.HasPrefix(text, teamsBulletDash) ||
+			strings.HasPrefix(text, teamsBulletStar) || teamsOpensFence(text) > 0 {
 			return teamsChatPlainGuard + text
 		}
 		return text
