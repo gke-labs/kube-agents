@@ -1611,22 +1611,26 @@ mint_ledger_token() { # <label>
   # The ladder stays at LEDGER_MINT_ATTEMPTS whatever GitHub is doing: an
   # incident lasts longer than any wait a unit holding its locks can afford,
   # and the not-run record is what keeps that from reading as a red.
-  local minted rc attempt=1 delay=2 diagnostics
+  local token expires line rc attempt=1 delay=2 minted diagnostics
   LEDGER_MINT_LAST_FAILURE=""
-  # The mint's stderr goes through a file so its last line can name the
-  # failure in the record; it is echoed to this shell's stderr as before.
-  diagnostics="$(mktemp)"
+  # The mint's stdout and stderr go through files rather than command
+  # substitutions so start_ledger_token_renewal can call this function while
+  # its TERM trap is armed; stderr is echoed to this shell's stderr as before.
+  minted="${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.out"
+  diagnostics="${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.err"
   while :; do
     rc=0
-    minted="$(LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint 2>"${diagnostics}")" || rc=$?
+    LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint >"${minted}" 2>"${diagnostics}" || rc=$?
     cat "${diagnostics}" >&2
     if [ "${rc}" -eq 0 ]; then
       LEDGER_MINT_LAST_FAILURE=""
       break
     fi
-    LEDGER_MINT_LAST_FAILURE="$(tail -n 1 "${diagnostics}")"
+    while IFS= read -r line; do
+      LEDGER_MINT_LAST_FAILURE="${line}"
+    done <"${diagnostics}"
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
-      rm -f "${diagnostics}"
+      rm -f "${minted}" "${diagnostics}"
       echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
            "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
       echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
@@ -1640,15 +1644,23 @@ mint_ledger_token() { # <label>
     attempt=$((attempt + 1))
     delay=$((delay * 4))
   done
+  read -r token expires <"${minted}" || true
   # The installation's hourly budget as the mint read it (LEDGER_BUDGET_PREFIX
   # in hack/ledger_token_mint.py; empty when that read failed), kept beside
   # the mint so a day of runs shows how much of the shard one run spends
   # (#6240). Taken from the file, so a renewal's discarded stderr keeps it.
-  local budget
-  budget="$(grep -m 1 "^${LEDGER_BUDGET_PREFIX}" "${diagnostics}" || true)"
-  rm -f "${diagnostics}"
-  export BENCH_GITHUB_TOKEN="${minted%% *}"
-  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"
+  local budget=""
+  while IFS= read -r line; do
+    case "${line}" in
+      "${LEDGER_BUDGET_PREFIX}"*)
+        budget="${line}"
+        break
+        ;;
+    esac
+  done <"${diagnostics}"
+  rm -f "${minted}" "${diagnostics}"
+  export BENCH_GITHUB_TOKEN="${token}"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${expires}${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"
 }
 
 # Keeps a unit's grading token alive for as long as its devops-bench runs.
@@ -1685,33 +1697,32 @@ start_ledger_token_renewal() { # <label> <file>
     failures=0
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
     # command only once it has returned. The nap is the renewer's only job, so
-    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
-    # a TERM to arrive ahead of.
-    napping=""
-    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
+    # the trap ends it by job spec (`kill %%`) without a command substitution.
+    trap 'kill %% 2>/dev/null || true; exit 0' TERM
     while :; do
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
       wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
-      [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
-      if mint_ledger_token "${label} renewal" 2>/dev/null \
-        && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
-        && mv -f "${file}.next" "${file}"; then
-        if [ "${failures}" -gt 0 ]; then
-          echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+      if [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ]; then
+        if mint_ledger_token "${label} renewal" 2>/dev/null \
+          && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
+          && mv -f "${file}.next" "${file}"; then
+          if [ "${failures}" -gt 0 ]; then
+            echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+          fi
+          failures=0
+          waited=0
+        else
+          failures=$((failures + 1))
+          if [ "${failures}" -eq 1 ]; then
+            echo "WARNING: ${label}: could not renew the ledger read token" \
+                 "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
+                 "stays in ${file} until it expires, and renewal is retried every" \
+                 "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+          fi
+          waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
         fi
-        failures=0
-        waited=0
-      else
-        failures=$((failures + 1))
-        if [ "${failures}" -eq 1 ]; then
-          echo "WARNING: ${label}: could not renew the ledger read token" \
-               "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
-               "stays in ${file} until it expires, and renewal is retried every" \
-               "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
-        fi
-        waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
       fi
     done
   ) &
@@ -1724,9 +1735,7 @@ start_ledger_token_renewal() { # <label> <file>
 # Killed outright, the renewer would leave that command running to write a live
 # token after the rm. A mint under way here is abandoned after its current
 # command (a mint call or a retry sleep), which leaves mint_ledger_token's
-# diagnostics file behind. The GitOps write token's mint is one command
-# substitution, so its whole retry ladder finishes first and its token is
-# dropped unwritten.
+# temporary files behind.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
@@ -1808,30 +1817,30 @@ start_gitops_write_token() { # <label> <file>
     failures=0
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
     # command only once it has returned. The nap is the renewer's only job, so
-    # the trap ends what jobs -p lists: it keeps no record of the nap's pid for
-    # a TERM to arrive ahead of.
-    napping=""
-    trap 'napping="$(jobs -p)"; [ -z "${napping}" ] || kill ${napping} 2>/dev/null || true; exit 0' TERM
+    # the trap ends it by job spec (`kill %%`) without a command substitution.
+    trap 'kill %% 2>/dev/null || true; exit 0' TERM
     while :; do
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
       wait $! 2>/dev/null || true
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
-      [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
-      if fresh="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" 2>/dev/null)" \
-        && (umask 077 && printf '%s\n' "${fresh}" > "${file}.next") \
-        && mv -f "${file}.next" "${file}"; then
-        if [ "${failures}" -gt 0 ]; then
-          echo "GitOps write token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+      if [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ]; then
+        if (umask 077 && forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" > "${file}.next" 2>/dev/null) \
+          && [ -s "${file}.next" ] \
+          && mv -f "${file}.next" "${file}"; then
+          if [ "${failures}" -gt 0 ]; then
+            echo "GitOps write token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+          fi
+          failures=0
+          waited=0
+        else
+          rm -f "${file}.next"
+          failures=$((failures + 1))
+          if [ "${failures}" -eq 1 ]; then
+            echo "WARNING: ${label}: could not renew the GitOps write token; the previous token stays in ${file} until it expires, and renewal is retried every ${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+          fi
+          waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
         fi
-        failures=0
-        waited=0
-      else
-        failures=$((failures + 1))
-        if [ "${failures}" -eq 1 ]; then
-          echo "WARNING: ${label}: could not renew the GitOps write token; the previous token stays in ${file} until it expires, and renewal is retried every ${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
-        fi
-        waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
       fi
     done
   ) &
@@ -2077,15 +2086,22 @@ forge_write_token() { # <owner/repo> [permissions JSON]
 # first attempt and means the grant is missing. Returns as mint_ledger_token
 # does: LEDGER_MINT_RETRYABLE when the last attempt was transient, 1 otherwise.
 ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]
-  local body minted rc attempt=1 permissions='{"issues":"write"}'
+  local body token minted rc attempt=1 permissions='{"issues":"write"}'
   [ -n "${2:-}" ] && permissions="$2"
   body="{\"repositories\":[\"${1##*/}\"],\"permissions\":${permissions}}"
+  minted="${TMPDIR:-/tmp}/ledger-reset-mint.$$.${BASHPID:-0}.out"
   while :; do
     # `&&` rather than `if`: the status of a failed `if` test is 0 by the
     # time the body would read it, and this needs the mint's own.
-    minted="$(LEDGER_MINT_BODY="${body}" _ledger_token_mint)" && { printf '%s\n' "${minted%% *}"; return 0; }
+    LEDGER_MINT_BODY="${body}" _ledger_token_mint >"${minted}" && {
+      read -r token _ <"${minted}" || true
+      rm -f "${minted}"
+      printf '%s\n' "${token}"
+      return 0
+    }
     rc=$?
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_RESET_MINT_ATTEMPTS}" ]; then
+      rm -f "${minted}"
       if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
         return "${LEDGER_MINT_RETRYABLE}"
       fi
