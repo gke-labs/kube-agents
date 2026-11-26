@@ -595,8 +595,9 @@ Execution limits per agent persona, where `<persona>` is one of `default` (the P
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress` and the dispatcher's memory `admission`, the session-pod cap `maxSessions`, the gateway's
 `defaultRoute`, the session pods' idle times `sessionIdleMinutes` and `dmSessionIdleMinutes`, and the AgentProfile knobs under
-`profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
-`maxSessions` renders `10`, `defaultRoute` renders `platform`, and the gateway reaps an idle session pod after 30 minutes (5 for a DM conversation with one message so far). `profiles.ceiling` follows `maxInProgress` (`6` unless set), and `profiles.warmReplicas` renders `1` on `platform` and on `session` each profile's `concurrency`, split over its interactive tiers and held to the ceiling ([AgentProfile](./agentprofile-crd.md)).
+`profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)).
+
+Unset, `maxSessions` renders `10`, `defaultRoute` renders `platform`, and the gateway reaps an idle session pod after 30 minutes (5 for a DM conversation with one message so far). `profiles.ceiling` follows `maxInProgress` (`6` unless set), and `profiles.warmReplicas` renders `1` on `platform` and on `session` each profile's `concurrency`, split over its interactive tiers and held to the ceiling ([AgentProfile](./agentprofile-crd.md)).
 
 `defaultRoute` is where the A2A gateway sends a plain conversation's first message: `platform` to the
 Platform Agent, `session` to a session pod of the conversation's own. Unset means `platform`, today's
