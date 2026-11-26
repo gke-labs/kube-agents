@@ -61,6 +61,7 @@ import collector_run  # noqa: E402
 import fleet_scope_args  # noqa: E402
 
 DEFAULT_TIMEOUT_SECONDS = 60
+PROJECTS_LIST_TIMEOUT_SECONDS = 240
 ERROR_EXCERPT_CHARS = 300
 JSON_INDENT = 2
 EXIT_OK = 0
@@ -110,9 +111,13 @@ API_DISABLED_MARKERS = (
     "accessNotConfigured",
     "has not been used in project",
 )
+ZONE_TIMEOUT_MARKER = "did not respond"
 AUDITABLE_CLUSTER_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 QUALIFIED_SEPARATOR = "/"
 EXPECTED_CLUSTER_SPEC_PARTS = 2
+RESTART_POLICY_FIELD = "restartPolicy"
+RESTART_POLICY_ALWAYS = "Always"
+OVERHEAD_FIELD = "overhead"
 
 # Fleet-wide system namespaces (S1) skipped when evaluating user workloads.
 SYSTEM_NAMESPACES = frozenset(
@@ -206,14 +211,17 @@ RULE_STANDALONE_POD = "standalone-pod"
 # CPU and memory resource constants.
 AUTOPILOT_CPU_INCREMENT_MILLIS = 250
 MILLICORES_PER_CORE = 1000
-MICROCORES_PER_MILLICORE = 1000
-NANOCORES_PER_MILLICORE = 1_000_000
-MILLICORE_SUFFIX = "m"
-MICROCORE_SUFFIX = "u"
-NANOCORE_SUFFIX = "n"
-
-MEMORY_MULTIPLIERS: dict[str, float] = {
-    "": 1.0,
+BINARY_SUFFIXES: dict[str, float] = {
+    "Ki": float(1 << 10),
+    "Mi": float(1 << 20),
+    "Gi": float(1 << 30),
+    "Ti": float(1 << 40),
+    "Pi": float(1 << 50),
+    "Ei": float(1 << 60),
+}
+DECIMAL_SUFFIXES: dict[str, float] = {
+    "n": 1e-9,
+    "u": 1e-6,
     "m": 1e-3,
     "k": 1e3,
     "K": 1e3,
@@ -222,15 +230,9 @@ MEMORY_MULTIPLIERS: dict[str, float] = {
     "T": 1e12,
     "P": 1e15,
     "E": 1e18,
-    "Ki": float(1 << 10),
-    "Mi": float(1 << 20),
-    "Gi": float(1 << 30),
-    "Ti": float(1 << 40),
-    "Pi": float(1 << 50),
-    "Ei": float(1 << 60),
 }
-MEMORY_QUANTITY_RE = re.compile(
-    r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(Ki|Mi|Gi|Ti|Pi|Ei|m|k|K|M|G|T|P|E|)\s*$"
+QUANTITY_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|K|M|G|T|P|E|)\s*$"
 )
 
 QOS_GUARANTEED = "Guaranteed"
@@ -276,6 +278,7 @@ SCOPED_PROJECT_NOTE_FORMAT = (
 )
 
 Run = collector_run.Run
+Discovery = collector_run.Discovery
 RunFn = Callable[..., Run]
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_SECONDS)
 paged_dump = collector_run.paged_dump
@@ -380,58 +383,61 @@ def evaluate_cluster(cluster: dict) -> dict:
     }
 
 
-def parse_cpu_millis(value: str | int | float | None) -> int | None:
-    """Parse a Kubernetes CPU quantity into integer millicores (rounded up), or None."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
+def parse_quantity(value: str | int | float | None) -> float | None:
+    """Parse a Kubernetes quantity string or number into a finite non-negative float, or None."""
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        if value < 0 or math.isnan(value) or math.isinf(value):
+        number_val: int | float | str = value
+        scale = 1.0
+    elif isinstance(value, str):
+        match = QUANTITY_RE.match(value)
+        if not match:
             return None
-        return int(math.ceil(float(value) * MILLICORES_PER_CORE))
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
+        number_text, suffix = match.groups()
+        number_val = number_text
+        if suffix == "":
+            scale = 1.0
+        elif suffix in BINARY_SUFFIXES:
+            scale = BINARY_SUFFIXES[suffix]
+        elif suffix in DECIMAL_SUFFIXES:
+            scale = DECIMAL_SUFFIXES[suffix]
+        else:
+            return None
+    else:
         return None
     try:
-        if text.endswith(MILLICORE_SUFFIX):
-            parsed = float(text[: -len(MILLICORE_SUFFIX)])
-            return int(math.ceil(parsed)) if parsed >= 0 else None
-        if text.endswith(MICROCORE_SUFFIX):
-            parsed = float(text[: -len(MICROCORE_SUFFIX)])
-            return int(math.ceil(parsed / MICROCORES_PER_MILLICORE)) if parsed >= 0 else None
-        if text.endswith(NANOCORE_SUFFIX):
-            parsed = float(text[: -len(NANOCORE_SUFFIX)])
-            return int(math.ceil(parsed / NANOCORES_PER_MILLICORE)) if parsed >= 0 else None
-        parsed = float(text)
-        return int(math.ceil(parsed * MILLICORES_PER_CORE)) if parsed >= 0 else None
-    except ValueError:
+        scaled = float(number_val) * scale
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(scaled) or scaled < 0:
+        return None
+    return scaled
+
+
+def parse_cpu_millis(value: str | int | float | None) -> int | None:
+    """Parse a Kubernetes CPU quantity into integer millicores (rounded up), or None."""
+    parsed = parse_quantity(value)
+    if parsed is None:
+        return None
+    millis = parsed * MILLICORES_PER_CORE
+    if not math.isfinite(millis):
+        return None
+    try:
+        return int(math.ceil(millis))
+    except OverflowError:
         return None
 
 
 def parse_memory_bytes(value: str | int | float | None) -> int | None:
     """Parse a Kubernetes memory quantity into integer bytes, or None."""
-    if value is None or isinstance(value, bool):
+    parsed = parse_quantity(value)
+    if parsed is None:
         return None
-    if isinstance(value, (int, float)):
-        if value < 0 or math.isnan(value) or math.isinf(value):
-            return None
-        return int(math.ceil(float(value)))
-    if not isinstance(value, str):
-        return None
-    match = MEMORY_QUANTITY_RE.match(value)
-    if not match:
-        return None
-    number_text, suffix = match.groups()
     try:
-        parsed = float(number_text)
-    except ValueError:
+        return int(math.ceil(parsed))
+    except OverflowError:
         return None
-    if parsed < 0:
-        return None
-    return int(math.ceil(parsed * MEMORY_MULTIPLIERS[suffix]))
 
 
 def round_autopilot_cpu_millis(cpu_millis: int) -> int:
@@ -462,15 +468,26 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
         if cpu_req is not None:
             app_requested_cpu_millis += cpu_req
 
-    init_max_cpu_millis = 0
+    sidecar_cpu_millis = 0
+    init_peak_cpu_millis = 0
     for container in init_containers:
         resources = container.get("resources")
         requests = resources.get("requests") if isinstance(resources, dict) else None
-        cpu_req = parse_cpu_millis(requests.get("cpu") if isinstance(requests, dict) else None)
-        if cpu_req is not None and cpu_req > init_max_cpu_millis:
-            init_max_cpu_millis = cpu_req
+        cpu_req = parse_cpu_millis(requests.get("cpu") if isinstance(requests, dict) else None) or 0
+        if container.get(RESTART_POLICY_FIELD) == RESTART_POLICY_ALWAYS:
+            sidecar_cpu_millis += cpu_req
+        else:
+            init_peak_cpu_millis = max(init_peak_cpu_millis, sidecar_cpu_millis + cpu_req)
 
-    requested_cpu_millis = max(app_requested_cpu_millis, init_max_cpu_millis)
+    overhead = pod_spec.get(OVERHEAD_FIELD)
+    overhead_cpu_millis = (
+        parse_cpu_millis(overhead.get("cpu") if isinstance(overhead, dict) else None) or 0
+    )
+
+    requested_cpu_millis = (
+        max(app_requested_cpu_millis + sidecar_cpu_millis, init_peak_cpu_millis)
+        + overhead_cpu_millis
+    )
     autopilot_cpu_millis = round_autopilot_cpu_millis(requested_cpu_millis)
     cpu_delta_millis = autopilot_cpu_millis - requested_cpu_millis
     cpu_rounded = cpu_delta_millis != 0
@@ -946,18 +963,18 @@ def discover_projects(
     *,
     scope: fleet_scope_args.DeclaredScope,
     run: RunFn = default_run,
-) -> collector_run.Discovery:
+) -> Discovery:
     """Resolve the project list from `--project`, `fleet_scope_args`, or `gcloud`."""
     if project_override is not None:
         cleaned = project_override.strip()
         if not cleaned:
-            return collector_run.Discovery(
+            return Discovery(
                 [], fleet_scope_args.EMPTY_PROJECT_OVERRIDE_ERROR, None
             )
         override_error = scope.override_error(cleaned)
         if override_error:
-            return collector_run.Discovery([], override_error, None)
-        return collector_run.Discovery(
+            return Discovery([], override_error, None)
+        return Discovery(
             [cleaned],
             None,
             SCOPED_PROJECT_NOTE_FORMAT.format(project=cleaned),
@@ -965,40 +982,54 @@ def discover_projects(
 
     if scope.declared:
         if not scope.projects:
-            return collector_run.Discovery([], scope.empty_error(), None)
-        return collector_run.Discovery(list(scope.projects), None, scope.note())
+            return Discovery([], scope.empty_error(), None)
+        return Discovery(list(scope.projects), None, scope.note())
 
     config_res = run(CONFIG_PROJECT_ARGV)
     base_project = config_res.stdout.strip() if config_res.rc == 0 else ""
     projects = [base_project] if base_project else []
 
-    list_res = run(PROJECTS_LIST_ARGV)
+    try:
+        list_res = run(PROJECTS_LIST_ARGV, timeout=PROJECTS_LIST_TIMEOUT_SECONDS)
+    except TypeError:
+        list_res = run(PROJECTS_LIST_ARGV)
     if list_res.rc != 0:
         stderr = list_res.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
         if not projects:
-            return collector_run.Discovery(
+            return Discovery(
                 [],
                 f"project discovery failed: `gcloud config get-value project` named no project "
                 f"and `gcloud projects list` failed (rc={list_res.rc}): {stderr}",
             )
-        return collector_run.Discovery(
+        return Discovery(
             projects,
             None,
             f"`gcloud projects list` failed (rc={list_res.rc}: {stderr}); fell back to {base_project!r}.",
         )
 
-    for line in (list_res.stdout or "").splitlines():
-        candidate = line.strip()
-        if candidate and candidate not in projects:
+    listed = [
+        line.strip()
+        for line in (list_res.stdout or "").splitlines()
+        if line.strip()
+    ]
+    for candidate in listed:
+        if candidate not in projects:
             projects.append(candidate)
 
+    if base_project and base_project not in listed:
+        partial_note = (
+            f"`gcloud projects list` rc=0 did not name the active project {base_project!r}, "
+            f"so it is filtered rather than complete: it returned {len(listed)} project(s)."
+        )
+        return Discovery(projects, None, partial_note)
+
     if not projects:
-        return collector_run.Discovery(
+        return Discovery(
             [],
             "project discovery named no project: `gcloud config get-value project` is unset "
             "and `gcloud projects list` returned nothing",
         )
-    return collector_run.Discovery(projects, None)
+    return Discovery(projects, None)
 
 
 def list_project_clusters(
@@ -1016,20 +1047,44 @@ def list_project_clusters(
     res = run(argv)
     if res.rc != 0:
         stderr = (res.stderr or "").strip()
-        if any(marker in stderr for marker in API_DISABLED_MARKERS):
-            return [], None
         excerpt = stderr[:ERROR_EXCERPT_CHARS] or "no stderr"
+        if any(marker in stderr for marker in API_DISABLED_MARKERS):
+            from collect import refusal_owner  # noqa: PLC0415
+
+            is_owner, why = refusal_owner(project, stderr, run=run)
+            if is_owner:
+                return [], None
+            return (
+                None,
+                f"`gcloud container clusters list --project {project}` failed "
+                f"(rc={res.rc}; {why}): {excerpt}",
+            )
         return None, f"`gcloud container clusters list --project {project}` failed (rc={res.rc}): {excerpt}"
     raw = (res.stdout or "").strip()
     if not raw:
-        return [], None
+        return (
+            None,
+            f"`gcloud container clusters list --project {project}` exited 0 with empty stdout",
+        )
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
         return None, f"`gcloud container clusters list --project {project}` returned invalid JSON: {exc}"
     if not isinstance(parsed, list):
         return None, f"`gcloud container clusters list --project {project}` returned {type(parsed).__name__}, not a list"
-    return [c for c in parsed if isinstance(c, dict)], None
+    clusters = [c for c in parsed if isinstance(c, dict)]
+    incomplete = [
+        line.strip()
+        for line in (res.stderr or "").splitlines()
+        if ZONE_TIMEOUT_MARKER in line
+    ]
+    if incomplete:
+        detail = " ".join(incomplete)[:ERROR_EXCERPT_CHARS]
+        return (
+            clusters,
+            f"`gcloud container clusters list --project {project}` rc=0 but incomplete: {detail}",
+        )
+    return clusters, None
 
 
 def kubeconfig_path(kubeconfig_dir: Path, project: str, cluster: str, location: str) -> Path:
@@ -1191,8 +1246,9 @@ def scan_fleet(
         clusters, list_err = list_project_clusters(project, run=run)
         if list_err:
             errors.append(list_err)
+        if clusters is None:
             continue
-        kept_clusters = active_scope.drop_excluded(project, clusters or [])
+        kept_clusters = active_scope.drop_excluded(project, clusters)
         for cluster_record in kept_clusters:
             if not _matches_cluster_filter(cluster_record, cluster_filter, location_filter):
                 continue
@@ -1216,6 +1272,11 @@ def scan_fleet(
             errors.append(
                 f"{project}/{location}/{name}: {evaluated['read_error']}"
             )
+        elif evaluated.get("status") == CLUSTER_STATUS_UNKNOWN:
+            unknown_notes = DETAIL_JOIN.join(
+                str(n) for n in (evaluated.get("notes") or [CLUSTER_STATUS_UNKNOWN])
+            )
+            errors.append(f"{project}/{location}/{name}: {unknown_notes}")
         evaluated_clusters.append(evaluated)
 
     if (cluster_filter or location_filter) and not matched_records and not errors:
@@ -1249,7 +1310,7 @@ def write_atomic_json(path: Path, payload: dict) -> None:
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding=UTF8_ENCODING) as handle:
-            json.dump(payload, handle, indent=JSON_INDENT, sort_keys=True)
+            json.dump(payload, handle, indent=JSON_INDENT, sort_keys=True, allow_nan=False)
             handle.write("\n")
         tmp_path.replace(path)
     except Exception:

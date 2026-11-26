@@ -370,6 +370,56 @@ class ResourceImpactTests(unittest.TestCase):
         self.assertEqual(be_res["requested_cpu_millis"], 0)
         self.assertEqual(be_res["autopilot_cpu_millis"], 250)
 
+    def test_quantity_scientific_notation_and_overflow_guards(self) -> None:
+        self.assertEqual(scan.parse_cpu_millis("1e3m"), 1000)
+        self.assertEqual(scan.parse_cpu_millis("1e-1"), 100)
+        self.assertEqual(scan.parse_cpu_millis("1k"), 1_000_000)
+        self.assertEqual(scan.parse_memory_bytes("5e8"), 500_000_000)
+        self.assertIsNone(scan.parse_cpu_millis("1e300E"))
+        self.assertIsNone(scan.parse_memory_bytes("1e300E"))
+        self.assertIsNone(scan.parse_cpu_millis(10**400))
+        self.assertIsNone(scan.parse_memory_bytes(10**400))
+        self.assertIsNone(scan.parse_cpu_millis(float("inf")))
+        self.assertIsNone(scan.parse_memory_bytes(float("nan")))
+
+    def test_native_sidecar_and_pod_overhead_cpu_aggregation(self) -> None:
+        dep = _make_deployment(
+            "with-sidecar",
+            containers=[
+                {
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "200m", "memory": "128Mi"},
+                        "limits": {"cpu": "200m", "memory": "128Mi"},
+                    },
+                }
+            ],
+            init_containers=[
+                {
+                    "name": "mesh-proxy",
+                    "restartPolicy": "Always",
+                    "resources": {
+                        "requests": {"cpu": "200m", "memory": "128Mi"},
+                        "limits": {"cpu": "200m", "memory": "128Mi"},
+                    },
+                },
+                {
+                    "name": "db-migrate",
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "64Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"},
+                    },
+                },
+            ],
+            pod_spec_extra={"overhead": {"cpu": "50m"}},
+        )
+        res = scan.evaluate_workload(dep)["resources"]
+        # app (200m) + native sidecar (200m) = 400m > init peak (200m + 100m = 300m), plus overhead (50m) = 450m -> 500m
+        self.assertEqual(res["requested_cpu_millis"], 450)
+        self.assertEqual(res["autopilot_cpu_millis"], 500)
+        self.assertEqual(res["cpu_delta_millis"], 50)
+        self.assertEqual(res["qos_class"], scan.QOS_GUARANTEED)
+
 
 class EndToEndCliTests(unittest.TestCase):
     def _fake_runner(
@@ -616,6 +666,98 @@ class EndToEndCliTests(unittest.TestCase):
                 )
             self.assertEqual(rc_missing, scan.EXIT_ERROR)
             self.assertIn("no cluster matching", buf_missing.getvalue())
+
+    def test_unknown_master_version_sets_exit_error(self) -> None:
+        clusters = [_make_cluster(name="seeded-a", location="us-central1-a", version="")]
+        runner = self._fake_runner(clusters=clusters)
+        with tempfile.TemporaryDirectory() as tmp:
+            kc_dir = Path(tmp) / "kubeconfigs"
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = scan.main(
+                    [
+                        "--project",
+                        "kube-agents-robot",
+                        "--kubeconfig-dir",
+                        str(kc_dir),
+                    ],
+                    run=runner,
+                )
+            self.assertEqual(rc, scan.EXIT_ERROR)
+            self.assertIn(scan.NOTE_VERSION_UNKNOWN, buf.getvalue())
+
+    def test_list_project_clusters_quota_refusal_zone_timeout_and_empty_stdout(self) -> None:
+        # 1. API disabled on the target project itself -> empty cluster list, no error.
+        def run_own_disabled(argv: list[str], **_kwargs) -> scan.Run:
+            return scan.Run(
+                argv,
+                1,
+                "",
+                "SERVICE_DISABLED: Kubernetes Engine API has not been used in project target-proj before",
+                0.01,
+            )
+
+        clusters, err = scan.list_project_clusters("target-proj", run=run_own_disabled)
+        self.assertEqual(clusters, [])
+        self.assertIsNone(err)
+
+        # 2. API disabled on a different quota project -> fails closed with error.
+        def run_quota_disabled(argv: list[str], **_kwargs) -> scan.Run:
+            return scan.Run(
+                argv,
+                1,
+                "",
+                "SERVICE_DISABLED: Kubernetes Engine API has not been used in project other-quota-proj before",
+                0.01,
+            )
+
+        clusters, err = scan.list_project_clusters("target-proj", run=run_quota_disabled)
+        self.assertIsNone(clusters)
+        self.assertIsNotNone(err)
+        self.assertIn("other-quota-proj", err or "")
+
+        # 3. Empty stdout on rc == 0 -> fails closed with error.
+        def run_empty_stdout(argv: list[str], **_kwargs) -> scan.Run:
+            return scan.Run(argv, 0, "", "", 0.01)
+
+        clusters, err = scan.list_project_clusters("target-proj", run=run_empty_stdout)
+        self.assertIsNone(clusters)
+        self.assertIn("empty stdout", err or "")
+
+        # 4. Zone timeout warning on rc == 0 -> returns partial clusters and incomplete error.
+        def run_zone_timeout(argv: list[str], **_kwargs) -> scan.Run:
+            return scan.Run(
+                argv,
+                0,
+                json.dumps([_make_cluster()]),
+                "WARNING: Following zones did not respond: us-central1-f",
+                0.01,
+            )
+
+        clusters, err = scan.list_project_clusters("target-proj", run=run_zone_timeout)
+        self.assertEqual(len(clusters or []), 1)
+        self.assertIn("incomplete", err or "")
+
+    def test_discover_projects_filtered_listing_and_timeout(self) -> None:
+        seen_timeouts: list[int | None] = []
+
+        def run(argv: list[str], **kwargs) -> scan.Run:
+            if argv == scan.CONFIG_PROJECT_ARGV:
+                return scan.Run(argv, 0, "active-proj\n", "", 0.01)
+            if argv == scan.PROJECTS_LIST_ARGV:
+                seen_timeouts.append(kwargs.get("timeout"))
+                return scan.Run(argv, 0, "other-proj\n", "", 0.01)
+            return scan.Run(argv, 1, "", "unexpected", 0.01)
+
+        discovery = scan.discover_projects(
+            None,
+            scope=scan.fleet_scope_args.DeclaredScope(),
+            run=run,
+        )
+        self.assertEqual(discovery.projects, ["active-proj", "other-proj"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("filtered rather than complete", discovery.partial or "")
+        self.assertEqual(seen_timeouts, [scan.PROJECTS_LIST_TIMEOUT_SECONDS])
 
 
 if __name__ == "__main__":
