@@ -560,14 +560,34 @@ func TestSlackHomePickNotAppliedSurvivesARedraw(t *testing.T) {
 	writeHomeFile(t, dir, "")
 	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
 	api.conversations["C0NEW3"] = homeChannelInfo("C0NEW3", nil)
+	moveReady := func(channel string, seq uint64) func() bool {
+		return func() bool {
+			if homeRecordData(t, cs)[homeRecordKeySlack] != channel {
+				return false
+			}
+			a.home.mu.Lock()
+			moves := a.home.moves
+			a.home.mu.Unlock()
+			a.homeLearn.mu.Lock()
+			busy := a.homeLearn.busy
+			a.homeLearn.mu.Unlock()
+			return moves == seq && !busy
+		}
+	}
 	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "218.1"))
-	waitFor(t, "the move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW2" })
+	waitFor(t, "the move to land", moveReady("C0NEW2", 1))
 	a.home.mu.Lock()
 	if a.home.pending != nil {
 		a.home.pending.at = time.Now().Add(-2 * slackHomePickPendingTTL)
 	}
 	a.home.mu.Unlock()
 	a.publishHome("U1", true) // clears the expired pending move
+	a.home.mu.Lock()
+	pending := a.home.pending
+	a.home.mu.Unlock()
+	if pending != nil {
+		t.Fatalf("pending move kept after redraw past TTL: %+v", pending)
+	}
 	a.homeLearn.wg.Wait()
 	if text := lastView(t, api, "U1"); !strings.Contains(text, slackHomePickNotApplied) {
 		t.Errorf("the redraw suppressed the not-applied status:\n%s", text)
@@ -575,9 +595,9 @@ func TestSlackHomePickNotAppliedSurvivesARedraw(t *testing.T) {
 	// Two moves; the file follows the second, and a publish clears pending.
 	a.homeLearn.followUp = time.Second
 	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW3", "218.2"))
-	waitFor(t, "the second move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW3" })
+	waitFor(t, "the second move to land", moveReady("C0NEW3", 2))
 	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "218.3"))
-	waitFor(t, "the third move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW2" })
+	waitFor(t, "the third move to land", moveReady("C0NEW2", 3))
 	writeHomeFile(t, dir, "C0NEW2\n")
 	a.publishHome("U1", true)
 	a.homeLearn.wg.Wait()
