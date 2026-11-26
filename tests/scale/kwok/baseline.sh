@@ -79,6 +79,11 @@ readonly RBAC_NAMESPACE="default"
 readonly PROXY_SA="kube-proxy"
 readonly CALLER_NAME="scale-caller"
 readonly PROXY_AUTH_MODE="none"
+# The caller's kubeconfig names a credential so the CLI does not prompt for a
+# username: with none at all, against an https server, it asks on stdin and a
+# script's empty stdin fails the read with EOF. The proxy reads no credential
+# under --auth-mode=none and strips the Authorization header before forwarding.
+readonly CALLER_PLACEHOLDER_TOKEN="unused-under-auth-mode-none"
 readonly PROXY_VIEW_BINDING="kube-proxy-view"
 readonly PROXY_NODES_ROLE="kube-proxy-nodes-read"
 readonly PROXY_NODES_BINDING="kube-proxy-nodes-read"
@@ -391,7 +396,8 @@ contexts:
 current-context: $PROXY_CONTEXT
 users:
 - name: $CALLER_NAME
-  user: {}
+  user:
+    token: $CALLER_PLACEHOLDER_TOKEN
 EOF
 
 log "starting $PROXY_BINARY on $LOOPBACK:$BASELINE_PROXY_PORT (metrics port $BASELINE_PROXY_METRICS_PORT, log $PROXY_LOG)"
