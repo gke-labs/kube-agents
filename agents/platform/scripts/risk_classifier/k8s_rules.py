@@ -2621,6 +2621,7 @@ def _check_metadata_edits(
                     DIM_BLAST_RADIUS,
                     RISK_MEDIUM,
                     f"modifies metadata.{sub} key {key!r} outside low-risk allowlist",
+                    revert=REVERT_MODERATE,
                     field_path=d.dotted,
                 )
             else:
@@ -5143,6 +5144,7 @@ def _check_monitoring_resource(ev: ResourceEval, action: str, before_obj: dict[s
         RISK_MEDIUM,
         f"{_action_verb(action)} {ev.ref.gvk_label()} {ev.ref.name!r}",
         blast=BLAST_LOW,
+        revert=REVERT_MODERATE,
     )
 
 

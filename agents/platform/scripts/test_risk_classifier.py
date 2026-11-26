@@ -2306,6 +2306,16 @@ class TriageEngineHardeningTests(unittest.TestCase):
         self.assertFalse(r_recov_ns.supported)
         self.assertIn("CONFIGMAP_NON_STRING_VALUE", {x.code for x in r_recov_ns.reasons})
 
+        # 20. Unallowlisted metadata.labels / metadata.annotations edit sets revertability == moderate (blocked by decide_risk)
+        dep_meta_unmod = BASE_DEPLOY.replace(
+            "  name: web\n",
+            "  name: web\n  annotations:\n    custom.corp/controller-hint: enabled\n",
+        )
+        r_meta_unmod = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, dep_meta_unmod)])
+        self.assertEqual(r_meta_unmod.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_meta_unmod.revertability, REVERT_MODERATE)
+        self.assertIn("UNALLOWLISTED_METADATA_EDIT", {x.code for x in r_meta_unmod.reasons})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -299,7 +299,7 @@ def _validate_rev(rev: str, label: str) -> str:
         raise ValueError(f"invalid git {label} revision: {rev!r}")
     if rev.startswith(("-", "^", ":", "+")) or ".." in rev or "@{" in rev:
         raise ValueError(f"invalid git {label} revision: {rev!r}")
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() for ch in rev):
+    if any(ord(ch) < _ASCII_SPACE or ord(ch) == _ASCII_DEL or ch.isspace() for ch in rev):
         raise ValueError(f"invalid git {label} revision: {rev!r}")
     return rev
 
