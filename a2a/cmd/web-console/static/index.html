@@ -2571,6 +2571,8 @@
             <div class="about" id="side-roster" hidden>
               <h3>Thread Default Agent</h3>
               <div class="roster-list" id="roster-default"></div>
+              <h3>Scoped Projects &amp; Clusters</h3>
+              <div class="roster-list" id="roster-scope"></div>
               <h3>Specialist Agents &amp; Watchers</h3>
               <div class="roster-list" id="roster-specialists"></div>
               <p class="about-caption">
@@ -2749,6 +2751,8 @@
                 <dt>Cluster</dt>
                 <dd id="about-cluster">&hellip;</dd>
               </dl>
+              <h3>Scoped Projects &amp; Clusters</h3>
+              <div class="roster-list" id="about-scope"></div>
               <h3>Install &amp; environment</h3>
               <dl id="about-environment">
                 <dt>Reading…</dt>
@@ -3890,6 +3894,7 @@
       const CHANNELS_POLL_MS = 15000;
       const CHAT_LIST_POLL_MS = 30000;
       const INSIGHTS_POLL_MS = 30000;
+      const SCOPE_POLL_MS = 30000;
       // The server caches the GitHub release read for an hour, but checks
       // cluster patch state live. Polling every 30s keeps the purple PR badge current.
       const RELEASE_POLL_MS = 30000;
@@ -5340,6 +5345,7 @@
           [...pinnedIds],
           channelErrors[view] || "",
           posts.map((p) => [p.id, p.message_count, p.last_active, p.summary]),
+          posts.length === 0 && view === "alerts" ? lastScope : null,
         ]);
         if (!toBottom && sig === feedSig) return;
         feedSig = sig;
@@ -5347,8 +5353,12 @@
         const top = feed.scrollTop;
         if (posts.length === 0) {
           const error = channelErrors[view];
-          feed.innerHTML = `<div class="empty-state"><div>${escapeHtml(error ? "Could not load posts." : ch.empty)}</div>
+          if (!error && view === "alerts") {
+            feed.innerHTML = renderAlertsEmptyStateHtml(lastScope);
+          } else {
+            feed.innerHTML = `<div class="empty-state"><div>${escapeHtml(error ? "Could not load posts." : ch.empty)}</div>
           ${error ? `<div>${escapeHtml(error)}</div>` : ""}</div>`;
+          }
         } else {
           feed.innerHTML = posts.map((p) => postHtml(p, ch)).join("");
         }
@@ -5801,6 +5811,165 @@
       }
 
       let lastInsights = null;
+      let lastScope = null;
+
+      function scopeOutcomeBadgeHtml(outcome) {
+        const key = String(outcome || "").toLowerCase();
+        const cls =
+          key === "ok"
+            ? "badge-green"
+            : key === "denied" || key === "api-disabled"
+              ? "badge-red"
+              : key === "unreachable" || key === "over-cap"
+                ? "badge-amber"
+                : "badge-grey";
+        const label = key || "unknown";
+        return `<span class="badge ${cls}" style="font-size:10.5px;padding:2px 8px;"><span class="badge-dot"></span>${escapeHtml(label)}</span>`;
+      }
+
+      function renderScopeRosterHtml(scopeData) {
+        const projects = Array.isArray(scopeData && scopeData.projects)
+          ? scopeData.projects
+          : [];
+        if (projects.length === 0) {
+          const fallbackCluster =
+            lastInsights && lastInsights.cluster && lastInsights.cluster.name
+              ? lastInsights.cluster
+              : null;
+          if (!fallbackCluster) {
+            return `<div class="roster-card"><div class="roster-status">No fleet scope snapshot reported yet.</div></div>`;
+          }
+          const loc = [fallbackCluster.location, fallbackCluster.project]
+            .filter(Boolean)
+            .join(" · ");
+          return `<div class="roster-card">
+            <div class="roster-card-head">
+              <span class="roster-handle">${escapeHtml(fallbackCluster.name)}</span>
+              ${scopeOutcomeBadgeHtml("ok")}
+            </div>
+            <div class="roster-role">${escapeHtml(loc || "Install cluster")}</div>
+            <div class="roster-status">Discovery: install-cluster</div>
+          </div>`;
+        }
+        return projects
+          .map((p) => {
+            const pClusters = Array.isArray(p.clusters) ? p.clusters : [];
+            const clustersHtml = pClusters.length
+              ? pClusters
+                  .map((c) => {
+                    const idLine = [c.project, c.location, c.name]
+                      .filter(Boolean)
+                      .join(" / ");
+                    const watchLabel = c.watching
+                      ? " · Event watcher active"
+                      : "";
+                    const rem =
+                      c.outcome !== "ok" && c.remediation
+                        ? `<div class="roster-status" style="margin-top:4px;color:var(--warn-fg, #b45309);">Onboarding hint: ${escapeHtml(c.remediation)}</div>`
+                        : "";
+                    return `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border-subtle, rgba(128,128,128,0.18));">
+                      <div class="roster-card-head">
+                        <span class="roster-handle" style="font-size:12px;">${escapeHtml(idLine || c.name || c.slug)}</span>
+                        ${scopeOutcomeBadgeHtml(c.outcome || p.outcome)}
+                      </div>
+                      <div class="roster-status">Profile: ${escapeHtml(c.slug || `cluster-${c.name}`)} · via ${escapeHtml(c.via || p.via || "scope")}${escapeHtml(watchLabel)}</div>
+                      ${rem}
+                    </div>`;
+                  })
+                  .join("")
+              : `<div class="roster-status" style="margin-top:4px;">No clusters active in this project (${escapeHtml(p.outcome || "unknown")}).</div>`;
+            const projRem =
+              p.outcome !== "ok" && p.remediation
+                ? `<div class="roster-status" style="margin-top:6px;color:var(--warn-fg, #b45309);">Onboarding hint: ${escapeHtml(p.remediation)}</div>`
+                : "";
+            return `<div class="roster-card">
+              <div class="roster-card-head">
+                <span class="roster-handle">Project: ${escapeHtml(p.project || "unknown")}</span>
+                ${scopeOutcomeBadgeHtml(p.outcome)}
+              </div>
+              <div class="roster-role">Discovery source: ${escapeHtml(p.via || "scope")}</div>
+              ${projRem}
+              ${clustersHtml}
+            </div>`;
+          })
+          .join("");
+      }
+
+      function renderScopeSection() {
+        const html = renderScopeRosterHtml(lastScope);
+        const rosterEl = $("roster-scope");
+        if (rosterEl) rosterEl.innerHTML = html;
+        const aboutEl = $("about-scope");
+        if (aboutEl) aboutEl.innerHTML = html;
+      }
+
+      function renderAlertsEmptyStateHtml(scopeData) {
+        const ew = (scopeData && scopeData.event_watcher) || {};
+        const sch = (scopeData && scopeData.schedule) || {};
+        const ewBadgeCls = ew.watch_set_ready
+          ? "badge-green"
+          : ew.enabled
+            ? "badge-amber"
+            : "badge-grey";
+        const ewBadgeLabel = ew.watch_set_ready
+          ? "Watching"
+          : ew.enabled
+            ? ew.reachable
+              ? "Starting"
+              : "Unreachable"
+            : "Disabled";
+        const ewDetail =
+          ew.detail ||
+          "Kubernetes Event Watcher streams Warning events into # alerts as they occur.";
+        const nextName = sch.next_audit_name || "Daily fleet audit";
+        const nextAt = sch.next_audit_at || "";
+        let nextTimeText = sch.daily_window_utc
+          ? `Daily window ${sch.daily_window_utc}`
+          : "Daily window 06:20–09:20 UTC";
+        if (nextAt) {
+          const dt = new Date(nextAt);
+          if (!isNaN(dt.getTime())) {
+            const diffMin = Math.max(
+              0,
+              Math.round((dt.getTime() - Date.now()) / 60000),
+            );
+            const hrs = Math.floor(diffMin / 60);
+            const mins = diffMin % 60;
+            const rel = hrs > 0 ? `in ${hrs}h ${mins}m` : `in ${mins}m`;
+            nextTimeText = `${nextName} at ${nextAt} (${rel})`;
+          } else {
+            nextTimeText = `${nextName} at ${nextAt}`;
+          }
+        }
+        const promptText =
+          sch.starter_prompt ||
+          "@platform Run an on-demand cluster health and security posture check now";
+        return `<div class="feed-empty" style="max-width:560px;margin:24px auto;text-align:left;padding:18px 20px;border:1px solid var(--border-subtle, rgba(128,128,128,0.22));border-radius:10px;">
+          <div style="font-weight:600;font-size:14px;margin-bottom:6px;">${escapeHtml(CHANNELS.alerts.empty)}</div>
+          <div style="font-size:12.5px;opacity:0.85;margin-bottom:12px;">Proactive fleet monitoring is active. New Kubernetes warning incidents and anomaly reports appear here automatically.</div>
+          <div style="display:flex;flex-direction:column;gap:8px;font-size:12.5px;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <span><strong>Kubernetes Event Watcher:</strong> ${escapeHtml(ewDetail)}</span>
+              <span class="badge ${ewBadgeCls}" style="font-size:10.5px;padding:2px 8px;"><span class="badge-dot"></span>${escapeHtml(ewBadgeLabel)}</span>
+            </div>
+            <div><strong>Next scheduled daily audit:</strong> ${escapeHtml(nextTimeText)}</div>
+          </div>
+          <button type="button" class="roster-act" data-starter-prompt="${escapeHtml(promptText)}">Run on-demand health check now</button>
+        </div>`;
+      }
+
+      async function fetchScope() {
+        try {
+          const resp = await fetch("/api/scope");
+          if (!resp.ok) return;
+          const data = await resp.json();
+          lastScope = data;
+          renderScopeSection();
+          if (view === "alerts" && channelPosts.alerts.length === 0) {
+            renderFeed(false);
+          }
+        } catch (err) {}
+      }
 
       function openRoster() {
         openSide("roster");
@@ -5956,6 +6125,7 @@
           .filter((a) => !a.defaultAgent)
           .map(cardHtml)
           .join("");
+        renderScopeSection();
       }
 
       function renderAbout() {
@@ -5993,9 +6163,11 @@
           roles.appendChild(chip);
         });
         renderRepos();
+        renderScopeSection();
         renderEnvironment();
         if (!lastEnvironment) fetchEnvironment().then(renderEnvironment);
         if (!lastRelease) fetchRelease().then(renderEnvironment);
+        if (!lastScope) fetchScope();
       }
 
       // ---- Threads in the centre pane ----
@@ -10439,6 +10611,13 @@
           selectThread(open.dataset.thread);
       });
       $("feed").addEventListener("click", (e) => {
+        const starter = e.target.closest("[data-starter-prompt]");
+        if (starter) {
+          if (view !== "thread" || isThreadBusy(findThread(activeId)))
+            newChat();
+          submitMessage(starter.dataset.starterPrompt);
+          return;
+        }
         const pin = e.target.closest("[data-pin]");
         if (pin) {
           togglePin(pin.dataset.pin);
@@ -10888,6 +11067,7 @@
       checkStatus();
       pollChannels();
       fetchInsights();
+      fetchScope();
       fetchEnvironment();
       fetchChatList();
       fetchRelease();
@@ -10896,6 +11076,7 @@
       setInterval(pollChannels, CHANNELS_POLL_MS);
       setInterval(fetchChatList, CHAT_LIST_POLL_MS);
       setInterval(fetchInsights, INSIGHTS_POLL_MS);
+      setInterval(fetchScope, SCOPE_POLL_MS);
       setInterval(fetchRelease, RELEASE_POLL_MS);
       setInterval(fetchModels, 60000);
       setInterval(pollAll, MESSAGES_POLL_MS);
