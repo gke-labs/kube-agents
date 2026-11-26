@@ -520,7 +520,7 @@ func TestSanitizeRequestHeaders(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sanitizeRequestHeaders(tc.in, tc.preserveUpgrade)
+			sanitizeRequestHeaders(tc.in, nil, tc.preserveUpgrade)
 			if len(tc.in) != len(tc.want) {
 				t.Fatalf("headers = %v, want %v", tc.in, tc.want)
 			}
