@@ -16,6 +16,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 // ToolReadTopics reads the install's topics and agent cards.
@@ -141,7 +142,8 @@ var errTopicReadsBusy = fmt.Errorf("this server is already reading %d topics; tr
 // what keeps a caller polling fast from filling the topic streams' and
 // DIRECTORY's consumer caps, which the web console shares. With it, a window costs at
 // most two consumers per distinct answer: the list, the cards, and each
-// spelling of each provisioned topic. A failed read is not kept; an answer
+// spelling of each provisioned topic (up to lib.EphemeralCreateMaxAttempts
+// times that when creates time out). A failed read is not kept; an answer
 // that reports problems is, since the read is not the caller's (below), so a
 // problem is the bus's and the next caller would only meet it again.
 //
@@ -519,7 +521,7 @@ func topicUpdate(msg jetstream.Msg) (*TopicUpdate, bool) {
 
 // FormatTopicsMarkdown renders the list action. Topic names and subjects are
 // the registry's, which only ever holds subject tokens; everything an agent
-// wrote goes through cell.
+// wrote goes through inerttext.Cell.
 func FormatTopicsMarkdown(l TopicList) string {
 	var sb strings.Builder
 	sb.WriteString("## kube-agents topics\n\n")
@@ -550,7 +552,7 @@ func FormatTopicsMarkdown(l TopicList) string {
 			continue
 		}
 		fmt.Fprintf(&sb, "| `%s` | %s | `%s` | %s | %s | %s |\n",
-			t.Topic, t.Class, t.Subject, cell(writerName(t.Latest.Writer)), formatTime(t.Latest.At), cell(t.Latest.Summary))
+			t.Topic, t.Class, t.Subject, inerttext.Cell(writerName(t.Latest.Writer)), formatTime(t.Latest.At), inerttext.Cell(t.Latest.Summary))
 	}
 	return sb.String()
 }
@@ -594,12 +596,12 @@ func FormatTopicMarkdown(r TopicRead) string {
 
 func writeTopicUpdate(sb *strings.Builder, u TopicUpdate) {
 	fmt.Fprintf(sb, "### Entry %d\n\n", u.Seq)
-	fmt.Fprintf(sb, "- Written by %s at %s\n", cell(writerName(u.Writer)), formatTime(u.At))
+	fmt.Fprintf(sb, "- Written by %s at %s\n", inerttext.Cell(writerName(u.Writer)), formatTime(u.At))
 	if u.TaskID != "" {
-		fmt.Fprintf(sb, "- During task %s\n", cell(u.TaskID))
+		fmt.Fprintf(sb, "- During task %s\n", inerttext.Cell(u.TaskID))
 	}
 	if u.CorrelationID != "" {
-		fmt.Fprintf(sb, "- Correlation %s\n", cell(u.CorrelationID))
+		fmt.Fprintf(sb, "- Correlation %s\n", inerttext.Cell(u.CorrelationID))
 	}
 	sb.WriteString("\n")
 	if u.Summary != "" {
@@ -684,7 +686,7 @@ func formatCardsMarkdown(cards map[string]AgentCard, err error) string {
 	sb.WriteString("| Profile | Name | Description |\n| :--- | :--- | :--- |\n")
 	for _, n := range names {
 		c := cards[n]
-		fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", n, cell(c.Name), cell(c.Description))
+		fmt.Fprintf(&sb, "| `%s` | %s | %s |\n", n, inerttext.Cell(c.Name), inerttext.Cell(c.Description))
 	}
 	return sb.String()
 }

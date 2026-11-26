@@ -49,7 +49,7 @@ slots:
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures over that pool
+    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -428,9 +428,8 @@ fixtures:
     defect: >-
       Slot c's default pool on a 50 GB boot disk with kubeletConfig.podPidsLimit
       4096, where every other pool in the fleet runs a 20 GB disk and no
-      kubelet block. The drift SOP's boot-disk facet reads the disk; the
-      kubelet block is planted ahead of the kubelet-config facet, which the SOP
-      does not read yet. Day 1 as for drift-outlier,
+      kubelet block. The drift SOP's boot-disk facet reads the disk and its
+      kubelet-config facet reads the kubelet block. Day 1 as for drift-outlier,
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
@@ -501,9 +500,10 @@ fixtures:
     defect: >-
       Slot c's default-pool labelled cloud.google.com/compute-class=general-ccc
       with no matching NoSchedule taint, so the scheduler fills it with
-      untargeted pods before the pre-filter drops them. The label is also what
-      leaves the cluster with no untainted pool without a class label, which
-      the obtainability audit's 3.24 needs before it files anything.
+      untargeted pods before the pre-filter (GKE 1.35.6 and later) drops them.
+      The label is also what leaves the cluster with no untainted pool without
+      a class label, which the obtainability audit's 3.24 needs before it
+      files anything.
 
   - role: manual-pools-compute-class
     slot: c
@@ -515,6 +515,22 @@ fixtures:
       rules across the nodepools rule default-pool backs and two machine
       families no pool backs, so a stockout on the first rule leaves pods with
       no fallback GKE can create.
+
+  - role: missing-reservation-compute-class
+    slot: c
+    available_from_day: 0
+    objects:
+      - computeclass/reserved-ccc
+    defect: >-
+      ComputeClass reserved-ccc, whose first rule asks for one named
+      reservation (affinity Specific, seeded-absent-reservation) that no
+      reservation of the project carries, and whose second rule is a machine
+      type that GKE can create. Node pool auto-creation is on and no workload
+      selects the class, so GKE makes no node pool for it. One NoSchedule
+      taint (dedicated=reserved-ccc) keeps the class out of the
+      general-purpose classes that the obtainability audit counts. GKE marks
+      the class misconfigured with the reason ReservationNotFound, and the
+      stockout audit files that status.
 
   - role: no-nodelocal-dnscache
     slot: c

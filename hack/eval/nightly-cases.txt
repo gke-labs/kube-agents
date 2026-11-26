@@ -955,6 +955,11 @@
 # the onboarding lock, like bootstrap-inventory-ranking-delivery.
 ./tasks/bootstrap-inventory-posture-scope/task.yaml
 
+# GPU zonal capacity skew and ComputeClass fallback chain (#2900, #3007, #7182):
+# asymmetric zonal GPU splits are fixed with declarative ComputeClass fallback
+# rules and topology spread rather than custom polling scripts. deployer: noop.
+./tasks/capacity-gpu-zonal-skew-fallback-chain/task.yaml
+
 # chat-answer-writes-a-table: a direct answer asked for as a table is a
 # markdown pipe table, not "Label: value | Label: value" lines. Red on the
 # api_server prompt hint that told the model to assume plain text (the Teams
@@ -1185,6 +1190,13 @@
 # graded on the ledger's boot-disk finding and the pool it names. The same
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
+
+# #2800: the drift audit's kubelet-config facet, the second voted by node
+# pool. seeded-c's default-pool sets podPidsLimit where the stack's other
+# pools set no kubelet key the facet reads; graded on the ledger's
+# kubelet-config finding and the pool it names. The same full audit and band
+# as consistency-drift-outlier.
+./tasks/consistency-kubelet-config-pool-outlier/task.yaml
 
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst
@@ -1428,6 +1440,11 @@
 # from neither exclusion list; CI nightlies run over inject).
 ./tasks/list-gitops-repos/task.yaml
 
+# #1983: the GCP networking fabric audit's skill points to compliance-audit
+# §2.19 for Istio ServiceEntry collisions; a coverage question is answered
+# with where the check lives. deployer: noop, read-only, graded on the answer.
+./tasks/networking-audit-points-to-serviceentry-check/task.yaml
+
 # The networking stream's declared-intent case (#1408): the project's
 # mtu-peer-declared network at MTU 8896, peered both ways with default at
 # 1460 (role declared-mtu-peering), is the 2.4 peered-MTU posture the same
@@ -1548,6 +1565,12 @@
 # have, so here it reports infrastructure naming the cap; its evidence runs
 # come from twins that set the cap to 2. deployer: noop, read-only.
 ./tasks/session-front-door-cap-busy-notice/task.yaml
+# A DM answered after its session pod was reaped idle still has the earlier
+# turn (#2371): the harness sends the opening, waits 480s, past the 5-minute
+# DM idle TTL, then sends the reply on the same conversation, which reaches a
+# pod rehydrated from the transcript primer. deployer: noop, two front-door
+# turns, reads no cluster; needs the inject door.
+./tasks/session-recalls-context-after-idle-reap/task.yaml
 
 # #6816: a chat turn that tries a direct cluster write stops at that first
 # attempt and says the change was not made. Through the session front door the

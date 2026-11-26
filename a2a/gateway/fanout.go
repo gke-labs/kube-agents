@@ -200,7 +200,8 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 		// nothing is held for a wake: the end is sent now and recorded
 		// without its text, which only a wake would read. A send that
 		// failed is recorded Unsent with its text, and the heal sends it
-		// again (healProfileBatch); the parent dedupes on the entry. The
+		// again (healProfileBatch) until AskTTL, when the bound drops it
+		// (TaskRef.clearBatchText); the parent dedupes on the entry. The
 		// last end changes nothing: the parent holds the conversation until
 		// its own end, which is the chain's.
 		if g.profileBatchChildEnded(ctx, rec, parent, child, end) {
@@ -393,7 +394,7 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 		return
 	}
 	if active.StatusMsgID != "" {
-		if probe, err := g.probeTask(ctx, stream, rec.AddresseeFor(parent.ID), parent.ID, g.profileRead(rec, parent.ID, rec.AddresseeFor(parent.ID))); err == nil && probe.final {
+		if probe, err := g.probeTask(ctx, stream, rec.AddresseeFor(parent.ID), parent.ID); err == nil && probe.final {
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(probe.state, ""), active.LineNote), "")
 			active.StatusMsgID = ""
 			changed = true
@@ -406,7 +407,7 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 		if fresh, _ := rec.TaskRefFor(kid.ID); fresh.BatchEnd != nil {
 			continue
 		}
-		probe, err := g.probeTask(ctx, stream, kid.Addressee, kid.ID, g.profileRead(rec, kid.ID, kid.Addressee))
+		probe, err := g.probeTask(ctx, stream, kid.Addressee, kid.ID)
 		if err != nil {
 			g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", kid.ID, "err", err)
 			continue
@@ -456,7 +457,7 @@ func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, pare
 			if streamErr != nil {
 				continue
 			}
-			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID, g.profileRead(rec, fresh.ID, fresh.Addressee))
+			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID)
 			if err != nil {
 				g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", fresh.ID, "err", err)
 				continue
@@ -468,7 +469,10 @@ func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, pare
 			}
 		case fresh.BatchEnd.Unsent:
 			end := *fresh.BatchEnd
-			if g.profileBatchChildEnded(ctx, rec, parent, fresh, end) {
+			// The parent as the record has it now, not the copy this pass
+			// started with: a mark set since (endedUnread, a stop) holds.
+			now, _ := rec.TaskRefFor(parent.ID)
+			if g.profileBatchChildEnded(ctx, rec, now, fresh, end) {
 				end.Unsent, end.Text = false, ""
 				rec.setBatchEnd(fresh.ID, &end)
 				changed = true
@@ -508,7 +512,7 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 	var terminalSubject string
 	var err error
 	if probe.final || spotCheck {
-		if task, terminalSubject, err = g.fanOutReplay(ctx, kid.Addressee, kid.ID, g.profileRead(rec, kid.ID, kid.Addressee)); err != nil {
+		if task, terminalSubject, err = g.fanOutReplay(ctx, kid.Addressee, kid.ID); err != nil {
 			g.log.Warn("heal: a fan-out child's stream could not be replayed", "conversation", rec.Key, "taskId", kid.ID, "err", err)
 		}
 	}
@@ -648,7 +652,7 @@ func (g *Gateway) answerFanOutStatus(ctx context.Context, rec *SessionRecord, pa
 		var probe taskProbe
 		err := streamErr
 		if err == nil {
-			probe, err = g.probeTask(ctx, stream, k.Addressee, k.ID, g.profileRead(rec, k.ID, k.Addressee))
+			probe, err = g.probeTask(ctx, stream, k.Addressee, k.ID)
 		}
 		switch {
 		case err != nil:
@@ -678,13 +682,13 @@ func (g *Gateway) refuseFanOutSteer(rec *SessionRecord, parent TaskRef) {
 // fanOutReplay replays a task's stream in full on an ordered consumer, the
 // one read a fan-out path makes that spends a TASKS consumer slot: its
 // folded state and the subject its terminal came on.
-func (g *Gateway) fanOutReplay(ctx context.Context, addressee, taskID string, opts ...lib.ReadOption) (*lib.Task, string, error) {
+func (g *Gateway) fanOutReplay(ctx context.Context, addressee, taskID string) (*lib.Task, string, error) {
 	g.mu.Lock()
 	hook := g.fanOutReplayHook
 	g.mu.Unlock()
 	if hook != nil {
 		hook(taskID)
 	}
-	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, taskID, opts...)
+	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, taskID)
 	return task, terminalSubject, err
 }

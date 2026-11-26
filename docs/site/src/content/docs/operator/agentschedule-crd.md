@@ -57,7 +57,9 @@ The value is recorded in `status.lastHandledStop` once acted on, so the same val
 
 A stop that is still being retried, because the gateway hasn't answered yet, stays in effect if the annotation is removed or set back. A `run-now` set meanwhile still waits for that run to end, then starts a new one. The gateway stops only a run it started for this schedule.
 
-**Status is the run ledger.** No run state lives in a pod: `status` holds the next and last slots, the run in flight, the last outcome, the skip counts and the last ten runs. A slot is claimed in `status.pendingSlot` before its submission, with an idempotency key the gateway answers with the same task, so an operator restart neither runs a slot twice nor drops it. The operator also exports `kubeagents_schedule_runs_total{schedule,outcome}` and `kubeagents_schedule_skips_total{schedule,reason}`. The `Submitted` condition shows how the gateway answered the last submission. It reads `False` (`GatewayRefused`, with the gateway's reason) when the gateway refused a run, which drops that slot without retrying it.
+**Status is the run ledger.** No run state lives in a pod: `status` holds the next and last slots, the run in flight, the last outcome, the skip counts and the last ten runs. `status.lastReason` says why the last run ended, as the bare reason token the gateway names, such as `deadline-exceeded`. Each recent run keeps its own `reason`, and the `Reason` column of `kubectl get agentschedules` shows the last one.
+
+A slot is claimed in `status.pendingSlot` before its submission, with an idempotency key the gateway answers with the same task, so an operator restart neither runs a slot twice nor drops it. The operator also exports `kubeagents_schedule_runs_total{schedule,outcome}` and `kubeagents_schedule_skips_total{schedule,reason}`. The `Submitted` condition shows how the gateway answered the last submission. It reads `False` (`GatewayRefused`, with the gateway's reason) when the gateway refused a run, which drops that slot without retrying it.
 
 Only the operator writes a schedule's status, and no agent ServiceAccount can write `AgentSchedule` resources.
 
