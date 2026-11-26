@@ -462,8 +462,11 @@ it, so a quoted mention of the invocation is one word and not a run, and a run m
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
-inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
-error on the api transport, so a case using it runs over the inject transport alone),
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; and
+`min_children` / `max_children`, inclusive bounds on how many child tasks the chain minted, read
+from the route's `childCount`, which counts a repeated addressee each time where
+`childAddressees` names it once; an error on the api transport, so a case using it runs over the
+inject transport alone, and a bound is an error on a door older than `childCount`),
 `worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
@@ -640,8 +643,8 @@ worker filed it reads the tagged call, which is the command as typed, so a `^`-a
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
-delegating turn's chain delegated to, by profile name, from the inject read route's
-`childAddressees`.
+delegating turn's chain delegated to, by profile name, and how many times, from the inject read
+route's `childAddressees` and `childCount`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
