@@ -960,6 +960,13 @@
 # rules and topology spread rather than custom polling scripts. deployer: noop.
 ./tasks/capacity-gpu-zonal-skew-fallback-chain/task.yaml
 
+# Multi-pool Cluster Autoscaler scan-delay probe (#2900, #3008, #7096):
+# untargeted dynamic `render-<uuid>` workloads across 28 tainted GPU pools force
+# per-pool evaluation across every pool; fixed durably with namespace
+# `cloud.google.com/default-compute-class` and `capacitybuffers.autoscaling.x-k8s.io`.
+# deployer: noop, no fixture.
+./tasks/capacity-multipool-ca-scan-delay-capacitybuffer/task.yaml
+
 # chat-answer-writes-a-table: a direct answer asked for as a table is a
 # markdown pipe table, not "Label: value | Label: value" lines. Red on the
 # api_server prompt hint that told the model to assume plain text (the Teams

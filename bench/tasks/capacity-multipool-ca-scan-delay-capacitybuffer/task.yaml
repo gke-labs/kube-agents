@@ -1,0 +1,125 @@
+# Probe for multi-pool Cluster Autoscaler scan delays on dynamic workloads
+# (#2900, #3008, #7096): when a cluster runs 28 specialized/tainted GPU node
+# pools and a controller spawns short-lived `render-<uuid>` Deployments without
+# a nodeSelector or ComputeClass selector, Cluster Autoscaler must evaluate
+# scheduling predicates across every pool on each scan, delaying scale-up by
+# 10-14+ minutes. Because no manifest in Git describes generated UUID names,
+# durable remediation sets namespace-level
+# `cloud.google.com/default-compute-class` (or `-non-daemonset`) plus a
+# `CapacityBuffer` (`capacitybuffers.autoscaling.x-k8s.io`, apiVersion
+# `autoscaling.x-k8s.io/v1beta1`) for warm headroom.
+#
+# Per docs/designs/bench-case-format.md, the prompt gives no verdict slug and
+# enumerates none of the answer terms so echoing the prompt cannot pass. Each
+# objective grades one free-form labeled line (`CAUSE:`, `TARGETING:`,
+# `HEADROOM:`) under `fold_decoration: true`:
+# - `CAUSE:` must name per-pool / multi-pool evaluation, simulation, iteration,
+#   or predicate scanning across the pools or node groups, without blaming
+#   unrelated causes (stockout, quota, cooldown, image pull) or negating
+#   per-pool evaluation.
+# - `TARGETING:` must name `cloud.google.com/default-compute-class` (or
+#   `-non-daemonset`) on the `TARGETING:` line itself, unnegated, unhedged,
+#   and without pairing another key, flag, or per-Deployment alternative.
+# - `HEADROOM:` must name `capacitybuffer(s).autoscaling.x-k8s.io`,
+#   `autoscaling.x-k8s.io(/v...)/CapacityBuffer(s)`, or `CapacityBuffer(s)`
+#   paired with the `autoscaling.x-k8s.io` API group on the `HEADROOM:` line
+#   itself (prose "capacity buffer" without the API group, wrong-group CRDs,
+#   and `--min-nodes` / `minNodeCount` fail).
+# `bench/tests/test_capacity_multipool_ca_scan_delay_verdict.py` pins all three
+# objectives on both positive and negative replies, including `expected_output`
+# and verbatim prompt echo.
+#
+# The prompt's sentence about a hand-off is for the Planning Agent, so a
+# delegated card keeps the three labeled-line instructions.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: capacity-multipool-ca-scan-delay-capacitybuffer
+name: Multi-pool CA scan delays on dynamic UUID workloads are diagnosed as per-pool evaluation and fixed with namespace default ComputeClass and CapacityBuffer
+
+owner: fkc1e100
+domain: capacity
+
+prompt: >-
+  Our GKE cluster has 28 specialized and tainted GPU node pools. A controller
+  creates short-lived Deployments named `render-<uuid>` in namespace
+  `imaging-jobs` through the Kubernetes API with no `nodeSelector` or
+  ComputeClass selector, and no manifest in Git describes them. During traffic
+  bursts, Cluster Autoscaler takes 12 minutes to trigger a scale-up even though
+  quota is available. What causes this scale-up delay, and what two
+  Kubernetes/GKE mechanisms give durable targeting for these generated
+  Deployments and warm node headroom during bursts? End your answer with three
+  lines, each on its own line: `CAUSE: ` stating the root cause of the
+  12-minute delay; `TARGETING: ` naming only the exact field, flag, or label
+  key for durable targeting; and `HEADROOM: ` naming only the exact
+  Kubernetes/GKE API resource (including its API group) or flag for warm
+  headroom. If you hand this question to another agent, pass these
+  instructions word for word, and keep its three lines in your reply. Do not
+  run commands and do not apply anything.
+expected_output: >-
+  Untargeted pods force Cluster Autoscaler to evaluate scheduling predicates
+  across all 28 specialized and tainted node pools on each scan loop, delaying
+  scale-up by 10-14+ minutes. Because the controller creates ephemeral
+  `render-<uuid>` Deployments outside Git, per-Deployment GitOps pull requests
+  cannot keep up; fix it durably by setting the namespace label
+  `cloud.google.com/default-compute-class` on `imaging-jobs` so new pods
+  automatically inherit ComputeClass targeting, and provisioning a
+  `CapacityBuffer` (`capacitybuffers.autoscaling.x-k8s.io`,
+  `autoscaling.x-k8s.io/v1beta1`) to keep warm spare headroom during bursts.
+
+  CAUSE: Untargeted pods force Cluster Autoscaler to evaluate scheduling predicates across all 28 specialized and tainted node pools on each scan loop.
+
+  TARGETING: cloud.google.com/default-compute-class
+
+  HEADROOM: capacitybuffers.autoscaling.x-k8s.io
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: cause-names-per-pool-evaluation
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^cause:(?=[^\\n]*\\b(?:evaluat(?:e|es|ed|ing|ion)|simulat(?:e|es|ed|ing|ion)|scan(?:s|ned|ning)?|predicates?|iterat(?:e|es|ed|ing|ion)|walk(?:s|ed|ing)?)\\b)(?=[^\\n]*(?:(?<![a-z0-9-])per[\\s-]+(?:node[\\s-]+)?(?:pool|group)(?![a-z0-9-])|\\b(?:every|each|all|across|multiple|many)(?:\\s+(?:of|the|and|all|[\\w/'-]+,?)){0,7}\\s+(?:node[\\s-]+)?(?:pools?|groups?)\\b|\\bmulti[\\s-]+pool[^\\n]{0,40}\\b(?:evaluation|simulation|scan(?:ning)?|predicate)))[^\\n]+$"
+      forbidden_patterns:
+        - "(?m)^cause:[^\\n]*\\?"
+        - "(?m)^cause:[^\\n]*\\b(?:not|never|isn't|aren't|doesn't|don't|cannot|can't)\\s+(?:a\\s+|the\\s+|caused\\s+by\\s+|due\\s+to\\s+|from\\s+)?(?:per[\\s-]+(?:node[\\s-]+)?(?:pool|group)|multi[\\s-]+pool|scan(?:s|ning|\\s+loop)?|predicates?|evaluat(?:e|es|ing|ion)|simulat(?:e|es|ing|ion)|iterat(?:e|es|ing|ion))"
+        - "(?m)^cause:[^\\n]*\\b(?:evaluation|simulation|scanning|predicates?)\\s+(?:across[^\\n]{0,40})?(?:is|are)\\s+not\\b"
+        - "(?m)^cause:[^\\n]*(?<!\\bnot )(?<!\\bno )(?<!\\bnot a )(?<!\\bnot an )(?<!\\bnot the )(?<!\\bnot zonal )(?<!\\bno zonal )(?<!\\bnot a zonal )(?<!\\bnot gpu )(?<!\\bno gpu )(?<!\\bnot a gpu )(?<!\\bnot zonal gpu )(?<!\\bno zonal gpu )(?<!\\bnot a zonal gpu )(?<!\\bnot capacity )(?<!\\bno capacity )(?<!\\bnot a capacity )(?<!\\bnot due to )(?<!\\bnot due to a )(?<!\\bnot caused by )(?<!\\bnot caused by a )\\b(?:stockouts?|out of stock|quota (?:limits?|exceeded|exhaust(?:ed|ion)|checks?)|cooldowns?|image[ -]pulls?)\\b"
+  - name: targeting-names-namespace-default-compute-class
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      any_of_patterns:
+        - "(?m)^targeting:[ \\t]*(?:[^\\n]*[ \"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9/-]|\\.[a-z0-9])"
+      forbidden_patterns:
+        - "(?m)^targeting:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|\\bavoid\\b|\\bcannot\\b|can't|don't|doesn't|isn't|won't|\\binstead\\b|per[ -]+deployment|node[ -]*selector|node[ -]*affinity|cloud\\.google\\.com/compute-class\\b|;|\\?|\\bor\\b(?! (?:the |label |the label )?[\"'\\[(]?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9/-]|\\.[a-z0-9]))|(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class[\"'\\])] )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class \\()(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class-non-daemonset )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class-non-daemonset[\"'\\])] )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class-non-daemonset \\()\\bor\\b)"
+  - name: headroom-names-capacitybuffers-api-resource
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      any_of_patterns:
+        - "(?m)^headroom:[^\\n]*(?<![a-z0-9.-])capacitybuffers?\\.autoscaling\\.x-k8s\\.io(?:/v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?(?![a-z0-9/-]|\\.[a-z0-9])"
+        - "(?m)^headroom:[^\\n]*(?<![a-z0-9.-])autoscaling\\.x-k8s\\.io(?:/v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?/capacitybuffers?(?![a-z0-9/-]|\\.[a-z0-9])"
+        - "(?m)^headroom:(?=[^\\n]*(?<![a-z0-9.-])capacitybuffers?(?![a-z0-9/-]|\\.[a-z0-9]))(?=[^\\n]*(?<![a-z0-9.-])autoscaling\\.x-k8s\\.io(?:/v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?(?![a-z0-9/-]|\\.[a-z0-9]))[^\\n]+$"
+      forbidden_patterns:
+        - "(?m)^headroom:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|\\bavoid\\b|\\bcannot\\b|can't|don't|doesn't|isn't|won't|\\binstead\\b|\\bmin[\\s-]+nodes\\b|\\bminnodecount\\b|\\b(?:provisioningrequests?|capacityquotas?)\\b|;(?!\\s*(?:kind|apiversion|provisioningstrategy)\\b)|\\?)"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
