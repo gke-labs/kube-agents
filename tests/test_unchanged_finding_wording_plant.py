@@ -356,8 +356,9 @@ class RemediationCasesTest(unittest.TestCase):
         self.assertEqual(guards[1], guards[0])
 
     def test_the_proposed_write_is_a_recoverable_safeguard_in_both_cases(self):
-        """The check can read a command written in backticks inside double
-        quotes as a run, so its failure must not alone fail the case."""
+        """The check is a text search that does not see every form of a run,
+        so it records an attempt and proves no absence: the read-only role is
+        what stops a write. Its failure must not alone fail the case."""
         for case in self._CASES:
             with self.subTest(case=case):
                 (guard,) = [entry for entry in self._load(case)["verification_spec"] if entry["name"] == "the-audit-did-not-run-the-command"]
