@@ -9,7 +9,7 @@ caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), imp
 the cluster's API server through `pkg/upstream` with credentials the sandbox never holds, and emits
 structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
-`cmd/k8s-api-proxy` builds the production server binary from `pkg/proxyserver`, which holds its
+`cmd/k8s-api-proxy` builds the standalone server binary from `pkg/proxyserver`, which holds its
 flags, environment variables and lifecycle.
 
 `tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
@@ -214,7 +214,8 @@ Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
 archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
 archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
-prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
+prints `dev`. The image runs [`kube-proxy/cmd/kube-proxy`](../kube-proxy/README.md), the same server
+with the kube-agents task credential gate. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
 it carry none.
 
 For standalone sidecar or loopback bridge deployments outside a host cluster, `cmd/k8s-api-proxy`

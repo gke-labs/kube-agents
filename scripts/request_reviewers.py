@@ -109,7 +109,8 @@ GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 # once a file has matched something at that level. `OWNERS_ALIASES` expands
 # names in either list. This repository has three shapes today: root OWNERS
 # approvers, the eval-crew filters in `hack/OWNERS`,
-# and `k8s-api-proxy/OWNERS`, a plain nested list that adds to the root's.
+# and `k8s-api-proxy/OWNERS` and `kube-proxy/OWNERS`, plain nested lists that
+# add to the root's.
 OWNERS_FILENAME = "OWNERS"
 OWNERS_ALIASES_FILENAME = "OWNERS_ALIASES"
 DEFAULT_OWNERS_ROOT = "."

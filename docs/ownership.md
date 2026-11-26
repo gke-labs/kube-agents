@@ -2,7 +2,7 @@
 
 This page answers who to ask about a part of the repository, and who owns a running service the
 project depends on. It does not grant anything. Who may set `approved` and
-`lgtm` on a change is `OWNERS`, `hack/OWNERS`, `k8s-api-proxy/OWNERS` and `OWNERS_ALIASES`, and a person can be an area's
+`lgtm` on a change is `OWNERS`, `hack/OWNERS`, `k8s-api-proxy/OWNERS`, `kube-proxy/OWNERS` and `OWNERS_ALIASES`, and a person can be an area's
 owner here without being an approver there.
 
 An area is a part of the system in plain words, with the paths that are most of it; a running

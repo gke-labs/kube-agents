@@ -30,6 +30,8 @@ const (
 	// testForwardedValue is what testForwardedHdr carries, to show a request went upstream
 	// as it was sent.
 	testForwardedValue = "yes"
+	// testUncheckedValue is a credential header value sent to a proxy whose gate is off.
+	testUncheckedValue = "credential-nobody-checks"
 )
 
 // testAuthenticator admits the caller testUserHeader names; testWorker is bound to its pod,
@@ -225,5 +227,55 @@ func TestHandlerRefusesBeforeTheCacheAndStripsTheCredential(t *testing.T) {
 	if bare.Code != http.StatusForbidden || audit.last(t).Reason != ReasonTaskTarget {
 		t.Errorf("worker on a path with no cluster = (%d, reason %q), want (403, %q): %s",
 			bare.Code, audit.last(t).Reason, ReasonTaskTarget, bare.Body.String())
+	}
+}
+
+// With the gate off the binary still names the credential header among the ones the proxy
+// never forwards, so a credential sent to a proxy that does not check it reaches no
+// upstream, whoever sent it.
+func TestHandlerStripsTheCredentialWithTheGateOff(t *testing.T) {
+	hook, err := FromEnv(envOf(nil), slog.New(slog.DiscardHandler))
+	if err != nil || hook != nil {
+		t.Fatalf("FromEnv with nothing set = (set=%v, %v); want no hook", hook != nil, err)
+	}
+	upstream := &testUpstream{}
+	h, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+		Authenticator:      testAuthenticator{},
+		Upstream:           upstream,
+		Policy:             k8sapiproxy.Policy{Mode: k8sapiproxy.ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Audit:              &testAudit{},
+		Logger:             slog.New(slog.DiscardHandler),
+		Authorize:          hook,
+		ExtraCallerHeaders: CallerHeaders(),
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	callers := []string{testWorker, testNonWorker}
+	for _, user := range callers {
+		// No credential is checked, so the worker is admitted without a valid one.
+		if rec := serveAs(h, user, testPodsPath, testUncheckedValue); rec.Code != http.StatusOK {
+			t.Fatalf("%s with the gate off: code = %d: %s", user, rec.Code, rec.Body.String())
+		}
+	}
+	sent := upstream.sent()
+	if len(sent) != len(callers) {
+		t.Fatalf("upstream calls = %d, want %d", len(sent), len(callers))
+	}
+	for i, headers := range sent {
+		if got := headers.Values(CredentialHeader); len(got) != 0 {
+			t.Errorf("request %d: the upstream was sent %s with the gate off", i, CredentialHeader)
+		}
+		if got := headers.Get(testForwardedHdr); got != testForwardedValue {
+			t.Errorf("request %d: upstream %s = %q, want %q", i, testForwardedHdr, got, testForwardedValue)
+		}
+		for name, values := range headers {
+			for _, value := range values {
+				if strings.Contains(value, testUncheckedValue) {
+					t.Errorf("request %d: the upstream was sent the credential in %s", i, name)
+				}
+			}
+		}
 	}
 }

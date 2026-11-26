@@ -8,6 +8,11 @@ because it is specific to kube-agents: the task credential gate.
 (`pkg/proxyserver`) and the task credential verifier (`a2a/taskcred`) through `replace` directives,
 and is built only into the image ([`deploy/kube-proxy/Dockerfile`](../deploy/kube-proxy/Dockerfile)).
 
+With the gate off this is the same server with the same flags, and it differs from the generic
+binary in three ways. It is built in this module, so a dependency both modules require resolves to
+the higher of the two versions. The `a2a` credential libraries are linked in. And the credential
+header is stripped from every caller's request before it is forwarded.
+
 ## The task credential gate
 
 An `AgentProfile` worker runs one task at a time, and the dispatcher signs a short-lived credential
@@ -23,12 +28,36 @@ For a caller the identity map names as a worker, a request is forwarded only whe
 - its pod name and pod UID are the ones the caller's TokenReview names, and its profile and tier are
   the caller's entry in the identity map;
 - it names a target cluster, and that target, written `gke_<project>_<location>_<cluster>`, equals
-  the cluster the request addresses. A request path with no `/clusters/<id>` prefix addresses the
-  proxy's default cluster and never matches.
+  the cluster the request addresses. A request path with no `/clusters/<id>` prefix is refused: with
+  a default cluster it never matches a task's target, without one it is an invalid route.
 
-Any other caller is not asked for a credential and is handled exactly as `k8s-api-proxy` handles it.
 The header is stripped before a request is forwarded, for every caller, whether the gate is on or
 off.
+
+### Who is gated
+
+Only callers the identity map names. A caller the proxy admits whose username is not a key of the
+map is not asked for a credential and is handled as `k8s-api-proxy` handles it. An empty map (`{}`)
+turns the gate off, and with `--auth-mode=none` no caller has a username in the map, so the gate
+gates nobody.
+
+The broker decides differently. It gives a caller the profile role by the audience of its token,
+and refuses a profile caller that has no map entry. Here the map alone decides, so a worker
+ServiceAccount that is allowed to call the proxy and is missing from the map reaches every cluster
+the proxy serves. Whoever renders the proxy's allowed callers must render the identity map from the
+same source.
+
+### When the credential is checked
+
+Once, when a request starts. A watch, a log follow or an upgraded connection opened under one task
+keeps streaming after its credential expires and after the pod moves on to another task. The
+component that attaches the credential must close the worker's connections when a task ends.
+
+### What answers before the gate
+
+Route validation, exclusions and holds. A worker with no credential still receives those refusals,
+a hold's reason text included: see the `Config.Authorize` paragraph of the
+[`k8s-api-proxy` README](../k8s-api-proxy/README.md).
 
 The credential broker applies the same rule to a worker's brokered `kubectl`
 (`agents/platform/scripts/credential_proxy.py`), with one difference: the broker lets a worker with
