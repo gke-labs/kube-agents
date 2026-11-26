@@ -134,7 +134,9 @@ operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, th
 kubectl cost table the shell's admission charges, which the operator passes only as a short
 lowercase word, before either reaches that Pod. The tier also goes, normalised the same way, to
 the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
-kubectl runs the same admission. The three
+kubectl runs the same admission, and to the credential broker (stateful and exec tiers), whose
+kubectl admission charges profile workers' cluster-wide reads from the same table; it is reserved
+there, so `spec.deployment.env` cannot pass a raw value through. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -264,8 +266,7 @@ for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagent
 for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
-pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), the session pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
 `kubeagents-credential-proxy-profile`; see
@@ -522,7 +523,13 @@ settings cannot be edited by anything holding the volume:
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
-  and a list that compares whole tokens matches nothing; and
+  and a list that compares whole tokens matches nothing;
+- a push stays in the repository the command names. A repository's own
+  configuration can make a plain `git push` also push inside each submodule,
+  to that submodule's own remote, and the check on the pushed branch reads only
+  the repository the command names. The setting is pinned to `no`, which is
+  git's default, and the flag that asks for the same on the command line is
+  refused; and
 - both editors git launches — the message editor and the rebase sequence editor
   — are set to a command that does nothing and fails. They are set through the
   environment for the same reason as the transport allowlist: those two
@@ -917,7 +924,10 @@ Consequences:
   back and lands it at
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
-  cluster from later commands.
+  cluster from later commands. It writes the file and the pin only when its
+  caller owns `.kubeconfigs`; another caller gets neither, and is told to name
+  a file of its own
+  ([`kube-proxy.md`](designs/kube-proxy.md#4-sandbox-kubectl-and-kubeconfig-setup)).
 - A `kubectl` read that names no cluster that way and comes back empty or with
   a server NotFound says where it looked. For `get`, `describe`, `events`,
   `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr

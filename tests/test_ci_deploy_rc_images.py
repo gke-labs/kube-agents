@@ -14,11 +14,12 @@ repository runs it, so a regression here is a repository-wide outage, and the
 switch is unset on every one of those runs — which makes the unset path the
 thing most worth pinning.
 
-The second is that the release-candidate path names only tags. The published
+The second is that the release-candidate path names tags and, off the default
+registry, one registry for the whole chart; never a per-image repository. The published
 operator image is `k8s-operator`; the one Artifact Registry carries is
 `kube-agents-operator`, so a repository override copied across from the
 presubmit path would 404. Dropping the override is also what carries the
-credential broker: its image is not a chart value, the operator derives it from
+credential broker: its image is not a chart value this lane sets, the operator derives it from
 the agent image (`resolveCredentialProxyImage`), so it follows whichever
 repository the agent uses only as long as nothing overrides that repository.
 
@@ -43,6 +44,8 @@ _RC_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
 _PRESUBMIT_TAG = "pr-1024-a3dc868"
 _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
 _GHCR_PREFIX = "ghcr.io/gke-labs/kube-agents"
+# A registry a candidate can be published to that is not the chart's default.
+_OTHER_REGISTRY_PREFIX = "us-docker.pkg.dev/example-project/candidates"
 
 # The two sections under test, delimited by the banner that follows each.
 _IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^# --- agent model required in a Prow job: begin")
@@ -58,7 +61,7 @@ def lifted(start: str, stop: str) -> str:
     return match.group(0)
 
 
-def fake_candidate_tree(tmp: str, images_exist: bool) -> tuple[pathlib.Path, str]:
+def fake_candidate_tree(tmp: str, images_exist: bool, registry_prefix: str = "") -> tuple[pathlib.Path, str]:
     """A stub tree standing in for a checkout at the candidate.
 
     Returns the `hack/` directory section 2a's SCRIPT_DIR points at, and the
@@ -77,7 +80,8 @@ def fake_candidate_tree(tmp: str, images_exist: bool) -> tuple[pathlib.Path, str
         textwrap.dedent(
             f"""\
             export REQUIRED_RELEASE_IMAGES=(k8s-operator platform-agent credential-proxy agent-sandbox)
-            get_registry_prefix() {{ echo "{_GHCR_PREFIX}"; }}
+            export DEFAULT_REGISTRY_PREFIX="{_GHCR_PREFIX}"
+            get_registry_prefix() {{ echo "{registry_prefix or _GHCR_PREFIX}"; }}
             check_commit_images_exist() {{ return {0 if images_exist else 1}; }}
             """
         )
@@ -234,8 +238,8 @@ class ReleaseCandidatePathTest(unittest.TestCase):
     def test_only_tags_are_set_and_no_repository_is_overridden(self) -> None:
         """The published operator image is `k8s-operator` and the Artifact
         Registry one is `kube-agents-operator`, so an override copied from the
-        presubmit path would 404. The chart already defaults every image to the
-        published path; only the tag has to be said. The two AgentPlugin images
+        presubmit path would 404. On the default registry the chart already
+        defaults every image to the published path; only the tag has to be said. The two AgentPlugin images
         and the web console are published under the same tag
         (scripts/release/common.sh, REQUIRED_RELEASE_IMAGES), so they get a
         tag and no repository too."""
@@ -283,6 +287,37 @@ class ReleaseCandidatePathTest(unittest.TestCase):
         self.assertEqual(got["IMG"], f"{_GHCR_PREFIX}/k8s-operator:{rc_sha}")
         self.assertEqual(got["AGENT_IMAGE"], f"{_GHCR_PREFIX}/platform-agent")
         self.assertIn(rc_sha[:7], got["DEPLOY_SOURCE"])
+
+    def test_the_default_registry_is_not_said_to_the_chart(self) -> None:
+        """On GHCR the chart's own defaults are the published images, so the
+        install names no registry and renders as it always has."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack, rc_sha = fake_candidate_tree(tmp, images_exist=True)
+            result = run_image_source(fake_hack, rc_commit_sha=rc_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([arg for arg in image_args(result) if "imageRegistry" in arg])
+
+    def test_another_registry_is_said_once_and_the_images_keep_their_names(self) -> None:
+        """A candidate published to another registry is checked there, so it
+        has to be installed from there: the chart is told the registry as
+        global.imageRegistry, which it puts in front of every first-party
+        image's published name. No per-image repository is set, so the names
+        stay the chart's (`k8s-operator`, not the presubmit's
+        `kube-agents-operator`), and the exported references name the same
+        registry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack, rc_sha = fake_candidate_tree(tmp, images_exist=True, registry_prefix=_OTHER_REGISTRY_PREFIX)
+            result = run_image_source(fake_hack, rc_commit_sha=rc_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = image_args(result)
+        self.assertEqual(args[-2:], ["--set-string", f"global.imageRegistry={_OTHER_REGISTRY_PREFIX}"])
+        self.assertEqual(len([arg for arg in args if "imageRegistry" in arg]), 1)
+        for arg in args:
+            self.assertNotIn("image.repository", arg)
+        got = fields(result)
+        self.assertEqual(got["IMG"], f"{_OTHER_REGISTRY_PREFIX}/k8s-operator:{rc_sha}")
+        self.assertEqual(got["AGENT_IMAGE"], f"{_OTHER_REGISTRY_PREFIX}/platform-agent")
+        self.assertIn(_OTHER_REGISTRY_PREFIX, got["DEPLOY_SOURCE"])
 
     def test_a_commit_with_no_published_images_stops_the_deploy(self) -> None:
         """Fifteen minutes earlier than the alternative. Without this the

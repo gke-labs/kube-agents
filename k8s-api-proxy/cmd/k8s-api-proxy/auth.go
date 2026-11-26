@@ -246,7 +246,7 @@ func (n namedAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapiproxy.C
 }
 
 // chainAuthenticator tries its authenticators in order and admits the caller the first one
-// accepts. When none does, the request is unavailable (503) if any authenticator could not
+// accepts, and stops at one whose refusal wraps k8sapiproxy.ErrCallerRefused. When none does, the request is unavailable (503) if any authenticator could not
 // decide, since the one that failed might have accepted it, and unauthenticated (401) only
 // when every one of them refused. Each authenticator gets its own copy of the request, so
 // one that consumes the Authorization header leaves it for the next.
@@ -270,6 +270,14 @@ func (c chainAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapiproxy.C
 		}
 		if err == nil {
 			err = errNoAuthenticatorAccepted
+		}
+		// An authenticator that recognized the credential and refused it is the last word:
+		// the next one must not admit what this one turned away.
+		if errors.Is(err, k8sapiproxy.ErrCallerRefused) {
+			if named, ok := authn.(namedAuthenticator); ok {
+				return nil, fmt.Errorf("%s%s%w", named.name, reasonPrefixSeparator, err)
+			}
+			return nil, err
 		}
 		if errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
 			unavailable = true

@@ -288,6 +288,44 @@ func TestAnUnattendedTriggeredTaskWithAClusterKeepsItsTarget(t *testing.T) {
 	checkBusCredentialIsBare(t, confirm, pub)
 }
 
+// A task that a trigger starts, whose submission asks for no change, carries
+// no permit: with a cluster target and with none, on a Job of its own, the
+// only place a permit is minted. The confirmed-change permit is for a change
+// that a person confirmed, and a scheduled run has no person to confirm one.
+func TestATriggeredTaskWithNoChangeRequestCarriesNoPermitOnAJob(t *testing.T) {
+	for name, params := range map[string]map[string]string{"a cluster target": clusterParams, "no target": nil} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "job-task-1")
+			b.ensure("inv", 2, 0, "unattended")
+			w := b.worker("inv", "unattended", "job-task-1", answerAccept, time.Second)
+			ti := unattendedInstall(2, nil)
+			ti.pool.Set("inv", "unattended", "job-task-1")
+			ti.pool.SetUID("inv", "unattended", "job-task-1", "uid-0")
+			kp, pub := signingKey(t)
+			b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) { d.UseJobs(newFakeJobs(0)) })
+
+			env := triggeredEnv(t, "inv", "task-1", "cap-ok", scheduleTriggerJSON, params)
+			if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("inv", "unattended", lib.SubmitKindTop, "task-1"), env); err != nil {
+				t.Fatal(err)
+			}
+			if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+				t.Fatalf("terminal %+v", ts)
+			}
+			confirms := confirmsOf(w)
+			if len(confirms) != 1 || confirms[0].ProxyToken == "" {
+				t.Fatalf("%d confirms; want one carrying a proxy token", len(confirms))
+			}
+			proxyC := verifyAs(t, confirms[0].ProxyToken, pub, taskcred.AudienceCredentialProxy)
+			if proxyC.Trigger == nil {
+				t.Fatal("the proxy token carries no trigger; the test must run a triggered task")
+			}
+			if proxyC.Permits != nil {
+				t.Errorf("the triggered task's proxy token carries permits %v", proxyC.Permits)
+			}
+		})
+	}
+}
+
 // The tier a report credential names is the one grants bind triggers at:
 // taskcred's ReportTier (and the Python verifier's REPORT_TIER) is
 // capability.TierUnattended, and the dispatcher's default unattended tier.

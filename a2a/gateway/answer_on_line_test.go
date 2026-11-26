@@ -405,6 +405,28 @@ func TestTheMuxTakesTheWholeLineAnswerAndPieceSizeFromTheOwningBackend(t *testin
 	var _ PieceSizer = mux
 }
 
+// A whole answer taken on the line keeps its feedback mark, so the backend
+// draws the rating controls on the line as it would on a posted answer;
+// without the mark an answer that fits one piece could never be rated.
+func TestAWholeLineAnswerBackendCarriesTheFeedbackMarkOntoTheLine(t *testing.T) {
+	t.Parallel()
+	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, withFeedbackBucket(t, 24*time.Hour), func(a *fakeAdapter) Adapter {
+		return wholeLineAnsweringAdapter{a}
+	})
+	origin := startChatTask(t, r, "discord:g1/whole-answer-rated-on-line", false)
+	line := lineID(t, r)
+	completeTask(t, r.execFor(t, origin, "platform"), "the fleet is fine")
+	waitFor(t, "the answer edited onto the line", func() bool {
+		edits := editsOf(r, line)
+		return len(edits) > 0 && edits[len(edits)-1] == "the fleet is fine"
+	})
+	r.adapter.mu.Lock()
+	defer r.adapter.mu.Unlock()
+	if len(r.adapter.editFeedbacks) != 1 || r.adapter.editFeedbacks[0] != origin.TaskID {
+		t.Fatalf("feedback marks on edits = %q, want the task's on the one answering edit", r.adapter.editFeedbacks)
+	}
+}
+
 // A rated answer past the piece size posts in pieces of the backend's size
 // too: the rated path (postMessage) reads PieceSizer as the plain one does.
 func TestAWholeLineAnswerBackendSplitsARatedAnswerAtItsPieceSize(t *testing.T) {

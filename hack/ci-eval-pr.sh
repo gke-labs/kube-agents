@@ -271,6 +271,7 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 # long enough for a slow API server, short against the 5m grace period.
 readonly EVAL_CANCEL_CUTS_MODEL_JOB_TYPES="presubmit batch"
 readonly EVAL_CANCEL_SCALE_REQUEST_TIMEOUT="30s"
+readonly EVAL_CANCEL_MARKER="cancelled"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -672,7 +673,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
     exit 1
   fi
   if ! openssl x509 -noout -text -in "${EVAL_FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
-    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh (kube-agents#3682)." >&2
     exit 1
   fi
 fi
@@ -1058,6 +1059,9 @@ stop_model_calls_on_cancel() {
   done
   [ -n "${cuts}" ] || return 0
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cancelled (JOB_TYPE=${JOB_TYPE}): stopping the fan-out and the model gateway before collecting artifacts ==="
+  if [ -n "${STATE_DIR:-}" ] && [ -d "${STATE_DIR}" ]; then
+    : > "${STATE_DIR}/${EVAL_CANCEL_MARKER}"
+  fi
   # Only the units still in this shell's job table: a finished unit's PID may
   # since belong to some other process.
   local pid frozen="" running
@@ -4970,6 +4974,10 @@ unit_cost_hint() {
     # early, and the presubmit wall estimate in
     # scripts/eval_rosters.py (#3987) is priced from these hints.
     consistency-drift-outlier) echo 600 ;;
+    # The same full drift audit as consistency-drift-outlier, graded on
+    # another finding of the same ledger. Priced with it, not measured on a
+    # lane yet.
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 600 ;;
     # On the blocking roster since 2026-11-02 (#4095), the presubmit's one
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
@@ -5000,6 +5008,9 @@ unit_cost_hint() {
     # case above, over compliance-rbac-overgrant's requested run, so it
     # launches early.
     fleet-audit-scheduled-run-files-the-finding) echo 1200 ;;
+    # The stack of fleet-audit-unchanged-finding-keeps-wording and the same
+    # full drift audit, with another plant state. Unmeasured on the lane.
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 900 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that
@@ -5149,6 +5160,11 @@ unit_cost_hint() {
     # priced in that band so a deadline cut does not take it first.
     # Unmeasured until its first nights.
     chat-stop-halts-delegated-remediation) echo 1100 ;;
+    # Nightly only. The harness waits idle_seconds=480 between the opening
+    # and the reply (idle_reply.py), so a repetition is never under 480s,
+    # plus two turns. Priced above that so a deadline cut does not take it
+    # first.
+    session-recalls-context-after-idle-reap) echo 700 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -5260,7 +5276,9 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
@@ -5371,6 +5389,7 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # verification wholesale (evalharness/default.py, "skipped_no_infra") and
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
+export STATE_DIR
 
 # The units the card fence could not run before (fence_live_cards): one reason
 # file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
@@ -5434,7 +5453,9 @@ fi
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label,
-#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unchanged-finding-keeps-wording,
+#                 fleet-audit-remediation-right-and-not-stale,
+#                 fleet-audit-wrong-kept-remediation-gives-way, and
 #                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
@@ -6483,6 +6504,12 @@ report_github_leftovers() {
     echo "WARNING: ${forge} leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
+  # A unit's token file is exported for that unit alone and unset at its stop
+  # (stop_ledger_token_renewal), so a BENCH_GITHUB_TOKEN_FILE set here is the
+  # caller's shell's, and the listing would read it in preference to
+  # BENCH_GITHUB_TOKEN: the token minted above, or the mounted one when there
+  # is no App key. The units drop it the same way (start_ledger_token_renewal).
+  unset BENCH_GITHUB_TOKEN_FILE
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
     echo "WARNING: ${forge} leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."

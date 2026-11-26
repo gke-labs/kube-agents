@@ -70,14 +70,14 @@ func TestChangeRequested_OnlyAConfirmIntentSetsIt(t *testing.T) {
 // requested, and then with an empty parameter set beside the flag.
 func TestChangeRequested_ThePartIsAttachedWhenOnlyTheFlagIsSet(t *testing.T) {
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r.adapter.inbox <- profileTurn("discord:cr/4", "chat", nil)
 	if found, _ := submittedChange(t, submissionOn(t, r, "chat")); found {
 		t.Fatal("a parameterless free-text submission carries a taskParameters part")
 	}
 
 	r2 := startProfileRig(t)
-	r2.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r2.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	r2.adapter.inbox <- confirmTurn("discord:cr/5", "chat", nil)
 	params, found, err := lib.TaskParametersOf(messageParts(t, submissionOn(t, r2, "chat")))
 	if err != nil || !found || !params.ChangeRequested || len(params.Parameters) != 0 {
@@ -140,7 +140,7 @@ func TestChangeRequested_AChildInheritsItsParentsAndCannotRaiseIt(t *testing.T) 
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := startProfileRig(t)
-			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 			ctx := context.Background()
 			conv := "discord:cr-child/" + string(rune('a'+i))
 			turn := profileTurn(conv, "chat", nil)
@@ -408,7 +408,7 @@ func TestTheIngressLineRecordsChangeRequested(t *testing.T) {
 			r := startRigWithLogger(t, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" },
 				slog.New(slog.NewTextHandler(logs, nil)))
 			r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
-			r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
+			r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams, Delegates: true,
 				ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 			r.adapter.inbox <- tc.turn
 			_ = submissionOn(t, r, "prod-east")

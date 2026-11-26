@@ -4,6 +4,8 @@ The persona of the `fleet-audit` AgentProfile: the parent of the install's fleet
 
 It's published as the `persona-fleet-audit` image (`a2a/Dockerfile.persona-fleet-audit`): this directory under `/files`, on the pinned busybox base, as `persona-cluster` and `persona-tse` are.
 
+`skills_manifest.sha256` is this directory's content manifest, which the profile worker checks the image's files against at start ([Content manifest](../../../a2a/lib/persona/README.md#content-manifest)). After changing any file here, run `make persona-manifests` (or `make docs-generate`, which runs it) from the repository root; `a2a/cmd/persona`'s tests fail until the manifest matches.
+
 ## The skill
 
 `skills/fleet-audit/` is the persona's own [`SKILL.md`](skills/fleet-audit/SKILL.md) and [`references/findings-document.md`](skills/fleet-audit/references/findings-document.md), a copy of the platform skill's with its one path and three links to references the persona doesn't carry rewritten. `a2a/lib/persona/claudecode/fleet_audit_persona_test.go` holds the copy to its source with only those edits.

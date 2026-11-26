@@ -473,7 +473,8 @@ posting every Medium as a thread and sets no round budget of its own — the sto
 - **Green is settled.** A `success` `AI Review` entry the bot wrote for a review of this pull
   request — `No findings`, `No findings above low severity`, and `Found N issues, none holding` are
   all green — ends the bot's part. After it, no author `/review` in any form (`all`, `fresh`, or
-  any argument), and no draft-to-ready or close-and-reopen to buy one. Answer each open 🟠 Medium
+  any argument), and no draft-to-ready or close-and-reopen to buy one (a reopen that `/retest`
+  advised, to replace runs GitHub lost, is not buying one). Answer each open 🟠 Medium
   by reply; push a fix only for a defect you would have fixed unasked, and say so in the thread;
   otherwise reply with the reason or a filed follow-up. The human reviewer the green summons rules
   on the rest. Settled ends, and one further `/review` is owed, only when a human review requests
@@ -671,6 +672,18 @@ do. The first step is always a push: a fix, a rebase onto `main`, or an empty co
 check, or a reason the comment does not name, a write user can re-add it with the command in the
 comment if the push does not work. To keep a pull request out past its next push, add a hold
 (`/hold`).
+
+**Do not push to a pull request that is in the queue.** The queue merges the commit it built when
+the pull request entered it. GitHub does not remove the pull request from the queue on a later
+push, and the sweep removes it only when the push costs it a label or gains it a hold, and the
+sweep runs before the merge. Otherwise the pushed commits do not reach `main`, although GitHub
+shows the pushed commit as the merged head. After each merge, the `dropped-push` job in
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml) runs `scripts/merge_queue_dropped_push.py`,
+which repeats the queue's merge with the final head. When the result differs from what merged, it
+posts one comment, which names the missing commits when it can find them; open a new pull request
+for them. A late push that only merges `main` into the branch loses nothing and gets no comment.
+A merge the script cannot decide, such as a final head that conflicts with `main`, gets no comment
+either, and the job's log says why. The script's docstring is the reference.
 
 The two labels are the two people:
 
@@ -890,7 +903,15 @@ of the queue, so it is re-run once no run of its workflow on the pull request is
 re-run. A run still `queued` an hour after it started, which is what a run GitHub lost during an
 Actions incident looks like, is cancelled (force-cancelled if a cancel does not take) and re-run
 whole; when a newer run of its workflow on the pull request carries its checks, it is cancelled
-and not re-run. That clears the checks without the push that would restart the smoke test. GitHub's own re-run button needs Write access, which most
+and not re-run. That clears the checks without the push that would restart the smoke test. A run
+GitHub lost before queueing it refuses every cancel ("has not been queued yet"), so it can be
+neither cancelled nor re-run: the command stops on that answer, and when the run is still the
+newest of its workflow it comments on the pull request that closing and reopening it starts fresh
+runs, and the `Retest Actions Checks` run goes red unless something else was re-run. A reopen keeps
+the approvals and needs no push, but it re-runs every check that runs on a reopen, the smoke test
+included (on a head it has already passed, it has reported green again within a minute), and starts
+a fresh automated review. A workflow that runs only on a label event gets no new run from a
+reopen; removing and re-adding its label starts one. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot

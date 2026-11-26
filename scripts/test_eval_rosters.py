@@ -935,6 +935,10 @@ INJECT_LANE_REQUESTING = [
     # objective's pull_request_opened leaf allows one.
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
+    # platform-agent-pdb-pull-request: side A of the first permit pair
+    # (#6539), the cluster profile's no-pdb ask on the default route; its
+    # objective's pull_request_opened leaf allows one.
+    "platform-agent-pdb-pull-request",
     "rca-remediation-pr",
     # scale-request-proposes-pr: asked to scale a Deployment, it may propose
     # the change as a pull request; its objective's pull_request_opened leaf

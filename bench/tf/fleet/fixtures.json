@@ -6,7 +6,7 @@
   "cluster_slots": {
     "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the declared zonal pool and the pool that names a missing reservation (both at zero nodes), the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
-    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with podPidsLimit 4096 where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
+    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with podPidsLimit 4096 where every other pool runs 20 GB and no kubelet block. Also the ComputeClass cluster (defects-c.tf), the one whose only pool carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool, ComputeClass `reserved-ccc` with no pool, which names a reservation that does not exist, the namespace `seeded-compute-class` with three small running workloads, NodeLocal DNSCache off, and no NetworkPolicy anywhere, because two nightly cases read this slot as the cluster with none. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
@@ -365,7 +365,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.podPidsLimit 4096, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
+      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.podPidsLimit 4096, where every other pool in the fleet runs a 20 GB disk and no kubelet block; the drift SOP's boot-disk facet reads the disk and its kubelet-config facet reads the kubelet block",
       "state": [
         {
           "subject": "cluster",
@@ -379,7 +379,7 @@
           "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.podPidsLimit",
           "op": "eq",
           "value": 4096,
-          "why": "the kubelet-config half. GKE sets no pod PID limit unless asked, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed by hand reads here as drift and as a 4/4 agreement to the facet, and one changed to another value as drift alone. An integer on purpose: the pinned provider sends a non-zero integer on an update as on a create, where the explicit false this half first asserted (cpuCfsQuota) was sent only at pool creation and never reached a pool that already existed. `observed nothing` means the key is not set; a re-apply restores it in place"
+          "why": "the kubelet-config half. GKE sets no pod PID limit unless asked, and the kubelet-config facet reads an absent key as unset, so this pool differs from the stack's other pools; a key removed by hand reads here as drift and gives the facet nothing to find on slot c, and one changed to another value reads as drift alone. An integer on purpose: the pinned provider sends a non-zero integer on an update as on a create, where the explicit false this half first asserted (cpuCfsQuota) was sent only at pool creation and never reached a pool that already existed. `observed nothing` means the key is not set; a re-apply restores it in place"
         }
       ]
     },
@@ -977,6 +977,172 @@
         }
       ]
     },
+    "long-name-replaced-pod": {
+      "cluster_slot": "a",
+      "namespace": "seeded-long-name",
+      "probes": [
+        "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+        "configmap/long-name-pod-cycle",
+        "serviceaccount/long-name-pod-cycle",
+        "role/long-name-pod-cycle",
+        "rolebinding/long-name-pod-cycle"
+      ],
+      "fixture": "settlement-batch-reconciliation-exporter-for-partner-feeds, one Deployment whose name has 58 characters, so Kubernetes cuts the names of its pods (the name and 5 generated characters, with no hash and no hyphen between them). Its one pod is idle until 18:00 UTC, then uses its CPU limit and holds 64Mi for 11 minutes, and at 18:11 UTC deletes itself through the API with the Role long-name-pod-cycle (delete on pods, in this namespace only). The ReplicaSet makes a new pod, so the live pod is idle and the pod of the day before is a replaced pod with a peak above the 20% bar of the waste audit's overrequest check. An audit that reads only the live pod files the Deployment; one that finds the replaced pod behind its cut name files nothing. The Deployment has no verdict from 18:00 to about 19:11 UTC (the live pod is the busy pod, and then a pod under an hour old), and none before the first replacement, up to one day after the plant. A case must not grade it in those times. The audit cuts a finding id at 100 characters, so on a pool project the id of this Deployment ends with seeded-long-name.deployment-settlement-batch-reco- and 6 generated characters: a case names the Deployment by a text that is in the cut id, such as seeded-long-name.deployment-settlement-batch",
+      "state": [
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.replicas",
+          "op": "eq",
+          "value": 1,
+          "why": "one replica is the design: two pods of one template delete themselves in the same minute, and a second pod is a second live pod in the audit's read"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the script runs in one ready pod. A pod that never runs (a pull that fails, a script that does not start) has no series and no busy period, the audit then files nothing, and each case passes on each build. This count is not 1 for some seconds of the daily replacement at 18:11 UTC; one scan in those seconds reads as drift, and the next scan does not"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "200m",
+          "why": "the busy pod uses the CPU up to this limit, two times the request; with a limit under 20% of the request the busy peak is under the audit's bar, and the replaced pod no longer clears the Deployment"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.serviceAccountName",
+          "op": "eq",
+          "value": "long-name-pod-cycle",
+          "why": "the pod's own delete call needs this account's Role; with another account the call is refused, no pod is replaced, and the busy pod stays the live pod"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "100m",
+          "why": "the request is on the CPU floor of the overrequest check; below it the check reads the Deployment on memory only"
+        },
+        {
+          "subject": "deployment/settlement-batch-reconciliation-exporter-for-partner-feeds",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "the request is on the memory floor of the overrequest check, and the busy period holds half of it; a smaller request moves the 20% bar under the idle pod's use"
+        },
+        {
+          "subject": "role/long-name-pod-cycle",
+          "path": "rules[0].verbs[*]",
+          "op": "eq",
+          "value": "delete",
+          "why": "the one grant of the fixture, and the one verb of its rule: without it the delete call is refused and no pod is replaced, and a second verb is a wider Role"
+        },
+        {
+          "subject": "role/long-name-pod-cycle",
+          "path": "rules[0].resources[*]",
+          "op": "eq",
+          "value": "pods",
+          "why": "the rule names pods and no other resource; a wider Role is a compliance finding that no case expects"
+        }
+      ]
+    },
+    "cpu-burst-and-flat": {
+      "cluster_slot": "a",
+      "namespace": "seeded-cpu-cycle",
+      "probes": [
+        "deployment/cpu-flat",
+        "deployment/cpu-burst",
+        "configmap/cpu-cycle"
+      ],
+      "fixture": "cpu-flat and cpu-burst, two Deployments of one replica whose real CPU use is in the manifest. cpu-flat uses the CPU all the time, held by its limit at 100% of its 100m request: the control, which no audit files. cpu-burst uses the CPU for 45 seconds at the start of each 10 minutes of the clock, held by its limit at its 200m request, and is idle for the rest: in a bucket of 300 seconds the burst reads as 15% of the request, under the 20% bar of the waste audit's overrequest check, and in a bucket of 60 seconds as 37% or more. The memory request of each is 64Mi, on the floor of the check's resize, so only the CPU can give a finding, and the memory limit is above the request, so neither pod is Guaranteed",
+      "state": [
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the loop runs in one pod; a pod that is not ready has no CPU series, and the audit then reads nothing for the Deployment"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "100m",
+          "why": "the audit's verdict is the peak as a part of this request; another request moves each ratio that the cases were written against"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "100m",
+          "why": "the limit is what holds the use at the request, so the real use is known from the manifest; without it the loop takes a whole core"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "64Mi",
+          "why": "64Mi is the floor of the check's resize, so memory gives no finding; a larger request adds a memory half to the finding"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].resources.limits.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a memory limit above the request keeps the pod out of the Guaranteed class; on a Guaranteed pod the over-request finding has another form (the guaranteed-qos marker, and from day 14 it can be an idle-workload finding)"
+        },
+        {
+          "subject": "deployment/cpu-flat",
+          "path": "spec.template.spec.containers[0].env[?(@.name=='CPU_MODE')].value",
+          "op": "eq",
+          "value": "flat",
+          "why": "the mode is the shape: flat is the control and burst is the 45 seconds in each 10 minutes; with the two swapped each case reads the wrong Deployment"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the loop runs in one pod; a pod that is not ready has no CPU series, and the audit then reads nothing for the Deployment"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "200m",
+          "why": "the audit's verdict is the peak as a part of this request; another request moves each ratio that the cases were written against"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "200m",
+          "why": "the limit is what holds the use at the request, so the real use is known from the manifest; without it the loop takes a whole core"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "64Mi",
+          "why": "64Mi is the floor of the check's resize, so memory gives no finding; a larger request adds a memory half to the finding"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].resources.limits.memory",
+          "op": "eq",
+          "value": "128Mi",
+          "why": "a memory limit above the request keeps the pod out of the Guaranteed class; on a Guaranteed pod the over-request finding has another form (the guaranteed-qos marker, and from day 14 it can be an idle-workload finding)"
+        },
+        {
+          "subject": "deployment/cpu-burst",
+          "path": "spec.template.spec.containers[0].env[?(@.name=='CPU_MODE')].value",
+          "op": "eq",
+          "value": "burst",
+          "why": "the mode is the shape: flat is the control and burst is the 45 seconds in each 10 minutes; with the two swapped each case reads the wrong Deployment"
+        }
+      ]
+    },
     "guaranteed-qos-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-qos",
@@ -1429,6 +1595,34 @@
         }
       ]
     },
+    "state-sync-controller": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/state-sync-controller"],
+      "fixture": "state-sync-controller Deployment (one replica) in seeded-shapes whose container startup argument passes --kube-api-qps=-1 to an inert sleep process, planting a controller with a negative client QPS (client-side rate limit disabled) for control-plane-configmap-lease-write-storm without generating API server write load",
+      "state": [
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the fixture is a running controller Deployment; a scaled-down or unscheduled pod is not an active controller shape"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready while the new pod waits; the controller omits unavailableReplicas when every replica is available"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "spec.template.spec.containers[*].args[*]",
+          "op": "any_eq",
+          "value": "--kube-api-qps=-1",
+          "why": "a negative QPS (--kube-api-qps=-1) disables client-side Kubernetes API rate limiting in client-go, the shape control-plane-configmap-lease-write-storm requires"
+        }
+      ]
+    },
     "scaled-zero-gateway": {
       "cluster_slot": "a",
       "namespace": "seeded-scaled-zero",
@@ -1816,7 +2010,7 @@
         "node?cloud.google.com/compute-class=general-ccc",
         "computeclass/general-ccc"
       ],
-      "fixture": "default-pool labelled cloud.google.com/compute-class=general-ccc with no matching NoSchedule taint, so the scheduler fills it with untargeted pods before the autoscaler's pre-filter drops them; also what gives the cluster no untainted pool without a class label",
+      "fixture": "default-pool labelled cloud.google.com/compute-class=general-ccc with no matching NoSchedule taint, so the scheduler fills it with untargeted pods before the autoscaler's pre-filter (GKE 1.35.6 and later) drops them; also what gives the cluster no untainted pool without a class label",
       "state": [
         {
           "subject": "cluster",
@@ -1824,6 +2018,13 @@
           "op": "eq",
           "value": "general-ccc",
           "why": "the label, read off the pool through clusters describe so a node re-creation never reads as drift; without it the cluster has general capacity again and the obtainability audit's 3.24 files nothing for the untargeted workloads"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].config.machineType",
+          "op": "eq",
+          "value": "e2-standard-2",
+          "why": "the room the slot's workloads schedule into. On an e2-medium the node keeps about 60m of CPU unrequested, and a node replacement can leave kube-dns at two replicas on it with the five seeded-compute-class pods Pending for good, which then reads as drift on the four workload roles. No drift facet reads machine type, so this is what says a project the reconcile has not reached is still on the smaller size; a re-apply restores it in place"
         },
         {
           "subject": "node?cloud.google.com/compute-class=general-ccc",
@@ -1859,6 +2060,90 @@
           "op": "any_eq",
           "value": "default-pool",
           "why": "the first rule is the one the labelled pool backs; the two family rules after it are the unbacked fallbacks"
+        }
+      ]
+    },
+    "missing-reservation-compute-class": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": ["computeclass/reserved-ccc"],
+      "fixture": "ComputeClass reserved-ccc, whose first rule asks for one named reservation (affinity Specific, seeded-absent-reservation) that no reservation of the project carries, and whose second rule is a machine type that GKE can create (e2-standard-4). Node pool auto-creation is on, and no workload selects the class, so GKE makes no node pool for it. The class has one NoSchedule taint (dedicated=reserved-ccc), so the obtainability audit does not count it as a general-purpose class, and a pod with no toleration for the taint gets no node from it. GKE accepts the class and marks it misconfigured: the condition CrdMisconfigured is True with the reason ReservationNotFound, and the stockout audit files that status as dangling-compute-class. The stack plants no reservation; the missing one is the defect",
+      "state": [
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[0].reservations.affinity",
+          "op": "eq",
+          "value": "Specific",
+          "why": "the defect is a rule bound to named reservations; with another affinity the rule can take on-demand capacity, and GKE reports no missing reservation"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[0].reservations.specific[*].name",
+          "op": "eq",
+          "value": "seeded-absent-reservation",
+          "why": "the one name of the rule, which no reservation carries; a class edited to name a real reservation is healed, and a case then grades a class with nothing wrong"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[0].machineType",
+          "op": "eq",
+          "value": "n2-standard-2",
+          "why": "the first rule is of another machine family and another size than the second; with the size or the family of the second rule, the two rules differ in one dimension, and the stockout audit files a second finding on the class, for a class with no fallback"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.priorities[1].machineType",
+          "op": "eq",
+          "value": "e2-standard-4",
+          "why": "the second rule is the fallback that GKE can create; without it the stockout audit files a second finding on the class, for a class with no fallback"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.nodePoolAutoCreation.enabled",
+          "op": "eq",
+          "value": true,
+          "why": "with auto-creation on, GKE reports the missing reservation; with it off, GKE reports that no node pool matches, says nothing about the reservation, and the audit files a second finding"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.whenUnsatisfiable",
+          "op": "eq",
+          "value": "DoNotScaleUp",
+          "why": "a pod that asks for the class gets no node outside the two rules of the class"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.nodePoolConfig.taints[*].effect",
+          "op": "eq",
+          "value": "NoSchedule",
+          "why": "the one taint of the class; without it the obtainability audit counts a second general-purpose class on the cluster, and its finding on app-worker-a no longer names general-ccc as the target class"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "spec.nodePoolConfig.taints[*].key",
+          "op": "eq",
+          "value": "dedicated",
+          "why": "a dedication taint that a pod must tolerate before GKE makes a node of the class for it; a taint key that a node controller sets does not take the class out of the general-purpose classes"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "status.conditions[?(@.type=='CrdMisconfigured')].status",
+          "op": "eq",
+          "value": "True",
+          "why": "the finding of the audit is this status. It goes away when a reservation of the name exists, and then the class has nothing wrong"
+        },
+        {
+          "subject": "computeclass/reserved-ccc",
+          "path": "status.conditions[?(@.type=='CrdMisconfigured')].reason",
+          "op": "eq",
+          "value": "ReservationNotFound",
+          "why": "the reason is the defect; with another reason the class is misconfigured for a cause that no case expects"
+        },
+        {
+          "subject": "node?cloud.google.com/compute-class=reserved-ccc",
+          "path": "metadata.name",
+          "op": "absent",
+          "why": "auto-creation is on, so a pod that asks for the class and tolerates its taint makes GKE create a paid node pool from the second rule. Nothing in the stack or in a case asks for it; a node with the class label means that something did, and the pool is not in the stack's state"
         }
       ]
     },

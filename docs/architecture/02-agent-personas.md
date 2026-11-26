@@ -204,7 +204,7 @@ at request time.
 
 > **Why OKF for v1 (cross-tier mem0 deferred):** OKF is the durable, human-curatable, git-backed _knowledge_
 > layer — a natural fit for read-only agents that propose via PR and humans who review as code, and it
-> adds no required infrastructure. Cross-tier **mem0/Qdrant coordination remains deferred post-v1**, while [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §5–§6 index `knowledge/` verbatim into single-install Hindsight (`kube-agents-decisions`) whenever `--memory=hindsight` is enabled (`--memory=file` and `--memory=off` evaluate OKF directly from Git). (The
+> adds no required infrastructure. Cross-tier **mem0/Qdrant coordination remains deferred post-v1**. Under `--memory=hindsight`, [`docs/designs/memory.md`](../designs/memory.md) and [06](06-api-and-data-contracts.md) §5–§6 automatically index `knowledge/`, ADR/RFC, and runbook records across `managed_repos` and read-only `context_repos` (`role:context`) into single-install Hindsight (`kube-agents-decisions`). Modes `--memory=file` and `--memory=off` evaluate OKF directly from Git. (The
 > conversational memory provider choice handles **per-user session isolation in the shared gateway**,
 > separate from cross-tier coordination.)
 
