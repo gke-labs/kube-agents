@@ -149,7 +149,7 @@ func TestTheRecoveredPanicTokenReadsInPlainWords(t *testing.T) {
 	// The panic can come after the run's work (the scrub, the chat fold, a
 	// publish), so asking again can repeat a write: the sentence says to
 	// check what was done first, never a bare "ask again".
-	if !strings.Contains(words, "check that before you ask again") || strings.HasSuffix(words, "; ask again") {
+	if !strings.Contains(words, "check what it already did before you ask again") || strings.HasSuffix(words, "; ask again") {
 		t.Fatalf("the sentence %q doesn't say to check what was done before asking again", words)
 	}
 }
@@ -164,7 +164,7 @@ func TestTheRecoveredPanicNoticeAsSlackGetsIt(t *testing.T) {
 	}
 	got := stub.forms[0].Get("text")
 	t.Logf("Slack text: %s", got)
-	if !strings.HasPrefix(got, "❌") || !strings.Contains(got, "check that before you ask again") || strings.Contains(got, taskguard.ReasonToken) {
+	if !strings.HasPrefix(got, noticeFailed+noticeDetailSeparator) || !strings.Contains(got, "check what it already did before you ask again") || strings.Contains(got, taskguard.ReasonToken) {
 		t.Fatalf("Slack got %q, want the failure notice with the check-first sentence and no token", got)
 	}
 }

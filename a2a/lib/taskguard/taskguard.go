@@ -35,7 +35,8 @@ func Count() int64 { return recovered.Load() }
 
 // PanicError is the error Guard returns for a recovered panic. Value is the
 // raw panic value, which may have been built from model or user text: it is
-// for errors.As and tests, and is never printed. Error() shows only Summary.
+// for errors.As and tests, and nothing outside tests prints it. Error() shows
+// the ReasonToken, What and Summary(Value), never Value itself.
 type PanicError struct {
 	// What names the work that panicked, as the caller gave it to Guard.
 	What string

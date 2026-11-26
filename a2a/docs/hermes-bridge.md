@@ -1111,9 +1111,11 @@ spec names, not one this sweep fills. Three failure classes:
   still answered 204. Each recovery is logged at Error with the message
   `recovered a panic`, the panic's type or runtime error, and the stack. The count of
   recoveries is kept in the process with no endpoint, so alert on the log message or the
-  reason. The door's routing, before a delivery is matched to a task, has no guard of its
-  own: `net/http` recovers a panic in a handler, as it always has, so that delivery is
-  dropped and no task is marked. A panic anywhere else (the durable's consumer goroutine
+  reason. The door's routing (`routeDelivery`, before a delivery is matched to a task) has
+  no guard of its own: `net/http` recovers a panic in a handler, as it always has, by
+  closing the connection with no answer and logging the panic value to stderr. No task is
+  marked, and hermes retries the delivery, as it retries any connection error. A panic
+  anywhere else (the durable's consumer goroutine
   and the finalizes it runs, the deadline and kill timers, and the `recordOrigin`,
   synthesis-watcher, board-action and session-card-abort goroutines) still ends the
   process, and the sweep above finalizes its tasks.
