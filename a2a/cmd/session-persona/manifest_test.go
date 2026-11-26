@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
+	"google.golang.org/adk/v2/tool/skilltoolset"
+	"google.golang.org/adk/v2/tool/skilltoolset/skill"
 )
 
 // The tree ships with a content manifest that covers exactly what was
@@ -117,6 +120,26 @@ func TestTheCoreAgentTreeIsARenderingTheHarnessAccepts(t *testing.T) {
 	}
 	if snap.Instructions == "" {
 		t.Error("the snapshot has no instructions")
+	}
+	// What the harness does with the skills at each turn: its loader lists
+	// every skill's frontmatter and builds the skill toolset, and refuses a
+	// name outside core-agent's rule, so a skill that would fail every
+	// core-agent session turn fails here instead.
+	for _, name := range sessionSkills {
+		if !coreagent.ValidSkillName(name) {
+			t.Errorf("%s is not a skill name core-agent takes", name)
+		}
+	}
+	src := skill.NewFileSystemSource(snap.Skills)
+	listed, err := src.ListFrontmatters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != len(sessionSkills) {
+		t.Errorf("the skill loader lists %d skills, want %d", len(listed), len(sessionSkills))
+	}
+	if _, err := skilltoolset.New(context.Background(), skilltoolset.Config{Source: src}); err != nil {
+		t.Errorf("the skill toolset refuses the session skills: %v", err)
 	}
 }
 

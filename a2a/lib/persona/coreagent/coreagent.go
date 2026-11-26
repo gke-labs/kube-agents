@@ -68,7 +68,7 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 	out := persona.Output{Model: p.Manifest.Model, Allowed: slices.Clone(p.Manifest.Tools), MCPServers: servers}
 	out.Files = append(out.Files, persona.File{Path: InstructionsFile, Data: []byte(p.Instructions)})
 	for _, s := range p.Skills {
-		if !skillNameRE.MatchString(s.Name) || strings.Contains(s.Name, "--") {
+		if !ValidSkillName(s.Name) {
 			return persona.Output{}, fmt.Errorf("skills/%s: not a skill name core-agent takes (lowercase letters, digits and single '-')", s.Name)
 		}
 		for _, f := range s.Files {
@@ -169,6 +169,12 @@ var toolNameRE = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 // skillNameRE is the Agent Skills name rule, as the persona loader applies
 // it; the harness's loader also refuses a name with "--".
 var skillNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,62}[a-z0-9])?$`)
+
+// ValidSkillName reports whether core-agent's skill loader takes name as a
+// skill's name: the Agent Skills rule, and no "--".
+func ValidSkillName(name string) bool {
+	return skillNameRE.MatchString(name) && !strings.Contains(name, "--")
+}
 
 // urlPlaceholder is what the relay's args carry where the server's address
 // goes, as for Claude Code.

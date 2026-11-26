@@ -101,7 +101,9 @@ core-agent harness reads it there (`--persona-dir`) and always requires it,
 so a missing, writable or changed tree fails the turn. A core-agent profile
 pod never reads it: its persona is the operator's rendering at
 `/var/lib/agent-persona`, so a profile pod whose rendering is missing fails
-rather than run with the session's persona.
+rather than run with the session's persona. Running the worker outside the image with
+`A2A_HARNESS=core-agent` and no profile flag therefore fails every turn
+unless that directory holds a sealed tree.
 
 Editing a skill in `sessionSkills` now also feeds the worker image: its build
 fails if the skill's frontmatter stops parsing, its `name` stops matching its

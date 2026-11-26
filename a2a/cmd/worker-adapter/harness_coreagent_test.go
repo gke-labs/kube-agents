@@ -37,6 +37,18 @@ func TestTheCoreAgentHarnessPathIsWhereTheImagePutsIt(t *testing.T) {
 			t.Errorf("Dockerfile.worker lacks %q", want)
 		}
 	}
+	// The tree has to stay root-owned with no write bit: copied and sealed
+	// after the runtime stage's last chown, and before it drops to the
+	// harness's user.
+	text := string(df)
+	runtime := strings.LastIndex(text, "\nFROM ")
+	chown := strings.LastIndex(text, "chown -R")
+	cp := strings.Index(text, "COPY --from=build /out/core-agent-session/")
+	seal := strings.Index(text, "RUN chmod -R a-w "+coreAgentSessionPersonaDir)
+	user := strings.LastIndex(text, "\nUSER ")
+	if !(runtime < chown && chown < cp && cp < seal && seal < user) {
+		t.Errorf("Dockerfile.worker order: last FROM %d, chown %d, copy %d, chmod %d, USER %d; want the tree copied and sealed after the chown and before USER", runtime, chown, cp, seal, user)
+	}
 }
 
 // The argv carries the model and the persona dir, and no session or resume
