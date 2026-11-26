@@ -26,15 +26,13 @@ from tests.testing.common import (
     RENEWAL_NAP_TICK_SECONDS,
     RENEWAL_WRITE_STALL_SECONDS,
     STALLED_RENEWAL_WRITE,
+    find_renewal_trap_offenders,
     get_isolated_test_env,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _REPO = "gke-agentic/kube-agents-evals-2-infra"
-_SUBSTITUTION_RE = re.compile(r"\$\((?!\()|`|<\(|>\(")
-_UNCLOSED_ARITHMETIC_RE = re.compile(r"\$\(\((?!.*\)\))")
-_LOOP_JUMP_RE = re.compile(r"\b(?:continue|break)\b")
 
 
 def _extract(pattern, what):
@@ -338,19 +336,13 @@ class GitopsWriteTokenTest(_Harness):
         start_fn = _function("start_gitops_write_token")
         subshell = re.search(r"^\s*\(\n\s*waited=0.*?^\s*\) &$", start_fn, re.S | re.M)
         self.assertIsNotNone(subshell, "could not find the renewer subshell in start_gitops_write_token")
-        offenders = []
-        for scope, text in (
-            ("start_gitops_write_token subshell", subshell.group(0)),
-            ("forge_write_token", _function("forge_write_token")),
-            ("ledger_reset_token", _function("ledger_reset_token")),
-        ):
-            for number, line in enumerate(text.splitlines(), 1):
-                if line.lstrip().startswith("#"):
-                    continue
-                if _SUBSTITUTION_RE.search(line) or _UNCLOSED_ARITHMETIC_RE.search(line):
-                    offenders.append(f"{scope}:{number} (substitution): {line.strip()}")
-                if scope.endswith("subshell") and _LOOP_JUMP_RE.search(line):
-                    offenders.append(f"{scope}:{number} (loop jump): {line.strip()}")
+        offenders = find_renewal_trap_offenders(
+            (
+                ("start_gitops_write_token subshell", subshell.group(0)),
+                ("forge_write_token", _function("forge_write_token")),
+                ("ledger_reset_token", _function("ledger_reset_token")),
+            )
+        )
         self.assertEqual(offenders, [], "unsafe construct under an armed trap:\n" + "\n".join(offenders))
 
     def test_stop_returns_promptly_when_sleep_is_a_noop(self):

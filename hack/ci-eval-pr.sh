@@ -1598,7 +1598,8 @@ mint_ledger_token() { # <label>
     return 0
   fi
   # The token never reaches argv, where ps would show it: python writes it to
-  # stdout and command substitution keeps it in this shell.
+  # stdout, redirected into a mode-0700 directory for read to take back into
+  # this shell without a command substitution.
   #
   # Retried because a short outage should not cost the repetition at all. A
   # unit that cannot mint releases its locks and returns without a run, and
@@ -1611,13 +1612,17 @@ mint_ledger_token() { # <label>
   # The ladder stays at LEDGER_MINT_ATTEMPTS whatever GitHub is doing: an
   # incident lasts longer than any wait a unit holding its locks can afford,
   # and the not-run record is what keeps that from reading as a red.
-  local token expires line rc attempt=1 delay=2 minted diagnostics
+  local token expires line rc attempt=1 delay=2 scratch minted diagnostics
   LEDGER_MINT_LAST_FAILURE=""
-  # The mint's stdout and stderr go through files rather than command
-  # substitutions so start_ledger_token_renewal can call this function while
-  # its TERM trap is armed; stderr is echoed to this shell's stderr as before.
-  minted="${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.out"
-  diagnostics="${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.err"
+  # The mint's stdout and stderr go through files in a mode-0700 directory
+  # rather than command substitutions so start_ledger_token_renewal can call
+  # this function while its TERM trap is armed; stderr is echoed to this
+  # shell's stderr as before.
+  scratch="${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.${RANDOM:-0}"
+  rm -rf "${scratch}"
+  mkdir -m 0700 "${scratch}" || return 1
+  minted="${scratch}/out"
+  diagnostics="${scratch}/err"
   while :; do
     rc=0
     LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint >"${minted}" 2>"${diagnostics}" || rc=$?
@@ -1630,7 +1635,7 @@ mint_ledger_token() { # <label>
       LEDGER_MINT_LAST_FAILURE="${line}"
     done <"${diagnostics}"
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
-      rm -f "${minted}" "${diagnostics}"
+      rm -rf "${scratch}"
       echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
            "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
       echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
@@ -1658,7 +1663,7 @@ mint_ledger_token() { # <label>
         ;;
     esac
   done <"${diagnostics}"
-  rm -f "${minted}" "${diagnostics}"
+  rm -rf "${scratch}"
   export BENCH_GITHUB_TOKEN="${token}"
   echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${expires}${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"
 }
@@ -2086,22 +2091,25 @@ forge_write_token() { # <owner/repo> [permissions JSON]
 # first attempt and means the grant is missing. Returns as mint_ledger_token
 # does: LEDGER_MINT_RETRYABLE when the last attempt was transient, 1 otherwise.
 ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]
-  local body token minted rc attempt=1 permissions='{"issues":"write"}'
+  local body token scratch minted rc attempt=1 permissions='{"issues":"write"}'
   [ -n "${2:-}" ] && permissions="$2"
   body="{\"repositories\":[\"${1##*/}\"],\"permissions\":${permissions}}"
-  minted="${TMPDIR:-/tmp}/ledger-reset-mint.$$.${BASHPID:-0}.out"
+  scratch="${TMPDIR:-/tmp}/ledger-reset-mint.$$.${BASHPID:-0}.${RANDOM:-0}"
+  rm -rf "${scratch}"
+  mkdir -m 0700 "${scratch}" || return 1
+  minted="${scratch}/out"
   while :; do
     # `&&` rather than `if`: the status of a failed `if` test is 0 by the
     # time the body would read it, and this needs the mint's own.
     LEDGER_MINT_BODY="${body}" _ledger_token_mint >"${minted}" && {
       read -r token _ <"${minted}" || true
-      rm -f "${minted}"
+      rm -rf "${scratch}"
       printf '%s\n' "${token}"
       return 0
     }
     rc=$?
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_RESET_MINT_ATTEMPTS}" ]; then
-      rm -f "${minted}"
+      rm -rf "${scratch}"
       if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
         return "${LEDGER_MINT_RETRYABLE}"
       fi
