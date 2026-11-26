@@ -349,7 +349,7 @@ check_go_directive() {
 }
 
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
-check_go_directive deploy/kube-proxy/Dockerfile GOLANG_VERSION k8s-api-proxy/go.mod
+check_go_directive deploy/kube-proxy/Dockerfile GOLANG_VERSION kube-proxy/go.mod
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
