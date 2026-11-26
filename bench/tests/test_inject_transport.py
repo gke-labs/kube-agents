@@ -353,6 +353,8 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # The read route's childAddressees on the chain read after the terminal;
     # None leaves the key out, as a door older than the field does.
     probe_child_addressees: list[str] | None = None
+    # The read route's childCount on the same read; None leaves the key out.
+    probe_child_count: int | None = None
     probe_usage_partial: bool = False
 
     def poll_fails(self) -> bool:
@@ -405,6 +407,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
         if self.probe_child_addressees is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["childAddressees"] = list(self.probe_child_addressees)
+        if self.probe_child_count is not None and chain and task == self.task_id:
+            report["taskId"] = self.task_id
+            report["childCount"] = self.probe_child_count
         if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
@@ -2457,6 +2462,7 @@ def test_the_infrastructure_reasons_are_the_executors_own() -> None:
         "hermes-api-unreachable",
         "hermes-api-refused",
         "session-busy",
+        "internal-panic",
     }
     assert not inject.INFRASTRUCTURE_REASONS & inject.PERSONA_REASONS
 
@@ -2612,8 +2618,20 @@ def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
             "result": None,
             "status": "completed",
         },
-        {"name": "kanban_create", "args": {"title": "list the fleet"}, "result": None, "status": "completed"},
-        {"name": "terminal", "args": {"command": "kubectl get nodes"}, "result": None, "status": "error"},
+        {
+            "name": "kanban_create",
+            "args": {"title": "list the fleet"},
+            "result": None,
+            "status": "completed",
+            "call_id": "call_1",
+        },
+        {
+            "name": "terminal",
+            "args": {"command": "kubectl get nodes"},
+            "result": None,
+            "status": "error",
+            "call_id": "call_2",
+        },
     ]
     # The block follows the lifecycle rather than interleaving with it.
     names = [e["name"] for e in result.trajectory]
@@ -2636,6 +2654,60 @@ def test_the_trace_the_door_carries_becomes_tool_entries_behind_a_marker(
     # existing reads and no read was added for it.
     probed = [p["task"] for p in stub_gateway.polls if p["probe"]]
     assert probed[0] == "" and probed[1:] and all(t == stub_gateway.task_id for t in probed[1:])
+
+
+def test_a_part_without_a_call_id_writes_no_call_id_field(stub_gateway: _StubGatewayServer) -> None:
+    """An executor that publishes no ``callId`` (or an empty or non-string
+    one) gives an entry in the api shape with no ``call_id`` key at all,
+    rather than one carrying a placeholder."""
+    no_id = {k: v for k, v in CALL_CREATE.items() if k != inject.ACTIVITY_CALL_ID_KEY}
+    empty_id = {**CALL_FAILED, inject.ACTIVITY_CALL_ID_KEY: ""}
+    numeric_id = {**CALL_FAILED, inject.ACTIVITY_CALL_ID_KEY: 7}
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+    stub_gateway.probe_activity = [no_id, empty_id, numeric_id]
+
+    result = KubeAgentsHarness().run("file a card")
+
+    calls = trace_block(result.trajectory)[1:]
+    assert [c["name"] for c in calls] == ["kanban_create", "terminal", "terminal"]
+    assert all(inject.ENTRY_CALL_ID_FIELD not in c for c in calls)
+
+
+def test_the_call_id_never_changes_what_tool_called_matches(stub_gateway: _StubGatewayServer) -> None:
+    """``call_id`` sits beside ``args``: the same calls with and without a
+    ``callId`` grade the same under ``tool_called``, by name, by an argument
+    pattern, and by success, and the id never appears in ``args``."""
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    def grades(activity: list[dict[str, Any]]) -> list[str]:
+        stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed t_1")
+        stub_gateway.probe_activity = activity
+        result = KubeAgentsHarness().run("file a card")
+        assert all(
+            inject.ENTRY_CALL_ID_FIELD not in c["args"] and inject.ACTIVITY_CALL_ID_KEY not in c["args"]
+            for c in trace_block(result.trajectory)[1:]
+        )
+        return [
+            ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"]).verify(5.0).status,
+            ToolCalledVerifier(
+                type="tool_called", tool_names=["terminal"], arguments={"command": "(?is).*kubectl.*"}
+            )
+            .verify(5.0)
+            .status,
+            ToolCalledVerifier(
+                type="tool_called", tool_names=["kanban_create"], arguments={inject.ENTRY_CALL_ID_FIELD: "(?is).*call_1.*"}
+            )
+            .verify(5.0)
+            .status,
+            ToolCalledVerifier(type="tool_called", tool_names=["terminal"], require_success=True)
+            .verify(5.0)
+            .status,
+        ]
+
+    without = [{k: v for k, v in c.items() if k != inject.ACTIVITY_CALL_ID_KEY} for c in (CALL_CREATE, CALL_FAILED)]
+    with_ids = grades([CALL_CREATE, CALL_FAILED])
+    assert with_ids == grades(without)
+    assert with_ids == ["pass", "pass", "fail", "fail"]
 
 
 def test_an_empty_trace_still_writes_the_marker(stub_gateway: _StubGatewayServer) -> None:
@@ -2718,7 +2790,13 @@ def test_the_tool_call_wrapper_stays_one_entry_the_verifier_unwraps() -> None:
     fold.note_activity([CALL_WRAPPED], 0, 0)
     calls = trace_block(fold.trajectory)[1:]
     assert calls == [
-        {"name": "tool_call", "args": CALL_WRAPPED["input"], "result": None, "status": "completed"}
+        {
+            "name": "tool_call",
+            "args": CALL_WRAPPED["input"],
+            "result": None,
+            "status": "completed",
+            "call_id": CALL_WRAPPED["callId"],
+        }
     ]
     assert _wrapped_tool_names(calls[0]) == {"mcp__gke__list_clusters", "mcp__gke__get_cluster"}
     transcript.set("answer", fold.trajectory)
@@ -3952,6 +4030,127 @@ def test_a_card_the_board_does_not_know_is_dropped_not_waited_on_to_the_ceiling(
     assert result.metadata["delegated_cards_missing"] == [CARD_A]
 
 
+
+def _adopted_card_run(tmp_path: Any, monkeypatch: pytest.MonkeyPatch, created_at: int, floor: int):
+    """CARD_A is on the board at the first read, running, then gone: a purge owing it deleted it."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_A, "running")
+    set_card(tmp_path, CARD_B, "done", result="fleet report")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, CARD_A))
+
+    def purge_after_first_read(n: int) -> None:
+        if n == 2:
+            with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+                conn.execute("DELETE FROM tasks WHERE id = ?", (CARD_A,))
+
+    real = local_shell(tmp_path, monkeypatch, purge_after_first_read)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    return KubeAgentsHarness().run("check the fleet")
+
+
+def test_an_earlier_runs_card_deleted_mid_wait_is_named_as_adopted_not_lost(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4794: this run's create was handed an earlier repetition's card by its key, and that card's
+    owed purge deleted it before the wait read it settled. The record says the run was not independent."""
+    floor = 1_700_000_000
+    result = _adopted_card_run(tmp_path, monkeypatch, created_at=floor - 60, floor=floor)
+
+    (error,) = result.errors
+    assert error.startswith(f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait")
+    assert "filed before this run started, so this run did not file it" in error
+    assert "this repetition is not independent" in error
+    assert result.metadata["delegated_cards_missing"] == [CARD_A]
+
+
+def test_a_card_of_this_runs_own_that_vanishes_keeps_the_plain_message(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    floor = 1_700_000_000
+    result = _adopted_card_run(tmp_path, monkeypatch, created_at=floor + 5, floor=floor)
+
+    assert result.errors == [
+        f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait, "
+        "nothing graded for it"
+    ]
+
+
+
+
+def test_an_earlier_runs_card_past_the_cap_deleted_before_its_promotion_is_still_named(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cap holds CARD_B back while its row is still read; CARD_A and CARD_B are then deleted.
+    CARD_KEEP keeps the wait going, so the slot CARD_A frees promotes CARD_B with no row left, and
+    CARD_B drops out too. Its creation time comes from the read that had its row, so it is still
+    named as not this run's."""
+    floor = 1_700_000_000
+    keep = "t_0000beef"
+    monkeypatch.setattr(harness, "_MAX_AWAITED_TASKS", 2)
+    build_session_store(tmp_path, created=[CARD_A, keep, CARD_B])
+    for tid, created_at in ((CARD_A, floor + 5), (keep, floor + 5), (CARD_B, floor - 60)):
+        set_card(tmp_path, tid, "running")
+        with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, tid))
+
+    def board_moves(n: int) -> None:
+        with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+            if n == 2:
+                conn.execute("DELETE FROM tasks WHERE id IN (?, ?)", (CARD_A, CARD_B))
+            if n == 12:
+                conn.execute("UPDATE tasks SET status = 'done', result = 'kept going' WHERE id = ?", (keep,))
+
+    real = local_shell(tmp_path, monkeypatch, board_moves)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        result = KubeAgentsHarness().run("check the fleet")
+
+    (b_error,) = [e for e in result.errors if e.startswith(f"card {CARD_B} ")]
+    assert "this repetition is not independent" in b_error
+    (a_error,) = [e for e in result.errors if e.startswith(f"card {CARD_A} ")]
+    assert "not independent" not in a_error
+    assert any(r.getMessage().startswith(f"awaited card {CARD_B} ") for r in caplog.records)
+
+def test_an_earlier_runs_card_that_settles_is_graded_and_logged_as_not_this_runs(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The commoner #4794 case: the earlier run's card stays and is graded as this run's answer. No
+    new error (the scorer reads errors), but the build log names the card this run did not file."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (floor - 60, CARD_A))
+    real = local_shell(tmp_path, monkeypatch)
+
+    def clocked(script: str, timeout: float) -> str:
+        return f"{floor}\n" if script == harness._POD_CLOCK_SCRIPT else real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert f"Result of delegated task {CARD_A}:\nall 3 clusters healthy" in result.metadata["final_message"]
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith(f"awaited card {CARD_A} ")]
+    assert "this repetition is not independent" in line
+
+
 def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4656,6 +4855,33 @@ def test_the_chains_addressees_reach_the_record_and_the_transcript(stub_gateway:
     assert snap is not None and snap.child_addressees == ["tse", "platform"]
 
 
+def test_the_chains_child_count_reaches_the_record_and_the_transcript(stub_gateway: _StubGatewayServer) -> None:
+    """The read after the terminal counts the chain's children beside the
+    addressees, a repeated addressee counted each time; the record's
+    metadata and the verifiers' transcript carry the count as given."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the fleet is green")
+    stub_gateway.probe_child_addressees = ["platform"]
+    stub_gateway.probe_child_count = 2
+
+    result = KubeAgentsHarness().run("/session how is the fleet?")
+
+    assert result.metadata["child_addressees"] == ["platform"]
+    assert result.metadata["child_count"] == 2
+    snap = transcript.get()
+    assert snap is not None and snap.child_count == 2
+
+
+def test_a_door_without_the_count_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+    stub_gateway.probe_child_addressees = []
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.metadata["child_count"] is None
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees == [] and snap.child_count is None
+
+
 def test_a_door_without_the_addressees_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
     stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
 
@@ -4689,6 +4915,28 @@ def test_the_addressees_a_poll_carried_survive_a_read_after_the_terminal_that_fa
     assert exchange.fold.child_addressees == ["tse"]
 
 
+def test_the_count_a_poll_carried_survives_a_read_after_the_terminal_that_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """childCount rides every read like childAddressees, and a poll's copy is
+    kept the same way when the read after the terminal fails."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed",
+                  "childAddressees": ["platform"], "childCount": 3},
+    })
+
+    def unavailable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    monkeypatch.setattr(inject, "_request", unavailable)
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.fold.child_count == 3
+
+
 def test_the_addressees_field_parses_none_from_cannot_say() -> None:
     def parsed(value: Any) -> list[str] | None:
         probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childAddressees": value}})
@@ -4701,6 +4949,26 @@ def test_the_addressees_field_parses_none_from_cannot_say() -> None:
     assert parsed("tse") is None
     assert parsed(["tse", 3]) is None
     assert inject.Probe.from_body({"probe": {"active": False}}).child_addressees is None
+
+
+def test_the_count_field_parses_none_from_cannot_say() -> None:
+    """A malformed count is "can't say", never zero: zero would vouch for a
+    chain that delegated nothing."""
+    def parsed(value: Any) -> int | None:
+        probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childCount": value}})
+        assert probe is not None
+        return probe.child_count
+
+    assert parsed(0) == 0
+    assert parsed(3) == 3
+    assert parsed(None) is None
+    assert parsed(-1) is None
+    assert parsed(True) is None
+    assert parsed(False) is None
+    assert parsed(2.0) is None
+    assert parsed("2") is None
+    assert parsed([2]) is None
+    assert inject.Probe.from_body({"probe": {"active": False}}).child_count is None
 
 
 def test_a_partial_usage_is_read_again_and_marked_when_it_stays_partial(

@@ -1256,10 +1256,11 @@ spec:
                             their number: the broker charges each command about 128Mi, the size of
                             a listing of a small cluster, and a kubectl listing thousands of objects
                             holds several hundred Mi on its own, so size the limit to the largest
-                            listing the fleet produces for every command that runs at once (eight
-                            at the slot cap) plus the 192Mi resident reserve for the broker and
-                            Envoy; the broker's child peak and memory high-water series give the
-                            figure.
+                            listing the fleet produces for every command that runs at once (8 on
+                            fixed/default profiles, or 8/12/16 across small/medium/fleet under
+                            sizingProfile: auto) plus the 192Mi resident reserve
+                            for the broker and Envoy; the broker's child peak and memory high-water
+                            series give the figure.
                             Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
                             refuses a memory limit below what admits two commands at once, a request
@@ -1268,7 +1269,8 @@ spec:
                             one that was valid, renders the proxy Deployment at the sizing
                             profile's row (the operator's defaults under small), not at the last
                             accepted override, until it is corrected,
-                            which on the proxy's Recreate Deployment restarts the proxy once; the
+                            which rolls the proxy Deployment once (active-standby RollingUpdate under
+                            sizingProfile: auto in-cluster, or Recreate otherwise); the
                             operator reports Degraded with reason InvalidCredentialProxyResources
                             when no higher-ranked Degraded cause is present, the agent staying
                             Ready, whether or not the validating webhook is enabled. Where the
@@ -9273,33 +9275,35 @@ spec:
                         4Gi. "fleet" raises the broker to 4 CPU and 8Gi requests with 8 CPU and
                         8Gi limits and the 8Gi ephemeral-storage limit, the sidecar's memory
                         limit to 8Gi and the shell's to 4Gi. "auto" promotes the tier from the
-                        cluster count the operator polls into status.usage, the larger of
+                        cluster count the operator polls into status.usage (the larger of
                         clustersRegistered and clustersMonitored: medium at 10 clusters, fleet
-                        at 25. It continues from the tier status.effectiveSizingTier holds,
-                        which is small on a CR that never named a tier and the explicit tier
-                        on one that did; set small first to restart it from small. A promotion
-                        is upward only, latched in that status field, so a count that falls
-                        never lowers the tier; and before each step up the operator checks
-                        every ResourceQuota in the namespace that counts these pods for the
-                        cpu, memory and ephemeral-storage the step adds, and every LimitRange
-                        max, min and maxLimitRequestRatio in the namespace against the three
-                        containers' figures at the higher row, per container and summed per
-                        pod, takes the highest tier both admit (the running one when they
-                        admit none) and sets the
-                        SizingCappedByQuota condition for the step refused, naming the quota
-                        or the LimitRange, rather than rolling out pods admission would refuse.
-                        A pod the namespace admits between that check and the recreated
-                        broker's admission can take the room the check found; a step whose
-                        pod a quota then refuses is stepped back one tier, the condition
-                        naming the quota and admission's message.
-                        The check reads namespaced admission, not node capacity: on GKE
-                        Standard the medium and fleet rows' broker requests (1 and 4 CPU) have
-                        to fit on one node before the recreated broker can start, so a Standard
-                        pool needs nodes that fit the fleet row's 4 CPU request (e2-standard-8
-                        or larger) before the count reaches 25 under auto. An
-                        explicit tier is applied as written, without either check. The agent
-                        container's own resources are not part of a profile. A change of tier
-                        recreates the proxy pod once and rolls the gateway and the shell pod.
+                        at 25) and proactively from sustained utilization (>= 75% of the current
+                        tier's capacity for 5m across PodMetrics CPU/memory or credential-proxy
+                        slot/budget/cgroup metrics). Under "auto" the tier can also step down one
+                        tier at a time (never below the cluster-count floor) when all scaled
+                        dimensions stay <= 55% of the lower tier's capacity for 25m after a 30m
+                        transition cooldown. It continues from the tier
+                        status.effectiveSizingTier holds, which is small on a CR that never named
+                        a tier and the explicit tier on one that did; set small first to restart
+                        it from small. Before each tier transition the operator checks every ResourceQuota
+                        in the namespace that counts these pods (including surge room for the
+                        credential-proxy RollingUpdate replacement alongside the running pod) and
+                        every LimitRange max, min and maxLimitRequestRatio in the namespace
+                        against the three containers' figures at the candidate row, per container
+                        and summed per pod, takes the highest tier both admit on step-up (or stays
+                        on the running one when they admit none) and sets the SizingCappedByQuota condition for the
+                        step refused, naming the quota, LimitRange, or pending surge capacity. If
+                        a surge pod stays unschedulable past the warm timeout or is refused by
+                        admission, the operator rolls back to the active running tier without
+                        terminating the healthy active broker. An explicit tier ("small", "medium",
+                        "fleet") or unset default renders credential-proxy with Recreate and is
+                        applied as written, without either check. The agent container's own
+                        resources are not part of a profile. Under "auto", a change of tier rolls
+                        credential-proxy in-cluster with active-standby maxSurge 1 / maxUnavailable 0
+                        handoff (after one Recreate hop on upgrade from a pre-standby pod) and
+                        restarts the gateway (every tier change) and the shell pod (on fleet
+                        transitions only), while fixed-2Gi credential-proxy-exec pods keep their
+                        8-slot cap unchanged.
                       enum:
                         - small
                         - medium
@@ -10211,6 +10215,19 @@ spec:
                             - session
                             - platform
                           type: string
+                        dmSessionIdleMinutes:
+                          description: |-
+                            DMSessionIdleMinutes replaces SessionIdleMinutes for a DM conversation
+                            with one message so far (A2A_DM_IDLE_TTL): most DMs are a single
+                            question, and a session pod held for the full idle time after its answer
+                            takes a slot of maxSessions. A delegation the pod makes to answer doesn't
+                            count as a message. A second message puts the conversation back
+                            on SessionIdleMinutes. Unset, the gateway's default of 5 applies. A
+                            value above SessionIdleMinutes has no effect beyond it.
+                          format: int32
+                          maximum: 10080
+                          minimum: 1
+                          type: integer
                         maxInProgress:
                           description: |-
                             MaxInProgress caps how many kanban workers run concurrently across the whole
@@ -10251,23 +10268,25 @@ spec:
                             over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
                             coordinator waiting on its own children gives its slot back but stays resident, so
                             processes can sit above six. The credential proxy at its default 2Gi memory limit
-                            admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
-                            watch's and cluster-agent reconcile's four-wide listings share. Per-install model
-                            rate limits are not measured: a small quota may see 429s at 6, so lower this if
+                            admits 10 brokered commands at once, held to 8 by its small/default slot cap, which
+                            the stall watch's and cluster-agent reconcile's four-wide listings share. Per-install
+                            model rate limits are not measured: a small quota may see 429s at 6, so lower this if
                             worker logs show them.
 
                             Set it higher once a deployment has measured its own worker footprint and model
-                            quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
-                            already admits more than its slot cap of 8, so up to about eight workers' worth of
-                            commands fit at the defaults, fewer while the listings above run. Past that the
-                            slot cap binds, and no CR field moves it, so raising the memory limit in
-                            spec.deployment.credentialProxy.resources does not help: a command beyond eight
-                            waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-                            more, since below it the memory budget (176 MiB per command after the 192 MiB
-                            resident reserve) binds first. Set it to 1 to serialise all delegated work. When
-                            quota rather than memory binds, note the related failure mode: workers that exhaust their retry
-                            budget exit without calling a terminal kanban tool, and the dispatcher reports that
-                            as a "protocol violation" rather than as the quota exhaustion it actually is.
+                            quota. The credential proxy sets the ceiling on brokered commands: its small/default
+                            2Gi already admits more than its slot cap of 8, so up to about eight workers' worth
+                            of commands fit at the defaults, fewer while the listings above run. Past that the
+                            slot cap binds (8 on fixed profiles and default, stepping 8/12/16 across
+                            small/medium/fleet under spec.deployment.sizingProfile: auto); raising only the
+                            proxy memory limit in spec.deployment.credentialProxy.resources without enabling
+                            auto does not raise the slot cap, and a command beyond the cap waits up to 60 s for
+                            a slot and is then refused busy. Keep that limit at 2Gi or more, since below it the memory budget
+                            (176 MiB per command after the 192 MiB resident reserve) binds first. Set it to 1 to
+                            serialise all delegated work. When quota rather than memory binds, note the related
+                            failure mode: workers that exhaust their retry budget exit without calling a terminal
+                            kanban tool, and the dispatcher reports that as a "protocol violation" rather than
+                            as the quota exhaustion it actually is.
                           minimum: 1
                           type: integer
                         maxSessions:
@@ -10471,6 +10490,20 @@ spec:
                                 "(has(self.restartGraceSeconds) ? self.restartGraceSeconds
                                 : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds
                                 : 20)"
+                        sessionIdleMinutes:
+                          description: |-
+                            SessionIdleMinutes is how long a session pod is kept after the last
+                            message in its conversation before the gateway reaps it (A2A_IDLE_TTL).
+                            A running task always keeps its pod, and the next message after a reap
+                            gets a new pod with the conversation's history. Unset, the gateway's
+                            default of 30 applies. It also bounds how long a Slack thread stays live
+                            without a fresh mention after its last task. A session pod also ends at
+                            its 4-hour maximum lifetime, so above 240 the value only lengthens that
+                            Slack thread liveness.
+                          format: int32
+                          maximum: 10080
+                          minimum: 1
+                          type: integer
                         sessionResources:
                           description: |-
                             SessionResources are the A2A session pods' CPU and memory requests and
@@ -10555,6 +10588,32 @@ spec:
                                 || k == 'memory')"
                             - message: sessionResources may not set claims
                               rule: "!has(self.claims) || size(self.claims) == 0"
+                        warmSessions:
+                          description: |-
+                            WarmSessions is how many warm A2A session pods the gateway keeps ready
+                            on the session route, so a new conversation's first turn is handed a
+                            running pod instead of waiting for one to be scheduled and its image
+                            pulled. Unset means 1. Each warm pod holds one session pod's requests
+                            while it waits (sessionResources: 150m CPU and 320Mi by default, billed
+                            on Autopilot, where without Pod bursting the per-Pod minimum of 250m and
+                            512Mi applies), so the default costs one session pod's requests per
+                            install; 0 turns the pool off.
+
+                            A warm pod becomes the conversation's session pod as it is, with exactly
+                            the identity and reach a freshly started one would have; one unclaimed
+                            for 25 minutes is replaced. The pool never takes the session cap's last
+                            slot: it keeps at most the effective cap less one (none below a cap of
+                            2), and fewer while live conversations fill the cap. Each warm pod
+                            takes one TASKS consumer and one pod in the session ResourceQuota, and
+                            only consumers the session cap leaves spare: a TASKS stream with none
+                            spare runs without a warm pod (status.effectiveWarmSessions) rather
+                            than losing a session, and a new stream is created with room for
+                            them. On the platform route, which an unset defaultRoute means, no
+                            warm pod runs and nothing is rendered for one. A change rolls the
+                            gateway on the session route.
+                          maximum: 100
+                          minimum: 0
+                          type: integer
                       type: object
                       x-kubernetes-validations:
                         - message:
@@ -12821,13 +12880,26 @@ spec:
                     EffectiveSizingTier is the sizing tier the operator last rendered the
                     credential proxy, the agent-api-auth sidecar and the shell container at:
                     "small", "medium" or "fleet". Under spec.deployment.sizingProfile "auto"
-                    it is also the latch: the tier rises from the value here with the
-                    cluster count, is stepped back one tier when admission refuses the pod
-                    a step recreated (the SizingCappedByQuota condition beside it says
-                    which quota), and a recreated CR starts again at small. Under an
-                    explicit profile it repeats that profile. Absent before the first pass
-                    that resolved it.
+                    it holds the current live tier: promoted proactively by sustained
+                    utilization (>= 75% for 5m) or cluster count (10 / 25), stepped down one
+                    tier when all dimensions stay <= 55% of the lower tier for 25m (never
+                    below the cluster-count floor, subject to a 30m cooldown), and rolled
+                    back when admission or node capacity cannot schedule the replacement pod
+                    (the SizingCappedByQuota condition beside it says why). Under an explicit
+                    profile it repeats that profile. Absent before the first pass that
+                    resolved it.
                   type: string
+                effectiveWarmSessions:
+                  description: |-
+                    EffectiveWarmSessions is how many warm session pods the operator
+                    renders on the session route: spec.harness.tuning.warmSessions,
+                    bounded by the effective session cap less one and by the TASKS
+                    consumers the cap leaves spare. Warm pods use only spare consumers,
+                    so a stream with none spare runs without one rather than losing a
+                    session. Written with effectiveSessionCap, from the same reading.
+                    Under a served CRD that drops this field no warm pod runs until the
+                    CRD is updated.
+                  type: integer
                 inference:
                   description: |-
                     Inference reports the Platform Agent's default model, as the install's LiteLLM
@@ -12866,6 +12938,17 @@ spec:
                         SecretUIDs maps each such Secret's name to the UID it was created with.
                         A tier key's Secret is in the profile namespace; every other one is in
                         the PlatformAgent's namespace.
+                      type: object
+                    tierUnboundAt:
+                      additionalProperties:
+                        format: date-time
+                        type: string
+                      description: |-
+                        TierUnboundAt maps a tier whose key Secret is recorded to when the
+                        operator first found no bound profile listing it. While the applied
+                        dispatch config still lists such a tier as live, its key is kept for at
+                        most the drain window from then. An entry goes when a bound profile
+                        lists the tier again, and on the pass after its key is deleted.
                       type: object
                   type: object
                 lastReconcileTime:
@@ -12967,6 +13050,69 @@ spec:
                       description:
                         Endpoint is the primary URL or IP (including protocol
                         and port) to reach the agent.
+                      type: string
+                  type: object
+                sizing:
+                  description: |-
+                    Sizing reports proactive utilization-driven auto-sizing telemetry,
+                    soak timestamps, and the current trigger beside EffectiveSizingTier.
+                    Absent until the first reconcile under a CRD carrying the field, and
+                    while the served CRD predates it.
+                  properties:
+                    activeTier:
+                      description: |-
+                        ActiveTier is the tier currently rendered onto the sized workloads
+                        ("small", "medium", or "fleet").
+                      type: string
+                    desiredTier:
+                      description: |-
+                        DesiredTier is the tier currently justified by cluster count and
+                        sustained utilization before any ResourceQuota, LimitRange, or surge
+                        capacity cap.
+                      type: string
+                    lastObservedDimension:
+                      description: |-
+                        LastObservedDimension names the bottleneck dimension for
+                        LastObservedPeakPct (for example "memory", "cpu", "slots",
+                        "child_memory", "cgroup_memory", or "watermark").
+                      type: string
+                    lastObservedPeakPct:
+                      description: |-
+                        LastObservedPeakPct is the highest utilization percentage (0-100+) seen
+                        across the sized workloads on the latest sample.
+                      format: int32
+                      type: integer
+                    lastObservedWorkload:
+                      description: |-
+                        LastObservedWorkload names the workload owning LastObservedDimension
+                        (for example "credential-proxy", "agent-api-auth", or "shell").
+                      type: string
+                    lastTransitionTime:
+                      description: |-
+                        LastTransitionTime records when EffectiveSizingTier last changed, used to
+                        enforce the step-down cooldown window.
+                      format: date-time
+                      type: string
+                    scaleDownSustainedSince:
+                      description: |-
+                        ScaleDownSustainedSince records when all dimensions that shrink in the
+                        lower tier first remained at or below the step-down threshold (<= 55%
+                        of the lower tier's capacity). Cleared when utilization rises above the
+                        threshold, at the cluster-count floor, or after demotion.
+                      format: date-time
+                      type: string
+                    scaleUpSustainedSince:
+                      description: |-
+                        ScaleUpSustainedSince records when a bottleneck dimension first stayed
+                        at or above the step-up utilization threshold (>= 75% of current tier
+                        capacity). Cleared when utilization falls below threshold or after
+                        promotion.
+                      format: date-time
+                      type: string
+                    trigger:
+                      description: |-
+                        Trigger identifies what drove the current ActiveTier or DesiredTier
+                        decision: "manual", "cluster-count", "utilization", or "both".
                       type: string
                   type: object
                 storageStatus:

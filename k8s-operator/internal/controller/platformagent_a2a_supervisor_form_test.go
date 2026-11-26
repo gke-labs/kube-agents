@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -277,5 +279,311 @@ func TestAReaderOnAnOlderImageHoldsTheInstallAndSaysSo(t *testing.T) {
 	setProfileSupervisorFormCondition(agent, false, "anything", metav1.Now())
 	if !meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
 		t.Error("a hold replaced the latch")
+	}
+}
+
+// cutoffEnvOf is the cutoff env on the gateway's and the MCP server's
+// containers, by workload, with whether each carries it.
+func cutoffEnvOf(agent *agentv1alpha1.PlatformAgent) map[string]*corev1.EnvVar {
+	out := map[string]*corev1.EnvVar{"gateway": nil, "mcp": nil}
+	for name, spec := range map[string]corev1.PodSpec{
+		"gateway": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
+		"mcp":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
+	} {
+		for _, c := range spec.Containers {
+			for i := range c.Env {
+				if c.Env[i].Name == a2aProfileSupervisorCutoffEnvVar {
+					out[name] = &c.Env[i]
+				}
+			}
+		}
+	}
+	return out
+}
+
+// readerTemplates is the gateway's and the MCP server's pod templates, as
+// JSON, the bytes a roll is decided on.
+func readerTemplates(t *testing.T, agent *agentv1alpha1.PlatformAgent) string {
+	t.Helper()
+	b, err := json.Marshal([]corev1.PodTemplateSpec{
+		buildA2AGatewayDeployment(agent).Spec.Template,
+		buildA2AMCPDeployment(agent).Spec.Template,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// Until the install latches the six-token form, neither reader carries the
+// cutoff, and its pod template is byte for byte what an install with no
+// ProfileSupervisorForm condition renders, held or not: nothing rolls for it
+// (#5301 PR 4).
+func TestAnUnlatchedInstallRendersNoCutoffAndRollsNothing(t *testing.T) {
+	want := readerTemplates(t, a2aTestAgent())
+	held := a2aTestAgent()
+	setProfileSupervisorFormCondition(held, false, "kube-agents-agent", metav1.Now())
+	if !meta.IsStatusConditionFalse(held.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		t.Fatal("the hold didn't set the condition False")
+	}
+	noAnchor := a2aTestAgent()
+	meta.SetStatusCondition(&noAnchor.Status.Conditions, metav1.Condition{Type: a2aProfileSupervisorFormCondition,
+		Status: metav1.ConditionTrue, Reason: a2aProfileSupervisorFormReason})
+	noAnchor.Status.Conditions[len(noAnchor.Status.Conditions)-1].LastTransitionTime = metav1.Time{}
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"no condition":           a2aTestAgent(),
+		"held on the five-token": held,
+		"latched with no anchor": noAnchor,
+	} {
+		for workload, env := range cutoffEnvOf(agent) {
+			if env != nil {
+				t.Errorf("%s: the %s carries %s=%q, want it absent", name, workload, env.Name, env.Value)
+			}
+		}
+		if got := readerTemplates(t, agent); got != want {
+			t.Errorf("%s: the reader templates differ from an install with no condition, so they would roll", name)
+		}
+	}
+}
+
+// gateEnvOf is the profile names file env on the gateway's and the MCP
+// server's containers, by workload.
+func gateEnvOf(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	out := map[string]string{}
+	for name, spec := range map[string]corev1.PodSpec{
+		"gateway": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
+		"mcp":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
+	} {
+		for _, c := range spec.Containers {
+			for _, e := range c.Env {
+				if e.Name == a2aProfileNamesEnvVar {
+					out[name] = e.Value
+				}
+			}
+		}
+	}
+	return out
+}
+
+// Once latched, both readers carry the cutoff: the persisted condition's
+// LastTransitionTime plus the margin, RFC3339 in UTC. The latch never moves,
+// so a later pass (a later "now") renders the same bytes and the readers roll
+// once.
+func TestALatchedInstallRendersTheCutoffFromThePersistedLatch(t *testing.T) {
+	agent := a2aTestAgent()
+	latchedAt := time.Date(2026, 11, 23, 9, 30, 0, 0, time.FixedZone("PST", -8*3600))
+	setProfileSupervisorFormCondition(agent, true, "", metav1.NewTime(latchedAt))
+	want := "2026-11-23T17:40:00Z"
+	for workload, env := range cutoffEnvOf(agent) {
+		if env == nil || env.Value != want || env.ValueFrom != nil {
+			t.Errorf("the %s's cutoff is %+v, want %s=%s", workload, env, a2aProfileSupervisorCutoffEnvVar, want)
+		}
+	}
+	first := readerTemplates(t, agent)
+	setProfileSupervisorFormCondition(agent, true, "", metav1.NewTime(latchedAt.Add(time.Hour)))
+	if got := readerTemplates(t, agent); got != first {
+		t.Error("a later pass moved the cutoff; the latch's time must hold it")
+	}
+	if _, err := time.Parse(time.RFC3339, want); err != nil {
+		t.Fatalf("the cutoff doesn't parse as the readers parse it: %v", err)
+	}
+}
+
+// The cutoff comes from the condition as the API server holds it, never from
+// this pass's wanted latch: the pass that latches renders the readers as they
+// were, and the env arrives one pass later. And the roll it causes doesn't
+// reopen the gate: a latched install keeps the six-token form while the
+// readers roll onto the cutoff.
+func TestTheCutoffFollowsThePersistedLatchAndItsRollKeepsTheForm(t *testing.T) {
+	agent := a2aTestAgent()
+	var objs []client.Object
+	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		objs = append(objs, readerDeployment(agent, rd, true))
+	}
+	job := a2aProvisionJobForm(agent, true)
+	job.Status.Succeeded = 1
+	r := supervisorFormReconciler(t, append(objs, job)...)
+	ctx := context.Background()
+	if _, form, err := r.a2aProfileSupervisorFormFor(ctx, agent); err != nil || form != a2aProfileSupervisorFormValue {
+		t.Fatalf("form %q err %v, want the latch wanted", form, err)
+	}
+	for workload, env := range cutoffEnvOf(agent) {
+		if env != nil {
+			t.Errorf("the pass that wants the latch rendered the %s's cutoff before it was persisted", workload)
+		}
+	}
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	// The readers now mid-roll onto the cutoff's template.
+	objs = nil
+	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		objs = append(objs, readerDeployment(agent, rd, false))
+	}
+	r = supervisorFormReconciler(t, objs...)
+	if filter, form, err := r.a2aProfileSupervisorFormFor(ctx, agent); err != nil || !filter || form != a2aProfileSupervisorFormValue {
+		t.Fatalf("latched, readers rolling onto the cutoff: filter %v form %q err %v, want both kept", filter, form, err)
+	}
+	for workload, env := range cutoffEnvOf(agent) {
+		if env == nil {
+			t.Errorf("the persisted latch rendered no cutoff on the %s", workload)
+		}
+	}
+}
+
+// Once latched, both readers mount the profile names file and are pointed at
+// it; before, neither does (the unlatched test above holds the templates byte
+// for byte). The mount is the operator's ConfigMap, read-only and optional,
+// in the reader's own container.
+func TestALatchedInstallMountsTheProfileNamesOnBothReaders(t *testing.T) {
+	agent := a2aTestAgent()
+	if got := gateEnvOf(agent); len(got) != 0 {
+		t.Errorf("unlatched readers point at a names file: %v", got)
+	}
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	want := a2aProfileNamesMountPath + "/" + a2aProfileNamesKey
+	if got := gateEnvOf(agent); got["gateway"] != want || got["mcp"] != want {
+		t.Errorf("names file env = %v, want %s on both", got, want)
+	}
+	for workload, c := range map[string]struct {
+		spec      corev1.PodSpec
+		container string
+	}{
+		"gateway": {buildA2AGatewayDeployment(agent).Spec.Template.Spec, a2aGatewayContainerName},
+		"mcp":     {buildA2AMCPDeployment(agent).Spec.Template.Spec, a2aMCPContainer},
+	} {
+		var vol *corev1.Volume
+		for i := range c.spec.Volumes {
+			if c.spec.Volumes[i].Name == a2aProfileNamesVolume {
+				vol = &c.spec.Volumes[i]
+			}
+		}
+		if vol == nil || vol.ConfigMap == nil || vol.ConfigMap.Name != a2aProfileNamesName(agent) || !ptr.Deref(vol.ConfigMap.Optional, false) {
+			t.Errorf("%s: names volume = %+v, want the optional %s ConfigMap", workload, vol, a2aProfileNamesName(agent))
+		}
+		mounted := false
+		for _, ct := range c.spec.Containers {
+			for _, m := range ct.VolumeMounts {
+				if m.Name == a2aProfileNamesVolume {
+					if ct.Name != c.container || m.MountPath != a2aProfileNamesMountPath || !m.ReadOnly || m.SubPath != "" {
+						t.Errorf("%s: names mount %+v on %s, want read-only %s on %s with no subPath", workload, m, ct.Name, a2aProfileNamesMountPath, c.container)
+					}
+					mounted = true
+				}
+			}
+		}
+		if !mounted {
+			t.Errorf("%s: the names file is not mounted", workload)
+		}
+	}
+}
+
+// The profile names file holds exactly the names nats.conf denies the gateway
+// the supervisor subjects of (gatewayProfileSupervisorDeny), sorted, once
+// each, so a reader's "profile" and the bus's deny are one set; and it is
+// written only once latched.
+func TestTheProfileNamesAreTheBusDenysNames(t *testing.T) {
+	agent := a2aTestAgent()
+	names := []string{"fleet-audit", "cto-otter-1a2b", "fleet-audit", "", "bad.name", "wild*"}
+	cm, err := buildA2AProfileNamesConfigMap(agent, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f a2aProfileNamesFile
+	if err := json.Unmarshal([]byte(cm.Data[a2aProfileNamesKey]), &f); err != nil {
+		t.Fatalf("names file %q: %v", cm.Data[a2aProfileNamesKey], err)
+	}
+	var fromDeny []string
+	for _, d := range gatewayProfileSupervisorDeny(names) {
+		fromDeny = append(fromDeny, strings.TrimSuffix(strings.TrimPrefix(d, a2aProfileSupervisorPrefix), a2aProfileSupervisorSuffix))
+	}
+	if strings.Join(f.Profiles, ",") != strings.Join(fromDeny, ",") || len(f.Profiles) != 2 {
+		t.Errorf("names file %v, the deny's names %v; want the same two", f.Profiles, fromDeny)
+	}
+
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: a2aProfileNamesName(agent)}
+	if err := r.applyA2AProfileNames(ctx, agent, names, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, key, &corev1.ConfigMap{}); err == nil {
+		t.Error("an unlatched install wrote the profile names")
+	}
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	if err := r.applyA2AProfileNames(ctx, agent, names, nil); err != nil {
+		t.Fatal(err)
+	}
+	var got corev1.ConfigMap
+	if err := cl.Get(ctx, key, &got); err != nil {
+		t.Fatalf("a latched install wrote no profile names: %v", err)
+	}
+	if got.Data[a2aProfileNamesKey] != cm.Data[a2aProfileNamesKey] {
+		t.Errorf("applied %q, want %q", got.Data[a2aProfileNamesKey], cm.Data[a2aProfileNamesKey])
+	}
+}
+
+// A names render that failed applies nothing and fails the pass: the
+// ConfigMap keeps the names last written rather than taking an empty list,
+// which would tell both readers no addressee is a profile.
+func TestAFailedNamesRenderKeepsTheNamesLastWritten(t *testing.T) {
+	agent := a2aTestAgent()
+	setProfileSupervisorFormCondition(agent, true, "", metav1.Now())
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: a2aProfileNamesName(agent)}
+	if err := r.applyA2AProfileNames(ctx, agent, nil, errors.New("render failed")); err == nil {
+		t.Fatal("a failed render applied with no error")
+	}
+	if err := cl.Get(ctx, key, &corev1.ConfigMap{}); err == nil {
+		t.Error("a failed render wrote a profile names ConfigMap")
+	}
+	if err := r.applyA2AProfileNames(ctx, agent, []string{"fleet-audit"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.applyA2AProfileNames(ctx, agent, nil, errors.New("render failed")); err == nil {
+		t.Fatal("a failed render applied with no error")
+	}
+	var got corev1.ConfigMap
+	if err := cl.Get(ctx, key, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Data[a2aProfileNamesKey] != `{"profiles":["fleet-audit"]}`+"\n" {
+		t.Errorf("after a failed render the names are %q, want the names last written", got.Data[a2aProfileNamesKey])
+	}
+}
+
+// The gate holds against the gateway, so neither reader may write the file
+// it takes profile-ness from: the gateway's Role names no write on any
+// ConfigMap but its home-channel record, never this one, and cannot write its
+// own Deployment (the cutoff env); the MCP server mounts no ServiceAccount
+// token, so it has no API access at all.
+func TestNeitherReaderCanWriteTheProfileSupervisorGate(t *testing.T) {
+	agent := a2aTestAgent()
+	writes := map[string]bool{"create": true, "update": true, "patch": true, "delete": true, "deletecollection": true, "*": true}
+	for _, rule := range buildA2AGatewayRole(agent).Rules {
+		write := false
+		for _, v := range rule.Verbs {
+			write = write || writes[v]
+		}
+		if !write {
+			continue
+		}
+		for _, res := range rule.Resources {
+			switch res {
+			case "configmaps":
+				if len(rule.ResourceNames) == 0 {
+					t.Errorf("the gateway may write every ConfigMap: %+v", rule)
+				}
+				for _, n := range rule.ResourceNames {
+					if n == a2aProfileNamesName(agent) {
+						t.Errorf("the gateway may write the profile names: %+v", rule)
+					}
+				}
+			case "deployments", "*":
+				t.Errorf("the gateway may write Deployments: %+v", rule)
+			}
+		}
+	}
+	if spec := buildA2AMCPDeployment(agent).Spec.Template.Spec; ptr.Deref(spec.AutomountServiceAccountToken, true) {
+		t.Error("the MCP server mounts a ServiceAccount token")
 	}
 }

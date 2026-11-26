@@ -65,6 +65,14 @@ var backendArms = []backendArm{
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultWarmSessions is what WarmSessions means when A2A_WARM_SESSIONS is
+// unset: no warm pool. The operator renders the variable from
+// spec.harness.tuning.warmSessions (default 1) only on an install that
+// resolves to the session route, so unset is the platform route, where a
+// warm pod would serve nothing, or a gateway run by hand, which spends
+// nothing it was not asked to.
+const defaultWarmSessions = 0
+
 // defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
@@ -158,10 +166,14 @@ const (
 // off when "false" (feedback.go); the operator renders each only from its
 // backend's answerFeedback=false. The gateway keeps one switch for every
 // backend it holds, so either name turns feedback off on Chat and Slack
-// alike.
+// alike. envTeamsAnswerFeedback is the same switch under Teams's name; no
+// CRD field renders it yet, so the operator carries it from its own
+// environment (A2A_TEAMS_ANSWER_FEEDBACK=false on the controller-manager,
+// the chart's operator.extraEnv) onto a gateway that holds Teams.
 const (
 	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
 	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+	envTeamsAnswerFeedback = "A2A_TEAMS_ANSWER_FEEDBACK"
 )
 
 // envPeopleSeen turns the people bucket's records off when "false"
@@ -378,8 +390,9 @@ type Config struct {
 	GatewayLease string
 	PodName      string
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
-	// googleChat.answerFeedback=false: no rating controls are drawn on any
-	// backend and nothing is kept, whatever the feedback bucket holds.
+	// googleChat.answerFeedback=false, or A2A_TEAMS_ANSWER_FEEDBACK=false:
+	// no rating controls are drawn on any backend and nothing is kept,
+	// whatever the feedback bucket holds.
 	AnswerFeedbackOff bool
 	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
 	// gateway records no one it sees in the people bucket.
@@ -573,6 +586,17 @@ type Config struct {
 	// conversation nobody has spoken in for the TTL is idle however recently
 	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
+
+	// DMIdleTTL replaces IdleTTL for a single-turn DM: a "dm" conversation
+	// whose current pod has taken at most one human turn (#2371,
+	// A2A_DM_IDLE_TTL, default 5m). Most DMs are one question, and under
+	// sessions by default each holds a session pod, and a slot of the session
+	// cap, for the full IdleTTL after its answer. A second turn for the pod
+	// puts the conversation back on IdleTTL. A reply after the reap still
+	// works: the next turn gets a new pod, rehydrated from the context's
+	// history. Never longer than IdleTTL (Config.idleTTLFor), and counted from
+	// the answer as well as the message (Config.idleExpired).
+	DMIdleTTL time.Duration
 
 	// SessionReuse keeps one pod per conversation across turns
 	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
@@ -842,6 +866,17 @@ type Config struct {
 	// margin absorbs.
 	MaxSessions int
 
+	// WarmSessions is how many warm session pods the leader keeps ready
+	// (A2A_WARM_SESSIONS, warm_pool.go): pods started before a conversation
+	// needs one, so a new conversation's first turn is handed a running pod
+	// instead of waiting on scheduling and the image pull. Each costs one
+	// session pod's requests while it waits. The pool keeps
+	// min(WarmSessions, MaxSessions - 1 - live sessions) of them, so it never
+	// takes the last slot, and none below a cap of 2; 0 turns it off. It runs
+	// only with SessionReuse, since a claimed warm pod serves its
+	// conversation the way a reused pod does.
+	WarmSessions int
+
 	// SessionResources are the session pod's CPU and memory requests and
 	// limits (#2371), from A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, which
 	// the operator renders resolved from spec.harness.tuning.sessionResources
@@ -1109,7 +1144,8 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
 	}
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false) ||
-		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false)
+		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false) ||
+		strings.TrimSpace(os.Getenv(envTeamsAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
@@ -1294,6 +1330,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	warmSessions := envOr("A2A_WARM_SESSIONS", strconv.Itoa(defaultWarmSessions))
+	warm, err := strconv.Atoi(warmSessions)
+	if err != nil || warm < 0 {
+		return nil, fmt.Errorf("A2A_WARM_SESSIONS %q: need an integer >= 0", warmSessions)
+	}
+	cfg.WarmSessions = warm
 	sessionResources, err := sessionResourcesFromEnv()
 	if err != nil {
 		return nil, err
@@ -1336,6 +1378,15 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", ttl)
 	}
 	cfg.IdleTTL = d
+	dmTTL := envOr("A2A_DM_IDLE_TTL", defaultDMIdleTTL.String())
+	dmIdle, err := time.ParseDuration(dmTTL)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_DM_IDLE_TTL %q: %w", dmTTL, err)
+	}
+	if dmIdle < time.Minute {
+		return nil, fmt.Errorf("A2A_DM_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", dmTTL)
+	}
+	cfg.DMIdleTTL = dmIdle
 
 	// The adapter's deadline, in the adapter's own units (integer seconds) —
 	// see the field comment for why the env name is shared.
@@ -1558,6 +1609,66 @@ func (c *Config) validateCapabilityCeiling() error {
 		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
 	}
 	return nil
+}
+
+// defaultDMIdleTTL is A2A_DM_IDLE_TTL's default (#2371).
+const defaultDMIdleTTL = 5 * time.Minute
+
+// singleTurnDM reports whether rec is a DM whose current pod has taken at
+// most one human turn and no steer (SteeredSession). Two things are left out
+// of the count:
+//   - a wake (Role set): a session pod without cluster access delegates every
+//     cluster read, and the child's result comes back as a wake addressed to
+//     the pod, so counting wakes would put nearly every one-question DM on
+//     IdleTTL (seen live on ka-fleet-dev-1). A delegation still running holds
+//     the conversation's active slot (the child, or a fan-out's parent), which
+//     already exempts the pod from the reap, so leaving it out of the count
+//     never reaps a pod with a result still to come;
+//   - a turn addressed to an earlier pod: a DM keyed by its channel or space
+//     (Discord, an unthreaded Google Chat DM) keeps one record across every
+//     question the user asks, and each pod mints a fresh bus session.
+func (rec *SessionRecord) singleTurnDM() bool {
+	if rec.Kind != sessionKindDM {
+		return false
+	}
+	// A follow-up steered into the running task is a second message for this
+	// pod even though it started no task.
+	if rec.SteeredSession != "" && rec.SteeredSession == rec.BusSession {
+		return false
+	}
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == "" && t.Addressee == rec.BusSession {
+			n++
+		}
+	}
+	return n <= 1
+}
+
+// idleTTLFor is the reap threshold for rec: DMIdleTTL for a single-turn DM,
+// IdleTTL otherwise. DMIdleTTL is capped at IdleTTL, so setting it higher
+// never keeps a DM's pod longer than any other conversation's, and zero (a
+// Config built without it) reads as IdleTTL.
+func (c *Config) idleTTLFor(rec *SessionRecord) time.Duration {
+	if c.DMIdleTTL > 0 && c.DMIdleTTL < c.IdleTTL && rec.singleTurnDM() {
+		return c.DMIdleTTL
+	}
+	return c.IdleTTL
+}
+
+// idleExpired reports whether rec's pod has been idle past its TTL at now.
+// The clock is the last user message (idleSince). Under the short DM TTL it
+// is the answer too, whichever is later (LastTaskActivity, which an
+// executor's terminal moves): a DM task that ran longer than DMIdleTTL would
+// otherwise lose its pod the moment the answer posts, leaving no time to
+// follow up. Under IdleTTL the answer does not move it, as before.
+func (c *Config) idleExpired(rec *SessionRecord, now time.Time) bool {
+	ttl := c.idleTTLFor(rec)
+	since := rec.idleSince()
+	if ttl < c.IdleTTL && rec.LastTaskActivity.After(since) {
+		since = rec.LastTaskActivity
+	}
+	return now.Sub(since) >= ttl
 }
 
 // sessionResourcesFromEnv reads the session pod's requests and limits from

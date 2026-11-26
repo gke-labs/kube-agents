@@ -3,6 +3,7 @@
 import atexit
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -183,6 +184,25 @@ RENEWAL_NAP_TICK_SECONDS = 20
 RENEWAL_NAP_STOP_BOUND_SECONDS = 10
 # How long the test waits before it stops, so the renewer is in its nap.
 RENEWAL_NAP_SETTLE_SECONDS = 0.5
+# Static checks for bash 5.2 signal-unsafe constructs inside a TERM-trapped renewer
+# subshell and its callees: command/process substitutions and loop jumps.
+RENEWAL_SUBSTITUTION_RE = re.compile(r"\$\((?!\()|`|<\(|>\(")
+RENEWAL_UNCLOSED_ARITHMETIC_RE = re.compile(r"\$\(\((?!.*\)\))")
+RENEWAL_LOOP_JUMP_RE = re.compile(r"\b(?:continue|break)\b")
+
+
+def find_renewal_trap_offenders(scopes):
+    """Returns a list of bash 5.2 signal-unsafe constructs in (scope, text) pairs."""
+    offenders = []
+    for scope, text in scopes:
+        for number, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if RENEWAL_SUBSTITUTION_RE.search(line) or RENEWAL_UNCLOSED_ARITHMETIC_RE.search(line):
+                offenders.append(f"{scope}:{number} (substitution): {line.strip()}")
+            if RENEWAL_LOOP_JUMP_RE.search(line):
+                offenders.append(f"{scope}:{number} (loop jump): {line.strip()}")
+    return offenders
 
 
 def installer_report_env():

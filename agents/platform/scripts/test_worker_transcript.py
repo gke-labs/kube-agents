@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -44,6 +45,42 @@ REDACTOR = _load_redactor()
 
 def _scrub(kind, text):
     return worker_transcript.scrub_step_text(REDACTOR, kind, text, WITHHELD)
+
+
+# A time test with no limit in seconds: it compares two CPU times that it reads
+# one after the other in the same process, so the machine and a tracer (CI
+# runs these tests under `coverage`, which makes each Python line slower) slow
+# the two together. A limit in seconds holds on one machine and fails on a
+# slower one. For a growth test, the second read is the first read on a text
+# `TIME_GROWTH_SHRINK` times longer: a linear read needs that many times as
+# long, and a read whose cost is all quadratic the square of it.
+TIME_GROWTH_SHRINK = 4
+# Between the growth of a linear read (4) and of a quadratic read (16).
+TIME_GROWTH_BOUND = 8
+# Other work on the machine can only add time, so a pair is read again while it is over its bound.
+CPU_TIME_ATTEMPTS = 3
+
+
+def _cpu_seconds(read):
+    start = time.process_time()
+    read()
+    return time.process_time() - start
+
+
+def _cpu_seconds_of_a_pair(first, second, bound):
+    """The CPU time of `first()` and of `second()`, read one after the other.
+
+    A new pair is read, up to `CPU_TIME_ATTEMPTS` pairs, while `second` needs
+    more than `bound` times `first`; the pair with the least ratio counts.
+    """
+    best = None
+    for _ in range(CPU_TIME_ATTEMPTS):
+        pair = (_cpu_seconds(first), _cpu_seconds(second))
+        if best is None or pair[1] * best[0] < best[1] * pair[0]:
+            best = pair
+        if best[1] <= bound * best[0]:
+            break
+    return best
 
 
 class TestScrubStepText(unittest.TestCase):
@@ -476,12 +513,14 @@ class TestScrubStepText(unittest.TestCase):
             "redis-cli -a pre{run} S3cretValue9",
             "curl https://admin:pre{run} S3cretValue9@host/x",
         )
-        # Known limits, the same on main and pinned so a fix flips them: the
-        # URL userinfo rules stop at a literal backslash (run 2 and more
-        # leaves one), and inside a quoted `bash -c "…"` script the short and
-        # user:pass flag rules do not run (`sub_shell_segments`).
+        # Known limits, pinned so a fix flips them: the URL userinfo rules
+        # stop at a literal backslash the redactor can't read as a JSON escape
+        # (an even run leaves one before the space; an odd run's pairs now
+        # read as escapes, so the password is masked), and inside a quoted
+        # `bash -c "…"` script the short and user:pass flag rules do not run
+        # (`sub_shell_segments`).
         def known_limit(shape, run, wrapper):
-            if "https://admin:" in shape and run > 1:
+            if "https://admin:" in shape and run > 1 and run % 2 == 0:
                 return True
             return wrapper == "bash -c" and any(f in shape for f in ("-u admin:", "-ppre", "-a pre"))
 
@@ -1906,6 +1945,91 @@ class TestTokenPrinterReadKeepsItsVerdict(unittest.TestCase):
                 start = time.process_time()
                 self.assertEqual(walk(words), withheld)
                 self.assertLess(time.process_time() - start, 1.0)
+
+
+class TestLongSimpleCommandIsWithheld(unittest.TestCase):
+    """A line that holds a simple command longer than `MAX_SIMPLE_COMMAND_CHARS`
+    is withheld with no read: one very long shell word costs each reader
+    quadratic time in `shlex`. A line of many short commands and no comment,
+    however long, keeps its verdict. The line is cut as it is and with its
+    comments off."""
+
+    LIMIT = worker_transcript.MAX_SIMPLE_COMMAND_CHARS
+    UNIT = "gh ab cde oc "
+    # The limit's check cuts the line two times at most and takes its comments
+    # off one time: the decision needs 1.0 to 1.5 times the CPU time of one cut.
+    DECISION_CUTS_BOUND = 4
+
+    def test_the_limit_is_on_one_simple_command_and_is_strict(self):
+        at_the_limit = "echo " + "a" * (self.LIMIT - len("echo "))
+        self.assertEqual(self.LIMIT, 65536)
+        self.assertEqual(len(at_the_limit), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(at_the_limit))
+        self.assertTrue(worker_transcript.command_reads_a_secret(at_the_limit + "a"))
+        # The wrapper that the feed, the bench record and the replay proxy call gives the same verdict.
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": at_the_limit + "a"})))
+        # One long simple command among short ones withholds the line; one at the limit does not.
+        self.assertTrue(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "a" + "; pwd"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "; pwd"))
+        # A separator inside quotes ends no simple command: the quoted body is one piece.
+        quoted_body = "printf '%s' '" + "one line; of a body\n" * (self.LIMIT // 20 + 1) + "' > notes.txt"
+        self.assertTrue(worker_transcript.command_reads_a_secret(quoted_body))
+        # A line longer than the limit, of simple commands that are each short, is read.
+        many_short = "\n".join(["echo ok"] * (self.LIMIT // 4))
+        self.assertGreater(len(many_short), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_short))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_short + "\nprintenv"))
+
+    def test_a_command_of_a_real_size_is_served(self):
+        # Commands of 11 KB and of 37 KB, well below the limit, are served.
+        for command in (
+            "echo " + self.UNIT * 850,
+            "printf '%s' '" + self.UNIT * 2850 + "' > notes.txt",
+        ):
+            with self.subTest(length=len(command)):
+                self.assertLess(len(command), self.LIMIT)
+                self.assertFalse(worker_transcript.command_reads_a_secret(command))
+
+    def test_a_very_long_word_is_decided_in_linear_time(self):
+        # 270 KB to 1 MB in one shell word: quoted, with the quote not closed,
+        # a quoted body with line breaks, with no quote, behind a comment with
+        # an apostrophe, and short commands behind such a comment. With no
+        # limit, a reader takes the words of each from `shlex`, in 20 to 200
+        # times the CPU time of the decision here. The limit decides each
+        # after one or two cuts of the line. Three checks hold that, with no
+        # limit in seconds: no reader gets the line; the decision needs no
+        # more than `DECISION_CUTS_BOUND` times the CPU time of one cut of the
+        # same line; and it needs no more than `TIME_GROWTH_BOUND` times the
+        # CPU time of the decision for the line `TIME_GROWTH_SHRINK` times
+        # shorter.
+        for build, count in (
+            (lambda count: "echo '" + self.UNIT * count + "'", 80000),
+            (lambda count: "echo '" + self.UNIT * count, 80000),
+            (lambda count: "cat > notes.txt <<< '" + "line of a file body\n" * count + "'", 52000),
+            (lambda count: "echo " + "ghabcdeoc/" * count, 40000),
+            # An apostrophe in a comment: the cut of the line as it is gives short
+            # pieces, and the cut with the comments off gives the long quoted body.
+            (lambda count: "echo ok # don't stop\nprintf '%s' '" + "reset the dataset; abc def\n" * count + "' > notes.txt", 10000),
+            # Short commands behind that comment: only the cut of the line as it
+            # is gives the long piece, because the apostrophe opens a quote there.
+            (lambda count: "echo ok # don't stop\n" + "\n".join(["echo ok"] * count), 70000),
+        ):
+            command, short = build(count), build(count // TIME_GROWTH_SHRINK)
+
+            def decide(line=command):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+
+            def cut(line=command):
+                worker_transcript.split_shell_commands(worker_transcript.fold_shell_continuations(line))
+
+            with self.subTest(command=command[:24], chars=len(command)):
+                self.assertGreater(len(short), self.LIMIT)
+                with mock.patch.object(shlex, "shlex", side_effect=AssertionError("a reader took the words of the line")) as reader:
+                    cut_seconds, decision_seconds = _cpu_seconds_of_a_pair(cut, decide, self.DECISION_CUTS_BOUND)
+                    short_seconds, full_seconds = _cpu_seconds_of_a_pair(lambda: decide(short), decide, TIME_GROWTH_BOUND)
+                reader.assert_not_called()
+                self.assertLessEqual(decision_seconds, self.DECISION_CUTS_BOUND * cut_seconds)
+                self.assertLessEqual(full_seconds, TIME_GROWTH_BOUND * short_seconds)
 
 
 class TestSecretReadDetector(unittest.TestCase):

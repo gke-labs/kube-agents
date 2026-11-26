@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `requested_pull_requests`, `audit_streams`, `scope_exclude`, `scope_hold`, `delegating_profile`, `suite`, `suite_part` and `task_version`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -102,6 +102,9 @@ One field is not a parameter: `intent=confirm` submits the ask as a structured c
 refuses any other; a directive without it sends a typed message. The door takes the confirm only
 where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
 which is infrastructure, since the agent never saw the ask.
+A case with the directive can be side B of a permit pair: a second case puts the same ask and
+checks to the platform agent, `hack/eval/permit-pairs.txt` names the two, and the lint holds them
+equal ([permit-pairs.md](permit-pairs.md)).
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -294,6 +297,22 @@ after (restore takes no `--task`; `--wait` also waits `PROPAGATION_SECONDS` for 
 the pods). The validator refuses a malformed value and a case that
 declares both `scope_hold` and `scope_exclude`. devops-bench ignores the key.
 
+`delegating_profile: true` is for a case that grades a profile task delegating to another profile
+(#6789). The eval install's chart profiles don't delegate, so the harness makes one per run: at the
+case's start it copies the live `cluster` AgentProfile with `spec.delegates: true` and
+`yieldToPinned: false` under a run-unique `delegating-<hex>` name, waits for its card, writes the name
+into the prompt's `{{BENCH_DELEGATING_PROFILE}}` (the `name` of the case's `[bench:profile ...]`
+directive), and deletes it in a `finally` whatever the run did, confirming the profile and its worker
+pool are gone. A setup or teardown it can't complete is recorded as infrastructure. On an install
+whose AgentProfile CRD has no `spec.delegates` the copy has no delegate tool and the case runs as it
+is, graded: that is its red. The access is the harness's own on the install (the same context and
+namespace as its other `kubectl` calls). `python -m kube_agents_bench.delegating_profile sweep`
+deletes labelled leftovers older than six hours, for a run killed before its `finally`; nothing runs it
+yet, so it is a manual step until the lease preflight calls it. The
+validator refuses the placeholder without the key, the key without the placeholder as the
+directive's name, a literal throwaway name, and a case on the Slack lane, which can't address a
+profile. devops-bench ignores the key (`bench/kube_agents_bench/delegating_profile.py`).
+
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
@@ -382,7 +401,9 @@ line's decoration folded when the check sets `fold_decoration: true` (indentatio
 numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
 negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
-line break; a phrase that may wrap says `\s+`), for what no substring can
+line break; a phrase that may wrap says `\s+`; the text is lowercased, so a pattern that spells a
+letter in upper case outside `(?i)`, alone or in a character class of nothing but such letters, does
+not load), for what no substring can
 express: a banned word whose negated uses are legitimate, a value only the work produces, such
 as a 32-hex trace id, where the words around it are the prompt's own and a report of failure
 would echo them (`required_patterns` must each match), a phrase that must start at a word
@@ -443,8 +464,11 @@ it, so a quoted mention of the invocation is one word and not a run, and a run m
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
-inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
-error on the api transport, so a case using it runs over the inject transport alone),
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; and
+`min_children` / `max_children`, inclusive bounds on how many child tasks the chain minted, read
+from the route's `childCount`, which counts a repeated addressee each time where
+`childAddressees` names it once; an error on the api transport, so a case using it runs over the
+inject transport alone, and a bound is an error on a door older than `childCount`),
 `worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
@@ -621,8 +645,8 @@ worker filed it reads the tagged call, which is the command as typed, so a `^`-a
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
-delegating turn's chain delegated to, by profile name, from the inject read route's
-`childAddressees`.
+delegating turn's chain delegated to, by profile name, and how many times, from the inject read
+route's `childAddressees` and `childCount`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
@@ -800,6 +824,8 @@ drift check, so `validate_all()` does not carry it; the lint asserts on
 `sanitization_findings()` in its own right. The same way, it rejects any file committed under
 a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
 or on the dev install, and the case cites the run by its directory name or build id.
+With no path given, it also rejects a line of `hack/eval/permit-pairs.txt` whose two cases are not
+a pair (`permit_pair_problems()`, [permit-pairs.md](permit-pairs.md)).
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

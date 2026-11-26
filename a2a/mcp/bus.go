@@ -84,10 +84,11 @@ type BusConfig struct {
 	PasswordFile string
 	Deployment   Deployment
 	Logger       *slog.Logger
-	// ProfileSupervisorCutoff is lib.EnvProfileSupervisorCutoff as read:
-	// zero on an unlatched install, where task reads take both supervisor
-	// forms for every task (lib.WithProfileSupervisorCutoff).
-	ProfileSupervisorCutoff time.Time
+	// ProfileSupervisorGate is the profile supervisor cutoff and the
+	// operator's profile names as read (lib.ProfileSupervisorGateFromEnv):
+	// a zero cutoff on an unlatched install, where task reads take both
+	// supervisor forms for every task.
+	ProfileSupervisorGate lib.ProfileSupervisorGate
 }
 
 // Bus is what the status tool needs from the bus, so the tool can be tested
@@ -115,13 +116,13 @@ type NATSBus struct {
 	// (maxTaskReaders); reapDelay is how long a released slot stays taken.
 	readers   chan struct{}
 	reapDelay time.Duration
+	// createAttemptTimeout bounds one attempt to create a read consumer;
+	// zero is lib.EphemeralCreateAttemptTimeout. Tests shorten it.
+	createAttemptTimeout time.Duration
 
 	// events listens to the console conversations this server knows and
 	// keeps their reports and results.
 	events *Events
-	// kinds is what this server's turns learned of their tasks' kinds, for
-	// the supervisor cutoff (cutoffScreen).
-	kinds taskKinds
 }
 
 // statusRead is one status read in flight: st is its answer once done is
@@ -151,7 +152,7 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if cfg.Logger != nil {
 		opts = append(opts, lib.WithLogger(cfg.Logger))
 	}
-	opts = append(opts, lib.WithProfileSupervisorCutoff(cfg.ProfileSupervisorCutoff))
+	opts = append(opts, cfg.ProfileSupervisorGate.ClientOptions()...)
 	client, err := lib.Connect(ctx, cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
@@ -160,6 +161,38 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 		events: NewEvents(client)}
 	b.readBus = b.read
 	return b, nil
+}
+
+// ProfileSupervisorHealth is the profile supervisor gate this server runs
+// with, for the health probe's answer (WithProfileSupervisorHealth): the
+// cutoff (empty when unset) and where it came from (lib.CutoffSource*),
+// whether the operator's profile names are loaded and when they were last
+// read, and how many five-token messages the gate has refused.
+func (b *NATSBus) ProfileSupervisorHealth() ProfileSupervisorHealth {
+	g := b.cfg.ProfileSupervisorGate
+	h := ProfileSupervisorHealth{Source: g.Source, NamesLoaded: g.Names.Loaded(), Drops: b.client.ProfileSupervisorDrops()}
+	if h.Source == "" {
+		h.Source = lib.CutoffSourceUnset
+	}
+	if !g.Cutoff.IsZero() {
+		h.Cutoff = g.Cutoff.UTC().Format(time.RFC3339)
+	}
+	if at := g.Names.LoadedAt(); !at.IsZero() {
+		h.NamesLoadedAt = at.UTC().Format(time.RFC3339)
+	}
+	return h
+}
+
+// ProfileSupervisorHealth is the gate's part of the health probe's answer.
+// NamesLoadedAt is when the profile names file was last read, changed or
+// not, absent when never: it is re-read every 30 seconds, so a time that
+// stops moving is reads failing and the names last read kept.
+type ProfileSupervisorHealth struct {
+	Cutoff        string `json:"cutoff,omitempty"`
+	Source        string `json:"source"`
+	NamesLoaded   bool   `json:"profileNamesLoaded"`
+	NamesLoadedAt string `json:"profileNamesLoadedAt,omitempty"`
+	Drops         int64  `json:"drops"`
 }
 
 // logger is the configured logger, or slog's default.
@@ -302,13 +335,15 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 	if s.CachedInfo().State.Msgs == 0 {
 		return cards, nil
 	}
-	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
+	// Not a reader slot's read, as before; the create is bounded and retried
+	// like one (lib.CreateEphemeralConsumer).
+	cons, _, err := lib.CreateEphemeralConsumer(ctx, s, jetstream.ConsumerConfig{
 		FilterSubject:     directorySubjects,
 		DeliverPolicy:     jetstream.DeliverLastPerSubjectPolicy,
 		AckPolicy:         jetstream.AckNonePolicy,
 		MemoryStorage:     true,
 		InactiveThreshold: directoryConsumerIdle,
-	})
+	}, lib.EphemeralCreateOptions{Logger: b.logger(), Stream: streamDirectory})
 	if err != nil {
 		return nil, err
 	}

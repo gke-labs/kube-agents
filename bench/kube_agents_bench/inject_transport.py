@@ -222,7 +222,13 @@ ENTRY_STATUS_DONE = "completed"
 # whose ``input.calls[]`` names the tools it invoked (while its input fits
 # the executor's cap: :data:`ACTIVITY_INPUT_TRUNCATED_KEY`), which is the
 # shape the verifier already unwraps on the api path, so it is kept as one
-# entry rather than split. Whenever the probe body carried the key at all, even
+# entry rather than split. A part's ``callId``, when it is a non-empty
+# string, goes on its entry as ``call_id`` (:data:`ENTRY_CALL_ID_FIELD`),
+# beside ``args`` and never in it, so a ``tool_called`` argument pattern
+# reads the same input either way; it names the call for a reader joining
+# the trajectory to other records of the same call, such as the worker
+# adapter's log of a refused tool call. Whenever the probe body carried
+# the key at all, even
 # empty, the fold also writes one marker entry named ``a2a.activity`` with
 # ``args.calls`` (entries written) and ``args.dropped`` (calls the door or
 # the executor counted and did not carry). The marker states the DOOR's
@@ -263,6 +269,12 @@ PROBE_USAGE_PARTIAL_KEY = "usagePartial"
 # older than the field omits the key, which reads as ``None`` here, "can't
 # say", never as "delegated nothing" (``delegated_to`` errors on it).
 PROBE_CHILD_ADDRESSEES_KEY = "childAddressees"
+# How many child tasks the chain minted, every delegation counted, so two to
+# platform read 2 where ``childAddressees`` names platform once. Sent on every
+# read like the addressees: ``0`` when nothing was delegated, ``null`` for a
+# task the door could not find, and absent on an older door, which reads as
+# ``None``, "can't say", never as zero (``delegated_to`` errors on it).
+PROBE_CHILD_COUNT_KEY = "childCount"
 USAGE_READ_ATTEMPTS = 2
 # How the usage read went, on ``Fold.usage_read``, so a result with null
 # buckets can say why (``tokens_note`` on the harness's result): no read was made (the
@@ -287,6 +299,9 @@ ACTIVITY_TOOL_KEY = "tool"
 ACTIVITY_INPUT_KEY = "input"
 ACTIVITY_STATUS_KEY = "status"
 ACTIVITY_DROPPED_KEY = "dropped"
+ACTIVITY_CALL_ID_KEY = "callId"
+# The trajectory entry's field for the part's ``callId`` (above).
+ENTRY_CALL_ID_FIELD = "call_id"
 ACTIVITY_STATUS_CALLED = "called"
 ACTIVITY_STATUS_TRUNCATED = "truncated"
 # The bridge caps one call's ``input`` and replaces an input over the cap
@@ -426,6 +441,9 @@ REASON_HERMES_API_REFUSED = "hermes-api-refused"
 # The task waited out its deadline behind an earlier turn in the same session
 # and was never sent: the persona never saw the prompt.
 REASON_SESSION_BUSY = "session-busy"
+# The bridge recovered a panic while handling the task and ended it failed
+# with no answer: the bridge's own fault, not the persona's.
+REASON_INTERNAL_PANIC = "internal-panic"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -439,6 +457,7 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_HERMES_API_UNREACHABLE,
         REASON_HERMES_API_REFUSED,
         REASON_SESSION_BUSY,
+        REASON_INTERNAL_PANIC,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
@@ -716,6 +735,15 @@ def _child_addressees(raw: Any) -> list[str] | None:
     return list(raw)
 
 
+def _child_count(raw: Any) -> int | None:
+    """The probe's ``childCount``, or ``None`` when it can't say: absent, null,
+    a bool, a float, or negative. A bad value is never read as zero, which
+    would vouch for a chain that delegated nothing."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
 def _usage_counts(raw: Any) -> dict[str, int | None] | None:
     """A usage object's two counts, ``{"input": n, "output": n}``, a count that
     cannot be read as ``None``; ``None`` whole when ``raw`` is no object."""
@@ -861,6 +889,10 @@ class Fold:
     # (:meth:`InjectTask._note`) and the read after the terminal last;
     # ``None`` until a read answers with it.
     child_addressees: list[str] | None = None
+    # How many children the chain minted (:data:`PROBE_CHILD_COUNT_KEY`), kept
+    # from the same reads as ``child_addressees``; ``None`` until one answers
+    # with it.
+    child_count: int | None = None
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -1000,14 +1032,16 @@ class Fold:
             else:
                 args = {ACTIVITY_INPUT_KEY: raw_input}
             status = part.get(ACTIVITY_STATUS_KEY)
-            calls.append(
-                {
-                    "name": tool,
-                    "args": args,
-                    "result": None,
-                    "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
-                }
-            )
+            entry: dict[str, Any] = {
+                "name": tool,
+                "args": args,
+                "result": None,
+                "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
+            }
+            call_id = part.get(ACTIVITY_CALL_ID_KEY)
+            if isinstance(call_id, str) and call_id:
+                entry[ENTRY_CALL_ID_FIELD] = call_id
+            calls.append(entry)
         marker_args: dict[str, Any] = {
             ACTIVITY_CALLS_ARG: len(calls),
             ACTIVITY_DROPPED_ARG: dropped,
@@ -1288,6 +1322,9 @@ class Probe:
     # The body's ``childAddressees`` (:data:`PROBE_CHILD_ADDRESSEES_KEY`):
     # ``None`` when the key was absent, null, or not a list of strings.
     child_addressees: list[str] | None = None
+    # The body's ``childCount`` (:data:`PROBE_CHILD_COUNT_KEY`): ``None`` when
+    # the key was absent, null, or not a non-negative integer.
+    child_count: int | None = None
     last_post: str = ""
     error: str = ""
     # The conversation's A2A contextId, from the gateway's session record;
@@ -1352,6 +1389,7 @@ class Probe:
             child_usage=_usage_counts(raw.get(PROBE_CHILD_USAGE_KEY)),
             usage_partial=raw.get(PROBE_USAGE_PARTIAL_KEY) is True,
             child_addressees=_child_addressees(raw.get(PROBE_CHILD_ADDRESSEES_KEY)),
+            child_count=_child_count(raw.get(PROBE_CHILD_COUNT_KEY)),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
             context_id=str(raw.get("contextId") or ""),
@@ -2027,6 +2065,8 @@ class InjectTask:
             fold.usage_read = USAGE_READ_ANSWERED
             if answered.child_addressees is not None:
                 fold.child_addressees = answered.child_addressees
+            if answered.child_count is not None:
+                fold.child_count = answered.child_count
             if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
                 return
             fold.usage = answered.usage
@@ -2083,6 +2123,8 @@ class InjectTask:
             # (the deadline, a transient error) still has it.
             if probe.child_addressees is not None:
                 fold.child_addressees = probe.child_addressees
+            if probe.child_count is not None:
+                fold.child_count = probe.child_count
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come

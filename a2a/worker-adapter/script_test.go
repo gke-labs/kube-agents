@@ -303,11 +303,38 @@ func TestAScriptsOutputIsCappedAndItsEndReported(t *testing.T) {
 	start := time.Now()
 	r := run("slow.sh", "(sleep 3; touch "+marker+") &\nsleep 30\n", 300*time.Millisecond)
 	if !r.timedOut || time.Since(start) > 10*time.Second {
-		t.Fatalf("timedOut %v after %s; want a timeout at its bound", r.timedOut, time.Since(start))
+		t.Fatalf("timedOut %v (exit %d, startErr %v) after %s; want a timeout at its bound", r.timedOut, r.exitCode, r.startErr, time.Since(start))
 	}
 	time.Sleep(4 * time.Second)
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("the script's child outlived its timeout: the process group wasn't killed")
+	}
+}
+
+// A script's timeout starts after its process launches, so a sub-millisecond bound still reports a
+// timeout with exit -1 rather than a pre-launch failure, and a script that fails to start reports
+// exit -1 (and stopped when the worker's context has already ended) rather than exit 0.
+func TestAScriptsTimeoutStartsAfterLaunchAndAStartFailureIsNeverExitZero(t *testing.T) {
+	root, _ := scriptRoot(t)
+	p := filepath.Join(root, "slow.sh")
+	writeScript(t, p, "#!/bin/sh\nsleep 30\n", 0o755)
+	for i := range 10 {
+		r := execScript(context.Background(), &scriptRun{name: "slow", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: 100 * time.Microsecond}, scriptSignals{})
+		if !r.timedOut || r.exitCode != -1 || r.startErr != nil {
+			t.Fatalf("run %d: timedOut %v exit %d startErr %v; want timedOut with exit -1", i, r.timedOut, r.exitCode, r.startErr)
+		}
+	}
+
+	missing := execScript(context.Background(), &scriptRun{name: "missing", path: filepath.Join(root, "nope.sh"), env: []string{"PATH=/usr/bin:/bin"}, timeout: time.Second}, scriptSignals{})
+	if missing.startErr == nil || missing.exitCode != -1 || missing.timedOut || missing.stopped {
+		t.Errorf("missing script: exit %d startErr %v timedOut %v stopped %v; want startErr with exit -1", missing.exitCode, missing.startErr, missing.timedOut, missing.stopped)
+	}
+
+	stoppedCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stopped := execScript(stoppedCtx, &scriptRun{name: "stopped", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: time.Second}, scriptSignals{})
+	if !stopped.stopped || stopped.exitCode != -1 || stopped.startErr != nil || stopped.timedOut {
+		t.Errorf("stopped context: stopped %v exit %d startErr %v timedOut %v; want stopped with exit -1", stopped.stopped, stopped.exitCode, stopped.startErr, stopped.timedOut)
 	}
 }
 

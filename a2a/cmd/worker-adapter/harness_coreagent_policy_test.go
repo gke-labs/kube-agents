@@ -232,3 +232,40 @@ func TestASessionPodsCoreAgentGrantMatchesItsClaudeArgv(t *testing.T) {
 		})
 	}
 }
+
+// TestACoreAgentProfileWorkerStartsWithNoSessionGrant: a profile worker's
+// grant comes from its persona, so the selector gives its core-agent driver
+// an empty one (every tool refused), never the session pod's allowlist,
+// and a session allowlist the profile can't use doesn't stop it starting.
+func TestACoreAgentProfileWorkerStartsWithNoSessionGrant(t *testing.T) {
+	for name, extra := range map[string]map[string]string{
+		"default":              nil,
+		"cluster view":         {lib.EnvClusterView: "true"},
+		"an unusable override": {"A2A_ALLOWED_TOOLS": "Read,Bash,WebFetch", lib.EnvClusterView: "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{
+				lib.EnvProfileWorker: "true", lib.EnvProfileHarness: "core-agent", lib.EnvHarnessUnisolated: "allow",
+				"A2A_HARNESS_PATH": "/bin/core-agent-harness", "A2A_WORKDIR": "/work",
+			}
+			for k, v := range extra {
+				env[k] = v
+			}
+			_, d, _, err := selectHarness(func(k string) string { return env[k] })
+			if err != nil {
+				t.Fatal(err)
+			}
+			line, err := d.EncodeUser("hi")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var e coreagentwire.Envelope
+			if err := json.Unmarshal(line, &e); err != nil {
+				t.Fatal(err)
+			}
+			if len(e.Policy.Tools) != 0 || len(e.Policy.Allow) != 0 {
+				t.Errorf("a profile worker's envelope policy %+v, want an empty grant", e.Policy)
+			}
+		})
+	}
+}

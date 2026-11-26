@@ -64,6 +64,13 @@ must be written **after** the close. An older command in the thread is reported 
 rather than honoured: comments are never edited away, so a March request would otherwise re-open an
 April close every morning forever. Post a fresh one.
 
+The same rule covers a declared `no-pdb` finding whose PodDisruptionBudget `finish` writes itself.
+A merged or closed pull request that carried the budget stops `finish` writing it again, so the
+finding stays `manual`. A `/remediate <finding-id>` naming it, written after that pull request
+merged or closed, sets it aside: `finish` writes the budget again and opens a new pull request. An older request leaves the
+finding `manual`, and is refused as not a `manifest`. `/remediate all` does not name it, so it does
+not set the pull request aside.
+
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
 When the collector's manifest shows that Config Connector does not apply the object, `finish` writes
@@ -80,6 +87,12 @@ being rewritten, so the all-clear comment lists the declared postures instead, w
 but declarations opens no ledger and posts nothing, because the ledger tracks findings and a
 standing declaration is the same every morning. From then on the declaration in the repository is
 the record, and `finish` reports the count as `declared`.
+
+When a target carries `notes` (what a check read but could not see, which is not a coverage gap),
+the scope table grows a Notes column with each note clipped, the body carries its own capped
+"Read but not visible" list of the full notes under the table, and the clean comment and the held
+comment list each note in full, under the same cap; a "…and N more" row points at the stored
+report for the rest.
 
 ## Size
 

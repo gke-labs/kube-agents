@@ -47,18 +47,28 @@ const (
 	testContentJSON     = "application/json"
 	testReviewRefused   = `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":false}}`
 	testReviewAudience  = "review-audience"
-	testReviewAccepted  = `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true,"user":{"username":"` + testReviewCaller + `"},"audiences":["` + testReviewAudience + `"]}}`
-	testForeignIssuer   = "https://kubernetes.default.svc"
+	testReviewAccepted  = `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true,"user":{"username":"` + testReviewCaller + `","extra":{"authentication.kubernetes.io/pod-name":["caller-0"],"authentication.kubernetes.io/pod-uid":["caller-uid"]}},"audiences":["` + testReviewAudience + `"]}}`
+	// testCallerPodPath and testCallerPod are the pod testReviewAccepted names, at the address
+	// httptest.NewRequest gives every request's peer.
+	testCallerPodPath = "/api/v1/namespaces/ns/pods/caller-0"
+	testCallerPod     = `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"caller-0","namespace":"ns","uid":"caller-uid"},"status":{"phase":"Running","podIP":"192.0.2.1","podIPs":[{"ip":"192.0.2.1"}]}}`
+	testForeignIssuer = "https://kubernetes.default.svc"
 )
 
-// proxyEnvVars are the variables registerFlags reads for the flags these tests set, cleared
-// so a developer's environment cannot change what a test parses.
+// proxyEnvVars are the KUBE_PROXY_ and CREDENTIAL_PROXY_ variables the binary reads, cleared
+// so a developer's environment cannot change what a test parses. The examples test refuses
+// a manifest that sets a variable under those prefixes that is not listed here.
 var proxyEnvVars = []string{
-	listenAddrEnv, authModeEnv, upstreamURLEnv, denyStreamingEnv, allowedCallersEnv, audienceEnv,
-	hostClusterIDEnv, scopeFileEnv, excludeHostClusterEnv, cacheMaxBytesEnv, cacheResourceTTLEnv,
+	listenAddrEnv, metricsPortEnv, tlsCertFileEnv, tlsKeyFileEnv, modeEnv, hostClusterIDEnv,
+	redactSecretsEnv, allowUpgradesEnv, kubeAPIServerEnv, kubeCAFileEnv, kubeTokenFileEnv,
+	audienceEnv, allowedCallersEnv, cacheMaxBytesEnv, cacheMaxEntryBytesEnv, cacheResourceTTLEnv,
+	cacheDiscoveryTTLEnv, scopeFileEnv, holdFileEnv, excludeHostClusterEnv, wifServiceAccountEnv,
+	wifTokenFileEnv, wifAudienceEnv, sessionAudienceEnv, sessionCallersEnv, maxInFlightEnv,
+	authModeEnv, upstreamURLEnv, denyStreamingEnv, upstreamTokenFileEnv, upstreamCAFileEnv,
+	universeDomainEnv, containerAPIURLEnv, scopedPoolFlagEnv, scopedPoolFileEnv,
 	jwtIssuerEnv, jwtKeySetURLEnv, jwtAudiencesEnv, jwtUsernameClaimEnv, jwtUIDClaimEnv,
 	jwtGroupsClaimEnv, jwtPartitionClaimEnv, jwtRequiredSubPrefixEnv, jwtAllowedPartitionsEnv,
-	jwtCAFileEnv, partitionByCallerEnv, upstreamTokenFileEnv, upstreamCAFileEnv,
+	jwtCAFileEnv, partitionByCallerEnv,
 }
 
 func clearProxyEnv(t *testing.T) {
@@ -370,7 +380,7 @@ func (u *emptyListUpstream) RoundTripCluster(_ context.Context, _ string, req *h
 func TestChainAuthenticator(t *testing.T) {
 	refused := errors.New("token not accepted")
 	unavailable := fmt.Errorf("%w: review failed", k8sapiproxy.ErrAuthenticationUnavailable)
-	first := &k8sapiproxy.CallerIdentity{Username: "first"}
+	first := &k8sapiproxy.CallerIdentity{Username: "first", Extra: map[string][]string{"example.io/pod": {"p"}}}
 	second := &k8sapiproxy.CallerIdentity{Username: "second"}
 
 	for _, tc := range []struct {
@@ -501,6 +511,10 @@ func TestChainAuthenticator(t *testing.T) {
 		caller, err := chain.AuthenticateRequest(httptest.NewRequest(http.MethodGet, testPodsPath, nil))
 		if err != nil || caller.Authenticator != tc.wantAuthenticator {
 			t.Errorf("%s: got (%+v, %v), want Authenticator %q", tc.name, caller, err, tc.wantAuthenticator)
+		}
+		// The stamped copy keeps what the authenticator said about the caller.
+		if err == nil && caller.Username == first.Username && !slices.Equal(caller.Extra["example.io/pod"], []string{"p"}) {
+			t.Errorf("%s: Extra = %v, want the authenticator's", tc.name, caller.Extra)
 		}
 	}
 	if first.Authenticator != "" || second.Authenticator != "" {
@@ -731,9 +745,13 @@ func TestBuildHandlerChainPassesAnotherIssuersTokenToTokenReview(t *testing.T) {
 	foreign := newTestJWTIssuer(t)
 	up := newCountingUpstream(t)
 	var reviews atomic.Int32
-	review := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		reviews.Add(1)
+	review := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", testContentJSON)
+		if r.Method == http.MethodGet && r.URL.Path == testCallerPodPath {
+			_, _ = io.WriteString(w, testCallerPod)
+			return
+		}
+		reviews.Add(1)
 		_, _ = io.WriteString(w, testReviewAccepted)
 	}))
 	t.Cleanup(review.Close)

@@ -820,10 +820,9 @@ resource "google_container_node_pool" "seeded_b_default" {
 # reason this fleet is at least three clusters and not two. Everything else
 # on C's control plane deliberately matches its peers; its default pool
 # differs on boot-disk size and kubelet config (seeded_c_default below):
-# the boot-disk facet reads the first, and no facet reads the second yet.
-# Two facets today, three once that lands, either count under the six at
-# which the split-cluster guard (SOP 3.6) stops calling C drift and calls
-# it a different kind of cluster.
+# the boot-disk facet reads the first and the kubelet-config facet the
+# second. Three facets, under the six at which the split-cluster guard
+# (SOP 3.6) stops calling C drift and calls it a different kind of cluster.
 resource "google_container_cluster" "seeded_c" {
   name     = "${var.cluster_prefix}-c"
   location = var.zone
@@ -877,13 +876,13 @@ resource "google_container_cluster" "seeded_c" {
 }
 
 # Defect (consistency, pool-level): the same cluster's default pool is the
-# outlier on two node facets, `boot-disk`, which the drift SOP reads, and
-# `kubelet-config`, which it does not read yet. Every other pool in this stack runs a 20 GB boot
+# outlier on the two node facets the drift SOP votes by pool, `boot-disk`
+# and `kubelet-config`. Every other pool in this stack runs a 20 GB boot
 # disk of the default type with no kubelet block; this one runs 50 GB (type
 # unchanged: size alone differed in the incident behind the facets) and
 # sets one kubelet key, pod_pids_limit, to 4096. GKE sets no pod PID limit
-# unless asked, so the facet reads a difference whether it treats an absent
-# key as unset or as the default, and a PID cap on a node whose only
+# unless asked, and the kubelet-config facet reads an absent key as unset,
+# so this pool differs from the others, and a PID cap on a node whose only
 # workload pods are the pause containers defects-c.tf plants changes
 # nothing anyone measures. An integer and not the cpu_cfs_quota = false
 # this block first carried: the pinned provider (8.4.0) force-sends an
@@ -892,13 +891,14 @@ resource "google_container_cluster" "seeded_c" {
 # existed; the key never reached a project older than the block. A
 # non-zero integer is sent on create and on update alike. A pool created
 # with the earlier key may keep it beside this one: the update request
-# leaves it out, and no assertion reads it. Both fields update in place:
+# leaves it out, and no assertion reads it. The facet does read it, as
+# part of the pool's token, and the pool is the outlier either way. Both fields update in place:
 # GKE recreates the pool's one node, the pool keeps its identity, and the
 # cluster's createTime does not move, so the drift SOP's 24-hour cohort
 # gate is untouched and no reconcile-allow entry is needed. The fixture
 # role is drift-pool-outlier (fixtures.json);
-# consistency-boot-disk-pool-outlier reads the disk, and the kubelet-config
-# facet and its case are the follow-up.
+# consistency-boot-disk-pool-outlier reads the disk, and
+# consistency-kubelet-config-pool-outlier the kubelet block.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
@@ -922,14 +922,25 @@ resource "google_container_node_pool" "seeded_c_default" {
   }
 
   node_config {
-    # e2-medium since the ComputeClass fixtures (defects-c.tf): GKE's system
-    # pods request about 99 percent of an e2-small's allocatable memory
-    # (1,420 of 1,424 MiB, read 11-10 on a dev fleet at 1.36), so three of the
-    # five fixture pods sat Pending on it at 8Mi each. Memory, not CPU, is the
-    # binding constraint here, the same wall seeded-a hit (#1278, #3607). The
-    # provider updates machine_type in place and GKE re-creates the one node
-    # under the pool's surge settings; no reconcile-allow.json entry.
-    machine_type    = "e2-medium"
+    # e2-standard-2, the size seeded-a's default pool took for the same wall
+    # (#3607). An e2-small could not hold the ComputeClass fixtures
+    # (defects-c.tf) for memory: GKE's system pods request about 99 percent
+    # of its allocatable (1,420 of 1,424 MiB, read 11-10 on a dev fleet at
+    # 1.36). The e2-medium that followed held them with about 60m of its 940m
+    # CPU to spare, and that did not survive a node replacement: the pool
+    # surges to two nodes, kube-dns-autoscaler (preventSinglePointFailure)
+    # takes kube-dns to two replicas of 270m, the old node drains, and the one
+    # node left is fully requested, so the autoscaler's own pod,
+    # metrics-server and the five fixture pods stay Pending and nothing brings
+    # kube-dns back to one. A node replacement on 2026-11-24 left 19 of 50
+    # pool projects that way. Every shared-core E2 size allocates the same
+    # 940m; a dedicated-core size allocates 1930m, and two kube-dns replicas
+    # with everything else request about 1150m of it. Not a no-surge pool
+    # instead: with autoscaling held at one node the upgrade-readiness rule
+    # would read it as a blocker on a slot meant to carry none. The provider
+    # updates machine_type in place and GKE re-creates the one node under the
+    # pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-standard-2"
     disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
@@ -939,11 +950,11 @@ resource "google_container_node_pool" "seeded_c_default" {
     # (defects-c.tf) by this label and carries no matching
     # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, so the
     # scheduler places untargeted pods on it until it is full and the
-    # autoscaler's pre-filter then drops them. With this the cluster has no
-    # untainted pool without a class label, which is what lets the
-    # obtainability audit's 3.24 file the untargeted workloads in
-    # defects-c.tf. A label change is an in-place pool update on provider 8.x
-    # (GKE relabels the node without re-creating it); the disk and kubelet
+    # autoscaler's pre-filter (GKE 1.35.6 and later) then drops them. With
+    # this the cluster has no untainted pool without a class label, which is
+    # what lets the obtainability audit's 3.24 file the untargeted workloads
+    # in defects-c.tf. A label change is an in-place pool update on provider
+    # 8.x (GKE relabels the node without re-creating it); the disk and kubelet
     # settings around it stay the drift-pool-outlier fixture.
     # Addressed by the untainted-compute-class-pool role.
     labels = {

@@ -61,6 +61,12 @@ func withModel(t *testing.T, m llm.LLM) {
 // runTurn runs one harness process's turn in dir and returns its lines.
 func runTurn(t *testing.T, dir string, env coreagentwire.Envelope) []coreagentwire.Event {
 	t.Helper()
+	return runTurnWith(t, dir, env)
+}
+
+// runTurnWith is runTurn with extra harness flags.
+func runTurnWith(t *testing.T, dir string, env coreagentwire.Envelope, flags ...string) []coreagentwire.Event {
+	t.Helper()
 	in, err := json.Marshal(env)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +77,7 @@ func runTurn(t *testing.T, dir string, env coreagentwire.Envelope) []coreagentwi
 	}
 	defer os.Chdir(wd)
 	var out, errOut bytes.Buffer
-	if code := run(context.Background(), []string{"--model", "gemini-2.5-flash"}, bytes.NewReader(in), &out, &errOut); code != 0 {
+	if code := run(context.Background(), append([]string{"--model", "gemini-2.5-flash"}, flags...), bytes.NewReader(in), &out, &errOut); code != 0 {
 		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
 	}
 	var evs []coreagentwire.Event
@@ -284,6 +290,10 @@ func TestARefusedShellCommandTellsTheModelWhatToDo(t *testing.T) {
 		{"a granted command in a pipe", "kubectl get pods -A | grep -v Running", "one plain command at a time"},
 		{"a granted command with a redirect", "kubectl get pods 2>&1", "-o jsonpath"},
 		{"a command not granted", "gcloud info", "Only these commands may run here, each as one plain command: kubectl"},
+		{"a pipe against the prefix", "kubectl|grep Running", "one plain command at a time"},
+		{"a chain against the prefix", "kubectl;id", "one plain command at a time"},
+		{"an environment prefix", "FOO=1 kubectl get pods", "environment prefixes"},
+		{"a command not granted, in a pipe", "gcloud info | jq .", "Only these commands may run here"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": c.command}}}}

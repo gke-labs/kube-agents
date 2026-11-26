@@ -2480,6 +2480,17 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("proposal-claim", vcs_broker.VCS_VERBS)
         self.assertNotIn("proposal-claim", vcs_broker.WRITE_VERBS)
 
+    def test_proposal_claim_confirms_a_proposal_already_merged(self):
+        # A repository's auto-merge workflow can merge the fix before the hook
+        # presents the token; refusing it left the fix without a post-merge
+        # record (#6947).
+        merged = (datetime.now(timezone.utc) - timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        broker, _ = self.broker(self.CLAIM_STATUS, self._claim_node(state="closed", merged_at=merged))
+        answer = broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(
+            {"url": "https://github.com/acme/infra/pull/7", "number": 7, "title": "Bump replicas"}, answer
+        )
+
     def test_write_mode_reads_the_two_tier_values_and_fails_closed(self):
         env = vcs_broker.WRITE_MODE_ENV
         self.assertEqual("KUBEAGENTS_WRITE_MODE", env)
@@ -2683,7 +2694,6 @@ class CollaborationTest(unittest.TestCase):
         ahead = (datetime.now(timezone.utc) + timedelta(seconds=vcs_broker.CLAIM_CLOCK_SKEW_SECONDS + 120))
         for case, node in (
             ("closed", self._claim_node(state="closed")),
-            ("merged", self._claim_node(state="closed", merged_at="2026-11-03T00:00:00Z")),
             ("too old", self._claim_node(created_at=old.strftime("%Y-%m-%dT%H:%M:%SZ"))),
             ("from the future", self._claim_node(created_at=ahead.strftime("%Y-%m-%dT%H:%M:%SZ"))),
             ("no created time", self._claim_node(created_at="")),

@@ -67,8 +67,8 @@ clock read before the agent is invoked, is not this run's and stays, files inclu
 both waits below. When the clock or the board cannot be read, such a card is taken like the run's
 own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
 other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
-fails, is written down in the agent pod, and the next repetition retries it before its agent is
-invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+fails, is written down in the agent pod, and every later purge retries it, the next repetition's
+before its agent is invoked included, each purge under its own start time, so a card an earlier purge owes goes even when a later
 run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
@@ -315,7 +315,8 @@ up on the provider's rate limit or billing, Hermes's exit 75 or the API server's
 `hermes-api-unreachable` (the bridge never got a response from the pod's API server),
 `hermes-api-refused` (the API server answered a 4xx other than 429, before any turn ran) and
 `session-busy` (the task's deadline passed while it waited for its session's previous turn, so
-no request was sent), and the worker adapter's `worker-evicted`
+no request was sent) and `internal-panic` (the bridge recovered a panic while handling the
+task and ended it with no answer), and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
@@ -347,7 +348,7 @@ transport. `tool_called` reads the trajectory, which on this path carries tool-c
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
 never posts `activity` to a conversation, so the harness reads the trace off the read route when
 the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry
-the bridge does not label with a card worker's session to a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+the bridge does not label with a card worker's session to a trajectory item in the api path's shape (plus the entry's `callId` as `call_id`, beside `args`, when it carries one), and writes one `a2a.activity` marker whenever the key
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
@@ -634,7 +635,10 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 `kubectl exec` the board read uses. It caps the cards at the harness's one cap, pending first,
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
-line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
+line on the record's errors, and nothing is graded for it. A card created before the run started
+was not filed by this run, so the repetition is not independent: the wait logs a warning for it,
+and its dropped line, if it is dropped, says so; marking a settled one in the record would change
+grading. Then it reads `tasks.result` and the
 newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
 newest block's kind and reason. No status turn is sent, because
 none could carry a result back through the door. Only a terminal card reaches the settle step,
@@ -712,6 +716,10 @@ The dashboard's Trend page keeps a series per mode: it draws `next` by default, 
 its window; its Nightly page reads the main nightly's runs, so it shows `next`.
 
 **The front door (#6539).** `EVAL_FRONT_DOOR` picks which front door a run deploys. `platform`, the default, sends a plain conversation to the platform agent, as every install does today. `session` sets the chart's `platformAgent.harness.tuning.defaultRoute` to `session`, so each new conversation gets a session pod of its own: the default session that the sessions-by-default change (#2371) makes the front door. The door takes the install's route, so the cases run unchanged. On the session route a session costs its conversation's replays too, 7 TASKS consumers rather than 3, and the floor would fit only 2 sessions at 4 parallel conversations. So a session run sizes `maxSessions` to the run's parallelism plus two (`EVAL_FRONT_DOOR_SESSIONS=fair`), and its fresh TASKS is created at that budget. The headroom matters because the gateway doesn't queue at the cap: it evicts the longest-idle pod or refuses the turn, and an eviction between a multi-turn case's turns would cost B for something that isn't the front door. `EVAL_FRONT_DOOR_SESSIONS=shipped` leaves the cap at the install default instead, which is what a customer install gets; an eviction or refusal there is a finding about that default. After its gates, the deploy reads the route the install resolved (the `A2A_DEFAULT_ADDRESSEE` the operator rendered on the gateway), writes the requested and the resolved route to `front-door.txt` in its artifacts, and fails when they differ (#6942). Today a mismatch means the chart or the CR lost the setting; once the operator can hold an explicit `session` back on `platform` (the session cap's guards, #6487), it also catches a run that would grade the wrong door. A session run keeps its records apart from the main nightly's: the gate files them under the version key's `next-session` mode, the dashboard publish skips the run, and it never records into the shared replay cache. `scripts/eval_front_door_ab.py <run A> <run B>` reads the two runs' `case-<name>.json` hand-offs and lists every case B fails where A passed. When both runs carry their `eval-grading.log`, it also compares each case's median answer words, infrastructure repetitions left out, and flags a case whose answer on B runs more than 25% and at least 10 words over A's; `--length-gate` makes that exit 1 too, since answer length is part of front-door parity, and exits 2 when a run has no shapes to compare. It exits 1 on a regression, and 2 when the runs can't be compared: an empty run, swapped front doors, a run whose resolved front door differs from the one it asked for or wasn't recorded, or a B where no case was graded.
+
+**The permit pairs (#6539).** That issue's other comparison, today's platform agent against a
+profile on the same ask, is the same script's `--pairs` mode: two cases, which can run on one
+install. [permit-pairs.md](permit-pairs.md) has the form.
 
 **History.** While `spec.mode: today` existed, `EVAL_MODE_NEXT=1` on a Prow job chose this path:
 the deploy installed `today`, proved it, then flipped the install to `next` through the chart's
