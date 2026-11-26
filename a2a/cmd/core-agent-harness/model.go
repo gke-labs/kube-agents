@@ -23,7 +23,8 @@ const placeholderKey = "gateway-proxy-owns-the-key"
 // server-side built-in tool off, so every tool the model can call is one
 // the policy offers.
 //
-// The base URL and its proxy wiring come with the model-routing change (#7158).
+// The adapter strips every other model endpoint and credential from this
+// process's environment (a2a/cmd/worker-adapter, startHarnessGateway).
 func buildModel(ctx context.Context, name string) (adkmodel.LLM, error) {
 	cfg := config.DefaultConfig()
 	cfg.Model.Provider = config.ProviderGemini

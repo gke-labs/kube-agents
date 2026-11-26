@@ -9101,6 +9101,20 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
 
 _GIT_PUSH_GLOBAL_WITH_VALUE = _GIT_GLOBAL_WITH_VALUE
 
+# `git push --recurse-submodules=on-demand` (or `only`) also pushes inside each
+# submodule, to that submodule's own remote, with the same refspec. The push
+# guard judges the repository that the command names, so it refuses the flag
+# with each value but `no`. git reads more words as off (`false`, `off`, `0`);
+# the guard takes the one word. The flag outranks the `push.recurseSubmodules`
+# pin of `GIT_FORCED_CONFIG`, so this refusal is the control for the flag. The
+# text is fixed.
+GIT_PUSH_RECURSE_SUBMODULES_OPTION = "--recurse-submodules"
+GIT_PUSH_RECURSE_SUBMODULES_OFF = "no"
+GIT_PUSH_RECURSE_SUBMODULES_REFUSAL = (
+    "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+    "inside each submodule too, and the broker judges only the repository that the command names."
+)
+
 # The remote a push is judged against when it names none, or names one that
 # `_detect_repo_default_branch` cannot look up.
 GIT_DEFAULT_REMOTE = "origin"
@@ -9312,7 +9326,8 @@ _PROVIDER_RE = re.compile(r"[a-z][a-z0-9]{0,31}")
 # layer. That layer outranks system, global and repo-local config, which is
 # the point: the agent owns the working tree, so `.git/config` is a file it
 # can write, and every key below turns a string in that file into a command
-# the credential holder executes.
+# the credential holder executes. `push.recurseSubmodules` is the one key that
+# is here for another reason; its entry says which.
 #
 #   core.hooksPath   `.git/hooks/pre-commit` is executed by `git commit`, and
 #                    `git commit` is a verb the skills issue nine times.
@@ -9378,6 +9393,23 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
     ("gpg.ssh.defaultKeyCommand", "false"),
     ("gpg.x509.program", "false"),
     ("help.autocorrect", "0"),
+    # This key is here for another reason than the ones above: it runs no command,
+    # it keeps a push in the repository that the push guard judges.
+    # `push.recurseSubmodules = on-demand` (or `only`) and `submodule.recurse =
+    # true` each make a plain `git push` also push inside each submodule, to that
+    # submodule's own remote, with the same refspec; git lets the one that it
+    # reads last decide. The agent can write both keys in `.git/config`, the argv
+    # then has no flag, and the push guard judges the repository that the command
+    # names and nothing below it. git reads this layer after each config file, so
+    # the pin decides. Measured with git 2.56 under this layer: with each of the
+    # two keys set in the repository, the push moved the default branch of the
+    # submodule's remote, and with this pin it did not. `no` is git's own
+    # default, so a push that succeeds today is the same; a repository's own
+    # `check` is turned off too. `-c` and `--config-env` are read after this
+    # layer, and the argv check refuses both. The flag `--recurse-submodules`
+    # also outranks the pin; the push guard refuses it
+    # (`GIT_PUSH_RECURSE_SUBMODULES_REFUSAL`).
+    ("push.recurseSubmodules", "no"),
 )
 
 
@@ -9973,14 +10005,22 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
             positional.extend(push_args[idx + 1:])
             break
         if arg.startswith("--"):
-            opt_name, sep, _ = arg.partition("=")
+            opt_name, sep, opt_value = arg.partition("=")
             if (
                 len(opt_name) > 2
                 and any(
                     opt.startswith(opt_name)
-                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules")
+                    for opt in ("--repo", "--receive-pack", "--exec", "--push-option", GIT_PUSH_RECURSE_SUBMODULES_OPTION)
                 )
             ):
+                # git takes the value in the same word or in the next one, and takes each
+                # prefix of the name that names one option. A prefix that names two is an
+                # error in git; here it is refused when its value is not `no`.
+                if GIT_PUSH_RECURSE_SUBMODULES_OPTION.startswith(opt_name):
+                    if not sep:
+                        opt_value = push_args[idx + 1] if idx + 1 < len(push_args) else ""
+                    if opt_value != GIT_PUSH_RECURSE_SUBMODULES_OFF:
+                        return GIT_PUSH_RECURSE_SUBMODULES_REFUSAL
                 if sep:
                     idx += 1
                     continue

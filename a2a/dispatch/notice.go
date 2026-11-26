@@ -191,12 +191,16 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, r *terminalRefusal, hk
 // sixTokenTerminalID is a six-token terminal's envelope id: the prefix and
 // 128 bits from crypto/rand, which no other writer can predict.
 func sixTokenTerminalID() (string, error) {
-	var b [16]byte
+	var b [sixTokenTerminalIDBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
 	return terminalEnvelopePrefix + hex.EncodeToString(b[:]), nil
 }
+
+// sixTokenTerminalIDBytes is how many random bytes a six-token terminal's id
+// carries: 128 bits, more than any writer can guess.
+const sixTokenTerminalIDBytes = 16
 
 // publishAckOn is c.PublishAck, or the test hook publishAck in its place.
 func (d *Dispatcher) publishAckOn(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error) {

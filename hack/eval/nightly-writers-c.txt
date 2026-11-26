@@ -16,3 +16,8 @@ fleet-audit-manifest-fix-names-stalled-config-connector
 # cluster-profile-confirmed-pdb-pull-request (#6380): listed here to keep the
 # three writers counts within one.
 cluster-profile-confirmed-pdb-pull-request
+# platform-agent-pdb-pull-request (#6539): the other side of that case's
+# permit pair (hack/eval/permit-pairs.txt), listed here so the two sides run
+# on one install at one commit; scripts/test_task_registration.py holds a
+# pair's two sides to one third.
+platform-agent-pdb-pull-request

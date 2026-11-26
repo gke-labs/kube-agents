@@ -388,6 +388,8 @@ leave open:
   `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
   the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
   only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  The [unattended write permit](unattended-write-permit.md) design proposes named version-control
+  routes on both lists for a run that holds its permit; the lists are as stated here until then.
   Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
   trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
   binds a trigger at. When the submission's

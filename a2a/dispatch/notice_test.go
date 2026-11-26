@@ -235,9 +235,8 @@ func refusedErr() error {
 
 // Only a latched install gives up: an unlatched one (the five-token form)
 // keeps retrying a refused terminal for as long as it takes, as it did before
-// the six-token form, and a duplicate that isn't the task's terminal gives up
-// at once whatever the bound. Only a permission refusal counts: a timeout
-// with no refusal heard is retried, latched or not.
+// the six-token form. Only a permission refusal counts: a timeout with no
+// refusal heard is retried, latched or not.
 func TestOnlyALatchedInstallGivesUpOnARefusedTerminal(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
