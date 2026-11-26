@@ -282,3 +282,23 @@ func TestACoreAgentSessionGetsItsClusterPromptInTheEnvelope(t *testing.T) {
 		})
 	}
 }
+
+// A profile pod that lost its role signal (A2A_PROFILE_WORKER) can't fall
+// back to the session tree: without it the worker takes the session path,
+// whose start needs a TASK_ID or the warm-pod flag, and the operator gives a
+// profile pod neither. So it exits 1 at start, before any turn or persona
+// read, rather than run the profile with the session's persona.
+func TestAProfilePodMissingItsRoleSignalRefusesToStart(t *testing.T) {
+	session := writeCoreAgentTree(t)
+	code, stderr := runChild(t, "",
+		"PROFILE=cluster", "NATS_URL=nats://127.0.0.1:1", "A2A_WORKDIR="+t.TempDir(),
+		lib.EnvProfileTier+"=read", coreAgentPersonaRequiredEnv+"=true",
+		lib.EnvHarness+"="+string(persona.CoreAgent), lib.EnvHarnessUnisolated+"="+lib.HarnessUnisolatedAllow,
+		"A2A_HARNESS_PATH=/bin/false", runChildSessionPersonaEnv+"="+session)
+	if code != 1 || !strings.Contains(stderr, "TASK_ID, PROFILE, and NATS_URL are required") {
+		t.Errorf("exit %d, stderr %q; want 1 and the start-up refusal", code, stderr)
+	}
+	if strings.Contains(stderr, "session skills match") || strings.Contains(stderr, "adapter run failed") {
+		t.Errorf("it went on past the refusal: %q", stderr)
+	}
+}
