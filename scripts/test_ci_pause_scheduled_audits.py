@@ -49,12 +49,17 @@ ROSTER_SOURCE = REPO / "agents" / "platform" / "cron" / "jobs.json"
 # one line changed and nothing else.
 ROUND_SLEEP_LINE_RE = re.compile(r"^PAUSE_ROUND_SLEEP_SECONDS = .+$", re.M)
 SHORT_ROUND_SLEEP_LINE = "PAUSE_ROUND_SLEEP_SECONDS = 0.01"
+HERMES_TIMEOUT_LINE_RE = re.compile(r"^HERMES_TIMEOUT_SECONDS = .+$", re.M)
 
 
-def script_text(real_round_sleep=False):
+def script_text(real_round_sleep=False, hermes_timeout=None):
     """The script as a run gets it on stdin: its own text, or that text with the
-    gap between two read-backs made short."""
+    gap between two read-backs made short. `hermes_timeout`, when given, replaces
+    the per-call bound, for a test whose stand-in stalls."""
     text = SCRIPT.read_text()
+    if hermes_timeout is not None:
+        text, lines = HERMES_TIMEOUT_LINE_RE.subn(f"HERMES_TIMEOUT_SECONDS = {hermes_timeout}", text)
+        assert lines == 1, f"{SCRIPT} has {lines} lines that set HERMES_TIMEOUT_SECONDS; script_text() replaces exactly one"
     if real_round_sleep:
         return text
     text, lines = ROUND_SLEEP_LINE_RE.subn(SHORT_ROUND_SLEEP_LINE, text)
@@ -74,6 +79,12 @@ FAKE_HERMES = textwrap.dedent('''\
     if mode == "fail":
         print("boom", file=sys.stderr)
         sys.exit(1)
+    if mode == "stall":
+        # A wedged store: the call is counted, then outlasts the script's per-call bound.
+        import time
+        with open(os.environ["FAKE_ROSTER"] + ".calls", "a") as calls:
+            calls.write(sys.argv[5] + os.linesep)
+        time.sleep(30)
     assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
     if mode == "noop":
         sys.exit(0)
@@ -184,7 +195,7 @@ class PauseTest(unittest.TestCase):
         self.roster.write_text(json.dumps({"jobs": jobs}))
         self.shipped.write_text(json.dumps({"jobs": jobs if shipped is None else shipped}))
 
-    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False, real_round_sleep=False):
+    def run_script(self, mode="ok", stage=STAGE, resume=False, chain=False, real_round_sleep=False, hermes_timeout=None):
         env = {
             **os.environ,
             "HERMES_BIN": str(self.hermes),
@@ -195,7 +206,7 @@ class PauseTest(unittest.TestCase):
         }
         result = subprocess.run(
             [sys.executable, "-", str(self.home), *(["--resume"] if resume else []), *(["--chain"] if chain else [])],
-            input=script_text(real_round_sleep),
+            input=script_text(real_round_sleep, hermes_timeout),
             capture_output=True, text=True, env=env, timeout=60,
         )
         store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
@@ -203,7 +214,7 @@ class PauseTest(unittest.TestCase):
 
     def test_the_shipped_roster(self):
         # The real roster and the real stage: every model-run watchdog is paused except the
-        # oobe stage's four, and no plumbing job is touched.
+        # oobe stage's audits, and no plumbing job is touched.
         shipped = json.loads(ROSTER_SOURCE.read_text())
         self.write_roster(shipped["jobs"])
         result, store = self.run_script()
@@ -531,6 +542,19 @@ class ChainTest(unittest.TestCase):
         for audit in STAGE_FIVE:
             self.assertEqual(store[audit]["state"], "paused", audit)
 
+    def test_a_call_that_times_out_is_not_tried_again_in_the_pass(self):
+        # What the runner's bound on one exec rests on: a pass whose calls all
+        # stall spends one timeout on each job, whatever the number of rounds.
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        result, store = self.run_script(mode="stall", chain=True, hermes_timeout=0.3)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        calls = pathlib.Path(f"{self.roster}.calls").read_text().split()
+        self.assertEqual(sorted(calls), sorted(STAGE_FIVE))
+        for audit in STAGE_FIVE:
+            self.assertIn(f"{audit} (timed out after 0.3s)", result.stdout)
+            self.assertTrue(store[audit]["enabled"], audit)
+
     def test_every_audit_is_paused_once_the_chain_is_done(self):
         self.write_roster(self.five())
         self.write_stage(fired=STAGE_FIVE, done=True)
@@ -784,6 +808,27 @@ class ReadyGatewayPodTest(unittest.TestCase):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_the_exec_bound_covers_a_pause_over_either_set_of_jobs(self):
+        # The runner's comment on EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS says a pause whose
+        # every call stalls still names them inside the bound. A call is bounded by
+        # HERMES_TIMEOUT_SECONDS and not tried again in the pass once it has timed out
+        # (ChainTest holds that); a stage audit's pause adds one read bounded by the
+        # ledger's busy timeout. Each pass also reads the ledger once for its decision
+        # and waits one round gap before the read-back that ends it. The watch's pass
+        # pauses the stage's audits, and a lease's pass the other model-run jobs.
+        script, runner = SCRIPT.read_text(), RUNNER.read_text()
+        per_call = int(re.search(r"^HERMES_TIMEOUT_SECONDS = (\d+)$", script, re.M).group(1))
+        ledger_read = int(re.search(r"^SQLITE_BUSY_TIMEOUT_SECONDS = (\d+)$", script, re.M).group(1))
+        round_gap = int(re.search(r"^PAUSE_ROUND_SLEEP_SECONDS = (\d+)$", script, re.M).group(1))
+        bound = int(re.search(r"^readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=(\d+)$", runner, re.M).group(1))
+        model_run = {job["id"] for job in json.loads(ROSTER_SOURCE.read_text())["jobs"] if not job.get("no_agent")}
+        stage_jobs, other_jobs = model_run & set(STAGE_FIVE), model_run - set(STAGE_FIVE)
+        self.assertTrue(stage_jobs)
+        self.assertTrue(other_jobs)
+        once_a_pass = ledger_read + round_gap
+        self.assertLessEqual(len(stage_jobs) * (per_call + ledger_read) + once_a_pass, bound)
+        self.assertLessEqual(len(other_jobs) * per_call + once_a_pass, bound)
+
     def test_called_at_lease_and_before_the_fan_out(self):
         text = RUNNER.read_text()
         calls = [m.start() for m in re.finditer(r'^scheduled_audits pause "lease"$', text, re.M)]
