@@ -69,22 +69,22 @@ readonly LOOPBACK="127.0.0.1"
 # directory kwok-cluster.sh dir NAME prints.
 readonly APISERVER_PID_FILE_SUFFIX="pids/kube-apiserver.pid"
 readonly APISERVER_BINARY_SUFFIX="bin/kube-apiserver"
-# The proxy's two identities, named as the install names them. The proxy reads
-# with `view` plus a nodes role (`view` has no cluster-scoped resources; the
-# install's role covers nodes) and authenticates callers through TokenReview,
-# which needs system:auth-delegator.
+# The proxy's identity, named as the install names it. The proxy reads with
+# `view` plus a nodes role (`view` has no cluster-scoped resources; the
+# install's role covers nodes). It runs --auth-mode=none on loopback: the lane
+# measures the proxy's list path, not caller authentication, and the install's
+# TokenReview mode holds each caller to its own pod, which a kwok cluster has
+# none of to call from.
 readonly RBAC_NAMESPACE="default"
 readonly PROXY_SA="kube-proxy"
-readonly CALLER_SA="scale-caller"
+readonly CALLER_NAME="scale-caller"
+readonly PROXY_AUTH_MODE="none"
 readonly PROXY_VIEW_BINDING="kube-proxy-view"
-readonly PROXY_TOKENREVIEW_BINDING="kube-proxy-tokenreview"
 readonly PROXY_NODES_ROLE="kube-proxy-nodes-read"
 readonly PROXY_NODES_BINDING="kube-proxy-nodes-read"
 readonly PROXY_NODES_VERBS="get,list,watch"
 readonly PROXY_NODES_RESOURCE="nodes"
 readonly VIEW_CLUSTERROLE="view"
-readonly TOKENREVIEW_CLUSTERROLE="system:auth-delegator"
-readonly PROXY_AUDIENCE="kubeagents-credential-proxy"
 # The proxy routes by the /clusters/<id> prefix of every request path; the
 # host cluster behind --kube-api-server is InClusterID in its policy.go.
 readonly PROXY_CLUSTER_ID="in-cluster"
@@ -325,7 +325,6 @@ WATCHER_BIN="$BASELINE_BIN_DIR/$WATCHER_BINARY"
 PROXY_BIN="$BASELINE_BIN_DIR/$PROXY_BINARY"
 # NAME.<what>: kwok-cluster.sh down removes NAME.* and cluster names carry no dot.
 PROXY_TOKEN_FILE="$STATE_DIR/$NAME.proxy.token"
-CALLER_TOKEN_FILE="$STATE_DIR/$NAME.caller.token"
 PROXY_CERT="$STATE_DIR/$NAME.proxy.crt"
 PROXY_KEY="$STATE_DIR/$NAME.proxy.key"
 CALLER_KUBECONFIG="$STATE_DIR/$NAME.caller.kubeconfig"
@@ -366,10 +365,7 @@ log "$NODE_COUNT nodes, $POD_COUNT pods, $SERVICE_COUNT services, $EVENT_COUNT e
 # ─── 3. Proxy baseline ───────────────────────────────────────────────────────
 log "proxy identities in namespace $RBAC_NAMESPACE"
 kc_admin create serviceaccount "$PROXY_SA" -n "$RBAC_NAMESPACE" --dry-run=client -o yaml | kc_admin apply -f -
-kc_admin create serviceaccount "$CALLER_SA" -n "$RBAC_NAMESPACE" --dry-run=client -o yaml | kc_admin apply -f -
 kc_admin create clusterrolebinding "$PROXY_VIEW_BINDING" --clusterrole="$VIEW_CLUSTERROLE" \
-  --serviceaccount="$RBAC_NAMESPACE:$PROXY_SA" --dry-run=client -o yaml | kc_admin apply -f -
-kc_admin create clusterrolebinding "$PROXY_TOKENREVIEW_BINDING" --clusterrole="$TOKENREVIEW_CLUSTERROLE" \
   --serviceaccount="$RBAC_NAMESPACE:$PROXY_SA" --dry-run=client -o yaml | kc_admin apply -f -
 kc_admin create clusterrole "$PROXY_NODES_ROLE" --verb="$PROXY_NODES_VERBS" --resource="$PROXY_NODES_RESOURCE" \
   --dry-run=client -o yaml | kc_admin apply -f -
@@ -378,7 +374,6 @@ kc_admin create clusterrolebinding "$PROXY_NODES_BINDING" --clusterrole="$PROXY_
 (
   umask 077
   kc_admin create token "$PROXY_SA" -n "$RBAC_NAMESPACE" --duration "$TOKEN_DURATION" >"$PROXY_TOKEN_FILE"
-  kc_admin create token "$CALLER_SA" -n "$RBAC_NAMESPACE" --audience "$PROXY_AUDIENCE" --duration "$TOKEN_DURATION" >"$CALLER_TOKEN_FILE"
   openssl req -x509 -newkey ec -pkeyopt "ec_paramgen_curve:$PROXY_CERT_CURVE" -nodes -days "$PROXY_CERT_DAYS" \
     -subj "$PROXY_CERT_SUBJECT" -addext "$PROXY_CERT_SAN" -keyout "$PROXY_KEY" -out "$PROXY_CERT" 2>/dev/null
 )
@@ -392,12 +387,11 @@ clusters:
     certificate-authority: $PROXY_CERT
 contexts:
 - name: $PROXY_CONTEXT
-  context: {cluster: $PROXY_CONTEXT, user: $CALLER_SA}
+  context: {cluster: $PROXY_CONTEXT, user: $CALLER_NAME}
 current-context: $PROXY_CONTEXT
 users:
-- name: $CALLER_SA
-  user:
-    tokenFile: $CALLER_TOKEN_FILE
+- name: $CALLER_NAME
+  user: {}
 EOF
 
 log "starting $PROXY_BINARY on $LOOPBACK:$BASELINE_PROXY_PORT (metrics port $BASELINE_PROXY_METRICS_PORT, log $PROXY_LOG)"
@@ -405,7 +399,7 @@ OTEL_SDK_DISABLED=true "$PROXY_BIN" \
   --listen-addr="$LOOPBACK:$BASELINE_PROXY_PORT" --metrics-port="$BASELINE_PROXY_METRICS_PORT" \
   --tls-cert-file="$PROXY_CERT" --tls-key-file="$PROXY_KEY" \
   --kube-api-server="$SERVER" --kube-ca-file="$CA" --kube-token-file="$PROXY_TOKEN_FILE" \
-  --audience="$PROXY_AUDIENCE" --allowed-callers="system:serviceaccount:$RBAC_NAMESPACE:$CALLER_SA" \
+  --auth-mode="$PROXY_AUTH_MODE" \
   >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 PROXY_HEALTHZ_URL="https://$LOOPBACK:$BASELINE_PROXY_PORT$PROXY_HEALTHZ_PATH"
@@ -421,7 +415,7 @@ curl -fsS --cacert "$PROXY_CERT" -o /dev/null "$PROXY_HEALTHZ_URL" \
 read -ra warmup_args <<<"$WARMUP_ARGS"
 kc_admin "${warmup_args[@]}" >/dev/null
 kubectl --kubeconfig "$CALLER_KUBECONFIG" --context "$PROXY_CONTEXT" "${warmup_args[@]}" >/dev/null \
-  || die "the CLI cannot read through the proxy as $CALLER_SA; see $PROXY_LOG"
+  || die "the CLI cannot read through the proxy; see $PROXY_LOG"
 
 LISTS_JSON="[]"
 for list_name in $LIST_NAMES; do

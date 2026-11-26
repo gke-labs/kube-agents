@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -669,6 +670,63 @@ func (r *PlatformAgentReconciler) ensureKubeProxyCABundle(ctx context.Context, a
 	return nil
 }
 
+// kubeProxyPodReadName names kube-proxy's pod-read Role and RoleBinding:
+// <agent>-kube-proxy-pod-read.
+func kubeProxyPodReadName(agent *agentv1alpha1.PlatformAgent) string {
+	return kubeProxyName(agent) + "-pod-read"
+}
+
+// buildKubeProxyPodReadRole lets kube-proxy read one pod at a time in the
+// agent's namespace, to hold each request to the pod its token was issued to:
+// the TokenReview names the pod, the pod's addresses come from this read, and
+// the request's peer has to be one of them (podBinder in
+// k8s-api-proxy/pkg/tokenreview/podbinding.go).
+//
+// `get` on pods, namespaced, in exactly the namespace whose pods present
+// tokens to kube-proxy: the agent's, where the <agent>-shell pod and, under the
+// session pods' cluster view, the A2A session pods run (the callers
+// buildKubeProxyNetworkPolicy admits, both by pod selector in this namespace,
+// and the only ServiceAccounts CREDENTIAL_PROXY_ALLOWED_CALLERS and
+// CREDENTIAL_PROXY_SESSION_CALLERS name). resourceNames can't narrow it,
+// because the pods it reads are named at runtime.
+//
+// A backstop, not a narrowing: kube-proxy runs as agentServiceAccountName,
+// which the minimal audit ClusterRole (buildMinimalPlatformRoleWithSecrets)
+// already grants get, list and watch on pods cluster-wide. This Role is what
+// the check needs on its own terms, so it keeps working if that cluster-wide
+// grant is ever narrowed or moved off kube-proxy's ServiceAccount.
+//
+// A chart rollback does not remove this Role or its binding: the operator
+// renders them, not the chart, and an older operator does not know them. They
+// stay, owned by the PlatformAgent, until it is deleted; they grant nothing
+// beyond the minimal ClusterRole's pod read.
+func buildKubeProxyPodReadRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	role := &rbacv1.Role{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyPodReadName(agent), Namespace: agent.Namespace},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get"},
+		}},
+	}
+	withCommonLabels(role, agent)
+	return role
+}
+
+// buildKubeProxyPodReadRoleBinding binds that Role to kube-proxy's
+// ServiceAccount.
+func buildKubeProxyPodReadRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.RoleBinding {
+	binding := &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyPodReadName(agent), Namespace: agent.Namespace},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: kubeProxyPodReadName(agent)},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: agentServiceAccountName(agent), Namespace: agent.Namespace}},
+	}
+	withCommonLabels(binding, agent)
+	return binding
+}
+
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
 	tlsHash, err := r.ensureKubeProxyTLSSecret(ctx, agent)
 	if err != nil {
@@ -676,6 +734,10 @@ func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent 
 	}
 
 	objs := []client.Object{
+		// Before the Deployment: its pods refuse every pod-token request
+		// they can't match to its pod, which needs this read.
+		buildKubeProxyPodReadRole(agent),
+		buildKubeProxyPodReadRoleBinding(agent),
 		buildKubeProxyService(agent),
 		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled, tlsHash),
 		buildKubeProxyPDB(agent),
