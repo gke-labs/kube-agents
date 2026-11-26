@@ -43,7 +43,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the pool that names a missing reservation
+    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the two pools that name a missing reservation
   - slot: b
     suffix: b
     carries: The held-back control plane, and the upgrade-readiness drain defects
@@ -268,6 +268,25 @@ fixtures:
       zone of the project. GKE reports the pool RUNNING and refuses the first
       node it would add, so the pool can never grow. The stack plants no
       reservation: the missing one is the defect. Zero nodes cost nothing.
+
+  - role: missing-reservation-autoscaled
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/dev-reserved-pool
+      - deployment/reserved-batch
+    namespace: seeded-reservation
+    defect: >-
+      A single-zone pool that autoscales from 0 to 1 node, held behind the
+      taint seeded-role=missing-reservation-autoscaled, that consumes the
+      reservation that missing-reservation-pool names (SPECIFIC_RESERVATION),
+      which exists in no zone of the project; and a Deployment (one replica)
+      whose pod only that pool can hold. The autoscaler asks for a node, GKE
+      refuses it, and the pod stays Pending with the pool at zero nodes: the
+      autoscaler's visibility log repeats scale.up.error.reservation.not.found.
+      `dev` in the pool's name makes it non-production for the stockout
+      audit, so the reservation check (3.10) does not name it. Zero nodes
+      cost nothing.
 
   - role: deprecated-api-caller
     slot: a
