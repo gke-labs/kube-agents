@@ -34,6 +34,7 @@ import socket
 import socketserver
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -9145,6 +9146,16 @@ GIT_PUSH_REF_FORMAT_REFUSAL = (
     "the remote's default branch from the files ref format only, so it cannot tell a push to "
     "that branch from another."
 )
+# A linked worktree, a submodule and a clone made with `--separate-git-dir` have a `.git`
+# that is a file with the path of the git directory, and a `.git` can be a symbolic link.
+# The guard follows neither, so it refuses each push from such a place, by name. The text
+# is fixed: it shows no path and no byte of a file that the agent can write.
+GIT_PUSH_LAYOUT_REFUSAL = (
+    "`git push` is refused: `.git` at the working directory or at a folder above it is not a "
+    "folder (a linked worktree, a submodule, a clone with a separate git directory, or a file or "
+    "a link named `.git`). The broker reads the remote's default branch only under a `.git` "
+    "folder and follows no file or link, so here it cannot tell a push to that branch from another."
+)
 
 # What `_detect_repo_default_branch` accepts as a remote *name*. The
 # `<repository>` slot of `git push` takes a name, a URL, or a filesystem path,
@@ -9811,6 +9822,44 @@ def _remote_head_path(remotes_dir: Path, remote: str) -> Path | None:
     return None
 
 
+def _git_entry_is_not_a_folder(repo_dir: Path) -> bool:
+    """Is a `.git` at `repo_dir`, or at a folder above it, something other than a folder (#7072)?
+
+    `repo_dir` is absolute; the caller resolves it.
+
+    git itself makes such a `.git`: a file with the path of the git directory, in a
+    linked worktree, a submodule and a clone made with `--separate-git-dir`. The
+    refs and the config are then in another directory, and the two reads of the
+    push guard (`_repo_ref_format`, `_detect_repo_default_branch`) look under a
+    `.git` folder or at the root of a bare layout. The caller refuses a push from
+    such a place. This test does not follow the file: it opens no file, and no
+    path that the file names.
+
+    The test is `lstat`, so a symbolic link to a folder is not a folder: a read
+    under it would be a read under the link's target. A `.git` that cannot be
+    examined counts as not a folder too.
+
+    The walk does not stop at a `.git` folder and goes to the root of the file
+    system, which is wider than git's own search. git goes past a `.git` folder
+    that it does not take as a repository, so a walk that stops at the first
+    `.git` folder can be hidden by one. The cost: one `.git` that is not a folder
+    refuses each push from each clone below it, also where git itself uses the
+    clone's own `.git` folder.
+    """
+    current = Path(repo_dir)
+    while True:
+        try:
+            if not stat.S_ISDIR(os.lstat(current / GIT_DIR_NAME).st_mode):
+                return True
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+
 def _repo_ref_format(repo_dir: Path) -> str:
     """The ref format of the clone at `repo_dir`, from its own config file, with no git call (#6593).
 
@@ -9824,9 +9873,10 @@ def _repo_ref_format(repo_dir: Path) -> str:
 
     Not read: a clone whose `.git` is a file that points to its git directory
     (a linked worktree, a submodule, a clone made with `--separate-git-dir`).
-    The answer there is `files`, in each ref format, and a push from there is
-    judged as before this check; `_detect_repo_default_branch` does not follow
-    that pointer either.
+    The answer there is `files`, in each ref format, and
+    `_detect_repo_default_branch` does not follow that pointer either. The push
+    guard asks `_git_entry_is_not_a_folder` first and refuses a push from such a
+    place, so neither answer decides a push there (#7072).
     """
     repo_root = _find_repo_root(repo_dir) or Path(repo_dir)
     for config in (repo_root / GIT_DIR_NAME / GIT_CONFIG_FILE, repo_root / GIT_CONFIG_FILE):
@@ -9922,7 +9972,8 @@ def _detect_repo_default_branch(
 
 def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | None:
     """Refuse direct pushes to protected rollout or base branches (#1498), and each push
-    from a clone whose ref format hides the remote's default branch from this check (#6593)."""
+    from a clone in another ref format than `files` (#6593) or from a place whose `.git`
+    is not a folder (#7072): there this check does not read the remote's default branch."""
     if not argv or Path(argv[0]).name != "git":
         return None
 
@@ -10043,6 +10094,11 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
 
     if cwd:
         repo_dir = Path(cwd).resolve()
+        # Where `.git` is a file, the two reads below do not find the git directory and
+        # would say nothing; where it is a link, they would read under the link's target.
+        # The push is refused here, by name.
+        if _git_entry_is_not_a_folder(repo_dir):
+            return GIT_PUSH_LAYOUT_REFUSAL
         # The detection below reads a file that only the files ref format keeps. In
         # another format it finds nothing, so the push is refused here, by name.
         ref_format = _repo_ref_format(repo_dir)
