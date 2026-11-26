@@ -19950,6 +19950,36 @@ class SweepTransportTest(unittest.TestCase):
 
         return Opener(*answers)
 
+    def test_a_failed_sweep_mint_reads_as_no_credential_and_never_reaches_the_forge(self):
+        """The readings sweep reports the cause by this code: `unauthorized`, not a fault of the forge's."""
+        import vcs_readings
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        for failure in (RuntimeError("sweep credential mint failed"), TimeoutError("sweep credential mint timed out")):
+            with self.subTest(failure=type(failure).__name__):
+                executor = _SweepExecutor()
+                executor.mint_sweep_credential = mock.Mock(side_effect=failure)
+                opener = self._opener({"items": []})
+                transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+                with self.assertRaises(providers.WorkspaceError) as raised:
+                    transport.api("GET", "search/issues")
+                self.assertEqual("FORGE_CREDENTIAL_UNAVAILABLE", raised.exception.fields.get("code"))
+                self.assertIs(failure, raised.exception.__cause__)
+                self.assertEqual([], opener.requests, "the forge is not asked without a token")
+                self.assertEqual("unauthorized", vcs_readings.connection_state(raised.exception))
+                self.assertNotIn(str(failure), str(raised.exception), "the helper's text stays out of the refusal")
+
+    def test_a_repository_that_is_not_managed_keeps_its_own_refusal(self):
+        import vcs_readings
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        executor = _SweepExecutor()
+        executor.mint_sweep_credential = mock.Mock(side_effect=PermissionError("acme/gitops is not a repository this install manages"))
+        transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=self._opener({"items": []}))
+        with self.assertRaises(PermissionError) as raised:
+            transport.api("GET", "search/issues")
+        self.assertEqual("unauthorized", vcs_readings.connection_state(raised.exception))
+
     def test_github_com_gets_an_http_transport_at_api_github_com(self):
         forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
         executor = _SweepExecutor()

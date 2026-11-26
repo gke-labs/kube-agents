@@ -36,6 +36,20 @@ authenticates the pod and applies the broker's tool policy and audit log.
 There is no direct-URL kind: `Load` refuses `url:` in `mcp.yaml`, because
 a server reached around the broker would be outside both.
 
+A persona declares no hook. `persona.yaml` has no `hooks` key, and `Load`
+refuses an unknown top-level key there. A key below `harness.<name>` loads,
+but it makes no hook: the Claude Code adapter ignores it with a warning. A
+skill's frontmatter that carries `hooks` is refused, and the profile worker
+writes each task's `settings.json` itself, as an empty object. The reason is
+the rule of this format: a persona is written once for every harness, so
+nothing in it can depend on a feature of one harness. A hook is a feature of
+Claude Code. This package renders a persona for `claude-code` and for
+`core-agent`, and an AgentProfile's `spec.harness.type` accepts `claude-code`
+only, so a hook could be rendered for one harness only today. Rows 1 and 15
+of [the hooks design](../../../docs/designs/profile-worker-hooks.md) record
+the decision: no hook mechanism is built now, and a later design can open
+one.
+
 `Load` also refuses:
 
 - a persona whose files differ from its `skills_manifest.sha256`, or one

@@ -2161,6 +2161,54 @@
           "why": "GKE omits a false boolean from clusters describe, so the off state reads as no value; the networking case that names this cluster needs the add-on off, and anyone turning it on heals the defect"
         }
       ]
+    },
+    "unaccepted-gateway-class": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": [
+        "gatewayclass/seeded-unaccepted-gw",
+        "gateway/seeded-unaccepted-gateway",
+        "httproute/seeded-unaccepted-route",
+        "gatewayclass/seeded-envoy"
+      ],
+      "fixture": "GatewayClass seeded-unaccepted-gw referencing example.com/unsupported-controller so no controller accepts it, with Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route in seeded-shapes bound to it; GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as the accepted-class negative control on the same cluster",
+      "state": [
+        {
+          "subject": "gatewayclass/seeded-unaccepted-gw",
+          "path": "spec.controllerName",
+          "op": "eq",
+          "value": "example.com/unsupported-controller",
+          "why": "the defect is the unsupported controller path the audit must name; changing controllerName to a supported GKE controller heals the fixture"
+        },
+        {
+          "subject": "gatewayclass/seeded-unaccepted-gw",
+          "path": "status.conditions[?(@.type=='Accepted')].status",
+          "op": "none_eq",
+          "value": "True",
+          "why": "the defect is a GatewayClass no controller has accepted; an Accepted=True condition means a controller reconciled it and the audit would stay silent"
+        },
+        {
+          "subject": "gateway/seeded-unaccepted-gateway",
+          "path": "spec.gatewayClassName",
+          "op": "eq",
+          "value": "seeded-unaccepted-gw",
+          "why": "the Gateway must remain bound to the unaccepted GatewayClass so the audit reports affected Gateways with no proxy Deployment, Service, or address"
+        },
+        {
+          "subject": "httproute/seeded-unaccepted-route",
+          "path": "spec.parentRefs[*].name",
+          "op": "any_eq",
+          "value": "seeded-unaccepted-gateway",
+          "why": "the HTTPRoute must remain attached to the Gateway on the unaccepted class so the audit reports unprogrammed routes"
+        },
+        {
+          "subject": "gatewayclass/seeded-envoy",
+          "path": "status.conditions[?(@.type=='Accepted')].status",
+          "op": "any_eq",
+          "value": "True",
+          "why": "seeded-envoy is the accepted-class negative control on the same cluster; without Accepted=True, silence on accepted classes cannot be distinguished from flagging every custom GatewayClass"
+        }
+      ]
     }
   }
 }
