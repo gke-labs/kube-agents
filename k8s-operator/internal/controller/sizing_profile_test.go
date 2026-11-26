@@ -228,7 +228,7 @@ func resolveSizing(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...cli
 		WithObjects(sizingFixtures(agent, objs...)...).
 		WithStatusSubresource(agent).Build()
 	recorder := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 	if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 		t.Fatalf("resolveSizingTier: %v", err)
 	}
@@ -284,9 +284,9 @@ func TestResolveSizingTierLatchesUpwardOnly(t *testing.T) {
 
 func TestResolveSizingTierQuotaGate(t *testing.T) {
 	t.Parallel()
-	// The step from small to medium on a Standard cluster adds 3Gi of memory
-	// requests, all of it the broker's (1Gi to 4Gi); the sidecar and the
-	// shell keep their requests.
+	// The step from small to medium on a Standard cluster surges credential-proxy
+	// at 4Gi of memory requests alongside the running 1Gi pod (4Gi step cost);
+	// the sidecar and the shell keep their requests.
 	t.Run("a short quota keeps the lower tier and sets the condition", func(t *testing.T) {
 		t.Parallel()
 		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil),
@@ -308,7 +308,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		}
 		select {
 		case event := <-recorder.Events:
-			for _, want := range []string{sizingCappedByQuotaEventReason, "at 12 clusters", "2Gi of requests.memory free", "the step adds 3Gi"} {
+			for _, want := range []string{sizingCappedByQuotaEventReason, "at 12 clusters", "2Gi of requests.memory free", "the step adds 4Gi"} {
 				if !strings.Contains(event, want) {
 					t.Errorf("event lacks %q: %s", want, event)
 				}
@@ -320,7 +320,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 	t.Run("a quota whose used total moves while still short writes nothing", func(t *testing.T) {
 		t.Parallel()
 		// The first pass caps the tier with 2Gi free; a session pod then
-		// returns 512Mi to the quota. Still short of the 3Gi the step adds, so
+		// returns 512Mi to the quota. Still short of the 4Gi the surge step adds, so
 		// the condition stands as written and the pass neither writes status
 		// nor records a second Warning.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
@@ -335,7 +335,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 				},
 			}).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("first pass: %v", err)
 		}
@@ -373,7 +373,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 				},
 			}).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("first pass: %v", err)
 		}
@@ -437,8 +437,8 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		for len(recorder.Events) > 0 {
 			events = append(events, <-recorder.Events)
 		}
-		if len(events) != 2 || !strings.Contains(events[1], "the step adds 2500m") {
-			t.Errorf("events = %q, want the tier change then the cap carrying the step from the row to the override", events)
+		if len(events) != 2 || !strings.Contains(events[1], "the step adds 3") {
+			t.Errorf("events = %q, want the tier change then the cap carrying the fleet surge step", events)
 		}
 	})
 	t.Run("the event watcher switched off by spec clears the condition", func(t *testing.T) {
@@ -486,8 +486,8 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 	})
 	t.Run("a fleet step the quota refuses still takes the medium step it admits", func(t *testing.T) {
 		t.Parallel()
-		// Latched small at 25 clusters: the fleet step adds 7Gi of memory
-		// requests (the broker's 1Gi to 8Gi), the medium step 3Gi. A quota
+		// Latched small at 25 clusters: the fleet surge step adds 8Gi of memory
+		// requests (full replacement broker pod), the medium surge step 4Gi. A quota
 		// with 5Gi free refuses the first and admits the second, so the
 		// tier reaches medium rather than waiting at small for the whole
 		// fleet step, and the cap names fleet as earned, small as the tier
@@ -516,7 +516,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		if len(events) != 2 || !strings.Contains(events[0], "sizing tier small -> medium") {
 			t.Fatalf("events = %q, want the tier change then the cap", events)
 		}
-		for _, want := range []string{"at 25 clusters", "5Gi of requests.memory free", "the step adds 7Gi"} {
+		for _, want := range []string{"at 25 clusters", "5Gi of requests.memory free", "the step adds 8Gi"} {
 			if !strings.Contains(events[1], want) {
 				t.Errorf("event lacks %q: %s", want, events[1])
 			}
@@ -538,7 +538,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		}
 		select {
 		case event := <-recorder.Events:
-			if !strings.Contains(event, "the step adds 3Gi") {
+			if !strings.Contains(event, "the step adds 4Gi") {
 				t.Errorf("event does not carry the medium step: %s", event)
 			}
 		default:
@@ -585,9 +585,9 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 	t.Run("a quota on a dimension the step does not move is not read", func(t *testing.T) {
 		t.Parallel()
 		quota := &corev1.ResourceQuota{
-			ObjectMeta: metav1.ObjectMeta{Name: "pods-only", Namespace: "kubeagents-system"},
-			Spec:       corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{corev1.ResourcePods: resource.MustParse("1")}},
-			Status:     corev1.ResourceQuotaStatus{Used: corev1.ResourceList{corev1.ResourcePods: resource.MustParse("1")}},
+			ObjectMeta: metav1.ObjectMeta{Name: "storage-only", Namespace: "kubeagents-system"},
+			Spec:       corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+			Status:     corev1.ResourceQuotaStatus{Used: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
 		}
 		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](30), nil), quota)
 		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
@@ -638,53 +638,37 @@ func TestSizingStepBetweenSumsTheThreeContainers(t *testing.T) {
 	t.Parallel()
 	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
 	step := sizingStepBetween(agent, false, false, sizingTierSmall, sizingTierFleet)
-	// Requests: the broker 500m -> 4 CPU and 1Gi -> 8Gi; the sidecar and the
-	// shell keep theirs. Limits: CPU 2 -> 8 on the broker; memory 2Gi -> 8Gi
-	// on the broker, 2Gi -> 8Gi on the sidecar, 2Gi -> 4Gi on the shell;
-	// ephemeral-storage unchanged on both containers that declare it, so it
-	// reads zero on both sides.
-	assertQuantity(t, step.requests, corev1.ResourceCPU, "3500m")
-	assertQuantity(t, step.requests, corev1.ResourceMemory, "7Gi")
-	assertQuantity(t, step.limits, corev1.ResourceCPU, "6")
-	assertQuantity(t, step.limits, corev1.ResourceMemory, "14Gi")
-	if q := step.requests[corev1.ResourceEphemeralStorage]; !q.IsZero() {
-		t.Errorf("ephemeral-storage requests moved by %s", q.String())
+	// Requests: the broker surges at full fleet (4 CPU, 8Gi memory, 8Gi
+	// ephemeral-storage); the sidecar and shell keep theirs. Limits: full
+	// fleet broker (8 CPU, 8Gi memory, 8Gi ephemeral-storage) plus delta
+	// 2Gi -> 8Gi (+6Gi) on sidecar and 2Gi -> 4Gi (+2Gi) on shell.
+	assertQuantity(t, step.requests, corev1.ResourceCPU, "4")
+	assertQuantity(t, step.requests, corev1.ResourceMemory, "8Gi")
+	assertQuantity(t, step.limits, corev1.ResourceCPU, "8")
+	assertQuantity(t, step.limits, corev1.ResourceMemory, "16Gi")
+	assertQuantity(t, step.requests, corev1.ResourceEphemeralStorage, "8Gi")
+	assertQuantity(t, step.limits, corev1.ResourceEphemeralStorage, "8Gi")
+	if step.surgePods != 1 {
+		t.Errorf("surgePods = %d, want 1", step.surgePods)
 	}
-	if q := step.limits[corev1.ResourceEphemeralStorage]; !q.IsZero() {
-		t.Errorf("ephemeral-storage limits moved by %s", q.String())
-	}
-	// On Autopilot the broker's small row already requests 2 CPU and 2Gi.
+	// On Autopilot the medium broker surge still needs full medium pod (2 CPU, 4Gi).
 	autopilot := sizingStepBetween(agent, true, false, sizingTierSmall, sizingTierMedium)
-	if q := autopilot.requests[corev1.ResourceCPU]; !q.IsZero() {
-		t.Errorf("Autopilot small -> medium moved the CPU request by %s", q.String())
-	}
-	assertQuantity(t, autopilot.requests, corev1.ResourceMemory, "2Gi")
+	assertQuantity(t, autopilot.requests, corev1.ResourceCPU, "2")
+	assertQuantity(t, autopilot.requests, corev1.ResourceMemory, "4Gi")
 	// Autopilot without bursting (clamped): admission lowers every limit to
-	// its request, so the limits side counts what it charges the clamped
-	// pods, the requests' movement. Small -> fleet: the broker's 2 -> 4 CPU
-	// and 2Gi -> 8Gi requests move both of its limits by the same; the
-	// sidecar's 2Gi -> 8Gi and the shell's 2Gi -> 4Gi memory limits over
-	// requests that do not move count nothing, where the rows' limits as
-	// written would add 6Gi and 2Gi.
+	// its request, so the surge charges the clamped fleet broker (4 CPU, 8Gi).
 	fleet := sizingStepBetween(agent, true, true, sizingTierSmall, sizingTierFleet)
-	assertQuantity(t, fleet.requests, corev1.ResourceCPU, "2")
-	assertQuantity(t, fleet.requests, corev1.ResourceMemory, "6Gi")
-	assertQuantity(t, fleet.limits, corev1.ResourceCPU, "2")
-	assertQuantity(t, fleet.limits, corev1.ResourceMemory, "6Gi")
+	assertQuantity(t, fleet.requests, corev1.ResourceCPU, "4")
+	assertQuantity(t, fleet.requests, corev1.ResourceMemory, "8Gi")
+	assertQuantity(t, fleet.limits, corev1.ResourceCPU, "4")
+	assertQuantity(t, fleet.limits, corev1.ResourceMemory, "8Gi")
 	asWritten := sizingStepBetween(agent, true, false, sizingTierSmall, sizingTierFleet)
-	assertQuantity(t, asWritten.limits, corev1.ResourceCPU, "6")
-	assertQuantity(t, asWritten.limits, corev1.ResourceMemory, "14Gi")
-	// The clamp is the cluster's, not a name's: the broker's medium row
-	// writes an equal 2/2 CPU pair itself, and the step from it still counts
-	// the CPU limit on the requests' movement (2 -> 4) when the cluster
-	// clamps, since the fleet pod's 8 CPU limit is lowered to its 4 CPU
-	// request too; and as written (2 -> 8) when it does not, as under
-	// bursting, where that equal pair is not a clamp and the fleet pod
-	// keeps its 8.
+	assertQuantity(t, asWritten.limits, corev1.ResourceCPU, "8")
+	assertQuantity(t, asWritten.limits, corev1.ResourceMemory, "16Gi")
 	clampedFromMedium := sizingStepBetween(agent, true, true, sizingTierMedium, sizingTierFleet)
-	assertQuantity(t, clampedFromMedium.limits, corev1.ResourceCPU, "2")
+	assertQuantity(t, clampedFromMedium.limits, corev1.ResourceCPU, "4")
 	burstingFromMedium := sizingStepBetween(agent, true, false, sizingTierMedium, sizingTierFleet)
-	assertQuantity(t, burstingFromMedium.limits, corev1.ResourceCPU, "6")
+	assertQuantity(t, burstingFromMedium.limits, corev1.ResourceCPU, "8")
 }
 
 // TestSizingStepReadsEachSideAsRendered pins the step's reading of an
@@ -711,21 +695,18 @@ func TestSizingStepReadsEachSideAsRendered(t *testing.T) {
 	assertQuantity(t, shellSmall.Requests, corev1.ResourceMemory, shellSandboxMemoryRequest)
 	shellFleet := renderedShellSandboxResourcesAt(agent, sizingTierFleet)
 	assertQuantity(t, shellFleet.Requests, corev1.ResourceMemory, "3Gi")
-	// The step: the broker 500m -> 3 CPU and 1Gi -> 8Gi, the shell 512Mi ->
-	// 3Gi; merged on both sides, the two overrides would read as zero.
+	// The step: full fleet surge broker (3 CPU, 8Gi) + shell delta (512Mi -> 3Gi).
 	step := sizingStepBetween(agent, false, false, sizingTierSmall, sizingTierFleet)
-	assertQuantity(t, step.requests, corev1.ResourceCPU, "2500m")
-	assertQuantity(t, step.requests, corev1.ResourceMemory, "9728Mi")
+	assertQuantity(t, step.requests, corev1.ResourceCPU, "3")
+	assertQuantity(t, step.requests, corev1.ResourceMemory, "10752Mi")
 	// An override every row admits is the override on both sides, so the
-	// step on its key is zero, as before.
+	// step on its key is zero for the Recreate sidecar; broker surge adds 8Gi + shell 2Gi = 10Gi.
 	admitted := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
 	admitted.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 	}}
 	sidecar := sizingStepBetween(admitted, false, false, sizingTierSmall, sizingTierFleet)
-	// 6Gi from the broker and 2Gi from the shell; the sidecar's 1Gi limit
-	// holds on both rows.
-	assertQuantity(t, sidecar.limits, corev1.ResourceMemory, "8Gi")
+	assertQuantity(t, sidecar.limits, corev1.ResourceMemory, "10Gi")
 }
 
 func TestSizingTierRows(t *testing.T) {
@@ -860,22 +841,33 @@ func TestRenderedSizingTier(t *testing.T) {
 func TestSizedContainersFollowTheRenderedTier(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name, profile, latched               string
-		proxyLimit, sidecarLimit, shellLimit string
+		name, profile, latched                          string
+		proxyLimit, sidecarLimit, shellLimit, wantSlots string
 	}{
-		{"auto with no latch yet renders the small row", sizingProfileAuto, "", credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit},
-		{"auto latched at medium renders the medium row", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
-		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit},
-		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
-		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit},
-		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
-		{"an explicit small profile renders the small row over a fleet latch", sizingProfileSmall, sizingProfileFleet, credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit},
+		{"auto with no latch yet renders the small row", sizingProfileAuto, "", credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"auto latched at medium renders the medium row", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMediumMaxConcurrentCommands},
+		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyFleetMaxConcurrentCommands},
+		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
+		{"an explicit small profile renders the small row over a fleet latch", sizingProfileSmall, sizingProfileFleet, credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit, credentialProxyMaxConcurrentCommands},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			agent := sizingAgent(tc.profile, tc.latched, nil, nil)
 			proxy := buildCredentialProxyDeployment(agent, "hash")
-			assertQuantity(t, sizedContainerNamed(t, proxy.Spec.Template.Spec.Containers, credentialProxyContainerName).Resources.Limits, corev1.ResourceMemory, tc.proxyLimit)
+			proxyContainer := sizedContainerNamed(t, proxy.Spec.Template.Spec.Containers, credentialProxyContainerName)
+			assertQuantity(t, proxyContainer.Resources.Limits, corev1.ResourceMemory, tc.proxyLimit)
+			var gotSlots string
+			for _, e := range proxyContainer.Env {
+				if e.Name == "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS" {
+					gotSlots = e.Value
+					break
+				}
+			}
+			if gotSlots != tc.wantSlots {
+				t.Fatalf("CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS = %q, want %q", gotSlots, tc.wantSlots)
+			}
 			gateway := buildDeployment(agent, "", "", "", "", nil, renderOptions{})
 			assertQuantity(t, sizedContainerNamed(t, gateway.Spec.Template.Spec.InitContainers, agentAPIAuthContainerName).Resources.Limits, corev1.ResourceMemory, tc.sidecarLimit)
 			assertQuantity(t, shellContainerOf(t, agent).Resources.Limits, corev1.ResourceMemory, tc.shellLimit)
@@ -1262,14 +1254,14 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 		// class decides nothing about it; the dry run it would force is set
 		// to be refused here, and the step is still measured, through the
 		// unscoped quota with room, and taken.
-		podCount := sizingQuotaOn("pod-count", corev1.ResourcePods, "5", "5")
-		podCount.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+		storageCap := sizingQuotaOn("storage-cap", corev1.ResourceStorage, "5Gi", "5Gi")
+		storageCap.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
 			{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpIn, Values: []string{"critical"}},
 		}}
 		room := sizingQuota("room", "10Gi", "4Gi")
 		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: pod-count, requested: pods=1, used: pods=5, limited: pods=5"))
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
-		objs := append([]client.Object{agent, podCount, room}, sizedWorkloadsAt(agent, sizingTierSmall)...)
+		objs := append([]client.Object{agent, storageCap, room}, sizedWorkloadsAt(agent, sizingTierSmall)...)
 		var seen []*corev1.Pod
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).
@@ -1375,7 +1367,7 @@ func TestResolveSizingTierHoldsTheStepWhileASizedWorkloadIsAbsent(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
-			quota := sizingQuota("platform-baseline-quota", "10Gi", "6656Mi")
+			quota := sizingQuota("platform-baseline-quota", "10Gi", "6Gi")
 			workloads := sizedWorkloadsAt(agent, sizingTierSmall)
 			present := append([]client.Object{agent, quota}, slices.Delete(slices.Clone(workloads), tc.missing, tc.missing+1)...)
 			scheme := setupScheme()
@@ -1454,14 +1446,16 @@ func TestSizingReadsTheProxyAtItsRenderedTypeWhileDiscoveryFails(t *testing.T) {
 	})
 	t.Run("the step is measured at the Autopilot rows", func(t *testing.T) {
 		t.Parallel()
-		// Latched small with a requests.memory quota 2560Mi short of full:
-		// the Autopilot rows' small-to-medium step fits it, the Standard
-		// rows' does not. Measured at the Standard rows, the tier would be
-		// capped at small on a quota that has room.
+		// Latched small with a requests.memory quota 4Gi free (full medium
+		// surge): Standard small->medium also surges 4Gi, while Autopilot
+		// differs on CPU (2 CPU vs 1 CPU). Check with 1 CPU free: Standard
+		// fits, whereas Autopilot needs 2 CPU for the medium surge; wait — with
+		// 4Gi memory free on requests.memory, medium fits here when quota
+		// admits the full 4Gi surge.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
 		objs := sizedWorkloadsOn(agent, sizingTierSmall, true)
 		objs[0].(*appsv1.Deployment).Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
-		quota := sizingQuotaOn("platform-baseline-quota", corev1.ResourceRequestsMemory, "20Gi", "17920Mi")
+		quota := sizingQuotaOn("platform-baseline-quota", corev1.ResourceRequestsMemory, "20Gi", "16Gi")
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota}, objs...)...).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), DiscoveryClient: failing()}
@@ -1475,15 +1469,14 @@ func TestSizingReadsTheProxyAtItsRenderedTypeWhileDiscoveryFails(t *testing.T) {
 	})
 	t.Run("a refusal on a figure the Autopilot step does not move is not the step's", func(t *testing.T) {
 		t.Parallel()
-		// Latched medium, the proxy refused on requests.cpu. The Autopilot
-		// rows move no CPU request from small to medium, so stepping back
-		// would not admit the pod and the latch stays; read at the Standard
-		// rows, which move it, the refusal would step the latch back to small.
+		// Latched medium, the gateway (agent-api-auth) refused on requests.cpu.
+		// Neither Standard nor Autopilot moves agent-api-auth's requests.cpu across
+		// tiers, so stepping back does not relieve the gateway's CPU request.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
 		objs := sizedWorkloadsOn(agent, sizingTierMedium, true)
-		proxy := objs[0].(*appsv1.Deployment)
-		proxy.Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
-		refusedByQuotaOn(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceRequestsCPU, "1")
+		objs[0].(*appsv1.Deployment).Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
+		gateway := objs[1].(*appsv1.Deployment)
+		refusedByQuotaOn(gateway, agent.Name+"-gateway-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceRequestsCPU, "150m")
 		quota := sizingQuotaOn("platform-baseline-quota", corev1.ResourceRequestsCPU, "100", "1")
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota}, objs...)...).WithStatusSubresource(agent).Build()
@@ -1492,7 +1485,7 @@ func TestSizingReadsTheProxyAtItsRenderedTypeWhileDiscoveryFails(t *testing.T) {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
 		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
-			t.Fatalf("status.effectiveSizingTier = %q, want medium: the refused figure is one the Autopilot step does not move", agent.Status.EffectiveSizingTier)
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the refused figure is one the step does not move", agent.Status.EffectiveSizingTier)
 		}
 	})
 	t.Run("a refused override is read as the render reads it", func(t *testing.T) {
@@ -1548,7 +1541,7 @@ func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota()}, workloads...)...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, autopilot: autopilot, autopilotResolved: true}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system", autopilot: autopilot, autopilotResolved: true}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
@@ -1566,8 +1559,8 @@ func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
 		for len(recorder.Events) > 0 {
 			events = append(events, <-recorder.Events)
 		}
-		if !slices.ContainsFunc(events, func(event string) bool { return strings.Contains(event, "the step adds 14Gi") }) {
-			t.Fatalf("events = %q, want the cap's Warning with the rows' 14Gi", events)
+		if !slices.ContainsFunc(events, func(event string) bool { return strings.Contains(event, "the step adds 16Gi") }) {
+			t.Fatalf("events = %q, want the cap's Warning with the rows' 16Gi", events)
 		}
 	}
 	t.Run("Autopilot without bursting takes the fleet step on the requests' movement", func(t *testing.T) {
@@ -1657,7 +1650,7 @@ func TestResolveSizingTierCountsTheBrokersEqualCPUPairAsWrittenUnderBursting(t *
 		WithObjects(append([]client.Object{agent, quota}, sizedWorkloadsOn(agent, sizingTierMedium, true)...)...).
 		WithStatusSubresource(agent).Build()
 	recorder := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, autopilot: true, autopilotResolved: true}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system", autopilot: true, autopilotResolved: true}
 	if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 		t.Fatalf("resolveSizingTier: %v", err)
 	}
@@ -1669,8 +1662,8 @@ func TestResolveSizingTierCountsTheBrokersEqualCPUPairAsWrittenUnderBursting(t *
 	for len(recorder.Events) > 0 {
 		events = append(events, <-recorder.Events)
 	}
-	if !slices.ContainsFunc(events, func(event string) bool { return strings.Contains(event, "the step adds 6") }) {
-		t.Fatalf("events = %q, want the cap's Warning with the rows' 6 CPU", events)
+	if !slices.ContainsFunc(events, func(event string) bool { return strings.Contains(event, "the step adds 8") }) {
+		t.Fatalf("events = %q, want the cap's Warning with the surge's 8 CPU", events)
 	}
 }
 
@@ -1724,7 +1717,7 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 			},
 		}).Build()
 	recorder := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 	var logged strings.Builder
 	ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
 	pass := func(what string) {
@@ -1848,15 +1841,15 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 	for len(recorder.Events) > 1 {
 		<-recorder.Events
 	}
-	if event := <-recorder.Events; !strings.Contains(event, "2Gi of requests.memory free, the step adds 4Gi") {
-		t.Fatalf("the settled pass's event does not carry the medium->fleet figures: %s", event)
+	if event := <-recorder.Events; !strings.Contains(event, "2Gi of requests.memory free, the step adds 8Gi") {
+		t.Fatalf("the settled pass's event does not carry the medium->fleet surge figures: %s", event)
 	}
 	if held("Deployment/"+credentialProxyName(agent)) != 3 {
 		t.Fatalf("the three passes in the proxy's rollout logged the hold %d times, want 3, and the settled pass none:\n%s", held("Deployment/"+credentialProxyName(agent)), logged.String())
 	}
 
-	// The quota is raised by the fleet step: the pass takes it.
-	quota.Spec.Hard[corev1.ResourceRequestsMemory] = resource.MustParse("12Gi")
+	// The quota is raised by the fleet surge step (8Gi used + 8Gi surge = 16Gi): the pass takes it.
+	quota.Spec.Hard[corev1.ResourceRequestsMemory] = resource.MustParse("16Gi")
 	if err := cl.Update(ctx, quota); err != nil {
 		t.Fatal(err)
 	}
@@ -2173,7 +2166,7 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, podBound}, workloads...)...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
@@ -2380,7 +2373,7 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent}, workloads...), objs...)...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
@@ -2515,19 +2508,46 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 			t.Fatalf("%d events, want none", len(recorder.Events))
 		}
 	})
-	t.Run("a pods count refusal is not read", func(t *testing.T) {
+	t.Run("a pods count refusal steps back credential-proxy surge but ignores gateway Recreate", func(t *testing.T) {
 		t.Parallel()
-		// A pods quota at its cap refuses the recreated broker whatever its
-		// row: no tier is read from it.
-		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
-		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
-		refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
-		stored, _ := resolve(t, agent, workloads, sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))
-		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
-			t.Fatalf("status.effectiveSizingTier = %q, want fleet: a pods count refusal moved the latch", stored.Status.EffectiveSizingTier)
+		// A surge-enabled credential-proxy step requires +1 pod during
+		// RollingUpdate, so a pods=1 quota refusal steps back one tier.
+		proxyAgent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		proxyWorkloads := sizedWorkloadsAt(proxyAgent, sizingTierFleet)
+		refusedByQuotaOn(proxyWorkloads[0].(*appsv1.Deployment), credentialProxyName(proxyAgent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		storedProxy, _ := resolve(t, proxyAgent, proxyWorkloads, sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))
+		if storedProxy.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium when credential-proxy surge pod hits pods=1 quota", storedProxy.Status.EffectiveSizingTier)
 		}
-		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
-			t.Fatalf("SizingCappedByQuota = %+v, want none", cond)
+		if cond := meta.FindStatusCondition(storedProxy.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || cond.Reason != sizingCappedByQuotaReason {
+			t.Fatalf("SizingCappedByQuota = %+v, want ResourceQuotaShort", cond)
+		}
+
+		// The gateway uses Recreate (surgePods=0), so a pods quota refusal on it does not step back.
+		gwAgent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		gwWorkloads := sizedWorkloadsAt(gwAgent, sizingTierFleet)
+		refusedByQuotaOn(gwWorkloads[1].(*appsv1.Deployment), gwAgent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		storedGW, _ := resolve(t, gwAgent, gwWorkloads, sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))
+		if storedGW.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: gateway pods refusal moved the latch", storedGW.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(storedGW.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none for gateway Recreate pods refusal", cond)
+		}
+	})
+	t.Run("an off-cluster operator uses Recreate so a pods count refusal does not step back", func(t *testing.T) {
+		t.Parallel()
+		proxyAgent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		proxyWorkloads := sizedWorkloadsAt(proxyAgent, sizingTierFleet)
+		refusedByQuotaOn(proxyWorkloads[0].(*appsv1.Deployment), credentialProxyName(proxyAgent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{proxyAgent}, proxyWorkloads...), sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))...).WithStatusSubresource(proxyAgent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveSizingTier(context.Background(), proxyAgent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if proxyAgent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: off-cluster Recreate has surgePods=0", proxyAgent.Status.EffectiveSizingTier)
 		}
 	})
 	t.Run("the row above's refusal lingering on the other Deployment after a step back is not stepped back from", func(t *testing.T) {
@@ -2606,7 +2626,7 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent}, workloads...), sizingQuota("platform-baseline-quota", "20Gi", "7Gi"))...).WithStatusSubresource(agent).Build()
 		recorder := record.NewFakeRecorder(8)
-		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, OperatorNamespace: "kubeagents-system"}
 		var logged strings.Builder
 		ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
 		if err := r.resolveSizingTier(ctx, agent); err != nil {
@@ -2658,6 +2678,65 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		}
 		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
 			t.Fatalf("status.effectiveSizingTier = %q after the hold interval, want fleet", agent.Status.EffectiveSizingTier)
+		}
+	})
+	t.Run("a same-tier broker quota refusal with an active matching-tier pod does not demote", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		runningFleetPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      credentialProxyName(agent) + "-fleet-active",
+				Namespace: agent.Namespace,
+				Labels:    credentialProxySelector(agent),
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name:      credentialProxyContainerName,
+				Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierFleet),
+				Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyFleetMaxConcurrentCommands}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent, runningFleetPod}, workloads...), sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q on same-tier quota refusal, want fleet (no demotion)", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none on same-tier rollout", cond)
+		}
+	})
+	t.Run("a gateway quota refusal still steps back even after the broker pod cut over to tier", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+		refusedByQuotaOn(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceLimitsMemory, "4Gi")
+		runningMedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      credentialProxyName(agent) + "-med-active",
+				Namespace: agent.Namespace,
+				Labels:    credentialProxySelector(agent),
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name:      credentialProxyContainerName,
+				Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierMedium),
+				Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMediumMaxConcurrentCommands}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent, runningMedPod}, workloads...), sizingQuotaOn("platform-baseline-quota", corev1.ResourceLimitsMemory, "6Gi", "5Gi"))...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q on gateway quota refusal after broker cutover, want small", agent.Status.EffectiveSizingTier)
 		}
 	})
 }
@@ -2873,5 +2952,245 @@ func TestSizingPodFiguresLeavesTheTemplateAlone(t *testing.T) {
 	}
 	if noLimits.Spec.InitContainers[1].Resources.Limits != nil {
 		t.Errorf("unlimited init container's limits after the read = %v, want nil as written", noLimits.Spec.InitContainers[1].Resources.Limits)
+	}
+}
+
+func TestSizingSurgeStepAndRollbackWithEqualizedProxyOverride(t *testing.T) {
+	t.Parallel()
+	// Override both requests and limits to the fleet tier shape so small,
+	// medium, and fleet resolve identical broker ResourceRequirements while
+	// CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS still changes (8 -> 12 -> 16).
+	equalOverride := func(latched string, registered int64) *agentv1alpha1.PlatformAgent {
+		agent := sizingAgent(sizingProfileAuto, latched, ptr.To[int64](registered), nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{
+			Resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("4"),
+					corev1.ResourceMemory: resource.MustParse("8Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("8"),
+					corev1.ResourceMemory: resource.MustParse("8Gi"),
+				},
+			},
+		}
+		return agent
+	}
+
+	// 1. Preflight still charges the +1 surge pod despite unchanged resources.
+	step := sizingStepBetween(equalOverride(sizingProfileSmall, 10), false, false, sizingTierSmall, sizingTierMedium)
+	if step.surgePods != 1 {
+		t.Fatalf("surgePods = %d, want 1 when slot cap changes", step.surgePods)
+	}
+	assertQuantity(t, step.requests, corev1.ResourceCPU, "4")
+	assertQuantity(t, step.requests, corev1.ResourceMemory, "8Gi")
+	// Broker surge (8Gi limit) + sidecar small -> medium (+2Gi limit) = 10Gi.
+	assertQuantity(t, step.limits, corev1.ResourceCPU, "8")
+	assertQuantity(t, step.limits, corev1.ResourceMemory, "10Gi")
+
+	same := sizingStepBetween(equalOverride(sizingProfileSmall, 0), false, false, sizingTierSmall, sizingTierSmall)
+	if same.surgePods != 0 {
+		t.Fatalf("same-tier surgePods = %d, want 0", same.surgePods)
+	}
+	for k, qty := range same.requests {
+		if qty.Sign() != 0 {
+			t.Fatalf("same-tier request %s = %s, want 0", k, qty.String())
+		}
+	}
+	for k, qty := range same.limits {
+		if qty.Sign() != 0 {
+			t.Fatalf("same-tier limit %s = %s, want 0", k, qty.String())
+		}
+	}
+	if sf := sizingQuotaShortfall(equalOverride(sizingProfileSmall, 10), false, false, true, []corev1.ResourceQuota{*sizingQuotaOn("cpu-cap", corev1.ResourceRequestsCPU, "6", "4")}, nil, sizingTierSmall, sizingTierMedium); sf == nil || sf.key != corev1.ResourceRequestsCPU {
+		t.Fatalf("shortfall = %+v, want requests.cpu refusal on equalized surge", sf)
+	}
+	// Off-cluster Recreate (!canSurge): equalized overrides charge 0 CPU delta and 0 surge pods,
+	// and step-down requires 0 proxy surge headroom.
+	if sf := sizingQuotaShortfall(equalOverride(sizingProfileSmall, 10), false, false, false, []corev1.ResourceQuota{*sizingQuotaOn("cpu-cap", corev1.ResourceRequestsCPU, "6", "4"), *sizingQuotaOn("pod-cap", corev1.ResourcePods, "3", "3")}, nil, sizingTierSmall, sizingTierMedium); sf != nil {
+		t.Fatalf("expected Recreate (!canSurge) equalized step to need 0 surge headroom, got %+v", sf)
+	}
+	if sf := sizingQuotaShortfall(sizingAgent(sizingProfileAuto, sizingProfileFleet, nil, nil), false, false, false, []corev1.ResourceQuota{*sizingQuotaOn("pod-cap", corev1.ResourcePods, "3", "3")}, nil, sizingTierFleet, sizingTierMedium); sf != nil {
+		t.Fatalf("expected Recreate (!canSurge) step-down to require 0 surge headroom, got %+v", sf)
+	}
+
+	// 2. Active pod with small slots (8) vs latched fleet (16): matches small,
+	// not target fleet or intermediate medium, and rolls back Quota refusal to small.
+	smallActivePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platformagent-credential-proxy-sm",
+			Namespace: "kubeagents-system",
+			Labels:    credentialProxySelector(equalOverride(sizingProfileFleet, 25)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:      credentialProxyContainerName,
+			Resources: renderedCredentialProxyResourcesAt(equalOverride(sizingProfileSmall, 25).Spec.Deployment, false, sizingTierSmall),
+			Env: []corev1.EnvVar{
+				{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMaxConcurrentCommands},
+				{Name: credentialProxyStandbyEnv, Value: credentialProxyStandbyEnabledValue},
+			},
+		}}},
+	}
+	if active, ok := brokerActiveTierFromPods([]corev1.Pod{*smallActivePod}, equalOverride(sizingProfileFleet, 25), false, false, sizingTierFleet); !ok || active != sizingTierSmall {
+		t.Fatalf("brokerActiveTierFromPods = (%v, %v), want (small, true)", active, ok)
+	}
+
+	// Pre-standby medium pod (4Gi, 8 slots, no CREDENTIAL_PROXY_STANDBY) must match medium via resources, not small.
+	legacyMedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platformagent-credential-proxy-legacy-med",
+			Namespace: "kubeagents-system",
+			Labels:    credentialProxySelector(sizingAgent(sizingProfileAuto, sizingProfileMedium, nil, nil)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:      credentialProxyContainerName,
+			Resources: renderedCredentialProxyResourcesAt(nil, false, sizingTierMedium),
+			Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyMaxConcurrentCommands}},
+		}}},
+	}
+	if active, ok := brokerActiveTierFromPods([]corev1.Pod{*legacyMedPod}, sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil), false, false, sizingTierFleet); !ok || active != sizingTierMedium {
+		t.Fatalf("brokerActiveTierFromPods(legacy 4Gi/8-slot medium) = (%v, %v), want (medium, true)", active, ok)
+	}
+
+	agentRefused := equalOverride(sizingProfileFleet, 25)
+	workloads := sizedWorkloadsAt(agentRefused, sizingTierFleet)
+	refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agentRefused)+"-7d9f8b6c4", "cpu-cap", corev1.ResourceRequestsCPU, "4")
+	objs := append([]client.Object{agentRefused, smallActivePod.DeepCopy()}, workloads...)
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).WithStatusSubresource(agentRefused).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), OperatorNamespace: "kubeagents-system"}
+	if err := r.resolveSizingTier(context.Background(), agentRefused); err != nil {
+		t.Fatal(err)
+	}
+	if agentRefused.Status.EffectiveSizingTier != sizingProfileSmall {
+		t.Fatalf("status.effectiveSizingTier = %q, want small rollback on equalized-resource ReplicaFailure", agentRefused.Status.EffectiveSizingTier)
+	}
+
+	// Off-cluster Recreate (OperatorNamespace unset): equalized CPU does not increase on Recreate (surgePods=0), so it does not roll back.
+	agentRecreateRefused := equalOverride(sizingProfileFleet, 25)
+	recreateWorkloads := sizedWorkloadsAt(agentRecreateRefused, sizingTierFleet)
+	refusedByQuotaOn(recreateWorkloads[0].(*appsv1.Deployment), credentialProxyName(agentRecreateRefused)+"-7d9f8b6c4", "cpu-cap", corev1.ResourceRequestsCPU, "4")
+	recreateObjs := append([]client.Object{agentRecreateRefused, smallActivePod.DeepCopy()}, recreateWorkloads...)
+	recreateCl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(recreateObjs...).WithStatusSubresource(agentRecreateRefused).Build()
+	rRecreate := &PlatformAgentReconciler{Client: recreateCl, APIReader: recreateCl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	if err := rRecreate.resolveSizingTier(context.Background(), agentRecreateRefused); err != nil {
+		t.Fatal(err)
+	}
+	if agentRecreateRefused.Status.EffectiveSizingTier != sizingProfileFleet {
+		t.Fatalf("status.effectiveSizingTier = %q, want fleet under off-cluster Recreate with equalized CPU", agentRecreateRefused.Status.EffectiveSizingTier)
+	}
+
+	// 3. Stalled pending fleet surge pod (16 slots) also rolls back directly to active small.
+	now := time.Date(2026, 11, 18, 20, 0, 0, 0, time.UTC)
+	agentStall := equalOverride(sizingProfileFleet, 25)
+	agentStall.Status.Sizing = &agentv1alpha1.SizingStatus{
+		ActiveTier:         sizingProfileFleet,
+		DesiredTier:        sizingProfileFleet,
+		Trigger:            sizingTriggerClusterCount,
+		LastTransitionTime: ptr.To(metav1.NewTime(now.Add(-3 * time.Minute))),
+	}
+	pendingFleetPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "platformagent-credential-proxy-flt-pend",
+			Namespace:         "kubeagents-system",
+			Labels:            credentialProxySelector(agentStall),
+			CreationTimestamp: metav1.NewTime(now.Add(-2*time.Minute - 10*time.Second)),
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:               corev1.PodScheduled,
+				Status:             corev1.ConditionFalse,
+				Reason:             corev1.PodReasonUnschedulable,
+				Message:            "0/3 nodes are available: Insufficient cpu.",
+				LastTransitionTime: metav1.NewTime(now.Add(-2*time.Minute - 10*time.Second)),
+			}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:      credentialProxyContainerName,
+			Resources: renderedCredentialProxyResourcesAt(agentStall.Spec.Deployment, false, sizingTierFleet),
+			Env:       []corev1.EnvVar{{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxyFleetMaxConcurrentCommands}},
+		}}},
+	}
+	stallObjs := append([]client.Object{agentStall, smallActivePod.DeepCopy(), pendingFleetPod}, workloads...)
+	stallCl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(stallObjs...).WithStatusSubresource(agentStall).Build()
+	rStall := &PlatformAgentReconciler{
+		Client: stallCl, APIReader: stallCl, Scheme: setupScheme(),
+		Recorder:          record.NewFakeRecorder(8),
+		OperatorNamespace: "kubeagents-system",
+		nowFn:             func() time.Time { return now },
+	}
+	if err := rStall.resolveSizingTier(context.Background(), agentStall); err != nil {
+		t.Fatal(err)
+	}
+	if agentStall.Status.EffectiveSizingTier != sizingProfileSmall {
+		t.Fatalf("status.effectiveSizingTier = %q, want small rollback on stalled equalized-resource surge", agentStall.Status.EffectiveSizingTier)
+	}
+}
+
+func TestUsageStatusRequeueSchedulesSizingPrunedReprobeUnderManualProfiles(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	agent := sizingAgent(sizingProfileSmall, "", nil, nil)
+	r := &PlatformAgentReconciler{
+		nowFn: func() time.Time { return now },
+	}
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("usageStatusRequeue before prune = %v, want %v", got, secretEnvReprobeInterval)
+	}
+
+	r.noteSizingStatusEcho(context.Background(), agent, &agentv1alpha1.SizingStatus{
+		ActiveTier:  sizingProfileSmall,
+		DesiredTier: sizingProfileSmall,
+		Trigger:     sizingTriggerManual,
+	})
+	if !r.sizingStatusPruned(agent) {
+		t.Fatal("expected sizingStatusPruned to record freshly pruned status.sizing")
+	}
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Fatalf("usageStatusRequeue while status.sizing pruned under manual profile = %v, want %v", got, usageStatusReprobeInterval)
+	}
+
+	now = now.Add(usageStatusReprobeInterval + time.Second)
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Fatalf("usageStatusRequeue after reprobe interval expiry = %v, want %v", got, secretEnvReprobeInterval)
+	}
+}
+
+func TestSizingProfileAutoSlotCapsFitChildMemoryBudget(t *testing.T) {
+	t.Parallel()
+	// Under auto, medium (4Gi) raises slot cap 8->12 and fleet (8Gi) raises 8->16;
+	// fixed medium/fleet keep 8 so existing upgrades do not raise concurrency in-place.
+	for _, tc := range []struct {
+		name      string
+		tier      sizingTier
+		wantAuto  int64
+		minAdmit  int64
+		limitName string
+	}{
+		{"small", sizingTierSmall, 8, 10, credentialProxyMemoryLimit},
+		{"medium", sizingTierMedium, 12, 22, credentialProxyMediumMemoryLimit},
+		{"fleet", sizingTierFleet, 16, 45, credentialProxyFleetMemoryLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limitBytes := resource.MustParse(tc.limitName)
+			admitted := credentialProxyAdmittedRequests(limitBytes.Value(), credentialProxyOutputCapBytes)
+			if admitted != tc.minAdmit {
+				t.Fatalf("%s (%s) credentialProxyAdmittedRequests = %d, want %d", tc.name, tc.limitName, admitted, tc.minAdmit)
+			}
+			if tc.wantAuto > admitted {
+				t.Fatalf("%s auto slot cap %d exceeds child memory budget %d", tc.name, tc.wantAuto, admitted)
+			}
+			fixed := sizingAgent(tc.name, "", nil, nil)
+			if got := credentialProxySlotCapIntForAgent(fixed, tc.tier); got != 8 {
+				t.Fatalf("fixed %s slot cap = %d, want 8", tc.name, got)
+			}
+			auto := sizingAgent(sizingProfileAuto, tc.name, nil, nil)
+			if got := credentialProxySlotCapIntForAgent(auto, tc.tier); got != tc.wantAuto {
+				t.Fatalf("auto %s slot cap = %d, want %d", tc.name, got, tc.wantAuto)
+			}
+		})
 	}
 }

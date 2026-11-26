@@ -10,12 +10,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +62,19 @@ const (
 	// jsonRPCServerError is the JSON-RPC code for an error the bridge
 	// answers with itself, never the server.
 	jsonRPCServerError = -32000
+
+	// Pre-admission handoff drain refusals match credential_proxy_client.py:
+	// only 503 with CREDENTIAL_PROXY_BUSY, bound="draining", before_admission=true
+	// is safe to retry because the broker rejected the call before forwarding.
+	mcpRelayDrainingCode       = "CREDENTIAL_PROXY_BUSY"
+	mcpRelayDrainingBound      = "draining"
+	mcpRelayDrainingMaxRetries = 4
+	mcpRelayRetryBackoffBase   = 2 * time.Second
+	mcpRelayRetryBackoffCap    = 16 * time.Second
+	mcpRelayRetryAfterCap      = 30 * time.Second
+	mcpRelayRetryAfterHeader   = "Retry-After"
+	mcpRelayRetryJitterFloor   = 0.5
+	mcpRelayRetryMaxShift      = 10
 )
 
 var (
@@ -121,6 +137,18 @@ func RelayTarget(base, raw string) (*url.URL, error) {
 // A request the broker can't answer gets a JSON-RPC error with its id, so
 // the harness sees why rather than waiting; a notification gets nothing.
 func ServeMCPRelay(ctx context.Context, target string, in io.Reader, out io.Writer, log *slog.Logger) error {
+	return serveMCPRelayWith(ctx, target, in, out, log, sleepWithContext, randFloatRange)
+}
+
+func serveMCPRelayWith(
+	ctx context.Context,
+	target string,
+	in io.Reader,
+	out io.Writer,
+	log *slog.Logger,
+	sleepFn func(context.Context, time.Duration) error,
+	randRange func(float64, float64) float64,
+) error {
 	u, err := RelayTarget(os.Getenv(EnvCredentialProxyURL), target)
 	if err != nil {
 		return err
@@ -155,7 +183,7 @@ func ServeMCPRelay(ctx context.Context, target string, in io.Reader, out io.Writ
 			log.Warn("mcp-relay: dropped a message that isn't one JSON object", "err", err)
 			continue
 		}
-		replies, err := relayOne(ctx, client, u, line)
+		replies, err := relayOneWithRetry(ctx, client, u, line, sleepFn, randRange)
 		if err == nil && len(replies) == 0 && len(probe.ID) > 0 && string(probe.ID) != "null" {
 			err = errors.New("the broker sent no reply to a request")
 		}
@@ -219,6 +247,91 @@ func newRelayClient() *http.Client {
 	}
 }
 
+type errDrainingRetry struct {
+	err        error
+	retryAfter string
+}
+
+func (e *errDrainingRetry) Error() string { return e.err.Error() }
+
+func randFloatRange(lo, hi float64) float64 {
+	return lo + rand.Float64()*(hi-lo) // #nosec G404 -- non-cryptographic retry backoff jitter
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func isRetryableDrainingBusy(statusCode int, body []byte) bool {
+	if statusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	var payload struct {
+		Code            string `json:"code"`
+		Bound           string `json:"bound"`
+		BeforeAdmission bool   `json:"before_admission"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	return payload.BeforeAdmission &&
+		payload.Code == mcpRelayDrainingCode &&
+		payload.Bound == mcpRelayDrainingBound
+}
+
+func relayDrainingDelay(attempt int, retryAfterHeader string, randRange func(float64, float64) float64) time.Duration {
+	baseSec := 0.0
+	if raw := strings.TrimSpace(retryAfterHeader); raw != "" {
+		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+			baseSec = math.Min(math.Max(parsed, mcpRelayRetryBackoffBase.Seconds()), mcpRelayRetryAfterCap.Seconds())
+		}
+	}
+	if baseSec == 0 {
+		exp := mcpRelayRetryBackoffBase * time.Duration(1<<min(attempt, mcpRelayRetryMaxShift))
+		if exp > mcpRelayRetryBackoffCap {
+			exp = mcpRelayRetryBackoffCap
+		}
+		baseSec = exp.Seconds()
+	}
+	jittered := randRange(mcpRelayRetryJitterFloor*baseSec, baseSec)
+	return time.Duration(jittered * float64(time.Second))
+}
+
+func relayOneWithRetry(
+	ctx context.Context,
+	client *http.Client,
+	u *url.URL,
+	message []byte,
+	sleepFn func(context.Context, time.Duration) error,
+	randRange func(float64, float64) float64,
+) ([][]byte, error) {
+	for attempt := 0; ; attempt++ {
+		replies, err := relayOne(ctx, client, u, message)
+		var retryErr *errDrainingRetry
+		if !errors.As(err, &retryErr) || attempt >= mcpRelayDrainingMaxRetries {
+			return replies, err
+		}
+		// Close idle pooled HTTP/1.1 sockets before retrying so the next attempt
+		// dials a fresh TCP connection through the Service instead of sticking
+		// to the draining broker Pod.
+		client.CloseIdleConnections()
+		delay := relayDrainingDelay(attempt, retryErr.retryAfter, randRange)
+		if sleepErr := sleepFn(ctx, delay); sleepErr != nil {
+			return nil, sleepErr
+		}
+	}
+}
+
 // relayOne POSTs one message with the pod's credentials and returns the
 // broker's replies: none for an accepted notification, one or more from a
 // JSON or event-stream body.
@@ -250,7 +363,11 @@ func relayOne(ctx context.Context, client *http.Client, u *url.URL, message []by
 		return nil, fmt.Errorf("the broker's reply passed %d bytes", maxRelayReplyBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("the broker answered HTTP %d%s", resp.StatusCode, brokerErrorDetail(body))
+		baseErr := fmt.Errorf("the broker answered HTTP %d%s", resp.StatusCode, brokerErrorDetail(body))
+		if isRetryableDrainingBusy(resp.StatusCode, body) {
+			return nil, &errDrainingRetry{err: baseErr, retryAfter: resp.Header.Get(mcpRelayRetryAfterHeader)}
+		}
+		return nil, baseErr
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil, nil

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -79,8 +80,9 @@ type tokenReviewAuthenticator struct {
 // the Authorization header when a TokenReview finds it valid for a configured audience and
 // its user is in that audience's allowed caller set, and the request comes from the pod the
 // token was issued to: the TokenReview names the pod, and the request's direct peer has to be
-// one of that pod's addresses (podBinder). A token that names no pod is refused. Reviews that
-// accept or refuse the token are cached for cfg.CacheTTL; a review that fails is not.
+// one of that pod's addresses (podBinder). A token that names no pod is refused. The caller it
+// returns carries the review's status.user.extra as CallerIdentity.Extra. Reviews that accept
+// or refuse the token are cached for cfg.CacheTTL; a review that fails is not.
 func NewAuthenticator(cfg Config) (k8sapiproxy.CallerAuthenticator, error) {
 	if cfg.Kubernetes == nil {
 		return nil, errors.New("tokenreview: Config.Kubernetes is required")
@@ -229,7 +231,26 @@ func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapi
 	if err := a.pods.check(r.Context(), r.RemoteAddr, resp.User); err != nil {
 		return nil, fmt.Errorf("%w: caller %q: %w", k8sapiproxy.ErrCallerRefused, name, err)
 	}
-	return &k8sapiproxy.CallerIdentity{Username: name, UID: resp.User.GetUID(), Groups: resp.User.GetGroups()}, nil
+	return &k8sapiproxy.CallerIdentity{
+		Username: name,
+		UID:      resp.User.GetUID(),
+		// The response is the cache's, shared by every request with this token.
+		Groups: slices.Clone(resp.User.GetGroups()),
+		Extra:  copyExtra(resp.User.GetExtra()),
+	}, nil
+}
+
+// copyExtra returns a copy of a user's extra attributes that shares nothing with in; nil
+// when there are none.
+func copyExtra[V ~[]string](in map[string]V) map[string][]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(in))
+	for key, values := range in {
+		out[key] = slices.Clone([]string(values))
+	}
+	return out
 }
 
 // tokenReviewer is an authenticator.Token backed by the TokenReview API. A refused token is
