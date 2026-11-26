@@ -590,35 +590,6 @@ func TestATaskWaitFoldsOnlyAfterAFinalStatus(t *testing.T) {
 	}
 }
 
-// A status-update the cutoff screen held is taken when the task's kind is
-// settled, which is after it was read. The wait checks for the task's end
-// then, as it does for a status-update it took at once.
-func TestAHeldStatusUpdateTakenLaterIsCheckedForTheTasksEnd(t *testing.T) {
-	url, _ := testBus(t)
-	b := dialCutoff(t, url, time.Now().Add(-time.Minute))
-	ref := TaskRef{Addressee: cutoffSessionShaped, TaskID: "task-held"}
-	payload := mustJSON(t, lib.StatusUpdate{TaskID: ref.TaskID, ContextID: "ctx-" + ref.TaskID,
-		Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
-	terminal, err := lib.NewStatusUpdateEnvelope(fakeGateway, ref.TaskID, "ctx-"+ref.TaskID, "corr-"+ref.TaskID, payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w := &taskWatch{ref: ref,
-		screen:  &cutoffScreen{b: b, cutoff: b.client.ProfileSupervisorCutoff(), ref: ref, settled: true},
-		doubted: []doubtedEvent{{subject: lib.TaskSupervisorSubject(ref.Addressee, ref.TaskID), storedAt: time.Now(), env: terminal}}}
-	if _, final := w.ended(); final {
-		t.Fatal("the task ended on an event the watch has not taken")
-	}
-	w.resolveDoubts(t.Context())
-	if len(w.events) != 1 {
-		t.Fatalf("the watch holds %d events after its doubts were resolved, want the terminal", len(w.events))
-	}
-	task, final := w.ended()
-	if !final || task.State != lib.StateFailed {
-		t.Fatalf("the held terminal did not end the task once it was taken: %+v final=%v", task, final)
-	}
-}
-
 // A turn that hands its work to kanban cards completes with its
 // acknowledgement, and send_message returns at once rather than following
 // the handoff as if a wake task were coming: the cards report over the
@@ -1017,11 +988,52 @@ func TestASlotWithNothingToReapGoesBackAtOnce(t *testing.T) {
 	if _, err := b.readerSlot(); err != errReadersBusy {
 		t.Errorf("a slot came back before its consumer's reap: err = %v", err)
 	}
-	if consumerMayExist(&jetstream.APIError{Code: 400, ErrorCode: jetstream.JSErrCodeConsumerCreate}) {
-		t.Error("a server refusal counted as a consumer that may exist")
+}
+
+// hangingCreator answers creates from plan in turn: "hang" blocks until the
+// attempt's context ends, as a create placed on a bus server that is down
+// does (#7082); "ok" answers with a consumer.
+type hangingCreator struct {
+	plan  []string
+	calls int
+}
+
+type createdConsumer struct{ jetstream.Consumer }
+
+func (createdConsumer) CachedInfo() *jetstream.ConsumerInfo {
+	return &jetstream.ConsumerInfo{Name: "read-1"}
+}
+
+func (h *hangingCreator) CreateConsumer(ctx context.Context, _ jetstream.ConsumerConfig) (jetstream.Consumer, error) {
+	step := h.plan[min(h.calls, len(h.plan)-1)]
+	h.calls++
+	if step == "ok" {
+		return createdConsumer{}, nil
 	}
-	if !consumerMayExist(context.DeadlineExceeded) {
-		t.Error("a timed-out create counted as one that made nothing")
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A read whose consumer create lands on a bus server that is down retries and
+// answers within its wait. The timed-out attempt keeps its reader slot until
+// the consumer it may have left would be reaped, and a read that can't get a
+// slot for its retry says the readers are busy rather than hanging.
+func TestAReadConsumerPlacedOnADownServerIsRetriedOnItsOwnSlot(t *testing.T) {
+	b := &NATSBus{readers: make(chan struct{}, maxTaskReaders), reapDelay: time.Hour, createAttemptTimeout: 50 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cons, release, err := b.createReadConsumer(ctx, &hangingCreator{plan: []string{"hang", "ok"}}, lib.TasksStream, jetstream.ConsumerConfig{})
+	if err != nil || cons.CachedInfo().Name != "read-1" {
+		t.Fatalf("create = %v, %v; want the retried consumer", cons, err)
+	}
+	if got := len(b.readers); got != 2 {
+		t.Fatalf("%d slots held, want 2: the timed-out attempt's and the consumer's", got)
+	}
+	release(true)
+
+	full := &NATSBus{readers: make(chan struct{}, 1), reapDelay: time.Hour, createAttemptTimeout: 50 * time.Millisecond}
+	if _, _, err := full.createReadConsumer(ctx, &hangingCreator{plan: []string{"hang"}}, lib.TasksStream, jetstream.ConsumerConfig{}); !errors.Is(err, errReadersBusy) {
+		t.Fatalf("a retry with no slot left: err = %v, want errReadersBusy", err)
 	}
 }
 

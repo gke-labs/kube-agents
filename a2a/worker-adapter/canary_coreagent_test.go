@@ -336,6 +336,13 @@ func TestTheCoreAgentHarnessIsolationCanary(t *testing.T) {
 		if err := ProtectProcess(); err != nil {
 			t.Fatal(err)
 		}
+		// The control leg of a repeated run (-count, the under-load
+		// script) needs the adapter dumpable again.
+		t.Cleanup(func() {
+			if err := unprotectProcess(); err != nil {
+				t.Errorf("making the test process dumpable again: %v", err)
+			}
+		})
 		l := runCanaryLeg(t, bin, true)
 		common(t, l)
 		if l.plantAlive {

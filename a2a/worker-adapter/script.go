@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -435,7 +436,7 @@ func statSession(stat string) (sid int, live, ok bool) {
 // after the script exits, so nothing it started outlives it (see the
 // comment at the top of this file for what the kill reaches).
 func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptResult {
-	runCtx, cancel := context.WithTimeout(ctx, sr.timeout)
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, sr.path) // #nosec G204 -- an allowlisted, resolved and ownership-checked path; no shell, no arguments
 	cmd.Env = sr.env
@@ -446,6 +447,7 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	// process group id are both its pid.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	killAll := func() error {
+		_ = cmd.Process.Kill()
 		groupErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		killSession(procRoot, cmd.Process.Pid)
 		if adapterPID() == containerInitPID {
@@ -464,9 +466,20 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 
 	var res scriptResult
 	if err := cmd.Start(); err != nil {
-		res.startErr = err
+		res.exitCode = -1
+		if ctx.Err() != nil {
+			res.stopped = true
+		} else {
+			res.startErr = err
+		}
 		return res
 	}
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(sr.timeout, func() {
+		timedOut.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
 	// The watcher ends before res is read, so an abandon it took is
 	// always seen; one it didn't take stays on the channel for the
 	// adapter's own check.
@@ -488,6 +501,7 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 		}
 	}()
 	err := cmd.Wait()
+	timer.Stop()
 	_ = killAll()
 	if adapterPID() == containerInitPID {
 		// Only now, with the script itself reaped by Wait: as init the
@@ -507,7 +521,7 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	case res.abandoned, res.canceled:
 	case ctx.Err() != nil:
 		res.stopped = true
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded) && !exitedOnItsOwn:
+	case timedOut.Load() && !exitedOnItsOwn:
 		res.timedOut = true
 	}
 	var exitErr *exec.ExitError

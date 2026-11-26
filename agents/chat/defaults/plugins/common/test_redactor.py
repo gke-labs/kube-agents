@@ -399,6 +399,50 @@ class TestRedactText(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(AuditRedactor.redact_text(text), expected)
 
+    def test_a_url_password_printed_inside_json_is_masked(self):
+        # JSON escapes, whole, may sit in the user and the password: Go writes
+        # `&`, `<` and `>` as \u0026, \u003c and \u003e, and every encoder a
+        # quote or a backslash as \" or \\. A scheme right after an escape
+        # starts there, so the escape's letters don't count toward its cap.
+        for text, expected in (
+            (
+                r'{"DATABASE_URL": "postgres://admin:synth\u0026Example\"Pw@db:5432/orders"}',
+                r'{"DATABASE_URL": "postgres://admin:[REDACTED_SECRET]@db:5432/orders"}',
+            ),
+            (
+                r'"url": "amqp://svc\u003cx\u003e:Synth\\Example@mq/vhost"',
+                r'"url": "amqp://svc\u003cx\u003e:[REDACTED_SECRET]@mq/vhost"',
+            ),
+            # A dotted host: decoded, the line after the `\"` would read as an
+            # email address, so the password is masked before decoding.
+            (
+                r'{"DATABASE_URL": "postgres://admin:synth\u0026Example\"Pw@db.shop.svc.cluster.local:5432/o"}',
+                r'{"DATABASE_URL": "postgres://admin:[REDACTED_SECRET]@db.shop.svc.cluster.local:5432/o"}',
+            ),
+            (
+                r'"a": "x\u0026' + "s" * 30 + r'://u:SynthExamplePw@h"',
+                r'"a": "x\u0026' + "s" * 30 + r'://u:[REDACTED_SECRET]@h"',
+            ),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(AuditRedactor.redact_text(text), expected)
+
+    def test_an_escaped_url_match_stops_at_a_line_and_a_closing_quote(self):
+        # Escaped JSON: a `host:port` URL with no path must not run across an
+        # escaped line break, or across a closing quote and a key's colon, to
+        # a later `@`. That would mask the key the credential rule needs and
+        # leave what follows the `@` in the clear.
+        line_break = r'{"data": {"app.env": "UPSTREAM=http://payments:8443\nDB_PASSWORD=p@ssword_synth_tail\n"}}'
+        out = AuditRedactor.redact_text(line_break)
+        self.assertNotIn("ssword_synth_tail", out)
+        self.assertIn("http://payments:8443", out)
+        contact = r'{"data": {"app.env": "UPSTREAM=http://payments:8443\nCONTACT=alice@example.com\n"}}'
+        self.assertNotIn("@example.com", AuditRedactor.redact_text(contact))
+        compact = r'"{\"https://gcr.io\":\"alice@example.com\"}"'
+        out = AuditRedactor.redact_text(compact)
+        self.assertNotIn("@example.com", out)
+        self.assertIsInstance(json.loads(json.loads(out)), dict, "the inner JSON stays valid")
+
     def test_urls_without_a_password_are_untouched(self):
         for text in (
             "http://example.com:8080/path?a=b",

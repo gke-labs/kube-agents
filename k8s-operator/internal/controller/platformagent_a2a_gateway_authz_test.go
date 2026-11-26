@@ -181,6 +181,25 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	it.Stop()
 
+	// lib.lastBySubject: the stored-time read the busy count and the empty
+	// read make on a profile task's five-token supervisor subject (#5301),
+	// a plain ephemeral pull consumer delivering that subject's last message,
+	// under a client-generated name, never deleted.
+	last, err := js.CreateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
+		FilterSubject:     supervisorSubject,
+		DeliverPolicy:     jetstream.DeliverLastPerSubjectPolicy,
+		AckPolicy:         jetstream.AckNonePolicy,
+		InactiveThreshold: 5 * time.Second,
+		MemoryStorage:     true,
+		Replicas:          1,
+	})
+	allowed("CONSUMER.CREATE TASKS ephemeral last-per-subject, supervisor (lib.lastBySubject)", err)
+	lastMsg, err := last.Next(jetstream.FetchMaxWait(5 * time.Second))
+	allowed("CONSUMER.MSG.NEXT TASKS ephemeral last-per-subject (lib.lastBySubject)", err)
+	if meta, err := lastMsg.Metadata(); err != nil || meta.Timestamp.IsZero() {
+		t.Errorf("the stored-time read's metadata: %+v, %v", meta, err)
+	}
+
 	// The direct-get route a2a/gateway/live_test.go takes to find a task by
 	// subject filter, which is the same API subject with a wildcard in the
 	// subject token. Raw, because it is a raw request there too.
