@@ -777,15 +777,15 @@ in the presubmit or nightly files
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
 indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
-comment, and the validator rejects a case path inside one. The one case that does not go
-in a roster file is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
+comment, and the validator rejects a case path inside one. A case that waits outside
+every lane is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
 entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture. The
 pull request that lands the fixture leaves it there, because merging puts nothing on a
 cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
 request moves it to the nightly file, citing a reconcile report that visited every pool
 project and a scan that reads the role healthy on all of them. A parked case of the
 Validated Capabilities suite returns by its `suite:` line instead, with its `suite_part:`
-line for a section other than 1: a suite case is never in the nightly file.
+line for a section other than 1: a suite case is never in a roster file.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly
