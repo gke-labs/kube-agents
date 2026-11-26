@@ -3269,7 +3269,9 @@ press is (`isChatTypedStop`), so a line never keeps a live button beside a poste
 
 An answer the relay marked for feedback carries its rating controls on the same card
 (`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
-`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. A post the agent made on
+its own (an alert, kept through the triage that edits it, or a report) carries them under the
+id the notifier marked it with, and a press on one is recorded under that id. 👍 is an `Action.Submit`
 like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
 alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
 the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
@@ -3292,7 +3294,8 @@ the plan with a status mark per item and a tick or an open mark per step, or the
 bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
 the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
 carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
-line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn, and the adapter has no `PostNotifyMessage`, so an unkeyed home post stays text. A
+line's Stop button and the rating controls. A row's Retry and Drop are not drawn. A home post
+goes through `PostNotifyMessage`, laid out the same way. A
 layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
 (`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
 `ErrTextOnly` as before. The shared cases lay out as the golden files in
