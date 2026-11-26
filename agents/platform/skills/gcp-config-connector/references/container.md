@@ -147,8 +147,9 @@ Persistent Disk `pd-*` rejected on `n4`/`c4`, `pd-standard` on `c3`, Hyperdisk
 boot disks on `n2`/`n2d`, Local SSD settings unsupported on `n4` or requiring
 `*-lssd` shapes on `c3`/`c4`, disabled Shielded VM / Secure Boot / vTPM,
 Confidential VM technology mismatches, or GKE version floors) before authoring
-the replacement YAML, and never copy rejected `nodeConfig` settings into the
-new pool.
+the replacement YAML. When the validator reports `VERDICT: INCOMPATIBLE` (or
+`VERDICT: ERROR`), report the findings and stop without generating YAML, and
+never copy rejected `nodeConfig` settings into the new pool.
 
 ## ContainerCluster
 

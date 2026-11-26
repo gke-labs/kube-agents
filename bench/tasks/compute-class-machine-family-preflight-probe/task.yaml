@@ -71,6 +71,10 @@ verification_spec:
       after_result_pattern: "(?!)"
       required_runs:
         - script: machine_family_preflight.py
+          word_patterns:
+            - "^--node-pool-json(=.*)?$"
+            - "^--target-family(=n4)?$"
+            - "^(--target-family=)?n4$"
   - name: the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers
     role: objective
     mode: assert
@@ -85,6 +89,8 @@ verification_spec:
         - "hyperdisk-balanced"
       forbidden_phrases:
         - "VERDICT: COMPATIBLE"
+      forbidden_patterns:
+        - 'kind:\s*(ComputeClass|NodePool|ContainerNodePool)'
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic

@@ -45,7 +45,9 @@ decides.
   Hyperdisk boot disks on `n2`/`n2d`, Local SSD settings unsupported on `n4` or
   requiring `*-lssd` shapes on `c3`/`c4`, disabled Shielded VM / Secure Boot /
   vTPM, Confidential VM incompatibilities, or GKE version floors) before writing
-  HCL, and never copy rejected `node_config` fields into the target pool.
+  HCL. When the validator reports `VERDICT: INCOMPATIBLE` (or `VERDICT: ERROR`),
+  report the findings and stop without generating HCL, and never copy rejected
+  `node_config` fields into the target pool.
 
 ### `describe` to arguments
 

@@ -1165,13 +1165,21 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         )
         self.assertEqual(code_cluster_and_wrapper, preflight.EXIT_READ_ERROR)
 
+        live_calls: list[list[str]] = []
+
+        def unexpected_live_runner(argv: list[str]) -> tuple[int, str, str]:
+            live_calls.append(argv)
+            return 1, "", "unexpected live call"
+
         code_live_and_wrapper, _ = preflight.run_preflight(
             cluster_name="live-cluster",
             location="us-central1",
             node_pool_json_sources=[json.dumps(wrapper_b)],
             target_specs=["n4"],
+            run=unexpected_live_runner,
         )
         self.assertEqual(code_live_and_wrapper, preflight.EXIT_READ_ERROR)
+        self.assertEqual(live_calls, [])
 
     def test_cvm_pool_with_local_ssd_targeting_c3_reports_combined_conflict(self):
         """Confidential VM on c3 rejects localNvmeSsdBlockConfig while allowing c3-standard-*-lssd with ephemeralStorageLocalSsdConfig."""
@@ -1361,6 +1369,65 @@ class MachineFamilyPreflightTests(unittest.TestCase):
         self.assertEqual(code_dup, preflight.EXIT_OK)
         self.assertEqual(report_dup["target_families"], ["n4"])
         self.assertEqual(len(report_dup["results"]), 1)
+
+    def test_duplicate_pool_names_with_node_pool_filter_evaluates_all_matching_pools(self):
+        """Filtering by --node-pool keeps every matching pool definition rather than overwriting earlier ones."""
+        bad_pool = {
+            "name": "shared-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n1-standard-4",
+                "diskType": "pd-ssd",
+            },
+        }
+        good_pool = {
+            "name": "shared-pool",
+            "version": "1.35.3-gke.1290000",
+            "config": {
+                "machineType": "n2-standard-4",
+                "diskType": "hyperdisk-balanced",
+            },
+        }
+        code_offline, report_offline = preflight.run_preflight(
+            node_pool_json_sources=[json.dumps(bad_pool), json.dumps(good_pool)],
+            node_pool_names=["shared-pool"],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_offline, preflight.EXIT_INCOMPATIBLE)
+        self.assertFalse(report_offline["compatible"])
+        self.assertEqual(len(report_offline["results"]), 2)
+        self.assertFalse(report_offline["results"][0]["compatible"])
+        self.assertTrue(report_offline["results"][1]["compatible"])
+
+        cluster_with_dup_pools = {
+            "name": "dup-cluster",
+            "currentMasterVersion": "1.35.3-gke.1290000",
+            "nodePools": [bad_pool, good_pool],
+        }
+        code_cluster, report_cluster = preflight.run_preflight(
+            cluster_json_source=json.dumps(cluster_with_dup_pools),
+            node_pool_names=["shared-pool"],
+            target_specs=["n4"],
+        )
+        self.assertEqual(code_cluster, preflight.EXIT_INCOMPATIBLE)
+        self.assertEqual(len(report_cluster["results"]), 2)
+
+    def test_multiple_stdin_json_sources_fail_closed_with_explicit_error(self):
+        """Passing '-' (stdin) more than once across --cluster-json and --node-pool-json fails closed with a dedicated stdin error."""
+        for cluster_src, pool_srcs in (
+            ("-", ["-"]),
+            ("", ["-", "-"]),
+        ):
+            with self.subTest(cluster_src=cluster_src, pool_srcs=pool_srcs):
+                code, report = preflight.run_preflight(
+                    cluster_json_source=cluster_src,
+                    node_pool_json_sources=pool_srcs,
+                    target_specs=["n4"],
+                )
+                self.assertEqual(code, preflight.EXIT_READ_ERROR)
+                self.assertFalse(report["compatible"])
+                self.assertEqual(len(report["errors"]), 1)
+                self.assertIn("stdin ('-') can only be used once", report["errors"][0]["message"])
 
 
 if __name__ == "__main__":

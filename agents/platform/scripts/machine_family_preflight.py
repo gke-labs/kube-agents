@@ -2168,7 +2168,24 @@ def run_preflight(
             normalized_targets.extend(parsed_entries)
     normalized_targets = list(dict.fromkeys(normalized_targets))
 
-    if cluster_json_source:
+    stdin_usage_count = 0
+    if cluster_json_source and cluster_json_source.strip() == STDIN_MARKER:
+        stdin_usage_count += 1
+    for pool_source in node_pool_json_sources or []:
+        if (pool_source or "").strip() == STDIN_MARKER:
+            stdin_usage_count += 1
+    if stdin_usage_count > 1:
+        errors.append(
+            {
+                "target": "cli",
+                "message": (
+                    f"stdin ({STDIN_MARKER!r}) can only be used once across "
+                    "--cluster-json and --node-pool-json (fail-closed)"
+                ),
+            }
+        )
+
+    if cluster_json_source and stdin_usage_count <= 1:
         loaded_cluster, err = _load_json_input(cluster_json_source, "--cluster-json")
         if err:
             errors.append({"target": "--cluster-json", "message": err})
@@ -2187,7 +2204,7 @@ def run_preflight(
     )
     wrapper_cluster_count = 0
 
-    for pool_source in node_pool_json_sources or []:
+    for pool_source in (node_pool_json_sources or []) if stdin_usage_count <= 1 else []:
         loaded_pool, err = _load_json_input(pool_source, "--node-pool-json")
         if err:
             errors.append({"target": f"--node-pool-json ({pool_source})", "message": err})
@@ -2249,7 +2266,7 @@ def run_preflight(
                 }
             )
 
-    if not cluster_json_source:
+    if not cluster_json_source and not errors:
         if cluster_name and location:
             if cluster_doc is None:
                 raw_live_cluster, err = _describe_cluster_live(
@@ -2295,14 +2312,14 @@ def run_preflight(
             else []
         )
         if requested_names:
-            by_name = {
-                _extract_pool_name(p): p
-                for p in cluster_pools
-                if _extract_pool_name(p)
-            }
             for req_name in requested_names:
-                if req_name in by_name:
-                    pools_to_check.append(by_name[req_name])
+                matches = [
+                    p
+                    for p in cluster_pools
+                    if _extract_pool_name(p) == req_name
+                ]
+                if matches:
+                    pools_to_check.extend(matches)
                 elif not cluster_json_source and cluster_name and location:
                     described_pool, pool_err = _describe_node_pool_live(
                         resolved_project,
@@ -2333,15 +2350,15 @@ def run_preflight(
         else:
             pools_to_check.extend(cluster_pools)
     elif pools_to_check and requested_names:
-        by_name = {
-            _extract_pool_name(p): p
-            for p in pools_to_check
-            if _extract_pool_name(p)
-        }
         filtered: list[dict[str, Any]] = []
         for req_name in requested_names:
-            if req_name in by_name:
-                filtered.append(by_name[req_name])
+            matches = [
+                p
+                for p in pools_to_check
+                if _extract_pool_name(p) == req_name
+            ]
+            if matches:
+                filtered.extend(matches)
             else:
                 errors.append(
                     {
