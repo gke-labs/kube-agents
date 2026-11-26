@@ -36,10 +36,13 @@ import (
 // All of these calls arrive under the session lock, so they only record
 // and return; one loop per conversation posts a `typing` activity through
 // the broker's passthrough every teamsTypingInterval until the ask is no
-// longer open or teamsTypingMax has passed since the ask opened or the
-// newest task started or ended. A new message the adapter posts there
-// holds the indicator off for one interval too (quietTyping). A post that fails is dropped: the indicator is a
-// courtesy, and the next tick tries again.
+// longer open or teamsTypingMax has passed since the ask opened, the newest
+// task started or ended, or the adapter last posted or edited a message
+// there (typingShown): a card that keeps showing its work keeps the
+// indicator, as Slack keeps a plan until it has gone without a new note. A
+// new message the adapter posts there holds the indicator off for one
+// interval too (quietTyping). A post that fails is dropped: the indicator
+// is a courtesy, and the next tick tries again.
 const (
 	teamsTypingActivityType = "typing"
 	// teamsTypingInterval is how often the indicator is posted again, and
@@ -52,7 +55,9 @@ const (
 	// teamsTypingMax ends the loop for an ask that never settles, so no
 	// indicator outlives its work by more than this, and forgets a task
 	// that never reports an end. It runs from the newest task's start or
-	// end, so a second ask late in the first's ten minutes gets its own.
+	// end, so a second ask late in the first's ten minutes gets its own,
+	// and from the adapter's last post or edit in the conversation, so
+	// work that goes on showing itself is not cut off at ten minutes.
 	teamsTypingMax = 10 * time.Minute
 )
 
@@ -125,6 +130,20 @@ func (a *TeamsAdapter) quietTyping(conversation string) {
 	if t := a.typing[conversation]; t != nil {
 		t.quietUntil = time.Now().Add(a.typingInterval)
 	}
+}
+
+// typingShown restarts the bound of conversation's open ask, and its loop
+// if the bound had ended it. The adapter calls it after each message it
+// posts or edits there: the work is still showing itself.
+func (a *TeamsAdapter) typingShown(conversation string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t := a.typing[conversation]
+	if t == nil || !t.open {
+		return
+	}
+	t.deadline = time.Now().Add(a.typingMax)
+	a.startTypingLocked(conversation, t)
 }
 
 // MarkChanged wants the indicator while the conversation's ask is open and

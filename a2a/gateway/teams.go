@@ -716,6 +716,7 @@ func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any)
 	if err != nil {
 		return "", err
 	}
+	a.typingShown(conversation)
 	var body struct {
 		Response struct {
 			ID string `json:"id"`
@@ -849,8 +850,11 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	if err != nil {
 		return fmt.Errorf("teams: encoding activity update: %w", err)
 	}
-	_, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload)
-	return err
+	if _, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload); err != nil {
+		return err
+	}
+	a.typingShown(conversation)
+	return nil
 }
 
 // PostMessage and EditMessage post text only: a chat message falls back to

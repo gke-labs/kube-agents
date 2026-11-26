@@ -172,6 +172,36 @@ func TestTeamsStopsTypingAtItsBound(t *testing.T) {
 	a.MarkChanged(conversation, "", "")
 }
 
+// Work that goes on showing itself keeps the indicator past the bound: each
+// message the adapter posts or edits in the conversation restarts it, and
+// one that lands after the bound ended the loop starts it again.
+func TestTeamsKeepsTypingWhileTheWorkShowsItself(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	const line = "1700000000001"
+	a.MarkChanged(conversation, "investigate", "")
+	for i := 0; i < 4; i++ {
+		time.Sleep(12 * testTeamsTypingInterval)
+		if err := a.Edit(conversation, line, "still working"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 48 intervals in, more than twice the bound from the ask's opening.
+	before := teamsTypingCount(relay)
+	waitFor(t, "the indicator kept posting past the bound", func() bool { return teamsTypingCount(relay) >= before+2 })
+	settled := teamsTypingSettled(t, relay)
+	if _, err := a.Post(conversation, "a new note"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a message after the bound turned the indicator on again", func() bool { return teamsTypingCount(relay) > settled })
+	a.MarkChanged(conversation, "", "")
+	if err := a.Edit(conversation, line, "done"); err != nil {
+		t.Fatal(err)
+	}
+	teamsTypingQuiet(t, relay, "after an edit with no ask open")
+}
+
 // A task that never reports its end is forgotten at the bound, so it does
 // not keep the indicator off for the asks that follow.
 func TestTeamsForgetsATaskThatNeverEnds(t *testing.T) {
