@@ -592,17 +592,19 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
                 )
 
     def test_the_step_5_parser_sees_every_mode_gate(self):
-        # Guards the parser the floor below rests on: the sandbox waits are
-        # guarded only on the object existing, so every mode pays them; the
-        # gateway gate reaches the operator mode through restarted_agent; and
-        # confirm_agent_image.sh is a harness/full wait only.
+        # Guards the parser the floor below rests on: the sandbox and broker
+        # waits are scoped to harness and full modes (operator mode leaves
+        # workload images on the previous revision); the gateway gate reaches
+        # operator mode only through restarted_agent; and confirm_agent_image.sh
+        # is a harness/full wait only.
         waits = _post_upgrade_waits_by_mode()
         sandbox_gate = _sandbox_rollout_timeout_seconds()
         gateway_gate = _rollout_gate_seconds(_UPGRADE_SCRIPT, "platform-agent-gateway")
         for mode in sorted(_UPGRADE_MODES):
             with self.subTest(mode=mode):
                 seconds = [s for _, s in waits[mode]]
-                self.assertEqual(seconds.count(sandbox_gate), 2, f"{mode}: {waits[mode]}")
+                expected_sandbox_waits = 0 if mode == "operator" else 2
+                self.assertEqual(seconds.count(sandbox_gate), expected_sandbox_waits, f"{mode}: {waits[mode]}")
                 self.assertIn(gateway_gate, seconds, f"{mode}: {waits[mode]}")
         labels = {mode: [label for label, _ in waits[mode]] for mode in _UPGRADE_MODES}
         self.assertNotIn("confirm_agent_image.sh", labels["operator"])
@@ -615,14 +617,14 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
         # So each such shape has to raise naming the line, not pass quietly.
         original = _UPGRADE_SCRIPT.read_text()
         gateway = 'kubectl rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=1500s'
-        statefulset_guard = '  if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET"'
+        statefulset_guard = '    if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET"'
         operator_guard = '  if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then'
         self.assertIn(gateway, original)
         self.assertIn(statefulset_guard, original)
         self.assertIn(operator_guard, original)
         mutations = {
-            "elif": (statefulset_guard, '  elif [ "$PARAM_UPGRADE_MODE" = "operator" ]; then\n    true\n  fi\n' + statefulset_guard),
-            "else": ('    kubectl rollout status "statefulset/', '    true\n  else\n    kubectl rollout status "statefulset/'),
+            "elif": (statefulset_guard, '    elif [ "$PARAM_UPGRADE_MODE" = "operator" ]; then\n      true\n    fi\n' + statefulset_guard),
+            "else": ('      kubectl rollout status "statefulset/', '      true\n    else\n      kubectl rollout status "statefulset/'),
             "case": ('  print_success "Upgraded deployments verified healthy."', '  case "$PARAM_UPGRADE_MODE" in operator) true;; esac\n  print_success "Upgraded deployments verified healthy."'),
             "negated mode test": (operator_guard, '  if ! [ "$PARAM_UPGRADE_MODE" = "operator" ]; then'),
             "!= mode test": (operator_guard, '  if [ "$PARAM_UPGRADE_MODE" != "harness" ]; then'),
@@ -631,7 +633,7 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
             "unquoted target": (gateway, gateway.replace('"deployment/${PLATFORM_AGENT_DEPLOYMENT}"', "deployment/${PLATFORM_AGENT_DEPLOYMENT}")),
             "--timeout space form": (gateway, gateway.replace("--timeout=1500s", "--timeout 1500s")),
             "no --timeout at all": (gateway, gateway.replace(" --timeout=1500s", "")),
-            "a guard that waits": (statefulset_guard, '  if ! kubectl rollout status "deployment/x" -n "$target_namespace" --timeout=300s; then\n    true\n  fi\n' + statefulset_guard),
+            "a guard that waits": (statefulset_guard, '    if ! kubectl rollout status "deployment/x" -n "$target_namespace" --timeout=300s; then\n      true\n    fi\n' + statefulset_guard),
             "kubectl wait": (gateway, gateway + '\n    kubectl wait --for=condition=Ready pod -l app=x -n "$target_namespace" --timeout=600s'),
         }
         with tempfile.TemporaryDirectory() as tmp:
