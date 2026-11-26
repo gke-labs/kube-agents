@@ -2259,7 +2259,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": ["computeclass/reserved-ccc"],
-      "fixture": "ComputeClass reserved-ccc, whose first rule asks for one named reservation (affinity Specific, seeded-absent-reservation) that no reservation of the project carries, and whose second rule is a machine type that GKE can create (e2-standard-4). Node pool auto-creation is on, and no workload selects the class, so GKE makes no node pool for it. The class has one NoSchedule taint (dedicated=reserved-ccc), so the obtainability audit does not count it as a general-purpose class, and a pod with no toleration for the taint gets no node from it. GKE accepts the class and marks it misconfigured: the condition CrdMisconfigured is True with the reason ReservationNotFound, and the stockout audit files that status as dangling-compute-class. The stack plants no reservation; the missing one is the defect",
+      "fixture": "ComputeClass reserved-ccc, whose first rule asks for one named reservation (affinity Specific, seeded-absent-reservation) that no reservation of the project carries, and whose second rule is a machine type that GKE can create (e2-standard-4). Node pool auto-creation is on, and no workload selects the class, so GKE makes no node pool for it. The class has one NoSchedule taint (dedicated=reserved-ccc), so the obtainability audit does not count it as a general-purpose class, and a pod with no toleration for the taint gets no node from it. GKE accepts the class and marks it misconfigured: the condition CrdMisconfigured is True with the reason ReservationNotFound, and the stockout audit files that status as reservation-mismatch-risk. The stack plants no reservation; the missing one is the defect",
       "state": [
         {
           "subject": "computeclass/reserved-ccc",
@@ -2294,7 +2294,7 @@
           "path": "spec.nodePoolAutoCreation.enabled",
           "op": "eq",
           "value": true,
-          "why": "with auto-creation on, GKE reports the missing reservation; with it off, GKE reports that no node pool matches, says nothing about the reservation, and the audit files a second finding"
+          "why": "with auto-creation on, GKE reports the missing reservation; with it off, GKE reports that no node pool matches, says nothing about the reservation, and the audit files two more findings"
         },
         {
           "subject": "computeclass/reserved-ccc",
