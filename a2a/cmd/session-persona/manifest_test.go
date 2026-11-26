@@ -172,3 +172,31 @@ func sealTree(t *testing.T, root string) {
 		}
 	})
 }
+
+// The two layouts carry the same skills, by name: the core-agent tree has
+// no skill the Claude Code tree lacks, and lacks none it has.
+func TestBothLayoutsShipTheSameSkills(t *testing.T) {
+	coreAgent := filepath.Join(t.TempDir(), "core-agent-session")
+	if err := buildLayout(repoSkillsDir, repoPersona, coreAgent, coreAgentLayout); err != nil {
+		t.Fatal(err)
+	}
+	names := func(dir string) []string {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, e := range entries {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+	claude := names(filepath.Join(buildShipped(t), skillsDir))
+	core := names(filepath.Join(coreAgent, coreagent.SkillsDir))
+	if strings.Join(claude, ",") != strings.Join(core, ",") {
+		t.Errorf("skills differ: Claude Code %v, core-agent %v", claude, core)
+	}
+	if len(core) != len(sessionSkills) {
+		t.Errorf("%d skills shipped, want the %d sessionSkills names", len(core), len(sessionSkills))
+	}
+}
