@@ -152,12 +152,16 @@ PROVIDER_FIELDS_KEY = "provider_specific_fields"
 PROVIDER_THOUGHT_SIGNATURE_KEY = "thought_signature"
 TOOL_CALLS_KEY = "tool_calls"
 RESPONSES_INPUT_KEY = "input"
+# A Responses input part whose base64 payload sits at the part's own file_data.
+RESPONSES_INPUT_FILE_TYPE = "input_file"
 # A media type the refusal message may name: anything else is reported in
 # fixed words, since the value comes from the request.
 NAMEABLE_MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}$")
 GEMINI_INLINE_KEYS = ("inlineData", "inline_data")
 GEMINI_MIME_KEYS = ("mimeType", "mime_type")
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
+# A function response may carry parts of its own (an image a tool returned).
+GEMINI_FUNCTION_RESPONSE_KEYS = ("functionResponse", "function_response")
 # The binary media types a payload may claim, each with how its bytes start:
 # a payload is kept only if its bytes start that way, so text labelled as one
 # of these is refused rather than kept unread. A type not listed here is
@@ -361,6 +365,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
         filed = part.get(FILE_KEY)
         if isinstance(filed, dict) and isinstance(filed.get(FILE_DATA_KEY), str):
             self._keep_data_url(filed[FILE_DATA_KEY], path + (FILE_KEY, FILE_DATA_KEY), kept)
+        # A Responses input_file holds its data URL on the part itself;
+        # input_image's image_url string is the data-URL case above.
+        if kind == RESPONSES_INPUT_FILE_TYPE and isinstance(part.get(FILE_DATA_KEY), str):
+            self._keep_data_url(part[FILE_DATA_KEY], path + (FILE_DATA_KEY,), kept)
         # A tool result's own content list holds parts too (an image a tool
         # returned); one level only, since deeper is the tool's own output.
         if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get(CONTENT_KEY), list):
@@ -399,11 +407,22 @@ class KubeAgentsRedactionCallback(CustomLogger):
             for key in GEMINI_OPAQUE_PART_KEYS:
                 if model and isinstance(part.get(key), str):
                     kept.append((path + (i, key), part[key]))
-            for key in GEMINI_INLINE_KEYS:
-                inline = part.get(key)
-                if isinstance(inline, dict):
-                    mime = next((inline[k] for k in GEMINI_MIME_KEYS if k in inline), None)
-                    self._keep_payload(mime, inline.get(DATA_KEY), path + (i, key, DATA_KEY), kept)
+            self._carve_gemini_inline(part, path + (i,), kept)
+            # A function response's own parts: one level, inline payloads only
+            # (a thought signature is never the tool's).
+            for key in GEMINI_FUNCTION_RESPONSE_KEYS:
+                response = part.get(key)
+                inner = response.get(PARTS_KEY) if isinstance(response, dict) else None
+                for j, sub in enumerate(inner if isinstance(inner, list) else []):
+                    if isinstance(sub, dict):
+                        self._carve_gemini_inline(sub, path + (i, key, PARTS_KEY, j), kept)
+
+    def _carve_gemini_inline(self, part: Dict[str, Any], path: tuple, kept: List[tuple]) -> None:
+        for key in GEMINI_INLINE_KEYS:
+            inline = part.get(key)
+            if isinstance(inline, dict):
+                mime = next((inline[k] for k in GEMINI_MIME_KEYS if k in inline), None)
+                self._keep_payload(mime, inline.get(DATA_KEY), path + (key, DATA_KEY), kept)
 
     def _carve(self, data: Dict[str, Any]) -> List[tuple]:
         """The fields to leave as they are, as (path from the request, value)."""
@@ -419,6 +438,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
         for i, item in enumerate(data.get(RESPONSES_INPUT_KEY) if isinstance(data.get(RESPONSES_INPUT_KEY), list) else []):
             if isinstance(item, dict) and item.get(TYPE_KEY) == REASONING_ITEM_TYPE and isinstance(item.get(ENCRYPTED_CONTENT_KEY), str):
                 kept.append(((RESPONSES_INPUT_KEY, i, ENCRYPTED_CONTENT_KEY), item[ENCRYPTED_CONTENT_KEY]))
+            # An input item's content parts (input_image, input_file): carved as
+            # chat parts are, never as an assistant's (no thinking exemption).
+            if isinstance(item, dict) and isinstance(item.get(CONTENT_KEY), list):
+                self._carve_parts(item[CONTENT_KEY], (RESPONSES_INPUT_KEY, i, CONTENT_KEY), kept)
         if isinstance(data.get(SYSTEM_KEY), list):
             self._carve_parts(data[SYSTEM_KEY], (SYSTEM_KEY,), kept)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):

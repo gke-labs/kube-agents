@@ -520,6 +520,47 @@ class TestCallback(unittest.TestCase):
             with self.assertRaises(HTTPException, msg=mime):
                 self._run(text, "agenerate_content")
 
+    def test_a_gemini_function_responses_own_parts_keep_binary_and_refuse_text(self) -> None:
+        for key in ("functionResponse", "function_response"):
+            for inline in ("inlineData", "inline_data"):
+                with self.subTest(key=key, inline=inline):
+                    binary = {"contents": [{"role": "user", "parts": [{key: {
+                        "name": "shot", "response": {"note": "pod 10.0.0.9"},
+                        "parts": [{inline: {"mimeType": "image/png", "data": _RULE_MATCHING_BASE64}}],
+                    }}]}]}
+                    out = self._run(binary, "agenerate_content")["contents"][0]["parts"][0][key]
+                    self.assertEqual(out["parts"][0][inline]["data"], _RULE_MATCHING_BASE64)
+                    # The response object beside the parts is still walked.
+                    self.assertNotIn("10.0.0.9", json.dumps(out["response"]))
+                    text = {"contents": [{"role": "user", "parts": [{key: {
+                        "name": "shot", "parts": [{inline: {"mimeType": "text/plain", "data": "b24gcHJvZC1ldS0x"}}],
+                    }}]}]}
+                    with self.assertRaises(HTTPException) as refused:
+                        self._run(text, "agenerate_content")
+                    self.assertEqual(refused.exception.status_code, 400)
+
+    def test_responses_input_parts_keep_binary_payloads_and_refuse_text_ones(self) -> None:
+        image_url = "data:image/png;base64," + _RULE_MATCHING_BASE64
+        file_data = "data:application/pdf;base64," + _PDF_BASE64
+        data = {"input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "on prod-eu-1"},
+            {"type": "input_image", "image_url": image_url},
+            {"type": "input_file", "filename": "r.pdf", "file_data": file_data},
+        ]}]}
+        text, image, filed = self._run(data, "aresponses")["input"][0]["content"]
+        self.assertNotIn("prod-eu-1", text["text"])
+        self.assertEqual(image["image_url"], image_url)
+        self.assertEqual(filed["file_data"], file_data)
+        refused_parts = [
+            {"type": "input_image", "image_url": "data:image/png;base64,b24gcHJvZC1ldS0x"},
+            {"type": "input_file", "file_data": "data:application/json;base64,e30="},
+            {"type": "input_file", "file_data": "b24gcHJvZC1ldS0x"},
+        ]
+        for part in refused_parts:
+            with self.subTest(part=part), self.assertRaises(HTTPException) as refused:
+                self._run({"input": [{"type": "message", "role": "user", "content": [part]}]}, "aresponses")
+            self.assertEqual(refused.exception.status_code, 400)
+
     def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
         # Forms providers accept: the URL-safe alphabet, no padding, and the
         # common image/jpg label. Each is kept byte for byte as it came.
