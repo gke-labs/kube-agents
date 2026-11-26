@@ -426,6 +426,10 @@ type adapter struct {
 	// harnessSession is the session id the harness reported at init, which
 	// the next task in a reused pod resumes (Config.SessionReuse).
 	harnessSession string
+	// turnCommitted is true once a turn of this task completed on a process
+	// that a later one replaced (respawn): the driver holds that turn in its
+	// conversation, whatever the task's own end.
+	turnCommitted bool
 	// harnessModel is the model the harness named at init, carried onto
 	// each turn's usage part.
 	harnessModel string
@@ -720,6 +724,10 @@ type turnOutcome struct {
 	// harnessSession is the session id the harness reported at init, or ""
 	// when it reported none (it never started, or died before saying).
 	harnessSession string
+	// turnCommitted is true when a turn of the task completed before a later
+	// process of the same task ran (adapter.turnCommitted), so the
+	// conversation holds it even if the task itself didn't complete.
+	turnCommitted bool
 	// costSeen and costKnown are the running total as this run last read
 	// it, handed to the next run's turnPlan.
 	costSeen  float64
@@ -1004,7 +1012,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	}
 
 	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh, respawn)
-	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
+	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession, turnCommitted: a.turnCommitted}
 }
 
 // respawner is a one-turn-per-process driver's next process: prepare runs
@@ -1321,6 +1329,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							// steer starts the next process once it is gone.
 							nextPrompt, held = held[0], held[1:]
 							pendingTurns++
+							a.turnCommitted = true
 							log.Info("turn ended; the held steer starts the next harness process", "task", a.taskID)
 							proc.closeStdin()
 							continue

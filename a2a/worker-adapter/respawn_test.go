@@ -87,6 +87,8 @@ func useRespawnScope(t *testing.T) *respawnScope {
 // user line, says "S conv-t", marks turn one started, waits for
 // $dir/steer-sent, then acts on $dir/mode:
 //   - error: a failed result;
+//   - seconderror: a failed result on the second run only, a clean one
+//     otherwise;
 //   - linger: a clean result, then it stays up until SIGTERM, on which it
 //     exits 0, so a stop after its result leaves a clean exit;
 //   - refusal: a clean result, then a write refusal record and a tool
@@ -109,11 +111,13 @@ n=$(( $(cat "$dir/runs" 2>/dev/null || echo 0) + 1 )); echo $n > "$dir/runs"
 echo "$*" > "$dir/argv.$n"
 mode=$(cat "$dir/mode" 2>/dev/null)
 read first || exit 1
+printf '%%s' "$first" > "$dir/prompt.$n"
 echo 'S conv-t'
 echo 1 > "$dir/turn1.$n"
 i=0; while [ ! -e "$dir/steer-sent" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done
 case "$mode" in
 error) echo 'ERR boom it failed' ;;
+seconderror) if [ $n = 2 ]; then echo 'ERR boom it failed'; else echo "OK turn $n"; fi ;;
 linger) echo "OK turn $n"; echo 1 > "$dir/result"; trap 'exit 0' TERM; while :; do sleep 0.05; done ;;
 refusal) echo "OK turn $n"; sleep 0.3; printf '%%s\n' %q >> "$%s"; echo 'R' ;;
 writer)
@@ -481,4 +485,55 @@ exit 0
 	if env2.Session != "ca-1" || len(env2.History) != 1 || !strings.Contains(string(env2.History[0]), `"turn":1`) {
 		t.Errorf("process 2 resumes session %q with history %s; want ca-1 with turn one's event", env2.Session, env2.History)
 	}
+}
+
+// completedOnlyToy is the toy driver for a harness whose conversation keeps
+// a turn only when it completes, as core-agent's does.
+type completedOnlyToy struct{ *toyDriver }
+
+func (completedOnlyToy) KeepsOnlyCompletedTurns() {}
+
+// TestATurnThatCompletedBeforeAFailedRespawnIsKept: on a reused pod whose
+// conversation keeps only completed turns, a task whose first turn
+// completes and whose steered turn, on a fresh process, fails still added
+// that first turn. The next task resumes the conversation, without the
+// primer, rather than starting fresh as if the task added nothing.
+func TestATurnThatCompletedBeforeAFailedRespawnIsKept(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "mode"), []byte("seconderror"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const session = "chat-respawn-kept"
+	url := startServer(t)
+	c := testClient(t, url)
+	origin := submit(t, c, session, "task-kept-1", "first question")
+	cfg := reuseConfig(url, "task-kept-1", session, toyRespawnStub(t, dir, "task-kept-1"))
+	cfg.Primer = "EARLIER-TURNS"
+	_, d := useToyRespawn(t, &cfg)
+	cfg.Driver = completedOnlyToy{d}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+
+	waitFileFor(t, filepath.Join(dir, "turn1.1"), 10*time.Second)
+	publishSteerFor(t, c, origin, session, respawnSteer)
+	time.Sleep(300 * time.Millisecond) // the steer reaches the adapter and is held
+	if err := os.WriteFile(filepath.Join(dir, "steer-sent"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, session, "task-kept-1", lib.StateFailed)
+	if p := readRunIfAny(dir, "prompt", 2); !strings.Contains(p, respawnSteer) {
+		t.Fatalf("run 2's prompt %q is not the steer", p)
+	}
+
+	submit(t, c, session, "task-kept-2", "second question")
+	waitState(t, c, session, "task-kept-2", lib.StateCompleted)
+	if a := readRunIfAny(dir, "argv", 3); !strings.Contains(a, "--again conv-t") {
+		t.Errorf("run 3 argv %q does not resume conv-t, which holds the completed first turn", a)
+	}
+	if p := readRunIfAny(dir, "prompt", 3); strings.Contains(p, "EARLIER-TURNS") {
+		t.Errorf("run 3 read the primer again, starting over: %q", p)
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
 }
