@@ -26,29 +26,29 @@ The first deliverable is the start of a triage. Later steps add the result in a 
 Facts of `main` on the date above. The later sections refer to these and do not repeat the numbers.
 
 - **The trigger ingress is built.** An unattended source asks the gateway for a task on `a2a.trigger.<source>.submit` (`a2a/gateway/trigger_ingress.go`, [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §3). The auth callout binds the source to a ServiceAccount. An event source names its trigger `<source>/<kind>` and its run `<source>/<kind>/<token>`. The gateway admits only the kinds in `A2A_TRIGGER_EVENT_KINDS`, which is empty by default. Each kind has a cap of 30 runs an hour; the cap is one value in the gateway's code, and no install setting changes it. The run has the `unattended` tier.
-- **An event key is answered for as long as its record lives.** Each event run has its own conversation, `trigger:<key>`. A submission with a key that already ran gets the task of that run, in each state of the run, also a failed one. The record lives until it had no activity for the session time to live (`A2A_SESSION_TTL`, 7 days by default).
+- **An event key is answered for as long as its record lives.** Each event run has its own conversation, `trigger:<key>`. A submission with a key that already ran gets the task of that run, in each state of the run, also a failed one. The record lives until it had no activity for the session time to live (`A2A_SESSION_TTL`, 7 days by default). A repeat is not activity. So the record is gone 7 days after the last activity of the run, and the next notice with that key starts a second run.
 - **No event source uses the ingress.** Its code says "No event source has that grant yet". The Kubernetes event watcher and the drift detector still post to the Session KV server (`agents/platform/scripts/session_kv_server.py`, `/sessions` and `/sessions/{id}/inject`) with one shared bearer token. Their move to the ingress is #6572, and its plan moves the triage gating with each watcher.
 - **The incident state lives in the Session KV server.** The fold of related events on a workload, the follow-up into the alert's thread, the note when an incident goes quiet, the severity gate, the daily quotas and the ledger are there, and they have the shape of Kubernetes events. The ingress has no follow-up path and no resolution path.
 - **A trigger run's result does not reach chat.** The gateway records the delivery that a submission asks for and delivers nothing. The result is on the task and on its conversation. [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §4 is the design of that delivery.
-- **The `cluster` profile does not take unattended work.** Its default `allowedTiers` is `read`, and an unattended task needs a Job runner for its profile. [`scheduling-on-profiles.md`](scheduling-on-profiles.md) plans the addition in its order of work.
+- **The `cluster` profile does not take unattended work.** The profile is off by default. Its default `allowedTiers` is `read`, and an unattended task needs a Job runner for its profile. [`scheduling-on-profiles.md`](scheduling-on-profiles.md) plans the addition in its order of work.
 - **One public endpoint exists, and the admin owns its Ingress.** The Teams inbound receiver is its own pod behind an Ingress that the install admin makes ([`spec-chatops-gateway.md`](spec-chatops-gateway.md)). Each other way in needs no public endpoint: Slack uses Socket Mode, and Google Chat and the drift detector pull from Pub/Sub subscriptions (`terraform/modules/chat-pubsub`, `terraform/modules/drift-pubsub`). The gateway's inject door and the A2A door are dev and eval doors with a ClusterIP Service.
 
 ## 3. The senders
 
 What each sender gives, from the vendor's public documentation on the date above. The names are the vendor's own.
 
-| Sender                                                             | One request holds                          | The name of one episode (`dedupeId`)                                 | State                                                                                                                     | Authentication that the sender can add                                                                                                     | Where the alert is                                        |
-| ------------------------------------------------------------------ | ------------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
-| Alertmanager, `webhook_config` (payload `version` 4)               | One group, with a list `alerts[]`          | `groupKey` and the earliest `startsAt` of the firing alerts          | `status`: `firing`, `resolved`                                                                                            | Basic authentication, an `Authorization` header, a client certificate. No signature of the body.                                           | `groupLabels`, `commonLabels`                             |
-| Grafana Alerting, webhook contact point                            | One group, with a list `alerts[]`          | `orgId`, `groupKey` and the earliest `startsAt` of the firing alerts | `status`: `firing`, `resolved`                                                                                            | Basic authentication, an `Authorization` header, a client certificate, and an HMAC-SHA256 signature of the body with an optional timestamp | `groupLabels`, `commonLabels`                             |
-| Cloud Monitoring, webhook channel and Pub/Sub channel (schema 1.2) | One incident                               | `incident.incident_id`                                               | `incident.state`: `open`, `closed`                                                                                        | Webhook: basic authentication, or a token in the query string. Pub/Sub: the IAM policy of the topic.                                       | `incident.resource.labels`, `incident.scoping_project_id` |
-| Datadog monitor, Webhooks integration                              | One notice for each group of a multi alert | `$ALERT_CYCLE_KEY`                                                   | `$ALERT_TRANSITION`: `Triggered`, `Warn`, `No Data`, their `Re-` forms and `Renotify` are firing; `Recovered` is resolved | Basic authentication in the URL, a custom header, an OAuth 2.0 bearer token. No signature of the body.                                     | `$TAGS`, `$HOSTNAME`                                      |
-| Generic JSON                                                       | One alert                                  | The sender sets `dedupeId`                                           | The sender sets `state`                                                                                                   | A custom header or an `Authorization` header                                                                                               | The sender sets `target`                                  |
+| Sender                                                             | One request holds                          | The name of one episode (`dedupeId`)                              | State                                                                                                                     | Authentication that the sender can add                                                                                                     | Where the alert is                                        |
+| ------------------------------------------------------------------ | ------------------------------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| Alertmanager, `webhook_config` (payload `version` 4)               | One group, with a list `alerts[]`          | `groupKey`, with the episode that the receiver counts             | `status`: `firing`, `resolved`                                                                                            | Basic authentication, an `Authorization` header, a client certificate. No signature of the body.                                           | `groupLabels`, `commonLabels`                             |
+| Grafana Alerting, webhook contact point                            | One group, with a list `alerts[]`          | `orgId` and `groupKey`, with the episode that the receiver counts | `status`: `firing`, `resolved`                                                                                            | Basic authentication, an `Authorization` header, a client certificate, and an HMAC-SHA256 signature of the body with an optional timestamp | `groupLabels`, `commonLabels`                             |
+| Cloud Monitoring, webhook channel and Pub/Sub channel (schema 1.2) | One incident                               | `incident.incident_id`                                            | `incident.state`: `open`, `closed`                                                                                        | Webhook: basic authentication, or a token in the query string. Pub/Sub: the IAM policy of the topic.                                       | `incident.resource.labels`, `incident.scoping_project_id` |
+| Datadog monitor, Webhooks integration                              | One notice for each group of a multi alert | `$ALERT_CYCLE_KEY`                                                | `$ALERT_TRANSITION`: `Triggered`, `Warn`, `No Data`, their `Re-` forms and `Renotify` are firing; `Recovered` is resolved | Basic authentication in the URL, a custom header, an OAuth 2.0 bearer token. No signature of the body.                                     | `$TAGS`, `$HOSTNAME`                                      |
+| Generic JSON                                                       | One alert                                  | The sender sets `dedupeId`                                        | The sender sets `state`                                                                                                   | A custom header or an `Authorization` header                                                                                               | The sender sets `target`                                  |
 
 Notes for the adapters:
 
-- **Lists.** An Alertmanager or Grafana notice is one group. The group is the incident, so the notice gives one record. `target` comes from the labels that each alert of the group has (`commonLabels`). The sender can cut the list (`max_alerts`, "Max Alerts") and then gives the count of the cut alerts in `truncatedAlerts`; a cut list can change the earliest `startsAt`, so a sender of this design sets no cut.
-- **A group key is not an episode.** `groupKey` names the group for as long as the route exists. The key of a run must name one episode ([§5](#5-the-incident-key)), so the adapter adds the earliest `startsAt` of the group's firing alerts. `incident.incident_id` and `$ALERT_CYCLE_KEY` name one episode by themselves.
+- **Lists.** An Alertmanager or Grafana notice is one group. The group is the incident, so the notice gives one record. `target` comes from the labels that each alert of the group has (`commonLabels`). The sender can cut the list (`max_alerts`, "Max Alerts") and then gives the count of the cut alerts in `truncatedAlerts`.
+- **A group key is not an episode.** `groupKey` names the group for as long as the route exists, and a group can resolve and fire again. The key of a run must name one episode ([§5](#5-the-incident-key)), so the receiver counts the episodes of a group: an episode starts with the first firing notice of the group and ends with the notice whose `status` is `resolved`. `incident.incident_id` and `$ALERT_CYCLE_KEY` name one episode by themselves.
 - **The Datadog payload is a template that the user writes.** The adapter ships one template that names the variables above, with `$ALERT_ID` as `source.monitorId`, `$INCIDENT_PUBLIC_ID` as `source.incidentId` and `$LINK` as `source.url`. The install admin pastes it into the webhook's payload field.
 - **The generic format is the normalized alert of [§4](#4-the-normalized-alert).** A sender that can write its own payload sends that form directly.
 - **Resolved notices.** Alertmanager and Grafana send them by default. Datadog sends a recovery notice. Cloud Monitoring sends a closed notice for a policy made with the API, and for a policy made in the console only when the user turns it on.
@@ -103,28 +103,35 @@ Each adapter turns one notice into one record of this form.
 
 The acceptance rule of #2002 is that a burst of related alerts gives one session. The failure to avoid is on record: with a key for each pod, a fault on N pods became N incidents ([`agent-harness-bottlenecks.md`](agent-harness-bottlenecks.md)). The key has two levels.
 
-1. **One episode of the sender's incident.** The run's key is `alert-webhook/<sender>/<token>`. The token is a digest of the sender name and `dedupeId`. Each repeat notice of the same episode has the same key, and the gateway answers it with the task of the first run. The receiver keeps no state for this level. An incident that resolves and fires again is a new episode with a new key.
+1. **One episode of the sender's incident.** The run's key is `alert-webhook/<sender>/<token>`. The token is a digest of the sender name and `dedupeId`. Each repeat notice of the same episode has the same key, and the gateway answers it with the task of the first run. An incident that resolves and fires again is a new episode with a new key.
 2. **The workload fold.** Two incidents of one sender system can name the same workload, for example one alert for each pod of a Deployment. The receiver keeps, in memory, the workloads for which it started a run in the last `foldSeconds` (default 3600, the default of the Session KV server's workload fold). A firing notice whose `target` names such a workload (cluster, namespace, workload) starts no new run. A `target` with a pod and no workload folds on the pod name without its generated suffix. A critical alert folds only into a run that a critical alert started, as on the event path.
 
 A sender can also group at its own side (the `group_by` of an Alertmanager route, the group of a Datadog multi alert). The fold is for the senders that do not.
 
-Limits that the reader must know:
+### The state of the receiver
+
+The receiver keeps four things in memory, each for one sender: the open episode of each group (for Alertmanager and Grafana), the keys that it submitted with their tasks, the fold memory, and the queue of [§6](#limits-and-answers). The reply of the ingress holds a task and does not say if the run is new, so the receiver needs its own list of keys to tell a start from a repeat.
+
+The receiver runs as one replica, and a restart empties the state. The cost has a bound: the next notice of an open group starts one more triage, a workload can get one more triage, and the held notices are lost. A durable state is a later option ([§13](#13-open-questions)).
+
+### Limits
 
 - **The fold can hide a second fault.** A different fault on the same workload in the fold time starts no run, and before step 3 nothing adds it to the first triage. `foldSeconds: 0` turns the fold off for a sender.
-- **The fold is in memory.** The receiver runs as one replica. A restart empties the memory, and the cost is one more triage for a workload.
-- **A long episode gets one triage.** While the record of the key lives, a repeat notice starts no second run. That is the purpose for a burst, and it also holds for an incident that stays open for days.
+- **A long episode gets one triage in about a week.** While the record of the key lives ([§2](#2-what-exists-today)), a repeat notice starts no second run. After the record is gone, the next repeat notice starts one.
 - **A failed first run stays the answer.** A repeat notice of an episode whose run failed gets that failed task. The receiver cannot ask for the state of a run, because the status subject of the ingress serves schedules only.
-- **A group that rolls over gets a new key.** When the earliest alert of an Alertmanager or Grafana group resolves and others still fire, `dedupeId` changes. The fold takes the new key when the group names one workload.
-- **A storm is bounded by the cap** of the sender's kind. [§6](#limits-and-answers) says what happens to a notice over the cap.
+- **The sender's grouping decides what one incident is.** While one alert of an Alertmanager or Grafana group fires, the group is one episode. Each later alert of that group, also a critical one, starts no run. A route that groups by the workload's labels keeps one incident to one workload.
+- **A storm has two bounds:** the cap of the sender's kind, and `maxRunsPerDay` of the sender (default 100), which the receiver counts. The cap of a kind alone is 720 runs a day, and a failover of the gateway fills its bucket again. [§6](#limits-and-answers) says what happens to a notice over a bound.
 - **An optional settle time** (`settleSeconds`, default 0) holds a firing notice before the submit, and a resolved notice for the same key in that time cancels it. The default is 0 because the sender's own rule already has a pending time. Set it for a sender that flaps.
 
 ## 6. The door
 
 ### Where the receiver runs
 
-The receiver is its own Deployment, `alert-receiver`, with its own ServiceAccount, as the Teams inbound receiver is its own pod. Its one grant on the bus is the trigger source `alert-webhook`: publish on `a2a.trigger.alert-webhook.submit`, and subscribe on its own reply subjects. It gets no grant on the status and stop subjects, which serve schedules only. It holds no cloud credential and no cluster credential. It parses text from outside the install, so it does not share a pod with the credential proxy, which holds credentials, or with the gateway, which mints grants.
+The receiver is its own Deployment, `alert-receiver`, with its own ServiceAccount, as the Teams inbound receiver is its own pod. Its one grant on the bus is the trigger source `alert-webhook`: publish on `a2a.trigger.alert-webhook.submit`, and subscribe on its own reply subjects. It gets no grant on the status and stop subjects, which serve schedules only. It holds no cluster credential. It holds no cloud credential in step 1; the Pub/Sub inlet adds one grant, subscriber on its subscription, as the drift detector has. It parses text from outside the install, so it does not share a pod with the credential proxy, which holds credentials, or with the gateway, which mints grants.
 
-The operator renders the receiver, its identity map entry, and one `A2A_TRIGGER_EVENT_KINDS` entry `alert-webhook/<sender>` for each configured sender. So each sender has its own rate cap, and one loud sender cannot use the budget of another. The operator also mounts the install's resolved scope (the `<name>-resolved-scope` ConfigMap) into the receiver, read-only, so that the receiver can find the project and the location of a cluster name.
+The operator renders the receiver, its identity map entry, and one `A2A_TRIGGER_EVENT_KINDS` entry `alert-webhook/<sender>` for each configured sender. So each sender has its own rate cap, and one loud sender cannot use the budget of another.
+
+Each sender's configuration lists the clusters that the sender can name, each with its project and its location. The receiver does not read the install's resolved scope for them: the operator fills the `<name>-resolved-scope` ConfigMap only for a scope with a folder, an organization, a Shared VPC host or a metrics scope.
 
 A proposal for the configuration, beside the other inbound integrations of the `PlatformAgent`:
 
@@ -134,7 +141,7 @@ spec:
     alertWebhook:
       enabled: true
       senders:
-        - name: datadog-prod # a DNS-1123 label: the request path and the trigger kind
+        - name: datadog-prod # a DNS-1123 label of 40 characters at most: the request path and the trigger kind
           format: datadog # alertmanager | grafana | cloud-monitoring | datadog | generic
           auth:
             method: header # bearer | basic | header | query | hmac | pubsub
@@ -147,7 +154,9 @@ spec:
               namespace: kube_namespace,
               workload: kube_deployment,
             }
-          clusters: [] # optional: the clusters of the scope that this sender can name; empty is each one
+          clusters: # the clusters that this sender can name
+            - { project: my-project, location: us-central1, name: prod-1 }
+          maxRunsPerDay: 100
           foldSeconds: 3600
           settleSeconds: 0
 ```
@@ -192,18 +201,21 @@ A sender with a shared secret in a header has the strength of a bearer token: a 
 
 The receiver owns the retry of a notice that it accepted. A sender's own retry rule is not a base for it: only Datadog documents one, and Cloud Monitoring and Datadog do not repeat a notice by default.
 
-| Case                                                                                                                    | Answer                      | What the receiver does                                                                                     |
-| ----------------------------------------------------------------------------------------------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| The secret is wrong, or the sender is unknown                                                                           | `401`, no detail            | Counts it                                                                                                  |
-| The body is over the proposed limit of 256 KiB                                                                          | `413`                       | Counts it                                                                                                  |
-| The request passed authentication and cannot be parsed                                                                  | `400`                       | Counts it for that sender                                                                                  |
-| A run started; a repeat of a run; a fold                                                                                | `202`, the body names which | Nothing more                                                                                               |
-| The alert names no cluster, a cluster outside the scope or the sender's list, or a name that fits more than one cluster | `202`                       | Records it. No run.                                                                                        |
-| The gateway refuses with `rate_limited` or `unavailable`, or does not answer                                            | `202`                       | Holds the notice in a bounded queue and submits it again, with a longer wait each time, for up to one hour |
-| The queue is full                                                                                                       | `503`                       | Counts it. A sender that retries tries again.                                                              |
-| The gateway refuses with `invalid`, `profile_unknown` or `tier_not_allowed`                                             | `202`                       | Records the reason. These three mean a fault of the install, and a retry cannot help.                      |
+| Case                                                                                 | Answer                      | What the receiver does                                                                                                                                                                                                                               |
+| ------------------------------------------------------------------------------------ | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The secret is wrong, or the sender is unknown                                        | `401`, no detail            | Counts it                                                                                                                                                                                                                                            |
+| The body is over the proposed limit of 256 KiB                                       | `413`                       | Counts it                                                                                                                                                                                                                                            |
+| The request passed authentication and cannot be parsed                               | `400`                       | Counts it for that sender                                                                                                                                                                                                                            |
+| A run started; a repeat of a run; a fold                                             | `202`, the body names which | Nothing more                                                                                                                                                                                                                                         |
+| A resolved notice                                                                    | `202`                       | Cancels a notice that the queue holds for the same key. Ends the episode of a group. Else it records the notice.                                                                                                                                     |
+| The alert names no cluster, or a cluster that is not in the sender's `clusters` list | `202`                       | Records it. No run.                                                                                                                                                                                                                                  |
+| The sender's count for the day is at `maxRunsPerDay`                                 | `202`                       | Records it. No run.                                                                                                                                                                                                                                  |
+| The gateway refuses with `rate_limited` or `unavailable`, or does not answer         | `202`                       | Holds the notice in the sender's queue and submits it again, with a longer wait each time, for up to one hour. Then it drops the notice and counts it.                                                                                               |
+| The gateway refuses with `invalid`, `profile_unknown` or `tier_not_allowed`          | `202`                       | Holds the notice and submits it again for up to 10 minutes: a new leader of the gateway, or a scope that is not current, gives these answers for a short time. Then it drops the notice and records the reason, because the fault is in the install. |
+| The sender's queue is full                                                           | `503`                       | Counts it. A sender that retries tries again.                                                                                                                                                                                                        |
 
 - A notice that the settle time holds is in the same queue.
+- Each sender has its own queue, with a bound on its length.
 - The queue is in memory. A restart of the receiver loses the held notices. A sender that repeats covers the loss. For Cloud Monitoring and Datadog the admin sets a re-notify interval, or that incident gets no triage.
 - The receiver answers in less than 10 seconds, which is inside the 15 seconds that Datadog gives a request.
 - For a Datadog sender, the admin can allow only the addresses that Datadog publishes for its webhooks (`webhooks.prefixes_ipv4` of the site's IP ranges).
@@ -213,9 +225,9 @@ The receiver owns the retry of a notice that it accepted. A sender's own retry r
 For each firing notice that passes the key rules, the receiver submits one `TriggerSubmit`:
 
 - `trigger.name` is `alert-webhook/<sender>`, `trigger.origin` is `builtin`, and `idempotencyKey` is `alert-webhook/<sender>/<token>`.
-- `profile` is `cluster`, with its three required parameters `project`, `location` and `cluster`. The alert gives them directly (Cloud Monitoring's resource labels), or it gives a cluster name that the receiver finds in the resolved scope. The gateway's route check then admits only a target that the install's scope admits.
+- `profile` is `cluster`, with its three required parameters `project`, `location` and `cluster`. The cluster that the alert names selects one entry of the sender's `clusters` list, and that entry gives the three values. The gateway's route check then admits only a target that the install's scope admits.
 - `prompt` is a fixed task text of the receiver, and then the normalized alert as one data block. The submission has one text field, so the alert is in the same string as the instruction ([§9](#9-security)). The namespace and the workload are in the data block, because the profile takes no other parameter.
-- `delivery.mode` is `chat`. `delivery.jobKey` is one label for each incident (the sender name and a short form of the token), because the delivery groups the posts of one job key and one day into one thread.
+- `delivery.mode` is `chat`. `delivery.jobKey` is one label for each incident (the sender name and a short form of the token), because the delivery groups the posts of one job key and one day into one thread. A job key is a label of 63 characters at most, which gives the limit of 40 characters for a sender name.
 
 The run is an `Unattended` task: it reads cluster state and logs, and it can only propose. Its result is the triage report.
 
@@ -223,17 +235,17 @@ One case is open: a cluster with a pinned profile. The `cluster` profile yields 
 
 What each step does with a notice:
 
-| Notice                     | Step 1                                                                       | Later                                               |
-| -------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------- |
-| Firing, a new key          | Starts one triage                                                            | The same                                            |
-| Firing, a repeat or a fold | No run. The answer names the task.                                           | A follow-up on the conversation of the key (step 3) |
-| Resolved                   | Cancels a start that the settle time holds. Else it is recorded and counted. | A resolution note on the same conversation (step 3) |
+| Notice                     | Step 1                                                                                                                    | Later                                               |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| Firing, a new key          | Starts one triage                                                                                                         | The same                                            |
+| Firing, a repeat or a fold | No run. The answer names the task.                                                                                        | A follow-up on the conversation of the key (step 3) |
+| Resolved                   | Cancels a notice that the queue holds for the same key, and ends the episode of a group. Else it is recorded and counted. | A resolution note on the same conversation (step 3) |
 
 ## 8. Order of the work
 
 | Step | What                                                                                                                                                       | Depends on                                                                                                                                                                                                                 |
 | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | The receiver with the HTTP inlet, the five adapters, the key rules, the identity grant and the kinds. The start of one read-only triage for each incident. | The `cluster` profile takes unattended work (`unattended` in its allowed tiers, and a Job runner), which [`scheduling-on-profiles.md`](scheduling-on-profiles.md) plans. Not the move of the watchers (#6572).             |
+| 1    | The receiver with the HTTP inlet, the five adapters, the key rules, the identity grant and the kinds. The start of one read-only triage for each incident. | The `cluster` profile is on and takes unattended work (`unattended` in its allowed tiers, and a Job runner), which [`scheduling-on-profiles.md`](scheduling-on-profiles.md) plans. Not the move of the watchers (#6572).   |
 | 2    | The result in a chat thread                                                                                                                                | The gateway's delivery of a trigger run's result ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §4), which is not on `main`. Before it, the result is on the task and on its `trigger:<key>` conversation only. |
 | 3    | A follow-up notice and the resolution go to the conversation of the key                                                                                    | A way for a source to reach the conversation of a key that already ran. The ingress has none. The plan of #6572 moves the gating with each source, so the follow-up path is a part of that work.                           |
 | 4    | The Pub/Sub inlet                                                                                                                                          | Nothing in the bus. A Terraform module in the form of `drift-pubsub`.                                                                                                                                                      |
@@ -256,27 +268,30 @@ A door that takes text from outside the install gets an identity of its own and 
 The alert text is untrusted data for a read-only run. A party that can make an alert (a person with a monitor, a log line in an alert message, a workload that sets a label) can put text in front of the model. Two controls stop a text that asks the agent to act, and they do not depend on the model:
 
 1. **The authority of the run.** The grant of the run has the tier `unattended`. That tier reads cluster state and logs and can only propose. Each child of the run has the same tier or `read` with no trigger. A change to a cluster is refused by the credential path, whatever the model decided.
-2. **No write permit.** [`unattended-write-permit.md`](unattended-write-permit.md) proposes an opt-in that lets the run of a built-in schedule publish a proposal with no person to confirm it. An alert run is not a built-in schedule. It has no permit, and this design asks for none.
+2. **No pull request.** The ingress submits a trigger run with no change request, and a task gets a write permit only with one. [`unattended-write-permit.md`](unattended-write-permit.md) proposes an opt-in for the run of a built-in schedule. An alert run is not a built-in schedule, and this design asks for no permit.
 
-One mitigation depends on the model: the form of the task. The instruction is a fixed text of the receiver, the alert is a marked data block with limits on its size, and the adapter removes the markers that close the block. The model can still follow a text in the block. The two controls bound what follows: a wrong or misleading report, and no change.
+One mitigation depends on the model: the form of the task. The instruction is a fixed text of the receiver, the alert is a marked data block with limits on its size, and the adapter removes the markers that close the block. The model can still follow a text in the block.
+
+The two controls bound what follows. The run can write a wrong or misleading report, and a ledger entry or a notice where the tools of its profile allow one. It cannot change a cluster, and it cannot open a pull request.
 
 From step 2 the report is in a chat thread, and a person can answer it. The report is then in front of a turn that has a person's authority, in the wrapper for an untrusted report that the delivery design names. So an alert text can reach an interactive turn through the report. The person who answers reads the report first; this design adds no control there.
 
 ### A party with a sender's secret, or with the power to write alert content
 
-Such a party can start read-only triages, up to the sender's cap. It can also stop a triage of a real incident:
+Such a party can start read-only triages, up to the sender's cap and its count for the day. It can also stop a triage of a real incident:
 
 - It sends a notice with the `dedupeId` of a real episode first, where it can predict that name. The real notice then gets the task of the false one.
 - It sends a false `target` for a workload, and the fold takes the real alert.
-- It uses the sender's cap. Real notices wait in the queue for up to one hour.
+- It uses the sender's cap or its count for the day. Real notices wait in the queue for up to one hour and are then dropped, or they start no run for the rest of the day.
 - It sends a resolved notice against a notice that the settle time holds.
 
-Each of these needs the secret of that sender, or the power to write labels in the sender's system. The effect is a missed or late triage for that sender, never a change, and the alert still reaches people on the sender's own channels. A second sender is not affected: it has its own secret, its own key space and its own cap. The counters of [§11](#11-what-a-person-sees-when-it-breaks) show a rise of folds and of notices over the cap.
+Each of these needs the secret of that sender, or the power to write labels in the sender's system. The effect is a missed or late triage for that sender, never a change, and the alert still reaches people on the sender's own channels. A second sender is not affected: it has its own secret, its own key space, its own cap, its own queue and its own fold memory. The counters of [§11](#11-what-a-person-sees-when-it-breaks) show a rise of folds and of notices over a bound.
 
 ### Other points
 
-- **Replay.** A method with no signature cannot stop a replay of a captured request. A replay of a firing notice has the key of its episode and starts no run. A replay of a resolved notice matters only against a held notice, and from step 3.
-- **Which cluster.** The alert can name a cluster, and a party that writes a label can aim a triage at each cluster that the sender can name. The install's scope and the sender's `clusters` list bound that. An alert cannot widen the scope.
+- **Replay.** A method with no signature cannot stop a replay of a captured request. A replay of a firing notice has the key of its episode. It starts no run while the record of that key lives ([§2](#2-what-exists-today)), and after that it starts one run, inside the two bounds. A replay of a resolved notice matters only against a held notice, and from step 3.
+- **Which cluster.** The alert can name a cluster, and a party that writes a label can aim a triage at each cluster that the sender can name. The sender's `clusters` list and the install's scope bound that. An alert cannot widen the scope.
+- **Disclosure.** An alert text can ask the run to put what it reads into its report: the state and the logs of each cluster that the sender can name. From step 2 the report is in a chat thread, and the members of that channel see it. The sender's `clusters` list is the bound, so a sender gets only the clusters whose alerts it sends.
 - **The secrets.** Only the receiver mounts them.
 - **The cap.** The cap of the kinds is one value in the gateway's code. Step 1 adds an install setting for it if an install needs another value.
 
@@ -291,8 +306,8 @@ The design for external MCP servers (#1989) is the read path to a vendor. This d
 
 ## 11. What a person sees when it breaks
 
-- **The sender's operator** sees the HTTP answer: `401` for a wrong secret, `413` for a body over the limit, `503` when the queue is full.
-- **The install admin** sees one counter for each sender and outcome (started, repeat, fold, held, over the cap, no cluster, refused, not parsed, not authenticated) and a log line for each notice that started no run, with the reason. A sender whose notices all fail to parse after a vendor changed its payload shows as a rising count for that sender.
+- **The sender's operator** sees the HTTP answer: `401` for a wrong secret, `400` for a body that the adapter cannot parse, `413` for a body over the limit, `503` when the sender's queue is full.
+- **The install admin** sees one counter for each sender and outcome (started, repeat, fold, resolved, held, dropped after the hold, queue full, over the day's count, no cluster, refused, not parsed, over size, not authenticated) and a log line for each notice that started no run, with the reason. A sender whose notices all fail to parse after a vendor changed its payload shows as a rising count for that sender.
 - **A person in chat** sees nothing in step 1. From step 2 the triage report is in a thread for the incident.
 
 ## 12. Fixture and eval
@@ -307,3 +322,4 @@ The design for external MCP servers (#1989) is the read path to a vendor. This d
 2. How does an event source name a cluster that has a pinned profile?
 3. Does the first user's alert path go from the monitor to chat only, or can the monitor also call a webhook? The answer decides which of the two ways of §6 that user needs.
 4. Is one triage for an episode right when the first run failed, or when the incident stays open for days? A second run needs a way to see the state of the first one.
+5. Does the receiver need a durable state, so that a restart starts no extra triage and loses no held notice?
