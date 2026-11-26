@@ -7,20 +7,27 @@ Inspects live GKE Standard clusters and non-system workloads to report:
      - Extended release channel (`releaseChannel.channel == "EXTENDED"`)
      - control-plane version below `1.33.1-gke.1107000` for Autopilot-mode ComputeClasses
      - notes clusters already running GKE Autopilot (`autopilot.enabled == true`)
-  2. Per-workload Autopilot admission blockers outside system namespaces:
-     - `privileged` containers or initContainers (`securityContext.privileged: true`)
-     - `hostNetwork: true`
-     - `hostPID: true`
-     - `hostIPC: true`
-     - `hostPath` volumes
-     - custom pod `securityContext.sysctls`
-     - user `DaemonSet` workloads
-     - active standalone `Pod` objects without `ownerReferences`
+  2. Per-workload Autopilot admission blockers and advisories outside system namespaces:
+     - Blockers:
+       - `privileged` containers or initContainers (`securityContext.privileged: true`)
+       - `hostNetwork: true`
+       - `hostPID: true`
+       - `hostIPC: true`
+       - `hostPath` volumes outside `/var/log` or mounted writable (Autopilot admits
+         read-only `hostPath` mounts under `/var/log`)
+       - unsafe pod `securityContext.sysctls` (Autopilot admits the Kubernetes safe
+         sysctl set)
+     - Advisories (do not change workload status from `ready` to `blocked`):
+       - user `DaemonSet` workloads
+       - active standalone `Pod` objects without `ownerReferences`
   3. Per-workload Autopilot resource-request impact:
-     - 250m CPU rounding (`max(250, ceil(cpu_millis / 250) * 250)`)
-     - `requests == limits` burst impact (flagging Burstable/BestEffort workloads where
-       limits exceed requests or are unset, and noting Guaranteed workloads where
-       `requests == limits`)
+     - Target-dependent CPU floor/rounding: 50m general-purpose minimum with no 250m step
+       rounding on bursting targets (Autopilot `1.30.2-gke.1394000+` on cgroupv2 and
+       Standard clusters using Autopilot-mode ComputeClasses), or 250m floor and 250m step
+       rounding (`max(250, ceil(cpu_millis / 250) * 250)`) on non-bursting targets
+     - Target-dependent QoS burst impact (preserving `Burstable` burst on bursting targets,
+       flagging `requests == limits` burst removal on non-bursting targets, and flagging
+       `BestEffort` default request assignment)
 
 Workload reads page one resource kind at a time through `collector_run.paged_dump`
 (`kubectl get --raw` at `limit=500`) using a per-target kubeconfig under
@@ -35,6 +42,7 @@ import functools
 import json
 import math
 import os
+import posixpath
 import re
 import sys
 import tempfile
@@ -98,6 +106,7 @@ LOCATION_FLAG = "--location"
 KUBECONFIG_FLAG = "--kubeconfig"
 KUBECONFIG_DIR_FLAG = "--kubeconfig-dir"
 OUTPUT_FLAG = "--output"
+NON_BURSTING_FLAG = "--non-bursting"
 QUIET_FLAG = "--quiet"
 UTF8_ENCODING = "utf-8"
 CONTAINER_KEYS = ("containers", "initContainers", "ephemeralContainers")
@@ -175,6 +184,9 @@ RELEASE_CHANNEL_EXTENDED = "EXTENDED"
 RELEASE_CHANNEL_UNSPECIFIED = "UNSPECIFIED"
 AUTOPILOT_COMPUTE_CLASS_MIN_VERSION = "1.33.1-gke.1107000"
 AUTOPILOT_COMPUTE_CLASS_MIN_VERSION_TUPLE = (1, 33, 1, 1107000)
+AUTOPILOT_BURSTING_MIN_VERSION = "1.30.2-gke.1394000"
+AUTOPILOT_BURSTING_MIN_VERSION_TUPLE = (1, 30, 2, 1394000)
+CGROUP_MODE_V1 = "CGROUP_MODE_V1"
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 
 NOTE_ALREADY_AUTOPILOT = "cluster already runs GKE Autopilot"
@@ -195,7 +207,7 @@ DETAIL_VERSION_FLOOR_FORMAT = (
     "Autopilot-mode ComputeClasses"
 )
 
-# Workload-level statuses and blocker rule identifiers.
+# Workload-level statuses, blocker rule identifiers, and advisory rule identifiers.
 WORKLOAD_STATUS_READY = "ready"
 WORKLOAD_STATUS_BLOCKED = "blocked"
 
@@ -208,7 +220,30 @@ RULE_SYSCTLS = "sysctls"
 RULE_DAEMONSET = "DaemonSet"
 RULE_STANDALONE_POD = "standalone-pod"
 
+ALLOWED_READONLY_HOSTPATH_ROOT = "/var/log"
+ALLOWED_READONLY_HOSTPATH_PREFIX = "/var/log/"
+PARENT_DIR_SEGMENT = ".."
+PATH_SEPARATOR = "/"
+
+SAFE_SYSCTLS = frozenset(
+    {
+        "kernel.shm_rmid_forced",
+        "net.ipv4.ip_local_port_range",
+        "net.ipv4.ip_local_reserved_ports",
+        "net.ipv4.ip_unprivileged_port_start",
+        "net.ipv4.ping_group_range",
+        "net.ipv4.tcp_fin_timeout",
+        "net.ipv4.tcp_keepalive_intvl",
+        "net.ipv4.tcp_keepalive_probes",
+        "net.ipv4.tcp_keepalive_time",
+        "net.ipv4.tcp_rmem",
+        "net.ipv4.tcp_syncookies",
+        "net.ipv4.tcp_wmem",
+    }
+)
+
 # CPU and memory resource constants.
+AUTOPILOT_BURSTING_MIN_CPU_MILLIS = 50
 AUTOPILOT_CPU_INCREMENT_MILLIS = 250
 MILLICORES_PER_CORE = 1000
 BINARY_SUFFIXES: dict[str, float] = {
@@ -266,6 +301,7 @@ WORKLOAD_TABLE_HEADERS = (
     "kind/name",
     "status",
     "blockers",
+    "advisories",
     "cpu (requested -> autopilot)",
     "qos / burst impact",
 )
@@ -301,6 +337,40 @@ def parse_gke_version(version: str | None) -> tuple[int, int, int, int] | None:
     return (int(major), int(minor), int(patch), int(build) if build is not None else 0)
 
 
+def _has_cgroup_v1(cluster: dict) -> bool:
+    """Return True when `cluster` or any of its `nodePools` explicitly sets `CGROUP_MODE_V1`."""
+    node_cfg = cluster.get("nodeConfig")
+    if isinstance(node_cfg, dict):
+        linux_cfg = node_cfg.get("linuxNodeConfig")
+        if isinstance(linux_cfg, dict) and linux_cfg.get("cgroupMode") == CGROUP_MODE_V1:
+            return True
+    node_pools = cluster.get("nodePools")
+    if isinstance(node_pools, list):
+        for pool in node_pools:
+            if not isinstance(pool, dict):
+                continue
+            pool_cfg = pool.get("config")
+            if isinstance(pool_cfg, dict):
+                linux_cfg = pool_cfg.get("linuxNodeConfig")
+                if (
+                    isinstance(linux_cfg, dict)
+                    and linux_cfg.get("cgroupMode") == CGROUP_MODE_V1
+                ):
+                    return True
+    return False
+
+
+def cluster_supports_bursting(cluster: dict) -> bool:
+    """Return True when `cluster` supports pod bursting (`>= 1.30.2-gke.1394000` on cgroupv2)."""
+    if _has_cgroup_v1(cluster):
+        return False
+    master_version = str(cluster.get("currentMasterVersion") or "")
+    parsed_version = parse_gke_version(master_version)
+    if parsed_version is None:
+        return False
+    return parsed_version >= AUTOPILOT_BURSTING_MIN_VERSION_TUPLE
+
+
 def evaluate_cluster(cluster: dict) -> dict:
     """Evaluate pure-function cluster-level Autopilot migration and ComputeClass rules."""
     name = str(cluster.get("name") or "")
@@ -314,12 +384,14 @@ def evaluate_cluster(cluster: dict) -> dict:
     )
     autopilot_obj = cluster.get("autopilot")
     is_autopilot = bool(isinstance(autopilot_obj, dict) and autopilot_obj.get("enabled") is True)
+    supports_bursting = cluster_supports_bursting(cluster)
 
     if is_autopilot:
         return {
             "name": name,
             "location": location,
             "autopilot": True,
+            "bursting": supports_bursting,
             "channel": channel,
             "current_master_version": master_version,
             "status": CLUSTER_STATUS_AUTOPILOT,
@@ -375,6 +447,7 @@ def evaluate_cluster(cluster: dict) -> dict:
         "name": name,
         "location": location,
         "autopilot": False,
+        "bursting": supports_bursting,
         "channel": channel,
         "current_master_version": master_version,
         "status": status,
@@ -440,9 +513,17 @@ def parse_memory_bytes(value: str | int | float | None) -> int | None:
         return None
 
 
-def round_autopilot_cpu_millis(cpu_millis: int) -> int:
-    """Compute GKE Autopilot 250m CPU request rounding: `max(250, ceil(cpu_millis / 250) * 250)`."""
+def round_autopilot_cpu_millis(cpu_millis: int, *, bursting: bool = True) -> int:
+    """Compute GKE Autopilot CPU request floor or step rounding.
+
+    On bursting targets (Autopilot >= 1.30.2-gke.1394000 on cgroupv2 and Standard
+    Autopilot-mode ComputeClasses), applies the 50m general-purpose minimum with no
+    250m step rounding (`max(50, cpu_millis)`). On non-bursting targets, applies
+    the 250m floor and 250m step rounding (`max(250, ceil(cpu_millis / 250) * 250)`).
+    """
     clamped = max(0, int(cpu_millis))
+    if bursting:
+        return max(AUTOPILOT_BURSTING_MIN_CPU_MILLIS, clamped)
     rounded = math.ceil(clamped / AUTOPILOT_CPU_INCREMENT_MILLIS) * AUTOPILOT_CPU_INCREMENT_MILLIS
     return max(AUTOPILOT_CPU_INCREMENT_MILLIS, rounded)
 
@@ -464,8 +545,8 @@ def _container_resource_dicts(container: dict) -> tuple[dict, dict]:
     )
 
 
-def evaluate_workload_resources(pod_spec: dict) -> dict:
-    """Evaluate 250m CPU rounding and `requests == limits` burst impact for a pod spec."""
+def evaluate_workload_resources(pod_spec: dict, *, bursting: bool = True) -> dict:
+    """Evaluate Autopilot CPU floor/rounding and QoS burst impact for a pod spec."""
     app_containers = _pod_containers(pod_spec, "containers")
     init_containers = _pod_containers(pod_spec, "initContainers")
     all_containers = app_containers + init_containers
@@ -502,7 +583,10 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
         max(app_requested_cpu_millis + sidecar_cpu_millis, init_peak_cpu_millis)
         + overhead_cpu_millis
     )
-    autopilot_cpu_millis = round_autopilot_cpu_millis(requested_cpu_millis)
+    autopilot_cpu_millis = round_autopilot_cpu_millis(requested_cpu_millis, bursting=bursting)
+    non_bursting_autopilot_cpu_millis = round_autopilot_cpu_millis(
+        requested_cpu_millis, bursting=False
+    )
     cpu_delta_millis = autopilot_cpu_millis - requested_cpu_millis
     cpu_rounded = cpu_delta_millis != 0
     cpu_rounding_summary = (
@@ -589,23 +673,37 @@ def evaluate_workload_resources(pod_spec: dict) -> dict:
         qos_class = QOS_BEST_EFFORT
         burst_status = BURST_STATUS_BEST_EFFORT
         burst_impacted = True
-        burst_summary = (
-            "BestEffort (requests and limits unset; Autopilot assigns default requests "
-            "and enforces requests == limits)"
-        )
+        if bursting:
+            burst_summary = (
+                "BestEffort (requests and limits unset; Autopilot assigns default requests)"
+            )
+        else:
+            burst_summary = (
+                "BestEffort (requests and limits unset; non-bursting Autopilot assigns "
+                "default requests and enforces requests == limits)"
+            )
     else:
         qos_class = QOS_BURSTABLE
         burst_status = BURST_STATUS_BURSTABLE
-        burst_impacted = True
         detail_text = DETAIL_JOIN.join(burst_details)
-        burst_summary = (
-            f"Burstable (Autopilot enforces requests == limits, removing burst above request: "
-            f"{detail_text})"
-        )
+        if bursting:
+            burst_impacted = False
+            burst_summary = (
+                f"Burstable (target supports bursting; burst above request preserved: "
+                f"{detail_text})"
+            )
+        else:
+            burst_impacted = True
+            burst_summary = (
+                f"Burstable (non-bursting Autopilot enforces requests == limits, removing "
+                f"burst above request: {detail_text})"
+            )
 
     return {
+        "bursting": bursting,
         "requested_cpu_millis": requested_cpu_millis,
         "autopilot_cpu_millis": autopilot_cpu_millis,
+        "non_bursting_autopilot_cpu_millis": non_bursting_autopilot_cpu_millis,
         "cpu_delta_millis": cpu_delta_millis,
         "cpu_rounded": cpu_rounded,
         "cpu_rounding_summary": cpu_rounding_summary,
@@ -633,6 +731,41 @@ def _pod_spec_for_item(item: dict) -> dict:
     template = spec.get("template")
     pod_spec = template.get("spec") if isinstance(template, dict) else None
     return pod_spec if isinstance(pod_spec, dict) else {}
+
+
+def _is_var_log_path(path: str) -> bool:
+    """Return True when `path` is `/var/log` or a subpath under `/var/log/` without `..` traversal."""
+    cleaned = path.strip()
+    if not cleaned.startswith(PATH_SEPARATOR):
+        return False
+    if PARENT_DIR_SEGMENT in cleaned.split(PATH_SEPARATOR):
+        return False
+    normalized = posixpath.normpath(cleaned)
+    return (
+        normalized == ALLOWED_READONLY_HOSTPATH_ROOT
+        or normalized.startswith(ALLOWED_READONLY_HOSTPATH_PREFIX)
+    )
+
+
+def _volume_mount_states(pod_spec: dict) -> tuple[set[str], set[str]]:
+    """Return `(mounted_volumes, writable_volumes)` across all container types in `pod_spec`."""
+    mounted: set[str] = set()
+    writable: set[str] = set()
+    for container_key in CONTAINER_KEYS:
+        for container in _pod_containers(pod_spec, container_key):
+            mounts = container.get("volumeMounts")
+            if not isinstance(mounts, list):
+                continue
+            for mount in mounts:
+                if not isinstance(mount, dict):
+                    continue
+                mount_name = str(mount.get("name") or "")
+                if not mount_name:
+                    continue
+                mounted.add(mount_name)
+                if mount.get("readOnly") is not True:
+                    writable.add(mount_name)
+    return mounted, writable
 
 
 def extract_workloads(items: list[dict]) -> list[dict]:
@@ -680,8 +813,8 @@ def extract_workloads(items: list[dict]) -> list[dict]:
     return selected
 
 
-def evaluate_workload(item: dict) -> dict:
-    """Evaluate Autopilot admission blockers and resource impact for one workload item."""
+def evaluate_workload(item: dict, *, bursting: bool = True) -> dict:
+    """Evaluate Autopilot admission blockers, advisories, and resource impact for one workload item."""
     kind = str(item.get("kind") or "")
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     namespace = str(metadata.get("namespace") or "")
@@ -689,6 +822,7 @@ def evaluate_workload(item: dict) -> dict:
     pod_spec = _pod_spec_for_item(item)
 
     blockers: list[dict[str, str]] = []
+    advisories: list[dict[str, str]] = []
 
     privileged_containers: list[str] = []
     for container_key in CONTAINER_KEYS:
@@ -731,6 +865,7 @@ def evaluate_workload(item: dict) -> dict:
             }
         )
 
+    mounted_volumes, writable_volumes = _volume_mount_states(pod_spec)
     raw_volumes = pod_spec.get("volumes")
     host_path_entries: list[str] = []
     if isinstance(raw_volumes, list):
@@ -741,6 +876,14 @@ def evaluate_workload(item: dict) -> dict:
             if isinstance(host_path, dict):
                 vol_name = str(volume.get("name") or UNNAMED_ITEM)
                 mount_path = str(host_path.get("path") or "")
+                if vol_name in mounted_volumes:
+                    is_read_only = vol_name not in writable_volumes
+                else:
+                    is_read_only = bool(
+                        volume.get("readOnly") is True or host_path.get("readOnly") is True
+                    )
+                if _is_var_log_path(mount_path) and is_read_only:
+                    continue
                 host_path_entries.append(
                     f"{vol_name} ({mount_path})" if mount_path else vol_name
                 )
@@ -754,25 +897,31 @@ def evaluate_workload(item: dict) -> dict:
 
     pod_sec_ctx = pod_spec.get("securityContext")
     raw_sysctls = pod_sec_ctx.get("sysctls") if isinstance(pod_sec_ctx, dict) else None
-    sysctl_names: list[str] = []
+    unsafe_sysctls: list[str] = []
     if isinstance(raw_sysctls, list):
         for entry in raw_sysctls:
             if isinstance(entry, dict):
-                sysctl_name = str(entry.get("name") or UNNAMED_ITEM)
+                raw_name = str(entry.get("name") or "").strip()
+                if raw_name in SAFE_SYSCTLS:
+                    continue
+                sysctl_name = raw_name or UNNAMED_ITEM
                 sysctl_val = entry.get("value")
-                sysctl_names.append(
+                unsafe_sysctls.append(
                     f"{sysctl_name}={sysctl_val}" if sysctl_val is not None else sysctl_name
                 )
-    if sysctl_names:
+    if unsafe_sysctls:
         blockers.append(
             {
                 "rule": RULE_SYSCTLS,
-                "detail": f"pod securityContext sets custom sysctls: {ITEM_JOIN.join(sysctl_names)}",
+                "detail": (
+                    f"pod securityContext sets unsafe sysctls: "
+                    f"{ITEM_JOIN.join(unsafe_sysctls)}"
+                ),
             }
         )
 
     if kind == KIND_DAEMONSET:
-        blockers.append(
+        advisories.append(
             {
                 "rule": RULE_DAEMONSET,
                 "detail": (
@@ -783,7 +932,7 @@ def evaluate_workload(item: dict) -> dict:
         )
 
     if kind == KIND_POD:
-        blockers.append(
+        advisories.append(
             {
                 "rule": RULE_STANDALONE_POD,
                 "detail": (
@@ -793,7 +942,7 @@ def evaluate_workload(item: dict) -> dict:
             }
         )
 
-    resources = evaluate_workload_resources(pod_spec)
+    resources = evaluate_workload_resources(pod_spec, bursting=bursting)
     status = WORKLOAD_STATUS_BLOCKED if blockers else WORKLOAD_STATUS_READY
 
     return {
@@ -802,6 +951,7 @@ def evaluate_workload(item: dict) -> dict:
         "name": name,
         "status": status,
         "blockers": blockers,
+        "advisories": advisories,
         "resources": resources,
     }
 
@@ -812,10 +962,15 @@ def evaluate_cluster_workloads(
     *,
     project: str = "",
     read_error: str | None = None,
+    bursting: bool | None = None,
 ) -> dict:
     """Combine cluster-level evaluation with workload evaluations for one cluster."""
     cluster_eval = evaluate_cluster(cluster)
     cluster_eval["project"] = project
+    target_bursting = (
+        bool(cluster_eval.get("bursting", True)) if bursting is None else bool(bursting)
+    )
+    cluster_eval["bursting"] = target_bursting
 
     if cluster_eval["autopilot"]:
         cluster_eval["workloads"] = []
@@ -848,7 +1003,10 @@ def evaluate_cluster_workloads(
         cluster_eval["read_error"] = error_text
         return cluster_eval
 
-    workloads = [evaluate_workload(item) for item in extract_workloads(items)]
+    workloads = [
+        evaluate_workload(item, bursting=target_bursting)
+        for item in extract_workloads(items)
+    ]
     ready_count = sum(1 for w in workloads if w["status"] == WORKLOAD_STATUS_READY)
     blocked_count = sum(1 for w in workloads if w["status"] == WORKLOAD_STATUS_BLOCKED)
     cpu_rounded_count = sum(1 for w in workloads if w["resources"]["cpu_rounded"])
@@ -945,6 +1103,14 @@ def render_markdown(report: dict) -> str:
                 if w_blockers
                 else EMPTY_CELL
             )
+            w_advisories = workload.get("advisories") or []
+            w_advisory_text = (
+                DETAIL_JOIN.join(
+                    f"{a.get('rule')}: {a.get('detail')}" for a in w_advisories
+                )
+                if w_advisories
+                else EMPTY_CELL
+            )
             w_resources = workload.get("resources") or {}
             cpu_cell = str(w_resources.get("cpu_rounding_summary") or EMPTY_CELL)
             burst_cell = str(w_resources.get("burst_summary") or EMPTY_CELL)
@@ -955,6 +1121,7 @@ def render_markdown(report: dict) -> str:
                     f"{w_kind}/{w_name}",
                     w_status,
                     w_blocker_text,
+                    w_advisory_text,
                     cpu_cell,
                     burst_cell,
                 )
@@ -1161,6 +1328,7 @@ def collect_cluster_workloads(
     *,
     kubeconfig: Path | None = None,
     kubeconfig_dir: Path = DEFAULT_KUBECONFIG_DIR,
+    bursting: bool | None = None,
     run: RunFn = default_run,
 ) -> dict:
     """Evaluate a cluster record and, for Standard clusters, page and evaluate its workloads."""
@@ -1169,7 +1337,9 @@ def collect_cluster_workloads(
     autopilot_obj = cluster_record.get("autopilot")
     is_autopilot = bool(isinstance(autopilot_obj, dict) and autopilot_obj.get("enabled") is True)
     if is_autopilot:
-        return evaluate_cluster_workloads(cluster_record, [], project=project)
+        return evaluate_cluster_workloads(
+            cluster_record, [], project=project, bursting=bursting
+        )
 
     cluster_status = str(cluster_record.get("status") or "")
     if cluster_status and cluster_status not in AUDITABLE_CLUSTER_STATUSES:
@@ -1180,6 +1350,7 @@ def collect_cluster_workloads(
             read_error=(
                 f"cluster status is {cluster_status}, which is neither RUNNING nor RECONCILING"
             ),
+            bursting=bursting,
         )
 
     if kubeconfig is not None:
@@ -1190,6 +1361,7 @@ def collect_cluster_workloads(
                 None,
                 project=project,
                 read_error=f"kubeconfig {kc_path} does not exist",
+                bursting=bursting,
             )
     else:
         kc_path, cred_error = fetch_cluster_credentials(
@@ -1205,6 +1377,7 @@ def collect_cluster_workloads(
                 None,
                 project=project,
                 read_error=cred_error,
+                bursting=bursting,
             )
 
     kube_env = {**os.environ, KUBECONFIG_ENV: str(kc_path)}
@@ -1217,10 +1390,13 @@ def collect_cluster_workloads(
             None,
             project=project,
             read_error=f"`{cmd_text}` failed (rc={dump_run.rc}): {stderr}",
+            bursting=bursting,
         )
 
     items = [i for i in (dump.get("items") or []) if isinstance(i, dict)]
-    return evaluate_cluster_workloads(cluster_record, items, project=project)
+    return evaluate_cluster_workloads(
+        cluster_record, items, project=project, bursting=bursting
+    )
 
 
 def _matches_cluster_filter(
@@ -1248,6 +1424,7 @@ def scan_fleet(
     location_filter: str | None = None,
     kubeconfig: Path | None = None,
     kubeconfig_dir: Path = DEFAULT_KUBECONFIG_DIR,
+    bursting: bool | None = None,
     scope: fleet_scope_args.DeclaredScope | None = None,
     run: RunFn = default_run,
 ) -> dict:
@@ -1288,6 +1465,7 @@ def scan_fleet(
             cluster_record,
             kubeconfig=kubeconfig,
             kubeconfig_dir=kubeconfig_dir,
+            bursting=bursting,
             run=run,
         )
         if evaluated.get("read_error"):
@@ -1378,6 +1556,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional file path to write the JSON report to.",
     )
+    parser.add_argument(
+        NON_BURSTING_FLAG,
+        action="store_true",
+        default=False,
+        help=(
+            "Evaluate CPU rounding and QoS burst impact for a non-bursting Autopilot target "
+            "(250m floor/steps and requests == limits)."
+        ),
+    )
     fleet_scope_args.add_scope_arguments(parser)
     return parser
 
@@ -1396,6 +1583,7 @@ def main(argv: list[str] | None = None, *, run: RunFn = default_run) -> int:
 
     kc_override = Path(args.kubeconfig) if args.kubeconfig else None
     kc_dir = Path(args.kubeconfig_dir) if args.kubeconfig_dir else DEFAULT_KUBECONFIG_DIR
+    bursting_override: bool | None = False if args.non_bursting else None
 
     report = scan_fleet(
         project_override=args.project,
@@ -1403,6 +1591,7 @@ def main(argv: list[str] | None = None, *, run: RunFn = default_run) -> int:
         location_filter=args.location,
         kubeconfig=kc_override,
         kubeconfig_dir=kc_dir,
+        bursting=bursting_override,
         scope=scope,
         run=run,
     )

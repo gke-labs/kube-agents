@@ -135,6 +135,40 @@ class ClusterRuleTests(unittest.TestCase):
         self.assertEqual(unparsable["status"], scan.CLUSTER_STATUS_UNKNOWN)
         self.assertIn(scan.NOTE_VERSION_UNKNOWN, unparsable["notes"])
 
+    def test_cluster_supports_bursting_version_and_cgroup_mode(self) -> None:
+        # 1. Autopilot and Standard clusters at 1.30.2-gke.1394000+ on cgroupv2 support bursting.
+        self.assertTrue(
+            scan.cluster_supports_bursting(
+                _make_cluster(version="1.30.2-gke.1394000", autopilot=True)
+            )
+        )
+        self.assertTrue(
+            scan.cluster_supports_bursting(
+                _make_cluster(version="1.33.1-gke.1107000", autopilot=False)
+            )
+        )
+        # 2. Clusters below 1.30.2-gke.1394000 do not support Autopilot bursting.
+        self.assertFalse(
+            scan.cluster_supports_bursting(
+                _make_cluster(version="1.30.2-gke.1393999", autopilot=True)
+            )
+        )
+        self.assertFalse(
+            scan.cluster_supports_bursting(
+                _make_cluster(version="1.29.8-gke.1000000", autopilot=False)
+            )
+        )
+        # 3. Clusters with CGROUP_MODE_V1 on nodeConfig or nodePools do not support bursting.
+        cluster_v1 = _make_cluster(version="1.35.8-gke.1796000", autopilot=True)
+        cluster_v1["nodeConfig"] = {"linuxNodeConfig": {"cgroupMode": "CGROUP_MODE_V1"}}
+        self.assertFalse(scan.cluster_supports_bursting(cluster_v1))
+
+        pool_v1 = _make_cluster(version="1.35.8-gke.1796000", autopilot=False)
+        pool_v1["nodePools"] = [
+            {"name": "default-pool", "config": {"linuxNodeConfig": {"cgroupMode": "CGROUP_MODE_V1"}}}
+        ]
+        self.assertFalse(scan.cluster_supports_bursting(pool_v1))
+
 
 class WorkloadBlockerRuleTests(unittest.TestCase):
     def test_privileged_containers_and_init_containers(self) -> None:
@@ -182,7 +216,179 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
         self.assertIn(scan.RULE_SYSCTLS, rules)
         self.assertIn("net.core.somaxconn=4096", rules[scan.RULE_SYSCTLS])
 
-    def test_user_daemonset_and_standalone_pod_flagged(self) -> None:
+    def test_readonly_var_log_hostpath_allowed_and_writable_or_other_hostpath_blocked(
+        self,
+    ) -> None:
+        # 1. Read-only hostPath on `/var/log` and `/var/log/pods` is admitted on Autopilot.
+        ro_var_log = _make_deployment(
+            "log-reader",
+            containers=[
+                {
+                    "name": "reader",
+                    "volumeMounts": [
+                        {"name": "varlog", "mountPath": "/var/log", "readOnly": True},
+                        {
+                            "name": "podlogs",
+                            "mountPath": "/var/log/pods",
+                            "readOnly": True,
+                        },
+                    ],
+                }
+            ],
+            pod_spec_extra={
+                "volumes": [
+                    {"name": "varlog", "hostPath": {"path": "/var/log"}},
+                    {"name": "podlogs", "hostPath": {"path": "/var/log/pods"}},
+                ]
+            },
+        )
+        ro_eval = scan.evaluate_workload(ro_var_log)
+        self.assertEqual(ro_eval["status"], scan.WORKLOAD_STATUS_READY)
+        self.assertEqual(ro_eval["blockers"], [])
+
+        # 2. Writable hostPath on `/var/log` (`readOnly` omitted or False) is blocked.
+        rw_var_log = _make_deployment(
+            "log-writer",
+            containers=[
+                {
+                    "name": "writer",
+                    "volumeMounts": [
+                        {"name": "varlog", "mountPath": "/var/log", "readOnly": False}
+                    ],
+                }
+            ],
+            pod_spec_extra={
+                "volumes": [
+                    {"name": "varlog", "hostPath": {"path": "/var/log"}},
+                ]
+            },
+        )
+        rw_eval = scan.evaluate_workload(rw_var_log)
+        self.assertEqual(rw_eval["status"], scan.WORKLOAD_STATUS_BLOCKED)
+        self.assertIn(
+            scan.RULE_HOST_PATH,
+            [b["rule"] for b in rw_eval["blockers"]],
+        )
+
+        # 3. Non-`/var/log` path or `..` traversal mounted read-only is blocked.
+        non_var_log_ro = _make_deployment(
+            "etc-reader",
+            containers=[
+                {
+                    "name": "reader",
+                    "volumeMounts": [
+                        {"name": "etcconf", "mountPath": "/etc", "readOnly": True},
+                        {
+                            "name": "traversal",
+                            "mountPath": "/var/log",
+                            "readOnly": True,
+                        },
+                    ],
+                }
+            ],
+            pod_spec_extra={
+                "volumes": [
+                    {"name": "etcconf", "hostPath": {"path": "/etc/cni/net.d"}},
+                    {
+                        "name": "traversal",
+                        "hostPath": {"path": "/var/log/../etc/passwd"},
+                    },
+                ]
+            },
+        )
+        non_var_log_eval = scan.evaluate_workload(non_var_log_ro)
+        self.assertEqual(non_var_log_eval["status"], scan.WORKLOAD_STATUS_BLOCKED)
+        host_path_detail = {
+            b["rule"]: b["detail"] for b in non_var_log_eval["blockers"]
+        }[scan.RULE_HOST_PATH]
+        self.assertIn("etcconf (/etc/cni/net.d)", host_path_detail)
+        self.assertIn("traversal (/var/log/../etc/passwd)", host_path_detail)
+
+    def test_safe_sysctls_allowed_and_unsafe_sysctls_blocked(self) -> None:
+        # 1. Kubernetes safe sysctls schedule on Autopilot without blocking.
+        safe_dep = _make_deployment(
+            "safe-sysctl-app",
+            pod_spec_extra={
+                "securityContext": {
+                    "sysctls": [
+                        {
+                            "name": "net.ipv4.ip_unprivileged_port_start",
+                            "value": "1024",
+                        },
+                        {"name": "net.ipv4.ping_group_range", "value": "0 2147483647"},
+                        {"name": "net.ipv4.tcp_keepalive_time", "value": "600"},
+                        {"name": "kernel.shm_rmid_forced", "value": "1"},
+                    ]
+                }
+            },
+        )
+        safe_eval = scan.evaluate_workload(safe_dep)
+        self.assertEqual(safe_eval["status"], scan.WORKLOAD_STATUS_READY)
+        self.assertEqual(safe_eval["blockers"], [])
+
+        # 2. Mixed safe and unsafe sysctls block only on the unsafe sysctl.
+        mixed_dep = _make_deployment(
+            "unsafe-sysctl-app",
+            pod_spec_extra={
+                "securityContext": {
+                    "sysctls": [
+                        {
+                            "name": "net.ipv4.ip_unprivileged_port_start",
+                            "value": "1024",
+                        },
+                        {"name": "net.core.somaxconn", "value": "4096"},
+                        {"name": "kernel.shmmax", "value": "65536"},
+                    ]
+                }
+            },
+        )
+        mixed_eval = scan.evaluate_workload(mixed_dep)
+        self.assertEqual(mixed_eval["status"], scan.WORKLOAD_STATUS_BLOCKED)
+        rules = {b["rule"]: b["detail"] for b in mixed_eval["blockers"]}
+        self.assertIn(scan.RULE_SYSCTLS, rules)
+        self.assertIn("net.core.somaxconn=4096", rules[scan.RULE_SYSCTLS])
+        self.assertIn("kernel.shmmax=65536", rules[scan.RULE_SYSCTLS])
+        self.assertNotIn(
+            "net.ipv4.ip_unprivileged_port_start", rules[scan.RULE_SYSCTLS]
+        )
+
+    def test_user_daemonset_and_standalone_pod_reported_as_advisories(self) -> None:
+        # 1. Admissible DaemonSet (e.g. read-only /var/log reader) stays `ready` with a DaemonSet advisory.
+        admissible_ds = {
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {"name": "log-shipper", "namespace": "logging"},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "volumes": [
+                            {"name": "varlog", "hostPath": {"path": "/var/log"}}
+                        ],
+                        "containers": [
+                            {
+                                "name": "shipper",
+                                "volumeMounts": [
+                                    {
+                                        "name": "varlog",
+                                        "mountPath": "/var/log",
+                                        "readOnly": True,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+        admissible_ds_eval = scan.evaluate_workload(admissible_ds)
+        self.assertEqual(admissible_ds_eval["status"], scan.WORKLOAD_STATUS_READY)
+        self.assertEqual(admissible_ds_eval["blockers"], [])
+        self.assertEqual(
+            [a["rule"] for a in admissible_ds_eval["advisories"]],
+            [scan.RULE_DAEMONSET],
+        )
+
+        # 2. DaemonSet with hostNetwork and non-/var/log hostPath is `blocked` by those rules and carries the DaemonSet advisory.
         ds = {
             "apiVersion": "apps/v1",
             "kind": "DaemonSet",
@@ -201,11 +407,16 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
         }
         ds_eval = scan.evaluate_workload(ds)
         self.assertEqual(ds_eval["status"], scan.WORKLOAD_STATUS_BLOCKED)
-        ds_rules = [b["rule"] for b in ds_eval["blockers"]]
-        self.assertIn(scan.RULE_DAEMONSET, ds_rules)
-        self.assertIn(scan.RULE_HOST_NETWORK, ds_rules)
-        self.assertIn(scan.RULE_HOST_PATH, ds_rules)
+        ds_blocker_rules = [b["rule"] for b in ds_eval["blockers"]]
+        self.assertNotIn(scan.RULE_DAEMONSET, ds_blocker_rules)
+        self.assertIn(scan.RULE_HOST_NETWORK, ds_blocker_rules)
+        self.assertIn(scan.RULE_HOST_PATH, ds_blocker_rules)
+        self.assertEqual(
+            [a["rule"] for a in ds_eval["advisories"]],
+            [scan.RULE_DAEMONSET],
+        )
 
+        # 3. Admissible standalone Pod stays `ready` with a `standalone-pod` advisory.
         standalone_pod = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -214,10 +425,11 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
             "status": {"phase": "Running"},
         }
         pod_eval = scan.evaluate_workload(standalone_pod)
-        self.assertEqual(pod_eval["status"], scan.WORKLOAD_STATUS_BLOCKED)
-        self.assertIn(
-            scan.RULE_STANDALONE_POD,
-            [b["rule"] for b in pod_eval["blockers"]],
+        self.assertEqual(pod_eval["status"], scan.WORKLOAD_STATUS_READY)
+        self.assertEqual(pod_eval["blockers"], [])
+        self.assertEqual(
+            [a["rule"] for a in pod_eval["advisories"]],
+            [scan.RULE_STANDALONE_POD],
         )
 
     def test_extract_workloads_filters_system_owned_mirror_and_terminal_pods(self) -> None:
@@ -308,13 +520,23 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
 
 class ResourceImpactTests(unittest.TestCase):
     def test_cpu_rounding_formula(self) -> None:
-        self.assertEqual(scan.round_autopilot_cpu_millis(0), 250)
-        self.assertEqual(scan.round_autopilot_cpu_millis(10), 250)
-        self.assertEqual(scan.round_autopilot_cpu_millis(250), 250)
-        self.assertEqual(scan.round_autopilot_cpu_millis(251), 500)
-        self.assertEqual(scan.round_autopilot_cpu_millis(300), 500)
+        # Bursting target (default): 50m general-purpose minimum, no 250m step rounding.
+        self.assertEqual(scan.round_autopilot_cpu_millis(0), 50)
+        self.assertEqual(scan.round_autopilot_cpu_millis(10), 50)
+        self.assertEqual(scan.round_autopilot_cpu_millis(50), 50)
+        self.assertEqual(scan.round_autopilot_cpu_millis(251), 251)
+        self.assertEqual(scan.round_autopilot_cpu_millis(300), 300)
         self.assertEqual(scan.round_autopilot_cpu_millis(1000), 1000)
-        self.assertEqual(scan.round_autopilot_cpu_millis(1200), 1250)
+        self.assertEqual(scan.round_autopilot_cpu_millis(1200), 1200)
+
+        # Non-bursting target: 250m floor and 250m step rounding.
+        self.assertEqual(scan.round_autopilot_cpu_millis(0, bursting=False), 250)
+        self.assertEqual(scan.round_autopilot_cpu_millis(10, bursting=False), 250)
+        self.assertEqual(scan.round_autopilot_cpu_millis(250, bursting=False), 250)
+        self.assertEqual(scan.round_autopilot_cpu_millis(251, bursting=False), 500)
+        self.assertEqual(scan.round_autopilot_cpu_millis(300, bursting=False), 500)
+        self.assertEqual(scan.round_autopilot_cpu_millis(1000, bursting=False), 1000)
+        self.assertEqual(scan.round_autopilot_cpu_millis(1200, bursting=False), 1250)
 
     def test_guaranteed_workload_with_cpu_rounding(self) -> None:
         # Matches `seeded-qos/ledger-writer`: 10m CPU, 32Mi memory, requests == limits.
@@ -331,17 +553,29 @@ class ResourceImpactTests(unittest.TestCase):
                 }
             ],
         )
+        # 1. Bursting target (default): 10m rounds to 50m (+40m).
         evaluated = scan.evaluate_workload(dep)
         self.assertEqual(evaluated["status"], scan.WORKLOAD_STATUS_READY)
         res = evaluated["resources"]
+        self.assertTrue(res["bursting"])
         self.assertEqual(res["requested_cpu_millis"], 10)
-        self.assertEqual(res["autopilot_cpu_millis"], 250)
-        self.assertEqual(res["cpu_delta_millis"], 240)
+        self.assertEqual(res["autopilot_cpu_millis"], 50)
+        self.assertEqual(res["non_bursting_autopilot_cpu_millis"], 250)
+        self.assertEqual(res["cpu_delta_millis"], 40)
         self.assertTrue(res["cpu_rounded"])
         self.assertEqual(res["qos_class"], scan.QOS_GUARANTEED)
         self.assertFalse(res["burst_impacted"])
-        self.assertIn("10m -> 250m (+240m)", res["cpu_rounding_summary"])
+        self.assertIn("10m -> 50m (+40m)", res["cpu_rounding_summary"])
         self.assertIn("Guaranteed", res["burst_summary"])
+
+        # 2. Non-bursting target: 10m rounds to 250m (+240m).
+        non_burst_res = scan.evaluate_workload(dep, bursting=False)["resources"]
+        self.assertFalse(non_burst_res["bursting"])
+        self.assertEqual(non_burst_res["requested_cpu_millis"], 10)
+        self.assertEqual(non_burst_res["autopilot_cpu_millis"], 250)
+        self.assertEqual(non_burst_res["cpu_delta_millis"], 240)
+        self.assertTrue(non_burst_res["cpu_rounded"])
+        self.assertIn("10m -> 250m (+240m)", non_burst_res["cpu_rounding_summary"])
 
     def test_burstable_and_best_effort_workloads(self) -> None:
         burstable = _make_deployment(
@@ -357,12 +591,25 @@ class ResourceImpactTests(unittest.TestCase):
                 }
             ],
         )
+        # 1. Bursting target (default): Burstable keeps burst (`burst_impacted == False`).
         b_res = scan.evaluate_workload(burstable)["resources"]
         self.assertEqual(b_res["qos_class"], scan.QOS_BURSTABLE)
-        self.assertTrue(b_res["burst_impacted"])
-        self.assertIn("Burstable", b_res["burst_summary"])
+        self.assertFalse(b_res["burst_impacted"])
+        self.assertEqual(b_res["autopilot_cpu_millis"], 50)
+        self.assertFalse(b_res["cpu_rounded"])
+        self.assertIn("Burstable (target supports bursting", b_res["burst_summary"])
         self.assertIn("cpu limit 500m > request 50m", b_res["burst_summary"])
         self.assertIn("memory limit 128Mi > request 64Mi", b_res["burst_summary"])
+
+        # 2. Non-bursting target: Burstable loses burst (`burst_impacted == True`).
+        b_non_burst = scan.evaluate_workload(burstable, bursting=False)["resources"]
+        self.assertEqual(b_non_burst["qos_class"], scan.QOS_BURSTABLE)
+        self.assertTrue(b_non_burst["burst_impacted"])
+        self.assertEqual(b_non_burst["autopilot_cpu_millis"], 250)
+        self.assertIn(
+            "non-bursting Autopilot enforces requests == limits, removing burst above request",
+            b_non_burst["burst_summary"],
+        )
 
         best_effort = _make_deployment(
             "unbounded",
@@ -372,7 +619,12 @@ class ResourceImpactTests(unittest.TestCase):
         self.assertEqual(be_res["qos_class"], scan.QOS_BEST_EFFORT)
         self.assertTrue(be_res["burst_impacted"])
         self.assertEqual(be_res["requested_cpu_millis"], 0)
-        self.assertEqual(be_res["autopilot_cpu_millis"], 250)
+        self.assertEqual(be_res["autopilot_cpu_millis"], 50)
+
+        be_non_burst = scan.evaluate_workload(best_effort, bursting=False)["resources"]
+        self.assertEqual(be_non_burst["qos_class"], scan.QOS_BEST_EFFORT)
+        self.assertTrue(be_non_burst["burst_impacted"])
+        self.assertEqual(be_non_burst["autopilot_cpu_millis"], 250)
 
     def test_quantity_scientific_notation_and_overflow_guards(self) -> None:
         self.assertEqual(scan.parse_cpu_millis("1e3m"), 1000)
@@ -417,12 +669,18 @@ class ResourceImpactTests(unittest.TestCase):
             ],
             pod_spec_extra={"overhead": {"cpu": "50m"}},
         )
+        # app (200m) + native sidecar (200m) = 400m > init peak (200m + 100m = 300m), plus overhead (50m) = 450m
         res = scan.evaluate_workload(dep)["resources"]
-        # app (200m) + native sidecar (200m) = 400m > init peak (200m + 100m = 300m), plus overhead (50m) = 450m -> 500m
         self.assertEqual(res["requested_cpu_millis"], 450)
-        self.assertEqual(res["autopilot_cpu_millis"], 500)
-        self.assertEqual(res["cpu_delta_millis"], 50)
+        self.assertEqual(res["autopilot_cpu_millis"], 450)
+        self.assertEqual(res["non_bursting_autopilot_cpu_millis"], 500)
+        self.assertEqual(res["cpu_delta_millis"], 0)
         self.assertEqual(res["qos_class"], scan.QOS_GUARANTEED)
+
+        non_burst_res = scan.evaluate_workload(dep, bursting=False)["resources"]
+        self.assertEqual(non_burst_res["requested_cpu_millis"], 450)
+        self.assertEqual(non_burst_res["autopilot_cpu_millis"], 500)
+        self.assertEqual(non_burst_res["cpu_delta_millis"], 50)
 
     def test_limits_only_containers_default_requests_from_limits(self) -> None:
         dep = _make_deployment(
@@ -492,11 +750,18 @@ class ResourceImpactTests(unittest.TestCase):
         )
         mixed_res = scan.evaluate_workload(mixed_zero)["resources"]
         self.assertEqual(mixed_res["qos_class"], scan.QOS_BURSTABLE)
-        self.assertTrue(mixed_res["burst_impacted"])
+        self.assertFalse(mixed_res["burst_impacted"])
         self.assertIn("app: memory request and limit are 0", mixed_res["burst_details"])
         self.assertIn(
-            "removing burst above request: app: memory request and limit are 0)",
+            "burst above request preserved: app: memory request and limit are 0)",
             mixed_res["burst_summary"],
+        )
+
+        mixed_non_burst = scan.evaluate_workload(mixed_zero, bursting=False)["resources"]
+        self.assertTrue(mixed_non_burst["burst_impacted"])
+        self.assertIn(
+            "removing burst above request: app: memory request and limit are 0)",
+            mixed_non_burst["burst_summary"],
         )
 
 
@@ -618,8 +883,40 @@ class EndToEndCliTests(unittest.TestCase):
             by_name = {c["name"]: c for c in saved["clusters"]}
             self.assertEqual(by_name["robot-host"]["status"], scan.CLUSTER_STATUS_AUTOPILOT)
             self.assertEqual(by_name["seeded-a"]["status"], scan.CLUSTER_STATUS_READY)
+            self.assertTrue(by_name["seeded-a"]["bursting"])
             self.assertEqual(
                 by_name["seeded-a"]["workload_summary"],
+                {
+                    "total": 2,
+                    "ready": 1,
+                    "blocked": 1,
+                    "cpu_rounded": 2,
+                    "burst_impacted": 0,
+                },
+            )
+
+            # With `--non-bursting`, 250m rounding and Burstable burst removal apply.
+            out_non_burst = Path(tmp) / "report-non-burst.json"
+            buf_non_burst = io.StringIO()
+            with mock.patch("sys.stdout", buf_non_burst):
+                rc_nb = scan.main(
+                    [
+                        "--project",
+                        "kube-agents-robot",
+                        "--non-bursting",
+                        "--kubeconfig-dir",
+                        str(kc_dir),
+                        "--output",
+                        str(out_non_burst),
+                    ],
+                    run=runner,
+                )
+            self.assertEqual(rc_nb, scan.EXIT_OK)
+            saved_nb = json.loads(out_non_burst.read_text(encoding="utf-8"))
+            seeded_nb = {c["name"]: c for c in saved_nb["clusters"]}["seeded-a"]
+            self.assertFalse(seeded_nb["bursting"])
+            self.assertEqual(
+                seeded_nb["workload_summary"],
                 {
                     "total": 2,
                     "ready": 1,
