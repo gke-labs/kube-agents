@@ -103,10 +103,22 @@ type PlatformAgentSpec struct {
 // freezes it except spec.suspend, so an override is the one supported way
 // to change a built-in without a release.
 type PlatformAgentSchedulesSpec struct {
+	// SuspendAll suspends every built-in schedule that no entry in
+	// overrides names: the built-in AgentSchedules, and the scheduled jobs
+	// the agent image still ships in the Platform Agent's cron roster, which
+	// take the change when the agent pod restarts. An entry in overrides
+	// wins, so suspend: false there turns one schedule back on. A
+	// run-now-only built-in is not affected.
+	// +optional
+	SuspendAll bool `json:"suspendAll,omitempty"`
+
 	// Overrides sets spec.suspend on built-in schedules, keyed on the
 	// schedule's rendered name: a canary (<name>-canary) and its live row
 	// are separate entries, so a suspend never carries from one phase to the
-	// other. An entry naming no built-in is reported on the PlatformAgent's
+	// other. A scheduled job in the Platform Agent's cron roster takes an
+	// entry under its job id, applied when the agent pod restarts; suspend:
+	// false does not start a job the image ships disabled. An entry naming no
+	// built-in and no such job is reported on the PlatformAgent's
 	// BuiltinSchedules condition and otherwise ignored. A run-now-only
 	// built-in, such as onboarding, takes only suspend: true, which stops
 	// the operator from starting its run; suspend: false is refused and

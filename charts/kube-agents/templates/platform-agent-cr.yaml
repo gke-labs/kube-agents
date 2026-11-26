@@ -985,6 +985,14 @@ spec:
   networkPolicy:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .Values.platformAgent.schedules }}
+  {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.schedules" "path" (list) "field" "schedules") }}
+  {{- if hasKey . "suspendAll" }}
+  {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.schedules.suspendAll" "path" (list "schedules") "field" "suspendAll") }}
+  {{- end }}
+  schedules:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
   {{- /* Runs the forge checks, and fails, before anything is written. */}}
   {{- $providers := include "kube-agents.forgeProviders" . }}

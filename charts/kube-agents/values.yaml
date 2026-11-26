@@ -2013,6 +2013,22 @@ platformAgent:
   #
   # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
   networkPolicy: {}
+  # PlatformAgent.spec.schedules, passed through as written: which built-in
+  # scheduled jobs run. Unset, every built-in follows its shipped default.
+  # suspendAll turns every built-in off; an entry in overrides wins over it, so
+  # suspend: false turns one back on, and suspend: true alone turns one off.
+  # A name is a built-in AgentSchedule's, or a job id in the Platform Agent's
+  # cron roster. A roster job takes the change when the agent pod restarts,
+  # which the operator does on a change here.
+  #
+  #   schedules:
+  #     suspendAll: true
+  #     overrides:
+  #       - name: compliance-audit
+  #         suspend: false
+  #
+  # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
+  schedules: {}
   integration:
     # The forges the agent talks to, and the repositories on them. Set these
     # or `github` below, not both — `github` is a deprecated alias for one

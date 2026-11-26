@@ -295,6 +295,31 @@ Each job in `jobs.json` follows this schema:
 
 ## Disabling a watchdog
 
+### On your install
+
+Set `spec.schedules` on the `PlatformAgent`, or `platformAgent.schedules` in the chart values. No new image is needed.
+
+```yaml
+platformAgent:
+  schedules:
+    suspendAll: true
+    overrides:
+      - name: session-retention
+        suspend: false
+      - name: kanban-workspace-gc
+        suspend: false
+```
+
+`suspendAll: true` turns off every job in the Platform Agent's roster. An entry in `overrides` wins over it: `suspend: false` turns one job back on, and `suspend: true` with no `suspendAll` turns one job off. The name is the job's `id` in the [roster](/kube-agents/reference/cron-jobs/).
+
+The operator restarts the agent pod when the setting changes, and the jobs change state at that start. A suspended job keeps its run history. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
+
+`suspendAll` includes the clean-up jobs. `session-retention` and `kanban-workspace-gc` post nothing when they have nothing to report, and the data volume grows while they are off. Keep them on, as the example does.
+
+The setting cannot start a job that the image ships disabled. It does not reach the Planning Agent's own jobs, which run the Platform Agent's roster and first-run onboarding. While an audit is suspended, onboarding does not start it.
+
+### In the image
+
 Flip `enabled` to `false` in `agents/platform/cron/jobs.json`. The scheduler honours the flag directly: the job stops being due, and nothing runs.
 
 Flip the flag; do not delete the entry. An id can be dropped from the roster only once no live cluster still needs the image to hold the job off, which is the path the five [retired watchdogs](#the-retired-jobs) took. Deleting is never the whole step: the same release must also name the id in the platform force-sync's `--cron-retire` (`deploy/shared/docker-entrypoint.sh`), or the volume keeps a disabled entry no later image can reach.

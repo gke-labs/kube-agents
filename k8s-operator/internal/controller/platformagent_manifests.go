@@ -6045,6 +6045,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	if platformFrontDoorEnabled(agent) {
 		frontDoorProfile = platformProfileName
 	}
+	// On the gateway container only: it owns the shared-state setup, which is where the
+	// entrypoint merges the Platform Agent's cron roster and applies this.
+	gatewayEnvVars = append(gatewayEnvVars, builtinSchedulesEnv(agent))
 	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
