@@ -32,13 +32,18 @@ package controller
 // authentication in credential_proxy.py.
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -413,4 +418,135 @@ func projectsWatcherToken(v corev1.Volume) bool {
 		}
 	}
 	return false
+}
+
+// credentialBrokerPodReadComponent is the a2a component label on the broker's
+// pod-read Role and RoleBinding in the profile namespace, which carry no owner
+// reference and are known as this agent's by their labels.
+const credentialBrokerPodReadComponent = "credential-proxy-pod-read"
+
+// credentialBrokerPodReadName names the broker's pod-read Role and RoleBinding,
+// the same in every namespace they are rendered in. Not prefixed "kubeagents":
+// cleanupAgentRBAC's sweep of the agent namespace reaps RoleBindings with that
+// prefix bound to the broker's ServiceAccount, and also spares this name by
+// itself for an agent whose own name carries the prefix.
+func credentialBrokerPodReadName(agent *agentv1alpha1.PlatformAgent) string {
+	return credentialBrokerName(agent) + "-pod-read"
+}
+
+// buildCredentialBrokerPodReadRole lets the broker read one pod at a time in
+// namespace, to hold each request to the pod its token was issued to: the
+// TokenReview names the pod, the pod's addresses come from this read, and the
+// request's peer has to be one of them (PodAddressBinding in
+// credential_proxy.py).
+//
+// `get` on pods, namespaced, in exactly the namespaces whose pods present
+// tokens to the broker: the agent's (the gateway, the sandbox, the A2A gateway,
+// session pods, the MCP server, the scope publisher, the curator and the Teams
+// receiver) and the profile namespace (profile workers). resourceNames can't
+// narrow it, because the pods it reads are named at runtime.
+//
+// Not the broker's only pod read today, and so not a narrowing of anything:
+// the same ServiceAccount is bound to the minimal audit ClusterRole
+// (buildMinimalPlatformRoleWithSecrets), which already grants get, list and
+// watch on pods cluster-wide. These Roles are what the check needs on its own
+// terms, so it keeps working if that cluster-wide grant is ever narrowed or
+// moved off the broker's ServiceAccount.
+func buildCredentialBrokerPodReadRole(agent *agentv1alpha1.PlatformAgent, namespace string) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+		ObjectMeta: metav1.ObjectMeta{Name: credentialBrokerPodReadName(agent), Namespace: namespace, Labels: credentialBrokerPodReadLabels(agent, namespace)},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get"},
+		}},
+	}
+}
+
+// buildCredentialBrokerPodReadRoleBinding binds that Role to the broker's
+// ServiceAccount, which lives in the agent's namespace wherever the binding is.
+func buildCredentialBrokerPodReadRoleBinding(agent *agentv1alpha1.PlatformAgent, namespace string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: credentialBrokerPodReadName(agent), Namespace: namespace, Labels: credentialBrokerPodReadLabels(agent, namespace)},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: credentialBrokerPodReadName(agent)},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: agentServiceAccountName(agent), Namespace: agent.Namespace}},
+	}
+}
+
+// credentialBrokerPodReadLabels are the profile namespace's ownership labels
+// there (agentLabelsMarkComponent reads them), and none of its own in the
+// agent's namespace, where the owner reference and applyManaged's common
+// labels say whose it is.
+func credentialBrokerPodReadLabels(agent *agentv1alpha1.PlatformAgent, namespace string) map[string]string {
+	if namespace == agent.Namespace {
+		return nil
+	}
+	return a2aLabels(agent, credentialBrokerPodReadComponent)
+}
+
+// reconcileCredentialBrokerPodReadRBAC applies the broker's pod-read Role and
+// binding in the agent's namespace. Unconditional, as the TokenReview grant is:
+// the broker refuses every pod-token request it can't match to its pod, so the
+// check must not depend on a grant made for another purpose (the minimal
+// ClusterRole's pod read, see buildCredentialBrokerPodReadRole). The broker and
+// these objects render in the same pass of the same release.
+func (r *PlatformAgentReconciler) reconcileCredentialBrokerPodReadRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for _, obj := range []client.Object{
+		buildCredentialBrokerPodReadRole(agent, agent.Namespace),
+		buildCredentialBrokerPodReadRoleBinding(agent, agent.Namespace),
+	} {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to reconcile the credential broker's pod-read %T: %w", obj, err)
+		}
+	}
+	return nil
+}
+
+// reconcileCredentialBrokerProfilePodRead applies the same Role and binding in
+// the profile namespace once it is fenced, as the profile quota is. A failure
+// is the profile namespace's, returned for the caller to join with the rest.
+// Today the minimal ClusterRole's pod read still covers that namespace; if it
+// didn't, the broker would refuse profile workers' requests until this landed
+// and say which namespace it may not read.
+func (r *PlatformAgentReconciler) reconcileCredentialBrokerProfilePodRead(ctx context.Context, agent *agentv1alpha1.PlatformAgent, fenced bool) error {
+	if !fenced {
+		return nil
+	}
+	namespace := profileNamespaceName(agent)
+	for _, obj := range []client.Object{
+		buildCredentialBrokerPodReadRole(agent, namespace),
+		buildCredentialBrokerPodReadRoleBinding(agent, namespace),
+	} {
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("the credential broker's pod-read %T in %s: %w", obj, namespace, err)
+		}
+	}
+	return nil
+}
+
+// deleteCredentialBrokerProfilePodRead removes the broker's pod-read Role and
+// binding from the profile namespace, if they carry this agent's labels. Read
+// uncached: Role is a kind this controller doesn't watch.
+func (r *PlatformAgentReconciler) deleteCredentialBrokerProfilePodRead(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: credentialBrokerPodReadName(agent)}
+	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
+		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("the credential broker's pod-read %T: %w", obj, err)
+		}
+		if !agentLabelsMarkComponent(obj, agent, credentialBrokerPodReadComponent) {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+			return fmt.Errorf("deleting the credential broker's pod-read %T: %w", obj, err)
+		}
+	}
+	return nil
 }
