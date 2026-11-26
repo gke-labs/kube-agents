@@ -2505,6 +2505,10 @@ def conntrack_entry(name: str = NODE_A, stamp: str = "2026-11-20T19:59:32.454392
     }
 
 
+# A serial console entry with no kernel line, as a healthy node writes at times.
+QUIET_ENTRY = conntrack_entry(text="[   12.345678] systemd[1]: Started kubelet.service.\\r\\n")
+
+
 class GkeNodesTest(unittest.TestCase):
     def test_a_running_instance_with_the_cluster_label_is_a_node(self):
         self.assertEqual(
@@ -2634,13 +2638,17 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
     """§2.6 inside `collect_project`: its three reads, and what each outcome
     leaves in the manifest entry."""
 
-    def responses(self, *, nodes: list | None = None, logged_names: tuple = (NODE_A,), entries: list | None = None, **overrides) -> dict:
+    def responses(self, *, nodes: list | None = None, logged_names: tuple = (NODE_A,), entries: list | None = None,
+                  control: list | None = None, **overrides) -> dict:
         """The clean project of `CollectProjectTest`, with §2.6's reads first:
-        the fake answers by substring in insertion order, and both of §2.6's
-        instance reads contain `instances list`."""
+        the fake answers by substring in insertion order, both of §2.6's
+        instance reads contain `instances list`, and both of its log reads
+        contain `logging read`. `control` is what the control read returns:
+        by default one serial console entry with no kernel line."""
         answers = {
             cf.SERIAL_LOGGING_KEY: run_of(0, logged(*logged_names)),
             cf.GKE_NODES_FILTER: run_of(0, json.dumps([gke_node()] if nodes is None else nodes)),
+            cf.GKE_NODE_NAME_PATTERN: run_of(0, json.dumps([QUIET_ENTRY] if control is None else control)),
             "logging read": run_of(0, json.dumps(entries or [])),
             "instances list": run_of(0, one_running_instance()),
             "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
@@ -2694,7 +2702,16 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
 
     def test_the_log_read_asks_for_one_day_of_the_serial_console_log(self):
         _, issued = self.collect(self.responses())
-        (read,) = [argv for argv in issued if argv[1:3] == ["logging", "read"]]
+        read, control = [argv for argv in issued if argv[1:3] == ["logging", "read"]]
+        self.assertEqual(
+            control,
+            [
+                "gcloud", "logging", "read",
+                'resource.type="gce_instance" AND log_id("serialconsole.googleapis.com/serial_port_1_output") '
+                'AND labels."compute.googleapis.com/resource_name"=~"^gke-"',
+                "--project", "proj-1", "--freshness", "30d", "--limit", "1", "--format", "json",
+            ],
+        )
         self.assertEqual(
             read,
             [
@@ -2727,7 +2744,7 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
 
         _, issued = self.collect(self.responses())
         own = [argv for argv in issued if cf.GKE_NODES_FILTER in " ".join(argv) or argv[1:3] == ["logging", "read"]]
-        self.assertEqual(len(own), 3)
+        self.assertEqual(len(own), 4)
         for argv in own:
             decision = command_policy.evaluate(argv)
             self.assertTrue(decision.allowed, f"{argv}: {decision.message}")
@@ -2742,6 +2759,42 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertNotIn(cf.CONNTRACK_SLUG, self.declared(entry))
         self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
         self.assertNotIn("limitations", entry)
+
+    def test_a_clean_day_asks_the_control_read_and_records_it(self):
+        entry, issued = self.collect(self.responses())
+        self.assertEqual(len([argv for argv in issued if argv[1:3] == ["logging", "read"]]), 2)
+        (record,) = [c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG]
+        self.assertIn(cf.SERIAL_CONTROL_FRESHNESS, record["command"])
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+
+    def test_a_day_with_lines_needs_no_control_read(self):
+        """The lines themselves show that the log reaches Cloud Logging."""
+        _, issued = self.collect(self.responses(entries=[conntrack_entry()]))
+        self.assertEqual(len([argv for argv in issued if argv[1:3] == ["logging", "read"]]), 1)
+
+    def test_a_project_that_stores_no_serial_console_log_is_not_clean(self):
+        """The switch reads "true" and the project keeps the log out of Cloud
+        Logging (an exclusion, a sink elsewhere, an organization policy): a
+        clean result would rest on nothing."""
+        entry, _ = self.collect(self.responses(control=[]))
+        self.assertEqual(
+            unevaluated(entry)[cf.CONNTRACK_SLUG],
+            cf.NO_SERIAL_ENTRIES_REASON.format(days=30, total=1),
+        )
+        self.assertEqual([c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG], [])
+        self.assertIn("node-conntrack-saturation could not be evaluated", entry["limitations"])
+        self.assertEqual(self.conntrack(entry), [])
+
+    def test_a_failed_control_read_leaves_the_check_unevaluated(self):
+        entry, _ = self.collect(self.responses(**{cf.GKE_NODE_NAME_PATTERN: run_of(1, "", "ERROR: DEADLINE_EXCEEDED")}))
+        self.assertIn("its control read of the serial console log failed", unevaluated(entry)[cf.CONNTRACK_SLUG])
+        self.assertIn("DEADLINE_EXCEEDED", unevaluated(entry)[cf.CONNTRACK_SLUG])
+
+    def test_a_project_that_stores_no_log_names_no_partial_coverage_beside_it(self):
+        nodes = [gke_node(NODE_A), gke_node(NODE_B)]
+        entry, _ = self.collect(self.responses(nodes=nodes, logged_names=(NODE_A,), control=[]))
+        self.assertIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertNotIn("covers 1 of the 2", entry["limitations"])
 
     def test_a_project_with_no_gke_node_declares_the_check_inapplicable_and_reads_no_log(self):
         entry, issued = self.collect(self.responses(nodes=[]))

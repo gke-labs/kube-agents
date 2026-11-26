@@ -24,7 +24,9 @@ All five of the SOP's checks are implemented here:
   table by default. A node whose serial console does not reach Cloud Logging
   would read clean, so the check also lists the RUNNING GKE nodes whose
   `serial-port-logging-enable` metadata value is `true` and names the rest as
-  not covered.
+  not covered. On a day with no such line it asks for any one serial console
+  entry of a GKE node in the last 30 days; with none, the project keeps that
+  log out of Cloud Logging and the check is unevaluated.
 - `gce-startup-script-status` enumerates with `compute instances list`, keeps
   the RUNNING instances that actually run a startup script — its own metadata
   or the project's common metadata, read with `compute project-info describe` —
@@ -334,7 +336,10 @@ SEVERITY = {
 # troubleshooting page names the line as the sign of the fault ("These can be
 # logged in the serial console of the node"), and a live test on GKE Standard
 # 1.35.8 found it in Cloud Logging, under the serial console log, within 90
-# seconds (2026-11-20, one node, one run).
+# seconds (2026-11-20, one node, one run). The same test found it on a node of
+# a cluster with GKE Dataplane V2 and on a node with the Ubuntu image, and on
+# both, 300 connections that a pod opened raised the kernel table's count by
+# about as many (2026-11-26, one node and one run each).
 CONNTRACK_FULL_TEXT = "nf_conntrack: table full, dropping packet"
 SERIAL_CONSOLE_LOG_ID = "serialconsole.googleapis.com/serial_port_1_output"
 CONNTRACK_LOG_FILTER = (
@@ -372,6 +377,28 @@ SERIAL_LOGGING_FILTER = (
     f"{GKE_NODES_FILTER} AND metadata.items.key['{SERIAL_LOGGING_KEY}']['value']='{SERIAL_LOGGING_ON}'"
 )
 SERIAL_LOGGING_FORMAT = "--format=json(name,zone)"
+# The control read. The metadata value says that a node sends its serial
+# console to Cloud Logging; it does not say that the project keeps the log. An
+# exclusion on the project's sink, a sink to another project, or the
+# organization policy `compute.disableSerialPortLogging` leaves the value at
+# "true" and stores no line. So when a run finds no kernel line, it asks for
+# any one serial console entry of a GKE node, with no text filter. None means
+# that the check has no sign that this log reaches Cloud Logging here, and
+# "clean" would rest on nothing. The window is the log bucket's default
+# retention and not the audit's day, because a healthy node can write nothing
+# for weeks: on one test project 6 of 15 nodes wrote a line in a day, 11 in a
+# week and all 15 in 30 days (2026-11-26). So the control proves the path as
+# of some day in that window; an exclusion added since is not seen.
+SERIAL_CONTROL_FRESHNESS_DAYS = 30
+SERIAL_CONTROL_FRESHNESS = f"{SERIAL_CONTROL_FRESHNESS_DAYS}d"
+SERIAL_CONTROL_LIMIT = 1
+# A GKE Standard node's instance name starts with this.
+GKE_NODE_NAME_PATTERN = "^gke-"
+SERIAL_CONTROL_FILTER = (
+    'resource.type="gce_instance" '
+    f'AND log_id("{SERIAL_CONSOLE_LOG_ID}") '
+    f'AND labels."{LOG_INSTANCE_NAME_LABEL}"=~"{GKE_NODE_NAME_PATTERN}"'
+)
 CONNTRACK_IMPACT = (
     "The kernel dropped new connections on these nodes because the connection tracking "
     "table was full. Pods there kept reading Ready while requests to and from them failed."
@@ -593,6 +620,18 @@ NO_SERIAL_LOGGING_REASON = (
 UNREAD_CONNTRACK_LOG_REASON = (
     "§2.6's read of the serial console log in Cloud Logging failed, so no line of the "
     "{total} RUNNING GKE node(s) on this project was read: {error}"
+)
+NO_SERIAL_ENTRIES_REASON = (
+    "§2.6 found no kernel line, and no serial console entry at all of a GKE node of this "
+    "project is in Cloud Logging for the last {days} days. So nothing shows that this log "
+    "reaches Cloud Logging here (a log exclusion, a sink to another project or an "
+    "organization policy can keep it out), and a clean result for the {total} RUNNING GKE "
+    "node(s) would rest on nothing."
+)
+UNREAD_SERIAL_CONTROL_REASON = (
+    "§2.6 found no kernel line, and its control read of the serial console log failed, so "
+    "nothing shows that this log reaches Cloud Logging for the {total} RUNNING GKE node(s) "
+    "on this project: {error}"
 )
 CONNTRACK_UNEVALUATED_LIMITATION = (
     "node-conntrack-saturation could not be evaluated on this project: {reason}"
@@ -1790,10 +1829,34 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 else:
                     read_command = shlex.join(read_argv)
                     reads[CONNTRACK_SLUG].add(read_command, read_result)
+                    if not entries:
+                        # A clean day. Lines would have shown that the log
+                        # reaches Cloud Logging; with none, the control asks.
+                        control_argv = [
+                            GCLOUD, "logging", "read", SERIAL_CONTROL_FILTER,
+                            "--project", project, "--freshness", SERIAL_CONTROL_FRESHNESS,
+                            "--limit", str(SERIAL_CONTROL_LIMIT), "--format", "json",
+                        ]
+                        control_result = run_logging_read(
+                            control_argv, run=run, project=project, filter_text=SERIAL_CONTROL_FILTER,
+                            freshness=datetime.timedelta(days=SERIAL_CONTROL_FRESHNESS_DAYS),
+                            limit=SERIAL_CONTROL_LIMIT,
+                        )
+                        control = _json_list(control_result)
+                        if control is None:
+                            conntrack_reason = UNREAD_SERIAL_CONTROL_REASON.format(
+                                total=len(nodes), error=_failure_text(control_argv, control_result)
+                            )
+                        elif not control:
+                            conntrack_reason = NO_SERIAL_ENTRIES_REASON.format(
+                                days=SERIAL_CONTROL_FRESHNESS_DAYS, total=len(nodes)
+                            )
+                        else:
+                            reads[CONNTRACK_SLUG].add(shlex.join(control_argv), control_result)
                     full_page = len(entries) >= CONNTRACK_LOG_LIMIT
                     for hit in check_conntrack_saturation(entries, nodes, skip=left_out, at_least=full_page):
                         candidates.append(_emit(CONNTRACK_SLUG, hit, read_command))
-                    if uncovered:
+                    if uncovered and not conntrack_reason:
                         shown = ", ".join(uncovered[:CONNTRACK_NODES_SHOWN])
                         if len(uncovered) > CONNTRACK_NODES_SHOWN:
                             shown += CONNTRACK_MORE_NODES.format(more=len(uncovered) - CONNTRACK_NODES_SHOWN)
