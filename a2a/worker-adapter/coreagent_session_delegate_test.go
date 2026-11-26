@@ -201,3 +201,34 @@ func TestWithDelegateGrantAddsExactlyTheDelegateRules(t *testing.T) {
 		t.Errorf("the base driver's allow changed: %q", b)
 	}
 }
+
+// A scopeClusters part beside the targets reaches the core-agent session's
+// delegate server too, as it does Claude Code's (withDelegateTargetsFor),
+// and a template's stale page never does.
+func TestTurnDelegateServerCarriesTheScopeClustersBesideTheTargets(t *testing.T) {
+	tmpl := delegateTemplate("/run/base.sock")
+	tmpl.Env[EnvScopeClusters] = `{"count":9}`
+	targets, err := lib.DelegateTargetsPart(lib.DelegateTargets{Targets: []lib.DelegateTarget{{Name: "platform"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := lib.ScopeClustersPart(lib.ScopeClusters{Count: 1, Clusters: []lib.ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := func(parts ...lib.Part) *lib.Envelope {
+		raw, err := json.Marshal(lib.Message{Role: "user", Parts: append([]lib.Part{{Kind: "text", Text: "hi"}}, parts...)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &lib.Envelope{Payload: raw}
+	}
+	s := turnDelegateServer(tmpl, true, "/run/t.sock", msg(targets, scope))
+	var got lib.ScopeClusters
+	if err := json.Unmarshal([]byte(s.Env[EnvScopeClusters]), &got); err != nil || got.Count != 1 || len(got.Clusters) != 1 {
+		t.Errorf("scope %q (%v), want the turn's page", s.Env[EnvScopeClusters], err)
+	}
+	if s := turnDelegateServer(tmpl, true, "/run/t.sock", msg(targets)); s.Env[EnvScopeClusters] != "" {
+		t.Errorf("a turn with no page kept the template's: %q", s.Env[EnvScopeClusters])
+	}
+}

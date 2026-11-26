@@ -57,8 +57,8 @@ func withTurnMCP(d Driver, servers []coreagentwire.MCPServer) Driver {
 }
 
 // turnDelegateServer is one turn's delegate server: tmpl with the turn's
-// socket, and the submission's delegateTargets part as JSON when it has one
-// that parses, in its env. Nil when there is no template or the turn may not
+// socket, and the submission's delegateTargets part (with any scopeClusters
+// part beside it) as JSON when it has one that parses, in its env. Nil when there is no template or the turn may not
 // delegate (a task with a via, a wake, a pod with the tool off). tmpl is not
 // modified.
 func turnDelegateServer(tmpl *persona.MCPServer, delegate bool, socket string, origin *lib.Envelope) *persona.MCPServer {
@@ -71,8 +71,14 @@ func turnDelegateServer(tmpl *persona.MCPServer, delegate bool, socket string, o
 	}
 	s.Env[EnvDelegateSocket] = socket
 	delete(s.Env, EnvDelegateTargets)
+	delete(s.Env, EnvScopeClusters)
 	if raw, ok := delegateTargetsJSON(origin); ok {
 		s.Env[EnvDelegateTargets] = raw
+		// A scopeClusters part goes beside the targets, as it does on
+		// Claude Code's delegate server (withDelegateTargetsFor).
+		if scope, ok := delegateScopeJSON(origin); ok {
+			s.Env[EnvScopeClusters] = scope
+		}
 	}
 	return &s
 }
