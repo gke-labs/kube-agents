@@ -223,13 +223,18 @@ NAP_ENTRY = {
 
 # The `errorMsg` arm for a node pool whose named reservation does not exist:
 # the first of the two entries, 5 minutes apart, that a throwaway cluster (GKE
-# 1.35.8-gke.1796000) logged on 2026-11-18 (capture
-# `out-a/res-missing.ca-visibility.json`), with the project replaced. The
-# capture `out-b/res-other-zone.ca-visibility.json` of that day has the same
-# shape for a reservation that exists only in another zone.
+# 1.35.8-gke.1796000) logged on 2026-11-18, with the project replaced. A
+# second cluster of that day logged the same shape for a reservation that
+# exists only in another zone.
 RESERVATION_NOT_FOUND_GROUP = "gke-ws2-e1r-reservation-a-res-missing-01bf9e69-grp"
 RESERVATION_NOT_FOUND_GROUP_URL = (
     f"https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-a/instanceGroups/{RESERVATION_NOT_FOUND_GROUP}"
+)
+# The same group as the node pool of that cluster lists it, read on the same
+# day: the pool names the instance group manager, the autoscaler names the
+# instance group.
+RESERVATION_NOT_FOUND_POOL_GROUP_URL = (
+    f"https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-a/instanceGroupManagers/{RESERVATION_NOT_FOUND_GROUP}"
 )
 RESERVATION_NOT_FOUND_ENTRY = {
     "timestamp": "2026-11-18T16:37:13.235984554Z",
@@ -248,6 +253,17 @@ RESERVATION_NOT_FOUND_ENTRY = {
         }
     },
 }
+
+
+def reservation_not_found_entry(group, zone="us-central1-a"):
+    """A copy of the recorded entry that names another instance group. Such a
+    group name is not from a recording."""
+    entry = json.loads(json.dumps(RESERVATION_NOT_FOUND_ENTRY))
+    entry["jsonPayload"]["resultInfo"]["results"][0]["errorMsg"]["parameters"] = [
+        f"https://www.googleapis.com/compute/v1/projects/acme/zones/{zone}/instanceGroups/{group}"
+    ]
+    return entry
+
 
 # A healthy tick. The SOP's log filter does not return it; it carries neither
 # arm, so an entry like it that arrives anyway must count for nothing.
@@ -1894,7 +1910,25 @@ class AutoscalerVisibilityTest(unittest.TestCase):
         self.assertEqual(hit["object"], "ScaleUpError/scale.up.error.reservation.not.found")
         self.assertIn("2 occurrences", hit["excerpt"])
         self.assertIn("2026-11-18T16:37:13 .. 2026-11-18T16:42:26", hit["excerpt"])
-        self.assertIn(f"first affected: {RESERVATION_NOT_FOUND_GROUP}", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith(f"; first affected: {RESERVATION_NOT_FOUND_GROUP}"))
+
+    def test_a_reservation_that_was_not_found_names_each_instance_group(self):
+        """The id can cover two node pools, and §3.10(d) can file one of them.
+        The finding that stays must name the other pool's group, in each
+        order of the log."""
+        recorded, other = RESERVATION_NOT_FOUND_ENTRY, reservation_not_found_entry("gke-c1-dev-pool-grp")
+        for entries, tail in (
+            ([recorded, other], f"; first affected: {RESERVATION_NOT_FOUND_GROUP}; also affected: gke-c1-dev-pool-grp"),
+            ([other, recorded, other], f"; first affected: gke-c1-dev-pool-grp; also affected: {RESERVATION_NOT_FOUND_GROUP}"),
+        ):
+            with self.subTest(first=tail):
+                [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids(entries))
+                self.assertTrue(hit["excerpt"].endswith(tail), hit["excerpt"])
+
+    def test_a_reservation_that_was_not_found_in_many_groups_names_some_and_counts_the_rest(self):
+        entries = [reservation_not_found_entry(f"grp-{n}") for n in (7, 3, 1, 6, 2, 0, 5, 4)]
+        [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids(entries))
+        self.assertTrue(hit["excerpt"].endswith("; first affected: grp-7; also affected: grp-0, grp-1, grp-2, grp-3, grp-4 and 2 more"), hit["excerpt"])
 
     def test_a_reservation_that_was_not_found_has_its_own_impact_and_marker(self):
         """The check's own sentence is about supply, quota and pod IPs. Each
@@ -1906,6 +1940,17 @@ class AutoscalerVisibilityTest(unittest.TestCase):
                 self.assertEqual(hit["impact"], fs.RESERVATION_NOT_FOUND_IMPACT)
                 self.assertEqual(hit["needs_triage"], fs.RESERVED_POOL_TRIAGE)
 
+    def test_the_impact_of_a_reservation_that_was_not_found_is_true_after_the_fix_too(self):
+        """An entry can be 24 hours old, and the owner can have made the
+        reservation since. The sentence says what the log shows and gives the
+        condition. It does not say that the pool cannot add a node now."""
+        self.assertEqual(
+            fs.RESERVATION_NOT_FOUND_IMPACT,
+            "The autoscaler tried to add a node to a node pool that can consume only a named reservation, and that "
+            "reservation was not found. While the reservation is not in one of the pool's zones, or this project cannot "
+            "consume it, the pool cannot add a node.",
+        )
+
     def test_the_procedure_names_each_id_that_the_collector_counts(self):
         """The procedure's `Flag when` line and its remediation branches, held
         in step with the collector's set: an id that the collector files and
@@ -1913,16 +1958,27 @@ class AutoscalerVisibilityTest(unittest.TestCase):
         sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
         section = sop.read_text().split("(`autoscaler-out-of-resources`)")[1].split("\n#### ")[0]
         flag_line = next(line for line in section.splitlines() if line.startswith("- **Flag when:**"))
+        # Only the list of ids: the line names some ids again after it.
+        flag_list, list_end, _ = flag_line.partition("within the past 24 hours")
+        self.assertTrue(list_end)
         branches = [line for line in section.splitlines() if line.startswith("  - `scale.up.error.")]
         for message_id in sorted(fs.AUTOSCALER_STOCKOUT_MESSAGE_IDS):
             with self.subTest(message_id=message_id):
-                self.assertIn(f"`{message_id}`", flag_line)
+                self.assertIn(f"`{message_id}`", flag_list)
                 self.assertEqual(len([line for line in branches if line.startswith(f"  - `{message_id}`:")]), 1)
         self.assertEqual(len(branches), len(fs.AUTOSCALER_STOCKOUT_MESSAGE_IDS))
 
-    def test_the_other_ids_keep_the_check_s_own_impact(self):
-        [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids([ERROR_MSG_ENTRY]))
-        self.assertNotIn("impact", hit)
+    def test_the_other_ids_keep_the_check_s_own_impact_and_excerpt(self):
+        """Each id other than `reservation.not.found`, in two instance groups:
+        no impact of its own, and the first group only."""
+        for message_id in sorted(fs.AUTOSCALER_STOCKOUT_MESSAGE_IDS - {fs.AUTOSCALER_RESERVATION_NOT_FOUND}):
+            with self.subTest(message_id=message_id):
+                entries = [json.loads(json.dumps(ERROR_MSG_ENTRY)) for _ in range(2)]
+                for entry, group in zip(entries, (self.GROUP, "another-grp")):
+                    entry["jsonPayload"]["resultInfo"]["results"][0]["errorMsg"].update(messageId=message_id, parameters=[group])
+                [hit] = fs.check_autoscaler_out_of_resources(fs.autoscaler_message_ids(entries))
+                self.assertNotIn("impact", hit)
+                self.assertTrue(hit["excerpt"].endswith(f"; first affected: {self.GROUP}"), hit["excerpt"])
 
 
 class SpotScarcityTest(unittest.TestCase):
@@ -4192,8 +4248,20 @@ class ReservedPoolTest(unittest.TestCase):
     @staticmethod
     def pool_with_group(name, reservation, **config):
         """A reserved pool with the instance group that the recorded autoscaler
-        entry names."""
-        return {**reserved_node_pool(name, reservation, **config), "instanceGroupUrls": [RESERVATION_NOT_FOUND_GROUP_URL]}
+        entry names, as the pool lists it."""
+        return {**reserved_node_pool(name, reservation, **config), "instanceGroupUrls": [RESERVATION_NOT_FOUND_POOL_GROUP_URL]}
+
+    @staticmethod
+    def pool_with_groups(name, reservation, *groups, zones=("us-central1-c",)):
+        """A reserved pool with one instance group in each of its zones, as a
+        pool lists them. A group that is not the recorded one has a name that
+        is not from a recording."""
+        urls = [f"https://www.googleapis.com/compute/v1/projects/acme/zones/{zone}/instanceGroupManagers/{group}" for zone, group in zip(zones, groups)]
+        return {**reserved_node_pool(name, reservation, zones=zones), "instanceGroupUrls": urls}
+
+    # A regional pool has one instance group for each zone.
+    REGIONAL_ZONES = ("us-central1-b", "us-central1-a", "us-central1-c")
+    REGIONAL_GROUPS = ("gke-c1-res-missing-b-grp", RESERVATION_NOT_FOUND_GROUP, "gke-c1-res-missing-c-grp")
 
     def sign(self, groups=(RESERVATION_NOT_FOUND_GROUP,)):
         """What `collect_cluster` leaves on an entry whose autoscaler log has
@@ -4215,6 +4283,12 @@ class ReservedPoolTest(unittest.TestCase):
 
     def test_the_pool_s_instance_groups_are_named_without_their_url(self):
         self.assertEqual(fs.reserved_pool(self.pool_with_group("res-pool", "r1"), "acme")["groups"], [RESERVATION_NOT_FOUND_GROUP])
+
+    def test_a_group_url_that_is_no_string_names_no_group(self):
+        """GKE returns strings. A value of another type must not cost the
+        cluster: the pool is still a reserved pool."""
+        pool = {**reserved_node_pool("res-pool", "r1"), "instanceGroupUrls": [None, RESERVATION_NOT_FOUND_POOL_GROUP_URL, 7]}
+        self.assertEqual(fs.reserved_pool(pool, "acme")["groups"], [RESERVATION_NOT_FOUND_GROUP])
 
     def test_a_zero_node_pool_with_no_autoscaling_is_reserved_too(self):
         """The shape the seeded fixture plants: GKE omits `autoscaling` and
@@ -4374,6 +4448,34 @@ class ReservedPoolTest(unittest.TestCase):
         entry = self.filed(self.pool_with_group("res-missing", "no-such-reservation"), **self.sign())
         self.assertEqual(self.checks_filed(entry), [(self.SLUG, "NodePool/res-missing")])
 
+    def test_the_sign_for_one_group_of_the_filed_pools_is_not_a_second_finding(self):
+        """The filed pools can have more groups than the sign names: a regional
+        pool has one group for each zone, and a cluster can have a second
+        filed pool."""
+        regional = self.pool_with_groups("res-missing", "no-such-reservation", *self.REGIONAL_GROUPS, zones=self.REGIONAL_ZONES)
+        second = self.pool_with_groups("res-missing-2", "no-such-reservation", "gke-c1-res-missing-2-grp")
+        for why, pools in (
+            ("a regional pool", [regional]),
+            ("two filed pools", [self.pool_with_group("res-missing", "no-such-reservation"), second]),
+        ):
+            with self.subTest(why=why):
+                entry = self.filed(*pools, **self.sign())
+                self.assertEqual(self.checks_filed(entry), [(self.SLUG, f"NodePool/{pool['name']}") for pool in pools])
+
+    def test_the_sign_stays_when_the_reservations_of_the_owner_project_were_not_read(self):
+        """This arm did not compare the pool, so the sign is the only finding
+        of the fault."""
+        entry = self.filed(self.pool_with_group("res-missing", "no-such-reservation"), read=(), **self.sign())
+        self.assertEqual(self.checks_filed(entry), [(self.SIGN_SLUG, self.SIGN_OBJECT)])
+        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG])
+
+    def test_the_fleet_keeps_the_sign_when_the_reservations_read_fails(self):
+        _, cluster = self.fleet(
+            self.pool_with_group("res-missing", "no-such-reservation"), reservations_rc=1, log_entries=[RESERVATION_NOT_FOUND_ENTRY]
+        )
+        self.assertEqual([c for c in self.checks_filed(cluster) if c[0] in (self.SLUG, self.SIGN_SLUG)], [(self.SIGN_SLUG, self.SIGN_OBJECT)])
+        self.assertIn(self.SLUG, {e["check"] for e in cluster["checks_unevaluated"]})
+
     def test_the_sign_stays_when_this_arm_filed_nothing_for_its_group(self):
         present = [listed_reservation("r1", "us-central1-c")]
         for why, pools, reservations, groups in (
@@ -4418,6 +4520,43 @@ class ReservedPoolTest(unittest.TestCase):
         _, cluster = self.fleet(self.pool_with_group("dev-pool", "no-such-reservation"), log_entries=[RESERVATION_NOT_FOUND_ENTRY])
         self.assertEqual([c for c in self.checks_filed(cluster) if c[0] in (self.SLUG, self.SIGN_SLUG)], [(self.SIGN_SLUG, self.SIGN_OBJECT)])
 
+    def test_the_fleet_files_one_finding_for_a_regional_pool_whichever_group_the_sign_names(self):
+        """The pool lists three groups and the autoscaler names one, two or
+        three of them."""
+        regional = self.pool_with_groups("res-missing", "no-such-reservation", *self.REGIONAL_GROUPS, zones=self.REGIONAL_ZONES)
+        # For the recorded group, the copy is equal to the recorded entry.
+        entry_of = {group: reservation_not_found_entry(group, zone) for zone, group in zip(self.REGIONAL_ZONES, self.REGIONAL_GROUPS)}
+        self.assertEqual(entry_of[RESERVATION_NOT_FOUND_GROUP], RESERVATION_NOT_FOUND_ENTRY)
+        for named in (*([group] for group in self.REGIONAL_GROUPS), list(self.REGIONAL_GROUPS)):
+            with self.subTest(named=named):
+                _, cluster = self.fleet(regional, log_entries=[entry_of[group] for group in named])
+                self.assertEqual([c for c in self.checks_filed(cluster) if c[0] in (self.SLUG, self.SIGN_SLUG)], [(self.SLUG, "NodePool/res-missing")])
+
+    def test_the_fleet_keeps_the_sign_for_the_pool_that_this_arm_did_not_file(self):
+        """A production pool and a `dev` pool, each with the sign: this arm
+        files the first, and the sign stays for the second, in each order of
+        the log. Its excerpt names the group of the `dev` pool."""
+        production = self.pool_with_group("res-missing", "no-such-reservation")
+        dev = self.pool_with_groups("dev-pool", "no-such-reservation", "gke-c1-dev-pool-grp")
+        of_production, of_dev = RESERVATION_NOT_FOUND_ENTRY, reservation_not_found_entry("gke-c1-dev-pool-grp", zone="us-central1-c")
+        for why, entries in (("the production pool is first in the log", [of_production, of_dev]), ("the dev pool is first in the log", [of_dev, of_production])):
+            with self.subTest(why=why):
+                _, cluster = self.fleet(production, dev, log_entries=entries)
+                self.assertEqual(
+                    [c for c in self.checks_filed(cluster) if c[0] in (self.SLUG, self.SIGN_SLUG)],
+                    [(self.SIGN_SLUG, self.SIGN_OBJECT), (self.SLUG, "NodePool/res-missing")],
+                )
+                [sign] = [c for c in cluster["candidates"] if c["check"] == self.SIGN_SLUG]
+                self.assertIn("gke-c1-dev-pool-grp", sign["excerpt"])
+
+    def test_the_sign_of_two_pools_that_this_arm_does_not_flag_names_both_groups(self):
+        first = self.pool_with_group("dev-pool", "no-such-reservation")
+        second = self.pool_with_groups("qa-pool", "no-such-reservation", "gke-c1-qa-pool-grp")
+        entries = [RESERVATION_NOT_FOUND_ENTRY, reservation_not_found_entry("gke-c1-qa-pool-grp", zone="us-central1-c")]
+        _, cluster = self.fleet(first, second, log_entries=entries)
+        [sign] = [c for c in cluster["candidates"] if c["check"] in (self.SLUG, self.SIGN_SLUG)]
+        self.assertTrue(sign["excerpt"].endswith(f"; first affected: {RESERVATION_NOT_FOUND_GROUP}; also affected: gke-c1-qa-pool-grp"), sign["excerpt"])
+
     def test_an_entry_with_no_reserved_pool_is_left_as_it_is(self):
         entry = {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"}
         fs.file_reserved_pools(entry, {}, frozenset({"acme"}))
@@ -4439,9 +4578,9 @@ class ReservedPoolTest(unittest.TestCase):
         # Stamped, since the slug's record is gone.
         self.assertIn("kubectl get computeclasses", candidate["command"])
 
-    def fleet(self, pool, *, reservations_rc=0, reservations=(), log_entries=None):
-        """One project, one cluster whose listing carries `pool`."""
-        listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": [pool]}])
+    def fleet(self, *pools, reservations_rc=0, reservations=(), log_entries=None):
+        """One project, one cluster whose listing carries `pools`."""
+        listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": list(pools)}])
 
         def run(argv, **kwargs):
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:

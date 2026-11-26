@@ -663,18 +663,28 @@ RESERVED_POOL_TRIAGE = "reserved-pool"
 RESERVED_POOLS_KEY = "_reserved_pools"
 RESERVATION_ZONES_KEY = "_reservation_zones"
 # §3.11 for `scale.up.error.reservation.not.found`: the sentence of this id,
-# since the check's own sentence is about supply, quota and pod IPs.
+# since the check's own sentence is about supply, quota and pod IPs. It says
+# what the log shows and gives the condition, not a present state: an entry
+# can be 24 hours old, and the owner can have made the reservation since.
 RESERVATION_NOT_FOUND_IMPACT = (
     "The autoscaler tried to add a node to a node pool that can consume only a named reservation, and that "
-    "reservation was not found, so the pool cannot add a node until the reservation exists in one of the pool's "
-    "zones and this project can consume it."
+    "reservation was not found. While the reservation is not in one of the pool's zones, or this project cannot "
+    "consume it, the pool cannot add a node."
 )
+# The slug of §3.11.
+AUTOSCALER_CHECK = "autoscaler-out-of-resources"
 # The kind of a §3.11 finding's object, `ScaleUpError/<message id>`.
 SCALE_UP_ERROR_KIND = "ScaleUpError"
 # Entry key that carries the instance groups of that id's entries to
 # `collect_fleet`, which removes it: §3.10(d) files the same fault on the
 # node pool, and one fault is one finding.
 RESERVATION_SIGN_GROUPS_KEY = "_reservation_sign_groups"
+# The key of a reserved pool's instance group names, which `reserved_pool`
+# writes and `file_reserved_pools` reads.
+RESERVED_POOL_GROUPS_KEY = "groups"
+# How many more instance groups the excerpt of that id names after the first;
+# the rest are a count.
+RESERVATION_SIGN_MORE_GROUPS_SHOWN = 5
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
@@ -2205,8 +2215,9 @@ def reserved_pool(pool: dict, project: str) -> dict | None:
         "pool": pool.get("name", ""),
         "zones": sorted(zones),
         "reservations": sorted(reservation_owner(value, project) for value in values),
-        # By name, as the autoscaler's `reservation.not.found` entries are compared.
-        "groups": sorted(url.rsplit("/", 1)[-1] for url in pool.get("instanceGroupUrls") or []),
+        # By name, as the autoscaler's `reservation.not.found` entries are
+        # compared. A value that is no string names no group.
+        RESERVED_POOL_GROUPS_KEY: sorted(url.rsplit("/", 1)[-1] for url in pool.get("instanceGroupUrls") or [] if isinstance(url, str)),
     }
 
 
@@ -2286,13 +2297,13 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
                     },
                 )
             )
-            filed_groups.update(reserved.get("groups", []))
+            filed_groups.update(reserved.get(RESERVED_POOL_GROUPS_KEY, []))
     sign_groups = entry.pop(RESERVATION_SIGN_GROUPS_KEY, None)
     if sign_groups and set(sign_groups) <= filed_groups:
         # One fault, one finding: each group that the autoscaler named is of a
         # pool filed above, and that finding's impact names the autoscaler's
         # id. The log read stays recorded as run.
-        sign = ("autoscaler-out-of-resources", f"{SCALE_UP_ERROR_KIND}/{AUTOSCALER_RESERVATION_NOT_FOUND}")
+        sign = (AUTOSCALER_CHECK, f"{SCALE_UP_ERROR_KIND}/{AUTOSCALER_RESERVATION_NOT_FOUND}")
         entry["candidates"] = [c for c in entry["candidates"] if (c["check"], c["object"]) != sign]
     limitations: list[str] = []
     if unread:
@@ -2408,7 +2419,9 @@ def check_autoscaler_out_of_resources(
     create case is the one the sweep must not open unattended.
 
     A `reservation.not.found` finding carries its own impact sentence and is
-    marked `RESERVED_POOL_TRIAGE`, class-backed or not.
+    marked `RESERVED_POOL_TRIAGE`, class-backed or not. Its excerpt names each
+    instance group and not only the first: the id can cover two node pools,
+    and §3.10(d) can file one of them and leave this finding for the other.
     """
     hits = []
     for message_id in sorted(message_ids):
@@ -2427,12 +2440,19 @@ def check_autoscaler_out_of_resources(
             if seen["first_seen"]
             else ""
         )
+        also = ""
+        if message_id == AUTOSCALER_RESERVATION_NOT_FOUND:
+            more = sorted({param.rsplit("/", 1)[-1] for param in seen["parameters"][1:]} - {where})
+            shown = more[:RESERVATION_SIGN_MORE_GROUPS_SHOWN]
+            if shown:
+                rest = len(more) - len(shown)
+                also = f"; also affected: {', '.join(shown)}{f' and {rest} more' if rest else ''}"
         hit = {
             "object": f"{SCALE_UP_ERROR_KIND}/{message_id}",
             "excerpt": (
                 f"{message_id}, {seen['count']} occurrence"
                 f"{'' if seen['count'] == 1 else 's'} in the autoscaler "
-                f"visibility log{window}; first affected: {where}"
+                f"visibility log{window}; first affected: {where}{also}"
             ),
         }
         class_backed = bool(seen["parameters"]) and all(

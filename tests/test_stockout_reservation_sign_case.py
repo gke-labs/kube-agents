@@ -55,21 +55,22 @@ import audit_report  # noqa: E402
 import fleet_stockout  # noqa: E402
 
 # The recorded log entries of the collector's own tests: the entry for a
-# missing reservation (GKE 1.35.8, 2026-11-18), its instance group, and an
-# entry for a stockout (2026-08-14).
+# missing reservation (GKE 1.35.8, 2026-11-18), its instance group as the node
+# pool lists it, and an entry for a stockout (2026-08-14).
 from test_fleet_stockout import (  # noqa: E402
     ERROR_MSG_ENTRY,
     RESERVATION_NOT_FOUND_ENTRY,
-    RESERVATION_NOT_FOUND_GROUP_URL,
+    RESERVATION_NOT_FOUND_POOL_GROUP_URL,
 )
 
 PROJECT = "acme"
 ZONE = "us-central1-a"
 SLOT_A = {"name": "seeded-a", "project": PROJECT, "location": ZONE, "autopilot": False}
 RESERVATION = {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": ["seeded-absent-reservation"]}
-# The instance group of slot a's other reservation pool. The name is not from
-# a recording; it must only differ from the group of the recorded entry.
-OTHER_GROUP_URL = f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/zones/{ZONE}/instanceGroups/gke-seeded-a-missing-reservation-pool-grp"
+# The instance group of slot a's other reservation pool, in the form that a
+# node pool lists. The name is not from a recording; it must only differ from
+# the group of the recorded entry.
+OTHER_GROUP_URL = f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/zones/{ZONE}/instanceGroupManagers/gke-seeded-a-missing-reservation-pool-grp"
 # What a worker writes as the impact of a finding.
 WORKER_IMPACT = "The pod of reserved-batch stays Pending."
 
@@ -95,7 +96,7 @@ def _reserved_pool(name: str, role: str, group_url: str, **more) -> dict:
 
 # The fixture's pool. The recorded entry names the instance group of the
 # cluster that logged it, so the pool here has that group.
-DEV_RESERVED_POOL = _reserved_pool("dev-reserved-pool", ROLE, RESERVATION_NOT_FOUND_GROUP_URL, autoscaling={"enabled": True, "maxNodeCount": 1})
+DEV_RESERVED_POOL = _reserved_pool("dev-reserved-pool", ROLE, RESERVATION_NOT_FOUND_POOL_GROUP_URL, autoscaling={"enabled": True, "maxNodeCount": 1})
 # Slot a's pool with no autoscaling (role missing-reservation-pool).
 MISSING_RESERVATION_POOL = _reserved_pool("missing-reservation-pool", "missing-reservation", OTHER_GROUP_URL)
 
