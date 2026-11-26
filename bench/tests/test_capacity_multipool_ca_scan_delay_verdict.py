@@ -8,7 +8,8 @@ objective grades one labeled line under ``fold_decoration: true``:
   (echoing the prompt's symptom or blaming stockout/quota/taints does not pass).
 - ``TARGETING:`` must name ``cloud.google.com/default-compute-class`` (or its
   ``-non-daemonset`` variant) on the ``TARGETING:`` line itself, unnegated,
-  unhedged, and without pairing a pod-level or per-Deployment alternative.
+  unhedged, and without pairing another key, flag, or per-Deployment
+  alternative.
 - ``HEADROOM:`` must name ``capacitybuffer(s).autoscaling.x-k8s.io``,
   ``autoscaling.x-k8s.io(/v...)/CapacityBuffer(s)``, or ``CapacityBuffer(s)``
   paired with ``autoscaling.x-k8s.io`` on the ``HEADROOM:`` line itself (prose
@@ -100,6 +101,9 @@ def test_accepts_variant_cause_targeting_and_headroom_forms():
         "CAUSE: With no scan pruning, Cluster Autoscaler simulates scheduling across all 28 pools.",
         "CAUSE: Untargeted pods have no selector, so there is no evaluation shortcut; CA scans all 28 pools.",
         "CAUSE: Not a zonal stockout — Cluster Autoscaler evaluates scheduling predicates across every node pool.",
+        "CAUSE: Not a zonal GPU stockout — Cluster Autoscaler evaluates scheduling predicates across every node pool.",
+        "CAUSE: With no quota limit, Cluster Autoscaler evaluates scheduling predicates across all 28 node pools.",
+        "CAUSE: Not a quota issue; Cluster Autoscaler evaluates scheduling predicates across all 28 node pools.",
     ):
         assert _passes(cause, CHECK_CAUSE), cause
 
@@ -108,6 +112,10 @@ def test_accepts_variant_cause_targeting_and_headroom_forms():
         'TARGETING: metadata.labels["cloud.google.com/default-compute-class"]',
         "TARGETING: namespace label cloud.google.com/default-compute-class-non-daemonset",
         "TARGETING: cloud.google.com/default-compute-class or cloud.google.com/default-compute-class-non-daemonset",
+        "TARGETING: cloud.google.com/default-compute-class-non-daemonset or cloud.google.com/default-compute-class",
+        "TARGETING: `cloud.google.com/default-compute-class` or `cloud.google.com/default-compute-class-non-daemonset`",
+        'TARGETING: "cloud.google.com/default-compute-class" or "cloud.google.com/default-compute-class-non-daemonset"',
+        "TARGETING: cloud.google.com/default-compute-class (or cloud.google.com/default-compute-class-non-daemonset)",
     ):
         assert _passes(targeting, CHECK_TARGETING), targeting
 
@@ -133,10 +141,15 @@ def test_rejects_prompt_echo_and_wrong_causes():
         # Taint mismatch without per-pool evaluation/simulation/scanning.
         "CAUSE: Untargeted pods do not match the taints on all 28 GPU node pools.",
         "CAUSE: Untargeted pods fail taint checks on all 28 GPU node pools.",
-        # Unrelated root causes, even when naming all pools or scan.
+        # Unrelated root causes, even when naming all pools or scan, or after negating another cause.
         "CAUSE: Zonal GPU stockout delays node provisioning by 12 minutes.",
         "CAUSE: Zonal GPU stockout across all 28 node pools delays the Cluster Autoscaler scan.",
+        "CAUSE: With no quota limit, a zonal GPU stockout across all 28 node pools delays the Cluster Autoscaler scan.",
+        "CAUSE: Not a stockout; Cluster Autoscaler has a 12-minute cooldown across all 28 node pools on each scan.",
+        "CAUSE: With no quota exhaustion, image pull latency across all 28 GPU node pools delays the scan.",
+        "CAUSE: Not a zonal stockout; there is a GPU stockout across all 28 node pools on each scan.",
         "CAUSE: Quota checks failed across all 28 GPU node pools.",
+        "CAUSE: Quota limits across all 28 GPU node pools delay the Cluster Autoscaler scan.",
         "CAUSE: Cluster Autoscaler has a 12-minute scale-up cooldown.",
         # Negated or hedged cause.
         "CAUSE: Not per-pool evaluation; it is image pull latency.",
@@ -158,18 +171,25 @@ def test_rejects_wrong_negated_or_unanchored_targeting():
         "TARGETING: cloud.google.com/default-compute-class-daemonset",
         "TARGETING: cloud.google.com/default-compute-class/invalid",
         "TARGETING: cloud.google.com/default-compute-class.invalid",
-        # Per-Deployment, nodeSelector, or wrong alternative paired with or.
+        # Per-Deployment, nodeSelector, or wrong alternative paired with or (on either side or with invalid suffix).
         "TARGETING: spec.template.spec.nodeSelector",
         "TARGETING: per-Deployment GitOps PRs with cloud.google.com/default-compute-class",
         "TARGETING: per deployment manifests with cloud.google.com/default-compute-class",
         "TARGETING: cloud.google.com/default-compute-class or node_selector",
         "TARGETING: cloud.google.com/default-compute-class or cloud.google.com/compute-class",
+        "TARGETING: cloud.google.com/default-compute-class or cloud.google.com/default-compute-class-daemonset",
+        "TARGETING: cloud.google.com/default-compute-class or cloud.google.com/default-compute-class/invalid",
+        "TARGETING: cloud.google.com/default-compute-class or cloud.google.com/default-compute-class.invalid",
+        "TARGETING: cloud.google.com/machine-family or cloud.google.com/default-compute-class",
+        "TARGETING: --enable-default-compute-class or cloud.google.com/default-compute-class",
+        "TARGETING: foo.cloud.google.com/default-compute-class or cloud.google.com/default-compute-class-non-daemonset",
         # Negated or hedged.
         "TARGETING: do not use cloud.google.com/default-compute-class",
         "TARGETING: avoid cloud.google.com/default-compute-class",
         "TARGETING: cloud.google.com/default-compute-class?",
-        # Only mentioned in prose, not on TARGETING line.
+        # Only mentioned in prose or on another line, not on TARGETING line.
         "Set cloud.google.com/default-compute-class on the namespace.\nTARGETING: nodeSelector",
+        "TARGETING:\nHEADROOM: cloud.google.com/default-compute-class",
     ):
         assert not _passes(bad_targeting, CHECK_TARGETING), bad_targeting
 

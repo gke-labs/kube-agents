@@ -19,7 +19,7 @@
 #   per-pool evaluation.
 # - `TARGETING:` must name `cloud.google.com/default-compute-class` (or
 #   `-non-daemonset`) on the `TARGETING:` line itself, unnegated, unhedged,
-#   and without pairing a pod-level/per-Deployment alternative.
+#   and without pairing another key, flag, or per-Deployment alternative.
 # - `HEADROOM:` must name `capacitybuffer(s).autoscaling.x-k8s.io`,
 #   `autoscaling.x-k8s.io(/v...)/CapacityBuffer(s)`, or `CapacityBuffer(s)`
 #   paired with the `autoscaling.x-k8s.io` API group on the `HEADROOM:` line
@@ -91,7 +91,7 @@ verification_spec:
         - "(?m)^cause:[^\\n]*\\?"
         - "(?m)^cause:[^\\n]*\\b(?:not|never|isn't|aren't|doesn't|don't|cannot|can't)\\s+(?:a\\s+|the\\s+|caused\\s+by\\s+|due\\s+to\\s+|from\\s+)?(?:per[\\s-]+(?:node[\\s-]+)?(?:pool|group)|multi[\\s-]+pool|scan(?:s|ning|\\s+loop)?|predicates?|evaluat(?:e|es|ing|ion)|simulat(?:e|es|ing|ion)|iterat(?:e|es|ing|ion))"
         - "(?m)^cause:[^\\n]*\\b(?:evaluation|simulation|scanning|predicates?)\\s+(?:across[^\\n]{0,40})?(?:is|are)\\s+not\\b"
-        - "(?m)^cause:(?![^\\n]*\\b(?:not|no)\\s+(?:a\\s+)?(?:zonal\\s+|gpu\\s+|capacity\\s+)?(?:stockout|quota|cooldown))[^\\n]*\\b(?:stockouts?|out\\s+of\\s+stock|quota\\s+(?:limit|exceeded|exhaust(?:ed|ion)|check)|cooldown|image\\s+pull)\\b"
+        - "(?m)^cause:[^\\n]*(?<!\\bnot )(?<!\\bno )(?<!\\bnot a )(?<!\\bnot an )(?<!\\bnot the )(?<!\\bnot zonal )(?<!\\bno zonal )(?<!\\bnot a zonal )(?<!\\bnot gpu )(?<!\\bno gpu )(?<!\\bnot a gpu )(?<!\\bnot zonal gpu )(?<!\\bno zonal gpu )(?<!\\bnot a zonal gpu )(?<!\\bnot capacity )(?<!\\bno capacity )(?<!\\bnot a capacity )(?<!\\bnot due to )(?<!\\bnot due to a )(?<!\\bnot caused by )(?<!\\bnot caused by a )\\b(?:stockouts?|out of stock|quota (?:limits?|exceeded|exhaust(?:ed|ion)|checks?)|cooldowns?|image[ -]pulls?)\\b"
   - name: targeting-names-namespace-default-compute-class
     role: objective
     mode: assert
@@ -99,9 +99,9 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - "(?m)^targeting:\\s*(?:[^\\n]*[\\s\"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9/-]|\\.[a-z0-9])"
+        - "(?m)^targeting:[ \\t]*(?:[^\\n]*[ \"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9/-]|\\.[a-z0-9])"
       forbidden_patterns:
-        - "(?m)^targeting:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|\\bavoid\\b|\\bcannot\\b|can't|don't|doesn't|isn't|won't|\\binstead\\b|per[\\s-]+deployment|node[\\s-]*selector|node[\\s-]*affinity|cloud\\.google\\.com/compute-class\\b|;|\\?|\\bor\\b(?!\\s+(?:the\\s+|label\\s+)?cloud\\.google\\.com/default-compute-class))"
+        - "(?m)^targeting:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|\\bavoid\\b|\\bcannot\\b|can't|don't|doesn't|isn't|won't|\\binstead\\b|per[ -]+deployment|node[ -]*selector|node[ -]*affinity|cloud\\.google\\.com/compute-class\\b|;|\\?|\\bor\\b(?! (?:the |label |the label )?[\"'\\[(]?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9/-]|\\.[a-z0-9]))|(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class[\"'\\])] )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class \\()(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class-non-daemonset )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class-non-daemonset[\"'\\])] )(?<![ \"'\\[(]cloud\\.google\\.com/default-compute-class-non-daemonset \\()\\bor\\b)"
   - name: headroom-names-capacitybuffers-api-resource
     role: objective
     mode: assert
