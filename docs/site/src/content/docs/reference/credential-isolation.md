@@ -149,6 +149,7 @@ It is a floor rather than an ownership check — the broker can tell that a push
 - the file-system monitor disabled;
 - commit signing disabled, along with the signing program of every signature format git supports rather than just the default one;
 - subcommand autocorrection off;
+- a push kept in the repository the command names, so `git` does not also push inside its submodules;
 - both of the editors `git` launches set to a command that does nothing. The broker has no terminal, so nothing that needed one could have worked anyway.
 
 On the defence-in-depth argument gate behind `/v1/exec` (which itself refuses `git` in favor of the `/v1/vcs/*` routes described below), the proxy also refuses, in the argument array, the global options that would undo any of that:
