@@ -124,7 +124,7 @@ The gateway checks the key each caller sends. The chart runs LiteLLM with a mast
 - A key listed under the reserved class `gateway-probe` reaches `GET /v1/models` and nothing else. It lets a readiness check confirm that a gateway pod has loaded the current map without sending any caller's key.
 - Any other key is refused with HTTP 401.
 
-An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
+An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`, and the Gemini-format generation calls `/v1beta/models/<model>:generateContent`, `:streamGenerateContent` and `:countTokens`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
 
 `litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart.
 
