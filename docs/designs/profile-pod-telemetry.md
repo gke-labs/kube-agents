@@ -129,10 +129,10 @@ The task credential carries the task, the profile, the tier and the trigger toda
 through the mint line of the dispatcher, which has the `jti`. A `correlationId` claim is a change
 of `a2a/taskcred` and of both verifiers (question 7).
 
-The write-permit design (pull request [#7130](https://github.com/gke-labs/kube-agents/pull/7130),
-open, not merged) has a row for the broker's line of an admitted unattended write. That line and the
-record of this document must be one record; the keys follow one decision. A route that another
-design opens to a profile writes the same record.
+The write-permit design ([`unattended-write-permit.md`](unattended-write-permit.md)) has a row for
+the broker's line of an admitted unattended write. That line and the record of this document must
+be one record; the keys follow one decision. A route that another design opens to a profile writes
+the same record.
 
 The requester keys follow
 [`audit-logging-user-attribution.md`](audit-logging-user-attribution.md).
