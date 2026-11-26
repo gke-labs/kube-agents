@@ -10211,6 +10211,19 @@ spec:
                             - session
                             - platform
                           type: string
+                        dmSessionIdleMinutes:
+                          description: |-
+                            DMSessionIdleMinutes replaces SessionIdleMinutes for a DM conversation
+                            with one message so far (A2A_DM_IDLE_TTL): most DMs are a single
+                            question, and a session pod held for the full idle time after its answer
+                            takes a slot of maxSessions. A delegation the pod makes to answer doesn't
+                            count as a message. A second message puts the conversation back
+                            on SessionIdleMinutes. Unset, the gateway's default of 5 applies. A
+                            value above SessionIdleMinutes has no effect beyond it.
+                          format: int32
+                          maximum: 10080
+                          minimum: 1
+                          type: integer
                         maxInProgress:
                           description: |-
                             MaxInProgress caps how many kanban workers run concurrently across the whole
@@ -10471,6 +10484,20 @@ spec:
                                 "(has(self.restartGraceSeconds) ? self.restartGraceSeconds
                                 : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds
                                 : 20)"
+                        sessionIdleMinutes:
+                          description: |-
+                            SessionIdleMinutes is how long a session pod is kept after the last
+                            message in its conversation before the gateway reaps it (A2A_IDLE_TTL).
+                            A running task always keeps its pod, and the next message after a reap
+                            gets a new pod with the conversation's history. Unset, the gateway's
+                            default of 30 applies. It also bounds how long a Slack thread stays live
+                            without a fresh mention after its last task. A session pod also ends at
+                            its 4-hour maximum lifetime, so above 240 the value only lengthens that
+                            Slack thread liveness.
+                          format: int32
+                          maximum: 10080
+                          minimum: 1
+                          type: integer
                         sessionResources:
                           description: |-
                             SessionResources are the A2A session pods' CPU and memory requests and
@@ -10555,6 +10582,32 @@ spec:
                                 || k == 'memory')"
                             - message: sessionResources may not set claims
                               rule: "!has(self.claims) || size(self.claims) == 0"
+                        warmSessions:
+                          description: |-
+                            WarmSessions is how many warm A2A session pods the gateway keeps ready
+                            on the session route, so a new conversation's first turn is handed a
+                            running pod instead of waiting for one to be scheduled and its image
+                            pulled. Unset means 1. Each warm pod holds one session pod's requests
+                            while it waits (sessionResources: 150m CPU and 320Mi by default, billed
+                            on Autopilot, where without Pod bursting the per-Pod minimum of 250m and
+                            512Mi applies), so the default costs one session pod's requests per
+                            install; 0 turns the pool off.
+
+                            A warm pod becomes the conversation's session pod as it is, with exactly
+                            the identity and reach a freshly started one would have; one unclaimed
+                            for 25 minutes is replaced. The pool never takes the session cap's last
+                            slot: it keeps at most the effective cap less one (none below a cap of
+                            2), and fewer while live conversations fill the cap. Each warm pod
+                            takes one TASKS consumer and one pod in the session ResourceQuota, and
+                            only consumers the session cap leaves spare: a TASKS stream with none
+                            spare runs without a warm pod (status.effectiveWarmSessions) rather
+                            than losing a session, and a new stream is created with room for
+                            them. On the platform route, which an unset defaultRoute means, no
+                            warm pod runs and nothing is rendered for one. A change rolls the
+                            gateway on the session route.
+                          maximum: 100
+                          minimum: 0
+                          type: integer
                       type: object
                       x-kubernetes-validations:
                         - message:
@@ -12828,6 +12881,17 @@ spec:
                     explicit profile it repeats that profile. Absent before the first pass
                     that resolved it.
                   type: string
+                effectiveWarmSessions:
+                  description: |-
+                    EffectiveWarmSessions is how many warm session pods the operator
+                    renders on the session route: spec.harness.tuning.warmSessions,
+                    bounded by the effective session cap less one and by the TASKS
+                    consumers the cap leaves spare. Warm pods use only spare consumers,
+                    so a stream with none spare runs without one rather than losing a
+                    session. Written with effectiveSessionCap, from the same reading.
+                    Under a served CRD that drops this field no warm pod runs until the
+                    CRD is updated.
+                  type: integer
                 inference:
                   description: |-
                     Inference reports the Platform Agent's default model, as the install's LiteLLM
@@ -12866,6 +12930,17 @@ spec:
                         SecretUIDs maps each such Secret's name to the UID it was created with.
                         A tier key's Secret is in the profile namespace; every other one is in
                         the PlatformAgent's namespace.
+                      type: object
+                    tierUnboundAt:
+                      additionalProperties:
+                        format: date-time
+                        type: string
+                      description: |-
+                        TierUnboundAt maps a tier whose key Secret is recorded to when the
+                        operator first found no bound profile listing it. While the applied
+                        dispatch config still lists such a tier as live, its key is kept for at
+                        most the drain window from then. An entry goes when a bound profile
+                        lists the tier again, and on the pass after its key is deleted.
                       type: object
                   type: object
                 lastReconcileTime:

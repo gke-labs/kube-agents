@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"regexp"
@@ -64,6 +65,14 @@ var backendArms = []backendArm{
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultWarmSessions is what WarmSessions means when A2A_WARM_SESSIONS is
+// unset: no warm pool. The operator renders the variable from
+// spec.harness.tuning.warmSessions (default 1) only on an install that
+// resolves to the session route, so unset is the platform route, where a
+// warm pod would serve nothing, or a gateway run by hand, which spends
+// nothing it was not asked to.
+const defaultWarmSessions = 0
+
 // defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
@@ -71,6 +80,15 @@ const defaultDelegationDepthMax = 3
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationWidthMax = 10
+
+// delegationRoundsEnv sets DelegationRoundsMax.
+const delegationRoundsEnv = "A2A_DELEGATION_ROUNDS_MAX"
+
+// delegationRoundsSupportedMax is the most rounds New lets DelegationRoundsMax
+// keep: one, until a profile parent's later rounds (a new batch after the
+// first's ends are delivered) land. A higher setting is clamped to it, with a
+// warning, rather than advertised to a worker the gateway would then refuse.
+const delegationRoundsSupportedMax = 1
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
 // accepts: ten, the fleet question's width (#5682). The children queue to
@@ -564,6 +582,17 @@ type Config struct {
 	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
 
+	// DMIdleTTL replaces IdleTTL for a single-turn DM: a "dm" conversation
+	// whose current pod has taken at most one human turn (#2371,
+	// A2A_DM_IDLE_TTL, default 5m). Most DMs are one question, and under
+	// sessions by default each holds a session pod, and a slot of the session
+	// cap, for the full IdleTTL after its answer. A second turn for the pod
+	// puts the conversation back on IdleTTL. A reply after the reap still
+	// works: the next turn gets a new pod, rehydrated from the context's
+	// history. Never longer than IdleTTL (Config.idleTTLFor), and counted from
+	// the answer as well as the message (Config.idleExpired).
+	DMIdleTTL time.Duration
+
 	// SessionReuse keeps one pod per conversation across turns
 	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
 	// idle goes to it, and only a conversation with no live pod gets a new
@@ -832,6 +861,17 @@ type Config struct {
 	// margin absorbs.
 	MaxSessions int
 
+	// WarmSessions is how many warm session pods the leader keeps ready
+	// (A2A_WARM_SESSIONS, warm_pool.go): pods started before a conversation
+	// needs one, so a new conversation's first turn is handed a running pod
+	// instead of waiting on scheduling and the image pull. Each costs one
+	// session pod's requests while it waits. The pool keeps
+	// min(WarmSessions, MaxSessions - 1 - live sessions) of them, so it never
+	// takes the last slot, and none below a cap of 2; 0 turns it off. It runs
+	// only with SessionReuse, since a claimed warm pod serves its
+	// conversation the way a reused pod does.
+	WarmSessions int
+
 	// SessionResources are the session pod's CPU and memory requests and
 	// limits (#2371), from A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, which
 	// the operator renders resolved from spec.harness.tuning.sessionResources
@@ -873,6 +913,20 @@ type Config struct {
 	// set up to lib.DelegateBatchMax. FromEnv refuses a value under 1, as it
 	// does the depth bound, and one over 10.
 	DelegationWidthMax int
+
+	// DelegationRoundsMax bounds how many delegate requests one profile
+	// task may make (A2A_DELEGATION_ROUNDS_MAX), each minted or refused
+	// using up one; a request past it is refused under delegation.rounds.
+	// With rounds left, a request while the last round's children still run
+	// is no new round and stays a busy ignore; with none left (the default
+	// of one) it is refused like any other. A profile task's delegateTargets part
+	// advertises it when over one.
+	//
+	// Zero means 1. New clamps it to 1 to lib.DelegateRoundsCeiling, and
+	// then to delegationRoundsSupportedMax (1) with a warning, until rounds
+	// past the first are supported. FromEnv refuses a value that is not an
+	// integer.
+	DelegationRoundsMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
 	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
@@ -1270,6 +1324,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	warmSessions := envOr("A2A_WARM_SESSIONS", strconv.Itoa(defaultWarmSessions))
+	warm, err := strconv.Atoi(warmSessions)
+	if err != nil || warm < 0 {
+		return nil, fmt.Errorf("A2A_WARM_SESSIONS %q: need an integer >= 0", warmSessions)
+	}
+	cfg.WarmSessions = warm
 	sessionResources, err := sessionResourcesFromEnv()
 	if err != nil {
 		return nil, err
@@ -1290,6 +1350,13 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
+	if v := strings.TrimSpace(os.Getenv(delegationRoundsEnv)); v != "" {
+		rm, err := strconv.Atoi(v)
+		if err != nil || rm < 1 {
+			return nil, fmt.Errorf("%s %q: need an integer from 1 to %d", delegationRoundsEnv, v, lib.DelegateRoundsCeiling)
+		}
+		cfg.DelegationRoundsMax = rm
+	}
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
 	ba, err := strconv.Atoi(busyAt)
 	if err != nil || ba < 1 {
@@ -1305,6 +1372,15 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", ttl)
 	}
 	cfg.IdleTTL = d
+	dmTTL := envOr("A2A_DM_IDLE_TTL", defaultDMIdleTTL.String())
+	dmIdle, err := time.ParseDuration(dmTTL)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_DM_IDLE_TTL %q: %w", dmTTL, err)
+	}
+	if dmIdle < time.Minute {
+		return nil, fmt.Errorf("A2A_DM_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", dmTTL)
+	}
+	cfg.DMIdleTTL = dmIdle
 
 	// The adapter's deadline, in the adapter's own units (integer seconds) —
 	// see the field comment for why the env name is shared.
@@ -1529,6 +1605,66 @@ func (c *Config) validateCapabilityCeiling() error {
 	return nil
 }
 
+// defaultDMIdleTTL is A2A_DM_IDLE_TTL's default (#2371).
+const defaultDMIdleTTL = 5 * time.Minute
+
+// singleTurnDM reports whether rec is a DM whose current pod has taken at
+// most one human turn and no steer (SteeredSession). Two things are left out
+// of the count:
+//   - a wake (Role set): a session pod without cluster access delegates every
+//     cluster read, and the child's result comes back as a wake addressed to
+//     the pod, so counting wakes would put nearly every one-question DM on
+//     IdleTTL (seen live on ka-fleet-dev-1). A delegation still running holds
+//     the conversation's active slot (the child, or a fan-out's parent), which
+//     already exempts the pod from the reap, so leaving it out of the count
+//     never reaps a pod with a result still to come;
+//   - a turn addressed to an earlier pod: a DM keyed by its channel or space
+//     (Discord, an unthreaded Google Chat DM) keeps one record across every
+//     question the user asks, and each pod mints a fresh bus session.
+func (rec *SessionRecord) singleTurnDM() bool {
+	if rec.Kind != sessionKindDM {
+		return false
+	}
+	// A follow-up steered into the running task is a second message for this
+	// pod even though it started no task.
+	if rec.SteeredSession != "" && rec.SteeredSession == rec.BusSession {
+		return false
+	}
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == "" && t.Addressee == rec.BusSession {
+			n++
+		}
+	}
+	return n <= 1
+}
+
+// idleTTLFor is the reap threshold for rec: DMIdleTTL for a single-turn DM,
+// IdleTTL otherwise. DMIdleTTL is capped at IdleTTL, so setting it higher
+// never keeps a DM's pod longer than any other conversation's, and zero (a
+// Config built without it) reads as IdleTTL.
+func (c *Config) idleTTLFor(rec *SessionRecord) time.Duration {
+	if c.DMIdleTTL > 0 && c.DMIdleTTL < c.IdleTTL && rec.singleTurnDM() {
+		return c.DMIdleTTL
+	}
+	return c.IdleTTL
+}
+
+// idleExpired reports whether rec's pod has been idle past its TTL at now.
+// The clock is the last user message (idleSince). Under the short DM TTL it
+// is the answer too, whichever is later (LastTaskActivity, which an
+// executor's terminal moves): a DM task that ran longer than DMIdleTTL would
+// otherwise lose its pod the moment the answer posts, leaving no time to
+// follow up. Under IdleTTL the answer does not move it, as before.
+func (c *Config) idleExpired(rec *SessionRecord, now time.Time) bool {
+	ttl := c.idleTTLFor(rec)
+	since := rec.idleSince()
+	if ttl < c.IdleTTL && rec.LastTaskActivity.After(since) {
+		since = rec.LastTaskActivity
+	}
+	return now.Sub(since) >= ttl
+}
+
 // sessionResourcesFromEnv reads the session pod's requests and limits from
 // A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, each defaulting to spawn.go's
 // value, and refuses an unparsable quantity or a request above its limit.
@@ -1594,3 +1730,23 @@ const envSessionHarness = "A2A_SESSION_HARNESS"
 // sessionHarnesses are the harnesses the gateway spawns session pods for.
 // Antigravity joins when its worker isolation lands.
 var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
+
+// clampDelegationRounds is the DelegationRoundsMax New keeps: unset is one, a
+// value outside 1 to lib.DelegateRoundsCeiling is clamped into it, and any
+// value over delegationRoundsSupportedMax is clamped to that, with a warning
+// naming the variable, until rounds past the first are supported.
+func clampDelegationRounds(n int, log *slog.Logger) int {
+	if n == 0 {
+		return 1
+	}
+	set := n
+	n = max(1, min(n, lib.DelegateRoundsCeiling))
+	if n > delegationRoundsSupportedMax {
+		log.Warn(delegationRoundsEnv+": rounds above 1 are not supported yet; using 1", "set", set, "using", delegationRoundsSupportedMax)
+		return delegationRoundsSupportedMax
+	}
+	if n != set {
+		log.Warn(delegationRoundsEnv+": out of range; clamped", "set", set, "using", n, "max", lib.DelegateRoundsCeiling)
+	}
+	return n
+}

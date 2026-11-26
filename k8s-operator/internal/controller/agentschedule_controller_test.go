@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -403,6 +404,54 @@ func TestAgentScheduleRecordsATerminal(t *testing.T) {
 	if s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeSucceeded || s.Status.ActiveTaskID != "" ||
 		len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Outcome != agentv1alpha1.AgentScheduleOutcomeSucceeded {
 		t.Fatalf("status = %+v", s.Status)
+	}
+}
+
+// A terminal's reason is recorded on the run and as the last reason; a reason
+// off the CRD's shape is dropped rather than failing the status write; a Lost
+// run carries none.
+func TestAgentScheduleRecordsARunsReason(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(1, 20), Reason: "deadline-exceeded"}
+	f.at(t, hourAt(1, 21))
+	s := f.get(t)
+	if s.Status.LastReason != "deadline-exceeded" || len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Reason != "deadline-exceeded" {
+		t.Fatalf("status = %+v; want the run and the last reason deadline-exceeded", s.Status)
+	}
+	// The next run is Lost: the last reason is cleared, not carried over.
+	f.tracker.state = ScheduleTaskState{Found: true}
+	f.at(t, hourAt(2, 0))
+	f.tracker.state = ScheduleTaskState{Found: false}
+	f.at(t, hourAt(3, 0))
+	s = f.get(t)
+	if s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeLost || s.Status.LastReason != "" {
+		t.Fatalf("status = %+v; want a Lost run with no reason", s.Status)
+	}
+	// A reason off the CRD's shape is dropped (knownReason). The fixture's
+	// client doesn't validate the CRD pattern; TestRunReasonShapeIsTheCRDsPattern
+	// pins that knownReason is that pattern.
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(3, 20), Reason: "not a token; with detail"}
+	f.at(t, hourAt(3, 21))
+	s = f.get(t)
+	if s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeFailed || s.Status.LastReason != "" || s.Status.RecentRuns[0].Reason != "" {
+		t.Fatalf("status = %+v; want an off-shape reason dropped", s.Status)
+	}
+}
+
+func TestKnownReason(t *testing.T) {
+	for in, want := range map[string]string{
+		"write-refused":          "write-refused",
+		"error_during_execution": "error_during_execution",
+		"":                       "",
+		"has space":              "",
+		"reason: x":              "",
+		strings.Repeat("a", 65):  "",
+	} {
+		if got := knownReason(in); got != want {
+			t.Errorf("knownReason(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -1399,6 +1448,20 @@ func TestAgentScheduleAControllerOfAnotherKindIsNotThePlatformAgent(t *testing.T
 	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
 	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
 		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
+	}
+}
+
+// TestRunReasonShapeIsTheCRDsPattern: the reconciler drops what the CRD would
+// refuse, so its shape and the generated CRD's pattern for both reason
+// fields are the same expression.
+func TestRunReasonShapeIsTheCRDsPattern(t *testing.T) {
+	crd, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "kubeagents.x-k8s.io_agentschedules.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "pattern: " + runReasonShape.String()
+	if n := strings.Count(string(crd), want); n < 2 {
+		t.Fatalf("the CRD has %d %q lines, want one each for reason and lastReason", n, want)
 	}
 }
 

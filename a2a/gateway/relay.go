@@ -111,6 +111,10 @@ var reasonSentences = map[string]string{
 	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
 	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
+	// A profile task the dispatcher settled with no terminal on the bus
+	// (#5301): its result could not be recorded, so whether the work ran is
+	// unknown here.
+	"terminal-unpublished": "this request's result could not be delivered, so check whether the work was done before you ask again",
 	// A script-run task's worker (#5622): refused before the script ran,
 	// the script failed, or it ran past its bound.
 	"script-refused": "the worker refused to run this scheduled script, and its log says why",
@@ -166,6 +170,16 @@ const (
 	kvRetryAttempts = 3
 	kvRetryPause    = 200 * time.Millisecond
 	requeueDelay    = 2 * time.Second
+	// profileNamesHoldDelay is how long a five-token supervisor event the
+	// relay refused while the profile names were not loaded waits before it
+	// comes back: the names file is re-read every 30 seconds.
+	profileNamesHoldDelay = 30 * time.Second
+	// profileNamesHoldLimit is how many times the relay gives such an event
+	// back before it stops waiting for the names: the relay durable has no
+	// MaxDeliver, so with a cutoff set and no names file at all the event
+	// would come back every profileNamesHoldDelay for good. Twenty is ten
+	// minutes, many re-reads of a file that is rendered or not.
+	profileNamesHoldLimit = 20
 )
 
 // relayMaxAckPending caps the events the relay holds unrendered on its
@@ -343,12 +357,17 @@ func (g *Gateway) retryAck(item relayItem) {
 // requeueDelay, for a try that may succeed then; an item that didn't come
 // off the durable is requeued in memory instead.
 func (g *Gateway) giveBackLater(item relayItem) {
+	g.giveBackAfter(item, requeueDelay)
+}
+
+// giveBackAfter is giveBackLater after delay.
+func (g *Gateway) giveBackAfter(item relayItem, delay time.Duration) {
 	if item.d == nil {
 		sessionKey := g.sessionForTask(g.runCtx, item.env.TaskID)
 		go func() {
 			select {
 			case <-g.runCtx.Done():
-			case <-time.After(requeueDelay):
+			case <-time.After(delay):
 				if sessionKey != "" {
 					g.events.enqueue(sessionKey, item)
 				}
@@ -360,7 +379,7 @@ func (g *Gateway) giveBackLater(item relayItem) {
 		// Stopping: the subscription's stop gives it back in stream order.
 		return
 	}
-	if err := item.d.Nak(requeueDelay); err != nil {
+	if err := item.d.Nak(delay); err != nil {
 		g.log.Warn("relay: give-back failed", "taskId", item.env.TaskID, "err", err)
 	}
 }
@@ -373,6 +392,100 @@ func firstDeliveryLevel(item relayItem) slog.Level {
 		return slog.LevelError
 	}
 	return slog.LevelDebug
+}
+
+// namesHolds counts, per message, the times the relay held a five-token
+// supervisor event because the profile names were not loaded
+// (profileNamesHoldLimit). The delivery's own count (NumDelivered) is not
+// that: it also counts a give-back after a failed KV write, a stop's or a
+// rollout's give-back, and an AckWait that lapsed, none of which is a wait
+// for the names, and each of which would eat into the hold budget. The
+// count is kept here instead, keyed by the message's stream sequence, and
+// bumped only on a names hold. It is bounded at namesHoldsMax entries,
+// the oldest forgotten first; an event held at once is one the durable has
+// not acked, so relayMaxAckPending of them is every one that can be held.
+// A gateway restart forgets the counts, and a held event's budget starts
+// again, which only waits longer for names that may load.
+type namesHolds struct {
+	mu    sync.Mutex
+	count map[any]int
+	order []any
+}
+
+// namesHoldsMax bounds namesHolds.
+const namesHoldsMax = relayMaxAckPending
+
+// namesHoldKey is the item's key in namesHolds: its stream sequence, or for
+// an item that didn't come off the durable, its envelope (the in-memory
+// requeue hands the same one back). A delivery with no sequence (no
+// metadata from the server) has no stable key and reads as nil.
+func (item relayItem) namesHoldKey() any {
+	if item.d == nil {
+		return item.env
+	}
+	if seq := item.d.Sequence(); seq != 0 {
+		return seq
+	}
+	return nil
+}
+
+// held is how many times the item has been held for the names so far.
+func (h *namesHolds) held(item relayItem) int {
+	key := item.namesHoldKey()
+	if key == nil {
+		// No key to count under: fall back to the delivery count, which
+		// at worst stops holding early.
+		if item.d.NumDelivered() <= 1 {
+			return 0
+		}
+		// Only ever compared with profileNamesHoldLimit, so clamp to it.
+		n := min(item.d.NumDelivered()-1, uint64(profileNamesHoldLimit))
+		return int(n) // #nosec G115 -- clamped to profileNamesHoldLimit just above
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.count[key]
+}
+
+// hold counts one more names hold for the item.
+func (h *namesHolds) hold(item relayItem) {
+	key := item.namesHoldKey()
+	if key == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.count == nil {
+		h.count = map[any]int{}
+	}
+	if _, ok := h.count[key]; !ok {
+		for len(h.order) >= namesHoldsMax {
+			delete(h.count, h.order[0])
+			h.order = h.order[1:]
+		}
+		h.order = append(h.order, key)
+	}
+	h.count[key]++
+}
+
+// forget drops the item's count, once it is settled or rendered.
+func (h *namesHolds) forget(item relayItem) {
+	key := item.namesHoldKey()
+	if key == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.count[key]; !ok {
+		return
+	}
+	delete(h.count, key)
+	for i, k := range h.order {
+		if k == key {
+			h.order = append(h.order[:i], h.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // storedAt is when the stream stored the item's message, zero when it has no
@@ -571,17 +684,62 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			g.settle(item)
 			continue
 		}
-		if !g.client.AcceptSupervisorEvent(item.subject, item.storedAt(), g.taskIsProfile(rec, item.env.TaskID, taskAddressee(rec, item.env.TaskID))) {
-			// A five-token supervisor message on a profile task, stored
-			// after the install's cutoff (#5301): the dispatcher writes a
-			// profile task's terminal on the six-token form by then, so
-			// this one is not the task's. Settled, never rendered and
-			// never a wake; the client counts it.
+		if !g.client.AcceptSupervisorEventUncounted(item.subject, item.storedAt()) {
+			// A five-token supervisor message on a profile's addressee,
+			// stored after the install's cutoff or at a time the server's
+			// metadata didn't give (#5301): the dispatcher writes a profile
+			// task's terminal on the six-token form by then, so this one
+			// is not the task's. Profile-ness is the operator's profile
+			// names, never this record. Never rendered and never a wake;
+			// the client counts it.
+			//
+			// Settled only once the names are loaded. Before then every
+			// addressee reads as a profile (lib.ProfileNames.Has), so the
+			// refusal may be a session task's terminal the names would
+			// take; an ack would lose it for good. It is given back to
+			// the stream instead, and read again once the names are in.
+			//
+			// Held at most profileNamesHoldLimit times: past that the names
+			// are not coming (no names file is configured, or it is never
+			// rendered), and the event is settled with an Error, as a refusal.
+			// The drop is counted once, when the event is settled, not on
+			// each hold.
+			//
+			// A known ordering effect: a held event the names then take
+			// renders when it comes back, up to profileNamesHoldDelay later,
+			// so it can render after events of the same task the relay
+			// delivered meanwhile. Only a session task's five-token
+			// terminal is held this way, and only while the names are
+			// unloaded; the sequence guard still keeps it from rendering
+			// twice.
+			if !g.client.ProfileNamesLoaded() {
+				if holds := g.namesHolds.held(item); holds < profileNamesHoldLimit {
+					g.log.Log(g.runCtx, firstDeliveryLevel(item), "relay: five-token supervisor event held; the profile names are not loaded, so every task reads as a profile's",
+						"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
+						"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff(), "holds", holds)
+					g.namesHolds.hold(item)
+					g.giveBackAfter(item, profileNamesHoldDelay)
+					continue
+				}
+				g.namesHolds.forget(item)
+				g.client.CountProfileSupervisorDrop()
+				g.log.Error("relay: five-token supervisor event dropped; the profile names never loaded while it was held",
+					"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
+					"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff(), "holds", profileNamesHoldLimit)
+				g.settle(item)
+				continue
+			}
+			g.namesHolds.forget(item)
+			g.client.CountProfileSupervisorDrop()
 			g.log.Warn("relay: five-token supervisor event on a profile task, stored after the cutoff, dropped",
 				"session", sessionKey, "taskId", item.env.TaskID, "subject", item.subject,
 				"storedAt", item.storedAt(), "cutoff", g.client.ProfileSupervisorCutoff())
 			g.settle(item)
 			continue
+		}
+		if lib.IsFiveTokenSupervisorSubject(item.subject) {
+			// Taken: whatever holds it had waiting for the names are done.
+			g.namesHolds.forget(item)
 		}
 		// A redelivery can share a batch with its original (a hold that
 		// outlived AckWait). It renders once, and is settled with its
@@ -939,6 +1097,18 @@ var canceledReasonShown = map[string]bool{
 	"tier-ended": true, // dispatch.ReasonTierEnded (#5850)
 }
 
+// canceledTerminalTokens are the canceled terminals' own tokens, which the
+// chat notice leaves bare (canceledReasonShown names the ones it explains)
+// but a scheduled run's record still carries.
+var canceledTerminalTokens = map[string]bool{
+	"canceled-by-request":     true,
+	"canceled-before-start":   true,
+	"canceled-while-orphaned": true,
+	// A run the operator or a parent stopped (dispatch.ReasonStopped, and
+	// the gateway's own stop in stoptree.go).
+	"stopped": true,
+}
+
 // noticeWithReason joins a notice's prefix to the reason's text: bare when
 // there is none, after a dash when it came out of the executors' shape, and
 // after a colon when it was plain text already.
@@ -1059,7 +1229,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// everything. Replay against the addressee the task's own subjects
 		// carried - after a Delegate re-home, rec.Addressee is not it.
 		addressee := rec.AddresseeFor(taskID)
-		if task, err := g.replayForTerminal(ctx, addressee, taskID, g.taskIsProfile(rec, taskID, addressee)); err == nil {
+		if task, err := g.replayForTerminal(ctx, addressee, taskID); err == nil {
 			if art := task.Artifact(lib.ArtifactResult); art != nil && needResult {
 				result = joinTextParts(art.Parts)
 				replayedResult = art.Parts
@@ -1502,15 +1672,57 @@ func (g *Gateway) postSteerShortfall(rec *SessionRecord, rs *relayState, taskID 
 	}
 }
 
-// replayForTerminal is relayTerminal's read of the task's stream. profile is
-// taskIsProfile's answer for the task.
-func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string, profile bool) (*lib.Task, error) {
+// replayForTerminal is relayTerminal's read of the task's stream.
+func (g *Gateway) replayForTerminal(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
 	if g.terminalReplayHook != nil {
 		if err := g.terminalReplayHook(taskID); err != nil {
 			return nil, err
 		}
 	}
-	return g.client.TasksGet(ctx, addressee, taskID, lib.ProfileTaskIf(profile))
+	return g.client.TasksGet(ctx, addressee, taskID)
+}
+
+// runReasonToken is the token a scheduled run's record carries for a
+// terminal message (lib.TriggerStatusReply.Reason): reasonToken's, when it is
+// one the gateway knows, in reasonSentences, reasonDetailShown,
+// canceledReasonShown or canceledTerminalTokens. Those tables are the one
+// vocabulary: a token an executor adds is added to one of them in the same
+// change. Anything else, malformed included, is empty, and no detail is ever
+// returned.
+func runReasonToken(message string) string {
+	token := reasonToken(message)
+	if token == "" || token == reasonTokenMalformed {
+		return ""
+	}
+	if _, ok := reasonSentences[token]; ok {
+		return token
+	}
+	if reasonDetailShown[token] || canceledReasonShown[token] || canceledTerminalTokens[token] {
+		return token
+	}
+	return ""
+}
+
+// runReasonTokens lists every token runReasonToken can return, for the
+// cross-module test that the operator's shape pattern accepts each one.
+func runReasonTokens() []string {
+	seen := map[string]bool{}
+	for t := range reasonSentences {
+		seen[t] = true
+	}
+	for _, m := range []map[string]bool{reasonDetailShown, canceledReasonShown, canceledTerminalTokens} {
+		for t, ok := range m {
+			if ok {
+				seen[t] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // reasonToken is the token of an executor's `reason: <token>[ - detail]`
