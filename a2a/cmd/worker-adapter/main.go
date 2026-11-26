@@ -49,6 +49,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
@@ -892,12 +893,18 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 		return "", nil, nil, err
 	}
 	// core-agent's tool grant travels in every turn's envelope, so the
-	// driver carries it. One that doesn't map or render stops the worker
-	// here rather than running with every tool refused.
+	// driver carries it. A session pod's is its allowlist; one that doesn't
+	// map or render stops the worker here rather than running with every
+	// tool refused. A profile worker's comes from its persona, not the
+	// session allowlist, so it starts with an empty grant (every tool
+	// refused) until the persona's is set.
 	if driver.Harness() == persona.CoreAgent {
-		p, err := coreAgentSessionGrant(getenv, envOrDefaultFrom(getenv, "A2A_WORKDIR", defaultWorkdir))
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("the tool grant for harness %q: %w", driver.Harness(), err)
+		var p coreagentwire.Policy
+		if getenv(lib.EnvProfileWorker) != "true" {
+			var err error
+			if p, err = coreAgentSessionGrant(getenv, envOrDefaultFrom(getenv, "A2A_WORKDIR", defaultWorkdir)); err != nil {
+				return "", nil, nil, fmt.Errorf("the tool grant for harness %q: %w", driver.Harness(), err)
+			}
 		}
 		driver = workeradapter.NewCoreAgentDriver(p, nil)
 	}

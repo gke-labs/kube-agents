@@ -88,7 +88,7 @@ var reasonSentences = map[string]string{
 	"spawn-failed":                       "the agent could not be started",
 	"bridge-died-without-terminal-event": "the agent stopped without reporting a result; ask again",
 	"worker-evicted":                     "the agent's worker was restarted before it finished; ask again",
-	"internal-panic":                     "the agent hit an internal error while it handled this, and sent no answer; ask again",
+	"internal-panic":                     "the agent hit an internal error and sent no answer; check what it already did before you ask again, and if it fails the same way, tell whoever manages this agent",
 	"session-busy":                       "the agent was still busy with an earlier request when time ran out; ask again",
 	"hermes-rate-limited":                "the agent's server or the model provider is rate-limiting requests; ask again in a few minutes",
 	"hermes-api-unreachable":             "the agent's server did not answer; ask again",
@@ -114,7 +114,10 @@ var reasonSentences = map[string]string{
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
 	// A profile task the dispatcher settled with no terminal on the bus
 	// (#5301): its result could not be recorded, so whether the work ran is
-	// unknown here.
+	// unknown here. Nothing delivers this reason today (the refused publish is
+	// the channel that would have): the requester sees no end until a stop,
+	// and the dispatcher's ALERT dispatcher_terminal_unpublished log line is
+	// the operator's signal (#6884).
 	"terminal-unpublished": "this request's result could not be delivered, so check whether the work was done before you ask again",
 	// A script-run task's worker (#5622): refused before the script ran,
 	// the script failed, or it ran past its bound.

@@ -1191,12 +1191,23 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# Node-pool kubelet cpuCfsQuota=false enforcement probe (#2599, #2799, #7179):
+# disabling cpuCfsQuota turns off kernel CPU limit enforcement for multi-tenant
+# workloads on that pool. deployer: noop, no fixture.
+./tasks/consistency-kcc-kubelet-cfs-quota-drift/task.yaml
+
 # #2800: the drift audit's kubelet-config facet, the second voted by node
 # pool. seeded-c's default-pool sets podPidsLimit where the stack's other
 # pools set no kubelet key the facet reads; graded on the ledger's
 # kubelet-config finding and the pool it names. The same full audit and band
 # as consistency-drift-outlier.
 ./tasks/consistency-kubelet-config-pool-outlier/task.yaml
+
+# Completed generated-name Job family grouping (#2900, #3005, #6955, #7098):
+# expected_fail: true until #6955 groups finished Jobs (`reindex-<uuid>` in
+# `seeded-family`, role `generated-name-job-family`) into one family finding
+# with parent-template `ttlSecondsAfterFinished` cleanup. deployer: noop.
+./tasks/cost-finished-job-family-grouped/task.yaml
 
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst

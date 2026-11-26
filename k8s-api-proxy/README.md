@@ -156,6 +156,33 @@ partition needs the cache off (`Config.Cache` nil). A write evicts the resource'
 in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
 caller's partition only, since only that credential's access changed.
 
+An embedder with a rule of its own about who may ask what sets `Config.Authorize`. The handler
+calls it for every request that names a cluster and classifies as an API request, after the
+exclusion and hold checks, with the request as received (headers not yet stripped, no body), the
+`CallerIdentity`, the cluster ID and the `RequestInfo`. It runs before the policy, the
+response cache, in-flight coalescing and the upstream, on a cache hit too, so a caller it refuses
+is never served a response fetched for another caller and never joins another's fetch. Any error
+is a `403 Forbidden`, audited as `refused` with `rejection_reason` `authorize.refused`; the caller
+reads a fixed message and the error goes to the audit record only. Returning an `AuthorizeError`
+chooses the reason and the message instead; the rejection metric counts such a reason as `other`.
+There is no "could not decide" answer: a hook whose dependency is unavailable fails closed, and a
+hook that panics refuses the request the same way, with the panic value in the audit record only.
+The hook does not hide a cluster's scope state: route validation, exclusions, holds and
+classification answer before it, so a caller it would refuse still receives those refusals, a
+hold's reason text included, and an embedder that must keep that from unauthorized callers cannot
+rely on the hook for it. It runs before the request takes an in-flight slot and gets no deadline
+beyond the request's context, so a hook that does I/O must bound it itself.
+`CallerIdentity.Extra` carries what else the authenticator verified about the caller, under the
+authenticator's own keys: `pkg/tokenreview` copies the TokenReview's `status.user.extra`, where
+Kubernetes names the pod of a pod-bound ServiceAccount token
+(`authentication.kubernetes.io/pod-name`, `authentication.kubernetes.io/pod-uid`). The default
+audit sink does not log it. `Config.ExtraCallerHeaders` names further request headers to strip
+before forwarding, on plain, watch and upgrade requests alike, for a deployment that passes a
+caller's identity or credential in headers of its own; the authenticator and `Config.Authorize`
+still read them. An entry that is not an HTTP header name, or is `Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets
+neither option.
+
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
 archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
@@ -288,7 +315,8 @@ so a program can embed the handler with its own authenticator, upstream transpor
 go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 ```
 
-The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
-`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
+`AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore` and
+`AuditEvent` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.
