@@ -1786,6 +1786,8 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             (["gcloud", "beta", "compute", "advice", "calendar-mode"], "calendar mode"),
             (["gcloud", "container", "clusters", "list"], "the fleet"),
             (["gcloud", "container", "node-pools", "list", "--cluster=c", "--region=us-central1"], "node pools"),
+            (["kubectl", "get", "capacitybuffers.autoscaling.x-k8s.io", "-A"], "capacity buffers reactive triage"),
+            (["kubectl", "get", "capacitybuffers.autoscaling.x-k8s.io", "-A", "--chunk-size=500", "-o", "json"], "capacity buffers collector"),
         ):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
