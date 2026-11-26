@@ -398,8 +398,10 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 
 	// The session's origin and its conversation route are written side by
 	// side under one deadline, so a store that hangs delays the first turn
-	// by one timeout, not two.
-	recordCtx, cancelRecord := context.WithTimeout(taskCtx, routeTimeout)
+	// by one timeout, not two. The deadline leaves room for storeDo's retry
+	// of a store that is not listening yet, which refuses at once and costs
+	// the turn nothing: the API server it waits on starts after the store.
+	recordCtx, cancelRecord := context.WithTimeout(taskCtx, b.cfg.APIConnectRetry+routeTimeout)
 	originDone := make(chan struct{})
 	go func() {
 		defer close(originDone)

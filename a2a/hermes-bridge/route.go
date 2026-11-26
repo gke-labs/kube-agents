@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -347,25 +348,62 @@ func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) er
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, routeTimeout)
-	defer cancel()
 	target := strings.TrimRight(b.cfg.RouteURL, "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(raw))
+	resp, cancel, err := b.storeDo(ctx, routeTimeout, func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+b.cfg.RouteKey)
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.cfg.RouteKey)
-	resp, err := b.routeClient.Do(req)
-	if err != nil {
-		return err
-	}
+	defer cancel()
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		tail, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
 		return &storeStatusError{status: resp.StatusCode, detail: strings.TrimSpace(string(tail))}
 	}
 	return nil
+}
+
+// storeDo sends a session-kv request that build makes for each attempt,
+// each under its own timeout, and retries a refused connection every
+// apiConnectRetryInterval for up to Config.APIConnectRetry while ctx lasts
+// (#7226). The store runs in the platform-agent container: a task the bridge
+// takes before it listens (one queued while the pod rolled, or one taken
+// while that container restarts) would otherwise lose its route, origin and
+// pushed report at the first refusal, while the turn itself waits for the
+// API server under the same rule (sendAPI). A refused connection never
+// reached the store, so retrying it writes nothing twice; any other error,
+// a timeout included, is returned at once. The caller closes the body and
+// then calls the returned cancel.
+func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(context.Context) (*http.Request, error)) (*http.Response, context.CancelFunc, error) {
+	giveUp := time.Now().Add(b.cfg.APIConnectRetry)
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := build(attemptCtx)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		resp, err := b.routeClient.Do(req)
+		if err == nil {
+			return resp, cancel, nil
+		}
+		cancel()
+		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
+			return nil, nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, err
+		case <-time.After(apiConnectRetryInterval):
+		}
+	}
 }
 
 // The session's origin (docs/designs/proposal-origin.md §2.1): before a task's
