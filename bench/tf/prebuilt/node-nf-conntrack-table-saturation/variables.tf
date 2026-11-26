@@ -58,6 +58,12 @@ variable "kernel_line_timeout_seconds" {
   type        = number
   description = "Seconds the apply waits for the kernel's line from the planted node to be in Cloud Logging before it fails"
   default     = 600
+
+  # A whole number: the wait compares it with the shell's own count of seconds.
+  validation {
+    condition     = var.kernel_line_timeout_seconds >= 0 && var.kernel_line_timeout_seconds <= 1800 && floor(var.kernel_line_timeout_seconds) == var.kernel_line_timeout_seconds
+    error_message = "kernel_line_timeout_seconds must be a whole number of seconds between 0 and 1800."
+  }
 }
 
 variable "prow_build_id" {

@@ -19,10 +19,11 @@
 # collects no figure for the table by default, so the check reads the kernel's
 # line and nothing else, and it files after connections were dropped.
 #
-# The lines of a run stay in the project's log for 24 hours after its cluster
-# is gone. A later compute audit of that project files nothing on them: the
-# check files no finding on an instance that is not running, and names it in
-# the target's notes. So a run cannot pass on an earlier run's lines.
+# The lines of a run stay in the project's log after its cluster is gone, and
+# a compute audit of that project in the next 24 hours reads them. It files
+# nothing on them: the check files no finding on an instance that the list of
+# running instances does not hold, and counts it in the target's notes. So a
+# run cannot pass on an earlier run's lines.
 #
 # Eval-driven development (.agents/rules/eval_driven_development.md): the
 # case was red before the check: no `node-conntrack-saturation` finding was

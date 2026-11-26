@@ -1860,8 +1860,8 @@ MAX_TEXT_CHARS = 1500
 MAX_NOTE_CHARS = 2000
 # A target's `notes`: what the collector read but could not show, written for
 # the reader and never counted as a coverage gap (`scope_notes`). The GCE
-# collector's rotated serial consoles are the one producer
-# (docs/designs/fleet-audit-collector-manifest.md).
+# collector is the one producer: rotated serial consoles, and what its
+# conntrack check could not see (docs/designs/fleet-audit-collector-manifest.md).
 SCOPE_NOTES_KEY = "notes"
 # The key on `finish`'s JSON line that holds the targets' notes as
 # `{target, note}` objects (`notes_payload`). It is on the line only when a
