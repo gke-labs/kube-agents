@@ -423,7 +423,7 @@ func projectsWatcherToken(v corev1.Volume) bool {
 // credentialBrokerPodReadComponent is the a2a component label on the broker's
 // pod-read Role and RoleBinding in the profile namespace, which carry no owner
 // reference and are known as this agent's by their labels.
-const credentialBrokerPodReadComponent = "credential-proxy-pod-read"
+const credentialBrokerPodReadComponent = "credential-proxy-pod-read" // #nosec G101 -- a label value naming the Role, not a credential
 
 // credentialBrokerPodReadName names the broker's pod-read Role and RoleBinding,
 // the same in every namespace they are rendered in. Not prefixed "kubeagents":
