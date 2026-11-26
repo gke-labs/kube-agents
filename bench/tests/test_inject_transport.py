@@ -353,6 +353,8 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # The read route's childAddressees on the chain read after the terminal;
     # None leaves the key out, as a door older than the field does.
     probe_child_addressees: list[str] | None = None
+    # The read route's childCount on the same read; None leaves the key out.
+    probe_child_count: int | None = None
     probe_usage_partial: bool = False
 
     def poll_fails(self) -> bool:
@@ -405,6 +407,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
         if self.probe_child_addressees is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["childAddressees"] = list(self.probe_child_addressees)
+        if self.probe_child_count is not None and chain and task == self.task_id:
+            report["taskId"] = self.task_id
+            report["childCount"] = self.probe_child_count
         if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
@@ -4850,6 +4855,33 @@ def test_the_chains_addressees_reach_the_record_and_the_transcript(stub_gateway:
     assert snap is not None and snap.child_addressees == ["tse", "platform"]
 
 
+def test_the_chains_child_count_reaches_the_record_and_the_transcript(stub_gateway: _StubGatewayServer) -> None:
+    """The read after the terminal counts the chain's children beside the
+    addressees, a repeated addressee counted each time; the record's
+    metadata and the verifiers' transcript carry the count as given."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the fleet is green")
+    stub_gateway.probe_child_addressees = ["platform"]
+    stub_gateway.probe_child_count = 2
+
+    result = KubeAgentsHarness().run("/session how is the fleet?")
+
+    assert result.metadata["child_addressees"] == ["platform"]
+    assert result.metadata["child_count"] == 2
+    snap = transcript.get()
+    assert snap is not None and snap.child_count == 2
+
+
+def test_a_door_without_the_count_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+    stub_gateway.probe_child_addressees = []
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.metadata["child_count"] is None
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees == [] and snap.child_count is None
+
+
 def test_a_door_without_the_addressees_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
     stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
 
@@ -4883,6 +4915,28 @@ def test_the_addressees_a_poll_carried_survive_a_read_after_the_terminal_that_fa
     assert exchange.fold.child_addressees == ["tse"]
 
 
+def test_the_count_a_poll_carried_survives_a_read_after_the_terminal_that_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """childCount rides every read like childAddressees, and a poll's copy is
+    kept the same way when the read after the terminal fails."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed",
+                  "childAddressees": ["platform"], "childCount": 3},
+    })
+
+    def unavailable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    monkeypatch.setattr(inject, "_request", unavailable)
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.fold.child_count == 3
+
+
 def test_the_addressees_field_parses_none_from_cannot_say() -> None:
     def parsed(value: Any) -> list[str] | None:
         probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childAddressees": value}})
@@ -4895,6 +4949,26 @@ def test_the_addressees_field_parses_none_from_cannot_say() -> None:
     assert parsed("tse") is None
     assert parsed(["tse", 3]) is None
     assert inject.Probe.from_body({"probe": {"active": False}}).child_addressees is None
+
+
+def test_the_count_field_parses_none_from_cannot_say() -> None:
+    """A malformed count is "can't say", never zero: zero would vouch for a
+    chain that delegated nothing."""
+    def parsed(value: Any) -> int | None:
+        probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childCount": value}})
+        assert probe is not None
+        return probe.child_count
+
+    assert parsed(0) == 0
+    assert parsed(3) == 3
+    assert parsed(None) is None
+    assert parsed(-1) is None
+    assert parsed(True) is None
+    assert parsed(False) is None
+    assert parsed(2.0) is None
+    assert parsed("2") is None
+    assert parsed([2]) is None
+    assert inject.Probe.from_body({"probe": {"active": False}}).child_count is None
 
 
 def test_a_partial_usage_is_read_again_and_marked_when_it_stays_partial(

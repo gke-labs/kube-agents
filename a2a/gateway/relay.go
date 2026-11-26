@@ -114,7 +114,10 @@ var reasonSentences = map[string]string{
 	"lease-expired":        "the worker that took this request stopped responding; ask again",
 	// A profile task the dispatcher settled with no terminal on the bus
 	// (#5301): its result could not be recorded, so whether the work ran is
-	// unknown here.
+	// unknown here. Nothing delivers this reason today (the refused publish is
+	// the channel that would have): the requester sees no end until a stop,
+	// and the dispatcher's ALERT dispatcher_terminal_unpublished log line is
+	// the operator's signal (#6884).
 	"terminal-unpublished": "this request's result could not be delivered, so check whether the work was done before you ask again",
 	// A script-run task's worker (#5622): refused before the script ran,
 	// the script failed, or it ran past its bound.

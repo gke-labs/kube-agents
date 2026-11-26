@@ -62,7 +62,8 @@ const (
 	// DroppedTerminalGiveUp (giveUpTerminal).
 	// The dispatcher can't write it on the task (the write is what failed);
 	// it keys the Error log and the health line's supervisorGiveUps. Nothing
-	// delivers it to the gateway yet, so no conversation hears it (#6884).
+	// delivers it to the gateway, so no conversation hears it; the Error
+	// log is an alert line (terminalUnpublishedAlert, #6884).
 	ReasonTerminalUnpublished = "terminal-unpublished"
 )
 
@@ -190,12 +191,16 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, r *terminalRefusal, hk
 // sixTokenTerminalID is a six-token terminal's envelope id: the prefix and
 // 128 bits from crypto/rand, which no other writer can predict.
 func sixTokenTerminalID() (string, error) {
-	var b [16]byte
+	var b [sixTokenTerminalIDBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
 	return terminalEnvelopePrefix + hex.EncodeToString(b[:]), nil
 }
+
+// sixTokenTerminalIDBytes is how many random bytes a six-token terminal's id
+// carries: 128 bits, more than any writer can guess.
+const sixTokenTerminalIDBytes = 16
 
 // publishAckOn is c.PublishAck, or the test hook publishAck in its place.
 func (d *Dispatcher) publishAckOn(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error) {

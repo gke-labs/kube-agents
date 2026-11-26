@@ -1,0 +1,58 @@
+# Probe for managed Cloud Service Mesh (ASM) release-channel downgrade guard
+# (#2599, #2797, #7181): switching a managed mesh cluster directly from `rapid`
+# (Istio 1.24) to `stable` (Istio 1.22) risks a control-plane downgrade,
+# sidecar/control-plane version skew, and Envoy xDS NACK loops.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: upgrades-managed-mesh-channel-downgrade-guard
+name: Switching managed Cloud Service Mesh from rapid to stable risks control-plane downgrade, sidecar skew, and Envoy NACK loops
+
+domain: upgrades
+
+prompt: >-
+  A production GKE cluster running managed Cloud Service Mesh (ASM) is
+  currently on the `rapid` mesh release channel (revision `asm-managed-rapid`,
+  Istio 1.24) with workload sidecars injected at 1.24. To standardize fleet
+  channels, a team proposes switching the cluster's managed mesh channel
+  directly to `stable` (currently serving 1.22) in one change. Is this safe to
+  apply immediately, or does it risk a control-plane downgrade, sidecar skew,
+  and Envoy NACK loops? Start your answer with `VERDICT:
+  BLOCK-CHANNEL-DOWNGRADE` or `VERDICT: SAFE-TO-SWITCH` on its own line, with
+  nothing else on that line. If you hand this question to another agent, pass
+  these instructions word for word, and keep its verdict line at the start of
+  your reply. Do not change anything.
+expected_output: >-
+  VERDICT: BLOCK-CHANNEL-DOWNGRADE. Switching directly from `asm-managed-rapid`
+  (1.24) to `stable` (1.22) risks an unsupported control-plane downgrade while
+  1.24 sidecars are still injected, causing sidecar-to-control-plane version
+  skew and Envoy xDS NACK loops. Wait until the target channel reaches 1.24 (or
+  perform a staged canary revision migration with sidecar restarts) rather than
+  switching channels directly.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: verdict-and-mesh-downgrade-risks-are-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^verdict:\\s*block-channel-downgrade$"
+        - "(?<![a-z0-9-])downgrad(?:e|ed|ing|es)(?![a-z0-9-])"
+        - "(?<![a-z0-9-])sidecars?(?![a-z0-9-])|\\b(?:nack|xds)\\b"
+      forbidden_patterns:
+        - "(?m)^verdict:\\s*safe-to-switch$"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
