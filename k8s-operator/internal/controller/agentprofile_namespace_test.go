@@ -42,14 +42,14 @@ func TestProfileTuningDefaults(t *testing.T) {
 	if got := resolveProfileCeiling(huge); got != agentv1alpha1.MaxProfileCeiling {
 		t.Errorf("ceiling = %d from a maxInProgress past the ceiling's maximum, want %d", got, agentv1alpha1.MaxProfileCeiling)
 	}
-	if got := resolveProfileWarmReplicas(agent); got != agentv1alpha1.DefaultProfileWarmReplicas {
+	if got := resolveProfileWarmReplicas(agent, nil); got != agentv1alpha1.DefaultProfileWarmReplicas {
 		t.Errorf("warm replicas = %d, want the default %d", got, agentv1alpha1.DefaultProfileWarmReplicas)
 	}
 	tuned := profileTunedAgent(ptr.To(5), ptr.To(0))
 	if got := resolveProfileCeiling(tuned); got != 5 {
 		t.Errorf("ceiling = %d, want the CR's 5", got)
 	}
-	if got := resolveProfileWarmReplicas(tuned); got != 0 {
+	if got := resolveProfileWarmReplicas(tuned, nil); got != 0 {
 		t.Errorf("warm replicas = %d, want the CR's 0", got)
 	}
 }
@@ -76,6 +76,10 @@ func TestBuildProfileQuota(t *testing.T) {
 		{"two read pools at the defaults", a2aTestAgent(), []agentv1alpha1.AgentProfile{readOnly, bothTiers, unattended}, 2*1 + 2 + defaultKanbanMaxInProgress},
 		{"tuned", profileTunedAgent(ptr.To(5), ptr.To(3)), []agentv1alpha1.AgentProfile{readOnly}, 1*3 + 1 + 5},
 		{"no warm workers", profileTunedAgent(ptr.To(5), ptr.To(0)), []agentv1alpha1.AgentProfile{readOnly}, 0 + 1 + 5},
+		// The session route sizes each read pool to its profile's
+		// concurrency (2 in testAgentProfile), #7014.
+		{"two read pools on the session route", sessionRouteTestAgent(), []agentv1alpha1.AgentProfile{readOnly, bothTiers, unattended}, 2*2 + 2 + defaultKanbanMaxInProgress},
+		{"the session route with warmReplicas set", sessionRouteProfileAgent(nil, ptr.To(1)), []agentv1alpha1.AgentProfile{readOnly, bothTiers}, 2*1 + 2 + defaultKanbanMaxInProgress},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(a2aDispatcherJobPolicyEnvVar, "")

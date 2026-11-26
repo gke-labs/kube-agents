@@ -54,7 +54,8 @@
 # scripts/validate_bench_cases.py, registered in no roster, and the run
 # grades nothing; a parked case carries no `suite: validated-capabilities` line,
 # since that line is the lane's registration, and the un-park pull request
-# adds it with the roster line. Nothing is planted by the run.
+# restores it, with `suite_part:` for a section other than 1. Nothing is
+# planted by the run.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: upgrade-surge-bluegreen-gce-quota-exhaustion
 name: "Surge and Blue-Green Node Pool Upgrades Stalling on Regional GCE CPU Quota Headroom (surge quota check)"

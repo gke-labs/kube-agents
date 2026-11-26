@@ -23,6 +23,7 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Caller authentication (signed JWT)       | [`k8s-api-proxy/pkg/jwtauth/`](../../k8s-api-proxy/pkg/jwtauth/)                                                                     |
 | GKE HTTPS upstream transport             | [`k8s-api-proxy/pkg/upstream/`](../../k8s-api-proxy/pkg/upstream/)                                                                   |
 | Rotated TLS certificate and CA reload    | [`k8s-api-proxy/pkg/certreload/`](../../k8s-api-proxy/pkg/certreload/)                                                               |
+| Server flags, environment and lifecycle  | [`k8s-api-proxy/pkg/proxyserver/`](../../k8s-api-proxy/pkg/proxyserver/)                                                             |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
 | Sandbox `kubectl` and `kubeconfig` setup | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
@@ -128,10 +129,12 @@ k8s-api-proxy/
 ├── go.sum
 ├── cmd/
 │   └── k8s-api-proxy/
-│       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
-│       ├── auth.go               # --auth-mode list, --jwt-* flags, authenticator chain, --partition-by-caller
-│       └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
+│       └── main.go               # Calls proxyserver.Run with the build's version and no other option
 └── pkg/
+    ├── proxyserver/
+    │   ├── server.go             # Run and Options: CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
+    │   ├── auth.go               # --auth-mode list, --jwt-* flags, authenticator chain, --partition-by-caller
+    │   └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
     ├── k8sapiproxy/
     │   ├── handler.go            # Core http.Handler: auth -> route -> RequestInfo -> policy -> proxy
     │   ├── policy.go             # Verb allowlist, subresource denylist, dryRun=All check
@@ -477,7 +480,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `--upstream-token-file` (`KUBE_PROXY_UPSTREAM_TOKEN_FILE`, `StaticConfig.BearerTokenFile`) is the bearer token the proxy sends in place of the caller's `Authorization` header. It requires an `https://` upstream, loopback included, is re-read at most once a second so a rotated token needs no restart, and fails closed: an unusable file stops the proxy at startup, and a request that reaches the upstream while the file is missing or empty gets `502 Bad Gateway` rather than an earlier token. Three things outlast a withdrawn or changed token: it can still be sent for up to a second, until the file is read again; a request already in flight (a watch, a log follow or an exec) keeps streaming; and answers already in the response cache (section 8a), discovery documents by default, are served until their TTL ends (`--cache-max-bytes=0` turns the cache off). With `--auth-mode=none` every peer that can reach the listener acts with the token's identity, so the listener is bound to loopback or otherwise restricted, and the proxy logs a startup warning for the combination.
    - `--upstream-ca-file` (`KUBE_PROXY_UPSTREAM_CA_FILE`, `StaticConfig.CAFile`) is the PEM bundle the upstream's certificate is verified against, reloaded by `certreload.CAPool` on rotation with hostname verification unchanged; a changed bundle that does not load is logged and counted in `kubeagents_kube_proxy_certificate_reload_failures_total`, and the previous one kept. A removed or permanently unreadable bundle file is reported once and its roots stay trusted until restart, so trust in a CA is withdrawn by replacing the bundle's contents, not by deleting the file.
 
-Neither transport needs Google credentials to start, so a proxy that serves `in-cluster` alone runs on a cluster that has none, and only a `gke_` request fails, naming the missing credentials. The binary's own token source (`cmd/k8s-api-proxy/tokens.go`) looks them up on first use; `upstream.New` does the same for an embedder that passes no `Config.TokenSource`.
+Neither transport needs Google credentials to start, so a proxy that serves `in-cluster` alone runs on a cluster that has none, and only a `gke_` request fails, naming the missing credentials. The binary's own token source (`pkg/proxyserver/tokens.go`) looks them up on first use; `upstream.New` does the same for an embedder that passes no `Config.TokenSource`.
 
 ### 10. Observability: Prometheus metrics, OpenTelemetry tracing, and audit logging (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`, `pkg/k8sapiproxy/audit.go`)
 

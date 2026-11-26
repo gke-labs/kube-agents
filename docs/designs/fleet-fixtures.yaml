@@ -826,3 +826,20 @@ fixtures:
       second zone's e2-standard-2, so every replica that runs is in the second
       zone and the rest stay Pending on insufficient CPU. Its distribution looks like
       the scheduling case; only the Pending pods' events say otherwise.
+
+  - role: unaccepted-gateway-class
+    slot: a
+    available_from_day: 0
+    objects:
+      - gatewayclass/seeded-unaccepted-gw
+      - gateway/seeded-unaccepted-gateway
+      - httproute/seeded-unaccepted-route
+      - gatewayclass/seeded-envoy
+    namespace: seeded-shapes
+    defect: >-
+      Cluster-scoped GatewayClass seeded-unaccepted-gw referencing
+      example.com/unsupported-controller so no controller accepts it, with
+      Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route
+      in seeded-shapes bound to it (zero Pods or Services provisioned).
+      GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as
+      the accepted-class negative control on the same cluster.

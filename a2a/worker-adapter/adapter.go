@@ -219,6 +219,12 @@ type Config struct {
 	TaskStem string
 
 	Logger *slog.Logger
+
+	// Trajectory, when set, is the session's tool-call capture for the
+	// evals (trajectory.go): every activity the harness emits is recorded
+	// in it, scrubbed and capped, and served only on the pod's loopback.
+	// nil records nothing.
+	Trajectory *TrajectoryStore
 }
 
 // Addressee is the executor's token on the task subjects.
@@ -1305,6 +1311,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					case EventProgress:
 						a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
 					case EventActivity:
+						a.cfg.Trajectory.Record(a.taskID, ev.Tool, ev.Input, nil, time.Now())
 						a.publishActivity(ctx, ev)
 					case EventResult:
 						// What the turn cost goes out first, whatever the turn
