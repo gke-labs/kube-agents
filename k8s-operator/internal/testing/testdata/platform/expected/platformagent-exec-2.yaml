@@ -1520,6 +1520,7 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-template-hash: <SHA256_FOR_TESTS>
       labels:
         app: platformagent-credential-proxy
         app.kubernetes.io/instance: kubeagents-system-platformagent

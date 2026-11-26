@@ -207,8 +207,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    sizingCappedByQuotaConditionType,
-		Written: "Only while `spec.deployment.sizingProfile` is `auto` and the cluster count earns a higher tier than the namespace's ResourceQuota has room for, or than a LimitRange bound admits, or after a quota refused the pod a step recreated",
-		Meaning: "`status: True`, `Reason: ResourceQuotaShort` or `LimitRangeShort`. The message names the tier earned, the tier the step was measured from, the tier that stays, and the short quota and key or the LimitRange, bound, resource and container; the figures go in the Warning event. Not `Degraded`: the running tier keeps running. Written before the render, so an earlier refusal neither writes nor clears it. Cleared by the pass that finds room or whose count no longer earns the step; a pass with no reading leaves it, so a gateway outage neither clears nor re-records it. The event watcher switched off by spec clears it. Raise the quota or the bound, or name the tier in `sizingProfile`.",
+		Written: "Only while `spec.deployment.sizingProfile` is `auto` and a tier transition is blocked by a namespace `ResourceQuota`, a `LimitRange` bound, an unschedulable `credential-proxy` surge pod (`SurgeUnschedulable`), or after admission refused a surged or recreated pod",
+		Meaning: "`status: True`, `Reason: ResourceQuotaShort`, `LimitRangeShort`, or `SurgeUnschedulable`. The message names the desired tier, the running tier, and the blocking quota key, LimitRange bound, or pending surge pod; `ResourceQuotaShort` and `LimitRangeShort` record numeric details in their Warning event, while `SurgeUnschedulable` carries the pending pod and scheduling reason directly in both the condition and Warning event. Not `Degraded`: the running tier keeps serving safely during an unschedulable surge without dropping the active broker. Cleared once capacity, quota, or bounds allow the step or utilization no longer requires it. Raise the quota, adjust cluster capacity/LimitRange, or name the tier explicitly in `sizingProfile`.",
 	},
 	{
 		Type:    sessionCapFittedConditionType,
