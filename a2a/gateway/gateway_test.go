@@ -84,6 +84,28 @@ func startServer(t *testing.T) *natsserver.Server {
 	return s
 }
 
+// retryTransientDial calls dial up to connectTestAttempts times, sleeping
+// connectTestRetryDelay between attempts when dial fails with a transient
+// loopback timeout.
+func retryTransientDial[T any](dial func() (T, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for attempt := 0; attempt < connectTestAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(connectTestRetryDelay)
+		}
+		conn, err := dial()
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if !isTransientDialTimeout(err) {
+			return zero, err
+		}
+	}
+	return zero, lastErr
+}
+
 // connectTest dials a test's own nats-server with the product's dial bound
 // (lib.DialTimeout) rather than nats.go's 2s default, and retries transient
 // loopback dial timeouts: the package's tests run in parallel under -race,
@@ -92,41 +114,17 @@ func startServer(t *testing.T) *natsserver.Server {
 // finding.
 func connectTest(url string, opts ...nats.Option) (*nats.Conn, error) {
 	dialOpts := append([]nats.Option{nats.Timeout(lib.DialTimeout)}, opts...)
-	var lastErr error
-	for attempt := 0; attempt < connectTestAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(connectTestRetryDelay)
-		}
-		nc, err := nats.Connect(url, dialOpts...)
-		if err == nil {
-			return nc, nil
-		}
-		lastErr = err
-		if !isTransientDialTimeout(err) {
-			return nil, err
-		}
-	}
-	return nil, lastErr
+	return retryTransientDial(func() (*nats.Conn, error) {
+		return nats.Connect(url, dialOpts...)
+	})
 }
 
 // connectClientTest wraps lib.Connect with the same transient dial-timeout
 // retry as connectTest for test rig setup.
 func connectClientTest(ctx context.Context, url string, opts ...lib.ClientOption) (*lib.Client, error) {
-	var lastErr error
-	for attempt := 0; attempt < connectTestAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(connectTestRetryDelay)
-		}
-		client, err := lib.Connect(ctx, url, opts...)
-		if err == nil {
-			return client, nil
-		}
-		lastErr = err
-		if !isTransientDialTimeout(err) {
-			return nil, err
-		}
-	}
-	return nil, lastErr
+	return retryTransientDial(func() (*lib.Client, error) {
+		return lib.Connect(ctx, url, opts...)
+	})
 }
 
 // provision creates the TASKS stream and the session-state and cap buckets
