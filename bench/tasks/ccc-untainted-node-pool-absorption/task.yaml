@@ -54,8 +54,8 @@ verification_spec:
   # read on the Where: line of a finding whose id starts with the slug;
   # `ComputeClass/<name>` is the collector's class object form. The object
   # phrase cannot carry the cluster (the Where: line's cluster is not read),
-  # so the binding rests on the class's name, which the fleet gives to slot
-  # c's class alone.
+  # so the binding rests on the class's name, which the fleet gives to one
+  # class of slot c alone (the slot's second class is `reserved-ccc`).
   - name: ledger-files-the-misconfigured-class
     role: objective
     mode: assert
