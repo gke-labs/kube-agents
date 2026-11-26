@@ -582,6 +582,21 @@ class CronSuspendTest(unittest.TestCase):
         merged = self.overlay([job("audit")], live, {"suspendAll": False, "overrides": {}})
         self.assertIs(True, merged["audit"]["enabled"])
 
+    def test_the_merge_writes_the_suspension_itself(self):
+        # One write, so no file ever holds the merged roster with the suspended
+        # jobs enabled: with the first-scaffold pass taken away, the merge alone
+        # still holds them off.
+        with unittest.mock.patch.object(ps, "_suspend_after_overlay"):
+            merged = self.overlay([job("audit")], [job("audit")], {"suspendAll": True, "overrides": {}})
+        self.assertIs(False, merged["audit"]["enabled"])
+
+    def test_a_first_scaffold_that_cannot_write_the_suspension_warns(self):
+        stderr = io.StringIO()
+        with unittest.mock.patch.object(ps.os, "replace", side_effect=OSError("disk full")), redirect_stderr(stderr):
+            merged = self.overlay([job("audit")], None, {"suspendAll": True, "overrides": {}})
+        self.assertIs(True, merged["audit"]["enabled"])
+        self.assertIn("could not suspend jobs in cron/jobs.json", stderr.getvalue())
+
     def test_an_unreadable_setting_stops_before_the_roster_is_touched(self):
         for text in ("{not json", "[]", '{"suspendAll": "yes"}', '{"overrides": {"audit": "no"}}', '{"overrides": []}'):
             with self.subTest(text=text), self.assertRaises(SystemExit):

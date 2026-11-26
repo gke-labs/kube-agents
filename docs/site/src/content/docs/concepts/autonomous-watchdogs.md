@@ -318,7 +318,7 @@ On an `install.sh` install, put the block in the `TF_VAR_extra_helm_values` line
 
 The setting does not reach a job that you or the agent added to the roster. Pause or remove that job with `hermes cron`.
 
-The operator restarts the agent pod when the setting changes for a roster job, and the jobs change state at that start. A suspended job keeps its run history. If you run a suspended job by hand with `hermes cron run`, Hermes turns the job back on, and it stays on until the next pod restart. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
+The operator restarts the agent pod when the setting changes for a roster job, and the jobs change state at that start. A suspended job keeps its run history. If a suspended job is run on demand, Hermes turns the job back on, and it stays on until the next pod restart. That happens when you run `hermes cron run`, and when you ask the agent in chat to run the job now. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
 
 `suspendAll` also turns off the [helper jobs](#the-helper-jobs), which do work that chat requests depend on:
 
@@ -328,7 +328,7 @@ The operator restarts the agent pod when the setting changes for a roster job, a
 
 Keep the first three on, as the example does, and turn the others back on when you want that work.
 
-The setting cannot start a job that the image ships disabled. It does not reach the Planning Agent's own jobs, which run the Platform Agent's roster and first-run onboarding. While an audit is suspended, onboarding does not start it.
+The setting cannot start a job that the image ships disabled. A rollback to a release that does not have the setting turns every suspended job back on. It does not reach the Planning Agent's own jobs, which run the Platform Agent's roster and first-run onboarding. While an audit is suspended, onboarding does not start it.
 
 ### In the image
 

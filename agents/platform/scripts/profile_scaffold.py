@@ -605,9 +605,10 @@ def parse_cron_suspend(text: str) -> dict | None:
 
     Exits on a document it cannot read, before anything is overlaid: the caller's
     whole overlay is skipped for this start (the entrypoint warns), so the
-    volume's roster stays as the last start wrote it. Guessing "nothing
-    suspended" instead would start every job an operator turned off. The
-    operator always writes a readable document; this guards a hand-set variable.
+    volume's roster stays as the last start wrote it, and a profile not yet
+    scaffolded is not created. Guessing "nothing suspended" instead would start
+    every job an operator turned off. The operator always writes a readable
+    document; this guards a hand-set variable.
     """
     if not text.strip():
         return None
