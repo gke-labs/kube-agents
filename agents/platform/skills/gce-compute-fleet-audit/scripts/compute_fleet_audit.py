@@ -33,7 +33,8 @@ All five of the SOP's checks are implemented here:
   nothing shows that the project stores that log, and `notes` says so. A
   read that fails leaves the check unevaluated. A line from an instance that
   the project's list of RUNNING instances does not hold files nothing, and
-  `notes` counts those instances.
+  `notes` counts those instances (no such note where the scope excludes a
+  cluster of the project).
 - `gce-startup-script-status` enumerates with `compute instances list`, keeps
   the RUNNING instances that actually run a startup script — its own metadata
   or the project's common metadata, read with `compute project-info describe` —
@@ -387,25 +388,27 @@ CONNTRACK_LOG_LIMIT = 1000
 # The read repeats while a page comes back full. A node that drops packets all
 # day writes far more than one page of lines, and the read returns the newest
 # first, so one busy node would use up the page and hide another node pool.
-# Each round leaves out the instances that an earlier page named. The verdict
-# is for each node pool (it wrote the line or it did not), so the rounds stop
-# at the first page that is not full.
+# Each round leaves out the instances that an earlier page named, by instance
+# id. The verdict is for each node pool (it wrote the line or it did not), so
+# the rounds stop at the first page that is not full.
 CONNTRACK_READ_ROUNDS = 5
-# How many instances one filter leaves out at most, by id and by name. A
-# Logging query is at most 20,000 characters (the Cloud Logging quotas page,
-# read 2026-11-26); an instance id has 19 digits and an instance name at most
-# 63 characters, so both lists at this size stay under it.
-CONNTRACK_FILTER_INSTANCES_MAX = 150
-CONNTRACK_WITHOUT_IDS = " AND NOT resource.labels.instance_id=({values})"
-FILTER_VALUE = '"{value}"'
-FILTER_OR = " OR "
-# What a value may hold to be written into a filter: an instance id's digits or
-# the characters of an instance name. Anything else is left out of the filter
-# and handled after the read.
-FILTER_SAFE_VALUE = re.compile(r"[a-z0-9-]+\Z")
+# How many instance ids one filter leaves out at most. An id has up to 20
+# digits, and the command with this many stays under MAX_COMMAND_CHARS, so the
+# record and a finding's evidence show it whole (a test holds that). It is far
+# under the 20,000 characters that a Logging query may have (the Cloud Logging
+# quotas page, read 2026-11-26).
+CONNTRACK_FILTER_INSTANCES_MAX = 60
+# One regex term, as the broker's own exclusion clause is (`scope_exclude`):
+# Cloud Logging can refuse a filter with many AND/OR terms.
+CONNTRACK_WITHOUT_IDS = ' AND NOT resource.labels.instance_id=~"^({ids})$"'
+INSTANCE_ID_OR = "|"
+# An instance id as a filter may hold it: digits only.
+INSTANCE_ID_PATTERN = re.compile(r"[0-9]+\Z")
 # How the report tool spells an object inside a finding id
 # (`audit_report._id_segment`): every run of other characters is one hyphen.
 LEDGER_SEGMENT_FOLD = re.compile(r"[^a-z0-9]+")
+LEDGER_SEGMENT_HYPHEN = "-"
+NAMES_JOIN = ", "
 # The fields of a serial console log entry that §2.6 reads.
 LOG_LABELS_KEY = "labels"
 LOG_RESOURCE_KEY = "resource"
@@ -414,9 +417,6 @@ LOG_INSTANCE_ID_KEY = "instance_id"
 LOG_INSTANCE_NAME_LABEL = "compute.googleapis.com/resource_name"
 LOG_TEXT_KEY = "textPayload"
 LOG_TIMESTAMP_KEY = "timestamp"
-# The same by instance name: the running nodes of a cluster that the declared
-# scope excludes are left out of the log read itself.
-CONNTRACK_WITHOUT_NAMES = f' AND NOT labels."{LOG_INSTANCE_NAME_LABEL}"=({{values}})'
 # How many node names one finding's excerpt lists before it counts the rest.
 CONNTRACK_NODES_SHOWN = 5
 # The metadata key that sends an instance's serial console to Cloud Logging,
@@ -481,6 +481,8 @@ CONNTRACK_SHARED_ID_EXCERPT = (
     "({pools}): {names}."
 )
 CONNTRACK_SHARED_ID_POOL = "{pool} in cluster {cluster} ({location})"
+# A GKE node whose instance carries no node pool label, as a note names it.
+CONNTRACK_UNLABELLED_NODE = "node {name} ({zone}), which names no pool"
 CONNTRACK_MORE_NODES = " and {more} more"
 # RFC 3339 down to the second: what an excerpt shows of an entry's timestamp.
 STAMP_SECONDS_CHARS = 19
@@ -693,29 +695,29 @@ EXCLUDED_GKE_NODES_REASON = (
 # nothing was read about the nodes' tables and a stale finding must not be
 # called fixed on the strength of this run. Each sentence is the plain cause.
 # The target's `limitations` carries it as it is, because a chat report shows
-# that text; the `checks_unevaluated` reason adds the command, its exit code
-# and its error text (CONNTRACK_READ_ERROR), which stay in the manifest.
+# that text: no command, no exit code, no error text and no section number.
+# The `checks_unevaluated` reason adds the command, its exit code and its error
+# text (CONNTRACK_READ_ERROR), which stay in the manifest.
 UNREAD_GKE_NODES_REASON = (
-    "§2.6 could not list this project's GKE nodes (`compute instances list` failed), so it "
-    "read nothing about their connection tracking tables."
+    "The list of this project's GKE nodes could not be read, so the check read nothing "
+    "about their connection tracking tables."
 )
 UNREAD_SERIAL_LOGGING_REASON = (
-    "§2.6 reads a node's serial console log in Cloud Logging, and the read of which of "
-    "the {total} RUNNING GKE node(s) on this project send that log there failed "
-    "(`compute instances list`)."
+    "The check reads a node's serial console log in Cloud Logging, and the read of which of "
+    "the {total} RUNNING GKE node(s) on this project send that log there failed."
 )
 UNREAD_CONNTRACK_LOG_REASON = (
-    "§2.6's read of the serial console log in Cloud Logging failed (`logging read`), so no "
-    "line of the {total} RUNNING GKE node(s) on this project was read."
+    "The read of the serial console log in Cloud Logging failed, so no line of the "
+    "{total} RUNNING GKE node(s) on this project was read."
 )
 UNREAD_SERIAL_CONTROL_REASON = (
-    "§2.6 found no kernel line, and its control read of the serial console log failed "
-    "(`logging read`), so nothing shows that this log reaches Cloud Logging for the "
-    "{total} RUNNING GKE node(s) on this project."
+    "The check found no kernel line, and its control read of the serial console log failed, "
+    "so nothing shows that this log reaches Cloud Logging for the {total} RUNNING GKE "
+    "node(s) on this project."
 )
 CONNTRACK_READ_ERROR = "{cause} The read: {error}"
 CONNTRACK_UNEVALUATED_LIMITATION = (
-    "node-conntrack-saturation could not be evaluated on this project: {cause}"
+    "node-conntrack-saturation could not be evaluated on this project. {cause}"
 )
 # The standing states in which §2.6 ran and could not see: nodes that do not
 # send their serial console to Cloud Logging, and a project that keeps none of
@@ -733,12 +735,14 @@ SERIAL_LOGGING_OFF_NOTE = (
     "{count} node pool(s) on this project. Their serial console does not reach Cloud "
     "Logging (`serial-port-logging-enable` is not `true`): {names}."
 )
-# No names, and short: on an install with no ledger a note line over the chat
-# card's line limit costs the summary its card.
+# No names, and short. On an install with no ledger the report's notes line is
+# `<lead>: project/<id>: <note>`, and a line over the chat card's 300 characters
+# costs the summary its card. This note fits for one noted project with the
+# longest project id; a test holds it there. The notes with names do not fit.
 NO_SERIAL_ENTRIES_NOTE = (
-    "node-conntrack-saturation: no serial console entry of a GKE node of this project "
-    "reached Cloud Logging in the last {days} days, so a full connection tracking table "
-    "is not visible here (a log exclusion or an organization policy can keep the log out)."
+    "node-conntrack-saturation: no serial console entry of a GKE node reached Cloud Logging "
+    "here in the last {days} days, so a full connection tracking table is not visible. A log "
+    "exclusion or a policy can cause this."
 )
 # Lines of an instance that the project's list of RUNNING instances does not
 # hold: a node that the autoscaler, a repair or an upgrade deleted, a stopped
@@ -746,22 +750,21 @@ NO_SERIAL_ENTRIES_NOTE = (
 # labels cannot be read, so its node pool is not known, and a finding on the
 # instance would name an object that may be gone and would be a new finding
 # for each deleted node. The lines were read, so this is a note; it lists no
-# noted object, because no finding can be on one.
+# noted object, because no finding can be on one. Where the declared scope
+# excludes a cluster of the project the note is not written at all: such an
+# instance could be a node of the cluster that the operator left out, and
+# nothing of that cluster is reported, counted or named.
 GONE_INSTANCES_NOTE = (
     "node-conntrack-saturation: {count} instance(s) that are not in this project's list of "
     "RUNNING instances wrote the kernel's line in the last {freshness}. Their node pool "
-    "cannot be read, so no finding names them{names}."
+    "cannot be read, so no finding names them: {names}."
 )
-GONE_INSTANCES_NAMED = ": {names}"
-# The names are left out where the declared scope excludes a cluster of the
-# project: such an instance has no label that says which cluster it was in, so
-# a name could be a node of the cluster that the operator left out.
-GONE_INSTANCES_UNNAMED = " (names left out: a cluster of this project is excluded from the scope)"
 CONNTRACK_FULL_PAGE_LIMITATION = (
-    "node-conntrack-saturation read {rounds} page(s) of {limit} serial console entries with "
-    "the kernel's line on this project, each time without the instances already seen, and the "
-    "last page was still full. Older entries of the {freshness} window were not read, and a "
-    "node pool named only there is not reported."
+    "node-conntrack-saturation did not read every serial console entry with the kernel's "
+    "line on this project, so a node pool named only in the older entries of the "
+    "{freshness} window is not reported. It read {rounds} page(s) of {limit} entries, each "
+    "without the instances already seen, and the last page was still full or the next read "
+    "failed."
 )
 
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
@@ -1525,6 +1528,19 @@ def instance_keys(listed: list) -> set[tuple[str, str]]:
     return keys
 
 
+def pool_names(nodes: dict[tuple[str, str], dict], keys) -> list[str]:
+    """The node pools of the nodes `keys` names, in words for a note, sorted
+    and without repeats. A node whose pool is not labelled is named itself."""
+    names = set()
+    for zone, name in keys:
+        node = nodes[(zone, name)]
+        if node["pool"]:
+            names.add(CONNTRACK_SHARED_ID_POOL.format(pool=node["pool"], cluster=node["cluster"], location=node["location"]))
+        else:
+            names.add(CONNTRACK_UNLABELLED_NODE.format(name=name, zone=zone))
+    return sorted(names)
+
+
 def node_objects(nodes: dict[tuple[str, str], dict], keys) -> list[str]:
     """The finding identities of the nodes `keys` names, sorted and without
     repeats: a node pool for a node whose pool is labelled, else the instance,
@@ -1579,15 +1595,37 @@ def ledger_segment(value: str) -> str:
     """`value` as the report tool spells it inside a finding id. Two objects
     with one spelling are one finding there, and a document that carries both
     is refused whole (`audit_report.validate_findings`)."""
-    return LEDGER_SEGMENT_FOLD.sub("-", value.strip().lower()).strip("-")
+    return LEDGER_SEGMENT_FOLD.sub(LEDGER_SEGMENT_HYPHEN, value.strip().lower()).strip(LEDGER_SEGMENT_HYPHEN)
 
 
 def shown_names(names: list[str]) -> str:
     """The first CONNTRACK_NODES_SHOWN of `names`, and how many more there are."""
-    shown = ", ".join(names[:CONNTRACK_NODES_SHOWN])
+    shown = NAMES_JOIN.join(names[:CONNTRACK_NODES_SHOWN])
     if len(names) > CONNTRACK_NODES_SHOWN:
         shown += CONNTRACK_MORE_NODES.format(more=len(names) - CONNTRACK_NODES_SHOWN)
     return shown
+
+
+def conntrack_object(
+    nodes: dict[tuple[str, str], dict],
+    running: set[tuple[str, str]] | None,
+    zone: str,
+    name: str,
+) -> tuple[str, dict | None] | None:
+    """The finding object of the instance `(zone, name)` and, for a node of a
+    pool, its labels; None for an instance that gets no finding.
+
+    A node of a labelled pool is its pool. Another instance is itself when
+    `running`, the `(zone, name)` of the project's RUNNING instances, names it
+    (or is None: every instance then counts as RUNNING). An instance that
+    `running` does not name is gone, and its pool cannot be read.
+    """
+    node = nodes.get((zone, name))
+    if node and node["pool"]:
+        return NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"]), node
+    if node or running is None or (zone, name) in running:
+        return INSTANCE_OBJECT_FORMAT.format(zone=zone or UNKNOWN_ZONE, name=name), None
+    return None
 
 
 def check_conntrack_saturation(
@@ -1620,14 +1658,10 @@ def check_conntrack_saturation(
     """
     groups: dict[str, dict] = {}
     for zone, name, stamp in _conntrack_lines(entries, skip):
-        node = nodes.get((zone, name))
-        if node and node["pool"]:
-            obj = NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"])
-        elif node or running is None or (zone, name) in running:
-            node = None
-            obj = INSTANCE_OBJECT_FORMAT.format(zone=zone or UNKNOWN_ZONE, name=name)
-        else:
+        placed = conntrack_object(nodes, running, zone, name)
+        if placed is None:
             continue
+        obj, node = placed
         group = groups.setdefault(
             ledger_segment(obj), {"objects": {}, "zone": zone or UNKNOWN_ZONE, "name": name, "lines": {}, "stamps": []}
         )
@@ -1651,7 +1685,7 @@ def check_conntrack_saturation(
             excerpt = CONNTRACK_SHARED_ID_EXCERPT.format(
                 prefix=prefix, lines=total, text=CONNTRACK_FULL_TEXT, first=first, last=last,
                 nodes=len(ranked), count=len(pools), names=names,
-                pools=", ".join(
+                pools=NAMES_JOIN.join(
                     CONNTRACK_SHARED_ID_POOL.format(pool=pool["pool"], cluster=pool["cluster"], location=pool["location"])
                     for pool in pools
                 ),
@@ -1705,45 +1739,37 @@ def run_logging_read(
     return run(argv, timeout=max(timeout_s - spent, 1)) if spent else run(argv)
 
 
-def conntrack_filter(without_names: list[str], without_ids: list[str]) -> str:
-    """§2.6's log filter, without the instances that the two lists name."""
-    text = CONNTRACK_LOG_FILTER
-    for clause, values in ((CONNTRACK_WITHOUT_NAMES, without_names), (CONNTRACK_WITHOUT_IDS, without_ids)):
-        if values:
-            text += clause.format(values=FILTER_OR.join(FILTER_VALUE.format(value=value) for value in values))
-    return text
+def conntrack_filter(without_ids: list[str]) -> str:
+    """§2.6's log filter, without the instances whose ids the list holds."""
+    if not without_ids:
+        return CONNTRACK_LOG_FILTER
+    return CONNTRACK_LOG_FILTER + CONNTRACK_WITHOUT_IDS.format(ids=INSTANCE_ID_OR.join(without_ids))
 
 
 class ConntrackLines(NamedTuple):
     """What `read_conntrack_lines` read."""
 
-    # Every page's entries; None when a read failed.
-    entries: list | None
-    # Each round's command and result, in order.
-    reads: list
+    # One `(command, result, entries)` for each round that returned a page, in order.
+    pages: list
     # The last page was not full, so no line of the window is left unread.
     complete: bool
-    # The command and result of the read that failed.
+    # The command and result of a read that failed; the pages before it stand.
     failed: tuple | None
 
 
-def read_conntrack_lines(project: str, left_out_names: list[str], *, run: RunFn) -> ConntrackLines:
+def read_conntrack_lines(project: str, *, run: RunFn) -> ConntrackLines:
     """The project's serial console entries with the kernel's line, in rounds.
 
     A round reads one page, newest first. While a page is full, the next round
     leaves out the instances that the pages so far named (by instance id), up
-    to CONNTRACK_READ_ROUNDS rounds, so the lines of one instance cannot hide
-    another's. `left_out_names` are the running nodes of the clusters that the
-    declared scope excludes: every round leaves them out by name, so their
-    lines are not read and cannot use up a page.
+    to CONNTRACK_READ_ROUNDS rounds and CONNTRACK_FILTER_INSTANCES_MAX
+    instances, so the lines of one instance cannot hide another's. A round
+    that fails ends the rounds; the pages before it are kept.
     """
-    names = sorted(name for name in set(left_out_names) if FILTER_SAFE_VALUE.match(name))
-    names = names[:CONNTRACK_FILTER_INSTANCES_MAX]
-    entries: list = []
-    reads: list = []
+    pages: list = []
     seen: list[str] = []
     for _round in range(CONNTRACK_READ_ROUNDS):
-        filter_text = conntrack_filter(names, seen)
+        filter_text = conntrack_filter(seen)
         argv = [
             GCLOUD, "logging", "read", filter_text,
             "--project", project, "--freshness", CONNTRACK_FRESHNESS,
@@ -1755,11 +1781,10 @@ def read_conntrack_lines(project: str, left_out_names: list[str], *, run: RunFn)
         )
         page = _json_list(result)
         if page is None:
-            return ConntrackLines(None, reads, False, (argv, result))
-        reads.append((shlex.join(argv), result))
-        entries += page
+            return ConntrackLines(pages, False, (argv, result))
+        pages.append((shlex.join(argv), result, page))
         if len(page) < CONNTRACK_LOG_LIMIT:
-            return ConntrackLines(entries, reads, True, None)
+            return ConntrackLines(pages, True, None)
         new = sorted(
             {
                 instance_id
@@ -1770,7 +1795,7 @@ def read_conntrack_lines(project: str, left_out_names: list[str], *, run: RunFn)
         if not new or len(seen) + len(new) > CONNTRACK_FILTER_INSTANCES_MAX:
             break
         seen += new
-    return ConntrackLines(entries, reads, False, None)
+    return ConntrackLines(pages, False, None)
 
 
 def _entry_instance_id(entry) -> str:
@@ -1778,7 +1803,7 @@ def _entry_instance_id(entry) -> str:
     resource = entry.get(LOG_RESOURCE_KEY) if isinstance(entry, dict) else None
     located = resource.get(LOG_LABELS_KEY) if isinstance(resource, dict) else None
     value = str(located.get(LOG_INSTANCE_ID_KEY) or "") if isinstance(located, dict) else ""
-    return value if FILTER_SAFE_VALUE.match(value) else ""
+    return value if INSTANCE_ID_PATTERN.match(value) else ""
 
 
 def _json_list(result: Run) -> list | None:
@@ -2138,7 +2163,8 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         listed_nodes, nodes_result = run_and_gate(nodes_argv, run=run)
         all_nodes = gke_nodes(listed_nodes if isinstance(listed_nodes, list) else [])
         # The nodes of a cluster the operator left out of the declared scope:
-        # neither read nor reported, and not a coverage gap.
+        # not listed as nodes here, their lines dropped after the log read, and
+        # nothing of them reported. Not a coverage gap.
         left_out = frozenset(
             key
             for key, node in all_nodes.items()
@@ -2171,45 +2197,56 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 # The node pools this run could not see, with the read that says so.
                 unseen: dict[str, str] = {}
                 if uncovered:
-                    pools = node_objects(nodes, uncovered)
-                    notes.append(SERIAL_LOGGING_OFF_NOTE.format(count=len(pools), names=shown_names(pools)))
-                    unseen.update(dict.fromkeys(pools, switch_command))
+                    named = pool_names(nodes, uncovered)
+                    notes.append(SERIAL_LOGGING_OFF_NOTE.format(count=len(named), names=shown_names(named)))
+                    unseen.update(dict.fromkeys(node_objects(nodes, uncovered), switch_command))
                 # The findings of this run, as the ledger spells their objects.
                 found: set[str] = set()
                 if covered:
-                    lines = read_conntrack_lines(project, [name for _zone, name in left_out], run=run)
-                    if lines.entries is None:
+                    lines = read_conntrack_lines(project, run=run)
+                    if not lines.pages:
                         failed_argv, failed_result = lines.failed
                         conntrack_cause = UNREAD_CONNTRACK_LOG_REASON.format(total=len(nodes))
                         conntrack_error = _failure_text(failed_argv, failed_result)
                     else:
-                        for command, result in lines.reads:
-                            reads[CONNTRACK_SLUG].add(command, result)
-                        read_command = lines.reads[0][0]
-                        entries = lines.entries
-                        # A full page anywhere makes every count a floor.
-                        floor = len(lines.reads) > 1 or not lines.complete
+                        entries: list = []
+                        # The round that first returned a line of each object.
+                        first_read: dict[str, str] = {}
                         running_now = {(zone, instance) for instance, zone in running}
+                        for command, result, page in lines.pages:
+                            reads[CONNTRACK_SLUG].add(command, result)
+                            entries += page
+                            for zone, instance, _stamp_text in _conntrack_lines(page, left_out):
+                                placed = conntrack_object(nodes, running_now, zone, instance)
+                                if placed:
+                                    first_read.setdefault(ledger_segment(placed[0]), command)
+                        if lines.failed:
+                            log(f"{project}: a later read of the serial console log failed; the pages before it stand")
+                        # A full page anywhere makes every count a floor.
+                        floor = len(lines.pages) > 1 or not lines.complete
                         for hit in check_conntrack_saturation(
                             entries, nodes, running=running_now, skip=left_out, at_least=floor
                         ):
-                            candidates.append(_emit(CONNTRACK_SLUG, hit, read_command))
-                            found.add(ledger_segment(hit["object"]))
-                        gone = gone_conntrack_instances(entries, running_now | set(nodes), skip=left_out)
+                            spelled = ledger_segment(hit["object"])
+                            candidates.append(_emit(CONNTRACK_SLUG, hit, first_read[spelled]))
+                            found.add(spelled)
+                        # No note where a cluster of the project is excluded: an instance
+                        # that the list does not hold could be a node of that cluster.
+                        excluded_here = any(
+                            scoped == project for scoped, _location, _name in declared_scope.excluded_clusters
+                        )
+                        gone = [] if excluded_here else gone_conntrack_instances(entries, running_now | set(nodes))
                         if gone:
-                            if any(scoped == project for scoped, _location, _name in declared_scope.excluded_clusters):
-                                named = GONE_INSTANCES_UNNAMED
-                            else:
-                                named = GONE_INSTANCES_NAMED.format(
-                                    names=shown_names([f"{instance} ({zone or UNKNOWN_ZONE})" for zone, instance in gone])
-                                )
+                            names = [f"{instance} ({zone or UNKNOWN_ZONE})" for zone, instance in gone]
                             notes.append(
-                                GONE_INSTANCES_NOTE.format(count=len(gone), freshness=CONNTRACK_FRESHNESS, names=named)
+                                GONE_INSTANCES_NOTE.format(
+                                    count=len(gone), freshness=CONNTRACK_FRESHNESS, names=shown_names(names)
+                                )
                             )
                         if not lines.complete:
                             limitations.append(
                                 CONNTRACK_FULL_PAGE_LIMITATION.format(
-                                    rounds=len(lines.reads), limit=CONNTRACK_LOG_LIMIT, freshness=CONNTRACK_FRESHNESS
+                                    rounds=len(lines.pages), limit=CONNTRACK_LOG_LIMIT, freshness=CONNTRACK_FRESHNESS
                                 )
                             )
                         if not entries:

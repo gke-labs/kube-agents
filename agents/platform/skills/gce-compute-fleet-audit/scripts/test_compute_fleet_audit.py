@@ -3077,7 +3077,7 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
     leaves in the manifest entry."""
 
     # What only a later round of the log read carries in its filter.
-    LATER_ROUND = "resource.labels.instance_id=("
+    LATER_ROUND = "resource.labels.instance_id=~"
 
     @staticmethod
     def later_rounds(pages: list):
@@ -3280,19 +3280,40 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
     def test_a_failed_node_list_leaves_the_check_unevaluated_and_the_project_collected(self):
         entry, issued = self.collect(self.responses(**{cf.GKE_NODES_FILTER: run_of(1, "", "ERROR: backend error")}))
         self.assertEqual(entry["outcome"], "collected")
-        self.assertIn("could not list this project's GKE nodes", unevaluated(entry)[cf.CONNTRACK_SLUG])
+        self.assertIn("list of this project's GKE nodes could not be read", unevaluated(entry)[cf.CONNTRACK_SLUG])
         self.assertIn("backend error", unevaluated(entry)[cf.CONNTRACK_SLUG])
         self.assertIn("rc=1", unevaluated(entry)[cf.CONNTRACK_SLUG])
         self.assertIn("node-conntrack-saturation could not be evaluated", entry["limitations"])
         # A chat report shows `limitations`: the cause in plain words, and no
         # command line, exit code or error text.
         self.assertIn(cf.UNREAD_GKE_NODES_REASON, entry["limitations"])
-        for plumbing in ("backend error", "rc=", "--format", "gcloud "):
+        for plumbing in ("backend error", "rc=", "--format", "gcloud ", "instances list", "§"):
             self.assertNotIn(plumbing, entry["limitations"])
+
         self.assertEqual([argv for argv in issued if "logging" in argv], [])
         self.assertEqual([c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG], [])
         # The four other checks keep their verdicts.
         self.assertIn(cf.MIG_SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_no_cause_of_a_failed_read_names_a_command_or_a_section(self):
+        """`limitations` is read in a chat report."""
+        for cause in (
+            cf.UNREAD_GKE_NODES_REASON, cf.UNREAD_SERIAL_LOGGING_REASON,
+            cf.UNREAD_CONNTRACK_LOG_REASON, cf.UNREAD_SERIAL_CONTROL_REASON,
+        ):
+            for plumbing in ("`", "§", "gcloud", "logging read", "instances list"):
+                self.assertNotIn(plumbing, cause)
+
+    def test_the_note_for_a_project_with_no_serial_log_fits_the_chat_cards_line(self):
+        """On an install with no ledger the notes line is `<lead>: project/<id>:
+        <note>`, and a line over the card's limit costs the summary its card."""
+        import audit_report
+        from slack_presenter import ROW_TEXT_MAX
+
+        longest_project_id = "p" * 30
+        note = cf.NO_SERIAL_ENTRIES_NOTE.format(days=cf.SERIAL_CONTROL_FRESHNESS_DAYS)
+        line = f"{audit_report.NOTES_LEAD}: project/{longest_project_id}: {note}"
+        self.assertLessEqual(len(line), ROW_TEXT_MAX)
 
     def test_a_failed_read_of_the_switch_leaves_the_check_unevaluated(self):
         entry, issued = self.collect(self.responses(**{cf.SERIAL_LOGGING_KEY: run_of(1, "", "ERROR: denied")}))
@@ -3311,9 +3332,10 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertNotIn("limitations", entry)
         self.assertEqual([argv for argv in issued if "logging" in argv], [])
         self.assertIn("not visible on nodes of 1 node pool(s)", entry["notes"])
-        self.assertIn("NodePool/us-central1-a/seeded-a/default-pool.", entry["notes"])
-        # The note names the pool and no node: a node's name changes with each repair.
+        self.assertIn("default-pool in cluster seeded-a (us-central1-a).", entry["notes"])
+        # The note names the pool, in words, and no node: a node's name changes with each repair.
         self.assertNotIn(NODE_A, entry["notes"])
+        self.assertNotIn("NodePool/", entry["notes"])
         (noted,) = self.noted(entry)
         self.assertEqual(noted["object"], "NodePool/us-central1-a/seeded-a/default-pool")
         self.assertIn("serial-port-logging-enable", noted["command"])
@@ -3327,8 +3349,8 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
         self.assertNotIn("limitations", entry)
         self.assertIn("not visible on nodes of 1 node pool(s)", entry["notes"])
-        self.assertIn("NodePool/us-central1-a/seeded-a/idle-batch-pool", entry["notes"])
-        self.assertNotIn("NodePool/us-central1-a/seeded-a/default-pool", entry["notes"])
+        self.assertIn("idle-batch-pool in cluster seeded-a (us-central1-a)", entry["notes"])
+        self.assertNotIn("default-pool in cluster", entry["notes"])
         self.assertEqual([n["object"] for n in self.noted(entry)], ["NodePool/us-central1-a/seeded-a/idle-batch-pool"])
 
     def test_a_pool_with_a_finding_this_run_is_not_a_noted_object(self):
@@ -3337,8 +3359,13 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         nodes = [gke_node(NODE_A), gke_node(NODE_B)]
         entry, _ = self.collect(self.responses(nodes=nodes, logged_names=(NODE_A,), entries=[conntrack_entry(NODE_A)]))
         self.assertEqual(len(self.conntrack(entry)), 1)
-        self.assertIn("NodePool/us-central1-a/seeded-a/default-pool", entry["notes"])
+        self.assertIn("default-pool in cluster seeded-a (us-central1-a)", entry["notes"])
         self.assertEqual(self.noted(entry), [])
+
+    def test_a_node_with_no_pool_label_is_named_itself_in_the_note(self):
+        entry, _ = self.collect(self.responses(nodes=[gke_node(pool="")], logged_names=()))
+        self.assertIn(f"node {NODE_A} (us-central1-a), which names no pool", entry["notes"])
+        self.assertEqual([n["object"] for n in self.noted(entry)], [f"ComputeInstance/us-central1-a/{NODE_A}"])
 
     def test_the_note_on_unseen_pools_does_not_change_when_a_node_is_replaced(self):
         """A note that changed with each replaced node would keep `precheck` from
@@ -3360,8 +3387,7 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         entries = [conntrack_entry("gke-old-node-gone"), conntrack_entry("gke-old-node-gone"), conntrack_entry()]
         entry, _ = self.collect(self.responses(entries=entries))
         self.assertEqual([c["object"] for c in self.conntrack(entry)], ["NodePool/us-central1-a/seeded-a/default-pool"])
-        named = cf.GONE_INSTANCES_NAMED.format(names="gke-old-node-gone (us-central1-a)")
-        note = cf.GONE_INSTANCES_NOTE.format(count=1, freshness=cf.CONNTRACK_FRESHNESS, names=named)
+        note = cf.GONE_INSTANCES_NOTE.format(count=1, freshness=cf.CONNTRACK_FRESHNESS, names="gke-old-node-gone (us-central1-a)")
         self.assertIn(note, entry["notes"])
         self.assertEqual(self.noted(entry), [])
         self.assertNotIn("limitations", entry)
@@ -3387,16 +3413,16 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertIn(f"{names[cf.CONNTRACK_NODES_SHOWN - 1]} (us-central1-a) and 2 more", entry["notes"])
         self.assertNotIn(names[cf.CONNTRACK_NODES_SHOWN], entry["notes"])
 
-    def test_the_gone_note_names_no_instance_where_the_project_has_an_excluded_cluster(self):
+    def test_there_is_no_gone_note_where_the_project_has_an_excluded_cluster(self):
         # A deleted instance carries no label to read, so it could be a node of the
-        # cluster that the operator left out; the note counts it and does not name it.
+        # cluster that the operator left out: it is not reported, counted or named.
         cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-b")
         entry, _ = self.collect(self.responses(entries=[conntrack_entry("gke-seeded-b-old-node")]))
         self.assertEqual(self.conntrack(entry), [])
-        self.assertIn(cf.GONE_INSTANCES_NOTE.format(count=1, freshness=cf.CONNTRACK_FRESHNESS, names=cf.GONE_INSTANCES_UNNAMED), entry["notes"])
-        self.assertNotIn("gke-seeded-b-old-node", entry["notes"])
+        self.assertNotIn("gke-seeded-b-old-node", json.dumps(entry))
+        self.assertNotIn("not in this project's list of RUNNING instances", entry.get("notes", ""))
 
-    def test_an_excluded_cluster_of_another_project_does_not_hide_the_names(self):
+    def test_an_excluded_cluster_of_another_project_does_not_stop_the_gone_note(self):
         cf.declared_scope.set("proj-1,proj-2", None, "proj-2/us-central1-a/seeded-b")
         entry, _ = self.collect(self.responses(entries=[conntrack_entry("gke-old-node-gone")]))
         self.assertIn("gke-old-node-gone (us-central1-a)", entry["notes"])
@@ -3442,7 +3468,7 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         )
         first, second = self.log_reads(issued)
         self.assertEqual(first, cf.CONNTRACK_LOG_FILTER)
-        self.assertEqual(second, cf.CONNTRACK_LOG_FILTER + f' AND NOT resource.labels.instance_id=("{INSTANCE_ID}")')
+        self.assertEqual(second, cf.CONNTRACK_LOG_FILTER + f' AND NOT resource.labels.instance_id=~"^({INSTANCE_ID})$"')
         # The last page was not full: nothing of the window is unread.
         self.assertNotIn("limitations", entry)
         self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
@@ -3451,20 +3477,25 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
             self.assertTrue(finding["excerpt"].startswith("At least "), finding["excerpt"])
         (record,) = [c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG]
         self.assertIn("instance_id=", record["command"])
+        # Each finding carries the read that returned its lines.
+        by_object = {c["object"]: c["command"] for c in self.conntrack(entry)}
+        self.assertNotIn("instance_id=~", by_object["NodePool/us-central1-a/seeded-a/default-pool"])
+        self.assertIn(f'instance_id=~"^({INSTANCE_ID})$"', by_object["NodePool/us-central1-a/seeded-a/idle-batch-pool"])
 
     def test_each_round_leaves_out_every_instance_seen_so_far(self):
         pages = [self.full_page("gke-busy-2", "2222"), []]
         _, issued = self.collect(self.responses(entries=self.full_page("gke-busy-1", "1111"), later_pages=pages))
         reads = self.log_reads(issued)
         self.assertEqual(len(reads), 3)
-        self.assertTrue(reads[1].endswith('instance_id=("1111")'), reads[1])
-        self.assertTrue(reads[2].endswith('instance_id=("1111" OR "2222")'), reads[2])
+        self.assertTrue(reads[1].endswith('instance_id=~"^(1111)$"'), reads[1])
+        self.assertTrue(reads[2].endswith('instance_id=~"^(1111|2222)$"'), reads[2])
 
     def test_a_last_page_that_is_still_full_is_a_limitation(self):
         pages = [self.full_page(f"gke-busy-{i}", str(1000 + i)) for i in range(cf.CONNTRACK_READ_ROUNDS)]
         entry, issued = self.collect(self.responses(entries=self.full_page(), later_pages=pages))
         self.assertEqual(len(self.log_reads(issued)), cf.CONNTRACK_READ_ROUNDS)
-        self.assertIn(f"read {cf.CONNTRACK_READ_ROUNDS} page(s) of 1000 serial console entries", entry["limitations"])
+        self.assertIn(f"It read {cf.CONNTRACK_READ_ROUNDS} page(s) of 1000 entries", entry["limitations"])
+        self.assertIn("did not read every serial console entry", entry["limitations"])
         self.assertIn("24h window", entry["limitations"])
         (finding,) = self.conntrack(entry)
         self.assertTrue(finding["excerpt"].startswith("At least 1000 kernel line(s)"), finding["excerpt"])
@@ -3474,46 +3505,68 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         no instance id), so another round would read the same page."""
         entry, issued = self.collect(self.responses(entries=self.full_page(), later_pages=[self.full_page()]))
         self.assertEqual(len(self.log_reads(issued)), 2)
-        self.assertIn("read 2 page(s)", entry["limitations"])
+        self.assertIn("It read 2 page(s)", entry["limitations"])
 
-    def test_a_later_round_that_fails_leaves_the_check_unevaluated(self):
+    def test_a_later_round_that_fails_keeps_the_pages_before_it(self):
+        """Page 1 was read and names a pool. A second read that fails takes
+        nothing back: the finding stands as a floor, and the run says that
+        older lines were not read."""
         answers = self.responses(entries=self.full_page())
         answers[self.LATER_ROUND] = run_of(1, "", "ERROR: DEADLINE_EXCEEDED")
         entry, _ = self.collect(answers)
+        (finding,) = self.conntrack(entry)
+        self.assertTrue(finding["excerpt"].startswith("At least 1000 kernel line(s)"), finding["excerpt"])
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertIn("It read 1 page(s)", entry["limitations"])
+        self.assertNotIn("DEADLINE_EXCEEDED", entry["limitations"])
+
+    def test_a_first_read_that_fails_leaves_the_check_unevaluated(self):
+        entry, _ = self.collect(self.responses(**{"logging read": run_of(1, "", "ERROR: DEADLINE_EXCEEDED")}))
         self.assertIn("DEADLINE_EXCEEDED", unevaluated(entry)[cf.CONNTRACK_SLUG])
         self.assertEqual(self.conntrack(entry), [])
         self.assertEqual(self.noted(entry), [])
 
-    def test_an_instance_id_that_is_not_digits_or_name_characters_is_not_written_into_a_filter(self):
+    def test_an_instance_id_that_is_not_digits_is_not_written_into_a_filter(self):
         page = [conntrack_entry(instance_id='1" OR "x') for _ in range(cf.CONNTRACK_LOG_LIMIT)]
         _, issued = self.collect(self.responses(entries=page))
         self.assertEqual(self.log_reads(issued), [cf.CONNTRACK_LOG_FILTER])
 
-    def test_the_running_nodes_of_an_excluded_cluster_are_left_out_of_the_read_by_name(self):
+    def test_the_rounds_end_when_a_filter_would_leave_out_too_many_instances(self):
+        """More instances in one page than a filter may leave out: no second
+        read, and the run says that older lines were not read."""
+        many = cf.CONNTRACK_FILTER_INSTANCES_MAX + 1
+        page = [conntrack_entry(f"gke-busy-{i % many}", instance_id=str(5000 + i % many)) for i in range(cf.CONNTRACK_LOG_LIMIT)]
+        entry, issued = self.collect(self.responses(entries=page))
+        self.assertEqual(len(self.log_reads(issued)), 1)
+        self.assertIn("It read 1 page(s)", entry["limitations"])
+
+    def test_a_command_at_the_instance_limit_fits_the_records_command_field(self):
+        """The record and a finding's evidence show the command whole."""
+        ids = ["9" * 20] * cf.CONNTRACK_FILTER_INSTANCES_MAX
+        argv = [
+            cf.GCLOUD, "logging", "read", cf.conntrack_filter(ids),
+            "--project", "p" * 30, "--freshness", cf.CONNTRACK_FRESHNESS,
+            "--limit", str(cf.CONNTRACK_LOG_LIMIT), "--format", "json",
+        ]
+        self.assertLessEqual(len(shlex.join(argv)), cf.MAX_COMMAND_CHARS)
+
+    def test_no_name_of_an_excluded_clusters_node_is_in_a_command_or_a_note(self):
+        """The filter leaves instances out by id only, so the record and a
+        finding's evidence command never carry a node name."""
         cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-a")
         nodes = [gke_node(NODE_A), gke_node(NODE_B), gke_node("gke-other-pool-1-abcd", cluster="other", pool="pool-1")]
-        _, issued = self.collect(self.responses(nodes=nodes, logged_names=("gke-other-pool-1-abcd",)))
-        (read,) = self.log_reads(issued)
-        self.assertEqual(
-            read,
-            cf.CONNTRACK_LOG_FILTER + f' AND NOT labels."compute.googleapis.com/resource_name"=("{NODE_A}" OR "{NODE_B}")',
+        busy = [conntrack_entry(NODE_A) for _ in range(cf.CONNTRACK_LOG_LIMIT)]
+        behind = [conntrack_entry("gke-other-pool-1-abcd", instance_id=OTHER_INSTANCE_ID)]
+        entry, issued = self.collect(
+            self.responses(nodes=nodes, logged_names=("gke-other-pool-1-abcd",), entries=busy, later_pages=[behind])
         )
+        # The busy node of the excluded cluster did not hide the pool behind it.
+        self.assertEqual([c["object"] for c in self.conntrack(entry)], ["NodePool/us-central1-a/other/pool-1"])
+        published = json.dumps([entry["commands"], entry["candidates"], entry.get("notes", ""), entry.get("limitations", "")])
+        for name in (NODE_A, NODE_B):
+            self.assertNotIn(name, published)
 
-    def test_no_more_names_than_the_filter_may_hold_are_left_out(self):
-        cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-a")
-        many = [gke_node(f"gke-seeded-a-pool-{i:04d}") for i in range(cf.CONNTRACK_FILTER_INSTANCES_MAX + 20)]
-        nodes = many + [gke_node("gke-other-pool-1-abcd", cluster="other", pool="pool-1")]
-        _, issued = self.collect(self.responses(nodes=nodes, logged_names=("gke-other-pool-1-abcd",)))
-        (read,) = self.log_reads(issued)
-        self.assertEqual(read.count(" OR ") + 1, cf.CONNTRACK_FILTER_INSTANCES_MAX)
-        self.assertLess(len(read), 20000)
-
-    def test_a_filter_at_both_limits_is_under_the_length_that_a_log_query_may_have(self):
-        names = ["n" * 63] * cf.CONNTRACK_FILTER_INSTANCES_MAX
-        ids = ["1" * 19] * cf.CONNTRACK_FILTER_INSTANCES_MAX
-        self.assertLess(len(cf.conntrack_filter(names, ids)), 20000)
-
-    def test_the_nodes_of_an_excluded_cluster_are_neither_read_nor_reported(self):
+    def test_the_nodes_of_an_excluded_cluster_are_not_reported(self):
         cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-a")
         nodes = [gke_node(NODE_A), gke_node("gke-other-pool-1-abcd", cluster="other", pool="pool-1")]
         entries = [conntrack_entry(NODE_A), conntrack_entry("gke-other-pool-1-abcd")]

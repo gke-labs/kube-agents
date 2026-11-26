@@ -300,7 +300,7 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         project_gke_cluster,
     ),
     # One project's log entries, for the code-owned `gcloud logging read` callers
-    # (fleet_stockout.py, the readiness report's audit_log.py): the same read
+    # (fleet_stockout.py, compute_fleet_audit.py, the readiness report's audit_log.py): the same read
     # without a `gcloud` start in the broker. The one POST the relay forwards;
     # `entries:write`, `entries:tail`, `entries:copy`, sinks, exclusions and every
     # other Logging path stay refused, and the body check holds the read to one
