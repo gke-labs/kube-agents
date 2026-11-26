@@ -775,6 +775,12 @@ type ConversationState struct {
 	// record, so it costs no stream read. Only the inject door's read
 	// route carries it, for a harness grading which agent a turn chose.
 	ChildAddressees []string
+	// ChildCount is how many child tasks the chain minted under TaskID's
+	// root (chainChildCount): every delegation, so it counts the repeats
+	// ChildAddressees names once. Zero when the chain delegated nothing,
+	// nil when the task is unknown. Read from the record, and carried only
+	// by the inject door's read route, like ChildAddressees.
+	ChildCount *int
 }
 
 // chainUsageKey marks a probe's context as asking for

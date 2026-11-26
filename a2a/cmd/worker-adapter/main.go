@@ -141,7 +141,8 @@ func main() {
 // at the socket the adapter named and with the delegate targets it wrote into
 // this process's env for the turn.
 func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
-	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+	return workeradapter.ServeDelegateMCPWith(ctx, in, out, workeradapter.DelegateSocketPath(),
+		workeradapter.DelegateTargetsFromEnv(log), workeradapter.ScopeClustersFromEnv(log), log)
 }
 
 func run() int {
@@ -215,6 +216,19 @@ func run() int {
 	// one-line result and exits 0 (workeradapter.Run).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	// A core-agent worker's model calls go through the adapter's loopback
+	// proxy, started once and closed when the worker exits
+	// (startHarnessGateway). A proxy that can't start refuses the worker:
+	// the harness never runs pointed at anything else.
+	gatewayProxy, err := applyHarnessGateway(&cfg, os.Getenv, gatewayProxyStarterFromEnv(os.Getenv, log), log)
+	if err != nil {
+		log.Error("worker refused", "err", err)
+		return 1
+	}
+	if gatewayProxy != nil {
+		defer func() { _ = gatewayProxy.Close() }()
+	}
 
 	if os.Getenv(lib.EnvProfileWorker) == "true" {
 		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)

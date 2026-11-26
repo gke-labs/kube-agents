@@ -47,8 +47,12 @@ const (
 	testContentJSON     = "application/json"
 	testReviewRefused   = `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":false}}`
 	testReviewAudience  = "review-audience"
-	testReviewAccepted  = `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true,"user":{"username":"` + testReviewCaller + `"},"audiences":["` + testReviewAudience + `"]}}`
-	testForeignIssuer   = "https://kubernetes.default.svc"
+	testReviewAccepted  = `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","status":{"authenticated":true,"user":{"username":"` + testReviewCaller + `","extra":{"authentication.kubernetes.io/pod-name":["caller-0"],"authentication.kubernetes.io/pod-uid":["caller-uid"]}},"audiences":["` + testReviewAudience + `"]}}`
+	// testCallerPodPath and testCallerPod are the pod testReviewAccepted names, at the address
+	// httptest.NewRequest gives every request's peer.
+	testCallerPodPath = "/api/v1/namespaces/ns/pods/caller-0"
+	testCallerPod     = `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"caller-0","namespace":"ns","uid":"caller-uid"},"status":{"phase":"Running","podIP":"192.0.2.1","podIPs":[{"ip":"192.0.2.1"}]}}`
+	testForeignIssuer = "https://kubernetes.default.svc"
 )
 
 // proxyEnvVars are the KUBE_PROXY_ and CREDENTIAL_PROXY_ variables the binary reads, cleared
@@ -737,9 +741,13 @@ func TestBuildHandlerChainPassesAnotherIssuersTokenToTokenReview(t *testing.T) {
 	foreign := newTestJWTIssuer(t)
 	up := newCountingUpstream(t)
 	var reviews atomic.Int32
-	review := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		reviews.Add(1)
+	review := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", testContentJSON)
+		if r.Method == http.MethodGet && r.URL.Path == testCallerPodPath {
+			_, _ = io.WriteString(w, testCallerPod)
+			return
+		}
+		reviews.Add(1)
 		_, _ = io.WriteString(w, testReviewAccepted)
 	}))
 	t.Cleanup(review.Close)

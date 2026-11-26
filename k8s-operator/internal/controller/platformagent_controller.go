@@ -4489,8 +4489,11 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range existingRoleBindings.Items {
 		rb := &existingRoleBindings.Items[i]
-		// Preserve local and leader bindings during reconciliation
-		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
+		// Preserve local and leader bindings during reconciliation.
+		// kube-proxy's pod-read binding is bound to saName too, and an agent
+		// named with the kubeagents prefix would give it the prefix this
+		// sweep reaps; reconcileKubeProxy applies it every pass.
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName || rb.Name == kubeProxyPodReadName(agent)) {
 			continue
 		}
 		isTargetSA := false

@@ -273,9 +273,14 @@ var (
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
 	metricsAnswers         = []string{answerReply, answerCard}
 	metricsPostKinds       = []string{postKindAlert, postKindReport}
-	// metricsRatedPlatforms are the backends that draw rating controls, each
-	// given a zero answer_feedback_total series per rating and answer.
-	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
+	// metricsRatedPlatforms are the backends that draw rating controls on
+	// the posts the agent makes on its own, each given a zero
+	// post_feedback_total series per rating and kind;
+	// metricsAnswerRatedPlatforms are the ones that draw them on an answer,
+	// each given a zero answer_feedback_total series per rating and answer.
+	// Teams rates answers only: its home posts carry no controls.
+	metricsRatedPlatforms       = []string{platformGoogleChat, platformSlack}
+	metricsAnswerRatedPlatforms = []string{platformGoogleChat, platformSlack, platformTeams}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
 	metricsBackendPlatforms = map[string]string{
@@ -666,11 +671,15 @@ func NewMetrics() *Metrics {
 	for _, outcome := range metricsTeamsOutcomes {
 		m.teamsPulls.WithLabelValues(outcome)
 	}
-	for _, platform := range metricsRatedPlatforms {
+	for _, platform := range metricsAnswerRatedPlatforms {
 		for _, rating := range metricsRatings {
 			for _, answer := range metricsAnswers {
 				m.answerFeedback.WithLabelValues(platform, rating, answer)
 			}
+		}
+	}
+	for _, platform := range metricsRatedPlatforms {
+		for _, rating := range metricsRatings {
 			for _, kind := range metricsPostKinds {
 				m.postFeedback.WithLabelValues(platform, rating, kind)
 			}

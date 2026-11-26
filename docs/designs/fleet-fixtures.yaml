@@ -768,6 +768,15 @@ fixtures:
     defect: >-
       cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
 
+  - role: state-sync-controller
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/state-sync-controller
+    namespace: seeded-shapes
+    defect: >-
+      state-sync-controller Deployment (one replica) in seeded-shapes whose container startup argument passes --kube-api-qps=-1 to an inert sleep process, planting a controller with a negative client QPS (client-side rate limit disabled) for control-plane-configmap-lease-write-storm without generating API server write load
+
   - role: scaled-zero-gateway
     slot: a
     available_from_day: 0

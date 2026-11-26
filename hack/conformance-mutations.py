@@ -297,6 +297,33 @@ MUTATIONS: list[Mutation] = [
         "caller with no task, so a stale credential degrades instead of failing",
     ),
     Mutation(
+        "A3-profile-reports-the-dial",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (DIAL_PATH, (CALLER_ROLE_CHAT,)),\n',
+         '    (DIAL_PATH, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "let a profile task report the dial's level, so a scheduled run that "
+        "watches the dial can also set it",
+    ),
+    Mutation(
+        "A3-shell-reports-the-dial",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (DIAL_PATH, (CALLER_ROLE_CHAT,)),\n',
+         '    (DIAL_PATH, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "let the shell report the dial's level too, so a helper script can "
+        "set it when the gateway's own report is late",
+    ),
+    Mutation(
+        "A3-dial-handler-asks-no-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if getattr(principal, "role", "") != CALLER_ROLE_CHAT:\n',
+         '        if False:\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "drop the dial handler's own role check as a copy of the role table, "
+        "which admits a caller with no role on every route",
+    ),
+    Mutation(
         "A3-role-verbs-as-a-string",
         "agents/platform/scripts/credential_proxy.py",
         ('        if not isinstance(verbs, frozenset):\n            raise TypeError(\n',

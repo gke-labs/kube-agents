@@ -1072,9 +1072,9 @@
 # A per-node listing (five columns) arrives in the chat thread as a pipe
 # table, not as a bullet per node: the A2A gateway renders a table on Google
 # Chat as a monospace block, and the personas and report stanza no longer tell
-# the worker that Chat drops it. deployer: noop, read-only, the three node-pool
-# fixtures of slot a (idle-nodepool, hpa-saturated, default-pool-headroom), one
-# card.
+# the worker that Chat drops it. deployer: noop, read-only, the node-pool
+# fixtures of slot a whose pools hold nodes (idle-nodepool, hpa-saturated,
+# default-pool-headroom), one card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
 # A presence answer from a Cluster Agent names the missing namespace and the
@@ -1352,6 +1352,18 @@
 # entry.
 ./tasks/gce-chat-request-runs-collector/task.yaml
 
+# The GCE compute audit's rotated-console notes over a standing plant
+# (#5389): the rotated-console-vm role's VM floods its own serial console
+# minutes after boot, so the boot's failure lines are gone; the report
+# names the VM as not visible, with no finding filed on it, and the ledger
+# carries no finding for it. deployer: noop, read-only on the project; a
+# full audit, in the band of the other fleet-audit cases. The fixture-state
+# scan of 2026-11-24 reads the role healthy on every pool project, after
+# the daily reconcile of 2026-11-24 converged every project. No stack, so
+# the main part shards it by checksum. Nightly from the merge that removes
+# its FIXTURE_NOT_READY entry.
+./tasks/gce-rotated-console-notes/task.yaml
+
 # The GCE compute audit end to end over the same standing plant (#2483): the
 # collector's gce-startup-script-status check flags the startup-fail-vm role's
 # VM, and the run files the ledger. deployer: noop, read-only on the project;
@@ -1491,6 +1503,16 @@
 # no pool fixture: its first nightly run is the pool proof of the plant and
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
+
+# Side A of the first permit pair (hack/eval/permit-pairs.txt, #6539): the ask
+# and the checks of cluster-profile-confirmed-pdb-pull-request with no
+# [bench:profile ...] directive, so today's platform agent opens the
+# PodDisruptionBudget pull request with today's authority. Graded as its pair
+# case is: the pull request (pull_request_opened, the budget file only) and an
+# unchanged cluster. deployer: noop. Nightly from its first merge, in the
+# writers part beside its pair case; its record is the platform side that
+# scripts/eval_front_door_ab.py --pairs compares the profile side with.
+./tasks/platform-agent-pdb-pull-request/task.yaml
 
 # The front door is running the plugins its image ships: an exec into the
 # agent container reads each plugin directory under /opt/defaults/plugins
@@ -1752,6 +1774,11 @@
 # seeded cluster carrying the rule's own entry as printed, none where it
 # prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
+
+# Managed Cloud Service Mesh (ASM) channel-downgrade guard (#2599, #2797, #7181):
+# switching from rapid to an older stable channel risks control-plane downgrade,
+# sidecar skew, and Envoy xDS NACK loops. deployer: noop, no fixture.
+./tasks/upgrades-managed-mesh-channel-downgrade-guard/task.yaml
 
 # Upgrade-failure catalogue entry 8 through the readiness report's
 # changed-defaults rule: the seeded-defaults namespace on slot a (role

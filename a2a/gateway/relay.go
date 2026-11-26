@@ -88,6 +88,7 @@ var reasonSentences = map[string]string{
 	"spawn-failed":                       "the agent could not be started",
 	"bridge-died-without-terminal-event": "the agent stopped without reporting a result; ask again",
 	"worker-evicted":                     "the agent's worker was restarted before it finished; ask again",
+	"internal-panic":                     "the agent hit an internal error while it handled this, and sent no answer; ask again",
 	"session-busy":                       "the agent was still busy with an earlier request when time ran out; ask again",
 	"hermes-rate-limited":                "the agent's server or the model provider is rate-limiting requests; ask again in a few minutes",
 	"hermes-api-unreachable":             "the agent's server did not answer; ask again",

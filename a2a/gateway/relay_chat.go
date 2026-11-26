@@ -171,14 +171,16 @@ func (g *Gateway) answersWholeOnLine(conversation string, m OutMessage) bool {
 // answerOnLine edits messageID, the task's live message, into m, the
 // acknowledgement of a turn that handed the ask to cards: laid out when m
 // carries a chat message the backend lays out, as text otherwise. The edit
-// carries no Stop, so the control comes off as at the terminal edit. It
-// reports whether the line carries the acknowledgement. An edit that does
+// carries no Stop, so the control comes off as at the terminal edit, and
+// it carries m's feedback mark, so a whole answer taken on the line
+// (WholeLineAnswerer) is rated as a posted one is; an acknowledgement has
+// none. It reports whether the line carries the acknowledgement. An edit that does
 // not land (a refused layout retries as text first, as a refused post does)
 // posts m as postMessage would, without a layout the edit already had
 // refused, and reports false, so the caller makes the terminal edit.
 func (g *Gateway) answerOnLine(conversation, messageID string, m OutMessage) bool {
 	if m.Chat != nil && strings.TrimSpace(m.Text) != "" {
-		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text, Chat: m.Chat})
+		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text, Chat: m.Chat, Feedback: m.Feedback})
 		if g.chatOutcome(conversation, err) {
 			return true
 		}
@@ -186,7 +188,7 @@ func (g *Gateway) answerOnLine(conversation, messageID string, m OutMessage) boo
 			m.Chat = nil
 		}
 	}
-	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text}); err != nil {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: m.Text, Feedback: m.Feedback}); err != nil {
 		g.log.Warn("editing the acknowledgement onto the task's line failed; posting it", "conversation", conversation, "err", err)
 		g.postMessage(conversation, m)
 		return false
