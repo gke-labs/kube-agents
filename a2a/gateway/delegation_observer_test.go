@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1393,6 +1394,10 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 	if want := []string{targetPlatform}; !slices.Equal(st.ChildAddressees, want) || !slices.Equal(plain.ChildAddressees, want) {
 		t.Fatalf("child addressees = %v / %v, want %v on both reads", st.ChildAddressees, plain.ChildAddressees, want)
 	}
+	// ...and counted twice: the count is the delegations, not the names.
+	if st.ChildCount == nil || *st.ChildCount != 2 || plain.ChildCount == nil || *plain.ChildCount != 2 {
+		t.Fatalf("child count = %s / %s, want 2 on both reads", childCountString(st.ChildCount), childCountString(plain.ChildCount))
+	}
 }
 
 // chainChildAddressees names each child of the read's chain once, in the
@@ -1423,6 +1428,47 @@ func TestChainChildAddresseesNameTheChainsChildrenOnce(t *testing.T) {
 	if got := chainChildAddressees(&SessionRecord{Tasks: []TaskRef{{ID: "solo"}}}, "solo"); got == nil || len(got) != 0 {
 		t.Errorf("no delegation: %#v, want an empty, non-nil list", got)
 	}
+}
+
+// chainChildCount counts every child of the read's chain, a repeated
+// addressee and an addressee-less child included, where chainChildAddressees
+// names each addressee once; a child of another chain on the same record
+// isn't this chain's.
+func TestChainChildCountCountsEveryDelegation(t *testing.T) {
+	rec := &SessionRecord{Tasks: []TaskRef{
+		{ID: "root", Addressee: "chat-otter"},
+		{ID: "c1", Addressee: targetPlatform, Role: taskRoleChild, ParentTaskID: "root", RootTaskID: "root"},
+		{ID: "w1", Addressee: "chat-otter", Role: taskRoleWake, RootTaskID: "root"},
+		{ID: "c2", Addressee: targetPlatform, Role: taskRoleChild, ParentTaskID: "w1", RootTaskID: "root"},
+		{ID: "c3", Role: taskRoleChild, ParentTaskID: "w1", RootTaskID: "root"},
+		{ID: "other", Addressee: "chat-otter"},
+		{ID: "c4", Addressee: "elsewhere", Role: taskRoleChild, ParentTaskID: "other", RootTaskID: "other"},
+	}}
+	for _, read := range []string{"root", "w1", "c2"} {
+		if got := chainChildCount(rec, read); got == nil || *got != 3 {
+			t.Errorf("read on %s: %s, want 3", read, childCountString(got))
+		}
+	}
+	if got := chainChildAddressees(rec, "root"); !slices.Equal(got, []string{targetPlatform}) {
+		t.Errorf("addressees beside the count: %v, want platform once", got)
+	}
+	if got := chainChildCount(rec, "other"); got == nil || *got != 1 {
+		t.Errorf("the other chain: %s, want 1", childCountString(got))
+	}
+	if got := chainChildCount(rec, "missing"); got != nil {
+		t.Errorf("an unknown task: %s, want nil", childCountString(got))
+	}
+	if got := chainChildCount(&SessionRecord{Tasks: []TaskRef{{ID: "solo"}}}, "solo"); got == nil || *got != 0 {
+		t.Errorf("no delegation: %s, want 0", childCountString(got))
+	}
+}
+
+// childCountString is a child count as a failure message prints it.
+func childCountString(n *int) string {
+	if n == nil {
+		return "nil"
+	}
+	return strconv.Itoa(*n)
 }
 
 // The door's one deliverable is the last turn's answer; earlier turns are

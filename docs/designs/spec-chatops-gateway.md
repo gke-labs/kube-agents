@@ -1559,7 +1559,7 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`), whom the chain delegated to (`childAddressees`, each child task's addressee once in the order delegated, the profile its address resolved to or `platform`, from the record: `[]` when nothing was delegated and `null` when the read had no task to look at; the inject door's alone), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
+  and the progress artifact's latest line (`progress`), whom the chain delegated to (`childAddressees`, each child task's addressee once in the order delegated, the profile its address resolved to or `platform`, from the record: `[]` when nothing was delegated and `null` when the read had no task to look at; the inject door's alone), how many child tasks the chain minted (`childCount`, every delegation counted, so a repeated addressee counts each time: `0` when nothing was delegated and `null` when the read had no task to look at, also the inject door's alone), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
   child tasks' usage artifacts summed; `usagePartial` when a link's stream could not be read, so
   the sums are short of it; and `usage`, the usage
   artifact's parts summed over the task and, for a delegation chain's root, every wake that
@@ -1651,7 +1651,7 @@ terminal status message the bridge and the worker adapter write as `reason: <tok
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
-`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `internal-panic`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-cli-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
