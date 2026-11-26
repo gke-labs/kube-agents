@@ -126,8 +126,9 @@ func TestASessionStoreThatAnswersIsNotRetried(t *testing.T) {
 	}
 }
 
-// A store that accepts the connection and then hangs costs one timeout, not
-// a retry window: only a refusal is retried.
+// A store that accepts the connection and then hangs costs one attempt's
+// timeout, not a retry window: only a refusal is retried. The outer context
+// outlives the attempt timeout, so a retry would show as a second request.
 func TestAHangingSessionStoreIsNotRetried(t *testing.T) {
 	var hits atomic.Int32
 	release := make(chan struct{})
@@ -136,15 +137,66 @@ func TestAHangingSessionStoreIsNotRetried(t *testing.T) {
 		<-release
 	}))
 	t.Cleanup(func() { close(release); srv.Close() })
-	b := &Bridge{cfg: Config{RouteURL: srv.URL, RouteKey: "kv-key", APIConnectRetry: time.Minute, Logger: discardLogger()},
-		routeClient: newAPIClient()}
-	ctx, cancel := context.WithTimeout(testCtx(t), 300*time.Millisecond)
+	b := &Bridge{cfg: Config{RouteURL: srv.URL, APIConnectRetry: time.Minute, Logger: discardLogger()}, routeClient: newAPIClient()}
+	const attempt = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(testCtx(t), 10*time.Second)
 	defer cancel()
-	if err := b.putRoute(ctx, "a2a-ctx-hang", conversationRoute{Platform: lib.NotifyPlatformSlack, Conversation: "slack:dm/D1"}); err == nil {
-		t.Fatal("putRoute = nil against a hanging store")
+	start := time.Now()
+	_, _, err := b.storeDo(ctx, attempt, func(ctx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/hang", nil)
+	})
+	if err == nil {
+		t.Fatal("storeDo = nil against a hanging store")
+	}
+	if took := time.Since(start); took > attempt+2*apiConnectRetryInterval {
+		t.Fatalf("storeDo took %s, want about one %s attempt", took, attempt)
 	}
 	if n := hits.Load(); n != 1 {
 		t.Fatalf("requests = %d, want 1", n)
+	}
+}
+
+// A store refused for a whole window is marked down: the next request tries
+// once instead of waiting out another window, and the first request that
+// reaches the store clears the mark.
+func TestADeadSessionStoreCostsOneWindowNotOnePerRequest(t *testing.T) {
+	const window = 1500 * time.Millisecond
+	addr := freeLoopbackAddr(t)
+	b := retryBridge(addr, window)
+	route := conversationRoute{Platform: lib.NotifyPlatformSlack, Conversation: "slack:dm/D1"}
+
+	start := time.Now()
+	if err := b.putRoute(testCtx(t), "a2a-ctx-1", route); err == nil {
+		t.Fatal("first putRoute = nil with nothing listening")
+	}
+	if took := time.Since(start); took < window {
+		t.Fatalf("first putRoute gave up after %s, want the %s window", took, window)
+	}
+	if !b.storeDown.Load() {
+		t.Fatal("store not marked down after a whole window of refusals")
+	}
+	start = time.Now()
+	if err := b.putRoute(testCtx(t), "a2a-ctx-2", route); err == nil {
+		t.Fatal("second putRoute = nil with nothing listening")
+	}
+	if took := time.Since(start); took > apiConnectRetryInterval {
+		t.Fatalf("second putRoute took %s, want one try while the store is marked down", took)
+	}
+
+	store := &routeStore{status: http.StatusOK}
+	startRouteStoreAt(t, store, addr, 0)
+	waitFor(t, 5*time.Second, "late store listening", func() bool {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			_ = c.Close()
+		}
+		return err == nil
+	})
+	if err := b.putRoute(testCtx(t), "a2a-ctx-3", route); err != nil {
+		t.Fatalf("putRoute once the store listens = %v", err)
+	}
+	if b.storeDown.Load() {
+		t.Fatal("store still marked down after a request reached it")
 	}
 }
 

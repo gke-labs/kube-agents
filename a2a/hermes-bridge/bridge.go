@@ -170,9 +170,10 @@ type Config struct {
 	// (cardstop.go); zero is DefaultCardStopTimeout. The wait for the
 	// session's turn before it is bounded apart (cardStopTurnWait).
 	CardStopTimeout time.Duration
-	// APIConnectRetry is how long a refused connection to the API server is
-	// retried before the task ends hermes-api-unreachable; zero is
-	// DefaultAPIConnectRetry.
+	// APIConnectRetry is how long a refused connection is retried: to the
+	// API server, before the task ends hermes-api-unreachable, and to the
+	// session-kv store, before a route, origin or pushed-report request
+	// fails (storeDo); zero is DefaultAPIConnectRetry.
 	APIConnectRetry time.Duration
 	// ActivitySecret signs the API executor's hook deliveries: the pod's
 	// managed config carries one hooks.outbound entry for the whole
@@ -519,6 +520,11 @@ type Bridge struct {
 	apiClient *http.Client
 	// routeClient records conversation routes (route.go).
 	routeClient *http.Client
+	// storeDown is set once a session-kv request has been refused for a
+	// whole APIConnectRetry window, and cleared by the next request that
+	// reaches the store; while it is set, storeDo tries once instead of
+	// retrying, so a store that has died costs one window, not one per task.
+	storeDown atomic.Bool
 	// routesMu guards routes, the route each session last recorded
 	// (route.go), so a failed PUT that would have written the same route
 	// is not reported as a lost one.

@@ -126,7 +126,8 @@ const (
 	// DefaultAPIConnectRetry and apiConnectRetryInterval pace the retry of a
 	// refused connection: the sidecar and the agent container start
 	// together, and the bridge can be consuming before hermes's API server
-	// listens. A refused connection never reached the server, so retrying it
+	// listens. The session-kv store in the same container is retried on the
+	// same window (storeDo). A refused connection never reached the server, so retrying it
 	// cannot run a turn twice. Past the window the server is not starting,
 	// it is absent, and the task ends hermes-api-unreachable.
 	DefaultAPIConnectRetry  = 2 * time.Minute
@@ -399,8 +400,10 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// The session's origin and its conversation route are written side by
 	// side under one deadline, so a store that hangs delays the first turn
 	// by one timeout, not two. The deadline leaves room for storeDo's retry
-	// of a store that is not listening yet, which refuses at once and costs
-	// the turn nothing: the API server it waits on starts after the store.
+	// of a store that is not listening yet, which refuses at once; while the
+	// container starts it costs the turn nothing, since the API server the
+	// turn waits on starts after the store. A store that stays down costs one
+	// retry window, once (Bridge.storeDown).
 	recordCtx, cancelRecord := context.WithTimeout(taskCtx, b.cfg.APIConnectRetry+routeTimeout)
 	originDone := make(chan struct{})
 	go func() {

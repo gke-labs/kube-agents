@@ -379,7 +379,10 @@ func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) er
 // pushed report at the first refusal, while the turn itself waits for the
 // API server under the same rule (sendAPI). A refused connection never
 // reached the store, so retrying it writes nothing twice; any other error,
-// a timeout included, is returned at once. The caller closes the body and
+// a timeout included, is returned at once. A store refused for a whole
+// window is marked down (Bridge.storeDown), and requests then try once until
+// one reaches it, so a store that has died while the container runs on
+// costs one window rather than one per task. The caller closes the body and
 // then calls the returned cancel.
 func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(context.Context) (*http.Request, error)) (*http.Response, context.CancelFunc, error) {
 	giveUp := time.Now().Add(b.cfg.APIConnectRetry)
@@ -392,10 +395,22 @@ func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(
 		}
 		resp, err := b.routeClient.Do(req)
 		if err == nil {
+			if b.storeDown.Swap(false) {
+				b.cfg.Logger.Info("the session store is answering again")
+			}
 			return resp, cancel, nil
 		}
 		cancel()
-		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			return nil, nil, err
+		}
+		if b.storeDown.Load() {
+			return nil, nil, err
+		}
+		if time.Now().After(giveUp) {
+			b.storeDown.Store(true)
+			b.cfg.Logger.Warn("the session store refused connections for the whole retry window; later requests try once until it answers",
+				"window", b.cfg.APIConnectRetry, "err", err)
 			return nil, nil, err
 		}
 		select {

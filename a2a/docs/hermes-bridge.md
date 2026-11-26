@@ -426,8 +426,12 @@ gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
 be posted back. A refused connection is retried every second for up to two minutes, the window the
 turn's own call to the API server uses, since session-kv runs in the agent container and is not listening yet when the bridge takes a task
-queued while the pod rolled, or one taken while that container restarts; the origin record and the
-pushed-report lookup below retry the same way. Any other failure, a timeout included, is not retried. A Google Chat, Slack, Teams or console conversation is posted back. A console
+queued while the pod rolled, or one taken while that container restarts; the session's origin
+record (`PUT /v1/sessions/{id}/origin`, [`proposal-origin.md`](../../docs/designs/proposal-origin.md)
+§2.1) and the pushed-report lookup below retry the same way. Any other failure, a timeout included,
+is not retried. A store refused for a whole window is taken as down: later requests try once, without
+the wait, until one reaches it, so a session-kv process that has died costs one window rather than one
+per task. A Google Chat, Slack, Teams or console conversation is posted back. A console
 conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google- or Entra-token A2A door, or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
