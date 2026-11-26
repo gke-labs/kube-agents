@@ -261,6 +261,14 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 			"cluster-proj-host-c2-us-east1":         "proj-host",
 			"cluster-proj-host-c3-no-ident":         "proj-host",
 			"cluster-proj-retiring-old-us-central1": "proj-retiring",
+			"cluster-proj-unmanaged-u1-us-central1": "proj-unmanaged",
+		},
+		Unmanaged: []upstreamUnmanagedEntry{
+			{
+				Profile: "cluster-proj-unmanaged-u1-us-central1",
+				Project: "proj-unmanaged",
+				Reason:  "never in scope",
+			},
 		},
 		ProfileIdentities: []upstreamProfileIdentity{
 			{
@@ -281,6 +289,13 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				Profile:  "cluster-proj-retiring-old-us-central1",
 				Project:  "proj-retiring",
 				Cluster:  "old",
+				Location: "us-central1",
+				Ready:    true,
+			},
+			{
+				Profile:  "cluster-proj-unmanaged-u1-us-central1",
+				Project:  "proj-unmanaged",
+				Cluster:  "u1",
 				Location: "us-central1",
 				Ready:    true,
 			},
@@ -342,6 +357,9 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	}
 	if _, exists := byProject["proj-retiring"]; exists {
 		t.Errorf("retiring project should not be included in active scope projects even when ProfileIdentities still exist on disk")
+	}
+	if _, exists := byProject["proj-unmanaged"]; exists {
+		t.Errorf("unmanaged never-in-scope project should not be promoted to active scope projects")
 	}
 	if len(byProject["proj-host"].ClusterRows) != 3 {
 		t.Fatalf("proj-host cluster rows = %+v, want 3", byProject["proj-host"].ClusterRows)
@@ -461,6 +479,28 @@ func TestBuildWatcherStatusReportsUnreachableWhenMetricsListenerRefuses(t *testi
 	}
 	if !strings.Contains(got.Detail, "ConnectionRefusedError") {
 		t.Errorf("Detail = %q, want ConnectionRefusedError", got.Detail)
+	}
+
+	degraded := buildWatcherStatus(&upstreamEventWatcher{
+		Enabled:       true,
+		Reachable:     true,
+		WatchSetReady: true,
+		ClustersUp:    0,
+		ClustersTotal: 2,
+	}, true, true, "")
+	if degraded.Healthy || degraded.Status != watcherStatusDegraded {
+		t.Errorf("buildWatcherStatus with 0 of 2 clusters up = %+v, want Healthy=false Status=degraded", degraded)
+	}
+
+	starting := buildWatcherStatus(&upstreamEventWatcher{
+		Enabled:       true,
+		Reachable:     true,
+		WatchSetReady: false,
+		ClustersUp:    0,
+		ClustersTotal: 2,
+	}, true, true, "")
+	if starting.Healthy || starting.Status != watcherStatusStarting {
+		t.Errorf("buildWatcherStatus while starting = %+v, want Healthy=false Status=starting", starting)
 	}
 }
 

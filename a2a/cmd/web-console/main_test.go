@@ -2159,6 +2159,7 @@ const rowSlots = arr => arr.map(c => c.dataset && c.dataset.localRow === "1"
 
 func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) {
 	cCount := 1
+	pendingCount := 2
 	zeroCount := 0
 	resp := buildScopeResponse(
 		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
@@ -2171,6 +2172,7 @@ func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) 
 				{ID: "proj-c", Via: []string{"folders/123"}, Outcome: "api-disabled", State: "in-scope"},
 				{ID: "proj-d", Via: []string{"explicit"}, Outcome: "unreachable", State: "in-scope"},
 				{ID: "proj-e", Via: []string{"explicit"}, Outcome: "over-cap", State: "in-scope", Clusters: &zeroCount},
+				{ID: "proj-pending", Via: []string{"explicit"}, Outcome: "ok", State: "in-scope", Clusters: &pendingCount},
 			},
 			Profiles: map[string]string{
 				"cluster-proj-a-prod-a-us-central1": "proj-a",
@@ -2200,9 +2202,21 @@ func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) 
 		"",
 		time.Date(2026, 11, 26, 5, 20, 0, 0, time.UTC),
 	)
+	fallbackResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{},
+		false,
+		true,
+		"",
+		time.Date(2026, 11, 26, 5, 20, 0, 0, time.UTC),
+	)
 	wireJSON, err := json.Marshal(resp)
 	if err != nil {
 		t.Fatalf("marshal scopeResponse: %v", err)
+	}
+	fallbackJSON, err := json.Marshal(fallbackResp)
+	if err != nil {
+		t.Fatalf("marshal fallbackResp: %v", err)
 	}
 
 	script := pageJS(t,
@@ -2211,7 +2225,7 @@ func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) 
 		"lastScope",
 		"scopeOutcomeBadgeHtml",
 		"renderScopeRosterHtml",
-	) + "\nconst payload = " + string(wireJSON) + ";\nconst html = renderScopeRosterHtml(payload);\n" + `
+	) + "\nconst payload = " + string(wireJSON) + ";\nconst html = renderScopeRosterHtml(payload);\nconst fallbackHtml = renderScopeRosterHtml(" + string(fallbackJSON) + ");\n" + `
 console.log(JSON.stringify({
   hasProjA: html.includes("Project: proj-a"),
   hasClusterProdA: html.includes("proj-a / us-central1 / prod-a"),
@@ -2222,10 +2236,12 @@ console.log(JSON.stringify({
   hasApiDisabledHint: html.includes("container.googleapis.com"),
   hasUnreachableHint: html.includes("VPC egress"),
   hasEmptyProjectStatus: html.includes("No clusters active in this project (denied)."),
+  hasPendingClustersStatus: html.includes("2 clusters discovered, profiles pending (ok)."),
+  hasNoneYetProfile: fallbackHtml.includes("Profile: none yet · via management") && !fallbackHtml.includes("cluster-prod-a"),
   noBogusPlaceholderProfile: !html.includes("cluster-("),
 }));
 `
-	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true,"hasEmptyProjectStatus":true,"noBogusPlaceholderProfile":true}`
+	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true,"hasEmptyProjectStatus":true,"hasPendingClustersStatus":true,"hasNoneYetProfile":true,"noBogusPlaceholderProfile":true}`
 	if got := runPageJS(t, script); got != want {
 		t.Errorf("renderScopeRosterHtml output checks = %s, want %s", got, want)
 	}
@@ -2264,6 +2280,34 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 		"",
 		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
 	)
+	degradedResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled:       true,
+				Reachable:     true,
+				WatchSetReady: true,
+				ClustersUp:    0,
+				ClustersTotal: 2,
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
+	disabledResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled: false,
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
 	watchingJSON, err := json.Marshal(watchingResp)
 	if err != nil {
 		t.Fatalf("marshal watchingResp: %v", err)
@@ -2272,22 +2316,33 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal startingResp: %v", err)
 	}
+	degradedJSON, err := json.Marshal(degradedResp)
+	if err != nil {
+		t.Fatalf("marshal degradedResp: %v", err)
+	}
+	disabledJSON, err := json.Marshal(disabledResp)
+	if err != nil {
+		t.Fatalf("marshal disabledResp: %v", err)
+	}
 
 	script := pageJS(t,
 		"escapeHtml",
 		"CHANNELS",
 		"renderAlertsEmptyStateHtml",
-	) + "\nconst htmlWatching = renderAlertsEmptyStateHtml(" + string(watchingJSON) + ");\nconst htmlStarting = renderAlertsEmptyStateHtml(" + string(startingJSON) + ");\n" + `
+	) + "\nconst htmlWatching = renderAlertsEmptyStateHtml(" + string(watchingJSON) + ");\nconst htmlStarting = renderAlertsEmptyStateHtml(" + string(startingJSON) + ");\nconst htmlDegraded = renderAlertsEmptyStateHtml(" + string(degradedJSON) + ");\nconst htmlDisabled = renderAlertsEmptyStateHtml(" + string(disabledJSON) + ");\nconst htmlNull = renderAlertsEmptyStateHtml(null);\n" + `
 console.log(JSON.stringify({
   hasEmptyHeadline: htmlWatching.includes(CHANNELS.alerts.empty),
   hasWatcherDetail: htmlWatching.includes("Watching 2 of 2 clusters for Kubernetes Warning events"),
   hasWatchingBadge: htmlWatching.includes("Watching") && htmlWatching.includes("badge-green"),
   hasStartingBadge: htmlStarting.includes("Starting") && htmlStarting.includes("badge-amber"),
+  hasDegradedBadge: htmlDegraded.includes("Degraded") && htmlDegraded.includes("badge-amber") && !htmlDegraded.includes("badge-green"),
+  hasDisabledBadge: htmlDisabled.includes("Disabled") && htmlDisabled.includes("badge-grey"),
+  hasLoadingBadge: htmlNull.includes("Loading") && htmlNull.includes("badge-grey") && !htmlNull.includes("Disabled"),
   hasNextAudit: htmlWatching.includes("Security &amp; RBAC Posture Audit at 2099-03-15T06:20:00Z"),
   hasStarterPrompt: htmlWatching.includes("data-starter-prompt="),
 }));
 `
-	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasStartingBadge":true,"hasNextAudit":true,"hasStarterPrompt":true}`
+	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasStartingBadge":true,"hasDegradedBadge":true,"hasDisabledBadge":true,"hasLoadingBadge":true,"hasNextAudit":true,"hasStarterPrompt":true}`
 	if got := runPageJS(t, script); got != want {
 		t.Errorf("renderAlertsEmptyStateHtml output checks = %s, want %s", got, want)
 	}
