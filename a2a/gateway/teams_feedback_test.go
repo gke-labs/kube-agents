@@ -310,6 +310,60 @@ func TestTeamsDoesNotRedrawARatedCardTheRecordedLineWouldOverflow(t *testing.T) 
 	}
 }
 
+// A laid-out post that opens a thread in a channel home files its question
+// under that thread, where its presses come from: a press of one of its
+// choices is a turn. A card the rating controls would push past the budget
+// is posted without them and keeps its layout.
+func TestTeamsHomeCardTakesAPressFromItsThread(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.SetFeedbackRecorder(&fakeRecorder{})
+	home, _, _ := strings.Cut(testTeamsChannel, teamsThreadToken)
+	mark := feedbackPostAlertPrefix + "drift-1"
+	id, landed, err := a.PostNotifyMessage(home, "", OutMessage{Text: "fallback", Chat: testTeamsQuestion(), Feedback: mark})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	q := a.uxLocked().questions[id]
+	a.mu.Unlock()
+	if want := teamsConversationID(landed); q.conversation != want {
+		t.Fatalf("the home card's question is filed under %q, want its thread %q", q.conversation, want)
+	}
+	press := testTeamsPress("f:80", id, teamsChoice("yes, restart it", 0, "Yes"))
+	press["conversation"] = map[string]any{"id": landed, "conversationType": "channel", "tenantId": testTeamsTenant}
+	if _, reason := a.classify(decodeTeamsActivity(t, press)); reason != "" {
+		t.Fatalf("a press from the home card's thread was not a turn: %s", reason)
+	}
+	// The largest detail whose card still fits without the controls.
+	sized := func(n int) OutMessage {
+		m := testTeamsQuestion()
+		m.Detail = strings.Repeat("x", n)
+		return OutMessage{Text: "fallback", Chat: m}
+	}
+	lo, hi := 0, teamsMaxActivityBytes
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if _, err := a.chatCard("", sized(mid)); err == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	plain, err := a.chatCard("", sized(lo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tight := sized(lo)
+	tight.Feedback = mark
+	if _, _, err := a.PostNotifyMessage(home, "", tight); err != nil {
+		t.Fatalf("a card the rating controls do not fit beside was refused: %v", err)
+	}
+	if actions := teamsLineActions(t, relay, 1); len(actions) != len(plain.actions()) {
+		t.Errorf("the tight card's actions: %d, want its own %d and no rating controls", len(actions), len(plain.actions()))
+	}
+}
+
 // A rating press on an alert or a report is recorded under the post's own
 // id, as on Slack and Google Chat, and the post gains the recorded line.
 func TestTeamsRecordsARatingPressOnAHomePost(t *testing.T) {

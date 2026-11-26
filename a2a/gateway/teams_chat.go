@@ -364,11 +364,18 @@ func (a *TeamsAdapter) chatCard(messageID string, m OutMessage) (teamsChatCard, 
 	if m.Stop != "" {
 		card.rest = append(card.rest, teamsStopActions(m.Stop)...)
 	}
-	if a.ratesTask(m.Feedback) {
-		card.rest = append(card.rest, teamsRatingActions(m.Feedback, a.feedbackRecorder().KeptDays())...)
-	}
 	if !teamsFitsCard(card.text, card.actions()) {
 		return teamsChatCard{}, fmt.Errorf("%w: %w", ErrLayoutRefused, errTeamsChatTooLarge)
+	}
+	if a.ratesTask(m.Feedback) {
+		// The rating controls must not cost the message its layout: a
+		// card they would push past the budget goes out without them, as
+		// on Slack and Google Chat.
+		rated := card
+		rated.rest = append(append([]map[string]any(nil), card.rest...), teamsRatingActions(m.Feedback, a.feedbackRecorder().KeptDays())...)
+		if teamsFitsCard(rated.text, rated.actions()) {
+			return rated, nil
+		}
 	}
 	return card, nil
 }

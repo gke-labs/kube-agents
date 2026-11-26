@@ -3281,11 +3281,12 @@ gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the 
 redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
 rating because the card is the conversation's; a card the line would push past the activity
 budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
-The form's kept-for line is drawn before any press, so it always names the question. It remembers a bounded number of rated messages
+The form's kept-for line is drawn before any press, so on an answer it always names the
+question; on an alert or a report it says only the post is kept. It remembers a bounded number of rated messages
 (`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
 recorded without the answer's text and without the redraw, and a re-rating that carries no
-answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
-names a post (`postKindOf`), so an alert its triage edits stays as it was.
+answer keeps the answer already kept. A triage edit of a rated alert draws it without the
+recorded line, which the next rating adds again.
 
 **Chat messages on Teams.** With cards on, a `kube-agents.chat/v1` message is laid out as the
 same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the

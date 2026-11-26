@@ -777,7 +777,13 @@ func (a *TeamsAdapter) PostNotifyMessage(home, thread string, m OutMessage) (mes
 	if err != nil {
 		return "", "", err
 	}
-	return message, teamsNotifyLanded(conversation, thread, message), nil
+	landed = teamsNotifyLanded(conversation, thread, message)
+	if landed != conversation {
+		// A press on the post, and a reply typed under it, arrive keyed by
+		// the thread the post started, so its question is filed there.
+		a.rehomeQuestion(message, teamsConversationID(conversation), teamsConversationID(landed))
+	}
+	return message, landed, nil
 }
 
 // teamsNotifyLanded is where a home post landed. A top-level post in a

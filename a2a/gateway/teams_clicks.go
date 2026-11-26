@@ -177,6 +177,25 @@ func (a *TeamsAdapter) trackQuestion(id, conversation string, m *chatmsg.Message
 	forget(&ux.answeredRing, id)
 }
 
+// rehomeQuestion files message id's question, posted into conversation
+// from, under conversation to: a top-level post in a channel starts a thread
+// of its own, and that thread is where its presses and replies come from.
+func (a *TeamsAdapter) rehomeQuestion(id, from, to string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	q, ok := ux.questions[id]
+	if !ok {
+		return
+	}
+	q.conversation = to
+	ux.questions[id] = q
+	if ux.open[from] == id {
+		delete(ux.open, from)
+		ux.open[to] = id
+	}
+}
+
 // forgetAnswer drops the answered line message id carries, for a question
 // asked again on it.
 func (a *TeamsAdapter) forgetAnswer(id string) {
