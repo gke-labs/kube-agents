@@ -925,10 +925,10 @@ and after it `findings_nudge.py` runs hourly and names only what `findings_queue
   They are not additions and count against nothing. A pending critical below that top is named
   only on the day it was added.
 - **The stop-add notice:** the same once-a-day part names every pending non-critical item above
-  a notice that new findings are paused until it is resolved, snoozed or dismissed, so stop-add is
-  never silent for more than a day. Accepting it releases the hold too (§3.2), and so does fixing
-  it, once a complete sweep no longer reports it. A pending critical holding non-criticals back
-  gets no such notice.
+  a notice that new findings are paused until it is accepted, snoozed or dismissed (§3.2), so
+  stop-add is never silent for more than a day. Fixing it releases the hold too, but only once a
+  complete sweep no longer reports it; the end of this section says which sweeps recur. A pending
+  critical holding non-criticals back gets no such notice.
 - **Ids stay out of the message:** a line names its object, its cluster and how many other objects
   a decision on it reaches. The id of each line, its members' ids and the split between reported
   and no-longer-reported objects go into the context stored for the message's thread

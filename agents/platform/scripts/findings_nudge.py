@@ -274,9 +274,11 @@ BACKLOG_LINK_LABEL = "Open backlog"
 BACKLOG_TEXT_LINE = "Open backlog: {url}"
 CHOICE_REPLY_FORMAT = "{label}: {summary}"
 
-BLOCKING_NOTICE_SINGLE = "New findings are paused until you resolve, snooze, or dismiss this open item{waiting}."
+# The notice names the three decisions the queue takes (findings_queue.DECISION_STATES).
+# "resolved" is a verification outcome, which the decision route refuses.
+BLOCKING_NOTICE_SINGLE = "New findings are paused until you accept, snooze, or dismiss this open item{waiting}."
 BLOCKING_NOTICE_MULTI = (
-    "New findings are paused until you resolve, snooze, or dismiss these {count} open items{waiting}."
+    "New findings are paused until you accept, snooze, or dismiss these {count} open items{waiting}."
 )
 WAITING_SUFFIX = " ({waiting} waiting behind {pronoun})"
 WAITING_PRONOUNS = ("it", "them")
