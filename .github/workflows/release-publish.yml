@@ -142,8 +142,14 @@ jobs:
     # Where the release reads the commit's built images, for every step alike:
     # the eligibility check and the promotion have to look in one place. Unset,
     # that is the registry the release is published to.
+    #
+    # ADDITIONAL_RELEASE_REGISTRY_PREFIX is a second registry the release is
+    # published to, beside the registry prefix: the promotion, the image
+    # signing and the chart publication each read it. Unset, the release is
+    # published to the one registry.
     env:
       CANDIDATE_REGISTRY_PREFIX: ${{ vars.CANDIDATE_REGISTRY_PREFIX }}
+      ADDITIONAL_RELEASE_REGISTRY_PREFIX: ${{ vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX }}
     steps:
       - name: Generate Release Bot Token
         id: release-token
@@ -187,29 +193,40 @@ jobs:
 
       # Before the eligibility check, which is the first read of the commit's
       # images: an Artifact Registry repository answers only a signed-in
-      # reader. The promotion below reads it, and writes the release version
-      # beside the commit there, on the same login.
-      - name: Authenticate to Google Cloud for the candidate registry
-        id: candidate-registry-auth
-        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/')
+      # reader. The promotion below reads the candidate registry and writes
+      # the release version beside the commit there, and writes the release to
+      # the additional registry, on the same login.
+      - name: Authenticate to Google Cloud for the Artifact Registry repositories
+        id: artifact-registry-auth
+        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/') || contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           token_format: access_token
           workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
           service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
 
-      - name: Resolve the candidate registry host
-        id: candidate-registry-host
-        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/')
-        run: echo "host=${CANDIDATE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"
+      - name: Resolve the Artifact Registry hosts
+        id: artifact-registry-hosts
+        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/') || contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')
+        run: |
+          echo "candidate=${CANDIDATE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"
+          echo "additional=${ADDITIONAL_RELEASE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to the candidate registry
         if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/')
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
-          registry: ${{ steps.candidate-registry-host.outputs.host }}
+          registry: ${{ steps.artifact-registry-hosts.outputs.candidate }}
           username: oauth2accesstoken
-          password: ${{ steps.candidate-registry-auth.outputs.access_token }}
+          password: ${{ steps.artifact-registry-auth.outputs.access_token }}
+
+      - name: Log in to the additional release registry
+        if: contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ steps.artifact-registry-hosts.outputs.additional }}
+          username: oauth2accesstoken
+          password: ${{ steps.artifact-registry-auth.outputs.access_token }}
 
       - name: Verify Release Eligibility
         id: verify-eligibility
@@ -290,6 +307,8 @@ jobs:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_USER: ${{ github.actor }}
+          # Helm keeps its own registry logins; empty when no Google login ran.
+          ADDITIONAL_RELEASE_REGISTRY_TOKEN: ${{ steps.artifact-registry-auth.outputs.access_token }}
         run: ./scripts/release/publish_helm_chart.sh
 
       - name: Install Syft
