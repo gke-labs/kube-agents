@@ -74,8 +74,10 @@ Nothing connects an AgentPlugin to an AgentProfile worker.
   not stop it. A worker has no approval prompt: the harness runs headless.
 - The event stream. The adapter reads the harness's stream through a driver. For each tool call
   it publishes one `activity` entry on the bus (the tool's name and input). The publish is
-  best-effort. The driver's event for a tool result carries no field: no id, no error flag, no
-  result, no duration. The adapter writes no log line and no file for a tool call.
+  best-effort. The event for a tool result of the Claude Code driver and of the Antigravity
+  driver carries no field: no id, no error flag, no result, no duration. The event of the
+  core-agent driver carries the tool, the text and a failed flag, and not the call's id. The
+  adapter writes no log line and no file for a tool call.
 - The broker's records. An `/v1/exec` call leaves a start record and an outcome record, each
   with the task id and the credential's id in its principal and with no argument. An MCP relay
   call leaves two lines. For a `/v1/vcs/` call that succeeds, only a metric and the HTTP request
@@ -157,6 +159,9 @@ What the drivers get, because they do not have it today:
   duration. The driver maps the two end states to one event today and reads none of these
   fields. A denied call is a step that ends in ERROR, and it is also in the list of denied
   actions at the end. Antigravity cannot run a profile task today.
+- The core-agent driver has more today: its result event carries the tool and a failed flag,
+  and its wire has the call's id, which the driver does not pass on. The AgentProfile does not
+  accept that harness type today.
 
 Limits of the record:
 
@@ -286,7 +291,8 @@ decode of the manifest and the refusal of `hooks` in a skill; the empty `setting
 two harness flags; that the harness runs as the adapter's user; the `--disallowedTools` list,
 the headless start and the stop after a refused kubectl write; the one stdio MCP server that a
 profile worker starts, and that the pool turns the delegate tool off; the `activity` entry of a
-tool call and the tool-result event with no field in both drivers; the fields of a tool step in
+tool call and the tool-result event of each driver (the core-agent driver came to `main` after
+that commit and was read at `ca2fe48e4`); the fields of a tool step in
 the recorded Antigravity stream; the broker's records for `/v1/exec` and the MCP relay; the
 broker's in-memory record and the claim token at `proposal-create`; that the worker image's
 client prints the token and that no worker code removes it; the profile's relay tools; the
