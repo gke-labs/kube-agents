@@ -71,6 +71,8 @@ type podBinder struct {
 	cache map[string]podAddrEntry
 	// lastLookup is when each pod and UID was last read.
 	lastLookup map[string]time.Time
+	// afterCacheMiss runs between a request's cache miss and its lookup; nil but in tests.
+	afterCacheMiss func()
 	// forbiddenLogged is when each namespace's missing pod read was last logged.
 	forbiddenLogged map[string]time.Time
 }
@@ -141,18 +143,25 @@ func (b *podBinder) check(ctx context.Context, remoteAddr string, u user.Info) e
 // without a GET before then.
 func (b *podBinder) podAddrs(ctx context.Context, namespace, name, uid string) ([]netip.Addr, error) {
 	key := namespace + "/" + name + "/" + uid
-	b.mu.Lock()
-	entry, ok := b.cache[key]
-	b.mu.Unlock()
-	if ok && b.now().Before(entry.expires) {
-		return entry.addrs, nil
+	if addrs, ok := b.cached(key); ok {
+		return addrs, nil
+	}
+	if b.afterCacheMiss != nil {
+		b.afterCacheMiss()
 	}
 	v, err, _ := b.group.Do(key, func() (any, error) {
-		// The GET is shared by every request waiting on it, so one caller leaving does not
-		// fail the others; the timeout still bounds it.
-		if !b.startLookup(key) {
+		// Another request's lookup can have stored the pod since this one missed the cache,
+		// and have left the in-flight set already: its pass is this request's too, and the
+		// per-pod interval refuses only where there is none.
+		addrs, cached, allowed := b.beginLookup(key)
+		if cached {
+			return addrs, nil
+		}
+		if !allowed {
 			return nil, fmt.Errorf("%w: %s/%s", errLookupTooSoon, namespace, name)
 		}
+		// The GET is shared by every request waiting on it, so one caller leaving does not
+		// fail the others; the timeout still bounds it.
 		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.timeout)
 		defer cancel()
 		addrs, err := b.lookup(lookupCtx, namespace, name, uid)
@@ -166,6 +175,22 @@ func (b *podBinder) podAddrs(ctx context.Context, namespace, name, uid string) (
 		return nil, err
 	}
 	return v.([]netip.Addr), nil
+}
+
+// cached returns key's addresses while its entry lasts.
+func (b *podBinder) cached(key string) ([]netip.Addr, bool) {
+	now := b.now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cachedLocked(key, now)
+}
+
+func (b *podBinder) cachedLocked(key string, now time.Time) ([]netip.Addr, bool) {
+	entry, ok := b.cache[key]
+	if !ok || !now.Before(entry.expires) {
+		return nil, false
+	}
+	return entry.addrs, true
 }
 
 func (b *podBinder) lookup(ctx context.Context, namespace, name, uid string) ([]netip.Addr, error) {
@@ -189,14 +214,18 @@ func (b *podBinder) lookup(ctx context.Context, namespace, name, uid string) ([]
 	return addrs, nil
 }
 
-// startLookup records a GET for key, or reports false when the last one was less than an
-// interval ago.
-func (b *podBinder) startLookup(key string) bool {
+// beginLookup returns key's cached addresses when its entry lasts. Otherwise it records a
+// GET for key and reports allowed, or reports not allowed when the last GET was less than
+// an interval ago. Both under one lock, so the interval never refuses a cached pass.
+func (b *podBinder) beginLookup(key string) (addrs []netip.Addr, cached, allowed bool) {
 	now := b.now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if addrs, ok := b.cachedLocked(key, now); ok {
+		return addrs, true, true
+	}
 	if last, ok := b.lastLookup[key]; ok && now.Sub(last) < b.interval {
-		return false
+		return nil, false, false
 	}
 	if len(b.lastLookup) >= podCacheSweepSize {
 		for k, last := range b.lastLookup {
@@ -206,7 +235,7 @@ func (b *podBinder) startLookup(key string) bool {
 		}
 	}
 	b.lastLookup[key] = now
-	return true
+	return nil, false, true
 }
 
 func (b *podBinder) store(key string, addrs []netip.Addr) {

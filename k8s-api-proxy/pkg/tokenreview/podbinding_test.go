@@ -508,3 +508,37 @@ func TestPodBindingCoversEveryAuthenticatedRoute(t *testing.T) {
 		t.Errorf("health probe: code = %d, want 200", rec.Code)
 	}
 }
+
+// A request that missed the cache while another request's lookup was storing the pod uses
+// that pass, even when it reaches the lookup after the other has left it and within the
+// per-pod interval.
+func TestPodBindingLateWaiterUsesTheFreshPass(t *testing.T) {
+	g := &countingGetter{respond: func() (*corev1.Pod, error) { return shellPod(), nil }}
+	b := newPodBinderWithGetter(g.get, 10*time.Second, slog.New(slog.DiscardHandler))
+	now := time.Unix(1_800_000_000, 0)
+	b.now = func() time.Time { return now }
+	missed, release := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	b.afterCacheMiss = func() {
+		// Only the first request to miss is held; the other goes straight on.
+		if first.CompareAndSwap(false, true) {
+			close(missed)
+			<-release
+		}
+	}
+	peer := shellPodIP + ":51000"
+	late := make(chan error, 1)
+	go func() { late <- b.check(context.Background(), peer, shellUser()) }()
+	<-missed
+	// The other request misses too, reads the pod, stores the pass and leaves.
+	if err := b.check(context.Background(), peer, shellUser()); err != nil {
+		t.Fatalf("the first lookup: %v", err)
+	}
+	close(release)
+	if err := <-late; err != nil {
+		t.Errorf("the request that missed the cache first was refused after the pass was stored: %v", err)
+	}
+	if got := g.calls.Load(); got != 1 {
+		t.Errorf("pod GETs = %d, want 1", got)
+	}
+}
