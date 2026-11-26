@@ -226,7 +226,7 @@ NAP_ENTRY = {
 # 1.35.8-gke.1796000) logged on 2026-11-18, with the project replaced. A
 # second cluster of that day logged the same shape for a reservation that
 # exists only in another zone.
-RESERVATION_NOT_FOUND_GROUP = "gke-ws2-e1r-reservation-a-res-missing-01bf9e69-grp"
+RESERVATION_NOT_FOUND_GROUP = "gke-reservation-a-res-missing-01bf9e69-grp"
 RESERVATION_NOT_FOUND_GROUP_URL = (
     f"https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-a/instanceGroups/{RESERVATION_NOT_FOUND_GROUP}"
 )
