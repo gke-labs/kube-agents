@@ -1,0 +1,229 @@
+# k8s-api-proxy as one shared Deployment that every tenant's sandbox reaches through an
+# egress gateway. README.md in this directory says what to change before applying it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox-proxy
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-api-proxy
+  namespace: sandbox-proxy
+---
+# An example namespace for the sandboxes to read. Replace it, and the RoleBinding's
+# namespace below, with one of yours.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shared-readonly
+---
+# The proxy sends every tenant's request upstream as this one ServiceAccount, so what it
+# is bound to is what every admitted sandbox can read, whatever its tenant. This binding
+# grants one namespace; README.md says how to grant more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-api-proxy-view
+  namespace: shared-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: k8s-api-proxy
+    namespace: sandbox-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-api-proxy
+  namespace: sandbox-proxy
+  labels:
+    app.kubernetes.io/name: k8s-api-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-api-proxy
+  strategy:
+    type: RollingUpdate
+    # One replica at a time and no surge pod, so a rollout needs no quota beyond the
+    # running count.
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k8s-api-proxy
+    spec:
+      serviceAccountName: k8s-api-proxy
+      # The only ServiceAccount token in the pod is the one in the `upstream` volume.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      # Advisory, so a single-node cluster still schedules both replicas.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: k8s-api-proxy
+          matchLabelKeys:
+            - pod-template-hash
+      containers:
+        - name: k8s-api-proxy
+          # Replace X.Y.Z with a kube-agents release.
+          image: ghcr.io/gke-labs/kube-agents/kube-proxy:X.Y.Z
+          args:
+            - --listen-addr=:8443
+            # One PEM file holds the certificate chain and its key, so both flags name it.
+            - --tls-cert-file=/var/run/secrets/k8s-api-proxy/tls/credential-bundle.pem
+            - --tls-key-file=/var/run/secrets/k8s-api-proxy/tls/credential-bundle.pem
+            # Callers: the token the egress gateway injects for each sandbox.
+            - --auth-mode=jwt
+            - --jwt-issuer=https://issuer.example.test
+            - --jwt-audiences=k8s-api-proxy.sandbox-proxy.svc
+            - --jwt-partition-claim=tenant
+            - --partition-by-caller=partition
+            # Optional narrowing; delete either line to admit any tenant or any subject.
+            - --jwt-allowed-partitions=tenant-a,tenant-b
+            - --jwt-required-sub-prefix=sandbox/
+            # Upstream: this cluster's API server, as the ServiceAccount above.
+            - --upstream-url=https://kubernetes.default.svc
+            - --upstream-token-file=/var/run/secrets/k8s-api-proxy/upstream/token
+            - --upstream-ca-file=/var/run/secrets/k8s-api-proxy/upstream/ca.crt
+          env:
+            # The Go runtime's soft heap limit: 85% of the 1Gi memory limit below, in
+            # bytes, the share the kube-agents operator gives its own proxy.
+            - name: GOMEMLIMIT
+              value: "912680550"
+          ports:
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          # Holds SIGTERM until the pod's removal from the Service has propagated, so
+          # connections opened meanwhile still reach a listening server. With the proxy's
+          # 10s shutdown drain it fits the default 30s grace period. The sleep action,
+          # because the image has no sleep binary.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          readinessProbe:
+            httpGet:
+              path: /_kube_proxy/healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /_kube_proxy/healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tls
+              mountPath: /var/run/secrets/k8s-api-proxy/tls
+              readOnly: true
+            - name: upstream
+              mountPath: /var/run/secrets/k8s-api-proxy/upstream
+              readOnly: true
+      volumes:
+        - name: tls
+          projected:
+            sources:
+              - podCertificate:
+                  # Needs pod certificates enabled on the cluster: this volume source
+                  # and the PodCertificateRequest API.
+                  # Replace with a signer in your cluster that issues serving
+                  # certificates naming the Service (k8s-api-proxy.sandbox-proxy.svc).
+                  signerName: example.test/service-dns
+                  keyType: ECDSAP256
+                  credentialBundlePath: credential-bundle.pem
+        - name: upstream
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: k8s-api-proxy
+  namespace: sandbox-proxy
+spec:
+  # maxUnavailable rather than minAvailable, which blocks every drain at one replica.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-api-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-api-proxy
+  namespace: sandbox-proxy
+spec:
+  selector:
+    app.kubernetes.io/name: k8s-api-proxy
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+---
+# Admits pods carrying the egress gateway's labels in the gateway's namespace, and no
+# other pod. Set both selectors to your gateway's namespace and pod labels.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: k8s-api-proxy-from-egress-gateway
+  namespace: sandbox-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-api-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: egress-gateway
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: egress-gateway
+      ports:
+        - protocol: TCP
+          port: 8443
