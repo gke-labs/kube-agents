@@ -94,7 +94,9 @@ func useRespawnScope(t *testing.T) *respawnScope {
 //   - refusal: a clean result, then a write refusal record and a tool
 //     step's result after it;
 //   - writer: a clean result after leaving a process in its own session
-//     (pid in $dir/writer) that the boundary must end;
+//     (pid in $dir/writer) that the boundary must end; on its first run it
+//     waits for $dir/tracked, so the test tracks the pid before the turn
+//     ends and the kill runs;
 //   - double: a clean result, then a second one once its stdin closes, so
 //     the second decides the task while a steer waits for the next process;
 //   - delegate: no result; it waits mid-turn (the test delegates on the
@@ -121,7 +123,7 @@ seconderror) if [ $n = 2 ]; then echo 'ERR boom it failed'; else echo "OK turn $
 linger) echo "OK turn $n"; echo 1 > "$dir/result"; trap 'exit 0' TERM; while :; do sleep 0.05; done ;;
 refusal) echo "OK turn $n"; sleep 0.3; printf '%%s\n' %q >> "$%s"; echo 'R' ;;
 writer)
-  if [ $n = 1 ]; then /usr/bin/perl -MPOSIX -e 'if (fork) { exit 0 } POSIX::setsid(); open(STDIN,"<","/dev/null"); open(STDOUT,">","/dev/null"); open(STDERR,">","/dev/null"); open(my $f, ">", $ARGV[0]) or die; print $f "$$\n"; close($f); sleep 60' "$dir/writer"; fi
+  if [ $n = 1 ]; then /usr/bin/perl -MPOSIX -e 'if (fork) { exit 0 } POSIX::setsid(); open(STDIN,"<","/dev/null"); open(STDOUT,">","/dev/null"); open(STDERR,">","/dev/null"); open(my $f, ">", $ARGV[0]) or die; print $f "$$\n"; close($f); sleep 60' "$dir/writer"; i=0; while [ ! -e "$dir/tracked" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; fi
   echo "OK turn $n" ;;
 double) echo "OK turn $n"; while read -r more; do :; done; echo "OK again $n" ;;
 delegate) echo 1 > "$dir/mid-turn"; trap 'exit 0' TERM; while :; do sleep 0.05; done ;;
@@ -255,6 +257,12 @@ func TestALeftoverFromOneProcessIsGoneBeforeTheNext(t *testing.T) {
 	r := respawnRun(t, "writer", 0, func(_ *Config, s *respawnScope) { scope = s }, func(_ *lib.Client, _ *lib.Envelope, _, _, dir string) {
 		pid, _ := strconv.Atoi(waitFileFor(t, filepath.Join(dir, "writer"), 10*time.Second))
 		scope.track(pid)
+		// The turn ends, and the kill runs, only once the pid is tracked:
+		// a kill before that would miss it, and the boundary check after
+		// would see it alive.
+		if err := os.WriteFile(filepath.Join(dir, "tracked"), []byte("1"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	})
 	if r.out.err != nil || r.out.res.State != lib.StateCompleted || r.runs != 2 {
 		t.Fatalf("state=%q err=%v runs=%d", r.out.res.State, r.out.err, r.runs)
