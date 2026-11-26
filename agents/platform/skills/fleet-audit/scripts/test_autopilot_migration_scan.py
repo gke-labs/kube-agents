@@ -826,6 +826,8 @@ class EndToEndCliTests(unittest.TestCase):
             if argv == scan.PROJECTS_LIST_ARGV:
                 seen_timeouts.append(kwargs.get("timeout"))
                 return scan.Run(argv, 0, "other-proj\n", "", 0.01)
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return scan.Run(argv, 0, "[]", "", 0.01)
             return scan.Run(argv, 1, "", "unexpected", 0.01)
 
         discovery = scan.discover_projects(
@@ -837,6 +839,92 @@ class EndToEndCliTests(unittest.TestCase):
         self.assertIsNone(discovery.error)
         self.assertIn("filtered rather than complete", discovery.partial or "")
         self.assertEqual(seen_timeouts, [scan.PROJECTS_LIST_TIMEOUT_SECONDS])
+
+        # Filtered listing without `--project` fails closed (rc == EXIT_ERROR).
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = scan.main([], run=run)
+        self.assertEqual(rc, scan.EXIT_ERROR)
+        self.assertIn("filtered rather than complete", buf.getvalue())
+
+    def test_incomplete_project_discovery_fails_closed(self) -> None:
+        # 1. `gcloud projects list` fails after `gcloud config get-value project` succeeds.
+        def run_list_failed(argv: list[str], **_kwargs) -> scan.Run:
+            if argv == scan.CONFIG_PROJECT_ARGV:
+                return scan.Run(argv, 0, "active-proj\n", "", 0.01)
+            if argv == scan.PROJECTS_LIST_ARGV:
+                return scan.Run(argv, 1, "", "ERROR: deadline exceeded", 0.01)
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return scan.Run(argv, 0, "[]", "", 0.01)
+            return scan.Run(argv, 1, "", "unexpected", 0.01)
+
+        buf_failed = io.StringIO()
+        with mock.patch("sys.stdout", buf_failed):
+            rc_failed = scan.main([], run=run_list_failed)
+        self.assertEqual(rc_failed, scan.EXIT_ERROR)
+        self.assertIn("fell back to 'active-proj'", buf_failed.getvalue())
+
+        # 2. Declared scope with `--scope-unread` entries fails closed when `--project` is not set.
+        buf_unread = io.StringIO()
+        with mock.patch("sys.stdout", buf_unread):
+            rc_unread = scan.main(
+                [
+                    "--scope-projects",
+                    "active-proj",
+                    "--scope-unread",
+                    "unread-proj: permission denied",
+                ],
+                run=run_list_failed,
+            )
+        self.assertEqual(rc_unread, scan.EXIT_ERROR)
+        self.assertIn("unread-proj", buf_unread.getvalue())
+
+    def test_fetch_cluster_credentials_guards_custom_and_symlinked_kubeconfig_dir(self) -> None:
+        seen_kubeconfigs: list[str] = []
+
+        def run_creds(argv: list[str], **kwargs) -> scan.Run:
+            env = kwargs.get("env") or {}
+            kc_val = env.get(scan.KUBECONFIG_ENV, "")
+            seen_kubeconfigs.append(kc_val)
+            if kc_val:
+                Path(kc_val).write_text("apiVersion: v1\n", encoding="utf-8")
+            return scan.Run(argv, 0, "", "", 0.01)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            custom_dir = tmp_path / "custom-kcs"
+            custom_dir.mkdir(parents=True, exist_ok=True)
+            planted_target = tmp_path / "planted-target.yaml"
+            planted_target.write_text("planted\n", encoding="utf-8")
+
+            kc_file = scan.kubeconfig_path(custom_dir, "proj-a", "seeded-a", "us-central1-a")
+            kc_file.symlink_to(planted_target)
+
+            # 1. Planted symlink at `kc` inside a custom `--kubeconfig-dir` is removed before get-credentials writes.
+            kc_out, err = scan.fetch_cluster_credentials(
+                "proj-a",
+                "seeded-a",
+                "us-central1-a",
+                kubeconfig_dir=custom_dir,
+                run=run_creds,
+            )
+            self.assertIsNone(err)
+            self.assertEqual(kc_out, kc_file)
+            self.assertFalse(kc_file.is_symlink())
+            self.assertEqual(planted_target.read_text(encoding="utf-8"), "planted\n")
+
+            # 2. A symlinked `--kubeconfig-dir` is refused by `prepare_kubeconfig`.
+            symlink_dir = tmp_path / "symlink-kcs"
+            symlink_dir.symlink_to(custom_dir)
+            _, symlink_err = scan.fetch_cluster_credentials(
+                "proj-a",
+                "seeded-a",
+                "us-central1-a",
+                kubeconfig_dir=symlink_dir,
+                run=run_creds,
+            )
+            self.assertIsNotNone(symlink_err)
+            self.assertIn("symlink", (symlink_err or "").lower())
 
 
 if __name__ == "__main__":

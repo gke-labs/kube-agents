@@ -1132,17 +1132,11 @@ def fetch_cluster_credentials(
 ) -> tuple[Path, str | None]:
     """Fetch per-cluster credentials into an isolated kubeconfig under `kubeconfig_dir`."""
     kc = kubeconfig_path(kubeconfig_dir, project, cluster, location)
-    if kubeconfig_dir == DEFAULT_KUBECONFIG_DIR:
-        from collect import prepare_kubeconfig  # noqa: PLC0415
+    from collect import prepare_kubeconfig  # noqa: PLC0415
 
-        note = prepare_kubeconfig(kc)
-        if note:
-            return kc, note
-    else:
-        try:
-            kubeconfig_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return kc, f"kubeconfig directory {kubeconfig_dir} could not be created ({exc})"
+    note = prepare_kubeconfig(kc)
+    if note:
+        return kc, note
 
     argv = [
         GCLOUD_BIN,
@@ -1264,6 +1258,8 @@ def scan_fleet(
     errors: list[str] = []
     if discovery.error:
         errors.append(discovery.error)
+    elif discovery.partial and project_override is None:
+        errors.append(discovery.partial)
 
     evaluated_clusters: list[dict] = []
     matched_records: list[tuple[str, dict]] = []
