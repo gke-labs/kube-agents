@@ -597,6 +597,7 @@ To move this group, needed: the dial and post-merge state somewhere other than t
 
 ## Designs for the Blockers
 
+- Blocker 7 (#6670): [the broker surface of a profile](profile-broker-surface.md), a proposal for each route and verb that the profile role does not reach.
 - Blocker 12 (#6672): [Unattended write permit](unattended-write-permit.md), a write permit for profile work that a built-in schedule starts.
 - Blocker 15 ([#6674](https://github.com/gke-labs/kube-agents/issues/6674)): [`profile-pod-telemetry.md`](profile-pod-telemetry.md) proposes a counterpart, or "not needed" with a reason, for each signal that the platform agent's pod ships: log lines, records of tool calls and messages, traces and metrics.
 
