@@ -2221,9 +2221,11 @@ console.log(JSON.stringify({
   hasDeniedHint: html.includes("roles/container.viewer"),
   hasApiDisabledHint: html.includes("container.googleapis.com"),
   hasUnreachableHint: html.includes("VPC egress"),
+  hasEmptyProjectStatus: html.includes("No clusters active in this project (denied)."),
+  noBogusPlaceholderProfile: !html.includes("cluster-("),
 }));
 `
-	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true}`
+	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true,"hasEmptyProjectStatus":true,"noBogusPlaceholderProfile":true}`
 	if got := runPageJS(t, script); got != want {
 		t.Errorf("renderScopeRosterHtml output checks = %s, want %s", got, want)
 	}

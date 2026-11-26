@@ -62,10 +62,6 @@ const (
 	viaManagement = "management"
 	viaProfile    = "profile"
 
-	placeholderNoClusters      = "(no clusters discovered)"
-	placeholderDiscoveryFailed = "(cluster discovery failed)"
-	placeholderDiscoveredFmt   = "(%d %s discovered)"
-
 	gatewayUnreachablePrefix = "agent gateway unreachable: "
 	gatewayAnsweredHTTPFmt   = "agent gateway answered HTTP %d"
 
@@ -449,6 +445,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	allClusters := []scopeClusterRow{}
 	seenClusters := map[[3]string]bool{}
 	seenProjects := map[string]bool{}
+	skippedProjects := map[string]bool{}
 
 	for _, p := range raw.Projects {
 		if p.ID == "" {
@@ -459,6 +456,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 			state = stateInScope
 		}
 		if state != stateInScope {
+			skippedProjects[p.ID] = true
 			continue
 		}
 		seenProjects[p.ID] = true
@@ -499,45 +497,13 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 					allClusters = append(allClusters, row)
 				}
 			} else {
-				row := scopeClusterRow{
-					Project:     p.ID,
-					Name:        profName,
-					Profile:     profName,
-					Outcome:     outcome,
-					Ready:       outcome == outcomeOK,
-					Remediation: remedy,
-				}
+				row := makeClusterRow(cfg, p.ID, "", profName, profName, outcome, false, remedy, watchByTriple)
 				projClusters = append(projClusters, row)
 				triple := [3]string{row.Project, row.Location, row.Name}
 				if !seenClusters[triple] {
 					seenClusters[triple] = true
 					allClusters = append(allClusters, row)
 				}
-			}
-		}
-
-		// When a project failed listing or has no profile directories on disk
-		// yet, surface a project-level row in allClusters so the cluster table
-		// shows why its clusters could not be onboarded.
-		if len(projClusters) == 0 {
-			placeholderName := placeholderNoClusters
-			if p.Clusters != nil && *p.Clusters > 0 {
-				placeholderName = fmt.Sprintf(placeholderDiscoveredFmt, *p.Clusters, pluralWord(*p.Clusters, wordCluster, wordClusters))
-			} else if outcome != outcomeOK {
-				placeholderName = placeholderDiscoveryFailed
-			}
-			if cfg.ClusterName != "" && p.ID == cfg.ProjectID {
-				placeholderName = cfg.ClusterName
-			}
-			row := makeClusterRow(cfg, p.ID, cfg.Location, placeholderName, "", outcome, outcome == outcomeOK, remedy, watchByTriple)
-			if p.ID != cfg.ProjectID {
-				row.Location = ""
-			}
-			projClusters = append(projClusters, row)
-			triple := [3]string{row.Project, row.Location, row.Name}
-			if !seenClusters[triple] {
-				seenClusters[triple] = true
-				allClusters = append(allClusters, row)
 			}
 		}
 
@@ -562,7 +528,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	extraProfsByProj := map[string][]string{}
 	for _, id := range raw.ProfileIdentities {
 		triple := [3]string{id.Project, id.Location, id.Cluster}
-		if seenClusters[triple] || id.Project == "" || id.Cluster == "" {
+		if seenClusters[triple] || skippedProjects[id.Project] || id.Project == "" || id.Cluster == "" {
 			continue
 		}
 		seenClusters[triple] = true
@@ -690,8 +656,9 @@ func makeClusterRow(cfg config, project, location, name, profile, projectOutcome
 		outcome = outcomeUnreachable
 		remedy = remediationProfileIncomplete
 	}
-	isHostCluster := (project == "" || cfg.ProjectID == "" || project == cfg.ProjectID) &&
-		(cfg.ClusterName == "" || name == cfg.ClusterName)
+	isHostCluster := cfg.ProjectID != "" && project == cfg.ProjectID &&
+		cfg.ClusterName != "" && name == cfg.ClusterName &&
+		(cfg.Location == "" || location == "" || location == cfg.Location)
 	var watching *bool
 	if up, ok := watchByTriple[[3]string{project, location, name}]; ok {
 		watching = &up

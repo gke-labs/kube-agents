@@ -203,6 +203,7 @@ func TestNextDailyAuditComputesNextUTCFireTime(t *testing.T) {
 
 func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	cCount := 2
+	oneCount := 1
 	zeroCount := 0
 	upstreamPayload := upstreamScopePayload{
 		ResolvedAt:  "2026-11-26T06:00:00Z",
@@ -252,12 +253,14 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				Outcome:     "ok",
 				State:       "retiring",
 				AbsentSince: "2026-11-26T05:00:00Z",
-				Clusters:    &zeroCount,
+				Clusters:    &oneCount,
 			},
 		},
 		Profiles: map[string]string{
-			"cluster-proj-host-c1-us-central1": "proj-host",
-			"cluster-proj-host-c2-us-east1":    "proj-host",
+			"cluster-proj-host-c1-us-central1":      "proj-host",
+			"cluster-proj-host-c2-us-east1":         "proj-host",
+			"cluster-proj-host-c3-no-ident":         "proj-host",
+			"cluster-proj-retiring-old-us-central1": "proj-retiring",
 		},
 		ProfileIdentities: []upstreamProfileIdentity{
 			{
@@ -273,6 +276,13 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				Cluster:  "c2",
 				Location: "us-east1",
 				Ready:    false,
+			},
+			{
+				Profile:  "cluster-proj-retiring-old-us-central1",
+				Project:  "proj-retiring",
+				Cluster:  "old",
+				Location: "us-central1",
+				Ready:    true,
 			},
 		},
 		EventWatcher: &upstreamEventWatcher{
@@ -318,6 +328,10 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	if got.Summary.TotalProjects != 5 || got.Summary.OKProjects != 1 || got.Summary.ErrorProjects != 4 {
 		t.Errorf("project summary = %+v, want total=5 ok=1 error=4 (retiring project excluded)", got.Summary)
 	}
+	// Only real cluster profiles (c1 ready=ok, c2 unready=error, c3 missing identity=error) are counted in cluster summary.
+	if got.Summary.TotalClusters != 3 || got.Summary.OKClusters != 1 || got.Summary.ErrorClusters != 2 {
+		t.Errorf("cluster summary = %+v, want total=3 ok=1 error=2 (no synthetic placeholder rows or retiring profiles)", got.Summary)
+	}
 	if !got.EventWatcher.Enabled || !got.EventWatcher.Healthy || got.EventWatcher.Status != watcherStatusWatching || got.EventWatcher.ClustersUp != 1 {
 		t.Errorf("EventWatcher = %+v", got.EventWatcher)
 	}
@@ -327,19 +341,27 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 		byProject[p.ID] = p
 	}
 	if _, exists := byProject["proj-retiring"]; exists {
-		t.Errorf("retiring project should not be included in active scope projects")
+		t.Errorf("retiring project should not be included in active scope projects even when ProfileIdentities still exist on disk")
 	}
-	if len(byProject["proj-host"].ClusterRows) != 2 {
-		t.Fatalf("proj-host cluster rows = %+v, want 2", byProject["proj-host"].ClusterRows)
+	if len(byProject["proj-host"].ClusterRows) != 3 {
+		t.Fatalf("proj-host cluster rows = %+v, want 3", byProject["proj-host"].ClusterRows)
 	}
-	// c1 is ready -> ok; c2 is unready -> unreachable with scaffold remediation.
+	// c1 is ready -> ok; c2 is unready -> unreachable with scaffold remediation;
+	// c3 has no readable cluster_identity -> Ready=false and unreachable with scaffold remediation.
 	c1 := byProject["proj-host"].ClusterRows[0]
 	c2 := byProject["proj-host"].ClusterRows[1]
+	c3 := byProject["proj-host"].ClusterRows[2]
 	if c1.Name != "c1" || c1.Outcome != outcomeOK || c1.Watching == nil || !*c1.Watching {
 		t.Errorf("c1 row = %+v", c1)
 	}
-	if c2.Name != "c2" || c2.Outcome != outcomeUnreachable || !strings.Contains(c2.Remediation, "kubeconfig.yaml, or USER.md missing") {
+	if c2.Name != "c2" || c2.Outcome != outcomeUnreachable || c2.Ready || !strings.Contains(c2.Remediation, "kubeconfig.yaml, or USER.md missing") {
 		t.Errorf("c2 unready row = %+v", c2)
+	}
+	if c3.Name != "cluster-proj-host-c3-no-ident" || c3.Outcome != outcomeUnreachable || c3.Ready || !strings.Contains(c3.Remediation, "kubeconfig.yaml, or USER.md missing") {
+		t.Errorf("c3 missing-identity row = %+v, want Ready=false and outcomeUnreachable", c3)
+	}
+	if len(byProject["proj-denied"].ClusterRows) != 0 {
+		t.Errorf("proj-denied cluster rows = %+v, want empty (no placeholder cluster row)", byProject["proj-denied"].ClusterRows)
 	}
 	if !strings.Contains(byProject["proj-denied"].Remediation, "roles/container.viewer") {
 		t.Errorf("proj-denied remediation = %q", byProject["proj-denied"].Remediation)
@@ -371,6 +393,13 @@ func TestBuildScopeResponseGroupsOrphanProfileIdentitiesAndScopesInClusterWatch(
 				Ready:    true,
 			},
 			{
+				Profile:  "cluster-proj-host-prod-us-east1",
+				Project:  "proj-host",
+				Cluster:  "prod",
+				Location: "us-east1",
+				Ready:    true,
+			},
+			{
 				Profile:  "cluster-proj-other-prod-europe-west1",
 				Project:  "proj-other",
 				Cluster:  "prod",
@@ -392,20 +421,32 @@ func TestBuildScopeResponseGroupsOrphanProfileIdentitiesAndScopesInClusterWatch(
 	}
 
 	got := buildScopeResponse(cfg, raw, true, true, "", time.Date(2026, 11, 26, 5, 0, 0, 0, time.UTC))
-	if len(got.Projects) != 2 || got.Summary.TotalProjects != 2 || got.Summary.TotalClusters != 2 {
-		t.Fatalf("Projects = %+v, Summary = %+v; want 2 projects and 2 clusters", got.Projects, got.Summary)
+	if len(got.Projects) != 2 || got.Summary.TotalProjects != 2 || got.Summary.TotalClusters != 3 {
+		t.Fatalf("Projects = %+v, Summary = %+v; want 2 projects and 3 clusters", got.Projects, got.Summary)
 	}
 	byProj := map[string]scopeProjectRow{}
 	for _, p := range got.Projects {
 		byProj[p.ID] = p
 	}
 	hostCluster := byProj["proj-host"].ClusterRows[0]
-	if hostCluster.Watching == nil || !*hostCluster.Watching {
-		t.Errorf("host cluster Watching = %v, want true from --in-cluster fallback", hostCluster.Watching)
+	if hostCluster.Location != "us-central1" || hostCluster.Watching == nil || !*hostCluster.Watching {
+		t.Errorf("host cluster (us-central1) Watching = %v, want true from --in-cluster fallback", hostCluster.Watching)
+	}
+	sameNameDifferentLoc := byProj["proj-host"].ClusterRows[1]
+	if sameNameDifferentLoc.Location != "us-east1" || sameNameDifferentLoc.Watching != nil {
+		t.Errorf("same-project cluster in different location (us-east1) Watching = %v, want nil", sameNameDifferentLoc.Watching)
 	}
 	otherCluster := byProj["proj-other"].ClusterRows[0]
 	if otherCluster.Watching != nil {
 		t.Errorf("non-host cluster with same bare name Watching = %v, want nil", *otherCluster.Watching)
+	}
+
+	// When cfg.ProjectID is unset, the --in-cluster fallback must not match any project.
+	gotNoProj := buildScopeResponse(config{ClusterName: "prod", Location: "us-central1"}, raw, true, true, "", time.Date(2026, 11, 26, 5, 0, 0, 0, time.UTC))
+	for _, c := range gotNoProj.Clusters {
+		if c.Watching != nil {
+			t.Errorf("cluster %+v matched --in-cluster fallback with empty cfg.ProjectID", c)
+		}
 	}
 }
 

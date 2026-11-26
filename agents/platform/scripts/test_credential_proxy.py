@@ -1128,14 +1128,20 @@ class AgentAPIProxyTest(unittest.TestCase):
         (prof_reserved / "profile.yaml").write_text("name: platform\n", encoding="utf-8")
         (prof_reserved / "USER.md").write_text("# Platform\n", encoding="utf-8")
 
+        filler_series = "".join(
+            f'k8s_event_watcher_events_seen_total{{cluster="c1",reason="BackOff_{i:05d}"}} 1\n'
+            for i in range(18000)
+        )
         metrics_body = (
-            "# HELP k8s_event_watcher_watch_set_ready ready\n"
-            "# TYPE k8s_event_watcher_watch_set_ready gauge\n"
-            "k8s_event_watcher_watch_set_ready 1\n"
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 2\n'
             'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
             'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
-            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 2\n'
+            + filler_series
+            + "# HELP k8s_event_watcher_watch_set_ready ready\n"
+            + "# TYPE k8s_event_watcher_watch_set_ready gauge\n"
+            + "k8s_event_watcher_watch_set_ready 1\n"
         ).encode("utf-8")
+        self.assertGreater(len(metrics_body), credential_proxy.AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES)
 
         class MetricsHandler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
