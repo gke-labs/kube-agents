@@ -4866,10 +4866,12 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 			outcome = a2aProvisionReportOutcomeReported
 		}
 		if findings.topicsStateSubjectMissing {
-			if added, err := r.appendTopicsStateSubjects(ctx, agent); err == nil && len(added) > 0 {
-				r.recordEvent(agent, corev1.EventTypeNormal, reasonTopicsStateSubjectsAppended,
-					fmt.Sprintf(topicsStateSubjectsAppendedEventMessage, job.Name, strings.Join(added, topicsStateSubjectsJoinSep)))
-				outcome = a2aProvisionReportOutcomeReported
+			if added, checked, err := r.appendTopicsStateSubjects(ctx, agent); err == nil && checked {
+				if len(added) > 0 {
+					r.recordEvent(agent, corev1.EventTypeNormal, reasonTopicsStateSubjectsAppended,
+						fmt.Sprintf(topicsStateSubjectsAppendedEventMessage, job.Name, strings.Join(added, topicsStateSubjectsJoinSep)))
+					outcome = a2aProvisionReportOutcomeReported
+				}
 			} else {
 				if err != nil {
 					log.Error(err, topicsStateAppendFailedLogMsg)

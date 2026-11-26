@@ -562,6 +562,24 @@ func TestTheOperatorAppendsTheMissingTopologySkewSubjectThroughReconcile(t *test
 	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
 		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
 	}
+
+	// When TOPICS-STATE already carries every rendered subject (added empty,
+	// no error), a provision report naming topics_state_subject is treated as
+	// clean rather than emitting a TopicsStateSubjectMissing Warning Event.
+	job := provisionJobOf(t, ctx, cl, agent)
+	delete(job.Annotations, a2aProvisionReportAnnotation)
+	if err := cl.Update(ctx, job); err != nil {
+		t.Fatalf("clearing report annotation: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile on already-converged TOPICS-STATE: %v", err)
+	}
+	if events := drainEvents(rec); len(events) != 0 {
+		t.Errorf("expected no Events when TOPICS-STATE already carries all subjects, got %q", events)
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeClean {
+		t.Errorf("Job stamp when TOPICS-STATE already converged = %q, want %q", got, a2aProvisionReportOutcomeClean)
+	}
 }
 
 func TestBothProvisionFindingsAreTwoEvents(t *testing.T) {

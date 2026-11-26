@@ -1298,25 +1298,28 @@ func (r *PlatformAgentReconciler) operatorTopicsStateConn(_ context.Context, age
 // appendTopicsStateSubjects appends missing rendered subjects to TOPICS-STATE
 // through busmigrate.AppendMissingSubjects, which refuses any change other
 // than added policy subjects (no removed subject, no changed limit or
-// retention, no RePublish). When the operator's bus identity is not configured
-// (and no test seam is set), it returns (nil, nil) so
+// retention, no RePublish). checked is true when the operator connected to the
+// bus and inspected TOPICS-STATE (including when every rendered subject was
+// already present and added is empty). When the operator's bus identity is not
+// configured (and no test seam is set), it returns (nil, false, nil) so
 // reportA2AProvisionFindings falls back to recording the
 // TopicsStateSubjectMissing Event.
-func (r *PlatformAgentReconciler) appendTopicsStateSubjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+func (r *PlatformAgentReconciler) appendTopicsStateSubjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (added []string, checked bool, err error) {
 	connFn := r.busTopicsStateConn
 	if connFn == nil {
 		connFn = r.operatorTopicsStateConn
 	}
 	policy, ok := a2aTopicsStatePolicy(agent)
 	if !ok {
-		return nil, fmt.Errorf(errNoStreamPolicyFmt, a2aTopicsStateStream)
+		return nil, false, fmt.Errorf(errNoStreamPolicyFmt, a2aTopicsStateStream)
 	}
 	nc, err := connFn(ctx, agent)
 	if err != nil || nc == nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer nc.Close()
-	return busmigrate.AppendMissingSubjects(ctx, nc, policy)
+	added, err = busmigrate.AppendMissingSubjects(ctx, nc, policy)
+	return added, err == nil, err
 }
 
 // ensureBusRunSecret writes the run Secret once the hashing pod has
