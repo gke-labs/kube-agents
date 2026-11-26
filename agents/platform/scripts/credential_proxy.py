@@ -1634,9 +1634,16 @@ AGENT_API_EVENT_WATCHER_METRICS_HOST = "127.0.0.1"
 AGENT_API_EVENT_WATCHER_METRICS_PATH = "/metrics"
 AGENT_API_EVENT_WATCHER_SCRAPE_TIMEOUT_SECONDS = 1.5
 AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES = 1024 * 1024
+AGENT_API_EVENT_WATCHER_READ_CHUNK_BYTES = 64 * 1024
+AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES = 64 * 1024
 AGENT_API_WATCH_SET_READY_METRIC = "k8s_event_watcher_watch_set_ready"
 AGENT_API_CLUSTER_UP_METRIC = "k8s_event_watcher_cluster_up"
 AGENT_API_DISCOVERY_ERRORS_METRIC = "k8s_event_watcher_cluster_discovery_errors_total"
+AGENT_API_EVENT_WATCHER_TRACKED_METRICS = (
+    AGENT_API_WATCH_SET_READY_METRIC,
+    AGENT_API_CLUSTER_UP_METRIC,
+    AGENT_API_DISCOVERY_ERRORS_METRIC,
+)
 AGENT_API_METRIC_CLUSTER_LABEL = "cluster"
 AGENT_API_METRIC_PROJECT_LABEL = "project"
 AGENT_API_METRIC_LOCATION_LABEL = "location"
@@ -7423,7 +7430,7 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "clusters": [],
                     "error": f"k8s-event-watcher metrics answered HTTP {resp.status}",
                 }
-            raw_metrics = resp.read(AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES).decode("utf-8", errors="replace")
+            raw_metrics = cls._read_tracked_event_watcher_metrics(resp)
         except (OSError, http.client.HTTPException) as exc:
             return {
                 "enabled": True,
@@ -7438,6 +7445,48 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         finally:
             conn.close()
         return cls._parse_event_watcher_metrics(raw_metrics)
+
+    @classmethod
+    def _read_tracked_event_watcher_metrics(cls, resp: Any) -> str:
+        """Stream `/metrics` line by line and keep only the three tracked metric families.
+
+        Prometheus `Registry.Gather` sorts families alphabetically, placing
+        unbounded event counters (`events_seen_total`, `events_deduped_total`,
+        etc.) between `k8s_event_watcher_cluster_up` and
+        `k8s_event_watcher_watch_set_ready`. Filtering lines as they arrive
+        reaches `watch_set_ready` at the end of the body without buffering
+        untracked counter series in memory.
+        """
+        kept_lines: list[str] = []
+        kept_bytes = 0
+        pending = b""
+        skipping_overlong = False
+        tracked_prefixes = tuple(m.encode("ascii") for m in AGENT_API_EVENT_WATCHER_TRACKED_METRICS)
+        while True:
+            chunk = resp.read(AGENT_API_EVENT_WATCHER_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            data = pending + chunk
+            parts = data.split(b"\n")
+            pending = parts.pop()
+            for raw_line in parts:
+                if skipping_overlong:
+                    skipping_overlong = False
+                    continue
+                line = raw_line.strip()
+                if line.startswith(tracked_prefixes) and len(line) <= AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                    if kept_bytes + len(line) <= AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES:
+                        kept_lines.append(line.decode("utf-8", errors="replace"))
+                        kept_bytes += len(line)
+            if len(pending) > AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                pending = b""
+                skipping_overlong = True
+        if pending and not skipping_overlong:
+            line = pending.strip()
+            if line.startswith(tracked_prefixes) and len(line) <= AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                if kept_bytes + len(line) <= AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES:
+                    kept_lines.append(line.decode("utf-8", errors="replace"))
+        return "\n".join(kept_lines)
 
     @classmethod
     def _parse_event_watcher_metrics(cls, text: str) -> dict[str, Any]:
