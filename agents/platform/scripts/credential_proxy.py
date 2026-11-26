@@ -417,6 +417,62 @@ PROC_COMM_FILE = "comm"
 ENVOY_PROCESS_NAME = "envoy"
 PROCESS_LABEL_BROKER = "broker"
 PROCESS_LABEL_ENVOY = "envoy"
+# Every request that authenticates with a pod-bound ServiceAccount token must
+# arrive from the pod the TokenReview names. The token names its pod in
+# user.extra (TOKEN_REVIEW_POD_NAME_EXTRA, TOKEN_REVIEW_POD_UID_EXTRA); the
+# API server answers that pod's addresses; and the connection's peer has to
+# be one of them. A token that leaves its pod is then refused from anywhere
+# else, for the hour it would otherwise stay valid.
+#
+# Where the peer address comes from depends on the listener. On a TCP
+# listener it is the socket's own peer and nothing else. On the Unix socket
+# behind Envoy (the broker Pod's shape, deploy/shared/envoy-credential-proxy.yaml)
+# the socket's peer is Envoy, so Envoy stamps the downstream connection's
+# direct remote address into POD_PEER_ADDRESS_HEADER on every listener,
+# overwriting whatever a caller sent under that name, and only that listener
+# reads it. The socket is 0600 in this container's own mount, which keeps out
+# every other uid but not the processes the broker itself starts (git, gcloud,
+# kubectl run as its uid); so the header is believed only on a connection whose
+# kernel-reported peer is the Envoy process whose pid start-services handed
+# over (EnvoyPeerCheck).
+#
+# The API server's TokenReview answer carries no pod address under any key
+# Kubernetes defines, so the addresses are always read from the pod object.
+POD_PEER_ADDRESS_HEADER = "X-Kube-Agents-Peer-Address"
+# How long a pod's addresses are reused before they are read again. Never
+# longer than the authenticator's own cache (ServiceAccountAuthenticator takes
+# the smaller), so a deleted pod's addresses go no later than its TokenReview answer.
+POD_ADDRESS_CACHE_SECONDS = 30.0
+# The most pods whose addresses are held at once. Past it a lookup is still
+# made and enforced; it just is not kept.
+POD_ADDRESS_CACHE_MAX_ENTRIES = 4096
+# How often the missing-permission line is repeated, per namespace.
+POD_ADDRESS_PERMISSION_LOG_SECONDS = 60.0
+# The TokenReview username of a ServiceAccount, whose namespace is the pod's.
+_SERVICE_ACCOUNT_USERNAME = re.compile(r"^system:serviceaccount:([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?):[^:]+\Z")
+# A pod name (a DNS-1123 subdomain) and a namespace (a DNS-1123 label): both
+# are interpolated into the API path, so anything else is refused first.
+_POD_NAME_SHAPE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?\Z")
+# Phases in which a pod's containers have all stopped: its address may already
+# be another pod's, and nothing in it can be calling.
+_POD_STOPPED_PHASES = frozenset({"Succeeded", "Failed"})
+# The pod read, on the API server, of the pod a token names.
+POD_READ_PATH = "/api/v1/namespaces/{namespace}/pods/{name}"
+# How far past its own read timeout a request waits on another request's read
+# of the same pod before giving up.
+POD_ADDRESS_WAIT_MARGIN_SECONDS = 1.0
+# The Envoy binary the image ships (deploy/docker/Dockerfile), the one
+# executable a Unix-socket peer may be.
+ENVOY_BINARY_PATH = "/usr/local/bin/envoy"
+# Envoy's pid, which start-services starts Envoy first to learn and hands to
+# this process alone, over any value the environment carried.
+ENVOY_PID_ENV = "CREDENTIAL_PROXY_ENVOY_PID"
+# Envoy's pid as start-services writes it: ASCII digits, nothing else.
+ENVOY_PID_SHAPE = re.compile(r"^[0-9]{1,10}\Z")
+# The size of the kernel's struct ucred (pid_t, uid_t, gid_t), SO_PEERCRED's answer.
+UCRED_SIZE = 12
+# /proc/<pid>/exe: the link to a process's executable.
+PROC_EXE_FILE = "exe"
 # /proc/<pid>/status fields, in kB: the resident set now and its high-water.
 PROC_STATUS_RSS_KEY = "VmRSS"
 PROC_STATUS_PEAK_KEY = "VmHWM"
@@ -6357,47 +6413,6 @@ class ServiceAccountAuthenticator:
         )
 
 
-# Every request that authenticates with a pod-bound ServiceAccount token must
-# arrive from the pod the TokenReview names. The token names its pod in
-# user.extra (TOKEN_REVIEW_POD_NAME_EXTRA, TOKEN_REVIEW_POD_UID_EXTRA); the
-# API server answers that pod's addresses; and the connection's peer has to
-# be one of them. A token that leaves its pod is then refused from anywhere
-# else, for the hour it would otherwise stay valid.
-#
-# Where the peer address comes from depends on the listener. On a TCP
-# listener it is the socket's own peer and nothing else. On the Unix socket
-# behind Envoy (the broker Pod's shape, deploy/shared/envoy-credential-proxy.yaml)
-# the socket's peer is Envoy, so Envoy stamps the downstream connection's
-# direct remote address into POD_PEER_ADDRESS_HEADER on every listener,
-# overwriting whatever a caller sent under that name, and only that listener
-# reads it. The socket is 0600 in this container's own mount, which keeps out
-# every other uid but not the processes the broker itself starts (git, gcloud,
-# kubectl run as its uid); so the header is believed only on a connection whose
-# kernel-reported peer is the Envoy process whose pid start-services handed
-# over (EnvoyPeerCheck).
-#
-# The API server's TokenReview answer carries no pod address under any key
-# Kubernetes defines, so the addresses are always read from the pod object.
-POD_PEER_ADDRESS_HEADER = "X-Kube-Agents-Peer-Address"
-# How long a pod's addresses are reused before they are read again. Never
-# longer than the authenticator's own cache (ServiceAccountAuthenticator takes
-# the smaller), so a deleted pod's addresses go no later than its TokenReview answer.
-POD_ADDRESS_CACHE_SECONDS = 30.0
-# The most pods whose addresses are held at once. Past it a lookup is still
-# made and enforced; it just is not kept.
-POD_ADDRESS_CACHE_MAX_ENTRIES = 4096
-# How often the missing-permission line is repeated, per namespace.
-POD_ADDRESS_PERMISSION_LOG_SECONDS = 60.0
-# The TokenReview username of a ServiceAccount, whose namespace is the pod's.
-_SERVICE_ACCOUNT_USERNAME = re.compile(r"^system:serviceaccount:([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?):[^:]+\Z")
-# A pod name (a DNS-1123 subdomain) and a namespace (a DNS-1123 label): both
-# are interpolated into the API path, so anything else is refused first.
-_POD_NAME_SHAPE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?\Z")
-# Phases in which a pod's containers have all stopped: its address may already
-# be another pod's, and nothing in it can be calling.
-_POD_STOPPED_PHASES = frozenset({"Succeeded", "Failed"})
-
-
 def _normalised_address(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """``value`` as an address, an IPv4-mapped IPv6 address as its IPv4 one; None if it is not one."""
     if not isinstance(value, str) or not value.strip():
@@ -6507,7 +6522,7 @@ class PodAddressBinding:
         if not leader:
             # The leader's read is bounded by timeout_seconds; a little past
             # that, give up rather than wait on a thread that never finished.
-            if not flight.done.wait(self.timeout_seconds + 1.0):
+            if not flight.done.wait(self.timeout_seconds + POD_ADDRESS_WAIT_MARGIN_SECONDS):
                 raise AuthenticationError("the token's pod could not be read in time")
             if flight.addresses is None:
                 raise AuthenticationError(flight.refusal or "the token's pod could not be read")
@@ -6544,9 +6559,8 @@ class PodAddressBinding:
             ) from exc
 
     def _read_pod(self, namespace: str, name: str) -> Any:
-        path = (
-            f"/api/v1/namespaces/{urllib.parse.quote(namespace, safe='')}"
-            f"/pods/{urllib.parse.quote(name, safe='')}"
+        path = POD_READ_PATH.format(
+            namespace=urllib.parse.quote(namespace, safe=""), name=urllib.parse.quote(name, safe="")
         )
         request = urllib.request.Request(
             f"https://{self.api_host}:{self.api_port}{path}",
@@ -6555,7 +6569,12 @@ class PodAddressBinding:
         )
         try:
             context = ssl.create_default_context(cafile=self.ca_file or None)
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds, context=context) as response:
+            # ProxyHandler({}): an in-cluster call carrying this broker's own
+            # bearer token never goes to a proxy named in the environment.
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             exc.close()
@@ -6616,21 +6635,16 @@ class PodAddressBinding:
         return frozenset(addresses)
 
 
-# The Envoy binary the image ships (deploy/docker/Dockerfile), the one
-# executable a Unix-socket peer may be.
-ENVOY_BINARY_PATH = "/usr/local/bin/envoy"
-
-
 def _socket_peer_credentials(connection: Any) -> tuple[int, int, int] | None:
     """(pid, uid, gid) of a Unix socket's peer, as the kernel recorded it at connect; None where unknown."""
     option = getattr(socket, "SO_PEERCRED", None)
     if option is None or connection is None:
         return None
     try:
-        raw = connection.getsockopt(socket.SOL_SOCKET, option, 12)
+        raw = connection.getsockopt(socket.SOL_SOCKET, option, UCRED_SIZE)
     except (OSError, AttributeError, TypeError):
         return None
-    if len(raw) != 12:
+    if len(raw) != UCRED_SIZE:
         return None
     # struct ucred: pid_t (signed), uid_t and gid_t (unsigned 32-bit). A signed
     # read of a uid past 2**31 would never equal os.getuid().
@@ -6638,11 +6652,6 @@ def _socket_peer_credentials(connection: Any) -> tuple[int, int, int] | None:
     uid = int.from_bytes(raw[4:8], sys.byteorder, signed=False)
     gid = int.from_bytes(raw[8:12], sys.byteorder, signed=False)
     return pid, uid, gid
-
-
-# Envoy's pid, which start-services starts Envoy first to learn and hands to
-# this process alone, over any value the environment carried.
-ENVOY_PID_ENV = "CREDENTIAL_PROXY_ENVOY_PID"
 
 
 class EnvoyPeerCheck:
@@ -6669,8 +6678,15 @@ class EnvoyPeerCheck:
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "EnvoyPeerCheck":
         """The check for the pid start-services handed over; one that refuses everything, said loudly, without it."""
-        raw = (os.environ if environ is None else environ).get(ENVOY_PID_ENV, "").strip()
-        pid = int(raw) if raw.isdigit() and int(raw) > 0 else None
+        raw = (os.environ if environ is None else environ).get(ENVOY_PID_ENV, "") or ""
+        raw = raw.strip() if isinstance(raw, str) else ""
+        pid = None
+        # ASCII digits only: str.isdigit admits characters int() refuses.
+        if ENVOY_PID_SHAPE.match(raw):
+            try:
+                pid = int(raw) or None
+            except ValueError:
+                pid = None
         if pid is None:
             LOGGER.error(
                 "ALERT %s is %s, so no Unix-socket connection can be matched to Envoy; every "
@@ -6690,7 +6706,7 @@ class EnvoyPeerCheck:
         if pid != self.pid or uid != os.getuid():
             return False
         try:
-            executable = os.readlink(self.proc_root / str(pid) / "exe")
+            executable = os.readlink(self.proc_root / str(pid) / PROC_EXE_FILE)
         except OSError:
             return False
         return os.path.realpath(executable) == os.path.realpath(self.binary)

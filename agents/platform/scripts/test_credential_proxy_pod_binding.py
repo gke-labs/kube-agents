@@ -2,7 +2,7 @@
 
 PodAddressBinding reads the pod the TokenReview names and refuses any request
 whose connection peer is not one of that pod's addresses. These tests drive
-the binding directly (with the pod read stubbed at urlopen, so its error
+the binding directly (with the pod read stubbed at the opener, so its error
 handling runs for real) and through the handler over real sockets: a TCP
 listener, which uses the socket's own peer and ignores every header, and the
 Unix socket behind Envoy, which takes the address Envoy stamps.
@@ -141,11 +141,19 @@ class _Response(io.BytesIO):
 
 
 class FakeApiServer:
-    """Stands in for urlopen: answers pod reads from a script, recording each."""
+    """Stands in for build_opener and its opener: answers pod reads from a script, recording each."""
 
     def __init__(self):
         self.answers = []
         self.requests = []
+        self.handlers = []
+
+    def build_opener(self, *handlers):
+        self.handlers.append(handlers)
+        return self
+
+    def open(self, request, timeout=None):
+        return self(request, timeout=timeout)
 
     def push(self, answer):
         self.answers.append(answer)
@@ -175,7 +183,7 @@ class PodAddressBindingTest(unittest.TestCase):
         self.own_token = Path(self.tmp.name) / "token"
         self.own_token.write_text("broker-own-token", encoding="utf-8")
         self.api = FakeApiServer()
-        patcher = mock.patch.object(credential_proxy.urllib.request, "urlopen", self.api)
+        patcher = mock.patch.object(credential_proxy.urllib.request, "build_opener", self.api.build_opener)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.clock = Clock()
@@ -195,6 +203,18 @@ class PodAddressBindingTest(unittest.TestCase):
         # The broker's own credential, as the TokenReview uses: never the caller's.
         self.assertEqual("Bearer broker-own-token", authorization)
 
+    def test_the_pod_read_never_goes_through_an_environment_proxy(self):
+        self.api.push(pod_object())
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://proxy.example:3128", "https_proxy": "http://proxy.example:3128"}):
+            self.binding().check(principal(), "10.8.0.12")
+        (handlers,) = self.api.handlers
+        proxies = [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertEqual(1, len(proxies), handlers)
+        self.assertEqual({}, proxies[0].proxies)
+        # And the real opener built from them has no proxy for https.
+        opener = urllib.request.build_opener(*handlers)
+        self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) and h.proxies for h in opener.handlers))
+
     def test_a_different_peer_with_a_valid_token_is_refused(self):
         self.api.push(pod_object())
         with self.assertRaisesRegex(AuthenticationError, "did not come from the token's pod"):
@@ -210,7 +230,7 @@ class PodAddressBindingTest(unittest.TestCase):
             with self.subTest(answer=answer):
                 api = FakeApiServer()
                 api.push(answer)
-                with mock.patch.object(credential_proxy.urllib.request, "urlopen", api):
+                with mock.patch.object(credential_proxy.urllib.request, "build_opener", api.build_opener):
                     with self.assertRaises(AuthenticationError):
                         self.binding().check(principal(), "10.8.0.12")
 
@@ -219,7 +239,7 @@ class PodAddressBindingTest(unittest.TestCase):
             with self.subTest(answer=answer):
                 api = FakeApiServer()
                 api.push(answer)
-                with mock.patch.object(credential_proxy.urllib.request, "urlopen", api):
+                with mock.patch.object(credential_proxy.urllib.request, "build_opener", api.build_opener):
                     with self.assertRaises(AuthenticationError):
                         self.binding().check(principal(), "10.8.0.12")
 
@@ -257,7 +277,7 @@ class PodAddressBindingTest(unittest.TestCase):
             with self.subTest(pod=pod):
                 api = FakeApiServer()
                 api.push(pod)
-                with mock.patch.object(credential_proxy.urllib.request, "urlopen", api):
+                with mock.patch.object(credential_proxy.urllib.request, "build_opener", api.build_opener):
                     with self.assertRaisesRegex(AuthenticationError, "has no address"):
                         self.binding().check(principal(), "10.8.0.12")
 
@@ -266,7 +286,7 @@ class PodAddressBindingTest(unittest.TestCase):
             with self.subTest(phase=phase):
                 api = FakeApiServer()
                 api.push(pod_object(phase=phase))
-                with mock.patch.object(credential_proxy.urllib.request, "urlopen", api):
+                with mock.patch.object(credential_proxy.urllib.request, "build_opener", api.build_opener):
                     with self.assertRaisesRegex(AuthenticationError, "stopped"):
                         self.binding().check(principal(), "10.8.0.12")
 
@@ -535,7 +555,8 @@ class EnvoyPeerCheckTest(unittest.TestCase):
 
     def test_no_pin_refuses_everything_and_says_so(self):
         self.process(self.ENVOY_PID, self.envoy_binary)
-        for raw in (None, "", "0", "-3", "4242x", "4242,5000"):
+        for raw in (None, "", "0", "0000", "-3", "4242x", "4242,5000", "\u00b2", "\u0663\u0663", "4\u0662",
+                    "99999999999", "1e3", " + 4242"):
             with self.subTest(raw=raw):
                 env = {} if raw is None else {credential_proxy.ENVOY_PID_ENV: raw}
                 with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
