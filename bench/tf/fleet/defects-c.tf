@@ -119,11 +119,11 @@ resource "kubernetes_manifest" "general_ccc" {
 # file it. GKE accepts the class and marks it misconfigured:
 # `CrdMisconfigured` is True with the reason `ReservationNotFound`, and
 # `Health` is False (read on GKE 1.36, on a dev fleet). The stockout audit's
-# 3.10(b) files that status as `reservation-mismatch-risk`.
+# 3.12(b) files that status as `dangling-compute-class`.
 #
 # Auto-creation is ON here, unlike `general-ccc`. With it off, GKE reports
 # another reason (`NapDisabledAndNoMatchingNodegroups`), says nothing about
-# the reservation, and the audit files 3.12(b) and 3.13 as well. GKE makes a
+# the reservation, and the audit files a second finding (3.13). GKE makes a
 # node pool for a class only for a pod that asks for the class: by its name
 # (a nodeSelector or an affinity) or through a default class label on its
 # namespace. No workload asks for this one, in this stack or in a case, and a
