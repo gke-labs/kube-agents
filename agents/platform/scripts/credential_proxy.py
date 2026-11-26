@@ -15,6 +15,7 @@ import hmac
 import http.client
 import io
 import functools
+import ipaddress
 import gc
 import json
 import logging
@@ -417,6 +418,62 @@ PROC_COMM_FILE = "comm"
 ENVOY_PROCESS_NAME = "envoy"
 PROCESS_LABEL_BROKER = "broker"
 PROCESS_LABEL_ENVOY = "envoy"
+# Every request that authenticates with a pod-bound ServiceAccount token must
+# arrive from the pod the TokenReview names. The token names its pod in
+# user.extra (TOKEN_REVIEW_POD_NAME_EXTRA, TOKEN_REVIEW_POD_UID_EXTRA); the
+# API server answers that pod's addresses; and the connection's peer has to
+# be one of them. A token that leaves its pod is then refused from anywhere
+# else, for the hour it would otherwise stay valid.
+#
+# Where the peer address comes from depends on the listener. On a TCP
+# listener it is the socket's own peer and nothing else. On the Unix socket
+# behind Envoy (the broker Pod's shape, deploy/shared/envoy-credential-proxy.yaml)
+# the socket's peer is Envoy, so Envoy stamps the downstream connection's
+# direct remote address into POD_PEER_ADDRESS_HEADER on every listener,
+# overwriting whatever a caller sent under that name, and only that listener
+# reads it. The socket is 0600 in this container's own mount, which keeps out
+# every other uid but not the processes the broker itself starts (git, gcloud,
+# kubectl run as its uid); so the header is believed only on a connection whose
+# kernel-reported peer is the Envoy process whose pid start-services handed
+# over (EnvoyPeerCheck).
+#
+# The API server's TokenReview answer carries no pod address under any key
+# Kubernetes defines, so the addresses are always read from the pod object.
+POD_PEER_ADDRESS_HEADER = "X-Kube-Agents-Peer-Address"
+# How long a pod's addresses are reused before they are read again. Never
+# longer than the authenticator's own cache (ServiceAccountAuthenticator takes
+# the smaller), so a deleted pod's addresses go no later than its TokenReview answer.
+POD_ADDRESS_CACHE_SECONDS = 30.0
+# The most pods whose addresses are held at once. Past it a lookup is still
+# made and enforced; it just is not kept.
+POD_ADDRESS_CACHE_MAX_ENTRIES = 4096
+# How often the missing-permission line is repeated, per namespace.
+POD_ADDRESS_PERMISSION_LOG_SECONDS = 60.0
+# The TokenReview username of a ServiceAccount, whose namespace is the pod's.
+_SERVICE_ACCOUNT_USERNAME = re.compile(r"^system:serviceaccount:([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?):[^:]+\Z")
+# A pod name (a DNS-1123 subdomain) and a namespace (a DNS-1123 label): both
+# are interpolated into the API path, so anything else is refused first.
+_POD_NAME_SHAPE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?\Z")
+# Phases in which a pod's containers have all stopped: its address may already
+# be another pod's, and nothing in it can be calling.
+_POD_STOPPED_PHASES = frozenset({"Succeeded", "Failed"})
+# The pod read, on the API server, of the pod a token names.
+POD_READ_PATH = "/api/v1/namespaces/{namespace}/pods/{name}"
+# How far past its own read timeout a request waits on another request's read
+# of the same pod before giving up.
+POD_ADDRESS_WAIT_MARGIN_SECONDS = 1.0
+# The Envoy binary the image ships (deploy/docker/Dockerfile), the one
+# executable a Unix-socket peer may be.
+ENVOY_BINARY_PATH = "/usr/local/bin/envoy"
+# Envoy's pid, which start-services starts Envoy first to learn and hands to
+# this process alone, over any value the environment carried.
+ENVOY_PID_ENV = "CREDENTIAL_PROXY_ENVOY_PID"
+# Envoy's pid as start-services writes it: ASCII digits, nothing else.
+ENVOY_PID_SHAPE = re.compile(r"^[0-9]{1,10}\Z")
+# The size of the kernel's struct ucred (pid_t, uid_t, gid_t), SO_PEERCRED's answer.
+UCRED_SIZE = 12
+# /proc/<pid>/exe: the link to a process's executable.
+PROC_EXE_FILE = "exe"
 # /proc/<pid>/status fields, in kB: the resident set now and its high-water.
 PROC_STATUS_RSS_KEY = "VmRSS"
 PROC_STATUS_PEAK_KEY = "VmHWM"
@@ -6268,6 +6325,9 @@ class ServiceAccountAuthenticator:
     non-empty the a2a-chat audience is refused to anyone not named. Empty
     leaves the audience alone deciding, as an older operator's rendering, which
     names no a2a-chat callers, still needs.
+    ``pod_binding`` holds each request to the pod its token was issued to
+    (PodAddressBinding). It is not applied here, where only headers are
+    seen, but by the handler, which knows the connection's peer.
     ``profile_identities`` binds the profile role the way ``mcp_callers``
     binds the mcp one, empty meaning nobody: its keys are the profile workers'
     ServiceAccounts, each held to the profile audience and the only callers
@@ -6296,6 +6356,7 @@ class ServiceAccountAuthenticator:
         a2a_reports_callers: frozenset[str] = frozenset(),
         a2a_chat_callers: frozenset[str] = frozenset(),
         teams_inbound_callers: frozenset[str] = frozenset(),
+        pod_binding: PodAddressBinding | None = None,
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -6322,6 +6383,13 @@ class ServiceAccountAuthenticator:
         self.cache_seconds = cache_seconds
         self._cache: dict[str, _CacheEntry] = {}
         self._cache_lock = threading.Lock()
+        # The handler holds every request to the pod its token names through
+        # this (PodAddressBinding.check). build_authenticator always sets it;
+        # its addresses are never kept longer than a TokenReview answer is.
+        self.pod_binding = pod_binding
+        if pod_binding is not None:
+            pod_binding.cache_seconds = min(pod_binding.cache_seconds, self.cache_seconds)
+            pod_binding.timeout_seconds = min(pod_binding.timeout_seconds, self.timeout_seconds)
 
     def authenticate(self, headers: Any) -> Principal:
         header = headers.get("Authorization", "") or ""
@@ -6515,6 +6583,305 @@ class ServiceAccountAuthenticator:
             pod=pod if isinstance(pod, str) else "",
             pod_uid=pod_uid if isinstance(pod_uid, str) else "",
         )
+
+
+def _normalised_address(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``value`` as an address, an IPv4-mapped IPv6 address as its IPv4 one; None if it is not one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+@dataclass(frozen=True)
+class _PodAddressEntry:
+    expires_at: float
+    addresses: frozenset
+
+
+class _PodAddressFlight:
+    """One pod read in progress, which concurrent requests for the same pod wait on."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.addresses: frozenset | None = None
+        self.refusal: str | None = None
+
+
+class PodAddressBinding:
+    """Hold a pod-bound token to the pod it was issued to, by the connection's peer address.
+
+    ``check`` runs on every authenticated request, cached TokenReview or not, since
+    the peer is per connection. It refuses, with AuthenticationError, a
+    principal with no pod or pod UID, a pod the API server does not return
+    (gone, unreadable, or this broker not permitted to read it), a pod whose
+    UID is not the token's, a stopped pod, a pod with no address, an unknown
+    peer, and a peer that is not one of the pod's addresses.
+
+    Only a pod read that passed every check is cached, keyed by namespace,
+    name and UID, for ``cache_seconds``; a refusal is never cached, so the
+    next request reads the pod again. Requests for the same pod that arrive
+    while it is being read wait for that one read (refused alike if it is
+    refused) rather than each making their own.
+    """
+
+    def __init__(
+        self,
+        api_host: str,
+        api_port: str,
+        ca_file: str,
+        token_file: str,
+        timeout_seconds: float = 10.0,
+        cache_seconds: float = POD_ADDRESS_CACHE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        max_entries: int = POD_ADDRESS_CACHE_MAX_ENTRIES,
+    ) -> None:
+        if not api_host:
+            raise ValueError("the Kubernetes API server address is not configured")
+        self.api_host = api_host
+        self.api_port = api_port
+        self.ca_file = ca_file
+        self.token_file = token_file
+        self.timeout_seconds = timeout_seconds
+        self.cache_seconds = max(0.0, cache_seconds)
+        self._clock = clock
+        self._max_entries = max_entries
+        self._cache: dict[tuple[str, str, str], _PodAddressEntry] = {}
+        self._inflight: dict[tuple[str, str, str], _PodAddressFlight] = {}
+        self._lock = threading.Lock()
+        self._permission_logged: dict[str, float] = {}
+
+    def check(self, principal: Principal, peer: str | None) -> None:
+        """Return if ``peer`` is one of the addresses of ``principal``'s pod; raise AuthenticationError otherwise."""
+        if not principal.pod or not principal.pod_uid:
+            raise AuthenticationError("the token names no pod to hold the request to")
+        match = _SERVICE_ACCOUNT_USERNAME.match(principal.workload or "")
+        if match is None:
+            raise AuthenticationError("the token's caller is not a ServiceAccount, so it names no pod namespace")
+        namespace = match.group(1)
+        if not _POD_NAME_SHAPE.match(principal.pod):
+            raise AuthenticationError("the token's pod name is not a pod name")
+        peer_address = _normalised_address(peer)
+        if peer_address is None:
+            raise AuthenticationError("the request's peer address is unknown")
+        addresses = self.addresses(namespace, principal.pod, principal.pod_uid)
+        if peer_address not in addresses:
+            raise AuthenticationError(
+                f"the request did not come from the token's pod {namespace}/{principal.pod} "
+                f"(peer {peer_address})"
+            )
+
+    def addresses(self, namespace: str, name: str, uid: str) -> frozenset:
+        """The pod's addresses, cached or read; raises AuthenticationError on any failure."""
+        key = (namespace, name, uid)
+        now = self._clock()
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                if entry.expires_at > now:
+                    return entry.addresses
+                del self._cache[key]
+            flight = self._inflight.get(key)
+            leader = flight is None
+            if leader:
+                flight = _PodAddressFlight()
+                self._inflight[key] = flight
+        if not leader:
+            # The leader's read is bounded by timeout_seconds; a little past
+            # that, give up rather than wait on a thread that never finished.
+            if not flight.done.wait(self.timeout_seconds + POD_ADDRESS_WAIT_MARGIN_SECONDS):
+                raise AuthenticationError("the token's pod could not be read in time")
+            if flight.addresses is None:
+                raise AuthenticationError(flight.refusal or "the token's pod could not be read")
+            return flight.addresses
+        try:
+            addresses = self._addresses_from(self._read_pod(namespace, name), namespace, name, uid)
+        except AuthenticationError as exc:
+            flight.refusal = str(exc)
+            raise
+        except Exception as exc:
+            flight.refusal = f"the token's pod could not be read: {type(exc).__name__}"
+            raise AuthenticationError(flight.refusal) from exc
+        else:
+            flight.addresses = addresses
+            if self.cache_seconds > 0:
+                now = self._clock()
+                with self._lock:
+                    self._cache = {k: e for k, e in self._cache.items() if e.expires_at > now}
+                    if len(self._cache) < self._max_entries:
+                        self._cache[key] = _PodAddressEntry(now + self.cache_seconds, addresses)
+            return addresses
+        finally:
+            with self._lock:
+                if self._inflight.get(key) is flight:
+                    del self._inflight[key]
+            flight.done.set()
+
+    def _own_token(self) -> str:
+        try:
+            return Path(self.token_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise AuthenticationError(
+                f"this pod's own API server token is unreadable: {type(exc).__name__}"
+            ) from exc
+
+    def _read_pod(self, namespace: str, name: str) -> Any:
+        path = POD_READ_PATH.format(
+            namespace=urllib.parse.quote(namespace, safe=""), name=urllib.parse.quote(name, safe="")
+        )
+        request = urllib.request.Request(
+            f"https://{self.api_host}:{self.api_port}{path}",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {self._own_token()}"},
+            method="GET",
+        )
+        try:
+            context = ssl.create_default_context(cafile=self.ca_file or None)
+            # ProxyHandler({}): an in-cluster call carrying this broker's own
+            # bearer token never goes to a proxy named in the environment.
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == HTTPStatus.NOT_FOUND:
+                raise AuthenticationError(f"the token's pod {namespace}/{name} does not exist") from exc
+            if exc.code in (HTTPStatus.FORBIDDEN, HTTPStatus.UNAUTHORIZED):
+                self._log_missing_permission(namespace, exc.code)
+                raise AuthenticationError(
+                    f"this broker may not read pods in namespace {namespace} (HTTP {exc.code})"
+                ) from exc
+            raise AuthenticationError(f"the token's pod could not be read: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, RecursionError) as exc:
+            raise AuthenticationError(f"the token's pod could not be read: {type(exc).__name__}") from exc
+
+    def _log_missing_permission(self, namespace: str, code: int) -> None:
+        """Say once a minute per namespace that the broker lacks `get` on pods there."""
+        now = self._clock()
+        with self._lock:
+            last = self._permission_logged.get(namespace)
+            if last is not None and now - last < POD_ADDRESS_PERMISSION_LOG_SECONDS:
+                return
+            self._permission_logged[namespace] = now
+        LOGGER.error(
+            "ALERT the broker's ServiceAccount is refused get on pods in namespace %s (HTTP %d); "
+            "every request presenting a pod token from that namespace is refused until it may "
+            "read pods there again (the operator renders <agent>-credential-proxy-pod-read for this)",
+            _sanitize_for_logging(namespace),
+            code,
+        )
+
+    @staticmethod
+    def _addresses_from(pod: Any, namespace: str, name: str, uid: str) -> frozenset:
+        if not isinstance(pod, dict):
+            raise AuthenticationError("the token's pod was read as something other than an object")
+        metadata = pod.get("metadata")
+        status = pod.get("status")
+        if not isinstance(metadata, dict) or not isinstance(status, dict):
+            raise AuthenticationError("the token's pod has no metadata or status")
+        if metadata.get("name") != name or metadata.get("namespace", namespace) != namespace:
+            raise AuthenticationError("the pod read is not the token's pod")
+        if not isinstance(metadata.get("uid"), str) or metadata.get("uid") != uid:
+            raise AuthenticationError(f"the pod {namespace}/{name} is not the one the token was issued to (UID differs)")
+        if status.get("phase") in _POD_STOPPED_PHASES:
+            raise AuthenticationError(f"the token's pod {namespace}/{name} has stopped")
+        addresses = set()
+        pod_ips = status.get("podIPs")
+        if isinstance(pod_ips, list):
+            for item in pod_ips:
+                address = _normalised_address(item.get("ip") if isinstance(item, dict) else None)
+                if address is not None:
+                    addresses.add(address)
+        if not addresses:
+            address = _normalised_address(status.get("podIP"))
+            if address is not None:
+                addresses.add(address)
+        if not addresses:
+            raise AuthenticationError(f"the token's pod {namespace}/{name} has no address")
+        return frozenset(addresses)
+
+
+def _socket_peer_credentials(connection: Any) -> tuple[int, int, int] | None:
+    """(pid, uid, gid) of a Unix socket's peer, as the kernel recorded it at connect; None where unknown."""
+    option = getattr(socket, "SO_PEERCRED", None)
+    if option is None or connection is None:
+        return None
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, option, UCRED_SIZE)
+    except (OSError, AttributeError, TypeError):
+        return None
+    if len(raw) != UCRED_SIZE:
+        return None
+    # struct ucred: pid_t (signed), uid_t and gid_t (unsigned 32-bit). A signed
+    # read of a uid past 2**31 would never equal os.getuid().
+    pid = int.from_bytes(raw[0:4], sys.byteorder, signed=True)
+    uid = int.from_bytes(raw[4:8], sys.byteorder, signed=False)
+    gid = int.from_bytes(raw[8:12], sys.byteorder, signed=False)
+    return pid, uid, gid
+
+
+class EnvoyPeerCheck:
+    """Is a Unix-socket connection from the Envoy that start-services launched for this broker?
+
+    The broker and Envoy share a container and a uid, and so do the commands
+    the broker runs, so neither the socket's mode nor the peer's uid tells
+    Envoy apart from a brokered command that opens the socket itself. The
+    peer's pid does. start-services starts Envoy before this process and
+    hands it Envoy's pid (ENVOY_PID_ENV), and the container ends when Envoy
+    does, so that pid is Envoy's for this process's whole life. A connection
+    is admitted only when the kernel-reported peer (SO_PEERCRED) has exactly
+    that pid, this process's uid, and ENVOY_BINARY_PATH as its executable;
+    another process running the Envoy binary has another pid and is refused.
+    With no usable pid every connection is refused, as it is where the kernel
+    reports no peer credentials.
+    """
+
+    def __init__(self, pid: int | None, binary: str = ENVOY_BINARY_PATH, proc_root: str = PROC_ROOT) -> None:
+        self.pid = pid if isinstance(pid, int) and pid > 0 else None
+        self.binary = binary
+        self.proc_root = Path(proc_root)
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "EnvoyPeerCheck":
+        """The check for the pid start-services handed over; one that refuses everything, said loudly, without it."""
+        raw = (os.environ if environ is None else environ).get(ENVOY_PID_ENV, "") or ""
+        raw = raw.strip() if isinstance(raw, str) else ""
+        pid = None
+        # ASCII digits only: str.isdigit admits characters int() refuses.
+        if ENVOY_PID_SHAPE.match(raw):
+            try:
+                pid = int(raw) or None
+            except ValueError:
+                pid = None
+        if pid is None:
+            LOGGER.error(
+                "ALERT %s is %s, so no Unix-socket connection can be matched to Envoy; every "
+                "request presenting a pod token on the socket is refused until the broker is "
+                "started by start-services with Envoy's pid",
+                ENVOY_PID_ENV, "unset" if not raw else repr(raw[:32]),
+            )
+        return cls(pid)
+
+    def admits(self, connection: Any) -> bool:
+        if self.pid is None:
+            return False
+        credentials = _socket_peer_credentials(connection)
+        if credentials is None:
+            return False
+        pid, uid, _ = credentials
+        if pid != self.pid or uid != os.getuid():
+            return False
+        try:
+            executable = os.readlink(self.proc_root / str(pid) / PROC_EXE_FILE)
+        except OSError:
+            return False
+        return os.path.realpath(executable) == os.path.realpath(self.binary)
 
 
 # The profile role's configuration (#3889). All four are reserved against
@@ -6958,7 +7325,23 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "exists once the chat audience split does, so the profile audience is ignored",
                 PROFILE_AUDIENCE_ENV,
             )
+    api_host = os.getenv("KUBERNETES_SERVICE_HOST", "").strip()
+    api_port = os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443"
+    ca_file = os.getenv(
+        "CREDENTIAL_PROXY_KUBE_CA_FILE",
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+    ).strip()
+    token_file = os.getenv(
+        "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
+        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    ).strip()
+    # Every role's token is pod-bound, so every request is held to its pod,
+    # read with the same client and credential the TokenReview uses.
+    pod_binding = PodAddressBinding(
+        api_host=api_host, api_port=api_port, ca_file=ca_file, token_file=token_file
+    ) if api_host else None
     return ServiceAccountAuthenticator(
+        pod_binding=pod_binding,
         audience_roles=audience_roles,
         allowed_callers=allowed,
         session_callers=session_callers,
@@ -6969,16 +7352,10 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         a2a_chat_callers=a2a_chat_callers,
         teams_inbound_callers=teams_inbound_callers,
         profile_identities=profile_identities,
-        api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
-        api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
-        ca_file=os.getenv(
-            "CREDENTIAL_PROXY_KUBE_CA_FILE",
-            "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-        ).strip(),
-        token_file=os.getenv(
-            "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
-            "/var/run/secrets/kubernetes.io/serviceaccount/token",
-        ).strip(),
+        api_host=api_host,
+        api_port=api_port,
+        ca_file=ca_file,
+        token_file=token_file,
     )
 
 
@@ -16255,6 +16632,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     report_profiles: frozenset[str] = frozenset()
     # Set per request once the caller is identified; read by the policy layer.
     principal: Principal | None = None
+    # Who may speak for a Unix-socket connection's peer (_peer_address): the
+    # Envoy beside the broker, and nothing else in its container.
+    # Refuses everything until serve() builds it from ENVOY_PID_ENV.
+    envoy_peer: EnvoyPeerCheck = EnvoyPeerCheck(None)
     # What the metrics listener serves. One registry per process; a test that
     # wants a clean one assigns a fresh ProxyMetrics here.
     metrics: ProxyMetrics = ProxyMetrics()
@@ -16275,12 +16656,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         present on the route they tested and None on the two they did not.
         """
         try:
-            self.principal = self.authenticator.authenticate(self.headers)
+            principal = self.authenticator.authenticate(self.headers)
+            # Per request, after the TokenReview, cached or not: the
+            # token is good, and now it has to be coming from its own pod.
+            binding = getattr(self.authenticator, "pod_binding", None)
+            if binding is not None:
+                binding.check(principal, self._peer_address())
+            self.principal = principal
         except AuthenticationError as exc:
+            self.principal = None
             LOGGER.warning(
                 "rejected an unauthenticated request path=%s reason=%s",
                 _sanitize_for_logging(self.path),
-                exc,
+                _sanitize_for_logging(str(exc), max_length=256),
             )
             self._json(
                 HTTPStatus.UNAUTHORIZED, {"error": "caller could not be authenticated"}
@@ -16291,6 +16679,31 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):
             return None
         return self.principal
+
+    def _peer_address(self) -> str | None:
+        """The address of the connection's peer, for PodAddressBinding; None when unknown.
+
+        A TCP listener's own socket peer, and on it nothing a header says. On
+        the Unix socket the peer is Envoy, the one thing that can reach it,
+        which stamps the downstream connection's direct remote address into
+        POD_PEER_ADDRESS_HEADER over anything the caller sent. Believed only
+        on a connection EnvoyPeerCheck admits, and only as exactly one value;
+        PodAddressBinding then refuses anything that is not one bare address.
+        """
+        address = self.client_address
+        if isinstance(address, tuple) and address and isinstance(address[0], str) and address[0]:
+            return address[0]
+        if isinstance(self.server, socketserver.UnixStreamServer):
+            if not self.envoy_peer.admits(self.connection):
+                LOGGER.warning(
+                    "a Unix-socket connection did not come from Envoy; its peer header is not believed path=%s",
+                    _sanitize_for_logging(self.path),
+                )
+                return None
+            values = self.headers.get_all(POD_PEER_ADDRESS_HEADER) or []
+            if len(values) == 1:
+                return values[0].strip()
+        return None
 
     def _admit_task(self, principal: Principal) -> bool:
         """Bind a profile caller's task credential, or answer 403 and return False.
@@ -20598,6 +21011,10 @@ def serve(args: argparse.Namespace) -> None:
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
     CredentialProxyHandler.profile_gate = build_profile_gate(CredentialProxyHandler.authenticator)
+    if getattr(args, "unix_socket", "") and getattr(CredentialProxyHandler.authenticator, "pod_binding", None) is not None:
+        # Read once, before the listener exists: the socket's peer header is
+        # believed from this pid alone (EnvoyPeerCheck).
+        CredentialProxyHandler.envoy_peer = EnvoyPeerCheck.from_env()
     # The audit-report store (#5619): unset on an exec pod, or under an operator
     # that predates it.
     CredentialProxyHandler.report_store = report_store_from_env(role)

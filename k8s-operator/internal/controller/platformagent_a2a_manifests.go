@@ -8616,6 +8616,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.reconcileProfileQuota(ctx, agent, profiles, profileFenced); err != nil {
 		*profileErr = goerrors.Join(*profileErr, err)
 	}
+	// The broker's pod read there, so it can hold a profile worker's request
+	// to the worker's own pod; the same rule as the quota's.
+	if err := r.reconcileCredentialBrokerProfilePodRead(ctx, agent, profileFenced); err != nil {
+		*profileErr = goerrors.Join(*profileErr, err)
+	}
 
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
