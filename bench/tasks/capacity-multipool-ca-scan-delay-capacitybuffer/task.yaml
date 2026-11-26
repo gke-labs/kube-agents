@@ -13,16 +13,21 @@
 # enumerates none of the answer terms so echoing the prompt cannot pass. Each
 # objective grades one free-form labeled line (`CAUSE:`, `TARGETING:`,
 # `HEADROOM:`) under `fold_decoration: true`:
-# - `CAUSE:` must name per-pool / multi-pool evaluation, simulation, or
-#   predicate scanning across the pools (not a prompt echo or stockout).
+# - `CAUSE:` must name per-pool / multi-pool evaluation, simulation, iteration,
+#   or predicate scanning across the pools or node groups, without blaming
+#   unrelated causes (stockout, quota, cooldown, image pull) or negating
+#   per-pool evaluation.
 # - `TARGETING:` must name `cloud.google.com/default-compute-class` (or
-#   `-non-daemonset`) on the `TARGETING:` line itself, unnegated and unhedged.
-# - `HEADROOM:` must name `capacitybuffers.autoscaling.x-k8s.io` or
-#   `CapacityBuffer` paired with the `autoscaling.x-k8s.io` API group on the
-#   `HEADROOM:` line itself (prose "capacity buffer" without the API group
-#   fails).
+#   `-non-daemonset`) on the `TARGETING:` line itself, unnegated, unhedged,
+#   and without pairing a pod-level/per-Deployment alternative.
+# - `HEADROOM:` must name `capacitybuffer(s).autoscaling.x-k8s.io`,
+#   `autoscaling.x-k8s.io(/v...)/CapacityBuffer(s)`, or `CapacityBuffer(s)`
+#   paired with the `autoscaling.x-k8s.io` API group on the `HEADROOM:` line
+#   itself (prose "capacity buffer" without the API group, wrong-group CRDs,
+#   and `--min-nodes` / `minNodeCount` fail).
 # `bench/tests/test_capacity_multipool_ca_scan_delay_verdict.py` pins all three
-# objectives on both positive and negative replies.
+# objectives on both positive and negative replies, including `expected_output`
+# and verbatim prompt echo.
 #
 # The prompt's sentence about a hand-off is for the Planning Agent, so a
 # delegated card keeps the three labeled-line instructions.
@@ -50,9 +55,9 @@ prompt: >-
   12-minute delay; `TARGETING: ` naming only the exact field, flag, or label
   key for durable targeting; and `HEADROOM: ` naming only the exact
   Kubernetes/GKE API resource (including its API group) or flag for warm
-  headroom. If you hand this question to another agent, pass these instructions
-  word for word, and keep its three lines in your reply. Do not run commands
-  and do not apply anything.
+  headroom. If you hand this question to another agent, pass these
+  instructions word for word, and keep its three lines in your reply. Do not
+  run commands and do not apply anything.
 expected_output: >-
   Untargeted pods force Cluster Autoscaler to evaluate scheduling predicates
   across all 28 specialized and tainted node pools on each scan loop, delaying
@@ -63,9 +68,11 @@ expected_output: >-
   automatically inherit ComputeClass targeting, and provisioning a
   `CapacityBuffer` (`capacitybuffers.autoscaling.x-k8s.io`,
   `autoscaling.x-k8s.io/v1beta1`) to keep warm spare headroom during bursts.
-  CAUSE: Untargeted pods force Cluster Autoscaler to evaluate scheduling
-  predicates per node pool across all 28 pools on each scan loop.
+
+  CAUSE: Untargeted pods force Cluster Autoscaler to evaluate scheduling predicates across all 28 specialized and tainted node pools on each scan loop.
+
   TARGETING: cloud.google.com/default-compute-class
+
   HEADROOM: capacitybuffers.autoscaling.x-k8s.io
 infrastructure:
   deployer: noop
@@ -79,10 +86,12 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       required_patterns:
-        - "(?m)^cause:(?=[^\\n]*\\b(?:evaluat(?:e|es|ed|ing|ion)|simulat(?:e|es|ed|ing|ion)|scan(?:s|ned|ning)?|predicates?|iterat(?:e|es|ed|ing|ion)|check(?:s|ed|ing)?|test(?:s|ed|ing)?|prob(?:e|es|ed|ing)|walk(?:s|ed|ing)?)\\b)(?=[^\\n]*(?:(?<![a-z0-9-])per[\\s-]+(?:node[\\s-]+)?pool(?![a-z0-9-])|\\b(?:every|each|all)(?:\\s+of)?(?:\\s+the)?(?:\\s+28)?(?:\\s+(?:specialized|tainted|gpu|node|candidate|eligible|matching|non-matching|unrelated|individual|separate|distinct))*\\s+(?:node[\\s-]+)?pools?\\b|\\bacross(?:\\s+all)?(?:\\s+the)?(?:\\s+28)?(?:\\s+(?:specialized|tainted|gpu|node|candidate|eligible|individual|separate|distinct))*\\s+(?:node[\\s-]+)?pools?\\b|\\bmulti[\\s-]+pool\\s+(?:evaluation|simulation|scan(?:ning)?|predicate)))[^\\n]+$"
+        - "(?m)^cause:(?=[^\\n]*\\b(?:evaluat(?:e|es|ed|ing|ion)|simulat(?:e|es|ed|ing|ion)|scan(?:s|ned|ning)?|predicates?|iterat(?:e|es|ed|ing|ion)|walk(?:s|ed|ing)?)\\b)(?=[^\\n]*(?:(?<![a-z0-9-])per[\\s-]+(?:node[\\s-]+)?(?:pool|group)(?![a-z0-9-])|\\b(?:every|each|all|across|multiple|many)(?:\\s+(?:of|the|and|all|[\\w/'-]+,?)){0,7}\\s+(?:node[\\s-]+)?(?:pools?|groups?)\\b|\\bmulti[\\s-]+pool[^\\n]{0,40}\\b(?:evaluation|simulation|scan(?:ning)?|predicate)))[^\\n]+$"
       forbidden_patterns:
         - "(?m)^cause:[^\\n]*\\?"
-        - "(?m)^cause:[^\\n]*\\b(?:not|no|never|isn't|aren't|doesn't)\\s+(?:a\\s+|caused\\s+by\\s+|due\\s+to\\s+)?(?:per[\\s-]+(?:node[\\s-]+)?pool|multi[\\s-]+pool|scan(?:\\s+loop)?|predicate|evaluation|simulation)"
+        - "(?m)^cause:[^\\n]*\\b(?:not|never|isn't|aren't|doesn't|don't|cannot|can't)\\s+(?:a\\s+|the\\s+|caused\\s+by\\s+|due\\s+to\\s+|from\\s+)?(?:per[\\s-]+(?:node[\\s-]+)?(?:pool|group)|multi[\\s-]+pool|scan(?:s|ning|\\s+loop)?|predicates?|evaluat(?:e|es|ing|ion)|simulat(?:e|es|ing|ion)|iterat(?:e|es|ing|ion))"
+        - "(?m)^cause:[^\\n]*\\b(?:evaluation|simulation|scanning|predicates?)\\s+(?:across[^\\n]{0,40})?(?:is|are)\\s+not\\b"
+        - "(?m)^cause:(?![^\\n]*\\b(?:not|no)\\s+(?:a\\s+)?(?:zonal\\s+|gpu\\s+|capacity\\s+)?(?:stockout|quota|cooldown))[^\\n]*\\b(?:stockouts?|out\\s+of\\s+stock|quota\\s+(?:limit|exceeded|exhaust(?:ed|ion)|check)|cooldown|image\\s+pull)\\b"
   - name: targeting-names-namespace-default-compute-class
     role: objective
     mode: assert
@@ -90,9 +99,9 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - "(?m)^targeting:\\s*(?:[^\\n]*[\\s\"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9-])"
+        - "(?m)^targeting:\\s*(?:[^\\n]*[\\s\"'\\[(])?cloud\\.google\\.com/default-compute-class(?:-non-daemonset)?(?![a-z0-9/-]|\\.[a-z0-9])"
       forbidden_patterns:
-        - "(?m)^targeting:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|don't|\\binstead\\b|per-deployment|nodeselector|;|\\?)"
+        - "(?m)^targeting:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|\\bavoid\\b|\\bcannot\\b|can't|don't|doesn't|isn't|won't|\\binstead\\b|per[\\s-]+deployment|node[\\s-]*selector|node[\\s-]*affinity|cloud\\.google\\.com/compute-class\\b|;|\\?|\\bor\\b(?!\\s+(?:the\\s+|label\\s+)?cloud\\.google\\.com/default-compute-class))"
   - name: headroom-names-capacitybuffers-api-resource
     role: objective
     mode: assert
@@ -100,10 +109,11 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - "(?m)^headroom:[^\\n]*(?<![a-z0-9.-])capacitybuffers\\.autoscaling\\.x-k8s\\.io(?:/v[0-9a-z]+)?(?![a-z0-9/-]|\\.[a-z0-9])"
-        - "(?m)^headroom:(?=[^\\n]*(?<![a-z0-9-])capacitybuffers?(?![a-z0-9-]))(?=[^\\n]*(?<![a-z0-9.-])autoscaling\\.x-k8s\\.io(?:/v[0-9a-z]+)?(?![a-z0-9/-]|\\.[a-z0-9]))[^\\n]+$"
+        - "(?m)^headroom:[^\\n]*(?<![a-z0-9.-])capacitybuffers?\\.autoscaling\\.x-k8s\\.io(?:/v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?(?![a-z0-9/-]|\\.[a-z0-9])"
+        - "(?m)^headroom:[^\\n]*(?<![a-z0-9.-])autoscaling\\.x-k8s\\.io(?:/v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?/capacitybuffers?(?![a-z0-9/-]|\\.[a-z0-9])"
+        - "(?m)^headroom:(?=[^\\n]*(?<![a-z0-9.-])capacitybuffers?(?![a-z0-9/-]|\\.[a-z0-9]))(?=[^\\n]*(?<![a-z0-9.-])autoscaling\\.x-k8s\\.io(?:/v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?(?![a-z0-9/-]|\\.[a-z0-9]))[^\\n]+$"
       forbidden_patterns:
-        - "(?m)^headroom:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|don't|\\binstead\\b|--min-nodes|\\bmin-nodes\\b|;|\\?)"
+        - "(?m)^headroom:[^\\n]*(?:\\bnot\\b|\\bno\\b|\\bnever\\b|\\bavoid\\b|\\bcannot\\b|can't|don't|doesn't|isn't|won't|\\binstead\\b|\\bmin[\\s-]+nodes\\b|\\bminnodecount\\b|\\b(?:provisioningrequests?|capacityquotas?)\\b|;(?!\\s*(?:kind|apiversion|provisioningstrategy)\\b)|\\?)"
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic
