@@ -115,8 +115,9 @@ func TestACoreAgentSessionTurnGetsTheDelegateServerGrantAndPromptTogetherExceptO
 	if err := json.Unmarshal([]byte(d.Env[EnvDelegateTargets]), &got); err != nil || len(got.Targets) != 2 || got.Targets[1].Name != "cluster" {
 		t.Errorf("the turn's targets %q (%v), want the gateway's two", d.Env[EnvDelegateTargets], err)
 	}
-	if !slices.Contains(first.Policy.Allow, "read_file:/workspace/*") {
-		t.Errorf("the human turn's allow rules = %v, want the session's beside the delegate tool's", first.Policy.Allow)
+	delegateRule := "mcp:" + persona.ReservedServer + "_" + DelegateToolName
+	if want := []string{"read_file:/workspace/*", delegateRule, delegateRule + " *"}; !slices.Equal(first.Policy.Allow, want) {
+		t.Errorf("the human turn's allow rules = %v, want exactly %v: the session's and the delegate tool's, nothing wider", first.Policy.Allow, want)
 	}
 	if !slices.Contains(first.Instructions, "session prompt") {
 		t.Errorf("the human turn's instructions = %q, want the session's beside the delegate prompt", first.Instructions)
@@ -230,5 +231,16 @@ func TestTurnDelegateServerCarriesTheScopeClustersBesideTheTargets(t *testing.T)
 	}
 	if s := turnDelegateServer(tmpl, true, "/run/t.sock", msg(targets)); s.Env[EnvScopeClusters] != "" {
 		t.Errorf("a turn with no page kept the template's: %q", s.Env[EnvScopeClusters])
+	}
+}
+
+// A grant that can't render (a server name the toolgrant rules refuse) is an
+// error, never a turn run without its grant or with a wider one.
+func TestWithDelegateGrantRefusesAServerItCannotRender(t *testing.T) {
+	base := NewCoreAgentDriver(coreagentwire.Policy{Tools: []string{"read_file"}}, nil)
+	bad := delegateTemplate("/run/d.sock")
+	bad.Name = "a2a delegate"
+	if _, err := withDelegateGrant(base, bad); err == nil {
+		t.Fatal("a server name toolgrant refuses rendered a grant")
 	}
 }

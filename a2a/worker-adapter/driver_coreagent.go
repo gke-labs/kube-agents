@@ -26,7 +26,9 @@ import (
 // carries them back.
 type coreAgentDriver struct {
 	// Policy is the turn's tool policy, set by NewCoreAgentDriver from the
-	// worker's grant (the session allowlist today). MCP is the turn's MCP
+	// worker's grant (the session allowlist today); a session turn that may
+	// delegate adds the delegate tool's allow rules to its own copy
+	// (WithAllow, withDelegateGrant). MCP is the turn's MCP
 	// servers, set each turn by WithMCP from the persona's (adapter.run,
 	// turnDriver); the pod's driver carries none.
 	Policy coreagentwire.Policy

@@ -128,8 +128,8 @@ type Config struct {
 	// Claude Code, the harness every argv below is built for.
 	Driver Driver
 	// PersonaMCP are the persona's MCP servers, for a harness that takes
-	// them in-process (core-agent): each turn's are built from these (and,
-	// once #6789 lands, the delegate server when the turn may delegate).
+	// them in-process (core-agent): each turn's are built from these, with
+	// DelegateMCP's server after them on a session turn that may delegate.
 	PersonaMCP []persona.MCPServer
 	// DelegateMCP is the delegate server for a harness that takes its MCP
 	// servers in the stdin envelope (core-agent): a turn that may delegate
