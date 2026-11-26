@@ -1440,6 +1440,11 @@
 # from neither exclusion list; CI nightlies run over inject).
 ./tasks/list-gitops-repos/task.yaml
 
+# #1983: the GCP networking fabric audit's skill points to compliance-audit
+# §2.19 for Istio ServiceEntry collisions; a coverage question is answered
+# with where the check lives. deployer: noop, read-only, graded on the answer.
+./tasks/networking-audit-points-to-serviceentry-check/task.yaml
+
 # The networking stream's declared-intent case (#1408): the project's
 # mtu-peer-declared network at MTU 8896, peered both ways with default at
 # 1460 (role declared-mtu-peering), is the 2.4 peered-MTU posture the same

@@ -1,0 +1,21 @@
+# Not a Kubernetes object, and not any product's schema: these are the values to enter
+# in your egress gateway's own rule for the proxy. Do not apply this file.
+egressRule:
+  # The three-label Service name, as in sandbox-kubeconfig.yaml and the certificate.
+  host: k8s-api-proxy.sandbox-proxy.svc
+  port: 8443
+  # https on both sides, so the injected token never crosses a cleartext connection.
+  scheme: https
+  # The gateway replaces the sandbox's placeholder with the token it mints.
+  setRequestHeaders:
+    Authorization: Bearer <jwt>
+  # What the minted token carries, and the proxy flag in proxy.yaml that checks it.
+  token:
+    issuer: https://issuer.example.test # --jwt-issuer
+    audience: k8s-api-proxy.sandbox-proxy.svc # --jwt-audiences
+    claims:
+      sub: sandbox/<sandbox-id> # --jwt-required-sub-prefix
+      tenant: <tenant> # --jwt-partition-claim, --jwt-allowed-partitions
+  # The gateway verifies the proxy's certificate against the CA of the signer named in
+  # proxy.yaml's podCertificate volume.
+  upstreamCertificateAuthority: <signer CA bundle>
