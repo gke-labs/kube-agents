@@ -106,7 +106,7 @@ NATS_CLAIMS = frozenset({"type", "version", "task", "profile", "tier", "pod", "p
 # Every nats key but target, trigger and permits is required. Permits is
 # taskcred's Permits, which Mint omits when there is none (#3993). Target may be
 # absent only on a report credential (below), in Go as here. Trigger is optional
-# in both.
+# in both, except beside PERMIT_VCS_UNATTENDED_WRITE.
 NATS_REQUIRED = frozenset({"type", "version", "task", "profile", "tier", "pod", "pod_uid"})
 # A report credential (#5619): a proxy credential with no target, which only an
 # unattended task started by a trigger may carry. A fleet audit names no
@@ -118,7 +118,8 @@ TARGET_CLAIMS = frozenset({"project", "location", "cluster"})
 TRIGGER_CLAIMS = frozenset({"name", "origin", "stream", "script"})
 TRIGGER_REQUIRED = frozenset({"name", "origin"})
 # taskcred.TriggerOriginBuiltin: the one origin a trigger may name today (#4685).
-TRIGGER_ORIGINS = frozenset({"builtin"})
+TRIGGER_ORIGIN_BUILTIN = "builtin"
+TRIGGER_ORIGINS = frozenset({TRIGGER_ORIGIN_BUILTIN})
 # The one source whose triggers may bind a report stream, and only their own:
 # lib.ValidateTrigger's schedule/<stream> rule.
 TRIGGER_SCHEDULE_SOURCE = "schedule"
@@ -129,9 +130,16 @@ HEADER_KEYS = frozenset({"typ", "alg"})
 # write verbs require of a profile caller.
 PERMIT_VCS_PROPOSAL_CREATE = "vcs:proposal-create"
 
+# taskcred.PermitVCSUnattendedWrite: the write permit of a run that a built-in
+# schedule started (docs/designs/unattended-write-permit.md, rows 1 and 2).
+# Accepted only beside a trigger _unattended_write_trigger accepts, and never
+# beside PERMIT_VCS_PROPOSAL_CREATE. Nothing mints it yet, and the broker's
+# gate does not read it.
+PERMIT_VCS_UNATTENDED_WRITE = "vcs:unattended-write"
+
 # Every permit taskcred mints and verifies. Closed: a credential naming any
 # other is refused, not read as carrying fewer permits.
-KNOWN_PERMITS = frozenset({PERMIT_VCS_PROPOSAL_CREATE})
+KNOWN_PERMITS = frozenset({PERMIT_VCS_PROPOSAL_CREATE, PERMIT_VCS_UNATTENDED_WRITE})
 
 # int64, the width of jwt/v2's time claims. A JSON integer outside it fails
 # Go's decode; Python would read it as a bignum.
@@ -528,6 +536,15 @@ def verify(
     if "permits" in nats and audience != AUDIENCE:
         raise TaskCredentialError(f"task credential permits may appear only on a {AUDIENCE!r} credential")
     permits = _permits(nats)
+    if PERMIT_VCS_UNATTENDED_WRITE in permits:
+        if PERMIT_VCS_PROPOSAL_CREATE in permits:
+            raise TaskCredentialError(
+                f"task credential may not carry both {PERMIT_VCS_UNATTENDED_WRITE!r} and {PERMIT_VCS_PROPOSAL_CREATE!r}"
+            )
+        if not _unattended_write_trigger(trigger):
+            raise TaskCredentialError(
+                f"task credential permit {PERMIT_VCS_UNATTENDED_WRITE!r} needs a builtin schedule trigger that binds its stream"
+            )
     if type(audience) is not str or audience != AUDIENCE:
         raise TaskCredentialError(f"task credential is not for {AUDIENCE!r}")
 
@@ -605,6 +622,22 @@ def _trigger(claim: Any) -> TaskTrigger:
     if script and (source != TRIGGER_SCHEDULE_SOURCE or not slash):
         raise TaskCredentialError("task credential trigger script is not on a schedule's trigger")
     return TaskTrigger(name=name, origin=origin, stream=stream, script=script)
+
+
+def _unattended_write_trigger(trigger: TaskTrigger | None) -> bool:
+    """Whether a credential may carry PERMIT_VCS_UNATTENDED_WRITE beside ``trigger``.
+
+    taskcred's unattendedWriteTrigger: origin builtin, a stream that is not
+    empty, and the name schedule/<stream>. _trigger already holds a stream to
+    that name and the origin to builtin; this states the permit's own rule
+    whole, so a trigger shape admitted later does not widen it.
+    """
+    return (
+        trigger is not None
+        and trigger.origin == TRIGGER_ORIGIN_BUILTIN
+        and bool(trigger.stream)
+        and trigger.name == f"{TRIGGER_SCHEDULE_SOURCE}/{trigger.stream}"
+    )
 
 
 # ---------------------------------------------------------------------------
