@@ -328,8 +328,8 @@ func profilePoolName(profile, tier string) string {
 	return "agentprofile-" + profile + "-" + tier
 }
 
-// buildProfilePool is one (profile, interactive tier)'s warm pool: warmReplicas
-// pods of the worker, in the profile namespace. It has no owner reference,
+// buildProfilePool is one (profile, interactive tier)'s warm pool:
+// resolveProfileWarmReplicas pods of the worker, in the profile namespace. It has no owner reference,
 // since an owner can't be in another namespace, so the operator removes it by
 // its labels (deleteProfilePools).
 func buildProfilePool(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1.AgentProfile, tier, serviceAccount string, imageVolumes bool) *appsv1.Deployment {
@@ -342,7 +342,7 @@ func buildProfilePool(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1
 			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(resolveProfileWarmReplicas(agent))), // #nosec G115 -- the CRD bounds warmReplicas to 0-100
+			Replicas: ptr.To(int32(resolveProfileWarmReplicas(agent, profile))), // #nosec G115 -- held to 0-100 (the CRD bounds warmReplicas; the default is held to MaxProfileWarmReplicas)
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
 				a2aComponentLabel:     agentProfileWorkerComponent,
 				agentProfileNameLabel: profile.Name,
