@@ -531,6 +531,48 @@ func TestTheCardStopIsOptInThroughTheOperator(t *testing.T) {
 	}
 }
 
+// The delegation rounds a profile task may use (#6789) render onto the
+// gateway explicitly at 1, the only value supported, whatever the operator
+// carries; any other value on the operator is refused by name, saying rounds
+// above 1 are not supported yet when it is one.
+func TestTheDelegationRoundsRenderAtOneAndAnythingElseIsRefused(t *testing.T) {
+	agent := a2aTestAgent()
+	rounds := func() (corev1.EnvVar, bool) {
+		t.Helper()
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "A2A_DELEGATION_ROUNDS_MAX" {
+				return e, true
+			}
+		}
+		return corev1.EnvVar{}, false
+	}
+	for _, set := range []string{"", "1", " 1 "} {
+		t.Setenv("A2A_DELEGATION_ROUNDS_MAX", set)
+		if e, ok := rounds(); !ok || e.Value != "1" {
+			t.Errorf("operator %q: gateway renders %+v (%v), want A2A_DELEGATION_ROUNDS_MAX=1", set, e, ok)
+		}
+		if err := ValidateA2ADelegationRoundsMax(); err != nil {
+			t.Errorf("operator %q refused: %v", set, err)
+		}
+	}
+	for _, tc := range []struct{ set, want string }{
+		{"2", "rounds above 1 are not supported yet"},
+		{"16", "rounds above 1 are not supported yet"},
+		{"0", "need an integer"},
+		{"-1", "need an integer"},
+		{"junk", "need an integer"},
+	} {
+		t.Setenv("A2A_DELEGATION_ROUNDS_MAX", tc.set)
+		if e, ok := rounds(); !ok || e.Value != "1" {
+			t.Errorf("operator %q: gateway renders %+v (%v), want 1", tc.set, e, ok)
+		}
+		err := ValidateA2ADelegationRoundsMax()
+		if err == nil || !strings.Contains(err.Error(), "A2A_DELEGATION_ROUNDS_MAX") || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("operator %q: err %v, want one naming the variable and %q", tc.set, err, tc.want)
+		}
+	}
+}
+
 // The credential A5 retired, refused by name at the render.
 //
 // Three routes could bring it back and two of them would be quiet. A

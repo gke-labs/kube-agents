@@ -15,7 +15,7 @@ import (
 
 // writeIntegrityManifest records dir the way an image build does
 // (`find . -type f ! -name skills_manifest.sha256 -exec sha256sum {} +`,
-// sorted): every regular file but the root manifest, "./"-prefixed.
+// sorted by path): every regular file but the root manifest, "./"-prefixed.
 func writeIntegrityManifest(t *testing.T, dir string) {
 	t.Helper()
 	var lines []string
@@ -39,7 +39,10 @@ func writeIntegrityManifest(t *testing.T, dir string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sort.Strings(lines)
+	// LC_ALL=C sort -k 2: byte order of the path.
+	sort.Slice(lines, func(i, j int) bool {
+		return lines[i][strings.Index(lines[i], "  "):] < lines[j][strings.Index(lines[j], "  "):]
+	})
 	writeFile(t, dir, IntegrityManifestFile, strings.Join(lines, "\n")+"\n")
 }
 
@@ -378,5 +381,108 @@ func TestIntegrityAnExtraSymlinkLeavesItUnverified(t *testing.T) {
 	l := &loader{dir: dir}
 	if integrity, _ := l.checkIntegrity(false); integrity != IntegrityUnverified {
 		t.Errorf("checkIntegrity = %v with an extra symlink, want unverified", integrity)
+	}
+}
+
+func TestCheckTreeCoversOnlyItsScope(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string][]byte{"CLAUDE.md": []byte("persona\n"), "skills/a/SKILL.md": []byte("a\n")}
+	for rel, data := range files {
+		writeFile(t, dir, rel, string(data))
+	}
+	writeFile(t, dir, IntegrityManifestFile, string(FormatIntegrityManifest(files)))
+	scope := func(rel string) bool {
+		return rel == "CLAUDE.md" || rel == "skills" || strings.HasPrefix(rel, "skills/")
+	}
+
+	// State outside the scope, beside the tree, is not checked.
+	writeFile(t, dir, "projects/state.json", "{}")
+	integrity, n, err := CheckTree(dir, scope)
+	if err != nil || integrity != IntegrityVerified || n != len(files) {
+		t.Fatalf("CheckTree = %v, %d, %v; want verified over %d", integrity, n, err, len(files))
+	}
+
+	// A file inside the scope that the build didn't write is.
+	writeFile(t, dir, "skills/b/SKILL.md", "b\n")
+	if _, _, err := CheckTree(dir, scope); err == nil || !strings.Contains(err.Error(), "skills/b/SKILL.md") {
+		t.Errorf("CheckTree = %v, want the extra skill named", err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "skills/b")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A manifest entry outside the scope is refused rather than ignored.
+	appendTo(t, dir, IntegrityManifestFile, strings.Repeat("0", 64)+"  ./projects/state.json\n")
+	if _, _, err := CheckTree(dir, scope); err == nil || !strings.Contains(err.Error(), "outside the files this check covers") {
+		t.Errorf("CheckTree = %v, want the out-of-scope entry refused", err)
+	}
+}
+
+func TestCheckTreeWithoutAManifestIsUnverified(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "CLAUDE.md", "persona\n")
+	integrity, n, err := CheckTree(dir, func(string) bool { return true })
+	if err != nil || integrity != IntegrityUnverified || n != 0 {
+		t.Errorf("CheckTree = %v, %d, %v; want unverified, 0, nil", integrity, n, err)
+	}
+}
+
+// FormatIntegrityManifest writes what the image builds write and Load reads.
+func TestFormatIntegrityManifestMatchesTheBuildRecipe(t *testing.T) {
+	dir := copyExample(t)
+	writeIntegrityManifest(t, dir)
+	want, err := os.ReadFile(filepath.Join(dir, IntegrityManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{}
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		if rel = filepath.ToSlash(rel); rel != IntegrityManifestFile {
+			files[rel], _ = os.ReadFile(p)
+		}
+		return nil
+	})
+	if got := FormatIntegrityManifest(files); string(got) != string(want) {
+		t.Errorf("FormatIntegrityManifest =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// WriteIntegrityManifest replaces a symlink at the manifest's path rather
+// than writing through it, and refuses a name it can't write as one line.
+func TestWriteIntegrityManifestDoesNotFollowASymlink(t *testing.T) {
+	dir := copyExample(t)
+	outside := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(outside, []byte("untouched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, IntegrityManifestFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteIntegrityManifest(dir); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(outside); string(data) != "untouched\n" {
+		t.Errorf("the symlink's target was written: %q", data)
+	}
+	if p, err := LoadWithOptions(dir, Options{RequireIntegrity: true}); err != nil || p.Integrity != IntegrityVerified {
+		t.Errorf("after WriteIntegrityManifest: %v, %v", p, err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestWriteIntegrityManifestRefusesALineBreakInAName(t *testing.T) {
+	dir := copyExample(t)
+	writeFile(t, dir, "skills/notes/odd\nname.md", "x\n")
+	if err := WriteIntegrityManifest(dir); err == nil || !strings.Contains(err.Error(), "line break") {
+		t.Errorf("WriteIntegrityManifest = %v, want the name refused", err)
 	}
 }

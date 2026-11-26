@@ -71,7 +71,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from contextvars import ContextVar
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import wraps
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
@@ -103,7 +103,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, ShellReadLimitError, _command_word_index, _holds_heredoc, _shell_argvs, _shell_argvs_and_unread, _shell_argvs_first_read, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -217,6 +217,23 @@ REPORT_STORE_ROOT = "/opt/data/fleet-audit/reports"
 # run that could not name its start (the key, null).
 _ENVELOPE_STARTED_KEY = "started_at"
 _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
+# The store's ring of earlier envelopes, beside `latest.json`
+# (audit_report.REPORT_RUNS_DIR); a planted previous run stays there after the
+# run under test has written its own `latest.json`, for as long as the ring,
+# which keeps the newest envelopes only, still holds it.
+_REPORT_RUNS_DIR = "runs"
+# The copy of the newest envelope, beside the ring (audit_report.REPORT_LATEST_NAME).
+_REPORT_LATEST_NAME = "latest.json"
+# Keys of the listing `report_store_command` prints for a `finding` block: the
+# selected findings, and how many envelopes hold the planted mark.
+_LISTED_FINDINGS_KEY = "findings"
+_LISTED_MARK_ENVELOPES_KEY = "mark_envelopes"
+# A literal IPv4 address or range, the thing a remediation command must not
+# carry where the SOP says the value is the owner's to give.
+_CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?(?![\d.])")
+_SHELL_COMMENT_PREFIX = "#"
+_SHELL_TRAILING_COMMENT = " #"
+_FLAG_PREFIX = "--"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
@@ -1065,6 +1082,11 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
         name = str(entry.get("name") or "")
         if not isinstance(result, str) or name.startswith(_KANBAN_TOOL_PREFIX):
             continue
+        # A card's report relayed onto the conversation (the inject door's
+        # `report` posts) is a worker's own words too, as a kanban result is.
+        args = entry.get("args")
+        if isinstance(args, dict) and args.get("report") is True:
+            continue
         if result == _WITHHELD_RESULT:
             withheld.append(f"a {name or 'tool'} result was withheld")
             continue
@@ -1750,6 +1772,8 @@ class AnswerFirstVerifier(BaseVerifier):
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
 _wrapped_tool_names = worker_trajectory.wrapped_tool_names
+# The wrapper's own top-level arguments, as Hermes reads them.
+_WRAPPER_OWN_ARGS = frozenset({"name", "arguments", "calls"})
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1898,7 +1922,11 @@ class ToolCalledVerifier(BaseVerifier):
     A name in ``tool_names`` therefore also matches a ``tool_call`` entry
     whose wrapped name or ``calls`` list names it, else a worker's MCP calls
     would be invisible to this check by name. One wrapper entry counts once
-    however many of its calls match; ``require_success`` reads the wrapper's status.
+    however many of its calls match; ``require_success`` reads the wrapper's status,
+    which the pod takes on the tool's answer inside Hermes' ``<untrusted_tool_result>``
+    envelope (``worker_trajectory``'s ``failed``). The pod reads a worker wrapper's
+    names before it clips the arguments and records them on the entry, so a wrapper
+    too long to parse is still counted by name.
 
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
@@ -2016,7 +2044,13 @@ class ToolCalledVerifier(BaseVerifier):
                 if re.fullmatch(pattern, str(args[name])) is None:
                     return False
                 continue
-            if not clipped:
+            # A wrapper the pod named (`wrapped`) is counted by name though its
+            # arguments were clipped. Its own arguments are the wrapped call's
+            # name and arguments, which this filter does not read through, so
+            # an argument that is not one of the wrapper's own rules the call
+            # out as it does for a wrapper that fits, and as it did before the
+            # pod named it. One of its own that the clip cut is undecided.
+            if not clipped or (worker_trajectory.WRAPPED_NAMES_KEY in entry and name not in _WRAPPER_OWN_ARGS):
                 return False
             undecided = True
         return None if undecided else True
@@ -2315,6 +2349,11 @@ _MAX_UNNAMED_IN_REASON = 5
 # candidates to shotgun the API with.
 _MAX_LEDGER_CANDIDATES = 8
 
+# How ``ledger_issue_contains`` searches its ``*_patterns``. The text is
+# lowercased before the search, so without this a capital in a pattern could
+# never match: an inert forbid, with nothing to say why.
+_LEDGER_PATTERN_FLAGS = re.IGNORECASE
+
 # A report that retired the ledger rather than filing on it, in the words the
 # harness and the audit's closing line use for that: `render_clean_comment`'s
 # "found **0 findings**" and "is now clean", and the roll-up a parent writes
@@ -2605,6 +2644,35 @@ _SHELL_READ_LIMIT_REASON = (
 )
 #: Beside a conclusive failure, what a "no worker command ran" part says when one line was not read.
 _UNREAD_COMMAND_NOTE = " (a command past the shell reader's limit was not read)"
+#: A worker command with a part that the shell reader refuses (quotes that do not balance, a
+#: redirect with no target, a substitution that does not close) has no argvs for that part and
+#: what follows it (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). The reader
+#: cannot tell if bash refuses the part too. When the part holds the words of a run that decides
+#: a check (:func:`_refused_part_can_hold`), the check cannot be evaluated: not a pass and not
+#: a fail.
+_SHELL_UNREAD_PART_REASON = (
+    "the shell reader refuses a part of worker command {shown!r} (quotes that do not balance, a "
+    "redirect with no target, or a substitution that does not close), and that part holds the "
+    "words of a run of {script}, so its runs cannot be read and this check could not be evaluated"
+)
+#: The shell's escape character, and a line continuation: bash removes the pair before it reads
+#: a word.
+_SHELL_QUOTING_ESCAPE = "\\"
+_SHELL_LINE_CONTINUATION = "\\\n"
+#: The characters a shell word loses when its quotes come off: the words of a part that was not
+#: read are looked for with these removed.
+_SHELL_QUOTING_CHARS_OFF = str.maketrans("", "", "'\"\\")
+#: What splits the text of a refused part into words: blanks, and the characters of the shell's
+#: operators and substitutions.
+_SHELL_BARE_WORD_SPLIT_RE = re.compile(r"[\s;&|()<>`]+")
+#: What joins the parts of one line that the reader refuses, for the search of a run's words.
+_SHELL_PARTS_JOIN = "\n"
+#: The interpreter flag that runs a module by its stem (``python3 -m <stem>``).
+_INTERPRETER_MODULE_FLAG = "-m"
+#: What parts a script's stem from its suffix.
+_SCRIPT_SUFFIX_SEPARATOR = "."
+#: The quotes that the pod's clip can leave open in a command that it cut, in the order tried.
+_CUT_COMMAND_QUOTES = ('"', "'")
 # The hermes tool a worker's shell command is recorded under, and its argument.
 _TERMINAL_TOOL = "terminal"
 #: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
@@ -2665,18 +2733,85 @@ class WorkerRun(BaseModel):
         return flags
 
 
-def _argvs_and_first_unread(lines: list[str]) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None]:
-    """The argvs of each line that the shell reader reads, and the first line that is past its
-    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None.
-    Each line is read by itself, so one unread line does not take the others' argvs."""
+def _argvs_and_first_unread(
+    lines: list[str], cut: frozenset[str] = frozenset(), programs: frozenset[str] = frozenset()
+) -> tuple[list[list[str]], tuple[str, ShellReadLimitError] | None, list[tuple[str, str]]]:
+    """The argvs of each line that the shell reader reads; the first line that is past its
+    limit (:class:`kube_agents_bench.shell_words.ShellReadLimitError`) with that error, or None;
+    and each line with parts that the reader refuses, with those parts
+    (:func:`kube_agents_bench.shell_words._shell_argvs_and_unread`). Each line is read by
+    itself, so one unread line does not take the others' argvs.
+
+    A line of ``cut`` is a command that the pod's clip cut (:func:`_cut_command_texts`). It is
+    read as if the quote that the cut left open closed at the cut (:func:`_cut_command_read`).
+    What the clip removed is not in the text, and this verifier does not report it: the cut
+    tail of a clipped command is a limit of the capture. So a forbidden run in the cut tail
+    still passes, while ``tool_called`` with an ``arguments`` pattern on the cut argument gives
+    ``error`` for the same call.
+
+    A line of ``programs``, the text of an ``execute_code`` program (:func:`_program_texts`),
+    is not a shell call. It is read as shell lines with the reader's first read alone, as
+    before the second read, and it is not in the third value."""
     argvs: list[list[str]] = []
     first_unread = None
+    refused: list[tuple[str, str]] = []
     for line in lines:
         try:
-            argvs.extend(_shell_argvs(line))
+            line_argvs, parts = (_shell_argvs_first_read(line), []) if line in programs else _shell_argvs_and_unread(line)
+            if parts and line in cut:
+                line_argvs, parts = _cut_command_read(line, line_argvs, parts)
         except ShellReadLimitError as limit:
             first_unread = first_unread or (line, limit)
-    return argvs, first_unread
+            continue
+        argvs.extend(line_argvs)
+        if parts:
+            refused.append((line, _SHELL_PARTS_JOIN.join(parts)))
+    return argvs, first_unread, refused
+
+
+def _cut_command_read(line: str, argvs: list[list[str]], parts: list[str]) -> tuple[list[list[str]], list[str]]:
+    """The argvs and the refused parts of a command that the pod's clip cut, of which the reader
+    gave ``argvs`` and refused ``parts``. The clip often falls inside a quoted value, so the
+    command is read again as if that quote closed at the cut, as the write attribution reads it
+    (:func:`kube_agents_bench.github_writes.writing_segments`): the first closing quote that
+    gives an argv more, or leaves fewer refused parts, gives the result. A part that is still
+    refused is text that the capture holds, so it follows the rule of each refused part
+    (:func:`_refused_part_can_hold`), also when the cut is its cause: a cut inside a
+    substitution, or inside two quotes."""
+    for quote in _CUT_COMMAND_QUOTES:
+        # A trailing backslash would escape the quote that closes the value.
+        closed_argvs, closed_parts = _shell_argvs_and_unread(line.rstrip(_SHELL_QUOTING_ESCAPE) + quote)
+        added = [argv for argv in closed_argvs if argv not in argvs]
+        if added or len(closed_parts) < len(parts):
+            return argvs + added, closed_parts
+    return argvs, parts
+
+
+def _refused_part_can_hold(part: str, run: WorkerRun) -> bool:
+    """Whether a part that the reader refuses can hold ``run``. A run is an argv with the script
+    as a word (by its basename, or its module stem after ``-m``), each flag as a word, and for
+    each word pattern a word that matches it. So the part can hold the run only when its text,
+    with the line continuations and the quoting characters off, has all of those words. The
+    limit of this test: a run that reaches the script by another spelling (through a variable,
+    or with a word that holds a blank or an operator character inside quotes) is not found,
+    and the check is graded on what was read."""
+    bare = part.replace(_SHELL_LINE_CONTINUATION, "").translate(_SHELL_QUOTING_CHARS_OFF)
+    words = [word for word in _SHELL_BARE_WORD_SPLIT_RE.split(bare) if word]
+    stem = run.script.rsplit(_SCRIPT_SUFFIX_SEPARATOR, 1)[0]
+    named = any(os.path.basename(word) == run.script for word in words) or any(
+        flag == _INTERPRETER_MODULE_FLAG and module == stem for flag, module in zip(words, words[1:])
+    )
+    return named and _words_after_carry(words, run)
+
+
+def _refused_part_naming(refused: list[tuple[str, str]], runs: list[WorkerRun]) -> tuple[str, str] | None:
+    """The first line of ``refused`` whose refused parts can hold one of ``runs``
+    (:func:`_refused_part_can_hold`), with that run's script, or None."""
+    for line, part in refused:
+        for run in runs:
+            if _refused_part_can_hold(part, run):
+                return line, run.script
+    return None
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2810,6 +2945,30 @@ def _clipped_cards(trajectory: list[Any]) -> set[str]:
         and isinstance(entry.get("args"), dict)
         and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
     }
+
+
+def _program_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged ``execute_code`` program, as :func:`_code_call_text` reads it."""
+    texts = (_code_call_text(entry) for entry in trajectory if isinstance(entry, dict) and entry.get("agent") and entry.get("name") != _TERMINAL_TOOL)
+    return frozenset(text for text in texts if text is not None)
+
+
+def _cut_command_texts(trajectory: list[Any]) -> frozenset[str]:
+    """The text of each tagged code-tool call whose command the pod's clip cut: the head that
+    :func:`_code_call_text` reads when the clipped arguments hold no whole command."""
+    cut: set[str] = set()
+    for entry in trajectory:
+        if not (isinstance(entry, dict) and entry.get("agent") and entry.get("name") in _CODE_TOOLS):
+            continue
+        args = entry.get("args")
+        if not (isinstance(args, dict) and set(args) == {_CLIPPED_ARGS_KEY} and isinstance(args[_CLIPPED_ARGS_KEY], str)):
+            continue
+        if _clipped_string_args(args[_CLIPPED_ARGS_KEY], {_COMMAND_ARG: "", _CODE_ARG: ""}):
+            continue
+        command = _code_call_text(entry)
+        if command is not None:
+            cut.add(command)
+    return frozenset(cut)
 
 
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
@@ -2969,7 +3128,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     row of such a call is read, and so is each row of a capture whose rows
     name no card. A result that only quotes the refusal words matches too.
 
-    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    ``after_result_pattern`` makes the forbidden patterns order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
     refused one, and a pattern over write verbs alone flags the honest attempt
     that met the refusal. The commands then come from the workers' tagged
@@ -3005,9 +3164,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     closes the chain gap, and the split stays. ``required_runs``
     reads each flag as the exact word, so a script a case names this way is
     built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
-    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
-    (an unclosed quote) yields no words, so no run is credited from it
-    (``forbidden_patterns`` read the text and still match it); and no shell
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a command that the
+    reader refuses (an unclosed quote) has no argv, so no run is credited from
+    it or from the commands after it, while the commands before it are read
+    (the last paragraph has the error rule; ``forbidden_patterns`` read the
+    text and still match it); and no shell
     expansion is resolved, so a run spelled through a variable that holds the
     whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
     command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
@@ -3062,6 +3223,23 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``status="error"`` when a line of the commands was not read, and a clean read of the
     forbidden runs is when a typed line was not read. A check with patterns alone reads no
     argv and is graded as before the limit.
+
+    A call is read a command at a time, as bash reads it
+    (:func:`kube_agents_bench.shell_words._shell_argvs`): a quote in a heredoc body opens
+    nothing (a body line that reads as a command is still an argv), and the commands before
+    one that the reader refuses (quotes that do not balance, a redirect with no target, a
+    substitution that does not close) are read. The refused command and what follows it have
+    no argvs, and the reader cannot tell if bash refuses that part too. So the part follows
+    the rule above for the runs that it can hold (:func:`_refused_part_can_hold`): a required
+    run that is still missing, or a clean read of the forbidden runs, is ``status="error"``
+    when the part has the run's words, which are the script as a word, each flag, and a word
+    for each word pattern. A refused part that reaches the script by another spelling is not
+    found, and the check is graded on what was read. A command that the pod clipped is read as
+    if the quote that the cut left open closed at the cut. What the clip removed is not
+    reported: a forbidden run in the cut tail still passes, while ``tool_called`` with an
+    ``arguments`` pattern on the cut argument gives ``error`` for the same call. An
+    ``execute_code`` program is not a shell call: it is read as shell lines with the reader's
+    first read alone, as before.
     """
 
     type: Literal["worker_commands"]
@@ -3352,9 +3530,11 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         # The argvs serve the runs only: the commands' for the required runs, the typed calls'
         # for the forbidden runs. A check with patterns alone reads none. Each line is read by
-        # itself; a line past the reader's limit has no argvs.
-        argvs, unread = _argvs_and_first_unread(commands if self.required_runs else [])
-        typed_argvs, typed_unread = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [])
+        # itself; a line past the reader's limit has no argvs, and a part that the reader
+        # refuses has none either.
+        cut, programs = _cut_command_texts(snap.trajectory), _program_texts(snap.trajectory)
+        argvs, unread, refused = _argvs_and_first_unread(commands if self.required_runs else [], cut, programs)
+        typed_argvs, typed_unread, typed_refused = _argvs_and_first_unread((typed if run_commands is None else run_commands) if self.forbidden_runs else [], cut, programs)
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
@@ -3374,6 +3554,20 @@ class WorkerCommandsVerifier(BaseVerifier):
                 status="error",
                 elapsed_time=time.monotonic() - start,
                 reason=_SHELL_READ_LIMIT_REASON.format(shown=past_limit[0][:_SHOWN_COMMAND_CHARS], limit=past_limit[1]),
+            )
+        # A part that the reader refuses follows the same rule, for the runs that it can hold:
+        # a required run that is still missing, when a refused part of the commands has its
+        # words; a clean read of the forbidden runs, when a refused part of a typed line has
+        # the words of one of them.
+        not_read = None
+        if not (hits or ran or missing):
+            not_read = _refused_part_naming(refused, unrun) if unrun else _refused_part_naming(typed_refused, self.forbidden_runs)
+        if not_read is not None and not partial:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_SHELL_UNREAD_PART_REASON.format(shown=not_read[0][:_SHOWN_COMMAND_CHARS], script=not_read[1]),
             )
         if hits or ran or ((missing or unrun) and not partial):
             parts = []
@@ -3664,11 +3858,14 @@ class WorkerBudgetVerifier(BaseVerifier):
     and no completed attempt either (the harness archived the card at its
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
-    A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a capture in which every result was
-    withheld or never recorded is unreadable, and with nothing named it is
-    ``status="error"`` too, while a single missing result among readable ones
-    does not turn a plain failure into one.
+    A notice in the part of a result that the capture's clip dropped is not
+    read: the clip keeps a result's head and its last
+    ``worker_trajectory.RESULT_TAIL_CHARS`` characters, where an appended
+    notice is, and a card of short tool outputs never reaches the clip; a
+    capture in which every result was withheld or never recorded is
+    unreadable, and with nothing named it is ``status="error"`` too, while a
+    single missing result among readable ones does not turn a plain failure
+    into one.
     """
 
     type: Literal["worker_budget"]
@@ -5049,6 +5246,21 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
+    # The regex forms, for a claim no one substring binds: a findings row is
+    # ``| [`<id>`](#user-content-finding-<id>) | <severity> | `<cluster>` | <state> |``
+    # and the id carries the project and location between the check slug and
+    # the cluster name, so only a pattern ties a check, a cluster and a
+    # severity to one row (through the id in the anchor, which the severity
+    # cell follows). Each is ``re.search``ed, as ``report_contains`` does, over
+    # the text the phrases are read from under the same ``scope``, lowercased
+    # and matched without regard to case, as the phrases are. The line breaks
+    # are kept, so a `.` stays on one table row, or on one id under
+    # ``finding_ids``; a body's hidden id block holds every id on ONE line, so
+    # a body pattern bounds its gaps with a class and not `.*`. Every required
+    # pattern must match; no forbidden pattern may. No ``{cluster:<slot>}`` is
+    # expanded here; one is refused at load.
+    required_patterns: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids", "finding"] = "body"
     # The check whose findings ``scope: finding`` reads: the first segment of
     # the finding id, ``no-memory-limit`` in
@@ -5072,6 +5284,25 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         raw = self.finding_check
         names = [raw] if isinstance(raw, str) else list(raw or [])
         return [n.strip() for n in names if n and n.strip()]
+
+    @field_validator("required_patterns", "forbidden_patterns")
+    @classmethod
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            # Not expanded by this check: it would compile as literal text and
+            # never match, an inert forbid or a miss on every run.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a cluster placeholder, which only report_contains "
+                    "expands; here it is literal text that never matches"
+                )
+            try:
+                re.compile(pattern, _LEDGER_PATTERN_FLAGS)
+            except re.error as exc:
+                # The same type ``report_contains`` raises for a pattern that
+                # does not compile, with the pattern named.
+                raise re.error(f"pattern {pattern!r} does not compile: {exc}") from exc
+        return patterns
 
     @model_validator(mode="after")
     def _finding_scope_names_its_check(self) -> "LedgerIssueContainsVerifier":
@@ -5389,6 +5620,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 return (
                     sum(1 for p in self.required_phrases if p.lower() not in block)
                     + sum(1 for p in self.forbidden_phrases if p.lower() in block)
+                    + sum(1 for p in self.required_patterns if not re.search(p, block, _LEDGER_PATTERN_FLAGS))
+                    + sum(1 for p in self.forbidden_patterns if re.search(p, block, _LEDGER_PATTERN_FLAGS))
                     + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
                 )
 
@@ -5441,13 +5674,15 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         any_of_miss = bool(self.any_of_phrases) and not any(
             p.lower() in text for p in self.any_of_phrases
         )
+        pattern_missing = [p for p in self.required_patterns if not re.search(p, text, _LEDGER_PATTERN_FLAGS)]
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, text, _LEDGER_PATTERN_FLAGS)]
         raw = {
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
             "finding_check": self.finding_check,
         }
-        if missing or present or any_of_miss or unnamed or omitted_unlisted:
+        if missing or present or any_of_miss or pattern_missing or pattern_hits or unnamed or omitted_unlisted:
             parts = []
             if omitted_unlisted:
                 parts.append(
@@ -5470,6 +5705,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     f"none of the alternative phrasings present in {surface}: "
                     f"{self.any_of_phrases}"
                 )
+            if pattern_missing:
+                parts.append(f"required patterns absent from {surface}: {pattern_missing}")
+            if pattern_hits:
+                parts.append(f"forbidden patterns matched in {surface}: {pattern_hits}")
             return done(False, "; ".join(parts), raw=raw)
         # Names every clause that ran, for the reason ReportContainsVerifier's
         # success branch does: an any_of-only check that reported "all 0
@@ -5482,6 +5721,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.required_patterns:
+            satisfied.append(f"all {len(self.required_patterns)} required pattern(s)")
+        if self.forbidden_patterns:
+            satisfied.append(f"none of {len(self.forbidden_patterns)} forbidden pattern(s)")
         if self.every_finding_named:
             satisfied.append("a visible name for every filed finding")
         return done(
@@ -8771,7 +9014,8 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
+        "ingress-gateway-healthcheck-mismatch", "network-daemonset-missing-ccc-toleration",
+        "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
@@ -9722,7 +9966,9 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool = False) -> str:
+def report_store_command(
+    audit: str, keys: tuple[str, ...] = (), excerpts: bool = False, fragments: tuple[str, ...] = (), mark: str = ""
+) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
@@ -9732,7 +9978,13 @@ def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool 
     and the ids of the findings in its ``document`` (this run's own, never ids it
     only carried), or the ``error`` that kept it unread. With ``excerpts``, also
     each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
-    which ``finish`` takes from the collector. The rest stays in the pod.
+    which ``finish`` takes from the collector. With ``fragments``, also
+    the ``title``, ``recommendation`` and ``remediation`` of each finding whose id contains
+    every fragment (``findings``); with ``mark``, how many envelopes of that
+    directory, ``latest.json`` and the ring, hold it (``mark_envelopes``). A
+    directory with a ring and no ``latest.json`` gives an entry with that count
+    alone: ``finish`` drops ``latest.json`` before it writes the ledger, and a
+    run that stops there has not lost the plant. The rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9752,12 +10004,56 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
                 str(f.get("id", "")): str((f.get("evidence") or {{}}).get("excerpt") or "")
                 for f in findings if isinstance(f, dict)
             }}
+        if {fragments!r}:
+            entry[{_LISTED_FINDINGS_KEY!r}] = [
+                {{"id": str(f.get("id", "")), "title": str(f.get("title", "")), "recommendation": f.get("recommendation"), "remediation": f.get("remediation")}}
+                for f in findings
+                if isinstance(f, dict) and all(part in str(f.get("id", "")) for part in {fragments!r})
+            ]
+        if {mark!r}:
+            ring = glob.glob(os.path.join(os.path.dirname(path), {_REPORT_RUNS_DIR!r}, "*.json"))
+            held = 0
+            for stored in [path, *ring]:
+                with open(stored, encoding="utf-8") as handle:
+                    held += {mark!r} in handle.read()
+            entry[{_LISTED_MARK_ENVELOPES_KEY!r}] = held
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
+if {mark!r}:
+    for runs in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*", "*", {_REPORT_RUNS_DIR!r}))):
+        if os.path.exists(os.path.join(os.path.dirname(runs), {_REPORT_LATEST_NAME!r})):
+            continue
+        try:
+            held = 0
+            for stored in glob.glob(os.path.join(runs, "*.json")):
+                with open(stored, encoding="utf-8") as handle:
+                    held += {mark!r} in handle.read()
+            out.append({{"path": runs, {_LISTED_MARK_ENVELOPES_KEY!r}: held}})
+        except Exception as exc:
+            out.append({{"path": runs, "error": str(exc)}})
 print({_REPORT_STORE_READ!r} + json.dumps(out))
 """
     return f"python3 -c {shlex.quote(script)}"
+
+
+def read_state_file(shell: Callable[[str, float], str], path: str, timeout: float) -> dict[str, Any] | None:
+    """The JSON object a stack recorded at ``path`` in the pod ``shell`` reaches, or None when there is none."""
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def fired_at_of(state: dict[str, Any] | None) -> datetime | None:
+    """A stack state's ``fired_at``, or None when it has none that is an aware ISO-8601 stamp."""
+    try:
+        fired = datetime.fromisoformat(str((state or {})["fired_at"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    return fired if fired.tzinfo is not None else None
 
 
 def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
@@ -9766,22 +10062,20 @@ def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float)
     Missing file, not JSON, no ``fired_at``, or one that is not an aware
     ISO-8601 stamp all read as None: the stack did not fire the run.
     """
-    reply = shell(f"cat {shlex.quote(path)}", timeout)
-    try:
-        state = json.loads(reply.strip().splitlines()[-1])
-        fired = datetime.fromisoformat(str(state["fired_at"]))
-    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if fired.tzinfo is None:
-        return None
-    return fired
+    return fired_at_of(read_state_file(shell, path, timeout))
 
 
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = (), excerpts: bool = False
+    shell: Callable[[str, float], str],
+    audit: str,
+    timeout: float,
+    keys: tuple[str, ...] = (),
+    excerpts: bool = False,
+    fragments: tuple[str, ...] = (),
+    mark: str = "",
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit, keys, excerpts), timeout)
+    reply = shell(report_store_command(audit, keys, excerpts, fragments, mark), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -9792,61 +10086,219 @@ def read_report_store(
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
 
 
-@VERIFIERS.register("audit_report_stored")
-class AuditReportStoredVerifier(_OnboardingPollVerifier):
-    """Checks that a fleet audit kept this run's report in the on-pod report store.
+def _string_values(value: Any) -> Iterator[str]:
+    """Each string in ``value``, a JSON value: the values of its objects, the items of its lists."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
 
-    Reads ``latest.json`` under every repository directory of ``audit`` in the
-    store, in the shell sandbox first and then in the agent container: the
-    store is on whichever pod ran the audit's shell. Passes when one envelope
-    finished at or after the run started (``TranscriptSnapshot.started_at``
-    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
-    ``fired_at`` a case's stack recorded in that file in the agent container,
-    for a scheduled run the stack fired and waited out before the turn), and,
-    when it records its run's start (``started_at``), whose run opened at or
-    after that same bound -- a run from an earlier repetition can finish inside
-    this one; an envelope with the key and no start is such a run, and one
-    from an older image, with no key, is read by ``finished_at`` alone -- has
-    ``status`` when the check names one, has
-    each ``required_envelope`` key equal to the value given (a top-level key of
-    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
-    and fails), has, for each ``required_finding_phrases`` entry, a finding
-    in its ``document`` whose id contains it, and has no finding whose id
-    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
-    that plants a look-alike the check must leave alone), and, for each
-    ``required_evidence_phrases`` entry, a finding whose id contains a
-    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
-    it: what the collector observed and ``finish`` published, read where it was
-    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
-    also carries ids a run held without finding them.
 
-    No envelope from this run is a fail: the audit published nothing where the
-    store's readers look. A pod that cannot be read, or a run with no start
-    time, is ``status="error"``.
+def remediation_commands(note: str, prefix: str) -> list[list[str]]:
+    """The arguments of each command line in ``note`` that opens with ``prefix``.
+
+    Read as a shell reads the note: comment lines and trailing comments are
+    not commands, a backslash joins a line to the next, and the words of
+    ``prefix`` must be the line's first words (an empty ``prefix`` is every
+    command line). A line a shell could not split (an apostrophe in a
+    placeholder) is split on spaces instead.
+    """
+    want = prefix.split()
+    found = []
+    for line in note.replace(_SHELL_LINE_CONTINUATION, " ").splitlines():
+        # Cut the trailing comment before any split: an apostrophe on each
+        # side of the `#` would otherwise quote it into the command.
+        line = line.strip().split(_SHELL_TRAILING_COMMENT, 1)[0]
+        if not line or line.startswith(_SHELL_COMMENT_PREFIX):
+            continue
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            argv = line.split()
+        if argv[: len(want)] == want:
+            found.append(argv[len(want):])
+    return found
+
+
+def flag_values(argv: list[str], flag: str) -> list[str] | None:
+    """Each value ``flag`` takes in ``argv`` (``""`` for a bare flag), or None when it is absent.
+
+    The flag is matched whole: ``--enable-x`` is not ``--enable-x-on-y``.
+    """
+    values = []
+    for index, word in enumerate(argv):
+        if word == flag:
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            values.append("" if following.startswith(_FLAG_PREFIX) else following)
+        elif word.startswith(f"{flag}="):
+            values.append(word[len(flag) + 1:])
+    return values or None
+
+
+class StoredFindingCheck(BaseModel):
+    """One assertion over one finding of the stored document, read as data.
+
+    The finding is the one whose id contains every ``id_contains`` fragment.
+    ``remediation_kind`` is its ``remediation.kind``. The command fields read
+    ``remediation.note`` as commands (:func:`remediation_commands`): some line
+    opening with ``command_prefix`` must carry ``command_argument`` as a whole
+    word and every flag of ``command_flags``; no command line of the note,
+    whatever it opens with, may give a flag of ``no_cidr_value`` a literal
+    IPv4 address or range. ``forbidden_text`` must not occur
+    in the finding's ``recommendation`` or ``remediation``. ``title_contains``
+    must each occur in its ``title``: the witness that ``finish`` kept a
+    planted run's wording for this finding. ``title_lacks`` must each be
+    absent from it: the title holds nothing of a planted run's wording (the
+    impact, which ``finish`` keeps with the title, is not read). ``planted_mark`` is
+    the mark of a previous run the case's stack planted: when no envelope of
+    the store holds it, the plant is gone and the check is an error, not a pass.
     """
 
-    type: Literal["audit_report_stored"]
-    audit: AuditId
+    model_config = ConfigDict(extra="forbid")
+
+    id_contains: list[str] = Field(min_length=1)
+    remediation_kind: str | None = None
+    command_prefix: str | None = None
+    command_argument: str | None = None
+    command_flags: list[str] = Field(default_factory=list)
+    no_cidr_value: list[str] = Field(default_factory=list)
+    forbidden_text: list[str] = Field(default_factory=list)
+    title_contains: list[str] = Field(default_factory=list)
+    title_lacks: list[str] = Field(default_factory=list)
+    planted_mark: str | None = None
+
+    @model_validator(mode="after")
+    def _command_fields_need_a_prefix(self) -> "StoredFindingCheck":
+        reads_commands = bool(self.command_argument or self.command_flags or self.no_cidr_value)
+        if reads_commands and not self.command_prefix:
+            raise ValueError("command_argument, command_flags and no_cidr_value read the lines command_prefix names")
+        if self.command_prefix and not reads_commands:
+            raise ValueError("command_prefix alone asserts nothing: give command_argument, command_flags or no_cidr_value")
+        return self
+
+    def problems(self, finding: dict[str, Any]) -> list[str]:
+        """What this finding lacks, as reasons; empty when it passes."""
+        remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+        found = []
+        if self.remediation_kind is not None and remediation.get("kind") != self.remediation_kind:
+            found.append(f"remediation.kind is {remediation.get('kind')!r}, not {self.remediation_kind!r}")
+        if self.command_prefix:
+            lines = remediation_commands(str(remediation.get("note") or ""), self.command_prefix)
+            # A note with no such line gives no flag a literal range: that is
+            # the command check's red, never the range check's.
+            if not lines and (self.command_argument or self.command_flags):
+                found.append(f"remediation.note has no command line opening with {self.command_prefix!r}")
+            elif self.command_argument or self.command_flags:
+                complete = [
+                    argv
+                    for argv in lines
+                    if (not self.command_argument or self.command_argument in argv)
+                    and all(flag_values(argv, flag) is not None for flag in self.command_flags)
+                ]
+                if not complete:
+                    found.append(
+                        f"no {self.command_prefix!r} line names {self.command_argument!r} with every flag of {self.command_flags}"
+                    )
+            # Every command line, not only the prefixed ones: a second line
+            # in another spelling (`gcloud beta ...`) is still a command the
+            # reader is told to run.
+            every_line = remediation_commands(str(remediation.get("note") or ""), "")
+            for flag in self.no_cidr_value:
+                literal = [
+                    value for argv in every_line for value in flag_values(argv, flag) or [] if _CIDR_LITERAL_RE.search(value)
+                ]
+                if literal:
+                    found.append(f"{flag} is given a literal address or range: {literal}")
+        # The values, not a JSON dump of them: a dump escapes a quote, a line
+        # break and a letter outside ASCII, and it holds the key names too.
+        texts = list(_string_values([finding.get("recommendation"), finding.get("remediation")]))
+        held = [word for word in self.forbidden_text if any(word in text for text in texts)]
+        if held:
+            found.append(f"its recommendation or remediation holds {held}")
+        title = str(finding.get("title") or "")
+        missing = [word for word in self.title_contains if word not in title]
+        if missing:
+            found.append(f"its title does not hold {missing}")
+        kept = [word for word in self.title_lacks if word in title]
+        if kept:
+            found.append(f"its title holds {kept}")
+        return found
+
+
+class _StoredReportVerifier(_OnboardingPollVerifier):
+    """What ``audit_report_stored`` and ``shadow_report_stored`` share: one stream's store read and its grading.
+
+    A subclass names the stream (``_stream``), the pods whose report store it
+    reads (``_store_shells``, with ``_store_where`` naming them for a reason),
+    the pod holding ``since_state_file`` (``_state_shell``), and any envelope
+    keys it holds every envelope to beyond ``required_envelope``
+    (``_forced_envelope``). The window, the start bound and the finding and
+    evidence rules are the same for both; :class:`AuditReportStoredVerifier`
+    documents them.
+    """
+
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
     forbidden_finding_phrases: list[str] = Field(default_factory=list)
     required_evidence_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
-    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
-    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
+    # A JSON file whose ``fired_at`` (ISO-8601, as the audit-chat-report,
+    # unchanged-manifest-digest and builtin-schedule-run-now stacks write it)
     # replaces the run's start as the lower bound, with no skew allowance: the
-    # fire and the envelope are stamped by the same pod. Unreadable is an error.
+    # fire and the envelope are stamped by the same install. Unreadable is an error.
     since_state_file: str | None = None
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
 
     @model_validator(mode="after")
-    def _evidence_names_its_findings(self) -> "AuditReportStoredVerifier":
+    def _evidence_names_its_findings(self) -> "_StoredReportVerifier":
         if self.required_evidence_phrases and not self.required_finding_phrases:
             raise ValueError("required_evidence_phrases needs required_finding_phrases to say which findings' evidence to read")
         return self
+
+    def _stream(self) -> str:
+        raise NotImplementedError
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        raise NotImplementedError
+
+    def _store_where(self) -> str:
+        raise NotImplementedError
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        raise NotImplementedError
+
+    def _forced_envelope(self) -> dict[str, Any]:
+        return {}
+
+    def _store_problem(self, envelopes: list[dict[str, Any]]) -> str:
+        """Why the store as it was read cannot be graded at all, or "": an error, not a fail."""
+        return ""
+
+    def _envelope_problem(self, envelope: dict[str, Any]) -> str:
+        """What a fresh envelope that passed every rule above still lacks, or ""."""
+        return ""
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """One pod's envelopes of ``stream``, or None and why not: the store tree, read directly.
+
+        ``state`` is the stack's state file, read once for the poll (None without one).
+        """
+        return read_report_store(shell, stream, timeout, keys, excerpts), None
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()
@@ -9857,23 +10309,35 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
             seconds=self.max_clock_skew_sec
         )
+        state = None
         if self.since_state_file:
-            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
+            # Read once per poll; _read_listing gets the same object.
+            state = read_state_file(self._state_shell(), self.since_state_file, read_timeout)
+            fired = fired_at_of(state)
             if fired is None:
                 return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
-            # No skew: the fire and the envelope are stamped by the same pod.
+            # No skew: the fire and the envelope are stamped by the same install.
             since = fired
+        stream = self._stream()
+        expected = {**self.required_envelope, **self._forced_envelope()}
         envelopes: list[dict[str, Any]] = []
         read_any = False
-        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(
-                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
+        unread: list[str] = []
+        for shell in self._store_shells():
+            listing, why = self._read_listing(
+                shell, stream, read_timeout, tuple(expected), bool(self.required_evidence_phrases), state
             )
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
+            elif why:
+                unread.append(why)
         if not read_any:
-            return "error", "neither the sandbox nor the agent container could be read", None
+            detail = f": {'; '.join(unread)}" if unread else ""
+            return "error", f"{self._store_where()} could not be read{detail}", None
+        store_problem = self._store_problem(envelopes)
+        if store_problem:
+            return "error", store_problem, None
         fresh = []
         started_early = 0
         for envelope in envelopes:
@@ -9904,7 +10368,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                     started_early += 1
                     continue
             fresh.append(envelope)
-        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *self.required_envelope)
+        shown = ("repo", "status", "finished_at", _ENVELOPE_STARTED_KEY, *expected)
         raw = {"stored": [{k: e.get(k) for k in shown if k in e or k != _ENVELOPE_STARTED_KEY} for e in envelopes]}
         if not fresh:
             window = "the stack fired the audit" if self.since_state_file else "the run started"
@@ -9913,10 +10377,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 if started_early
                 else ""
             )
+            errors = [str(e["error"]) for e in envelopes if e.get("error")]
+            said = f"; unread: {'; '.join(errors)}" if errors else ""
             return (
                 "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since {window} "
-                f"({len(envelopes) - started_early} older or unreadable{early})",
+                f"no {stream} report in {REPORT_STORE_ROOT} finished since {window} "
+                f"({len(envelopes) - started_early} older or unreadable{early}){said}",
                 raw,
             )
         failures = []
@@ -9927,13 +10393,13 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
             excerpts = envelope.get("finding_excerpts") or {}
             matched = [str(excerpts.get(fid) or "") for fid in ids if any(r in fid for r in self.required_finding_phrases)]
             unevidenced = [p for p in self.required_evidence_phrases if not any(p in text for text in matched)]
-            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
+            wrong = {key: envelope.get(key) for key, value in expected.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
             elif wrong:
                 failures.append(
                     f"{envelope.get('repo')}: "
-                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
+                    + ", ".join(f"{key} is {actual!r}, not {expected[key]!r}" for key, actual in wrong.items())
                 )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
@@ -9941,6 +10407,99 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
             elif unevidenced:
                 failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
+            elif lacking := self._envelope_problem(envelope):
+                failures.append(f"{envelope.get('repo')}: {lacking}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw
+
+
+@VERIFIERS.register("audit_report_stored")
+class AuditReportStoredVerifier(_StoredReportVerifier):
+    """Checks that a fleet audit kept this run's report in the on-pod report store.
+
+    Reads ``latest.json`` under every repository directory of ``audit`` in the
+    store, in the shell sandbox first and then in the agent container: the
+    store is on whichever pod ran the audit's shell. Passes when one envelope
+    finished at or after the run started (``TranscriptSnapshot.started_at``
+    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
+    ``fired_at`` a case's stack recorded in that file in the agent container,
+    for a scheduled run the stack fired and waited out before the turn), and,
+    when it records its run's start (``started_at``), whose run opened at or
+    after that same bound -- a run from an earlier repetition can finish inside
+    this one; an envelope with the key and no start is such a run, and one
+    from an older image, with no key, is read by ``finished_at`` alone -- has
+    ``status`` when the check names one, has
+    each ``required_envelope`` key equal to the value given (a top-level key of
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``,
+    which fails any other value and meets a required ``null``), has, for each
+    ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it, and has no finding whose id
+    contains a ``forbidden_finding_phrases`` entry (the silent half of a case
+    that plants a look-alike the check must leave alone), and, for each
+    ``required_evidence_phrases`` entry, a finding whose id contains a
+    ``required_finding_phrases`` entry and whose ``evidence.excerpt`` contains
+    it: what the collector observed and ``finish`` published, read where it was
+    stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
+    also carries ids a run held without finding them.
+    ``finding`` reads one finding's title, recommendation and remediation as data
+    (:class:`StoredFindingCheck`).
+
+    No envelope from this run is a fail: the audit published nothing where the
+    store's readers look. A pod that cannot be read, or a run with no start
+    time, is ``status="error"``.
+    """
+
+    type: Literal["audit_report_stored"]
+    audit: AuditId
+    finding: StoredFindingCheck | None = None
+
+    def _stream(self) -> str:
+        return self.audit
+
+    def _store_shells(self) -> tuple[Callable[[str, float], str], ...]:
+        # Looked up on each read, so a test's swap of either shell is seen.
+        return (onboarding.sandbox_shell, onboarding.agent_shell)
+
+    def _store_where(self) -> str:
+        return "the sandbox and the agent container"
+
+    def _state_shell(self) -> Callable[[str, float], str]:
+        return onboarding.agent_shell
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        # With a `finding` block the listing also carries the selected finding
+        # and the count of the envelopes that hold the planted mark.
+        if not self.finding:
+            return super()._read_listing(shell, stream, timeout, keys, excerpts, state)
+        listing = read_report_store(
+            shell, stream, timeout, keys, excerpts, tuple(self.finding.id_contains), self.finding.planted_mark or ""
+        )
+        return listing, None
+
+    def _store_problem(self, envelopes: list[dict[str, Any]]) -> str:
+        if self.finding and self.finding.planted_mark and not any(e.get(_LISTED_MARK_ENVELOPES_KEY) for e in envelopes):
+            return (
+                f"no stored {self.audit} envelope holds {self.finding.planted_mark!r}: the previous run the "
+                "stack planted is gone, so this run was not measured against it"
+            )
+        return ""
+
+    def _envelope_problem(self, envelope: dict[str, Any]) -> str:
+        if not self.finding:
+            return ""
+        if not envelope.get(_LISTED_FINDINGS_KEY):
+            return f"no finding in its document has an id containing every one of {self.finding.id_contains}"
+        return " | ".join(
+            f"{finding.get('id')}: {'; '.join(problems)}"
+            for finding in envelope[_LISTED_FINDINGS_KEY]
+            if (problems := self.finding.problems(finding))
+        )

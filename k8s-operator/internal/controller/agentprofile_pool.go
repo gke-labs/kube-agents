@@ -134,11 +134,15 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
 		// The install's inference gateway, by its full name: the worker runs
 		// in the profile namespace, where the session worker's short default
-		// doesn't resolve. The gateway runs keyless. Do not set
+		// doesn't resolve. Set whether or not the worker sends its tier's
+		// key: worker-adapter's default base URL applies only while
+		// ANTHROPIC_API_KEY is unset too (harnessEnv), and the key is added
+		// by the reconcile step, once the gateway serves it
+		// (withInferenceKeyEnv), as a Secret reference. Never set a literal
 		// ANTHROPIC_API_KEY here: the AI workload audit flags a literal model
 		// key in a pod spec (check 3.5, model-credential-plaintext-env), also
 		// a placeholder. worker-adapter adds the placeholder to the harness
-		// env (harnessEnv).
+		// env while the pod sets none.
 		{Name: "ANTHROPIC_BASE_URL", Value: fmt.Sprintf("http://%s.%s.svc.cluster.local", inferenceGatewayServiceName, agent.Namespace)},
 		{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL(agent)},
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
@@ -244,7 +248,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		Containers: []corev1.Container{{
 			Name:         profileWorkerContainer,
 			Image:        profile.Spec.Harness.Image,
-			Env:          env,
+			Env:          withToolWithheldList(env),
 			VolumeMounts: mounts,
 			Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: profileWorkerStatusPort}},
 			// Ready only once the worker is listening on its dispatch
@@ -398,6 +402,7 @@ func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]st
 // pass (before publishing Job templates), so it isn't copied again.
 func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, bundleCopied, keepBundle bool) error {
 	imageVolumes := r.imageVolumeSupported(agent)
+	callers := inferenceKeyCallersFrom(ctx)
 	var pools []*appsv1.Deployment
 	var errs []error
 	want := map[string]bool{}
@@ -411,6 +416,10 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 				continue
 			}
 			pool := buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes)
+			// The tier's inference gateway key, once the gateway serves it
+			// (inference_key_callers.go), from its Secret in the profile
+			// namespace, where the pool runs.
+			withInferenceKeyEnv(&pool.Spec.Template.Spec, profileWorkerContainer, callers, tierInferenceKeyClassName(id.tier), workerInferenceKeyEnv)
 			want[pool.Name] = true
 			// Past the tool limit with image volumes off, the worker's
 			// ephemeral request passes Autopilot's 10Gi and its pods would
@@ -511,4 +520,24 @@ func (r *PlatformAgentReconciler) deleteProfileCABundle(ctx context.Context, age
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, bundle))
+}
+
+// envToolWithheld is the worker adapter's lib.EnvToolWithheld: the worker
+// withholds each variable it names from the processes a turn's tools start.
+const envToolWithheld = "A2A_TOOL_WITHHELD_ENV"
+
+// withToolWithheldList is env with envToolWithheld naming every entry sourced
+// from a Secret (secretKeyRef); env as it was when there is none. A worker
+// container takes no envFrom Secret: its keys aren't known here.
+func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
+	var names []string
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			names = append(names, e.Name)
+		}
+	}
+	if len(names) == 0 {
+		return env
+	}
+	return append(env, corev1.EnvVar{Name: envToolWithheld, Value: strings.Join(names, ",")})
 }

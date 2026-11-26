@@ -56,6 +56,8 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 	g.mu.Lock()
 	cursor := g.reapCursor
+	// A fresh waiting-children count for this pass (noticeChildWaiting).
+	g.waitingPass = map[string]int{}
 	g.mu.Unlock()
 
 	nextCursor, done, err := g.reg.ScanSessions(ctx, cursor, func(rec *SessionRecord) (bool, error) {
@@ -80,6 +82,7 @@ func (g *Gateway) reapOnce(ctx context.Context) {
 
 func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	g.boundAskCopy(ctx, rec)
+	g.noticeChildWaiting(ctx, rec)
 	g.noticeNoFirstEvent(ctx, rec)
 
 	// Prune records older than SessionTTL whose pod has been reaped (or never
@@ -121,8 +124,9 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 		return // never delete a pod out from under a running task
 	}
 	// The idle clock is the last user message, not the last activity: the
-	// answer to a message does not keep the pod (idleSince).
-	if time.Since(rec.idleSince()) < g.cfg.IdleTTL {
+	// answer to a message does not keep the pod (idleSince), except under the
+	// short single-turn DM TTL (Config.idleExpired).
+	if !g.cfg.idleExpired(rec, time.Now()) {
 		return
 	}
 	l := g.lockSession(rec.Key)
@@ -134,7 +138,7 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 	fresh, err := g.reg.Get(ctx, rec.Key)
 	if err != nil || fresh == nil || fresh.PodName == "" ||
 		(fresh.ActiveTask != nil && !fresh.ActiveTask.Detached) ||
-		time.Since(fresh.idleSince()) < g.cfg.IdleTTL {
+		!g.cfg.idleExpired(fresh, time.Now()) {
 		l.Unlock()
 		return
 	}
@@ -156,6 +160,9 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 		}
 	}
 	g.log.Info("reaped idle session", "session", fresh.Key, "pod", fresh.PodName)
+	if g.spawner != nil {
+		g.kickCapQueue()
+	}
 	// The pod was an incarnation, not the identity: contextId persists
 	// until SessionTTL expires.
 	fresh.PodName = ""
@@ -232,11 +239,17 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 	// copy too, from the child's terminal on the stream: bounded from the
 	// child's start, which is never later than that terminal, so the copy
 	// never outlives the stream's. The end itself stays, so the batch still
-	// counts the child ended.
+	// counts the child ended. A profile parent's end that was never sent
+	// (Unsent) can't be sent past this bound either, since the loop above
+	// clears the parent's attribution, so it is dropped with its text.
 	var batchTextIDs []string
 	for i := range fresh.Tasks {
 		ref := &fresh.Tasks[i]
 		if g.batchTextPast(*ref, now) {
+			if ref.BatchEnd.Unsent {
+				g.log.Warn("a batch child's end was never sent to its profile parent and is dropped at the ask bound; the parent's deadline bounds its wait",
+					"session", fresh.Key, "child", ref.ID, "parent", ref.ParentTaskID, "entry", ref.BatchIndex)
+			}
 			ref.clearBatchText()
 			batchTextIDs = append(batchTextIDs, ref.ID)
 			changed = true
@@ -267,7 +280,9 @@ func (g *Gateway) boundAskCopyAt(ctx context.Context, rec *SessionRecord, now ti
 // batchTextPast reports a fan-out child's entry holding result text
 // (BatchEnd.Text) past AskTTL from its start.
 func (g *Gateway) batchTextPast(ref TaskRef, now time.Time) bool {
-	return ref.BatchEnd != nil && ref.BatchEnd.Text != "" && !ref.StartedAt.IsZero() &&
+	// An unsent end counts with no text too (a failure with no message):
+	// past the bound it can't be sent, and clearBatchText drops it.
+	return ref.BatchEnd != nil && (ref.BatchEnd.Text != "" || ref.BatchEnd.Unsent) && !ref.StartedAt.IsZero() &&
 		now.Sub(ref.StartedAt) >= g.cfg.AskTTL
 }
 
@@ -352,7 +367,7 @@ func (g *Gateway) buildRehydrationPrimer(ctx context.Context, rec *SessionRecord
 		if ref.Role == "" && strings.TrimSpace(ref.Request) != "" {
 			said = ref.Request
 		}
-		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID, g.profileRead(rec, ref.ID, ref.Addressee))
+		task, err := g.client.TasksGet(ctx, ref.Addressee, ref.ID)
 		if err != nil && !isTaskNotFound(err) {
 			// The stream didn't answer (a transport error, a consumer
 			// refusal, the turn's budget running out): leave the turn out
@@ -514,22 +529,23 @@ func noFirstEventPastGrace(active *ActiveTask, streamEmpty bool, grace time.Dura
 // subjects in the retention window. It is the test the replay makes before
 // it opens a consumer (TasksGet answers TaskNotFound exactly when this
 // answers true, but for the case lib.TaskReplayHeads names), made with
-// direct gets and no consumer, so a caller that only needs to know whether
-// the task has a first event does not spend one of the TASKS stream's
-// consumer slots on a five-second ephemeral. The task is read as the
-// replay reads it (taskIsProfile), so a five-token supervisor message the
-// cutoff refuses on a profile task is not a first event here either. An error is the read failing, not the subjects being empty.
-func (g *Gateway) taskStreamEmpty(ctx context.Context, rec *SessionRecord, taskID string) (bool, error) {
-	addressee := rec.AddresseeFor(taskID)
-	heads, err := g.client.TaskReplayHeads(ctx, nil, addressee, taskID, g.profileRead(rec, taskID, addressee))
-	if err != nil {
-		return false, err
-	}
-	return len(heads) == 0, nil
+// direct gets, so a caller that only needs to know whether the task has a
+// first event does not spend one of the TASKS stream's consumer slots on a
+// five-second ephemeral. The exception is a profile task's five-token
+// supervisor subject on a latched gateway: a direct get can't give its
+// stored time, so it is read on one such consumer (lib.TaskReplayHeads). A
+// five-token supervisor message the cutoff refuses on a profile's addressee
+// is not a first event here either. It stops at the first message it takes, events first, so a task
+// with a first event costs one direct get, as before the cutoff; one with
+// none costs three, bounded by the three replay subjects. An error is the
+// read failing, not the subjects being empty.
+func (g *Gateway) taskStreamEmpty(ctx context.Context, addressee, taskID string) (bool, error) {
+	return g.client.TaskReplayEmpty(ctx, nil, addressee, taskID)
 }
 
 // taskProbe is what the newest message on each of a task's replay subjects
-// says, read with direct gets and no consumer (probeTask).
+// says, read with direct gets, and a stored-time consumer only for the
+// five-token subject lib.TaskReplayHeads names (probeTask).
 type taskProbe struct {
 	// empty is nothing on any of the subjects in the retention window.
 	empty bool
@@ -554,17 +570,18 @@ type taskProbe struct {
 // per child (#6646). Only a terminal needs the full replay, for its folded
 // final message, and the caller makes that read for those children alone.
 // An error is the read failing, not the subjects being empty.
-func (g *Gateway) probeTask(ctx context.Context, stream jetstream.Stream, addressee, taskID string, opts ...lib.ReadOption) (taskProbe, error) {
+func (g *Gateway) probeTask(ctx context.Context, stream jetstream.Stream, addressee, taskID string) (taskProbe, error) {
 	p := taskProbe{empty: true, state: lib.StateWorking}
 	var newest, finalSeq uint64
 	for _, subject := range lib.TaskReplaySubjects(addressee, taskID) {
 		// Screened as the replay screens each envelope (LastEnvelopeOn), so
 		// an envelope the fold drops is dropped here too, a profile task's
 		// five-token supervisor terminal past the install's cutoff among
-		// them (opts, lib.AcceptsSupervisorEvent; #5301). That includes a
+		// them (lib.Client.AcceptSupervisorEvent, on the operator's profile
+		// names and the server's stored time; #5301). That includes a
 		// status whose payload names another task: ParseEnvelope refuses
 		// it, and LastEnvelopeOn skips it.
-		env, seq, err := g.client.LastEnvelopeOn(ctx, stream, subject, opts...)
+		env, seq, err := g.client.LastEnvelopeOn(ctx, stream, subject)
 		if err != nil {
 			return taskProbe{}, err
 		}
@@ -649,9 +666,10 @@ func (g *Gateway) sessionPruneDue(rec *SessionRecord, now time.Time) bool {
 // record, bounded for the notice: when the active task is past the grace,
 // inside the ceiling (withinNoticeCeiling), and the record is not about to
 // be pruned (sessionPruneDue), it asks the stream whether the task has a
-// first event (taskStreamEmpty, no consumer) and applies the test. A read
-// and nothing else: no lock, no post, no write. A task outside that window
-// is answered without touching the stream. A read that fails answers false.
+// first event (taskStreamEmpty, no consumer but the one it names) and
+// applies the test. A read and nothing else: no lock, no post, no write. A
+// task outside that window is answered without touching the stream. A read
+// that fails answers false.
 func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) bool {
 	active := rec.ActiveTask
 	now := time.Now()
@@ -664,7 +682,7 @@ func (g *Gateway) firstEventOverdue(ctx context.Context, rec *SessionRecord) boo
 	if g.noticeStreamReadHook != nil {
 		g.noticeStreamReadHook(active.TaskID)
 	}
-	empty, err := g.taskStreamEmpty(ctx, rec, active.TaskID)
+	empty, err := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	return err == nil && noFirstEventPastGrace(active, empty, g.cfg.FirstEventGrace, now)
 }
 
@@ -724,5 +742,10 @@ func (g *Gateway) noticeNoFirstEvent(ctx context.Context, rec *SessionRecord) {
 	g.log.Info("no first event inside the grace; told the conversation",
 		"taskId", active.TaskID, "conversation", fresh.Key, "addressee", fresh.AddresseeFor(active.TaskID),
 		"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
+	// A child whose line says it's waiting gets that line closed instead,
+	// so no ⏳ is left on it (closeWaitingLine); otherwise the post.
+	if g.closeWaitingLine(fresh) {
+		return
+	}
 	g.post(fresh.Key, fmt.Sprintf(noFirstEventNotice, active.TaskID, g.cfg.FirstEventGrace))
 }

@@ -885,7 +885,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
   single-tenant lock-down is set via `tenantId`, and user authorization is
   configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
-  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  Adaptive Cards v1.5 with markdown fallback. `inbound.enabled: true` (with
+  `tenantId`) runs the receiver that accepts the messages Microsoft delivers for
+  the bot; expose its Service with your own Ingress. Custom refs can likewise be
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
@@ -1014,6 +1016,15 @@ when the gateway runs the Slack adapter. Empty by default, and an `operator.extr
 user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
 off a real install, and a listed member's posts through any app in the workspace read as theirs.
 
+### Delegation rounds (`operator.delegation.roundsMax`)
+
+How many delegate requests one AgentProfile task may make, each minted or refused using one up;
+the A2A gateway refuses one past it under its `delegation.rounds` rule. `1`, the default, is the
+only value supported until a profile task's later rounds ship: the values schema and the render
+refuse any other. The controller manager renders `A2A_DELEGATION_ROUNDS_MAX=1` onto the gateway,
+and an `A2A_DELEGATION_ROUNDS_MAX` it carries from `operator.extraEnv` other than `1` is refused
+in its startup log and rendered as `1`.
+
 ### Microsoft Teams on the A2A gateway (`A2A_TEAMS_BACKEND`)
 
 An `operator.extraEnv` entry `A2A_TEAMS_BACKEND=true` (no value key yet) has the A2A gateway's
@@ -1062,7 +1073,7 @@ operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads
 credential-proxy and `agent-api-auth` containers, and is left out.
 `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` is left out because it has no effect on `gcloud` there: the
 credential proxy does not pass the pod's value to the commands it runs, and sets the variable
-itself for the commands its exec tier runs. Pass the file beside your own values with
+itself for every command it runs. Pass the file beside your own values with
 `-f charts/kube-agents/examples/values-fleet.yaml`,
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
@@ -1356,14 +1367,15 @@ that predates the field: `helm upgrade` does not apply `crds/`, and an older
 CRD would admit the CR with the block pruned, leaving the broker on the agent's
 own identity while the release record says armed, so the chart looks the CRD
 up and fails the render until `kubectl apply --server-side -f
-charts/kube-agents/crds/` has run. One retired key is tolerated for a
-release: every release the composition applied before the pool moved to
-projects recorded `platformAgent.security.scopedServiceAccounts: []`, and a
-harness- or operator-mode retag re-applies the recorded values over this
-chart after checking them against its schema, so the schema admits that key
-only as an empty list, which renders nothing, and refuses a populated one by
-name — that was a pool armed under the old per-cluster field, and the install
-takes `--upgrade-mode=full` so `install.env` renders the new one. See the site's
+charts/kube-agents/crds/` has run. The schema refuses the retired per-cluster
+key `platformAgent.security.scopedServiceAccounts` by name, empty or
+populated. A release record whose last install or full upgrade ran at 0.4.0
+to 0.8.0, before the pool moved to projects, still carries that key, so a
+harness- or operator-mode retag from such a record is refused: run `--upgrade-mode=full` once, and `install.env`
+renders the new block. `upgrade.sh --drop-undeclared-values` drops the key
+instead, and with it a populated list, which was a pool armed under the old
+per-cluster field; the pool then stays off until a full upgrade arms the new
+block. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
@@ -1506,6 +1518,9 @@ all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
 `platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
+The Teams inbound receiver is counted as one pod (`operatorRenderedPerReplica.teamsInboundReceiver`)
+while `platformAgent.integration.teams.inbound.enabled` is set beside `teams.enabled`; its cpu and
+memory are fixed in the operator.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.

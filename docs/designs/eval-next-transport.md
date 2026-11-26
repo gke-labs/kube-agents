@@ -163,7 +163,7 @@ Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is the agent API transpor
    turn and every wake that continued its chain
    (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
    the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
-   leaves them null when it carries none. The scorer's liveness rule
+   leaves them null when it carries none; they are also null when the harness made no such read or got no answer to it. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
    `working` and the terminal, is a trajectory entry under the status-event name, the latency
@@ -347,7 +347,7 @@ transport. `tool_called` reads the trajectory, which on this path carries tool-c
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
 never posts `activity` to a conversation, so the harness reads the trace off the read route when
 the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry
-the bridge does not label with a card worker's session to a trajectory item in the api path's shape, and writes one `a2a.activity` marker whenever the key
+the bridge does not label with a card worker's session to a trajectory item in the api path's shape (plus the entry's `callId` as `call_id`, beside `args`, when it carries one), and writes one `a2a.activity` marker whenever the key
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
@@ -357,9 +357,9 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id (for the required checks, for the forbidden runs where a `terminal` entry holds no heredoc, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
+the kanban worker logs by card id (for the required checks, for the forbidden runs where a `terminal` entry holds no heredoc, for a card with no log line, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
-wait found the cards and the door showed the trace); on
+wait found the cards and the door showed the trace; a check with `after_result_pattern` and a forbidden set reads those entries alone); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
 as a failure here: on this transport's record the scorer sets every `worker_commands`,
@@ -698,7 +698,7 @@ lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scra
 task file, which the unit hands devops-bench, over the leased project's GitOps repository exported
 as `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
 request, the stopped asks and the cases that declare `writes_alone: true` run in a second phase
-after every first-phase unit (a case that declares `scope_exclude:` runs after them, in a phase
+after every first-phase unit (a case that declares `scope_exclude:` or `scope_hold:` runs after them, in a phase
 of its own), one at a time and each after a settle, so no repetition that requests nothing shares
 the repository with one that writes by design and no window reaches back into the unit before;
 and after the fan-out the script lists in the job log what the run left on that repository,
@@ -711,7 +711,7 @@ The dashboard's Trend page keeps a series per mode: it draws `next` by default, 
 `today` series stays selectable from the lines the store already holds until they age out of
 its window; its Nightly page reads the main nightly's runs, so it shows `next`.
 
-**The front door (#6539).** `EVAL_FRONT_DOOR` picks which front door a run deploys. `platform`, the default, sends a plain conversation to the platform agent, as every install does today. `session` sets the chart's `platformAgent.harness.tuning.defaultRoute` to `session`, so each new conversation gets a session pod of its own: the default session that the sessions-by-default change (#2371) makes the front door. The door takes the install's route, so the cases run unchanged. On the session route a session costs its conversation's replays too, 7 TASKS consumers rather than 3, and the floor would fit only 2 sessions at 4 parallel conversations. So a session run sizes `maxSessions` to the run's parallelism plus two (`EVAL_FRONT_DOOR_SESSIONS=fair`), and its fresh TASKS is created at that budget. The headroom matters because the gateway doesn't queue at the cap: it evicts the longest-idle pod or refuses the turn, and an eviction between a multi-turn case's turns would cost B for something that isn't the front door. `EVAL_FRONT_DOOR_SESSIONS=shipped` leaves the cap at the install default instead, which is what a customer install gets; an eviction or refusal there is a finding about that default. The deploy writes the front door to `front-door.txt` in its artifacts. A session run keeps its records apart from the main nightly's: the gate files them under the version key's `next-session` mode, the dashboard publish skips the run, and it never records into the shared replay cache. `scripts/eval_front_door_ab.py <run A> <run B>` reads the two runs' `case-<name>.json` hand-offs and lists every case B fails where A passed. When both runs carry their `eval-grading.log`, it also compares each case's median answer words, infrastructure repetitions left out, and flags a case whose answer on B runs more than 25% and at least 10 words over A's; `--length-gate` makes that exit 1 too, since answer length is part of front-door parity, and exits 2 when a run has no shapes to compare. It exits 1 on a regression, and 2 when the runs can't be compared: an empty run, swapped front doors, or a B where no case was graded.
+**The front door (#6539).** `EVAL_FRONT_DOOR` picks which front door a run deploys. `platform`, the default, sends a plain conversation to the platform agent, as every install does today. `session` sets the chart's `platformAgent.harness.tuning.defaultRoute` to `session`, so each new conversation gets a session pod of its own: the default session that the sessions-by-default change (#2371) makes the front door. The door takes the install's route, so the cases run unchanged. On the session route a session costs its conversation's replays too, 7 TASKS consumers rather than 3, and the floor would fit only 2 sessions at 4 parallel conversations. So a session run sizes `maxSessions` to the run's parallelism plus two (`EVAL_FRONT_DOOR_SESSIONS=fair`), and its fresh TASKS is created at that budget. The headroom matters because the gateway doesn't queue at the cap: it evicts the longest-idle pod or refuses the turn, and an eviction between a multi-turn case's turns would cost B for something that isn't the front door. `EVAL_FRONT_DOOR_SESSIONS=shipped` leaves the cap at the install default instead, which is what a customer install gets; an eviction or refusal there is a finding about that default. After its gates, the deploy reads the route the install resolved (the `A2A_DEFAULT_ADDRESSEE` the operator rendered on the gateway), writes the requested and the resolved route to `front-door.txt` in its artifacts, and fails when they differ (#6942). Today a mismatch means the chart or the CR lost the setting; once the operator can hold an explicit `session` back on `platform` (the session cap's guards, #6487), it also catches a run that would grade the wrong door. A session run keeps its records apart from the main nightly's: the gate files them under the version key's `next-session` mode, the dashboard publish skips the run, and it never records into the shared replay cache. `scripts/eval_front_door_ab.py <run A> <run B>` reads the two runs' `case-<name>.json` hand-offs and lists every case B fails where A passed. When both runs carry their `eval-grading.log`, it also compares each case's median answer words, infrastructure repetitions left out, and flags a case whose answer on B runs more than 25% and at least 10 words over A's; `--length-gate` makes that exit 1 too, since answer length is part of front-door parity, and exits 2 when a run has no shapes to compare. It exits 1 on a regression, and 2 when the runs can't be compared: an empty run, swapped front doors, a run whose resolved front door differs from the one it asked for or wasn't recorded, or a B where no case was graded.
 
 **History.** While `spec.mode: today` existed, `EVAL_MODE_NEXT=1` on a Prow job chose this path:
 the deploy installed `today`, proved it, then flipped the install to `next` through the chart's

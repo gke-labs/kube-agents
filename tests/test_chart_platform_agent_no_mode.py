@@ -18,6 +18,7 @@ Run: python3 -m unittest discover -s tests -p 'test_chart_platform_agent_no_mode
 
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import unittest
@@ -36,6 +37,17 @@ _REQUIRED = [
 ]
 # What the deprecated key accepted while it chose the stack; it keeps accepting exactly that.
 _LEFTOVER_VALUES = (None, "", "today", "next")
+
+
+# The gateway's master key is generated on every render that finds no Secret
+# in a cluster (templates/litellm.yaml), so two renders differ in that one
+# value; it is masked before a byte-for-byte comparison.
+_MASTER_KEY_LINE = re.compile(r'^(\s*LITELLM_MASTER_KEY: )"sk-[A-Za-z0-9]+"$', re.MULTILINE)
+_MASTER_KEY_MASK = r'\1"<generated>"'
+
+
+def _masked(rendered: str) -> str:
+    return _MASTER_KEY_LINE.sub(_MASTER_KEY_MASK, rendered)
 
 
 def _render(*extra: str) -> subprocess.CompletedProcess:
@@ -108,7 +120,7 @@ class NoModeRenderTest(unittest.TestCase):
     def setUp(self):
         default = _render()
         self.assertEqual(default.returncode, 0, default.stderr)
-        self.default = default.stdout
+        self.default = _masked(default.stdout)
 
     def test_the_cr_carries_no_mode(self):
         self.assertNotIn("mode", _cr(self.default)["spec"])
@@ -119,7 +131,7 @@ class NoModeRenderTest(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 out = _render("--set", spelling)
                 self.assertEqual(out.returncode, 0, out.stderr)
-                self.assertEqual(out.stdout, self.default)
+                self.assertEqual(_masked(out.stdout), self.default)
 
     def test_anything_else_is_refused_before_it_renders(self):
         for value in ("Next", "TODAY", "later", "true"):

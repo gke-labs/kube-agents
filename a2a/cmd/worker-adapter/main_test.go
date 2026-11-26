@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
@@ -698,6 +702,44 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 }
 
+// harnessConfigDir is where the session check and the settings lookup both
+// look: $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
+func TestHarnessConfigDir(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, "/cfg")
+	t.Setenv("HOME", "/home/u")
+	if got := harnessConfigDir(); got != "/cfg" {
+		t.Errorf("with %s set: %q", claudeConfigDirEnv, got)
+	}
+	t.Setenv(claudeConfigDirEnv, "")
+	if got := harnessConfigDir(); got != filepath.Join("/home/u", claudeDefaultConfigDir) {
+		t.Errorf("with HOME only: %q", got)
+	}
+	t.Setenv("HOME", "")
+	if got := harnessConfigDir(); got != "" {
+		t.Errorf("with neither: %q", got)
+	}
+}
+
+// TestSessionWriteRefusalDir: only a session pod with the cluster view keeps a
+// per-turn write-refusal record, under its workdir.
+func TestSessionWriteRefusalDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, session, clusterView, want string
+	}{
+		{"session with the cluster view", "chat-a", "true", "/scratch/.kube-agents"},
+		{"session without the cluster view", "chat-a", "", ""},
+		{"cluster view spelled otherwise", "chat-a", "TRUE", ""},
+		{"no session (a profile pod)", "", "true", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(lib.EnvClusterView, tc.clusterView)
+			if got := sessionWriteRefusalDir(tc.session, "/scratch"); got != tc.want {
+				t.Fatalf("sessionWriteRefusalDir(%q) = %q, want %q", tc.session, got, tc.want)
+			}
+		})
+	}
+}
+
 // A session with the cluster view reads for itself, and that pulls an ask
 // that also needs a change toward reading first: the reads fan out to read
 // delegations and the change never reaches platform (#6859). The delegate
@@ -755,5 +797,50 @@ func TestTheClusterViewSessionHandsAChangeRequiringAskToPlatformWhole(t *testing
 	}
 	if strings.Contains(p, "hand the whole ask") {
 		t.Errorf("a pod without the delegate tool is told to hand asks over: %q", p)
+	}
+}
+
+// A warm session pod's env: no TASK_ID, warm and reuse on, the idle bound in
+// seconds, and the pod's ready file. Without the warm switch an empty TASK_ID
+// still refuses to start. The readiness subcommand answers from the file.
+func TestAWarmSessionPodStartsWithNoTaskID(t *testing.T) {
+	quiet := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	t.Setenv("TASK_ID", "")
+	t.Setenv("PROFILE", "chat")
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	t.Setenv(lib.EnvSessionReuse, "true")
+	t.Setenv(lib.EnvSessionWarm, "")
+	if _, ok := configFromEnv(quiet); ok {
+		t.Fatal("an empty TASK_ID started without the warm switch")
+	}
+	t.Setenv(lib.EnvSessionWarm, "true")
+	t.Setenv(lib.EnvSessionWarmIdleSeconds, "1800")
+	cfg, ok := configFromEnv(quiet)
+	if !ok {
+		t.Fatal("a warm pod's environment was refused")
+	}
+	if !cfg.Warm || !cfg.SessionReuse || cfg.WarmIdle != 30*time.Minute || cfg.WarmStatusAddr != warmStatusHostPort() {
+		t.Errorf("warm config = Warm %v SessionReuse %v WarmIdle %v WarmStatusAddr %q", cfg.Warm, cfg.SessionReuse, cfg.WarmIdle, cfg.WarmStatusAddr)
+	}
+	if !strings.HasPrefix(cfg.WarmStatusAddr, warmStatusHost+":") {
+		t.Errorf("the warm status endpoint binds %q, not the loopback interface alone", cfg.WarmStatusAddr)
+	}
+	// The probe waits out the adapter's start rather than failing during it,
+	// so a routine warm pod start records no Unhealthy Event, and fails only
+	// when nothing ever answers.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "http://" + ln.Addr().String() + lib.SessionWarmReadyPath
+	if warmReady(url, 0) == 0 {
+		t.Error("the readiness probe passed with nothing answering")
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	}()
+	if warmReady(url, 10*time.Second) != 0 {
+		t.Error("the readiness probe failed while the endpoint was on its way")
 	}
 }

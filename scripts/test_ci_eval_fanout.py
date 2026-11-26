@@ -31,6 +31,8 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
@@ -746,6 +748,17 @@ TF_ROOT = REPO_ROOT / "bench" / "tf"
 # The onboarding markers a stack under the onboarding state lock rewrites. The
 # stacks that touch the Planning Agent's `oobe` job all write one of them too.
 ONBOARDING_STATE = re.compile(r"bootstrap_scan_filed|bootstrap_handoff_filed|oobe_audits_fired")
+# The stack-bearing cases the script runs off the infra lock (infra_lock_exempt).
+EXEMPT_CASES = (
+    "oobe-first-run-audits",
+    "autoops-warning-event-no-action-triage",
+    "fleet-audit-scheduled-run-files-the-finding",
+)
+# The two waits of an exempt stack's apply, by name. audit-chat-report waits
+# for a run already going and then for the one it fired, and takes both as
+# variables, which the case may set.
+EXEMPT_STACK_WAITS = ("own_wait", "chain_wait")
+EXEMPT_STACK_WAITS_BY_CASE = {"fleet-audit-scheduled-run-files-the-finding": ("own_wait", "run_wait")}
 
 
 def task_stack(case: str) -> str:
@@ -769,6 +782,8 @@ class StateLockTest(unittest.TestCase):
     an exempt case needs two things in its place: a private kubeconfig, since
     devops-bench runs get-credentials for the stack's output on the shared one,
     and a state lock with the cases whose stacks rewrite the same install state.
+    One state is kept apart by the nightly's parts and by no lock: the Platform
+    Agent's cron roster (scripts/test_ci_eval_nightly.py holds the parts).
     """
 
     def exempt(self, case: str) -> bool:
@@ -778,7 +793,7 @@ class StateLockTest(unittest.TestCase):
         return shell_answer("unit_state_lock", f"unit_state_lock {case}").stdout.strip()
 
     def test_only_the_listed_cases_are_exempt(self):
-        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
+        for case in EXEMPT_CASES:
             with self.subTest(case=case):
                 self.assertTrue(self.exempt(case))
         for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe",
@@ -816,7 +831,7 @@ class StateLockTest(unittest.TestCase):
         self.assertEqual(self.state_lock("capacity-pinned-pool-probe"), "")
 
     def test_an_exempt_stack_reaches_its_cluster_through_its_own_kubeconfig(self):
-        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
+        for case in EXEMPT_CASES:
             with self.subTest(case=case):
                 self.assertTrue(self.exempt(case))
                 main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
@@ -921,22 +936,78 @@ class StateLockTest(unittest.TestCase):
         self.assertIn("HELD", out)
         self.assertIn("RELEASED", out)
 
+    @staticmethod
+    def stack_variable(case: str, name: str) -> str | None:
+        """What a case's stack gets for one of its variables, as text: the value
+        the case sets under infrastructure.variables, else the default in the
+        stack's variables.tf. None when neither has it, or when the default is
+        in a form this does not read (a string with a quote inside it)."""
+        task = yaml.safe_load((TASKS_DIR / case / "task.yaml").read_text(encoding="utf-8"))
+        set_by_case = (task.get("infrastructure") or {}).get("variables") or {}
+        if name in set_by_case:
+            return str(set_by_case[name])
+        variables = TF_ROOT / task_stack(case) / "variables.tf"
+        if not variables.is_file():
+            return None
+        # The block runs to the first line that is a closing brace alone, so a
+        # brace inside a description does not end it.
+        block = re.search(rf'^variable "{name}" \{{\n(.*?)^\}}$', variables.read_text(encoding="utf-8"), re.M | re.S)
+        default = re.search(r'^\s*default\s*=\s*"?([^"\n#]*?)"?\s*(?:#.*)?$', block.group(1), re.M) if block else None
+        return default.group(1) if default else None
+
     def test_the_hold_covers_the_exempt_stacks_waits(self):
         # STATE_LOCK_HOLD_SECONDS stands for the time an exempt stack's apply
-        # can wait: its own_wait plus its chain_wait. The turn and teardown on
-        # top fit in the INFRA_LOCK_DEADLINE term state_lock_deadline adds.
+        # can wait: its own_wait plus its chain_wait, as locals in its main.tf.
+        # A stack that takes its waits as variables is read through the case
+        # (EXEMPT_STACK_WAITS_BY_CASE). The turn and teardown on top fit in the
+        # INFRA_LOCK_DEADLINE term state_lock_deadline adds. The script reads
+        # the bound for a state-lock holder only; a case with no state lock is
+        # held to it all the same, so that every exempt stack's waits are
+        # written down and under one figure.
         hold = int(lifted_constant("STATE_LOCK_HOLD_SECONDS").split("=")[1])
         exempt = [t.parent.name for t in sorted(TASKS_DIR.glob("*/task.yaml")) if self.exempt(t.parent.name)]
         self.assertIn("oobe-first-run-audits", exempt)
         for case in exempt:
             with self.subTest(case=case):
-                main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
                 waits = []
-                for name in ("own_wait", "chain_wait"):
-                    match = re.search(rf"^\s*{name}\s*=\s*(\d+)\s*$", main, re.M)
-                    self.assertIsNotNone(match, f"{case}: no {name} local in its stack's main.tf")
-                    waits.append(int(match.group(1)))
+                if case in EXEMPT_STACK_WAITS_BY_CASE:
+                    for name in EXEMPT_STACK_WAITS_BY_CASE[case]:
+                        wait = self.stack_variable(case, name)
+                        self.assertIsNotNone(wait, f"{case}: no {name} in its task file or its stack's variables.tf")
+                        waits.append(int(wait))
+                else:
+                    main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
+                    for name in EXEMPT_STACK_WAITS:
+                        match = re.search(rf"^\s*{name}\s*=\s*(\d+)\s*$", main, re.M)
+                        self.assertIsNotNone(match, f"{case}: no {name} local in its stack's main.tf")
+                        waits.append(int(match.group(1)))
                 self.assertLessEqual(sum(waits), hold)
+
+    def test_a_stack_variable_is_read_from_the_case_before_the_stacks_default(self):
+        # The case sets run_wait under the stack's default, and leaves own_wait
+        # and audit_job to the defaults.
+        case = "fleet-audit-scheduled-run-files-the-finding"
+        self.assertEqual(self.stack_variable(case, "run_wait"), "3000")
+        self.assertEqual(self.stack_variable(case, "own_wait"), "3600")
+        self.assertEqual(self.stack_variable(case, "audit_job"), "compliance-audit")
+        self.assertIsNone(self.stack_variable(case, "no_such_variable"))
+
+    def test_an_exempt_stack_that_fires_an_audit_job_holds_that_audits_stream(self):
+        # Off the infra lock, the stream lock is what keeps a stack that sets
+        # an audit's stored report aside and fires its job apart from the other
+        # cases on that audit. The runner takes it for the streams a case
+        # declares, so the case must declare the job its stack fires.
+        exempt = [t.parent.name for t in sorted(TASKS_DIR.glob("*/task.yaml")) if self.exempt(t.parent.name)]
+        firing = [case for case in exempt if "trigger_job" in stack_text(task_stack(case))]
+        self.assertIn("fleet-audit-scheduled-run-files-the-finding", firing)
+        for case in firing:
+            with self.subTest(case=case):
+                # The job the stack fires is its audit_job variable; a stack
+                # that fires anything else needs this test taught to read it.
+                main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
+                self.assertRegex(main, r'arm fire [^\n]*"\$\{var\.audit_job\}"')
+                task = yaml.safe_load((TASKS_DIR / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertIn(self.stack_variable(case, "audit_job"), task.get("audit_streams") or [])
 
     def give_up_on_busy_state_lock(self, has_stack: str) -> str:
         body = "\n".join(

@@ -98,6 +98,9 @@ steps:
           -f deploy/docker/Dockerfile \
           --target platform \
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          --build-arg HERMES_AGENT_IMAGE="$_DOCKER_HUB_MIRROR/nousresearch/hermes-agent" \
+          --build-arg ENVOY_IMAGE="$_DOCKER_HUB_MIRROR/envoyproxy/envoy" \
+          --build-arg GOLANG_IMAGE="$_DOCKER_HUB_MIRROR/library/golang" \
           --build-arg KUBE_AGENTS_VERSION="$_KUBE_AGENTS_VERSION" \
           .
 
@@ -126,6 +129,9 @@ steps:
           -f deploy/docker/Dockerfile \
           --target credential-proxy \
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          --build-arg HERMES_AGENT_IMAGE="$_DOCKER_HUB_MIRROR/nousresearch/hermes-agent" \
+          --build-arg ENVOY_IMAGE="$_DOCKER_HUB_MIRROR/envoyproxy/envoy" \
+          --build-arg GOLANG_IMAGE="$_DOCKER_HUB_MIRROR/library/golang" \
           .
 
   # The shell sandbox every agent pod now talks to over ssh. Like the operator
@@ -148,6 +154,8 @@ steps:
       - "$_SANDBOX_URI"
       - "-f"
       - "deploy/sandbox/Dockerfile"
+      - "--build-arg"
+      - "PYTHON_IMAGE=$_DOCKER_HUB_MIRROR/library/python"
       - "."
 
   # k8s-operator/Dockerfile shares no stage with the agent images, so it starts
@@ -166,6 +174,8 @@ steps:
       - "$_OPERATOR_URI"
       - "-f"
       - "k8s-operator/Dockerfile"
+      - "--build-arg"
+      - "GOLANG_IMAGE=$_DOCKER_HUB_MIRROR/library/golang"
       - "k8s-operator"
 
   # deploy/kube-proxy/Dockerfile shares no stage with the agent images, so it
@@ -185,6 +195,8 @@ steps:
       - "deploy/kube-proxy/Dockerfile"
       - "--build-arg"
       - "KUBE_AGENTS_VERSION=$_KUBE_AGENTS_VERSION"
+      - "--build-arg"
+      - "GOLANG_IMAGE=$_DOCKER_HUB_MIRROR/library/golang"
       - "."
 
   # The two AgentPlugin images the presubmit deploys so the Pub/Sub platform
@@ -214,8 +226,8 @@ steps:
           docker push "$$uri"
         done
 
-  # The A2A stack's six first-party images (a2a/Dockerfile.gateway,
-  # .authcallout, .worker, .verifier, .console, .dispatcher), built only when hack/ci-deploy.sh
+  # The A2A stack's seven first-party images (a2a/Dockerfile.gateway,
+  # .authcallout, .worker, .verifier, .console, .dispatcher, .teams-inbound), built only when hack/ci-deploy.sh
   # passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
@@ -255,7 +267,10 @@ steps:
         fi
         set -e
         build_and_push() { # <Dockerfile suffix> <image URI> <build context>
-          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" "$$3"
+          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" \
+            --build-arg GOLANG_IMAGE="$_DOCKER_HUB_MIRROR/library/golang" \
+            --build-arg NODE_IMAGE="$_DOCKER_HUB_MIRROR/library/node" \
+            "$$3"
           docker push "$$2"
         }
         build_and_push gateway "$_A2A_GATEWAY_URI" a2a
@@ -264,6 +279,8 @@ steps:
         build_and_push verifier "$_A2A_VERIFIER_URI" a2a
         build_and_push console "$_A2A_CONSOLE_URI" a2a
         build_and_push dispatcher "$_A2A_DISPATCHER_URI" a2a
+        # The Teams inbound receiver (#1034), the same shape as the console.
+        build_and_push teams-inbound "$_A2A_TEAMS_INBOUND_URI" a2a
         # The cluster profile's persona: busybox and the persona directory.
         build_and_push persona-cluster "$_PERSONA_CLUSTER_URI" agents/cluster/persona
         # The tse profile's persona, the same shape (#3842).
@@ -304,6 +321,7 @@ steps:
         fi
         docker build --platform linux/amd64 -t "$_A2A_BRIDGE_URI" \
           --build-arg "PLATFORM_AGENT_IMAGE=$_PLATFORM_URI" \
+          --build-arg "GOLANG_IMAGE=$_DOCKER_HUB_MIRROR/library/golang" \
           -f a2a/Dockerfile.hermes-bridge a2a
         docker push "$_A2A_BRIDGE_URI"
 
@@ -332,7 +350,8 @@ steps:
           echo "web-console: _WEB_CONSOLE_URI is empty; the web console image is not built"
           exit 0
         fi
-        docker build --platform linux/amd64 -t "$_WEB_CONSOLE_URI" -f a2a/Dockerfile.web-console a2a
+        docker build --platform linux/amd64 -t "$_WEB_CONSOLE_URI" -f a2a/Dockerfile.web-console \
+          --build-arg GOLANG_IMAGE="$_DOCKER_HUB_MIRROR/library/golang" a2a
         docker push "$_WEB_CONSOLE_URI"
 
   # The shadow-mode replay proxy (hack/replay-proxy/Dockerfile), an eval
@@ -356,7 +375,8 @@ steps:
           echo "replay-shadow-proxy: not requested (EVAL_REPLAY_SHADOW unset); skipping"
           exit 0
         fi
-        docker build --platform linux/amd64 -t "$_REPLAY_SHADOW_PROXY_URI" -f hack/replay-proxy/Dockerfile .
+        docker build --platform linux/amd64 -t "$_REPLAY_SHADOW_PROXY_URI" -f hack/replay-proxy/Dockerfile \
+          --build-arg PYTHON_IMAGE="$_DOCKER_HUB_MIRROR/library/python" .
         docker push "$_REPLAY_SHADOW_PROXY_URI"
 
 # Presubmits push only PR-scoped immutable tags, avoiding cross-PR cache pollution
@@ -392,6 +412,18 @@ substitutions:
   _HERMES_AGENT_TAG: ""
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
+  # Where every Docker Hub base image is pulled from (#7033). Cloud Build pulls
+  # anonymously from a shared egress, and Docker Hub rate-limits that: a 429 on
+  # node:24-slim killed a smoke on 2026-11-24. mirror.gcr.io serves the same
+  # manifests (the digests of every base below were compared against Docker
+  # Hub before the switch); the Dockerfiles' defaults stay Docker Hub names, so
+  # a local build is unchanged. The workflows mirror docker.io the same way
+  # through .github/buildkitd.toml, where buildkitd falls back to Docker Hub
+  # when the mirror lacks a ref; this file has no such fallback. If a base the
+  # mirror does not hold breaks the smoke (a hand-made bump of the Hermes tag in
+  # tags.env, say), pass _DOCKER_HUB_MIRROR=docker.io, which every override
+  # resolves as a Docker Hub name, until the mirror has it.
+  _DOCKER_HUB_MIRROR: "mirror.gcr.io"
   # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
   # sets all seven together. The a2a step gates on
   # _A2A_GATEWAY_URI alone, so they are set as a set or not at all.
@@ -407,6 +439,7 @@ substitutions:
   _A2A_WORKER_URI: ""
   _A2A_VERIFIER_URI: ""
   _A2A_CONSOLE_URI: ""
+  _A2A_TEAMS_INBOUND_URI: ""
   _A2A_BRIDGE_URI: ""
   _A2A_DISPATCHER_URI: ""
   _PERSONA_CLUSTER_URI: ""

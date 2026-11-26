@@ -49,6 +49,18 @@ The verification fields, all optional:
   workload the record names; `none` passes the window on the run after the fix
   is applied, for a fix whose object is not a workload.
 
+How the broker proves a pull request is the fix: `verify` is `add-manifest`
+(the default: one new file, byte for byte what `fix.py` generates) or
+`edit-manifest`. An `edit-manifest` recipe names `edit_api_version` and `edit_kind`, the
+apiVersion and Kubernetes kind of the one document it edits, and `edit_paths`, the dotted scalar paths
+it may change (a segment of digits is a list index), never an identity,
+label, selector (including any `...Selector`), placement, privilege, service
+account, ownership, server-bookkeeping or status field
+(`EDIT_FORBIDDEN_SEGMENTS`).
+`automerge_edit` holds a pull request to exactly those edits, refuses any
+that changes a field's YAML type (a bool is not an int), and then asks
+`fix.py`'s `allowed_edit(path, old, new)`, which must return True for each.
+
 A kind's fix generator is `fix.py` beside its `recipe.yaml`, loaded with
 `generator(kind)`, and stdlib only for the same reason. `no-pdb` has one:
 the audit calls it through `audit_report._pdb_manifest`, and the broker
@@ -77,10 +89,33 @@ CHECKS_FILE = "checks.py"
 MAX_RECIPE_BYTES = 8 * 1024
 REQUIRED = ("kind", "name", "title", "dial_environment")
 OPTIONAL = ("owner", "eval_case", "recheck_kinds", "recheck_siblings", "applied", "applied_resource", "applied_noun",
-            "applied_field", "applied_value", "health")
+            "applied_field", "applied_value", "health", "verify", "edit_api_version", "edit_kind", "edit_paths")
 #: The stock probes `fix_recipes/probes.py` runs, and the health windows the post-merge check holds.
 APPLIED_PROBES = ("object_present", "field_equals")
 HEALTH_PROBES = ("restart_flat", "none")
+#: How the broker proves a pull request is the recipe's fix: `add-manifest`
+#: (one new file, `automerge_eligibility.verify_added_manifest`) or
+#: `edit-manifest` (one scalar edit to an existing manifest, `automerge_edit`).
+VERIFY_VERBS = ("add-manifest", "edit-manifest")
+#: Segments refused anywhere in an `edit_paths` entry: identity at any depth
+#: (a List's items, a pod template), labels and every selector (any segment
+#: ending in `Selector` too, such as `nodeSelector`), where a pod runs and as
+#: whom (`nodeName`, `serviceAccountName`), ownership, the server's own
+#: bookkeeping, and status, which the cluster writes.
+EDIT_FORBIDDEN_SEGMENTS = frozenset({
+    "apiVersion", "kind", "name", "namespace", "generateName", "uid", "ownerReferences", "finalizers",
+    "labels", "annotations", "selector", "matchLabels", "matchExpressions", "status",
+    "nodeName", "serviceAccountName", "serviceAccount", "resourceVersion", "generation", "managedFields",
+    "creationTimestamp", "deletionTimestamp", "selfLink",
+    # Placement and privilege.
+    "tolerations", "affinity", "topologySpreadConstraints", "priorityClassName", "schedulerName",
+    "runtimeClassName", "hostNetwork", "hostPID", "hostIPC", "hostPath", "securityContext", "privileged",
+    "automountServiceAccountToken",
+})
+_API_VERSION_RE = re.compile(r"(?:[a-z0-9]+(?:[.-][a-z0-9]+)*/)?v[0-9]+(?:(?:alpha|beta)[0-9]+)?")
+#: One `edit_paths` entry: dotted mapping keys, a segment of digits being a list index.
+EDIT_PATH_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*(?:\.(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*))*")
+_K8S_KIND_RE = re.compile(r"[A-Z][A-Za-z0-9]*")
 #: What `applied` needs beside it.
 APPLIED_NEEDS = {"object_present": ("applied_resource",),
                  "field_equals": ("applied_resource", "applied_field", "applied_value")}
@@ -117,6 +152,18 @@ class Recipe(NamedTuple):
     applied_field: str = ""
     applied_value: str = ""
     health: str = "restart_flat"
+    verify: str = "add-manifest"
+    edit_api_version: str = ""
+    edit_kind: str = ""
+    edit_paths: str = ""
+
+    def edit_path_list(self) -> tuple[tuple[str | int, ...], ...]:
+        """`edit_paths` as `yaml_edit` paths: `spec.containers.0.image` is
+        `("spec", "containers", 0, "image")`."""
+        return tuple(
+            tuple(int(seg) if seg.isdigit() else seg for seg in path.split("."))
+            for path in self.edit_paths.split()
+        )
 
     def siblings(self) -> tuple[str, ...]:
         """The collector checks the fix could trip, in the order the re-check runs them."""
@@ -199,6 +246,29 @@ def _check_verification(fields: dict[str, str], where: str) -> None:
         raise RecipeError(f"{where}: `applied_field` must be a dotted field path such as `spec.maxUnavailable`")
     if "health" in fields and fields["health"] not in HEALTH_PROBES:
         raise RecipeError(f"{where}: `health` must be one of {', '.join(HEALTH_PROBES)}")
+    verify = fields.get("verify", "add-manifest")
+    if verify not in VERIFY_VERBS:
+        raise RecipeError(f"{where}: `verify` must be one of {', '.join(VERIFY_VERBS)}")
+    if verify != "edit-manifest":
+        if {"edit_api_version", "edit_kind", "edit_paths"} & set(fields):
+            raise RecipeError(f"{where}: `edit_api_version`, `edit_kind` and `edit_paths` mean nothing without `verify: edit-manifest`")
+        return
+    if not _API_VERSION_RE.fullmatch(fields.get("edit_api_version", "")):
+        raise RecipeError(f"{where}: `verify: edit-manifest` needs `edit_api_version`, such as `policy/v1`")
+    if not _K8S_KIND_RE.fullmatch(fields.get("edit_kind", "")):
+        raise RecipeError(f"{where}: `verify: edit-manifest` needs `edit_kind`, a Kubernetes kind such as `PodDisruptionBudget`")
+    paths = fields.get("edit_paths", "").split()
+    if not paths or not all(EDIT_PATH_RE.fullmatch(p) for p in paths):
+        raise RecipeError(f"{where}: `edit_paths` must be dotted field paths separated by spaces, such as `spec.minAvailable`")
+    if len(set(paths)) != len(paths):
+        raise RecipeError(f"{where}: `edit_paths` repeats a path")
+    named = sorted({
+        seg for p in paths for seg in p.split(".") if seg in EDIT_FORBIDDEN_SEGMENTS or seg.endswith("Selector")
+    })
+    if named:
+        raise RecipeError(f"{where}: `edit_paths` may not name {', '.join(named)} at any depth")
+    if any(a != b and b.startswith(a + ".") for a in paths for b in paths):
+        raise RecipeError(f"{where}: one `edit_paths` entry contains another")
 
 
 def load(root: Path = HERE) -> tuple[Recipe, ...]:

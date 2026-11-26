@@ -33,7 +33,8 @@
 #
 # `available_from_day` is days after the stack is applied, and it is the SOP's
 # own age gate rather than a provisioning delay: recreating a fixture restarts
-# its clock, because creationTimestamp is server-set and immutable. The clock
+# its clock, because creationTimestamp is server-set and immutable (and so is
+# the status.completionTime of a finished Job). The clock
 # runs per project, so a fleet-wide assertion holds only from the most recently
 # applied project's date.
 
@@ -48,7 +49,7 @@ slots:
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures over that pool
+    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -133,6 +134,61 @@ fixtures:
       audit's overrequest posture on objects whose names no repository file
       declares. The names are literals in the stack, the same on every
       project. No multi-day age gate.
+
+  - role: generated-name-job-family
+    slot: a
+    available_from_day: 7
+    objects:
+      - job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39
+      - job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041
+      - job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2
+    namespace: seeded-family
+    defect: >-
+      Three finished Jobs named reindex-<uuid>, the shape a spawner leaves,
+      with one common app.kubernetes.io/part-of label, no owner reference
+      and no ttlSecondsAfterFinished, so each one stays after it ran. The
+      waste audit's terminal-pods check files a finished Job once its
+      status.completionTime is 7 days old, so the role is not ready, rather
+      than drifted, until then. The names are literals in the stack, the
+      same on every project.
+
+  - role: long-name-replaced-pod
+    slot: a
+    available_from_day: 1
+    objects:
+      - deployment/settlement-batch-reconciliation-exporter-for-partner-feeds
+      - configmap/long-name-pod-cycle
+      - serviceaccount/long-name-pod-cycle
+      - role/long-name-pod-cycle
+      - rolebinding/long-name-pod-cycle
+    namespace: seeded-long-name
+    defect: >-
+      One Deployment whose name has 58 characters, so Kubernetes cuts the
+      names of its pods: the name and 5 generated characters, with no hash
+      between them. Its one pod is idle until 18:00 UTC, then uses its CPU
+      limit and holds 64Mi for 11 minutes, then deletes itself through the
+      API with a Role that can delete pods in this namespace only. The live
+      pod is then idle, and the pod of the day before is a replaced pod with
+      a peak above the bar of the waste audit's overrequest check. The first
+      replaced pod exists one day after the plant. The Deployment has no
+      verdict from 18:00 to about 19:11 UTC.
+
+  - role: cpu-burst-and-flat
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cpu-flat
+      - deployment/cpu-burst
+      - configmap/cpu-cycle
+    namespace: seeded-cpu-cycle
+    defect: >-
+      Two Deployments whose real CPU use is in the manifest. cpu-flat uses
+      the CPU all the time, held by its limit at its 100m request: the
+      control. cpu-burst uses the CPU for 45 seconds at the start of each 10
+      minutes, held by its limit at its 200m request: in a bucket of 300
+      seconds the burst reads as 15% of the request, under the bar of the
+      waste audit's overrequest check, and in a bucket of 60 seconds as 37%
+      or more. No multi-day age gate: the check reads a pod after one hour.
 
   - role: guaranteed-qos-workload
     slot: a
@@ -370,10 +426,10 @@ fixtures:
     objects:
       - cluster/self
     defect: >-
-      Slot c's default pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota
-      false, where every other pool in the fleet runs a 20 GB disk and no
-      kubelet block, planted ahead of the boot-disk and kubelet-config drift
-      facets, which the drift SOP does not read yet. Day 1 as for drift-outlier,
+      Slot c's default pool on a 50 GB boot disk with kubeletConfig.podPidsLimit
+      4096, where every other pool in the fleet runs a 20 GB disk and no
+      kubelet block. The drift SOP's boot-disk facet reads the disk and its
+      kubelet-config facet reads the kubelet block. Day 1 as for drift-outlier,
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
@@ -444,9 +500,10 @@ fixtures:
     defect: >-
       Slot c's default-pool labelled cloud.google.com/compute-class=general-ccc
       with no matching NoSchedule taint, so the scheduler fills it with
-      untargeted pods before the pre-filter drops them. The label is also what
-      leaves the cluster with no untainted pool without a class label, which
-      the obtainability audit's 3.24 needs before it files anything.
+      untargeted pods before the pre-filter (GKE 1.35.6 and later) drops them.
+      The label is also what leaves the cluster with no untainted pool without
+      a class label, which the obtainability audit's 3.24 needs before it
+      files anything.
 
   - role: manual-pools-compute-class
     slot: c
@@ -458,6 +515,22 @@ fixtures:
       rules across the nodepools rule default-pool backs and two machine
       families no pool backs, so a stockout on the first rule leaves pods with
       no fallback GKE can create.
+
+  - role: missing-reservation-compute-class
+    slot: c
+    available_from_day: 0
+    objects:
+      - computeclass/reserved-ccc
+    defect: >-
+      ComputeClass reserved-ccc, whose first rule asks for one named
+      reservation (affinity Specific, seeded-absent-reservation) that no
+      reservation of the project carries, and whose second rule is a machine
+      type that GKE can create. Node pool auto-creation is on and no workload
+      selects the class, so GKE makes no node pool for it. One NoSchedule
+      taint (dedicated=reserved-ccc) keeps the class out of the
+      general-purpose classes that the obtainability audit counts. GKE marks
+      the class misconfigured with the reason ReservationNotFound, and the
+      stockout audit files that status.
 
   - role: no-nodelocal-dnscache
     slot: c

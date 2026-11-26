@@ -79,18 +79,73 @@ class TestScrubStepText(unittest.TestCase):
             if not self._parses(nested):
                 self.skipTest("the JSON parser refuses %d levels here, so no document of this depth parses" % depth)
             self.assertEqual(_scrub("tool_result", nested), WITHHELD)
-        # A document too deep to parse is scrubbed as text rather than dropped.
-        # The parser's depth limit is the interpreter's: some thousands of
-        # levels on Python 3.12 and 3.13, and on 3.14 as many as the stack
-        # holds (more than 100,000 with a 16 MB stack). So the test finds a
-        # depth above it and holds no fixed one.
-        deep = nested
+
+    def _too_deep_to_parse(self):
+        """A document the JSON parser of this Python refuses for its depth.
+
+        The parser's depth limit is the interpreter's: some thousands of
+        levels on Python 3.12 and 3.13, and on 3.14 as many as the stack holds
+        (more than 100,000 with a 16 MB stack). So the search finds a depth
+        above it and holds no fixed one.
+        """
+        depth = 2 * sys.getrecursionlimit()
+        deep = "[" * depth + "]" * depth
         while self._parses(deep):
             if 2 * depth > self.DEEPEST_DOCUMENT_TRIED:
                 self.skipTest("the JSON parser of this Python parses %d levels; the search stops there" % depth)
             depth *= 2
             deep = "[" * depth + "]" * depth
-        self.assertEqual(_scrub("tool_result", deep), deep)
+        return deep
+
+    def test_withheld_when_the_document_is_too_deep_to_parse(self):
+        """More depth never gets a weaker rule: a document the parser refuses
+        is withheld as one too deep to walk is, not served under the text rules."""
+        deep = self._too_deep_to_parse()
+        for kind in ("thinking", "tool_call", "tool_result", "reply"):
+            with self.subTest(kind=kind):
+                self.assertEqual(_scrub(kind, deep), WITHHELD)
+
+    def test_withheld_when_a_string_inside_the_step_is_too_deep_to_parse(self):
+        deep = self._too_deep_to_parse()
+        for name, step in (
+            ("a value of a structure", json.dumps({"output": deep})),
+            ("a value of a nested structure", json.dumps({"result": [{"stdout": deep}]})),
+        ):
+            for kind in ("tool_call", "tool_result"):
+                with self.subTest(step=name, kind=kind):
+                    self.assertEqual(_scrub(kind, step), WITHHELD)
+        # The inline-object rule is a tool result's, and parses each `{...}` in a line of text.
+        inline = 'the call returned {"items": %s} and exited' % deep
+        self.assertEqual(_scrub("tool_result", inline), WITHHELD)
+
+    def test_withheld_when_the_parser_gives_up_on_text_that_is_no_document(self):
+        """Brackets that never close: no JSON document, but the parser stops
+        for the depth before it can say so, and that is all this module sees."""
+        deep = self._too_deep_to_parse()
+        unclosed = deep[: len(deep) // 2]
+        self.assertFalse(self._parses(unclosed))
+        self.assertEqual(_scrub("tool_result", unclosed), WITHHELD)
+
+    def test_text_the_parser_refuses_for_its_form_is_still_scrubbed_as_text(self):
+        for step in ('{"a": 1', "[1, 2,", "{not json}", "[" * 50):
+            with self.subTest(step=step):
+                self.assertEqual(_scrub("tool_result", step), step)
+        # Scrubbed, not only served: the text rules still mask a value in it.
+        out = _scrub("tool_result", '{"password": "hunter2hunter2", "a": 1')
+        self.assertNotIn("hunter2hunter2", out)
+        self.assertIn(MARKER, out)
+        self.assertNotEqual(out, WITHHELD)
+
+    def test_arguments_too_deep_to_parse_count_as_a_secret_read(self):
+        """They cannot be shown not to print a secret, so the call's result is
+        withheld with them."""
+        deep = self._too_deep_to_parse()
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(deep))
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(deep[: len(deep) // 2]))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": "ls -la"})))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call("ls -la"))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call('{"command": "ls'))
+        self.assertFalse(worker_transcript.is_secret_read_tool_call("[" * 50))
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
         for cmd, cred, kept in (
@@ -421,12 +476,14 @@ class TestScrubStepText(unittest.TestCase):
             "redis-cli -a pre{run} S3cretValue9",
             "curl https://admin:pre{run} S3cretValue9@host/x",
         )
-        # Known limits, the same on main and pinned so a fix flips them: the
-        # URL userinfo rules stop at a literal backslash (run 2 and more
-        # leaves one), and inside a quoted `bash -c "…"` script the short and
-        # user:pass flag rules do not run (`sub_shell_segments`).
+        # Known limits, pinned so a fix flips them: the URL userinfo rules
+        # stop at a literal backslash the redactor can't read as a JSON escape
+        # (an even run leaves one before the space; an odd run's pairs now
+        # read as escapes, so the password is masked), and inside a quoted
+        # `bash -c "…"` script the short and user:pass flag rules do not run
+        # (`sub_shell_segments`).
         def known_limit(shape, run, wrapper):
-            if "https://admin:" in shape and run > 1:
+            if "https://admin:" in shape and run > 1 and run % 2 == 0:
                 return True
             return wrapper == "bash -c" and any(f in shape for f in ("-u admin:", "-ppre", "-a pre"))
 
@@ -1797,6 +1854,129 @@ class TestStoreFamilyReadKeepsItsVerdict(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
 
 
+class TestTokenPrinterReadKeepsItsVerdict(unittest.TestCase):
+    """A gcloud token printer withholds when its group word stands ahead of
+    it. The read copied the words ahead of each printer word, which costs
+    quadratic time on a command that repeats one. The one-pass read must give
+    the same verdict."""
+
+    @staticmethod
+    def old_read(words):
+        # The line before the one-pass read, kept here ONLY as the reference for equal output.
+        groups = worker_transcript.GCLOUD_TOKEN_PRINTER_GROUPS
+        return any(groups[word] in words[:index] for index, word in enumerate(words) if word in groups)
+
+    def test_the_one_pass_read_gives_the_old_verdict(self):
+        import itertools
+
+        # Each list of 1 to 5 words from the printers, their group words, and
+        # words that only look like one of them.
+        units = sorted(worker_transcript.GCLOUD_TOKEN_PRINTER_GROUPS) + ["auth", "config", "authx", "print-access-tokens"]
+        withheld = 0
+        for length in range(1, 6):
+            for words in itertools.product(units, repeat=length):
+                verdict = worker_transcript._token_printer_behind_its_group(words)
+                self.assertEqual(verdict, self.old_read(words), words)
+                withheld += verdict
+        # Both verdicts occur, so the comparison is of a read that decides.
+        self.assertGreater(withheld, 1000)
+        self.assertFalse(worker_transcript._token_printer_behind_its_group(("print-access-token", "auth")))
+        self.assertFalse(worker_transcript._token_printer_behind_its_group(("config", "print-access-token")))
+        self.assertTrue(worker_transcript._token_printer_behind_its_group(("auth", "x", "print-identity-token")))
+
+    def test_a_run_of_printer_words_reads_in_linear_time(self):
+        # The words of one simple command that repeats a printer word 48000
+        # times. The first two lists have no group word; the third has the
+        # group word of another printer ahead. The old read needs about 6 s of
+        # CPU time for each of the three; the one-pass read needs 0.01 s for
+        # all four lists. The last list has the printer's own group word
+        # ahead, so each read withholds it at the first printer word. The
+        # bound is on CPU time, as in the other linear-time tests of this file.
+        import time
+
+        def walk(words):
+            budget = [worker_transcript.MAX_READ_CHARS_FLOOR] * worker_transcript.READ_COUNT
+            return worker_transcript._words_print_token_or_environment(words, 0, budget)
+
+        for words, withheld in (
+            (["echo"] + ["print-access-token"] * 48000, False),
+            (["echo"] + ["config-helper"] * 48000, False),
+            (["echo", "config"] + ["print-identity-token"] * 48000, False),
+            (["echo", "auth"] + ["print-access-token"] * 48000, True),
+        ):
+            with self.subTest(words=words[:3]):
+                start = time.process_time()
+                self.assertEqual(walk(words), withheld)
+                self.assertLess(time.process_time() - start, 1.0)
+
+
+class TestLongSimpleCommandIsWithheld(unittest.TestCase):
+    """A line that holds a simple command longer than `MAX_SIMPLE_COMMAND_CHARS`
+    is withheld with no read: one very long shell word costs each reader
+    quadratic time in `shlex`. A line of many short commands and no comment,
+    however long, keeps its verdict. The line is cut as it is and with its
+    comments off."""
+
+    LIMIT = worker_transcript.MAX_SIMPLE_COMMAND_CHARS
+    UNIT = "gh ab cde oc "
+
+    def test_the_limit_is_on_one_simple_command_and_is_strict(self):
+        at_the_limit = "echo " + "a" * (self.LIMIT - len("echo "))
+        self.assertEqual(self.LIMIT, 65536)
+        self.assertEqual(len(at_the_limit), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(at_the_limit))
+        self.assertTrue(worker_transcript.command_reads_a_secret(at_the_limit + "a"))
+        # The wrapper that the feed, the bench record and the replay proxy call gives the same verdict.
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": at_the_limit + "a"})))
+        # One long simple command among short ones withholds the line; one at the limit does not.
+        self.assertTrue(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "a" + "; pwd"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "; pwd"))
+        # A separator inside quotes ends no simple command: the quoted body is one piece.
+        quoted_body = "printf '%s' '" + "one line; of a body\n" * (self.LIMIT // 20 + 1) + "' > notes.txt"
+        self.assertTrue(worker_transcript.command_reads_a_secret(quoted_body))
+        # A line longer than the limit, of simple commands that are each short, is read.
+        many_short = "\n".join(["echo ok"] * (self.LIMIT // 4))
+        self.assertGreater(len(many_short), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_short))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_short + "\nprintenv"))
+
+    def test_a_command_of_a_real_size_is_served(self):
+        # Commands of 11 KB and of 37 KB, well below the limit, are served.
+        for command in (
+            "echo " + self.UNIT * 850,
+            "printf '%s' '" + self.UNIT * 2850 + "' > notes.txt",
+        ):
+            with self.subTest(length=len(command)):
+                self.assertLess(len(command), self.LIMIT)
+                self.assertFalse(worker_transcript.command_reads_a_secret(command))
+
+    def test_a_very_long_word_is_decided_in_linear_time(self):
+        # 270 KB to 1 MB in one shell word: quoted, with the quote not closed,
+        # a quoted body with line breaks, with no quote, behind a comment with
+        # an apostrophe, and short commands behind such a comment. With no
+        # limit, `shlex` needs 1 s to 8 s of CPU time for each; the limit
+        # decides each after one or two cuts of the line, in 0.1 s or less. The
+        # bound is on CPU time, as in the other linear-time tests of this file.
+        import time
+
+        for command in (
+            "echo '" + self.UNIT * 80000 + "'",
+            "echo '" + self.UNIT * 80000,
+            "cat > notes.txt <<< '" + "line of a file body\n" * 52000 + "'",
+            "echo " + "ghabcdeoc/" * 40000,
+            # An apostrophe in a comment: the cut of the line as it is gives short
+            # pieces, and the cut with the comments off gives the long quoted body.
+            "echo ok # don't stop\nprintf '%s' '" + "reset the dataset; abc def\n" * 10000 + "' > notes.txt",
+            # Short commands behind that comment: only the cut of the line as it
+            # is gives the long piece, because the apostrophe opens a quote there.
+            "echo ok # don't stop\n" + "\n".join(["echo ok"] * 70000),
+        ):
+            with self.subTest(command=command[:24]):
+                start = time.process_time()
+                self.assertTrue(worker_transcript.command_reads_a_secret(command))
+                self.assertLess(time.process_time() - start, 1.0)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
@@ -1924,6 +2104,26 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get pods -fdb=1.yaml -o yaml",
         "kubectl get pods -Rf=db.yaml -o yaml",
         "kubectl --unknown-global-flag=x get pods",
+        # a credential read from the metadata server: each host and address,
+        # each client, an account by its name, the path behind a variable, a
+        # brace list, another version of the tree, upper case, a command that
+        # only prints the read
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        "curl -s -H Metadata-Flavor:Google http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity?audience=x",
+        "wget -qO- --header Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://metadata.goog/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://metadata:80/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://169.254.169.252:988/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s 'http://[fd20:ce::254]/computeMetadata/v1/instance/service-accounts/default/token'",
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/{email,scopes,token}',
+        "curl -s http://metadata/computeMetadata/v1beta1/instance/service-accounts/default/token",
+        "CURL -S HTTP://METADATA.GOOGLE.INTERNAL/COMPUTEMETADATA/V1/INSTANCE/SERVICE-ACCOUNTS/DEFAULT/TOKEN",
+        'curl -s -H "metadata-flavor: google" "$MD/instance/service-accounts/builder@p.iam.gserviceaccount.com/token?scopes=x"',
+        'TOKEN=$(curl -s -H "Metadata-Flavor: Google" "$MD/instance/service-accounts/default/token" | jq -r .access_token)',
+        'kubectl exec p -- curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        "python3 -c \"import urllib.request as u; print(u.urlopen(u.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor': 'Google'})).read())\"",
+        "bash -c 'curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/identity'",
+        "echo curl -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -2002,6 +2202,25 @@ class TestSecretReadDetector(unittest.TestCase):
         "vault kv list secret/",
         "vault kv metadata get secret/db",
         "sops --version",
+        # the metadata server's paths that hold no credential, and a
+        # credential path with no sign of the metadata server
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/cluster-name',
+        "grep -rn instance/service-accounts/default/token docs/ | grep -v metadata/",
+        "grep -rn instance/service-accounts/default/token docs/metadata/",
+        "grep -rn instance/service-accounts/default/token docs/169-254-169-254.md",
+        # text that only looks like the credential path, with no sign and
+        # with one; the path with a host that only looks like a sign
+        "grep -rn service-accounts/default/token docs/",
+        "grep -rn service-accounts/default/token docs/ # metadata.goog",
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/tokens',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/xtoken',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ docs/token',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -o token',
+        "curl -s http://metadata2/computeMetadata/v1/instance/service-accounts/default/token",
     ]
 
     def test_covers_every_output_form(self):
@@ -2011,6 +2230,53 @@ class TestSecretReadDetector(unittest.TestCase):
         for cmd in self.SERVED_COMMANDS:
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_a_metadata_sign_counts_anywhere_on_the_line(self):
+        """The rule reads the whole text of the command: the sign of the
+        metadata server and the credential path can stand in two of its
+        simple commands, and on two of its lines."""
+        path = '"$MD/instance/service-accounts/default/token"'
+        for line in (
+            "MD=http://metadata.google.internal/computeMetadata/v1; curl -s " + path,
+            "MD=http://169.254.169.254/computeMetadata/v1 && curl -s " + path,
+            "H='Metadata-Flavor: Google'\ncurl -s -H \"$H\" " + path,
+            "curl -s " + path + " \\\n  -H 'Metadata-Flavor: Google'",
+            "curl -s " + path + " | jq . ; echo metadata.goog",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+        # Control: the same lines with no sign are served.
+        for line in ("MD=http://localhost:8080/v1; curl -s " + path, "curl -s " + path + " | jq ."):
+            with self.subTest(line=line):
+                self.assertFalse(worker_transcript.command_reads_a_secret(line))
+
+    def test_a_run_of_metadata_words_reads_in_linear_time(self):
+        # 390 KB or more of credential paths with no sign, of signs with no
+        # path, and of each part cut short. The path pattern starts from fixed
+        # text and reads to the next `/` or blank; the sign pattern is fixed
+        # text. One search of each needs at most 0.01 s of CPU time here. The
+        # bound is on the two searches of the rule, and on CPU time, as in the
+        # other linear-time tests of this file.
+        import time
+
+        for text, path, sign in (
+            ("instance/service-accounts/default/token " * 10000, True, False),
+            ("instance/service-accounts/" * 16000, False, False),
+            ("instance/service-accounts/" + "x" * 400000, False, False),
+            ("instance/service-accounts/default/toke " * 10000, False, False),
+            ("instance/service-accounts/default/" + "x" * 400000, False, False),
+            ("instance/service-accounts/default/{email,scopes} " * 8000, False, False),
+            ("Metadata-Flavor: Google http://metadata.google.internal/ " * 8000, False, True),
+            ("//metadata.x //metadata-x metadata.goo 169.254.169.25 " * 8000, False, False),
+        ):
+            with self.subTest(text=text[:40]):
+                start = time.process_time()
+                found = (
+                    bool(worker_transcript.METADATA_CREDENTIAL_PATH_RE.search(text)),
+                    bool(worker_transcript.METADATA_SERVER_SIGN_RE.search(text)),
+                )
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(found, (path, sign))
 
     # A command that prints a token or the environment (#5484).
     TOKEN_AND_ENVIRONMENT_PRINTS = [

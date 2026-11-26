@@ -173,6 +173,7 @@ func buildA2ACuratorServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 }
 
 // buildA2ACuratorDeployment builds the credential-free curator Deployment.
+// reconcileA2ACurator adds the curator's inference gateway key, once served.
 func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aCuratorName(agent)
 	selector := a2aCuratorPodSelector(agent)
@@ -362,6 +363,9 @@ func (r *PlatformAgentReconciler) reconcileA2ACurator(ctx context.Context, agent
 	}
 	sa := buildA2ACuratorServiceAccount(agent)
 	dep := buildA2ACuratorDeployment(agent)
+	// The curator class's inference gateway key, once the gateway serves it
+	// (inference_key_callers.go): the one Secret the curator reads.
+	withInferenceKeyEnv(&dep.Spec.Template.Spec, a2aCuratorContainer, inferenceKeyCallersFrom(ctx), inferenceKeyClassCurator, curatorInferenceKeyEnv)
 	objs := []client.Object{sa}
 	if !busHeld {
 		objs = append(objs, dep)

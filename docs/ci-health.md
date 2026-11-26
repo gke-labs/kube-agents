@@ -1576,7 +1576,8 @@ observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gatew
 status.readyReplicas eq 2: observed 0`); for an absent one, the runner's
 warning that the fixture is not there (never planted, or no cluster for its
 slot), a rollout the next reconcile finishes; for one not ready (the orphaned-snapshot
-roles, which the GCE compute audit ignores for 91 days), the `ready_after_hours` line
+roles, which the GCE compute audit ignores for 91 days, and the finished-Job family, which the
+waste audit ignores for 7), the `ready_after_hours` line
 with the time the clock passes (`… 240.0 hours old; ready at 2027-02-15T…`), read and
 in shape, which no re-apply moves and the drift condition never counts; for one not checked, why (the reader
 could not be impersonated, the runner could not list or reach the cluster, its
@@ -1589,7 +1590,7 @@ which this document does not carry; the note is judged at lease time by the
 presubmit and the nightly, never here, and a stale note surfaces as
 `fixture-drift:<role>` on their runs, with the replace command's printer in
 the drift line. The digest's fixture line and `health.json`'s `fixture_state` block carry
-drifted, absent and unread roles only, so a project whose two snapshots are young reads
+drifted, absent and unread roles only, so a project whose two snapshots or three finished Jobs are young reads
 there as every fixture in its designed state; the document's `summary` and each project's
 carry `not_ready` beside the other counts. `summary` counts projects, projects checked (at least one role
 read, or seen absent), projects with drift, projects with an absent role, and roles by state. `previous` is the prior
@@ -1739,7 +1740,7 @@ The verifier is the one implementation; the scan runs it and reads its report.
 `forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project with provider `gemini` in their eval-model pair (`docs/ci-pool-projects.md` 5.10); a lane whose pair names `vertex_ai` does not read the key. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
-Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache and candidate-image reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
 (`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
@@ -1782,8 +1783,8 @@ or more calls; `reason` says which.
 `roles/storage.bucketViewer`, `roles/compute.networkViewer` and `roles/dns.reader` on each
 project (`POOL_STATE_READER_ROLES` in the
 verifier; together they cover every read the scan's checks make, and none writes;
-the one read outside the project, the warm-cache repository's policy in the Prow
-project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
+the reads outside the project, the warm-cache and candidate-image repositories' policies in the
+Prow project, are the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
 grants them (`pool_state_readers`), so a project gets them from its fleet apply and
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or

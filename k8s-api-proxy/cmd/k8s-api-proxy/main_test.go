@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -362,6 +364,14 @@ func TestBuildHandlerStandaloneBridgeEndToEnd(t *testing.T) {
 }
 
 func TestBuildHandlerRejectsConflictingOrInvalidFlags(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile, emptyFile, absentFile := filepath.Join(dir, "token"), filepath.Join(dir, "empty"), filepath.Join(dir, "absent")
+	if err := os.WriteFile(tokenFile, []byte("upstream-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(emptyFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	base := proxyConfig{
 		listenAddr:    "127.0.0.1:18443",
 		listenAddrSet: true,
@@ -447,12 +457,75 @@ func TestBuildHandlerRejectsConflictingOrInvalidFlags(t *testing.T) {
 		{
 			name:    "upstream-url with exclude-host-cluster-id",
 			mutate:  func(c *proxyConfig) { c.excludeHostCluster = "gke_proj_us-central1_c" },
-			wantMsg: "--upstream-url cannot be combined with --scope-file or --exclude-host-cluster-id",
+			wantMsg: "--upstream-url cannot be combined with --scope-file, --hold-file or --exclude-host-cluster-id",
+		},
+		{
+			name:    "upstream-url with hold-file",
+			mutate:  func(c *proxyConfig) { c.holdFile = "/etc/hold.json" },
+			wantMsg: "--upstream-url cannot be combined with --scope-file, --hold-file",
 		},
 		{
 			name:    "invalid upstream-url",
 			mutate:  func(c *proxyConfig) { c.upstreamURL = "ftp://127.0.0.1:21" },
 			wantMsg: "static upstream transport",
+		},
+		{
+			name:    "upstream-token-file over plain http",
+			mutate:  func(c *proxyConfig) { c.upstreamTokenFile = tokenFile },
+			wantMsg: "with a bearer token file",
+		},
+		{
+			name:    "upstream-ca-file over plain http",
+			mutate:  func(c *proxyConfig) { c.upstreamCAFile = tokenFile },
+			wantMsg: "with a CA file",
+		},
+		{
+			name: "upstream-token-file without upstream-url",
+			mutate: func(c *proxyConfig) {
+				c.upstreamURL = ""
+				c.upstreamTokenFile = tokenFile
+			},
+			wantMsg: "--" + upstreamTokenFileFlag + " and --" + upstreamCAFileFlag + " require --" + upstreamURLFlag,
+		},
+		{
+			name: "upstream-ca-file without upstream-url",
+			mutate: func(c *proxyConfig) {
+				c.upstreamURL = ""
+				c.upstreamCAFile = tokenFile
+			},
+			wantMsg: "--" + upstreamTokenFileFlag + " and --" + upstreamCAFileFlag + " require --" + upstreamURLFlag,
+		},
+		{
+			name: "upstream-token-file that cannot be read at startup",
+			mutate: func(c *proxyConfig) {
+				c.upstreamURL = "https://127.0.0.1:18443"
+				c.upstreamTokenFile = absentFile
+			},
+			wantMsg: "bearer token file",
+		},
+		{
+			name: "upstream-token-file that is empty at startup",
+			mutate: func(c *proxyConfig) {
+				c.upstreamURL = "https://127.0.0.1:18443"
+				c.upstreamTokenFile = emptyFile
+			},
+			wantMsg: "is empty",
+		},
+		{
+			name: "upstream-ca-file that cannot be read at startup",
+			mutate: func(c *proxyConfig) {
+				c.upstreamURL = "https://127.0.0.1:18443"
+				c.upstreamCAFile = absentFile
+			},
+			wantMsg: "static upstream CA file",
+		},
+		{
+			name: "upstream-ca-file without a certificate",
+			mutate: func(c *proxyConfig) {
+				c.upstreamURL = "https://127.0.0.1:18443"
+				c.upstreamCAFile = tokenFile
+			},
+			wantMsg: "static upstream CA file",
 		},
 	}
 

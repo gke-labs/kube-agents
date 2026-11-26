@@ -403,6 +403,18 @@ human or an external tool recovers a run's id set with no pod access. The identi
 remediation pull request bodies keeps both its write and its read, because reconciliation has to
 work from the live pull request list, which humans change between runs.
 
+### Shadow streams
+
+A shadow run (`start` and `finish` with `--store-only`, #5623) is a canary beside the job it may
+replace. It writes its report to the store and nothing else: no ledger, no forge or git write, no
+remediation and no chat. Its envelopes go to a stream of their own, so two runs of one audit never
+move each other's baseline: the triggering schedule's name when the worker exports it
+(`PROFILE_TRIGGER_STREAM`), or `<audit>-shadow` for a run started by hand. They are stored under the
+install's own store key, which is the one key the broker lets a profile write to, and the stream is
+the trigger's stream, as the broker also requires. A shadow envelope carries `shadow: true`, the
+stream, and `shadow_summary`, the summary a live run would have posted. The store is a shadow run's
+only output, so a write that fails fails the run.
+
 ## 5. Liveness
 
 Whether a run is in flight comes from the lease `start` takes — the in-flight note
@@ -447,6 +459,14 @@ directory, so one the stream stopped publishing to keeps its last row, unflagged
 deletes `<audit-id>/<owner>/<name>/` from the store. `report_status.py` therefore imports nothing outside the standard
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
+
+A shadow run's stream (#5623) holds a canary's results, not a live audit's. `report_status.project`
+leaves it out and counts it as `shadow_hidden`, so the board snapshot and the status view never show
+it, and `report_query.py` leaves it out of `streams` and refuses a question about one of its runs,
+unless `--include-shadow` asks for it. That flag is for the canary's comparison and its eval, never
+for an answer to a person. A stream is a shadow run's when its newest envelope carries `shadow: true`,
+which is enough because a shadow run never writes to a live audit's stream. The broker's raw routes
+don't filter; a reader that goes around these two must check the key itself.
 
 ## 7. Rejected alternatives
 

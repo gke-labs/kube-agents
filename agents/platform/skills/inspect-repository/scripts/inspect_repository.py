@@ -63,10 +63,14 @@ DEFAULT_MAX_BYTES = vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES
 # The broker's refusal of a `paths` entry that names nothing at the revision.
 PATH_NOT_FOUND = "PATH_NOT_FOUND"
 
-# The folder under the scratch directory that holds every clone's staging, and
-# nothing else. The script owns it, so a sweep of it removes no file of the
-# caller's.
+# The start of the name of each folder under the scratch directory that holds
+# clone staging, and nothing else. The script owns these folders, so a sweep of
+# them removes no file of the caller's. The bare name is the folder that every
+# user shared before; a clone no longer stages there, and the sweep still reads
+# it.
 STAGING_DIR_NAME = ".inspect-repository-staging"
+# Between STAGING_DIR_NAME and the user id, in the name of one user's folder.
+STAGING_USER_SEPARATOR = "-"
 # The name of one clone's staging directory, before mkdtemp's suffix.
 STAGING_PREFIX = "clone."
 
@@ -94,8 +98,35 @@ def default_into(repo: str) -> Path:
 
 
 def staging_root() -> Path:
-    """The folder that holds every clone's staging, beside `scratch_root()`."""
-    return scratch_root().parent / STAGING_DIR_NAME
+    """The folder that holds the caller's clone staging, beside `scratch_root()`.
+
+    One folder for each user. A root `kubectl exec` and the agent user write to
+    the same volume, and a folder that one of them made is not writable for the
+    other, so a shared folder made every later clone of the other user fail.
+    """
+    return scratch_root().parent / f"{STAGING_DIR_NAME}{STAGING_USER_SEPARATOR}{os.getuid()}"
+
+
+def is_staging_name(name: str) -> bool:
+    """True for the shared folder's name and for the name of a user's folder."""
+    if name == STAGING_DIR_NAME:
+        return True
+    prefix = STAGING_DIR_NAME + STAGING_USER_SEPARATOR
+    suffix = name[len(prefix):]
+    # A user id is ASCII digits; `isdigit` alone is also true for other scripts' digits.
+    return name.startswith(prefix) and suffix.isascii() and suffix.isdigit()
+
+
+def staging_folders() -> list[Path]:
+    """Each staging folder that exists: the shared one and every user's.
+
+    A symbolic link with one of these names is not listed as a staging folder.
+    """
+    try:
+        entries = list(staging_root().parent.iterdir())
+    except OSError:
+        return []
+    return sorted(p for p in entries if is_staging_name(p.name) and p.is_dir() and not p.is_symlink())
 
 
 def prepare_destination(into: Path, force: bool) -> Path:
@@ -120,23 +151,25 @@ def remove_stale_staging() -> None:
     """Remove the staging directories that an earlier clone left.
 
     A clone removes its staging directory in a `finally`, which a SIGKILL does
-    not run. Every staging directory is in `staging_root()`, so each entry
-    there that is older than STALE_STAGING_AGE_SECONDS is removed, whatever
-    its name. Nothing outside that folder is removed. A missing folder or a
-    failure here does not stop the clone.
+    not run. Every staging directory is in one of `staging_folders()`, so each
+    entry there that is older than STALE_STAGING_AGE_SECONDS is removed,
+    whatever its name. Nothing outside those folders is removed. A missing
+    folder, another user's folder that the caller cannot read, or a failure
+    here does not stop the clone.
     """
     cutoff = time.time() - STALE_STAGING_AGE_SECONDS
-    try:
-        entries = list(staging_root().iterdir())
-    except OSError:
-        return
-    for path in entries:
+    for folder in staging_folders():
         try:
-            # `rmtree` refuses a symbolic link, so a link is never followed.
-            if path.is_dir() and path.lstat().st_mtime < cutoff:
-                shutil.rmtree(path, ignore_errors=True)
+            entries = list(folder.iterdir())
         except OSError:
             continue
+        for path in entries:
+            try:
+                # `rmtree` refuses a symbolic link, so a link is never followed.
+                if path.is_dir() and path.lstat().st_mtime < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
 
 
 def copy_over(staging: Path, into: Path) -> None:
@@ -208,14 +241,16 @@ def clone_content(args) -> int:
     """
     remove_stale_staging()
     target = Path(args.into).expanduser() if args.into else default_into(args.repo)
-    # The sweep removes what sits in staging_root(), so a copy there would be
-    # removed an hour later.
-    resolved, root_resolved = target.resolve(), staging_root().resolve()
-    if resolved == root_resolved or root_resolved in resolved.parents:
-        raise SystemExit(
-            f"{target} is in {staging_root()}, which holds only clone staging. "
-            "Name a directory outside it with --into."
-        )
+    # The sweep removes what sits in a staging folder, the caller's or another
+    # user's, so a copy there would be removed an hour later.
+    resolved, scratch = target.resolve(), staging_root().parent
+    scratch_resolved = scratch.resolve()
+    for path in (resolved, *resolved.parents):
+        if path.parent == scratch_resolved and is_staging_name(path.name):
+            raise SystemExit(
+                f"{target} is in {scratch / path.name}, which holds only clone staging. "
+                "Name a directory outside it with --into."
+            )
     into = prepare_destination(target, args.force)
     paths = [args.prefix] if args.prefix else None
     root = staging_root()

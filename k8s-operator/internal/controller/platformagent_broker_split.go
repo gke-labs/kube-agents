@@ -239,7 +239,7 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	// audiences, and with Chat armed by CREDENTIAL_PROXY_A2A_CHAT_CALLERS
 	// as well, so it reaches no other role.
 	callers = append(callers, a2aGatewayBrokerCaller(agent))
-	// The session pods' caller exists only under the cluster-view flag. It is
+	// The session pods' caller exists only under the session pods' cluster view. It is
 	// held to the session role by CREDENTIAL_PROXY_SESSION_CALLERS, which
 	// buildCredentialProxyEnv renders beside it: the broker refuses this
 	// ServiceAccount every audience but the session one, and the session
@@ -265,6 +265,11 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, owned brokerCaller
 	}
 	if a2aCuratorEnabled() {
 		callers = append(callers, a2aCuratorBrokerCaller(agent))
+	}
+	// The Teams inbound receiver, while it runs: held to the teams-inbound
+	// audience by CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS, rendered beside it.
+	if teamsInboundEnabled(agent) {
+		callers = append(callers, teamsInboundBrokerCaller(agent))
 	}
 	return strings.Join(callers, ",")
 }

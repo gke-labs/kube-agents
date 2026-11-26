@@ -1,0 +1,63 @@
+# WHAT THIS MEASURES: how long `/session` conversations take when several run
+# at once and each fans out read-only cluster reads (#7014). A session pod
+# hands each cluster read to the `cluster` AgentProfile as a child task, and
+# those children run only on that profile's warm pool; with one pod there,
+# children queue behind each other for minutes, and a turn that delegates
+# often delegates four at once.
+#
+# The [bench:burst-reads] directive (bench/kube_agents_bench/burst_reads.py)
+# has the harness run the ask on 1, then 3, then 6 conversations at once
+# through the inject door, one level after the other, cancelling anything
+# still running at AGENT_INJECT_TIMEOUT before the next level starts. The pass
+# is completion: every conversation of every level ended completed. The
+# answers are not graded; the record of each level (conversation keys, task
+# ids, terminal states, submit and end times) is the harness_burst_reads
+# entry's arguments in the results file, which bench/tools/child_queue_time.py
+# reads beside the gateway and dispatcher logs for the children's queue time
+# per level.
+#
+# HOW IT RUNS: by hand, in held presubmit twins (one on the base, one on the
+# fix) that restrict the smoke to this case, so nothing else holds session
+# workers or the cluster pool. It is in no roster file (KNOWN_UNREGISTERED in
+# scripts/validate_bench_cases.py): six concurrent sessions, each delegating
+# to a one-pod pool, would hold a lane for most of an hour.
+#
+# TRANSPORT: inject only, against a `spec.mode: next` install with the
+# AgentProfile dispatcher and profiles.cluster, where `/session ...` reaches a
+# session pod. The api transport refuses the directive. A session cap below 6
+# is infrastructure before anything is sent, as is a conversation the gateway
+# queues or refuses, one no executor takes, and a door outage. The lanes'
+# write safeguard (no pull request or branch written) is appended to this
+# case as to every other; the ask writes nothing.
+id: session-burst-cluster-reads
+name: Concurrent sessions that each fan out cluster reads all complete
+prompt: |-
+  [bench:burst-reads] levels=1,3,6
+  /session For each cluster in the fleet, ask the cluster agent for that cluster, all at the same time, how many nodes it has and which pods in any namespace are not Running or Succeeded. Then give me one line per cluster with the node count and the pods that are not running. This is read-only: change nothing.
+expected_output: >-
+  One line per cluster in the fleet, each with that cluster's node count and
+  the pods that are not Running or Succeeded (or that there are none), read
+  from the clusters through the cluster agent. Nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a fleet question a session hands to the
+# cluster agent.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+verification_spec:
+  # Every conversation of every level ended completed: a conversation still
+  # running at the deadline (its children queued behind the pool) fails it.
+  - name: every-conversation-completed
+    role: objective
+    # assert, not the converge default: the record is fixed once the run
+    # ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["harness_burst_reads"]
+      require_success: true
