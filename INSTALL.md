@@ -1663,7 +1663,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
      `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record doesn't decode (logged first as `notify: session record unreadable`). A record that couldn't be read in time gets `the conversation's record couldn't be read in time; not posted` instead, which the sender retries.
-  2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer carries `I couldn't save this conversation's details, so the result of any work I started that's still running won't be posted here on its own. Ask me about it later to get it.`
+  2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer carries `I couldn't save this conversation's details, so the result of any work I started that's still running won't be posted here on its own. If you need it, ask me about it later.`
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'
      ```

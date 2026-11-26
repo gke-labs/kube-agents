@@ -54,7 +54,7 @@ const (
 	// running". It is user text (.agents/rules/chat_ux.md): it names no card
 	// or route, and its next step needs no route, since a later turn answers
 	// a question about the work from the board, and files no second card.
-	routeLostNote = "\n\nI couldn't save this conversation's details, so the result of any work I started that's still running won't be posted here on its own. Ask me about it later to get it."
+	routeLostNote = "\n\nI couldn't save this conversation's details, so the result of any work I started that's still running won't be posted here on its own. If you need it, ask me about it later."
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
