@@ -463,19 +463,6 @@ FIXTURE_NOT_READY = {
         "and a privileged pod that lowers kernel.pid_max, which is not on the fleet and which no "
         "issue plans"
     ),
-    # Needs the order of two times on one node: a workload container that
-    # starts before a per-node agent's pod is Ready. That order is evidence
-    # only on a node made after the agent's DaemonSet, and a workload's restart
-    # resets it. The fleet's pools make a node only at an upgrade or a repair,
-    # and its two zero-node pools are read by other cases as empty; the cost,
-    # not tried, is a pool of its own with one standing small node. The first
-    # plan's signal, a label only a fixture writes, is not a fixture (fixture
-    # rule 9). #5411 owns the gap and proposes the first plan's check.
-    "node-kubelet-startup-admission-race": (
-        "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
-        "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
-        "tried, is a pool of its own with one standing small node whose two times stay readable"
-    ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the
     # kubectl cost table's fleet tier. No pool project carries one.
