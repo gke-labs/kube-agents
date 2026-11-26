@@ -259,6 +259,13 @@ type TeamsAdapter struct {
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
 	countInterval time.Duration
+	// typing is the conversations with a task running or an ask open,
+	// each with the loop that keeps Teams's typing indicator on while only
+	// the ask is (teams_typing.go);
+	// typingInterval and typingMax pace and bound it (tests shorten both).
+	typing         map[string]*teamsTyping
+	typingInterval time.Duration
+	typingMax      time.Duration
 }
 
 // NewTeamsAdapter builds the adapter against the credential proxy's relay
@@ -272,17 +279,20 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		return nil, fmt.Errorf("teams: relay token path is required")
 	}
 	return &TeamsAdapter{
-		relayURL:      strings.TrimSuffix(relayURL, "/"),
-		tokenPath:     tokenPath,
-		tenantID:      strings.TrimSpace(tenantID),
-		adaptiveCards: adaptiveCards,
-		client:        &http.Client{Timeout: teamsRelayTimeout},
-		log:           log,
-		seen:          map[string]bool{},
-		serviceURLs:   map[string]string{},
-		rated:         map[string]teamsRated{},
-		allowed:       map[string]bool{},
-		countInterval: teamsEventCountInterval,
+		relayURL:       strings.TrimSuffix(relayURL, "/"),
+		tokenPath:      tokenPath,
+		tenantID:       strings.TrimSpace(tenantID),
+		adaptiveCards:  adaptiveCards,
+		client:         &http.Client{Timeout: teamsRelayTimeout},
+		log:            log,
+		seen:           map[string]bool{},
+		serviceURLs:    map[string]string{},
+		rated:          map[string]teamsRated{},
+		allowed:        map[string]bool{},
+		countInterval:  teamsEventCountInterval,
+		typing:         map[string]*teamsTyping{},
+		typingInterval: teamsTypingInterval,
+		typingMax:      teamsTypingMax,
 	}, nil
 }
 
@@ -700,10 +710,13 @@ func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("teams: encoding activity: %w", err)
 	}
+	a.quietTyping(conversation)
 	raw, err := a.apiPost(context.Background(), http.MethodPost, endpoint, payload)
+	a.quietTyping(conversation)
 	if err != nil {
 		return "", err
 	}
+	a.typingShown(conversation, false)
 	var body struct {
 		Response struct {
 			ID string `json:"id"`
@@ -837,8 +850,11 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	if err != nil {
 		return fmt.Errorf("teams: encoding activity update: %w", err)
 	}
-	_, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload)
-	return err
+	if _, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload); err != nil {
+		return err
+	}
+	a.typingShown(conversation, true)
+	return nil
 }
 
 // PostMessage and EditMessage post text only: a chat message falls back to

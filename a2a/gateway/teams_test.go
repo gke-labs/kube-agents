@@ -379,10 +379,13 @@ type fakeTeamsRelay struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 
-	event      map[string]any
-	pulled     bool
-	acks       []string
-	apiCall    []map[string]any
+	event   map[string]any
+	pulled  bool
+	acks    []string
+	apiCall []map[string]any
+	// typing holds the typing-indicator posts, apart from apiCall, so a
+	// test that counts the adapter's messages is not moved by them.
+	typing     []map[string]any
 	tokens     []string
 	pullStatus int
 	apiStatus  int
@@ -416,6 +419,16 @@ func newFakeTeamsRelay(t *testing.T, event map[string]any) *fakeTeamsRelay {
 			f.acks = append(f.acks, body["receipt"].(string))
 			_ = json.NewEncoder(w).Encode(map[string]any{"settled": true})
 		case teamsRelayAPIPath:
+			if payload, _ := body["payload"].(map[string]any); payload["type"] == teamsTypingActivityType {
+				f.typing = append(f.typing, body)
+				if f.apiStatus != 0 {
+					w.WriteHeader(f.apiStatus)
+					_ = json.NewEncoder(w).Encode(f.apiBody)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"response": map[string]any{}})
+				return
+			}
 			f.apiCall = append(f.apiCall, body)
 			if f.apiStatus != 0 {
 				w.WriteHeader(f.apiStatus)

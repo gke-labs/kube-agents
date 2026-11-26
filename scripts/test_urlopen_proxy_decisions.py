@@ -108,6 +108,7 @@ DECISIONS = (
     Decision(SCRIPTS + "broker_admission.py", "<module>._OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._METADATA_OPENER", BUILD_OPENER, REFUSES, REFUSE, METADATA, "a link-local address must never go through a proxy"),
     Decision(SCRIPTS + "credential_proxy.py", "ServiceAccountAuthenticator._review", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
+    Decision(SCRIPTS + "credential_proxy.py", "PodAddressBinding._read_pod", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "SlackRelay.download", BUILD_OPENER, TAKES, KEEP, "slack.com", PUBLIC_HOST),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._TEAMS_OPENER", BUILD_OPENER, TAKES, KEEP, "the Microsoft identity and Bot Framework hosts", PUBLIC_HOST),
     Decision(SCRIPTS + "dial_state.py", "<module>._BROKER_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, "an in-cluster http call with the broker token"),
