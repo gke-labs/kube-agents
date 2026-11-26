@@ -832,7 +832,14 @@ fixtures:
     available_from_day: 0
     objects:
       - gatewayclass/seeded-unaccepted-gw
+      - gateway/seeded-unaccepted-gateway
+      - httproute/seeded-unaccepted-route
+      - gatewayclass/seeded-envoy
+    namespace: seeded-shapes
     defect: >-
-      Cluster-scoped GatewayClass referencing example.com/unsupported-controller
-      so no controller accepts it (#1982, #7097). Carries no Gateway, HTTPRoute,
-      or Pods.
+      Cluster-scoped GatewayClass seeded-unaccepted-gw referencing
+      example.com/unsupported-controller so no controller accepts it, with
+      Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route
+      in seeded-shapes bound to it (zero Pods or Services provisioned).
+      GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as
+      the accepted-class negative control on the same cluster.

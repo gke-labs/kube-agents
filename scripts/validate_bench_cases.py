@@ -434,7 +434,7 @@ FIXTURE_NOT_READY = {
     # until the postsubmit fleet reconcile applies unaccepted-gateway-class
     # across the pool projects, after which a follow-up moves it to nightly-cases.txt.
     "networking-unaccepted-gatewayclass": (
-        "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw) applied to every pool project by the postsubmit fleet reconcile"
+        "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw, gateway/seeded-unaccepted-gateway, httproute/seeded-unaccepted-route) applied to every pool project by the postsubmit fleet reconcile"
     ),
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of

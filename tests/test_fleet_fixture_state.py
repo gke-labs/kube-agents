@@ -744,7 +744,10 @@ def _healthy_world() -> dict:
                 {"type": "Accepted", "status": "True", "reason": "Accepted"},
                 {"type": "Programmed", "status": "False", "reason": "NoResources"},
             ]}},
+            "gatewayclass/seeded-envoy": {"status": {"conditions": [{"type": "Accepted", "status": "True", "reason": "Accepted"}]}},
             "gatewayclass/seeded-unaccepted-gw": {"spec": {"controllerName": "example.com/unsupported-controller"}},
+            "gateway/seeded-unaccepted-gateway": {"spec": {"gatewayClassName": "seeded-unaccepted-gw"}},
+            "httproute/seeded-unaccepted-route": {"spec": {"parentRefs": [{"name": "seeded-unaccepted-gateway"}]}},
             "pod?app=storefront": {"items": []},
             "pod?app.kubernetes.io/name=envoy": {"items": []},
             "configconnector/configconnector.core.cnrm.cloud.google.com": {"spec": {"mode": "namespaced"}, "status": {"healthy": True}},
@@ -3088,7 +3091,7 @@ class MissingReservationComputeClassRoleTest(_Harness):
         done = self.run_script(world)
         assert set(self.drift_files()) == {self.ROLE}, done.stderr
         assert f'{_RESERVED_CCC} spec.priorities[0].reservations.affinity eq "Specific": observed nothing' in self.drift_files()[self.ROLE]
-        assert "60 role(s) in their designed state, 1 drifted" in done.stderr, done.stderr
+        assert "61 role(s) in their designed state, 1 drifted" in done.stderr, done.stderr
 
     def test_the_stack_plants_the_class_that_the_role_asserts(self):
         stack = (_REPO / "bench" / "tf" / "fleet" / "defects-c.tf").read_text()
@@ -3232,6 +3235,46 @@ class ReportTest(_Harness):
         done = self.run_script(_healthy_world())
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(list(self.tmp.glob("*.json")), [self.world])
+
+
+class UnacceptedGatewayClassRoleTest(_Harness):
+    """The unaccepted-gateway-class fixture and its accepted-class negative control."""
+
+    ROLE = "unaccepted-gateway-class"
+
+    def test_each_healed_or_detached_mutation_is_drift(self):
+        def accepted_class(k):
+            k["gatewayclass/seeded-unaccepted-gw"]["status"] = {
+                "conditions": [{"type": "Accepted", "status": "True", "reason": "Accepted"}]
+            }
+
+        def repointed_controller(k):
+            k["gatewayclass/seeded-unaccepted-gw"]["spec"]["controllerName"] = "networking.gke.io/gateway"
+
+        def repointed_gateway(k):
+            k["gateway/seeded-unaccepted-gateway"]["spec"]["gatewayClassName"] = "seeded-envoy"
+
+        def detached_route(k):
+            k["httproute/seeded-unaccepted-route"]["spec"]["parentRefs"] = [{"name": "storefront-edge"}]
+
+        def missing_negative_control_accepted(k):
+            k["gatewayclass/seeded-envoy"]["status"] = {
+                "conditions": [{"type": "Accepted", "status": "False", "reason": "Invalid"}]
+            }
+
+        for defect, expected_substring in (
+            (accepted_class, 'gatewayclass/seeded-unaccepted-gw status.conditions[?(@.type==\'Accepted\')].status none_eq "True"'),
+            (repointed_controller, 'gatewayclass/seeded-unaccepted-gw spec.controllerName eq "example.com/unsupported-controller"'),
+            (repointed_gateway, 'gateway/seeded-unaccepted-gateway spec.gatewayClassName eq "seeded-unaccepted-gw"'),
+            (detached_route, 'httproute/seeded-unaccepted-route spec.parentRefs[*].name any_eq "seeded-unaccepted-gateway"'),
+            (missing_negative_control_accepted, 'gatewayclass/seeded-envoy status.conditions[?(@.type==\'Accepted\')].status any_eq "True"'),
+        ):
+            with self.subTest(defect=defect.__name__):
+                world = _healthy_world()
+                defect(world["kubectl"])
+                done = self.run_script(world)
+                assert set(self.drift_files()) == {self.ROLE}, done.stderr
+                assert expected_substring in self.drift_files()[self.ROLE], self.drift_files()[self.ROLE]
 
 
 if __name__ == "__main__":
