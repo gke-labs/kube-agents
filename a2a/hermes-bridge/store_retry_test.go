@@ -270,3 +270,35 @@ func TestAMarkedStoreIsTriedOnceWhileTheAPIServerAnswers(t *testing.T) {
 		t.Fatal("mark cleared while the store still refuses and the API server answers")
 	}
 }
+
+// A store refused for a whole window while the API server refuses too is
+// not marked down: the container is still restarting.
+func TestAStoreIsNotMarkedDownWhileTheContainerRestarts(t *testing.T) {
+	b := retryBridge(freeLoopbackAddr(t), 300*time.Millisecond)
+	b.cfg.APIURL = "http://" + freeLoopbackAddr(t) + "/v1/chat/completions"
+	if err := b.putRoute(testCtx(t), "a2a-ctx-down", conversationRoute{Platform: lib.NotifyPlatformSlack, Conversation: "slack:dm/D1"}); err == nil {
+		t.Fatal("putRoute = nil with nothing listening")
+	}
+	if b.storeDown.Load() {
+		t.Fatal("store marked down while the API server also refuses")
+	}
+}
+
+// An API URL without a port is checked on its scheme's default port.
+func TestTheAPIServerCheckUsesTheSchemesDefaultPort(t *testing.T) {
+	for in, want := range map[string]string{
+		"http://127.0.0.1:8642/v1/chat/completions": "127.0.0.1:8642",
+		"http://localhost/v1/chat/completions":      "localhost:80",
+		"https://agent.example/v1":                  "agent.example:443",
+		"http://[::1]/v1":                           "[::1]:80",
+	} {
+		if got, ok := apiDialAddr(in); !ok || got != want {
+			t.Errorf("apiDialAddr(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"", "not a url", "ftp://host/x"} {
+		if got, ok := apiDialAddr(in); ok {
+			t.Errorf("apiDialAddr(%q) = %q, want none", in, got)
+		}
+	}
+}

@@ -418,9 +418,13 @@ func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(
 			b.cfg.Logger.Info("the agent container is restarting; retrying the session store")
 		}
 		if time.Now().After(giveUp) {
-			b.storeDown.Store(true)
-			b.cfg.Logger.Warn("the session store refused connections for the whole retry window; later requests try once until it answers",
-				"window", b.cfg.APIConnectRetry, "err", err)
+			// Marked down only with the API server up: a container still
+			// restarting gets the full retry on its next request too.
+			if !b.apiServerRefusing() {
+				b.storeDown.Store(true)
+				b.cfg.Logger.Warn("the session store refused connections for the whole retry window; later requests try once until it answers",
+					"window", b.cfg.APIConnectRetry, "err", err)
+			}
 			return nil, nil, err
 		}
 		select {
@@ -431,17 +435,37 @@ func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(
 	}
 }
 
+// apiDefaultPorts are the ports an API URL without one names, by scheme.
+var apiDefaultPorts = map[string]string{apiURLSchemeHTTP: "80", apiURLSchemeHTTPS: "443"}
+
+// apiDialAddr is the host:port an API URL is served on, its scheme's
+// default port when it names none.
+func apiDialAddr(apiURL string) (string, bool) {
+	u, err := url.Parse(apiURL)
+	if err != nil || u.Hostname() == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = apiDefaultPorts[u.Scheme]
+	}
+	if port == "" {
+		return "", false
+	}
+	return net.JoinHostPort(u.Hostname(), port), true
+}
+
 // apiServerRefusing reports whether a connection to the API server is
 // refused, which tells a restarting agent container (the store and the API
 // server both down) from a session-kv process that died while the container
 // runs on (the API server up). Anything else, an unparsable URL included,
 // reads as not refusing.
 func (b *Bridge) apiServerRefusing() bool {
-	u, err := url.Parse(b.cfg.APIURL)
-	if err != nil || u.Host == "" {
+	addr, ok := apiDialAddr(b.cfg.APIURL)
+	if !ok {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", u.Host, apiConnectRetryInterval)
+	conn, err := net.DialTimeout("tcp", addr, apiConnectRetryInterval)
 	if err == nil {
 		_ = conn.Close()
 		return false
