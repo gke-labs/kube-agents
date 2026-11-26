@@ -62,8 +62,8 @@ signals are worth:
   adapter already copies up to 200 characters of a harness stdout line that it cannot decode
   into its own log line, as a value.
 - The platform's own tool record has the same limit: the platform agent's process writes it.
-- A profile task can read the log lines of a profile pod today, through a Cloud Logging read on
-  the broker's exec route. See "Who can read these lines".
+- The log lines of a profile pod are in the container logs of the profile namespace. "Who can
+  read these lines" has the rule for a log read by the profile role.
 
 So nothing that a profile pod writes is a record of authority. For what a task did with a
 credential, the broker's record is the only record that the pod cannot write; its `request_id` on
@@ -104,7 +104,7 @@ B is the option that declares it for each profile.
 | Log lines              | The adapter's stderr through the node log agent, with no sidecar. The platform's sidecar exists only because Hermes writes files. Each line gets the run keys.                                                                                                                                                                                                                                                                                                                                      | None.                                                                                                                                                                                                   | The adapter's logger.                                 |
 | The harness's stderr   | Stays a 2048-byte tail in the failure reason. It can hold tenant text.                                                                                                                                                                                                                                                                                                                                                                                                                              | None.                                                                                                                                                                                                   | Nothing.                                              |
 | Credentialed calls     | The broker's audit record, on each route that the profile role reaches: also the version-control route, the MCP relay and the audit-report store. It gets keys of its own for the profile, the task and the trigger, from the verified credential.                                                                                                                                                                                                                                                  | None.                                                                                                                                                                                                   | The broker's audit record.                            |
-| The activity of a task | The adapter writes each activity entry also as a log line. It is a trail of what the worker says it did, with the limits of "What a profile pod can forge". See the next section.                                                                                                                                                                                                                                                                                                                   | None.                                                                                                                                                                                                   | The adapter.                                          |
+| The activity of a task | The adapter writes the per-tool line of the hooks design, at the start of a tool call and at its result. It is a trail of what the worker says it did, with the limits of "What a profile pod can forge". See the next section.                                                                                                                                                                                                                                                                     | None.                                                                                                                                                                                                   | The adapter.                                          |
 | Messages               | No new record. The task's messages stay on the bus, and the delivery of a result has its own records.                                                                                                                                                                                                                                                                                                                                                                                               | None.                                                                                                                                                                                                   | Nothing.                                              |
 | The join of one task   | The task id and the `correlationId` in each log line of the adapter, the dispatcher and the gateway. This needs no exporter. The broker record carries the task id; see "The task keys" for its join.                                                                                                                                                                                                                                                                                               | None.                                                                                                                                                                                                   | The adapter, the dispatcher, the gateway, the broker. |
 | Spans                  | Spans for a task and its hops, from the gateway and the dispatcher. No span from inside the worker (question 2).                                                                                                                                                                                                                                                                                                                                                                                    | An egress rule for those two to the collector in the cluster. The gateway's egress policy has none today. The operator renders no policy that selects the dispatcher's pods; the chart was not checked. | The gateway, the dispatcher, the operator's policies. |
@@ -139,61 +139,52 @@ The requester keys follow
 
 ### The activity of a task
 
-The activity entry is the tool and its input today. The open draft pull request
-[#6796](https://github.com/gke-labs/kube-agents/pull/6796) (not merged at `be60d590d`) changes it to
-the tool and a short title, with a scrub at the source and no arguments. This design assumes that
-form. If #6796 changes or does not merge, the log line needs a scrub of its own before it ships.
+Decided by bnaylor on 2026-11-26
+([#7308](https://github.com/gke-labs/kube-agents/issues/7308)): one line for a tool call.
+
+The adapter's per-tool line is the one line for a tool call. The hooks design (pull request
+[#7253](https://github.com/gke-labs/kube-agents/pull/7253), open, not merged) owns its source and
+its fields; this design owns its task keys and how it ships. This line is the trail of this
+design, and the adapter copies no activity entry to stderr.
+
+Rows 2 and 3 of the hooks design give the line, which that design calls the per-tool record. The
+adapter writes it at the start of a tool call and at its result, with the task id, a call id, the
+tool's name, the status, the duration that the adapter measures, and the skill's name when the tool
+is the harness's skill tool. The line holds no result, and no tool input apart from that skill's
+name. It ships as each adapter line does: stderr and the node log agent, with the keys of "The task
+keys".
+
+The activity entry stays on the bus, and this design does not change it.
 
 What the trail is and is not:
 
 - It is the worker's own word. It has the trust of the platform's tool record, and it is not an
   audit record. It does not use the `audit_event` key, so no reader takes it for one.
-- It has the start of a call only. The driver of the adapter emits an end event for each tool step
-  today (`EventToolResult`), with no name of the call and no result, and the adapter does not
-  publish it. A line for the end and a duration is possible from it. A result, or an event from a
-  hook, is a question of the hooks group
-  ([#6671](https://github.com/gke-labs/kube-agents/issues/6671)), not of this document. The design
-  of that group is pull request [#7253](https://github.com/gke-labs/kube-agents/pull/7253) (open,
-  not merged).
+- Its source, a result and an event from a hook are questions of the hooks group
+  ([#6671](https://github.com/gke-labs/kube-agents/issues/6671)), not of this document.
 - A script run has its own line and no activity entry.
 - The Admin Console reads audit records from the platform agent's namespace. Profile work does
   not show there under this proposal (question 5).
-- A profile task can read the lines of this trail today. See "Who can read these lines".
-
-Open for the decider: one line for a tool call. The hooks design (pull request
-[#7253](https://github.com/gke-labs/kube-agents/pull/7253), open, not merged) proposes in its rows 2
-and 3 an adapter line when a tool call starts and when its result is in: the task id, a call id, the
-tool, the status and the duration, with no input and no result. With the trail of this document, the
-adapter then writes two lines for one call, with different fields. With a yes to one line, this
-document changes so:
-
-- The line for a tool call is the line of the hooks design. That design owns its source and its
-  fields. This design owns its keys ("The task keys") and how it ships: stderr and the node log
-  agent.
-- This document's trail row becomes that line, and the adapter copies no activity entry to
-  stderr.
-- The scrubbed title of #6796 is in the line only if row 3 of the hooks design is answered "no".
+- By the rule of "Who can read these lines", a log read by the profile role does not return the
+  lines of this trail.
 
 ### Who can read these lines
 
-A profile task can run `gcloud logging read` on the broker's exec route today, held to the project
-of its task. So a task whose target project is the install's project reads the container logs of the
-profile namespace and of the platform namespace now: the adapter's lines, its copy of undecoded
-harness output, and the failure reasons. The task need not be on the same profile. The
-broker-surface design (pull request [#7120](https://github.com/gke-labs/kube-agents/pull/7120),
-open, not merged) has a row for this read.
+Decided by bnaylor on 2026-11-26
+([#7308](https://github.com/gke-labs/kube-agents/issues/7308)): a log read by the profile role does
+not return the container logs of the profile namespace or of the platform namespace. The lines of
+this document are in those logs: the adapter's lines, its copy of undecoded harness output, and
+the failure reasons.
 
-Option A adds no network rule, but each line that it ships lands in that reach.
+- The broker already rewrites the filter of a logging read, on the exec route and on the Cloud
+  API relay, to drop the entries of an excluded cluster. We propose the same rewrite as the means
+  of this rule on each route that gives the profile role a log read, with a conformance row for
+  each.
+- A duty that must read the install's own logs gets a grant of its own.
 
-Open for the decider: the reads of these lines through Cloud Logging. The broker already rewrites
-the filter of a logging read, to drop the entries of an excluded cluster. With a yes to the same
-rewrite for these lines, this document changes so:
-
-- The rewrite drops the container logs of the profile namespace and of the platform namespace
-  for the profile role, with a conformance row, and "Done when" gets that line.
-- A duty that must read the install's own logs then needs a grant of its own.
-
-With a no, the reach stays, and it is one more cost of option A under question 1.
+The broker-surface design ([`profile-broker-surface.md`](profile-broker-surface.md)) proposes to
+grant the Logging reads of the Cloud API relay to each profile. This rule applies to that route
+also.
 
 ### What the platform has and this proposal does not give
 
@@ -239,9 +230,10 @@ bus.
 
 For the security approver:
 
-Each question has our recommendation after it. Two more points are open for the decider in the
-text, each with what a yes changes: one line for a tool call ("The activity of a task"), and the
-reads through Cloud Logging ("Who can read these lines").
+Each question has our recommendation after it. Two more points were open for the decider in the
+text. bnaylor decided both on 2026-11-26
+([#7308](https://github.com/gke-labs/kube-agents/issues/7308)): one line for a tool call ("The
+activity of a task"), and the scope of log reads ("Who can read these lines").
 
 1. The issue asks for telemetry that the operator declares for each profile. Is option A accepted
    in place of that, with the losses of "What the platform has and this proposal does not give"?
@@ -251,9 +243,10 @@ reads through Cloud Logging ("Who can read these lines").
    rule in the profile namespace? Recommendation: the gateway and the dispatcher.
 3. Is the broker's record the record of authority for profile work, and does it get a record on
    the version-control route, the MCP relay and the audit-report store? Recommendation: yes.
-4. Is the activity trail on stderr wanted, given that it is the worker's own word? The other
-   choices are no trail outside the bus, or an exporter on the bus (option C). Recommendation:
-   yes.
+4. Is the per-tool line wanted as the trail on stderr, given that it is the worker's own word?
+   The decision on one line for a tool call makes it the only trail, and row 2 of the hooks design
+   is the same question. The other choices are no trail outside the bus, or an exporter on the bus
+   (option C). Recommendation: yes.
 5. Does the Admin Console show profile work in this group? Recommendation: no; later, from the
    broker's record.
 6. Is a scrape of the dispatcher right, or must a profile pod have a scrape target of its own?
@@ -278,8 +271,8 @@ For #6674:
   a test for each part.
 - A call of a profile task on each broker route that the profile role reaches has a broker audit
   record with keys for the profile and the task, with a test.
-- The adapter writes each activity entry as a log line with the task keys, with a test; or the
-  approver's "no" to question 4 is recorded here.
+- The adapter writes the per-tool line of the hooks design with the task keys, and copies no
+  activity entry to stderr, with a test; or the approver's "no" to question 4 is recorded here.
 - The gateway and the dispatcher export a span for a task and its hops, and their egress rule is
   named here; or the approver's "none" to question 2 is recorded here.
 - The dispatcher exports a task counter by profile, tier, kind and end, and one health rule reads
@@ -287,11 +280,9 @@ For #6674:
 - The NetworkPolicy of the profile namespace has no new rule, or each new rule is named here with
   the approver's decision and has a conformance row.
 - The open fact has an answer from an install where a profile worker pod ran.
-- With a yes to one line for a tool call: the adapter writes the line of the hooks design with
-  the task keys, and copies no activity entry to stderr.
-- With a yes to the rewrite: a logging read of the profile role does not return the container
-  logs of the profile namespace and of the platform namespace, with a conformance row.
+- A log read by the profile role does not return the container logs of the profile namespace or
+  of the platform namespace, with a conformance row.
 
-What these lines need from other work: the broker lines change `credential_proxy.py`, so they take
-their turn in the order of work on that file. The activity trail assumes the entry form of #6796
-(open, not merged) and changes the same file as that pull request.
+What these lines need from other work: the broker lines and the log-read line change
+`credential_proxy.py`, so they take their turn in the order of work on that file. The per-tool line
+waits for the hooks design (pull request #7253, open, not merged).
