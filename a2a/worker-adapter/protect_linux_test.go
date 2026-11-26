@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"syscall"
 	"testing"
 )
 
@@ -59,4 +60,14 @@ func TestProtectProcessMakesTheEnvironUnreadableToChildren(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("child: %v\n%s", err, out)
 	}
+}
+
+// unprotectProcess makes this process dumpable again, undoing
+// protectProcess, so a test that protected the test process leaves it as it
+// found it.
+func unprotectProcess() error {
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetDumpable, 1, 0); errno != 0 {
+		return errno
+	}
+	return nil
 }
