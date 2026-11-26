@@ -189,14 +189,18 @@ AUDITS: dict[str, AuditSpec] = {
             "webhook-backend-unreachable",
             "serviceentry-host-collision",
             "webhook-ca-bundle-expired",
+            "wi-gsa-iam-binding-unverifiable",
         ),
-        # The two compliance checks that judge a posture an owner may choose:
+        # The three compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
         # (2.6, the zero-policy and partial-coverage shapes, which name the
         # namespace; the allow-all shape names the policy and is a fault),
-        # and a workload that needs the API token the default ServiceAccount
-        # mounts (2.7). Every other check is a fault no declaration excuses.
-        declarable=("netpol-missing", "default-sa-automount"),
+        # a workload that needs the API token the default ServiceAccount
+        # mounts (2.7), and a Workload Identity ServiceAccount annotation
+        # pointing into a central-IAM project outside this install's read
+        # scope (2.19, `ServiceAccount/<name>`). Every other check is a fault
+        # no declaration excuses.
+        declarable=("netpol-missing", "default-sa-automount", "wi-gsa-iam-binding-unverifiable"),
     ),
     "security-patch-orchestrator": AuditSpec(
         "Upgrade & Patch Readiness Audit",
@@ -1271,6 +1275,7 @@ CHECK_PHRASES = {
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
     "webhook-ca-bundle-expired": "{object} has an expired or expiring webhook CA bundle",
+    "wi-gsa-iam-binding-unverifiable": "{object} names a Google service account this install cannot vouch for",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -2214,6 +2219,12 @@ MTU_PEERING_CHECK = "mtu-packet-fragmentation"
 NETWORKING_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     MTU_PEERING_CHECK: frozenset({"networkpeering"}),
 }
+# Compliance 2.21 (`wi-gsa-iam-binding-unverifiable`) names the annotated
+# ServiceAccount and nothing else: a `Namespace/` or `Cluster/` declaration
+# cannot excuse an entire namespace or cluster of Workload Identity bindings.
+COMPLIANCE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    "wi-gsa-iam-binding-unverifiable": frozenset({"serviceaccount"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
@@ -2224,6 +2235,7 @@ DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
     **COMPUTE_DECLARABLE_OBJECT_KINDS,
     **NETWORKING_DECLARABLE_OBJECT_KINDS,
+    **COMPLIANCE_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -10582,8 +10594,9 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
     A check with fixed object kinds accepts only those
-    (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
-    the compute snapshot check and the networking peering check). The two
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check,
+    the compute snapshot check, the networking peering check, and the
+    compliance ServiceAccount check). The two
     controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's

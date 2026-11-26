@@ -127,6 +127,11 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 			cl := testClient(t, url)
 			session, taskID := "chat-callid-"+c.name, "task-callid-"+c.name
 			submit(t, cl, session, taskID, "look")
+			if c.driver != nil {
+				// core-agent's PrepareTurn wants the adapter as the
+				// container's init; this stands in for it.
+				useRespawnScope(t)
+			}
 			cfg := adapterConfig(url, taskID, session, stub(t, c.script))
 			// The core-agent driver checks it is the container's init before
 			// every process; a test stands in for that (useRespawnScope).

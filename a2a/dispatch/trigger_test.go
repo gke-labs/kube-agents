@@ -297,7 +297,9 @@ func TestATriggeredTaskWithNoChangeRequestCarriesNoPermitOnAJob(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			b := newBus(t, "job-task-1")
 			b.ensure("inv", 2, 0, "unattended")
-			w := b.worker("inv", "unattended", "job-task-1", answerAccept, time.Second)
+			// The fake worker runs for 50 ms, so the 10 s wait for the terminal
+			// below is a far backstop for a hang, not a limit on speed.
+			w := b.worker("inv", "unattended", "job-task-1", answerAccept, 50*time.Millisecond)
 			ti := unattendedInstall(2, nil)
 			ti.pool.Set("inv", "unattended", "job-task-1")
 			ti.pool.SetUID("inv", "unattended", "job-task-1", "uid-0")

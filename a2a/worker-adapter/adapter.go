@@ -984,6 +984,8 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
+	// The harness's own log lines (stdout chatter, refused tool calls) name
+	// the task.
 	// A harness with its own wall-clock bound gets it from the task's
 	// deadline less the kill grace, so it ends the turn with a result
 	// before the adapter stops it.
@@ -991,8 +993,6 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	if b, ok := drv.(turnBudgeter); ok {
 		firstArgv = b.WithTurnBudget(argv, cfg.TaskDeadline-cfg.KillGrace)
 	}
-	// The harness's own log lines (stdout chatter, refused tool calls) name
-	// the task.
 	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 	if err != nil {
 		state := lib.StateFailed
