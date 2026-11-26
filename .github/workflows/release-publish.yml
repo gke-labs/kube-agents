@@ -196,24 +196,26 @@ jobs:
       # reader. The promotion below reads the candidate registry and writes
       # the release version beside the commit there, and writes the release to
       # the additional registry, on the same login.
+      #
+      # The hosts come first and from the script, which writes one only for a
+      # variable whose host is an Artifact Registry Docker host and fails on
+      # one that only looks like it: every step below sends the access token
+      # to a host named here, or does not run.
+      - name: Resolve the Artifact Registry hosts
+        id: artifact-registry-hosts
+        run: ./scripts/release/resolve_artifact_registry_hosts.sh
+
       - name: Authenticate to Google Cloud for the Artifact Registry repositories
         id: artifact-registry-auth
-        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/') || contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')
+        if: steps.artifact-registry-hosts.outputs.candidate != '' || steps.artifact-registry-hosts.outputs.additional != ''
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           token_format: access_token
           workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
           service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
 
-      - name: Resolve the Artifact Registry hosts
-        id: artifact-registry-hosts
-        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/') || contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')
-        run: |
-          echo "candidate=${CANDIDATE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"
-          echo "additional=${ADDITIONAL_RELEASE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"
-
       - name: Log in to the candidate registry
-        if: contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/')
+        if: steps.artifact-registry-hosts.outputs.candidate != ''
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ steps.artifact-registry-hosts.outputs.candidate }}
@@ -221,7 +223,7 @@ jobs:
           password: ${{ steps.artifact-registry-auth.outputs.access_token }}
 
       - name: Log in to the additional release registry
-        if: contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')
+        if: steps.artifact-registry-hosts.outputs.additional != ''
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ steps.artifact-registry-hosts.outputs.additional }}

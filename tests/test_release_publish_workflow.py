@@ -43,14 +43,14 @@ _ARTIFACT_REGISTRY_HOSTS_STEP = "Resolve the Artifact Registry hosts"
 _CANDIDATE_LOGIN_STEP = "Log in to the candidate registry"
 _ADDITIONAL_LOGIN_STEP = "Log in to the additional release registry"
 _ARTIFACT_REGISTRY_LOGIN_STEPS = (
-    _ARTIFACT_REGISTRY_AUTH_STEP,
     _ARTIFACT_REGISTRY_HOSTS_STEP,
+    _ARTIFACT_REGISTRY_AUTH_STEP,
     _CANDIDATE_LOGIN_STEP,
     _ADDITIONAL_LOGIN_STEP,
 )
-_CANDIDATE_IS_ARTIFACT_REGISTRY = "contains(vars.CANDIDATE_REGISTRY_PREFIX, '-docker.pkg.dev/')"
-_ADDITIONAL_IS_ARTIFACT_REGISTRY = "contains(vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX, '-docker.pkg.dev/')"
-_EITHER_IS_ARTIFACT_REGISTRY = f"{_CANDIDATE_IS_ARTIFACT_REGISTRY} || {_ADDITIONAL_IS_ARTIFACT_REGISTRY}"
+_HOSTS_SCRIPT = "./scripts/release/resolve_artifact_registry_hosts.sh"
+_CANDIDATE_HOST = "steps.artifact-registry-hosts.outputs.candidate"
+_ADDITIONAL_HOST = "steps.artifact-registry-hosts.outputs.additional"
 _ACCESS_TOKEN = "${{ steps.artifact-registry-auth.outputs.access_token }}"
 
 
@@ -291,27 +291,30 @@ class RegistryWiringTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertLess(positions[-1], first_read)
 
-    def test_each_step_runs_only_for_the_artifact_registry_repository_it_serves(self):
-        self.assertEqual(self._step(_ARTIFACT_REGISTRY_AUTH_STEP).get("if"), _EITHER_IS_ARTIFACT_REGISTRY)
-        self.assertEqual(self._step(_ARTIFACT_REGISTRY_HOSTS_STEP).get("if"), _EITHER_IS_ARTIFACT_REGISTRY)
-        self.assertEqual(self._step(_CANDIDATE_LOGIN_STEP).get("if"), _CANDIDATE_IS_ARTIFACT_REGISTRY)
-        self.assertEqual(self._step(_ADDITIONAL_LOGIN_STEP).get("if"), _ADDITIONAL_IS_ARTIFACT_REGISTRY)
-
-    def test_docker_logs_in_to_each_variable_s_host_with_the_minted_token(self):
-        auth = self._step(_ARTIFACT_REGISTRY_AUTH_STEP)
+    def test_the_hosts_come_from_the_script_before_any_credential_exists(self):
+        """The script validates each host; the workflow tests no variable itself."""
         hosts = self._step(_ARTIFACT_REGISTRY_HOSTS_STEP)
+        self.assertEqual(hosts["id"], "artifact-registry-hosts")
+        self.assertEqual(hosts["run"], _HOSTS_SCRIPT)
+        self.assertNotIn("if", hosts)
+        self.assertLess(self.names.index(_ARTIFACT_REGISTRY_HOSTS_STEP), self.names.index(_ARTIFACT_REGISTRY_AUTH_STEP))
+        for step in self.steps:
+            self.assertNotIn("docker.pkg.dev", str(step.get("if", "")), step.get("name"))
+
+    def test_each_step_runs_only_for_a_host_the_script_resolved(self):
+        self.assertEqual(
+            self._step(_ARTIFACT_REGISTRY_AUTH_STEP).get("if"), f"{_CANDIDATE_HOST} != '' || {_ADDITIONAL_HOST} != ''"
+        )
+        self.assertEqual(self._step(_CANDIDATE_LOGIN_STEP).get("if"), f"{_CANDIDATE_HOST} != ''")
+        self.assertEqual(self._step(_ADDITIONAL_LOGIN_STEP).get("if"), f"{_ADDITIONAL_HOST} != ''")
+
+    def test_docker_logs_in_to_the_resolved_host_with_the_minted_token(self):
+        auth = self._step(_ARTIFACT_REGISTRY_AUTH_STEP)
         self.assertEqual(auth["id"], "artifact-registry-auth")
         self.assertEqual(auth["with"]["token_format"], "access_token")
-        self.assertEqual(
-            hosts["run"].splitlines(),
-            [
-                'echo "candidate=${CANDIDATE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"',
-                'echo "additional=${ADDITIONAL_RELEASE_REGISTRY_PREFIX%%/*}" >> "$GITHUB_OUTPUT"',
-            ],
-        )
-        for name, output in ((_CANDIDATE_LOGIN_STEP, "candidate"), (_ADDITIONAL_LOGIN_STEP, "additional")):
+        for name, host in ((_CANDIDATE_LOGIN_STEP, _CANDIDATE_HOST), (_ADDITIONAL_LOGIN_STEP, _ADDITIONAL_HOST)):
             login = self._step(name)
-            self.assertEqual(login["with"]["registry"], f"${{{{ steps.{hosts['id']}.outputs.{output} }}}}")
+            self.assertEqual(login["with"]["registry"], f"${{{{ {host} }}}}")
             self.assertEqual(login["with"]["username"], "oauth2accesstoken")
             self.assertEqual(login["with"]["password"], _ACCESS_TOKEN)
 
