@@ -179,7 +179,9 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
 	stderr := &tailBuffer{max: stderrTailBytes}
-	cmd.Stderr = stderr
+	// The tail is kept for a failed turn's reason; refused tool calls the
+	// harness reports go to the worker's log as well (refusalLines).
+	cmd.Stderr = io.MultiWriter(stderr, &refusalLines{log: log})
 	// WaitDelay bounds every reap. A descendant that left the process group
 	// survives the group kill and can hold stderr open, and Wait reads stderr
 	// to EOF, so without a bound Wait blocks until that descendant exits.

@@ -1,0 +1,47 @@
+2026-10-07T02:18:01.644315+00:00 startup-fail-seeded google_guest_agent_manager[669]: Cloud Logging Client Error: rpc error: code = Unauthenticated desc = transport: per-RPC creds failed due to error: credentials: cannot fetch token: metadata: GCE metadata "instance/service-accounts/default/token?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Flogging.write" not defined
+2026-10-07T02:18:02.504133+00:00 startup-fail-seeded systemd[1]: Started google-guest-agent-manager.service - Google Compute Engine Guest Agent Plugin Manager.
+2026-10-07T02:18:02.507510+00:00 startup-fail-seeded google_guest_agent_manager[669]: Google Guest Agent (version: "20260715.00") Initialized...
+2026-10-07T02:18:02.521224+00:00 startup-fail-seeded systemd[1]: Starting google-startup-scripts.service - Google Compute Engine Startup Scripts...
+2026-10-07T02:18:02.526190+00:00 startup-fail-seeded systemd[1]: Starting ssh.service - OpenBSD Secure Shell server...
+2026-10-07T02:18:02.607735+00:00 startup-fail-seeded systemd[1]: Started ssh.service - OpenBSD Secure Shell server.
+2026-10-07T02:18:02.626217+00:00 startup-fail-seeded google_guest_agent[691]: Status check for unit "nscd.service" completed with: exit status 4; Unit nscd.service could not be found.#012, defaulting to true
+2026-10-07T02:18:02.626349+00:00 startup-fail-seeded google_guest_agent[691]: Restarting service: "nscd"
+2026-10-07T02:18:02.652525+00:00 startup-fail-seeded google_guest_agent[691]: Status check for unit "unscd.service" completed with: exit status 4; Unit unscd.service could not be found.#012, defaulting to true
+2026-10-07T02:18:02.652725+00:00 startup-fail-seeded google_guest_agent[691]: Restarting service: "unscd"
+2026-10-07T02:18:02.691186+00:00 startup-fail-seeded google_guest_agent[691]: Restarting service: "systemd-logind"
+2026-10-07T02:18:02.704237+00:00 startup-fail-seeded systemd[1]: Stopping systemd-logind.service - User Login Management...
+2026-10-07T02:18:02.727310+00:00 startup-fail-seeded google_compat_metadata_script_runner[829]: Initialized Metadata Script Runner Compat (version 20260715.00)
+2026-10-07T02:18:02.729450+00:00 startup-fail-seeded google_compat_metadata_script_runner[829]: Enable core plugin set to: [true], launching script runner for event "startup" from "/usr/bin/gce_metadata_script_runner"
+2026-10-07T02:18:02.745290+00:00 startup-fail-seeded systemd[1]: systemd-logind.service: Deactivated successfully.
+2026-10-07T02:18:02.745774+00:00 startup-fail-seeded systemd[1]: Stopped systemd-logind.service - User Login Management.
+2026-10-07T02:18:02.765015+00:00 startup-fail-seeded systemd[1]: Starting modprobe@drm.service - Load Kernel Module drm...
+2026-10-07T02:18:02.770041+00:00 startup-fail-seeded systemd[1]: modprobe@drm.service: Deactivated successfully.
+2026-10-07T02:18:02.772135+00:00 startup-fail-seeded systemd[1]: Finished modprobe@drm.service - Load Kernel Module drm.
+2026-10-07T02:18:02.777260+00:00 startup-fail-seeded systemd[1]: Starting systemd-logind.service - User Login Management...
+2026-10-07T02:18:02.827909+00:00 startup-fail-seeded systemd[1]: Started systemd-logind.service - User Login Management.
+2026-10-07T02:18:02.845612+00:00 startup-fail-seeded google_guest_agent[691]: Restarting service: "cron"
+2026-10-07T02:18:02.859397+00:00 startup-fail-seeded systemd[1]: Stopping cron.service - Regular background program processing daemon...
+2026-10-07T02:18:02.860453+00:00 startup-fail-seeded systemd[1]: cron.service: Deactivated successfully.
+2026-10-07T02:18:02.860829+00:00 startup-fail-seeded systemd[1]: Stopped cron.service - Regular background program processing daemon.
+2026-10-07T02:18:02.881737+00:00 startup-fail-seeded systemd[1]: Started cron.service - Regular background program processing daemon.
+2026-10-07T02:18:02.886339+00:00 startup-fail-seeded google_guest_agent[691]: Triggering NSS cache refresh via systemd.
+2026-10-07T02:18:02.901207+00:00 startup-fail-seeded systemd[1]: Starting google-oslogin-cache.service - NSS cache refresh...
+2026-10-07T02:18:02.903693+00:00 startup-fail-seeded google_guest_agent[691]: Creating metric registry for "events_manager" with flush interval: 1m0s, max records: 10
+2026-10-07T02:18:02.920856+00:00 startup-fail-seeded google_oslogin_nss_cache[858]: oslogin_cache_refresh[858]: Refreshing passwd entry cache
+2026-10-07T02:18:02.922223+00:00 startup-fail-seeded google_guest_agent[691]: Cloud logging initialized (core_plugin)
+2026-10-07T02:18:02.957691+00:00 startup-fail-seeded google_oslogin_nss_cache[858]: oslogin_cache_refresh[858]: Refreshing group entry cache
+2026-10-07T02:18:02.964309+00:00 startup-fail-seeded systemd[1]: google-oslogin-cache.service: Deactivated successfully.
+2026-10-07T02:18:02.964496+00:00 startup-fail-seeded systemd[1]: Finished google-oslogin-cache.service - NSS cache refresh.
+2026-10-07T02:18:03.055302+00:00 startup-fail-seeded google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "startup" event
+2026-10-07T02:18:03.058995+00:00 startup-fail-seeded google_metadata_script_runner[845]: Found startup-script in metadata
+2026-10-07T02:18:03.065033+00:00 startup-fail-seeded google_metadata_script_runner[845]: Script "startup-script" failed with error: exit status 1
+2026-10-07T02:18:03.065309+00:00 startup-fail-seeded google_metadata_script_runner[845]: Finished running startup scripts
+2026-10-07T02:18:03.097983+00:00 startup-fail-seeded systemd[1]: google-startup-scripts.service: Deactivated successfully.
+2026-10-07T02:18:03.098252+00:00 startup-fail-seeded systemd[1]: Finished google-startup-scripts.service - Google Compute Engine Startup Scripts.
+2026-10-07T02:18:03.099158+00:00 startup-fail-seeded systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-10-07T02:18:03.099275+00:00 startup-fail-seeded systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-10-07T02:18:03.117067+00:00 startup-fail-seeded systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-10-07T02:18:03.127987+00:00 startup-fail-seeded systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-10-07T02:18:03.128254+00:00 startup-fail-seeded systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-10-07T02:18:03.143944+00:00 startup-fail-seeded systemd[1]: Startup finished in 2.316s (kernel) + 20.375s (userspace) = 22.692s.
+2026-10-07T02:18:08.082699+00:00 startup-fail-seeded google_guest_agent[691]: Cloud Logging Client Error: rpc error: code = Unauthenticated desc = transport: per-RPC creds failed due to error: credentials: cannot fetch token: metadata: GCE metadata "instance/service-accounts/default/token?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Flogging.write" not defined

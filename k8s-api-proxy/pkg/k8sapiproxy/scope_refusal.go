@@ -23,7 +23,19 @@ var scopeRefusalReasons = map[RejectionReason]bool{
 // shows the message rather than "unknown", and as the usual JSON Status elsewhere. The
 // audit and the metrics read the event either way.
 func refuseScope(w http.ResponseWriter, ev *AuditEvent, perr *PolicyError, apiPath string) {
-	if !scopeRefusalReasons[perr.RejectionReason] || !isDiscoveryPath(apiPath) {
+	if !scopeRefusalReasons[perr.RejectionReason] {
+		refuse(w, ev, perr)
+		return
+	}
+	refuseReadably(w, ev, perr, apiPath)
+}
+
+// refuseReadably answers a 403 in the form kubectl can show on apiPath: plain text on a
+// discovery path, the JSON Status elsewhere. It is for a refusal that turns the caller away
+// whatever the request asks (a scope refusal, a Config.Authorize refusal), which a caller
+// meets first on discovery.
+func refuseReadably(w http.ResponseWriter, ev *AuditEvent, perr *PolicyError, apiPath string) {
+	if !isDiscoveryPath(apiPath) {
 		refuse(w, ev, perr)
 		return
 	}

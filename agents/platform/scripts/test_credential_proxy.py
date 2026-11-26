@@ -157,7 +157,7 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # default is None (unbounded). A test that calls `serve` puts them back: a later
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
-_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots", "lifecycle", "readings_sweep")
 
 
 def setUpModule():
@@ -3031,17 +3031,23 @@ class GitHardeningTest(unittest.TestCase):
         self.assertEqual("files", _repo_ref_format(closed))
 
     def test_a_git_file_that_points_to_the_git_directory_is_not_followed(self):
-        """A known limit, held so that a change of it is a decision: a linked worktree, a
-        submodule and a clone with a separate git directory have a `.git` file. The reader
-        does not follow it, so the format reads as `files` and the push is judged as before."""
+        """A linked worktree, a submodule and a clone with a separate git directory have a
+        `.git` file. The reader does not follow it, so the format reads as `files` in each
+        ref format. That answer does not decide a push: the guard refuses a push from such
+        a place before it asks for the format (#7072)."""
         from credential_proxy import _repo_ref_format, git_push_violation
 
         main = self.clone_folder("main-clone", self.REFTABLE_CONFIG)
         linked = Path(self.temp_dir.name) / "linked-worktree"
         linked.mkdir()
-        (linked / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'linked'}\n", encoding="utf-8")
+        # As git writes it: the pointer names a folder whose `commondir` file names the clone's
+        # git directory. A reader that follows the two would find the reftable config.
+        admin = main / ".git" / "worktrees" / "linked"
+        admin.mkdir(parents=True)
+        (admin / "commondir").write_text("../..\n", encoding="utf-8")
+        (linked / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
         self.assertEqual("files", _repo_ref_format(linked))
-        self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=linked))
+        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=linked))
 
     def test_a_byte_that_is_not_utf8_does_not_hide_the_format(self):
         from credential_proxy import _repo_ref_format
@@ -3159,6 +3165,422 @@ class GitHardeningTest(unittest.TestCase):
                     self.skipTest(f"this git cannot make a clone in the {ref_format} ref format")
                 self.assertEqual(0, made.returncode, made.stderr)
                 self.assertEqual(ref_format, _repo_ref_format(clone))
+                to_default = git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=clone) or ""
+                to_work = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=clone)
+                if ref_format == "files":
+                    self.assertIn("protected branch 'release-trunk'", to_default)
+                    self.assertIsNone(to_work)
+                else:
+                    self.assertIn("'reftable' ref format", to_default)
+                    self.assertIn("'reftable' ref format", to_work or "")
+
+    # -- a `.git` that is not a folder (#7072) --------------------------------
+
+    LAYOUT_REFUSAL = (
+        "`git push` is refused: `.git` at the working directory or at a folder above it is not a "
+        "folder (a linked worktree, a submodule, a clone with a separate git directory, or a file or "
+        "a link named `.git`). The broker reads the remote's default branch only under a `.git` "
+        "folder and follows no file or link, so here it cannot tell a push to that branch from another."
+    )
+    GIT_ENTRY_KINDS = (
+        "a pointer file",
+        "a pointer file past the size that the guard reads",
+        "a file with other text",
+        "an empty file",
+        "a link to a `.git` folder",
+        "a link to a pointer file",
+        "a link to nothing",
+    )
+
+    def place_with_a_git_entry(self, name, kind):
+        """A folder whose `.git` is `kind`, written by hand. The clone that a pointer or a
+        link names is beside it: the files ref format, `release-trunk` as the remote's default."""
+        base = Path(self.temp_dir.name)
+        target = self.clone_folder(f"{name}-target", self.FILES_CONFIG, default_branch="release-trunk")
+        place = base / name
+        place.mkdir()
+        entry = place / ".git"
+        pointer = f"gitdir: {target / '.git'}\n"
+        if kind == "a pointer file":
+            entry.write_text(pointer, encoding="utf-8")
+        elif kind == "a pointer file past the size that the guard reads":
+            entry.write_text(pointer + "#" * 8192, encoding="utf-8")
+        elif kind == "a file with other text":
+            entry.write_text("not a pointer\n", encoding="utf-8")
+        elif kind == "an empty file":
+            entry.write_text("", encoding="utf-8")
+        elif kind == "a link to a `.git` folder":
+            entry.symlink_to(target / ".git", target_is_directory=True)
+        elif kind == "a link to a pointer file":
+            (base / f"{name}-pointer").write_text(pointer, encoding="utf-8")
+            entry.symlink_to(base / f"{name}-pointer")
+        elif kind == "a link to nothing":
+            entry.symlink_to(base / f"{name}-absent")
+        else:
+            raise AssertionError(kind)
+        return place
+
+    def test_a_push_from_a_place_whose_git_entry_is_not_a_folder_is_refused_by_name(self):
+        """The guard reads the remote's default branch and the ref format only under a `.git`
+        folder. Where `.git` is a file or a link it cannot tell a push to the default branch
+        from another push, so each push is refused, with one fixed text."""
+        from credential_proxy import GIT_PUSH_LAYOUT_REFUSAL, _git_entry_is_not_a_folder, git_push_violation
+
+        self.assertEqual(self.LAYOUT_REFUSAL, GIT_PUSH_LAYOUT_REFUSAL)
+        pushes = (
+            ["git", "push", "origin", "HEAD:release-trunk"],
+            ["git", "push", "origin", "HEAD:feature"],
+            ["git", "push", "-u", "origin", "platform-agent/work"],
+            ["git", "push", "origin"],
+            ["git", "push"],
+            # Before this check, a push of tags only and a push with no refspec had their own answer.
+            ["git", "push", "--tags", "origin"],
+            ["git", "push", "--force-with-lease", "origin", "+HEAD:feature"],
+        )
+        for number, kind in enumerate(self.GIT_ENTRY_KINDS):
+            place = self.place_with_a_git_entry(f"place-{number}", kind)
+            inside = place / "manifests" / "prod"
+            inside.mkdir(parents=True)
+            for where, cwd in (
+                ("the place", place),
+                ("a folder inside it", inside),
+                ("a path inside it that is not there", place / "absent" / "deeper"),
+            ):
+                self.assertTrue(_git_entry_is_not_a_folder(cwd), f"{kind}, {where}")
+                for argv in pushes:
+                    with self.subTest(git_entry=kind, cwd=where, argv=argv[2:]):
+                        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(argv, cwd=cwd))
+                        # The working directory as text, as the executor's caller sends it.
+                        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(argv, cwd=str(cwd)))
+            # A command that is not a push is not this guard's.
+            for argv in (["git", "status"], ["git", "fetch", "origin"], ["git", "commit", "-m", "push"]):
+                with self.subTest(git_entry=kind, argv=argv[1]):
+                    self.assertIsNone(git_push_violation(argv, cwd=place))
+
+    def test_the_refusals_that_come_before_the_layout_check_keep_their_text(self):
+        from credential_proxy import git_push_violation
+
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        for option in ("--all", "--mirror"):
+            with self.subTest(option=option):
+                self.assertIn(
+                    f"`git push {option}` is refused",
+                    git_push_violation(["git", "push", option, "origin"], cwd=place) or "",
+                )
+
+    def test_a_push_from_a_place_with_a_git_folder_or_with_no_git_entry_is_judged_as_before(self):
+        """The pass-through of the layout check: it refuses nothing where each `.git` is a folder."""
+        from credential_proxy import _git_entry_is_not_a_folder, git_push_violation
+
+        base = Path(self.temp_dir.name)
+        clone = self.clone_folder("clone", self.FILES_CONFIG, default_branch="release-trunk")
+        inside = clone / "manifests"
+        inside.mkdir()
+        no_clone = base / "no-clone"
+        no_clone.mkdir()
+        bare = base / "bare.git"
+        bare.mkdir()
+        (bare / "config").write_text(self.FILES_CONFIG, encoding="utf-8")
+        (bare / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        a_file = clone / "README.md"
+        a_file.write_text("hello\n", encoding="utf-8")
+        for name, cwd in (
+            ("a clone", clone),
+            ("a folder inside a clone", inside),
+            ("a folder with no clone", no_clone),
+            ("a bare layout", bare),
+            ("a path that is a file", a_file),
+            ("a path that is not there", base / "absent" / "deeper"),
+        ):
+            with self.subTest(cwd=name):
+                self.assertFalse(_git_entry_is_not_a_folder(cwd))
+                self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=cwd))
+                self.assertIn(
+                    "protected branch 'main'",
+                    git_push_violation(["git", "push", "origin", "HEAD:main"], cwd=cwd) or "",
+                )
+        for name, cwd in (("a clone", clone), ("a folder inside a clone", inside)):
+            with self.subTest(cwd=name):
+                self.assertIn(
+                    "protected branch 'release-trunk'",
+                    git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=cwd) or "",
+                )
+        # With no working directory the guard reads no folder.
+        with mock.patch.object(credential_proxy.os, "lstat", side_effect=AssertionError("a read with no working directory")):
+            self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"]))
+            self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=""))
+
+    def test_a_git_folder_below_does_not_hide_a_git_entry_that_is_not_a_folder_above(self):
+        """git goes past a `.git` folder that it does not take as a repository, to the folder
+        above. The walk does not stop at a `.git` folder, so such a folder cannot hide the
+        place. The cost is in the last row: a clone that git makes inside such a place is
+        refused too, where git itself uses the clone."""
+        from credential_proxy import _git_entry_is_not_a_folder, git_push_violation
+
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        empty_folder = place / "decoy-empty"
+        (empty_folder / ".git").mkdir(parents=True)
+        folder_with_a_config = place / "decoy-config"
+        (folder_with_a_config / ".git").mkdir(parents=True)
+        (folder_with_a_config / ".git" / "config").write_text(self.FILES_CONFIG, encoding="utf-8")
+        reftable_config = place / "decoy-reftable-config"
+        (reftable_config / ".git").mkdir(parents=True)
+        (reftable_config / ".git" / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        # The entries of a repository, with a `commondir` file that names a path that is not
+        # there: git does not take the folder, and a walk that stops at this shape is hidden.
+        looks_like_a_clone = self.clone_folder("place/decoy-entries", self.FILES_CONFIG, default_branch="harmless")
+        (looks_like_a_clone / ".git" / "HEAD").write_text("ref: refs/heads/work\n", encoding="utf-8")
+        (looks_like_a_clone / ".git" / "objects").mkdir()
+        (looks_like_a_clone / ".git" / "commondir").write_text("../absent\n", encoding="utf-8")
+        real_clone = place / "real-clone"
+        subprocess.run(["git", "init", "--quiet", str(real_clone)], check=True, capture_output=True)
+        self.assertTrue((real_clone / ".git").is_dir())
+        for name, cwd in (
+            ("an empty `.git` folder", empty_folder),
+            ("a `.git` folder with a config file", folder_with_a_config),
+            ("a folder below it", folder_with_a_config / "deeper"),
+            ("a `.git` folder with a config file of another ref format", reftable_config),
+            ("a `.git` folder with the entries of a repository", looks_like_a_clone),
+            ("a clone that git makes", real_clone),
+        ):
+            with self.subTest(below=name):
+                cwd.mkdir(exist_ok=True)
+                self.assertTrue(_git_entry_is_not_a_folder(cwd))
+                for target in ("release-trunk", "feature"):
+                    self.assertEqual(
+                        self.LAYOUT_REFUSAL,
+                        git_push_violation(["git", "push", "origin", f"HEAD:{target}"], cwd=cwd),
+                    )
+        # A folder beside the place is not below it.
+        beside = self.clone_folder("beside", self.FILES_CONFIG)
+        self.assertFalse(_git_entry_is_not_a_folder(beside))
+
+    def test_a_working_directory_that_is_a_link_is_judged_at_the_folder_that_it_names(self):
+        from credential_proxy import git_push_violation
+
+        base = Path(self.temp_dir.name)
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        clone = self.clone_folder("clone", self.FILES_CONFIG)
+        (base / "to-the-place").symlink_to(place, target_is_directory=True)
+        (place / "to-the-clone").symlink_to(clone, target_is_directory=True)
+        push = ["git", "push", "origin", "HEAD:feature"]
+        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(push, cwd=base / "to-the-place"))
+        self.assertIsNone(git_push_violation(push, cwd=place / "to-the-clone"))
+
+    def test_a_git_entry_that_cannot_be_examined_counts_as_not_a_folder(self):
+        clone = self.clone_folder("clone", self.FILES_CONFIG)
+        self.assertFalse(credential_proxy._git_entry_is_not_a_folder(clone))
+        for error in (PermissionError("no permission"), OSError("too many levels of symbolic links")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(credential_proxy.os, "lstat", side_effect=error):
+                self.assertTrue(credential_proxy._git_entry_is_not_a_folder(clone))
+        # No `.git` at a folder, or a path whose parent is a file, is no answer for that folder.
+        for error in (FileNotFoundError(), NotADirectoryError()):
+            with self.subTest(error=type(error).__name__), mock.patch.object(credential_proxy.os, "lstat", side_effect=error):
+                self.assertFalse(credential_proxy._git_entry_is_not_a_folder(clone))
+
+    def test_a_git_entry_of_another_file_type_counts_as_not_a_folder(self):
+        """A FIFO stands for each type that is not a folder, a file or a link. The stand-in
+        for `lstat` gives the FIFO's answer for the `.git` of a place, so there is no FIFO
+        at that path and no reader can wait on it."""
+        base = Path(self.temp_dir.name)
+        os.mkfifo(base / "a-fifo")
+        as_a_fifo = os.lstat(base / "a-fifo")
+        place = base / "place"
+
+        def lstat(path):
+            if Path(path) == place / ".git":
+                return as_a_fifo
+            raise FileNotFoundError(path)
+
+        with mock.patch.object(credential_proxy.os, "lstat", side_effect=lstat):
+            self.assertTrue(credential_proxy._git_entry_is_not_a_folder(place / "manifests"))
+
+    def test_the_guard_opens_no_file_before_it_refuses_for_the_layout(self):
+        """It does not follow the `.git` file: it opens neither that file nor a path that it names."""
+        from credential_proxy import git_push_violation
+
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        opened = AssertionError("the guard opened a file")
+        with mock.patch("builtins.open", side_effect=opened), mock.patch("io.open", side_effect=opened):
+            violation = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=place)
+        self.assertEqual(self.LAYOUT_REFUSAL, violation)
+
+    def test_the_walk_goes_to_the_root_of_the_file_system(self):
+        """With a stand-in for `lstat`: only the named path has a `.git`, and it is a file."""
+        a_file = Path(self.temp_dir.name) / "a-file"
+        a_file.write_text("", encoding="utf-8")
+        as_a_file = os.lstat(a_file)
+        root = Path(a_file.anchor)
+        below = root / "volume" / "workspace" / "lease" / "clone"
+        for name, with_a_git_file in (("the root", root), ("the folder below the root", root / "volume")):
+            asked = []
+
+            def lstat(path, with_a_git_file=with_a_git_file, asked=asked):
+                asked.append(Path(path))
+                if Path(path) == with_a_git_file / ".git":
+                    return as_a_file
+                raise FileNotFoundError(path)
+
+            with self.subTest(git_file_at=name), mock.patch.object(credential_proxy.os, "lstat", side_effect=lstat):
+                self.assertTrue(credential_proxy._git_entry_is_not_a_folder(below))
+                self.assertEqual(below / ".git", asked[0])
+        asked = []
+
+        def no_git_entry(path):
+            asked.append(Path(path))
+            raise FileNotFoundError(path)
+
+        with mock.patch.object(credential_proxy.os, "lstat", side_effect=no_git_entry):
+            self.assertFalse(credential_proxy._git_entry_is_not_a_folder(below))
+        self.assertEqual([folder / ".git" for folder in (below, *below.parents)], asked)
+
+    def test_the_executor_refuses_a_push_from_a_place_whose_git_entry_is_a_file(self):
+        """Through the executor's own check, with the lease switch on and off, and with the
+        place named by `-C` and by the working directory. The refusal comes before the lease
+        check, so the reason is the layout also where the place is in no leased workspace."""
+        executor = self.executor()
+        main = Path(executor.workspace_dir) / "main-clone"
+        (main / ".git" / "worktrees" / "linked").mkdir(parents=True)
+        (main / ".git" / "config").write_text(self.FILES_CONFIG, encoding="utf-8")
+        linked = Path(executor.workspace_dir) / "linked-worktree"
+        (linked / "manifests").mkdir(parents=True)
+        (linked / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'linked'}\n", encoding="utf-8")
+        for lease in (False, True):
+            executor.require_git_lease = lease
+            for argv, cwd in (
+                (["git", "push", "origin", "HEAD:feature"], str(linked)),
+                (["git", "push", "origin", "HEAD:release-trunk"], str(linked / "manifests")),
+                (["git", "-C", str(linked), "push", "origin", "HEAD:feature"], str(executor.workspace_dir)),
+                (["git", "-C", "linked-worktree", "-C", "manifests", "push", "origin", "HEAD:feature"], str(executor.workspace_dir)),
+            ):
+                with self.subTest(lease=lease, argv=argv[1], cwd=Path(cwd).name):
+                    self.assertEqual(self.LAYOUT_REFUSAL, executor.git_lease_violation(argv, cwd=cwd))
+                    violation, _ = executor.resolve_git_command(argv, cwd)
+                    self.assertEqual(self.LAYOUT_REFUSAL, violation)
+            # A command that is not a push is not refused for the layout.
+            self.assertNotEqual(self.LAYOUT_REFUSAL, executor.git_lease_violation(["git", "status"], cwd=str(linked)))
+        executor.require_git_lease = False
+        self.assertIsNone(executor.git_lease_violation(["git", "status"], cwd=str(linked)))
+
+    GIT_REF_FORMAT_OPTIONS = ("--ref-format", "--ref-storage-format")
+
+    def places_that_git_makes(self, ref_format):
+        """With the host's git: a clone in `ref_format`, and the three places where git itself
+        writes a `.git` file: a linked worktree of that clone, a clone with a separate git
+        directory and a submodule. The format is in each command, and no git variable and
+        no config file of the host is read, so the host's default does not matter. Each place
+        is checked before it is returned: a wrong fixture fails."""
+        base = Path(self.temp_dir.name) / f"made-{ref_format}"
+        base.mkdir()
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+
+        def git(*arguments):
+            return subprocess.run(["git", *arguments], env=environment, capture_output=True, text=True, check=False)
+
+        def must(*arguments):
+            done = git(*arguments)
+            self.assertEqual(0, done.returncode, f"git {' '.join(arguments)}: {done.stderr}")
+            return done
+
+        def in_the_format(before, after):
+            """`git <before> <the format option> <after>`. git has had two names for the option.
+            A git that knows neither has only the files format: for that format the command
+            runs with no option, and for another format the test is skipped. In CI (the
+            variable `CI` is set) that skip is a failure, so that a runner with an older git
+            does not lose the rows of the other format in silence."""
+
+            def not_known(done):
+                # `git submodule` was a shell script: for an option that it does not know it
+                # prints its usage text.
+                return done.returncode != 0 and ("unknown option" in done.stderr or done.stderr.startswith("usage: git submodule"))
+
+            for option in self.GIT_REF_FORMAT_OPTIONS:
+                done = git(*before, f"{option}={ref_format}", *after)
+                if not not_known(done):
+                    break
+            if not_known(done) and ref_format == "files":
+                done = git(*before, *after)
+            if ref_format != "files" and (not_known(done) or (done.returncode != 0 and "ref storage format" in done.stderr)):
+                reason = f"this git cannot make a place in the {ref_format} ref format: {done.stderr.strip()[:200]}"
+                if os.environ.get("CI"):
+                    self.fail(f"{reason}. In CI these rows must run: the runner needs a git that has this format.")
+                self.skipTest(reason)
+            self.assertEqual(0, done.returncode, f"{before} {after}: {done.stderr}")
+
+        remote = base / "remote.git"
+        must("init", "--quiet", "--bare", "-b", "release-trunk", str(remote))
+        seed = base / "seed"
+        must("clone", "--quiet", str(remote), str(seed))
+        (seed / "README.md").write_text("hello\n", encoding="utf-8")
+        must("-C", str(seed), "add", ".")
+        must("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+        must("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+
+        clone = base / "clone"
+        in_the_format(["clone", "--quiet"], [str(remote), str(clone)])
+        linked = base / "linked-worktree"
+        # `worktree add` has no format option: a linked worktree has the format of its clone.
+        must("-C", str(clone), "worktree", "add", "--quiet", "-b", "work", str(linked))
+        separate = base / "separate-git-dir"
+        in_the_format(["clone", "--quiet", f"--separate-git-dir={base / 'separate.git'}"], [str(remote), str(separate)])
+        superproject = base / "superproject"
+        must("init", "--quiet", str(superproject))
+        # A submodule from a local path needs the file protocol, which git allows a user only by name.
+        in_the_format(
+            ["-C", str(superproject), "-c", "protocol.file.allow=always", "submodule", "add", "--quiet"],
+            [str(remote), "module"],
+        )
+        places = {"a linked worktree": linked, "a clone with a separate git directory": separate, "a submodule": superproject / "module"}
+
+        self.assertTrue((clone / ".git").is_dir() and not (clone / ".git").is_symlink())
+        for name, place in {"the clone": clone, **places}.items():
+            if place != clone:
+                entry = place / ".git"
+                self.assertTrue(entry.is_file() and not entry.is_symlink(), f"{name}: `.git` is not a file")
+                self.assertTrue(entry.read_text(encoding="utf-8").startswith("gitdir: "), name)
+            shown = must("-C", str(place), "rev-parse", "--show-ref-format").stdout.strip()
+            # A git from before this option prints the option back, and has only the files format.
+            if shown != "--show-ref-format":
+                self.assertEqual(ref_format, shown, name)
+            # git takes the place for a repository with the remote, and pushes from it.
+            branch = f"refs/heads/from-{place.name}"
+            must("-C", str(place), "push", "--quiet", "origin", f"HEAD:{branch}")
+            must("-C", str(remote), "rev-parse", "--verify", "--quiet", branch)
+        return clone, places
+
+    def test_a_push_from_each_place_where_git_writes_a_git_file_is_refused(self):
+        """A linked worktree, a clone with a separate git directory and a submodule, made by
+        the host's git in each ref format. Before this check the guard said nothing for a
+        push to the remote's default branch from each of them."""
+        from credential_proxy import git_push_violation
+
+        for ref_format in ("files", "reftable"):
+            with self.subTest(ref_format=ref_format):
+                clone, places = self.places_that_git_makes(ref_format)
+                for name, place in places.items():
+                    inside = place / "manifests"
+                    inside.mkdir()
+                    for cwd in (place, inside):
+                        for target in ("release-trunk", "feature"):
+                            self.assertEqual(
+                                self.LAYOUT_REFUSAL,
+                                git_push_violation(["git", "push", "origin", f"HEAD:{target}"], cwd=cwd),
+                                f"{name}, {cwd.name}, {target}",
+                            )
+                    self.assertIsNone(git_push_violation(["git", "status"], cwd=place), name)
+                # A push through an alias of the clone's config, from the linked worktree and,
+                # as the control, from the clone.
+                subprocess.run(["git", "-C", str(clone), "config", "alias.p", "push"], check=True, capture_output=True)
+                executor = self.executor()
+                executor.require_git_lease = False
+                alias_push = ["git", "p", "origin", "HEAD:feature"]
+                violation, _ = executor.resolve_git_command(alias_push, str(places["a linked worktree"]))
+                self.assertEqual(self.LAYOUT_REFUSAL, violation)
+                violation, _ = executor.resolve_git_command(alias_push, str(clone))
+                self.assertNotEqual(self.LAYOUT_REFUSAL, violation)
+                # The control: the clone itself has a `.git` folder and is judged as before.
                 to_default = git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=clone) or ""
                 to_work = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=clone)
                 if ref_format == "files":
@@ -10751,6 +11173,9 @@ class GracefulDrainTest(unittest.TestCase):
         slack = mock.patch.object(CredentialProxyHandler, "slack_relay", None)
         slack.start()
         self.addCleanup(slack.stop)
+        lifecycle = mock.patch.object(CredentialProxyHandler, "lifecycle", None)
+        lifecycle.start()
+        self.addCleanup(lifecycle.stop)
 
     def _handler(self, path):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
@@ -10760,7 +11185,9 @@ class GracefulDrainTest(unittest.TestCase):
         handler._authenticated = lambda: object()
         handler._counted_in_flight = False
         captured = {}
-        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+        handler._json = lambda status, payload, headers=None: captured.update(
+            status=status, payload=payload, headers=headers
+        )
         return handler, captured
 
     def test_a_new_request_is_refused_with_the_draining_bound(self):
@@ -10779,6 +11206,10 @@ class GracefulDrainTest(unittest.TestCase):
                 with mock.patch.object(credential_proxy, "drain_request_body") as drained:
                     getattr(handler, f"do_{method}")()
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+                self.assertEqual(
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)},
+                    captured["headers"],
+                )
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
                      "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
@@ -10803,15 +11234,15 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual({}, captured)
 
     def test_a_draining_exec_pod_fails_its_readiness_probe(self):
-        # The readiness probe reads /healthz. An exec pod that drains answers
-        # 503, so the Service stops sending it new connections and a caller at
-        # one replica falls back to the stateful broker; the broker, which
-        # rolls with Recreate, and any pod that does not drain answer ok.
+        # The readiness probe reads /healthz. Both an exec pod and a RollingUpdate
+        # standalone broker return 503 while draining so Kubernetes stops routing
+        # new connections to them while in-flight requests finish; a sidecar role
+        # or non-draining pod answers ok.
         cases = (
             (credential_proxy_client.EXEC_ROLE, True, HTTPStatus.SERVICE_UNAVAILABLE,
              credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             (credential_proxy_client.EXEC_ROLE, False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
-            ("broker", True, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", True, HTTPStatus.SERVICE_UNAVAILABLE, credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             ("broker", False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
         )
         for role, draining, status, payload in cases:
@@ -22944,7 +23375,13 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.metrics = credential_proxy.ProxyMetrics()
         handler.replies = []
-        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        handler.reply_headers = []
+
+        def _capture_json(status, payload, headers=None):
+            handler.replies.append((status, payload))
+            handler.reply_headers.append(headers)
+
+        handler._json = _capture_json
         handler._busy(credential_proxy.CommandSlotUnavailable("held", bound=bound))
         return handler
 
@@ -22963,6 +23400,12 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
                        credential_proxy_client.BUSY_BOUND_KEY: bound, "error": "held"})],
                     handler.replies,
                 )
+                expected_headers = (
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)}
+                    if bound == credential_proxy_client.ADMISSION_BOUND_DRAINING
+                    else None
+                )
+                self.assertEqual([expected_headers], handler.reply_headers)
                 self.assertIn(
                     f'{credential_proxy.ADMISSION_REFUSALS_METRIC}{{bound="{bound}",class="interactive"}} 1',
                     handler.metrics.render(),

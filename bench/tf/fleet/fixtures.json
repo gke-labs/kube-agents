@@ -1595,6 +1595,34 @@
         }
       ]
     },
+    "state-sync-controller": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/state-sync-controller"],
+      "fixture": "state-sync-controller Deployment (one replica) in seeded-shapes whose container startup argument passes --kube-api-qps=-1 to an inert sleep process, planting a controller with a negative client QPS (client-side rate limit disabled) for control-plane-configmap-lease-write-storm without generating API server write load",
+      "state": [
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the fixture is a running controller Deployment; a scaled-down or unscheduled pod is not an active controller shape"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready while the new pod waits; the controller omits unavailableReplicas when every replica is available"
+        },
+        {
+          "subject": "deployment/state-sync-controller",
+          "path": "spec.template.spec.containers[*].args[*]",
+          "op": "any_eq",
+          "value": "--kube-api-qps=-1",
+          "why": "a negative QPS (--kube-api-qps=-1) disables client-side Kubernetes API rate limiting in client-go, the shape control-plane-configmap-lease-write-storm requires"
+        }
+      ]
+    },
     "scaled-zero-gateway": {
       "cluster_slot": "a",
       "namespace": "seeded-scaled-zero",
@@ -1666,7 +1694,7 @@
           "subject": "instance/startup-fail-*",
           "op": "serial_contains",
           "value": "Script \"startup-script\" failed with error",
-          "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector finds no failure line and files nothing, so gce-startup-script-failure has no finding to grade. Each reconcile resets the VM to print it again"
+          "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector writes a note on the target and files nothing, so gce-startup-script-failure has no finding to grade. Each reconcile resets the VM to print it again"
         }
       ]
     },
@@ -2131,6 +2159,54 @@
           "op": "none_eq",
           "value": true,
           "why": "GKE omits a false boolean from clusters describe, so the off state reads as no value; the networking case that names this cluster needs the add-on off, and anyone turning it on heals the defect"
+        }
+      ]
+    },
+    "unaccepted-gateway-class": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": [
+        "gatewayclass/seeded-unaccepted-gw",
+        "gateway/seeded-unaccepted-gateway",
+        "httproute/seeded-unaccepted-route",
+        "gatewayclass/seeded-envoy"
+      ],
+      "fixture": "GatewayClass seeded-unaccepted-gw referencing example.com/unsupported-controller so no controller accepts it, with Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route in seeded-shapes bound to it; GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as the accepted-class negative control on the same cluster",
+      "state": [
+        {
+          "subject": "gatewayclass/seeded-unaccepted-gw",
+          "path": "spec.controllerName",
+          "op": "eq",
+          "value": "example.com/unsupported-controller",
+          "why": "the defect is the unsupported controller path the audit must name; changing controllerName to a supported GKE controller heals the fixture"
+        },
+        {
+          "subject": "gatewayclass/seeded-unaccepted-gw",
+          "path": "status.conditions[?(@.type=='Accepted')].status",
+          "op": "none_eq",
+          "value": "True",
+          "why": "the defect is a GatewayClass no controller has accepted; an Accepted=True condition means a controller reconciled it and the audit would stay silent"
+        },
+        {
+          "subject": "gateway/seeded-unaccepted-gateway",
+          "path": "spec.gatewayClassName",
+          "op": "eq",
+          "value": "seeded-unaccepted-gw",
+          "why": "the Gateway must remain bound to the unaccepted GatewayClass so the audit reports affected Gateways with no proxy Deployment, Service, or address"
+        },
+        {
+          "subject": "httproute/seeded-unaccepted-route",
+          "path": "spec.parentRefs[*].name",
+          "op": "any_eq",
+          "value": "seeded-unaccepted-gateway",
+          "why": "the HTTPRoute must remain attached to the Gateway on the unaccepted class so the audit reports unprogrammed routes"
+        },
+        {
+          "subject": "gatewayclass/seeded-envoy",
+          "path": "status.conditions[?(@.type=='Accepted')].status",
+          "op": "any_eq",
+          "value": "True",
+          "why": "seeded-envoy is the accepted-class negative control on the same cluster; without Accepted=True, silence on accepted classes cannot be distinguished from flagging every custom GatewayClass"
         }
       ]
     }

@@ -19,9 +19,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 // TestRunReasonToken: a scheduled run's record carries the bare token of a
@@ -30,6 +32,7 @@ func TestRunReasonToken(t *testing.T) {
 	for _, tc := range []struct{ name, message, want string }{
 		{"a known token with its detail", "reason: deadline-exceeded - the task ran past 15m", "deadline-exceeded"},
 		{"a known bare token", "reason: worker-evicted", "worker-evicted"},
+		{"a recovered panic", taskguard.Reason, taskguard.ReasonToken},
 		{"a detail-shown token", "reason: verifier-refused - the cluster is out of scope", "verifier-refused"},
 		{"a canceled terminal's own token", "reason: canceled-by-request", "canceled-by-request"},
 		{"a stopped run", "reason: stopped - the operator stopped the run", "stopped"},
@@ -129,5 +132,39 @@ func TestACompletedRunCarriesNoReason(t *testing.T) {
 	})
 	if got.State != lib.StateCompleted || got.Reason != "" {
 		t.Fatalf("the completed run's status = %+v, want completed with no reason", got)
+	}
+}
+
+// A recovered panic's terminal (taskguard.Reason, from the hermes-bridge or
+// the worker adapter) reads in chat as the failure notice plus a sentence,
+// not the bare notice: the token is in the gateway's vocabulary.
+func TestTheRecoveredPanicTokenReadsInPlainWords(t *testing.T) {
+	words, ok := reasonInPlainWords(taskguard.Reason)
+	if !ok || words == "" {
+		t.Fatalf("reasonInPlainWords(%q) = %q, %v; want a sentence", taskguard.Reason, words, ok)
+	}
+	if strings.Contains(words, taskguard.ReasonToken) {
+		t.Fatalf("the sentence %q shows the raw token", words)
+	}
+	// The panic can come after the run's work (the scrub, the chat fold, a
+	// publish), so asking again can repeat a write: the sentence says to
+	// check what was done first, never a bare "ask again".
+	if !strings.Contains(words, "check what it already did before you ask again") || strings.HasSuffix(words, "; ask again") {
+		t.Fatalf("the sentence %q doesn't say to check what was done before asking again", words)
+	}
+}
+
+// The recovered panic's notice as Slack receives it: the failure notice and
+// the check-first sentence, through the Slack adapter's post (the
+// chat.postMessage form on the wire), with no raw token.
+func TestTheRecoveredPanicNoticeAsSlackGetsIt(t *testing.T) {
+	adapter, stub := startSlackStubAdapter(t)
+	if _, err := adapter.Post("slack:C1/1.0", terminalNotice(lib.StateFailed, taskguard.Reason)); err != nil {
+		t.Fatal(err)
+	}
+	got := stub.forms[0].Get("text")
+	t.Logf("Slack text: %s", got)
+	if !strings.HasPrefix(got, noticeFailed+noticeDetailSeparator) || !strings.Contains(got, "check what it already did before you ask again") || strings.Contains(got, taskguard.ReasonToken) {
+		t.Fatalf("Slack got %q, want the failure notice with the check-first sentence and no token", got)
 	}
 }

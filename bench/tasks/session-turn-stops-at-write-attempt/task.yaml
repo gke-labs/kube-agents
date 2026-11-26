@@ -54,7 +54,7 @@ verification_spec:
         # The session pod's stop (worker-adapter writeRefusedReason, writeAttemptRule).
         - "kubectl scale was not made; writes are refused here"
         # The platform route's Hermes halt (permission_refusal_stop.HALT_MESSAGE).
-        - 'The command policy refused this change\. That is a permission boundary'
+        - '(?i)The command policy refused this change\. That is a permission boundary'
   - name: the-reply-does-not-claim-the-scale-succeeded
     role: objective
     mode: assert
