@@ -116,15 +116,22 @@ var forgeStateWords = map[string]string{
 
 // usageForgesForPoll is the forge reading this poll projects: the stateful
 // broker's, or nil when no such body was read this poll, which leaves the
-// condition as it stands. The broker is one pod by design, so there is at most
-// one.
+// condition as it stands. The broker is one pod, except during an
+// active-standby rollout, when the poll can read two: a standby that has not
+// swept yet names no provider, so a reading that names one is taken before one
+// that names none.
 func usageForgesForPoll(scraped []usageScrapedPod) *usageForgeReading {
+	var empty *usageForgeReading
 	for _, s := range scraped {
-		if s.Forges != nil {
+		if s.Forges == nil {
+			continue
+		}
+		if len(s.Forges.Forges) > 0 {
 			return s.Forges
 		}
+		empty = s.Forges
 	}
-	return nil
+	return empty
 }
 
 // forgeProviderName is the provider a reading names, held to the providers

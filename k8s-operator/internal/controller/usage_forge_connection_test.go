@@ -418,3 +418,25 @@ func TestForgeCondition_AStaleProviderMergedIntoOtherIsNotHidden(t *testing.T) {
 		t.Errorf("a failing entry beside a stale one: condition %+v, want False Unreachable", cond)
 	}
 }
+
+// During an active-standby rollout the poll can read two brokers. A standby
+// that has not swept names no provider, and does not take the place of the
+// reading that names one, whichever pod is read first.
+func TestUsageForgesForPoll_AReadingThatNamesAProviderIsTakenBeforeAnEmptyOne(t *testing.T) {
+	named := &usageForgeReading{Forges: []usageForge{connectedForge("github", 1)}}
+	empty := &usageForgeReading{}
+	for name, scraped := range map[string][]usageScrapedPod{
+		"the standby first": {{}, {Forges: empty}, {Forges: named}},
+		"the standby last":  {{Forges: named}, {Forges: empty}, {}},
+	} {
+		if got := usageForgesForPoll(scraped); got != named {
+			t.Errorf("%s: reading %+v, want the one that names a provider", name, got)
+		}
+	}
+	if got := usageForgesForPoll([]usageScrapedPod{{}, {Forges: empty}}); got != empty {
+		t.Errorf("only an empty reading: got %+v, want it", got)
+	}
+	if got := usageForgesForPoll([]usageScrapedPod{{}, {}}); got != nil {
+		t.Errorf("no broker body: got %+v, want nil", got)
+	}
+}
