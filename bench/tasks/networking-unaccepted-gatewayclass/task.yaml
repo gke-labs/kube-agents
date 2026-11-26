@@ -23,9 +23,12 @@
 # body so major findings cannot be dropped by ledger body truncation (#5052)
 # and the case reads identically with or without a forge. Because finding IDs
 # over 100 characters are shortened longest-segment-first (`_shorten_id`), the
-# required finding phrase (`seeded-unacc`) is the prefix that survives trimming
-# across any check-slug length, while `required_evidence_phrases` pins the
-# exact unsupported `controllerName`, attached `Gateway`, and attached
+# required finding phrase (`seeded-un`, unique in `bench/tf/fleet/`) survives
+# trimming through 45-character check slugs on cluster-scoped findings
+# (`namespace: ""`) and 33-character slugs under `seeded-shapes`, while the
+# negative-control phrase (`seeded-env`, unique to `seeded-envoy`) survives
+# through 43-character / 31-character slugs. `required_evidence_phrases` pins
+# the exact unsupported `controllerName`, attached `Gateway`, and attached
 # `HTTPRoute`.
 #
 # Declared gap (`expected_fail: true`): #1982 has not shipped yet. Parked in
@@ -70,8 +73,8 @@ verification_spec:
     check:
       type: audit_report_stored
       audit: obtainability-audit
-      required_finding_phrases: ["seeded-unacc"]
-      forbidden_finding_phrases: ["seeded-envoy", "gke-l7-"]
+      required_finding_phrases: ["seeded-un"]
+      forbidden_finding_phrases: ["seeded-env", "gke-l7-"]
       required_evidence_phrases:
         - "example.com/unsupported-controller"
         - "seeded-unaccepted-gateway"
@@ -112,6 +115,6 @@ verification_spec:
       kind: httproute
       resource_name: seeded-unaccepted-route
       namespace: seeded-shapes
-      path: spec.parentRefs[0].name
+      path: spec.parentRefs[*].name
       op: eq
       value: "seeded-unaccepted-gateway"

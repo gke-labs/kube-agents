@@ -2825,9 +2825,13 @@ resource "kubernetes_manifest" "scaled_zero_gateway_class" {
 # Service, or cloud load balancer is provisioned, and the HTTPRoute stays
 # unprogrammed with zero pod/CPU footprint. The HTTPRoute carries no
 # backendRefs so obtainability §3.26 (ingress-gateway-healthcheck-mismatch)
-# stays silent on it. GatewayClass seeded-envoy (Accepted=True written by
-# gateway_status.py above) and GKE's built-in GatewayClasses serve as the
-# accepted-class negative control on the same cluster. Asserted by
+# stays silent on it. Both the Gateway and HTTPRoute carry the stall-watch
+# opt-out annotation (`kubeagents.x-k8s.io/stall-watch: exempt`) so the
+# periodic stall-watch cron does not fire controller-stall alerts on
+# seeded-shapes while the Gateway sits in GKE's default Accepted=Unknown /
+# Programmed=Unknown Pending state. GatewayClass seeded-envoy (Accepted=True
+# written by gateway_status.py below) and GKE's built-in GatewayClasses serve
+# as the accepted-class negative control on the same cluster. Asserted by
 # networking-unaccepted-gatewayclass.
 resource "kubernetes_manifest" "unaccepted_gateway_class" {
   manifest = {
@@ -2843,8 +2847,9 @@ resource "kubernetes_manifest" "unaccepted_gateway" {
     apiVersion = "gateway.networking.k8s.io/v1"
     kind       = "Gateway"
     metadata = {
-      name      = "seeded-unaccepted-gateway"
-      namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      name        = "seeded-unaccepted-gateway"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
     }
     spec = {
       gatewayClassName = kubernetes_manifest.unaccepted_gateway_class.manifest.metadata.name
@@ -2858,8 +2863,9 @@ resource "kubernetes_manifest" "unaccepted_route" {
     apiVersion = "gateway.networking.k8s.io/v1"
     kind       = "HTTPRoute"
     metadata = {
-      name      = "seeded-unaccepted-route"
-      namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      name        = "seeded-unaccepted-route"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
     }
     spec = {
       parentRefs = [{ name = kubernetes_manifest.unaccepted_gateway.manifest.metadata.name }]
