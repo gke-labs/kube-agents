@@ -957,8 +957,9 @@ resource "kubernetes_deployment_v1" "long_name_replaced_pod" {
 # The memory request of each is on the floor of 3.1's resize (64Mi), so only
 # the CPU can give a finding. The memory limit is above the request on
 # purpose: with requests equal to limits on both dimensions the pod is
-# Guaranteed, and the 3.1 finding on `cpu-burst` then has the guaranteed-qos
-# marker and can become an idle-workload finding (3.13) from day 14. No
+# Guaranteed, and the 3.1 finding that an audit with the 300-second bucket
+# files on `cpu-burst` then has the guaranteed-qos marker and can become an
+# idle-workload finding (3.13) from day 14. No
 # token, no Service, no emptyDir. One replica each: a second replica adds
 # nothing to the reading. The script is process 1 and has no child process.
 # The pod template holds the hash of the script, so a change of the script

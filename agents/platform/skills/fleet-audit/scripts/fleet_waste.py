@@ -339,7 +339,12 @@ CUT_NAME_KINDS = {"Deployment": True, "ReplicaSet": False}
 # one away and understates the peak. The secondary pass then takes the max
 # across those buckets, which is the number we want, and collapses the
 # response to one point per pod: measured on a 137-pod cluster, one page and
-# 0.3s rather than ten pages and 3.3s, with both routes agreeing on all 137.
+# 0.3s rather than ten pages and 3.3s, with both routes agreeing on all 137
+# (measured with this period for CPU and memory).
+#
+# This is the period of the memory reads (the peak and the mean), where
+# `ALIGN_MAX` averages nothing. The averaging reason above is the CPU rate's,
+# and the CPU rate has its own period, `CPU_USAGE_ALIGNMENT_S`.
 USAGE_ALIGNMENT_S = 300
 MONITORING_SCOPE = "https://www.googleapis.com/auth/monitoring.read"
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
@@ -384,6 +389,12 @@ MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
 # 30% high at 60 seconds (about 5% at 300). The error has one direction: a
 # finding just under the bar can be missed and a proposed resize is larger;
 # no finding is wrong and no proposed cut is deeper.
+#
+# The same direction for a start burst: the read covers each pod's whole
+# series, its first hour too, so a pod that is at its limit for some tens of
+# seconds at its start reads that as the week's peak for seven days, where
+# the wider bucket averaged it away. Such a workload gets a larger target or
+# no finding in that time.
 CPU_USAGE_ALIGNMENT_S = 60
 # Cloud Monitoring's aggregation enums, as the query string spells them.
 ALIGN_RATE = "ALIGN_RATE"
