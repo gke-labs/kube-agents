@@ -289,6 +289,9 @@ func TestAProfileDriverKeepsItsHistory(t *testing.T) {
 // shell, web search, developer_knowledge's two tools), not the session
 // grant the pod's driver started with.
 func TestACoreAgentProfileTurnCarriesThePersonasGrant(t *testing.T) {
+	// core-agent's PrepareTurn wants the adapter as the container's init;
+	// this stands in for it, scoped to the test's own processes.
+	useRespawnScope(t)
 	url := startServer(t)
 	d := newFakeDispatcher(t, url)
 	root := t.TempDir()
