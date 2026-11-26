@@ -430,6 +430,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Fixture planted in bench/tf/fleet/defects-a.tf (#7097, #1982); parked
+    # until the postsubmit fleet reconcile applies unaccepted-gateway-class
+    # across the pool projects, after which a follow-up moves it to nightly-cases.txt.
+    "networking-unaccepted-gatewayclass": (
+        "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw, gateway/seeded-unaccepted-gateway, httproute/seeded-unaccepted-route) applied to every pool project by the postsubmit fleet reconcile"
+    ),
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of
     # its own and Config Sync to apply the merge, as a customer's reconciler would.
@@ -764,7 +770,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
-    "delegated_to": ("required_addressees", "forbidden_addressees"),
+    "delegated_to": ("required_addressees", "forbidden_addressees", "min_children", "max_children"),
     "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
@@ -1622,6 +1628,16 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
         )
+
+    # `min_children: 0` holds for every chain, so it populates the field
+    # without asserting anything; alone it can only pass, which the
+    # verifier's model refuses too.
+    if (
+        node_type == "delegated_to"
+        and node.get("min_children") == 0
+        and not any(_populated(node.get(f)) for f in ("required_addressees", "forbidden_addressees", "max_children"))
+    ):
+        problems.append(f"{where}: check 'delegated_to' sets only min_children: 0, so it can only pass")
 
     # The same two rules the verifier's model applies after the cluster lease:
     # the scope needs its check, a name or a list of names; the field is

@@ -34,6 +34,8 @@ func TestEveryGrantTheOperatorRendersIsHeldByItsOwnRole(t *testing.T) {
 	}{
 		{"minimal (ClusterRole)", buildMinimalPlatformRoleWithSecrets(agent, true).Rules, true},
 		{"credential broker tokenreview (ClusterRole)", buildCredentialBrokerTokenReviewRole(agent).Rules, true},
+		{"credential broker pod read (agent namespace)", buildCredentialBrokerPodReadRole(agent, agent.Namespace).Rules, false},
+		{"credential broker pod read (profile namespace)", buildCredentialBrokerPodReadRole(agent, profileNamespaceName(agent)).Rules, false},
 		{"kube-proxy pod read", buildKubeProxyPodReadRole(agent).Rules, false},
 		{"local", buildPlatformLocalRole(agent).Rules, false},
 		{"leader", buildPlatformLeaderRole(agent).Rules, false},

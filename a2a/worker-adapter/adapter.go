@@ -217,6 +217,12 @@ type Config struct {
 
 	Logger *slog.Logger
 
+	// Trajectory, when set, is the session's tool-call capture for the
+	// evals (trajectory.go): every activity the harness emits is recorded
+	// in it, scrubbed and capped, and served only on the pod's loopback.
+	// nil records nothing.
+	Trajectory *TrajectoryStore
+
 	// panicSeam, a test's, runs at each panicSeam point (panic.go) with the
 	// point and its detail, so a test can raise a panic there. Nil outside
 	// tests.
@@ -998,6 +1004,8 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
+	// The harness's own log lines (stdout chatter, refused tool calls) name
+	// the task.
 	// A harness with its own wall-clock bound gets it from the task's
 	// deadline less the kill grace, so it ends the turn with a result
 	// before the adapter stops it.
@@ -1005,7 +1013,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	if b, ok := drv.(turnBudgeter); ok {
 		firstArgv = b.WithTurnBudget(argv, cfg.TaskDeadline-cfg.KillGrace)
 	}
-	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log)
+	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -1038,7 +1046,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			if b, ok := drv.(turnBudgeter); ok {
 				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
 			}
-			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log)
+			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 		}
 	}
 
@@ -1322,6 +1330,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
 					case EventActivity:
 						a.seam(seamActivity, ev.Tool)
+						a.cfg.Trajectory.Record(a.taskID, ev.Tool, ev.Input, nil, time.Now())
 						a.publishActivity(ctx, ev)
 					case EventResult:
 						// What the turn cost goes out first, whatever the turn
@@ -1729,15 +1738,22 @@ func (a *adapter) publishUsage(ctx context.Context, t resultTelemetry) {
 // artifacts, the milestone stream the gateway's rolling line renders at zero
 // model cost. (The spec's explicit progress tool is the stage 3 shape;
 // mapping the narration is the playground stand-in, recorded in the
-// findings.) An input that does not marshal publishes nothing.
+// findings.) An input that does not marshal publishes nothing. A call id,
+// when the harness gives one, goes beside the input as callId, never in it,
+// so it joins the call to a refused-call log record without changing what
+// the input matches.
 func (a *adapter) publishActivity(ctx context.Context, ev Event) {
 	if a.failClosed() {
 		return
 	}
-	entry, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"tool":  ev.Tool,
 		"input": ev.Input,
-	})
+	}
+	if ev.CallID != "" {
+		fields["callId"] = ev.CallID
+	}
+	entry, err := json.Marshal(fields)
 	if err != nil {
 		return
 	}

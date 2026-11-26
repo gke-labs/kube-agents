@@ -107,7 +107,7 @@ Anti-goals, what would make this a failure even if it works:
 
 ## 4. What the broker publishes
 
-All on the existing metrics-only listener, port 8766, rendered by `ProxyMetrics` beside the
+All on the existing `cred-metrics` listener, port 8766 (serving unauthenticated `/metrics` and bearer-authenticated `/control/*`), rendered by `ProxyMetrics` beside the
 families it already serves. No login, repository name, URL or proposal number appears in any
 label.
 
@@ -374,8 +374,7 @@ transient child memory the same way.
 A new reading slot beside the cluster gauges, generic rather than a third special case: a declared
 list of reading series (`usageReadingSpecs`) with, for each, the status field it lands in, its
 label filter, the reading it belongs to (`outcomes` or `details`) and the aggregation across pods
-(`max`, the cluster gauges' rule; the broker is one pod by design, with a `Recreate` strategy, so
-the rule is for form). The scrape parses them from the broker body into `usageReading.Readings`;
+(`max`, the cluster gauges' rule; the broker runs `RollingUpdate` `maxSurge: 1, maxUnavailable: 0` during active-standby handoff with at most one pod serving at a time, so `max` still holds). The scrape parses them from the broker body into `usageReading.Readings`;
 `foldUsage` never sees them; `projectStatus` writes them as the latest poll's reading. The rules
 are the cluster gauges' rules, applied to the broker target, with one difference: the cluster
 gauges share one miss streak, and here each reading has its own, because a warming sweep, or a

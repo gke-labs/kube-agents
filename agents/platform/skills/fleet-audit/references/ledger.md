@@ -88,6 +88,12 @@ but declarations opens no ledger and posts nothing, because the ledger tracks fi
 standing declaration is the same every morning. From then on the declaration in the repository is
 the record, and `finish` reports the count as `declared`.
 
+When a target carries `notes` (what a check read but could not see, which is not a coverage gap),
+the scope table grows a Notes column with each note clipped, the body carries its own capped
+"Read but not visible" list of the full notes under the table, and the clean comment and the held
+comment list each note in full, under the same cap; a "…and N more" row points at the stored
+report for the rest.
+
 ## Size
 
 GitHub caps an issue body at 65,536 characters, and a pull request body at the same. The harness

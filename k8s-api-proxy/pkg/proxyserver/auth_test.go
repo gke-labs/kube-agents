@@ -1,4 +1,4 @@
-package main
+package proxyserver
 
 import (
 	"bytes"
@@ -380,7 +380,7 @@ func (u *emptyListUpstream) RoundTripCluster(_ context.Context, _ string, req *h
 func TestChainAuthenticator(t *testing.T) {
 	refused := errors.New("token not accepted")
 	unavailable := fmt.Errorf("%w: review failed", k8sapiproxy.ErrAuthenticationUnavailable)
-	first := &k8sapiproxy.CallerIdentity{Username: "first"}
+	first := &k8sapiproxy.CallerIdentity{Username: "first", Extra: map[string][]string{"example.io/pod": {"p"}}}
 	second := &k8sapiproxy.CallerIdentity{Username: "second"}
 
 	for _, tc := range []struct {
@@ -511,6 +511,10 @@ func TestChainAuthenticator(t *testing.T) {
 		caller, err := chain.AuthenticateRequest(httptest.NewRequest(http.MethodGet, testPodsPath, nil))
 		if err != nil || caller.Authenticator != tc.wantAuthenticator {
 			t.Errorf("%s: got (%+v, %v), want Authenticator %q", tc.name, caller, err, tc.wantAuthenticator)
+		}
+		// The stamped copy keeps what the authenticator said about the caller.
+		if err == nil && caller.Username == first.Username && !slices.Equal(caller.Extra["example.io/pod"], []string{"p"}) {
+			t.Errorf("%s: Extra = %v, want the authenticator's", tc.name, caller.Extra)
 		}
 	}
 	if first.Authenticator != "" || second.Authenticator != "" {

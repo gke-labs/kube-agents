@@ -25,6 +25,7 @@ from tests.testing.release import (
     MOCK_TARGET_RELEASE_TAG,
     commit_required_release_images,
     create_mock_docker_binary,
+    create_mock_gcloud_token_binary,
     create_mock_gh_binary,
 )
 
@@ -432,6 +433,9 @@ exit {docker_exit}
                         bin_dir,
                         existing_images=[f"{holding}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
                     )
+                    # No Google credential, so the Artifact Registry probe cannot ask and
+                    # docker, which the release job logs in, answers.
+                    create_mock_gcloud_token_binary(bin_dir, token="")
                     proc = self._run_verify_script(
                         repo_dir,
                         args=[MOCK_TARGET_RELEASE_TAG, candidate],

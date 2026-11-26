@@ -476,6 +476,22 @@ class TestTheValidatorItself(unittest.TestCase):
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("can only pass", problems[0])
 
+    def test_a_delegated_to_check_with_only_min_children_zero_is_rejected(self):
+        """Every chain has at least zero children, so `min_children: 0` alone
+        asserts nothing; with another field set it is a real lower bound."""
+        problems = []
+        validator._check_assertions({"type": "delegated_to", "min_children": 0}, "check 'x'", problems)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("can only pass", problems[0])
+        for node in (
+            {"type": "delegated_to", "min_children": 0, "max_children": 1},
+            {"type": "delegated_to", "min_children": 1},
+            {"type": "delegated_to", "min_children": 0, "required_addressees": ["cluster"]},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
+
     def test_a_finding_scope_without_its_check_is_rejected(self):
         """The verifier's model refuses the pair after the cluster lease; this
         rule refuses it here."""

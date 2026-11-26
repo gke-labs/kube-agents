@@ -243,6 +243,61 @@ func TestTokenReviewAuthenticatorAccepts(t *testing.T) {
 	}
 }
 
+// The review's status.user.extra becomes CallerIdentity.Extra, as a copy each caller of
+// AuthenticateRequest owns: the review is cached, and one request must not change the next's.
+func TestTokenReviewAuthenticatorCarriesExtra(t *testing.T) {
+	const podNameKey, podUIDKey = "authentication.kubernetes.io/pod-name", "authentication.kubernetes.io/pod-uid"
+	// shellReview names the shell's pod in user.extra, as the pod check requires.
+	fake := &fakeTokenReviewServer{status: shellReview()}
+	a := newTestTokenReviewAuthenticator(t, fake)
+
+	id, err := a.AuthenticateRequest(bearerRequest(testCallerToken))
+	if err != nil {
+		t.Fatalf("AuthenticateRequest: %v", err)
+	}
+	if len(id.Extra) != 2 || !slices.Equal(id.Extra[podNameKey], []string{shellPodName}) || !slices.Equal(id.Extra[podUIDKey], []string{shellPodUID}) {
+		t.Fatalf("Extra = %v, want the review's user.extra", id.Extra)
+	}
+
+	id.Extra[podNameKey][0] = "another-pod"
+	delete(id.Extra, podUIDKey)
+	again, err := a.AuthenticateRequest(bearerRequest(testCallerToken))
+	if err != nil {
+		t.Fatalf("cached AuthenticateRequest: %v", err)
+	}
+	if !slices.Equal(again.Extra[podNameKey], []string{shellPodName}) || !slices.Equal(again.Extra[podUIDKey], []string{shellPodUID}) {
+		t.Errorf("cached Extra = %v: a caller's change to its copy reached the cached review", again.Extra)
+	}
+	if got := fake.calls(); got != 1 {
+		t.Errorf("TokenReviews = %d, want 1: the second request is the cache's", got)
+	}
+}
+
+// Groups are the caller's own copy too, for the same reason.
+func TestTokenReviewAuthenticatorCopiesGroups(t *testing.T) {
+	fake := &fakeTokenReviewServer{status: shellReview()}
+	a := newTestTokenReviewAuthenticator(t, fake)
+
+	id, err := a.AuthenticateRequest(bearerRequest(testCallerToken))
+	if err != nil {
+		t.Fatalf("AuthenticateRequest: %v", err)
+	}
+	if !slices.Equal(id.Groups, []string{"system:serviceaccounts"}) {
+		t.Fatalf("Groups = %v", id.Groups)
+	}
+	id.Groups[0] = "system:masters"
+	again, err := a.AuthenticateRequest(bearerRequest(testCallerToken))
+	if err != nil {
+		t.Fatalf("cached AuthenticateRequest: %v", err)
+	}
+	if !slices.Equal(again.Groups, []string{"system:serviceaccounts"}) {
+		t.Errorf("cached Groups = %v: a caller's change to its copy reached the cached review", again.Groups)
+	}
+	if got := fake.calls(); got != 1 {
+		t.Errorf("TokenReviews = %d, want 1: the second request is the cache's", got)
+	}
+}
+
 func TestTokenReviewAuthenticatorRefuses(t *testing.T) {
 	tests := []struct {
 		name   string
