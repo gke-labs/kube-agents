@@ -1,12 +1,12 @@
 # Control plane, setup, cost and CLI (gce-compute-fleet-audit): programs list
 # every object of a large type cluster-wide, again and again, and the API
 # server answers other clients more slowly. Parked as FIXTURE_NOT_READY
-# (gke-labs/kube-agents#5413, which proposes `apiserver-heavy-list-call`): the
-# tests below do not show the shape of the first plan, a command with
-# `--chunk-size=0`, as the fault, and no kept record that is on by default
-# names a heavy lister, so the case carries no suite line. #5413's text
-# predates the tests and still proposes a check on that command; where the two
-# differ, this header is the newer one.
+# (gke-labs/kube-agents#5413): the tests below do not show the shape of the
+# first plan, a command with `--chunk-size=0`, as the fault, and no kept
+# record that is on by default names a heavy lister, so the case carries no
+# suite line. #5413 now asks for a check that names heavy listers from the API
+# server's request log, and that says so where that log is off; the case comes
+# back with that check and a fixture of a program that really lists.
 # Two vendor pages name two things. GKE names the repeat: "The simplest
 # approach is to use periodic LIST calls. However, this is an inefficient and
 # expensive approach for both the caller and the server because all objects
@@ -75,15 +75,16 @@
 # tests do not show as the fault: the page limit changed the size of the harm
 # in the one matched pair; a missing page limit was not needed for the harm,
 # and a page limit did not prevent it; a suspended CronJob lists nothing at
-# all (fixture rule 9). What a correct check would name, which rate and which
-# size, is not settled. A fixture for the measured harm needs listers at a
-# rate that slows a cluster, which a shared fleet cluster may not carry, and a
-# check on real requests needs a record of them on that cluster. That fixture
-# is not tried, so its cost is a judgment and not a reading. Nothing is
-# planted. The objective below keeps the form of the first plan, a finding
-# that names CronJob `legacy-inventory-poller`, which is in no fleet file; the
-# pull request that brings a fixture rewrites it, and the un-park pull request
-# restores the lines `suite: validated-capabilities` and `suite_part: 2`.
+# all (fixture rule 9). #5413's check reads real requests; which rate and
+# which size it names is not settled. A fixture for the measured harm needs
+# listers at a rate that slows a cluster, which a shared fleet cluster may not
+# carry, and a check on real requests needs a record of them on that cluster.
+# That fixture is not tried, so its cost is a judgment and not a reading.
+# Nothing is planted. The objective below keeps the form of the first plan, a
+# finding that names CronJob `legacy-inventory-poller`, which is in no fleet
+# file; the pull request that brings a fixture rewrites it, and the un-park
+# pull request restores the lines `suite: validated-capabilities` and
+# `suite_part: 2`.
 # `expected_fail` stays. `fixtures: []`: the run plants nothing and reads no
 # fixture, so no fixture's drift may excuse it; no safeguard reads a fixture
 # because none exists.
@@ -113,7 +114,7 @@ validated: false
 
 verification_spec:
   # One finding must carry both the check and the shape's object. The three
-  # slugs are the names the case accepts; the first is the one #5413 proposes.
+  # slugs are the names the case accepts; the first is the first plan's.
   - name: ledger-files-the-unpaginated-list-shape-on-the-cronjob
     role: objective
     mode: assert

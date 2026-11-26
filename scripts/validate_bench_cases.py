@@ -483,8 +483,8 @@ FIXTURE_NOT_READY = {
     # measured harm needs listers at a rate that slows a cluster, which a
     # shared fleet cluster may not carry; a check on real requests also needs
     # a record of them there (API server logs; Data Access audit logs were not
-    # tested). Not tried, so the cost is a judgment. #5413 owns the gap; its
-    # text predates the tests.
+    # tested). Not tried, so the cost is a judgment. #5413 owns the gap and
+    # asks for the check on real requests.
     "control-plane-unpaginated-heavy-list-oom": (
         "#5413: a fixture needs listers at a rate that slows a cluster, which a shared fleet "
         "cluster may not carry, and for a check on real requests a record of them there; live "
