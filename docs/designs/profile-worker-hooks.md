@@ -9,13 +9,13 @@ Related designs: [`spec-profiles-dispatch.md`](spec-profiles-dispatch.md) (the p
 the per-task configuration directory), [`spec-subagent-profiles.md`](spec-subagent-profiles.md)
 (the MCP relay rule and the activity artifact),
 [`platform-as-profile-inventory.md`](platform-as-profile-inventory.md) (blocker 11). Other work
-owns a part that this design only names: the log line of a tool call and where it is shipped
-(telemetry and log shipping, #6674), where durable state lives (#6669), the dial and post-merge
-state (#6673), how a task posts to chat (#6668), reads across the fleet (#6667), what a profile
-reaches on the broker (#6670), delegation from a profile worker (#6789), and a plugin surface
-for agents (#1726). A design is written for five of these parts: the broker surface (#7120), the
-state homes with the dial and post-merge state (#7123), the unattended write permit (#7130),
-telemetry and log shipping (#7250) and reads with no cluster (#7260).
+owns a part that this design only names: the task keys of the log line of a tool call and where
+it is shipped (telemetry and log shipping, #6674), where durable state lives (#6669), the dial
+and post-merge state (#6673), how a task posts to chat (#6668), reads across the fleet (#6667),
+what a profile reaches on the broker (#6670), delegation from a profile worker (#6789), and a
+plugin surface for agents (#1726). A design is written for five of these parts: the broker
+surface (#7120), the state homes with the dial and post-merge state (#7123), the unattended write
+permit (#7130), telemetry and log shipping (#7250) and reads with no cluster (#7260).
 
 ## What the platform agent has today
 
@@ -115,15 +115,20 @@ is not decided (see [The opened proposal](#the-opened-proposal)).
 In rows 2, 3 and 6, "record" means a log line that a component writes. It is not stored state.
 For a row with "none" under Where, a "no" means that the need gets a design of its own.
 
+The security approver (bnaylor) decided rows 1, 3, 6, 7 and 15 on 2026-11-26
+([the comment](https://github.com/gke-labs/kube-agents/pull/7253#issuecomment-7180059137)).
+His decision A is row 6, B is row 7, C is row 3, and D is rows 1 and 15. The other rows wait
+for an answer.
+
 | Id  | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Where                                                                                                   |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| 1   | No hook mechanism for profile workers. `settings.json` stays empty and the worker's own, and the persona format gets no `hooks` key. This follows the dispatch spec's rule that no persona depends on one harness's feature.                                                                                                                                                                                                                                                             | `a2a/lib/persona/README.md` says so; the tests stay                                                     |
-| 2   | The per-tool record. The worker adapter writes one structured log line when a tool call starts and one when its result is in: the task id, a call id, the tool's name, the status and the duration. See [The per-tool record](#the-per-tool-record).                                                                                                                                                                                                                                     | `a2a/worker-adapter` (the drivers and the adapter)                                                      |
-| 3   | The per-tool record holds no input and no result. A "no" puts the redacted input in the line. See [The per-tool record](#the-per-tool-record) for what each answer costs.                                                                                                                                                                                                                                                                                                                | the same                                                                                                |
+| 1   | No hook mechanism for profile workers. `settings.json` stays empty and the worker's own, and the persona format gets no `hooks` key. This follows the dispatch spec's rule that no persona depends on one harness's feature. Decided: yes.                                                                                                                                                                                                                                               | `a2a/lib/persona/README.md` says so; the tests stay                                                     |
+| 2   | The per-tool record. The worker adapter writes one structured log line when a tool call starts and one when its result is in: the task id, a call id, the tool's name, the status and the duration. It follows the approver's decision on the telemetry design (one line for a tool call, #7250) and the decision on row 3. See [The per-tool record](#the-per-tool-record).                                                                                                             | `a2a/worker-adapter` (the drivers and the adapter)                                                      |
+| 3   | The per-tool record holds no input and no result. It holds the skill's name as a field of its own when the tool is the harness's skill tool. Decided: yes. See [The per-tool record](#the-per-tool-record) for what the readers get.                                                                                                                                                                                                                                                     | the same                                                                                                |
 | 4   | The approval lines and the message line of `tool_call_audit` have no counterpart on a worker. A worker has no approval prompt. The message line records an inbound chat message at the Hermes gateway; a worker receives a task, not a chat message. A record of the chat message is a front-door row (#6538).                                                                                                                                                                           | none                                                                                                    |
 | 5   | The `activity` artifact stays as it is. It is a live view on the bus and can lose an entry, so it is not the record. The subagent spec says today that it is "always in the audit replay".                                                                                                                                                                                                                                                                                               | the `activity` row of the artifact table of `spec-subagent-profiles.md`                                 |
-| 6   | The opened proposal. The source of "this task opened proposal N" is the broker: when a profile task's `proposal-create` succeeds, the broker writes one audit log line (not stored state). See [The opened proposal](#the-opened-proposal) for what the line does not hold and what it does not decide.                                                                                                                                                                                  | `agents/platform/scripts/credential_proxy.py`                                                           |
-| 7   | No claim for profiles. The broker puts no claim token in a `proposal-create` answer to the profile role, and the profile role gets no `proposal-claim` verb. The line of row 6 is in place of the claim. The broker-surface work (#6670) records this result for the verb.                                                                                                                                                                                                               | `agents/platform/scripts/credential_proxy.py`                                                           |
+| 6   | The broker's line for a write. The source of "this task opened proposal N" is the broker: when a profile task's `publish`, `proposal-create` or `proposal-update` succeeds, the broker writes one audit log line (not stored state). Decided: yes, for the three write verbs. See [The opened proposal](#the-opened-proposal) for what the line does not hold and what it does not decide.                                                                                               | `agents/platform/scripts/credential_proxy.py`                                                           |
+| 7   | No claim for profiles. The broker puts no claim token in a `proposal-create` answer to the profile role, and the profile role gets no `proposal-claim` verb. The line of row 6 is in place of the claim. The broker-surface work (#6670) records this result for the verb. Decided: yes.                                                                                                                                                                                                 | `agents/platform/scripts/credential_proxy.py`                                                           |
 | 8   | The chat notice of an opened proposal. The gateway's `notice` artifact is the place. If a profile task uses it, and which component produces it, is a decision of the chat delivery work (#6668).                                                                                                                                                                                                                                                                                        | none here                                                                                               |
 | 9   | Traces. A span for a session, a turn and a tool call comes from the adapter's event stream, not from a hook. What is exported, and where, is the telemetry work (#6674). A metric counterpart is also that work.                                                                                                                                                                                                                                                                         | none here                                                                                               |
 | 10  | `incident_context` has no profile counterpart. It rewrites an inbound chat message before dispatch and records an `apply`; both are on the side of the session (#6538) and the incident store.                                                                                                                                                                                                                                                                                           | none                                                                                                    |
@@ -131,14 +136,15 @@ For a row with "none" under Where, a "no" means that the need gets a design of i
 | 12  | The refusal of `submit_suggestion.py` after a run ended has no profile counterpart. The adapter stops the harness and its process group when the task has its result. The broker's permit gate holds each write of a profile task; no component revokes the task credential before it expires.                                                                                                                                                                                           | none                                                                                                    |
 | 13  | No MCP server with logic or state of its own in a profile worker. The worker's one fixed stdio server stays: the adapter's proxy to a broker relay. A persona adds none. The delegate tool is off in a profile worker today; the delegation work (#6789) decides if it starts there. The rule stays as the profile spec has it: a persona names MCP servers on the broker's relay only. Which server and which tools a profile reaches is a decision of the broker-surface work (#6670). | one comment of `spec-subagent-profiles.md` (the worked `platform` profile lists `mcp-platform_control`) |
 | 14  | The AgentPlugin CRD does not reach profile workers. See [What an AgentPlugin carries](#what-an-agentplugin-carries) for where each part goes.                                                                                                                                                                                                                                                                                                                                            | none; each move is its own change                                                                       |
-| 15  | A declared hook is not built now, and this design does not close it. A later design can open it when three things exist: a need that rows 2 to 12 do not meet; a second harness with a hook mechanism, or the decision that one harness is enough, which changes that rule of `spec-profiles-dispatch.md`; and a rule for whose code a hook is. A "no" closes it.                                                                                                                        | none now; the plugin track (#1726) is the home                                                          |
+| 15  | A declared hook is not built now, and this design does not close it. A later design can open it when three things exist: a need that rows 2 to 12 do not meet; a second harness with a hook mechanism, or the decision that one harness is enough, which changes that rule of `spec-profiles-dispatch.md`; and a rule for whose code a hook is. Decided: yes, it stays open for a later design.                                                                                          | none now; the plugin track (#1726) is the home                                                          |
 
 ### The per-tool record
 
-The telemetry work (#6674) decides the form of the log line for a tool call and how it ships.
-Row 2 names the source and what that source must carry. It does not add a second line format.
-The telemetry design (#7250) leaves the result of a tool call to this group; rows 2 and 3 are
-the answer.
+The adapter's per-tool line is the one line for a tool call. The hooks design
+(`profile-worker-hooks.md`) owns its source and its fields; the telemetry design
+([`profile-pod-telemetry.md`](profile-pod-telemetry.md)) owns its task keys and how it ships.
+This line is the trail of the telemetry design, and the adapter copies no activity entry to
+stderr.
 
 What the drivers get, because they do not have it today:
 
@@ -157,26 +163,27 @@ Limits of the record:
 - The harness reports it. The harness and each tool run as one user, so treat a line as one
   that a process in the worker can omit or forge. For a `/v1/exec` call and an MCP relay call,
   the broker's record is the one that counts. For a `/v1/vcs/` call the broker has no record
-  with the task today; row 6 adds one for `proposal-create` only. On the platform agent, the
-  tool commands run in a different pod and cannot write `audit.jsonl`.
+  with the task today; row 6 adds one for each write verb, and a read verb still leaves none.
+  On the platform agent, the tool commands run in a different pod and cannot write
+  `audit.jsonl`.
 - The admin console and the skill-invocation metric read the `audit.jsonl` of the platform
-  agent. If they read a profile task's lines, which is a question of the telemetry work (#6674),
-  then with row 3 at yes they get two things less. The console shows a tool call with its
-  status and without its arguments; the status comes from the error flag, not from the result.
-  The metric reads the skill's name from the arguments, so it cannot count a skill by name.
-- With row 3 at no, the adapter needs the redaction of `tool_call_audit`, which is Python today,
-  as Go code. The line then holds what the model sent to a tool, after redaction, and the
-  telemetry work (#6674) decides if that line can leave the pod.
+  agent. If the console reads a profile task's lines, which is a question of the telemetry work
+  (#6674), it shows a tool call with its status and without its arguments; the status comes
+  from the error flag, not from the result.
+- The metric reads the skill's name from the arguments of the Hermes tool `skill_view` today.
+  For a profile task it will read the skill's name field of the adapter's line. That reader
+  change is part of this group.
 
 ### The opened proposal
 
 The line of row 6 holds the task id, the credential's id, the repository, the number and the
-url. Today a profile task opens a proposal only through `proposal-create`, from a branch that
-the same task made (the broker's per-task bar), and that verb has one success path in the
-broker. Row 8 of the unattended write permit design (#7130) puts a schedule bar in place of the
-per-task bar for an unattended write. A later run of a schedule can then update a proposal
-that an earlier run opened, so the task in the line of row 6 is the task that opened the
-proposal, not each task that changed it.
+url. For `publish` it holds the branch in place of the number and the url. The three write
+verbs go through one success path of the broker's dispatch. Today a profile task opens a
+proposal only through `proposal-create`, from a branch that the same task made (the broker's
+per-task bar). Row 8 of the unattended write permit design (#7130) puts a schedule bar in
+place of the per-task bar for an unattended write. A later run of a schedule can then update
+a proposal that an earlier run opened. With a line for each write verb, each run that
+changes the proposal leaves a line of its own.
 
 The line does not hold three fields that the post-merge record and the ledger hold today: the
 finding's target, which the caller sets and never sends to the broker; the origin; and the chat
@@ -185,19 +192,11 @@ source for these three fields are decisions of the state work (#6669, and #6673 
 post-merge record). This design gives that work one source fact and no more.
 
 Row 6 is an audit line of the broker. It is not the post-merge record and not the ledger count;
-the form of those is a question of the state work, and a yes on row 6 does not answer it.
+the form of those is a question of the state work, and the decision on row 6 does not answer it.
 
 On the platform agent the claim proves that a `proposal-opened` line in terminal output names a
 proposal that the broker made. For a profile task the broker writes the line itself, so nothing
-needs that proof. With row 7 at no, the token stays in the answer; the model can read it, and
-the profile role cannot use it.
-
-Open for the decider: the same line for `publish` and `proposal-update`. Row 6 as written
-covers `proposal-create` only, and the broker-surface design (#7120) has no row for a broker
-log line, so a line for the two other write verbs has no owner. The three verbs go through one
-success path of the broker's dispatch. For `publish` the line holds the branch in place of the
-number and the url. Without that line, an unattended run that updates the proposal of an
-earlier run (row 8 of #7130) leaves no broker record with the task.
+needs that proof.
 
 ### What an AgentPlugin carries
 
@@ -232,8 +231,8 @@ decides each.
 ## What stays out
 
 - Memory recall and a memory provider (#2903).
-- The form and the shipping of logs and traces, and the fields that a compliance reader needs in
-  them (#6674).
+- The task keys and the shipping of logs and traces, and what a compliance reader needs in them
+  beyond the fields of rows 2 and 3 (#6674).
 - The homes of the ledger and the findings queue (#6669) and of the post-merge record (#6673).
 - The broker's relay rows and verbs, apart from row 7 (#6670).
 - The home of the `fleet_scope` read (blocker 4, #6667; a state home, #6669, is the other
@@ -257,11 +256,12 @@ For the group issue (#6671):
 
 1. Each row of [Decisions](#decisions) has the decider's answer.
 2. If row 2 has a yes: the worker adapter writes the per-tool record for each driver that can
-   run a profile task, with tests for a success, an error and two parallel calls.
-3. If row 6 has a yes: the broker writes the line of row 6, with a test that a success writes
-   one line and a test that a refused `proposal-create` writes none.
-4. If row 7 has a yes: the broker's answer follows row 7, with a test for the profile role and
-   one for another role.
+   run a profile task, with tests for a success, an error, two parallel calls and the skill's
+   name field of row 3.
+3. The broker writes the line of row 6 for `publish`, `proposal-create` and `proposal-update`,
+   with a test for each verb that a success writes one line and that a refusal writes none.
+4. The broker's answer follows row 7, with a test for the profile role and one for another
+   role.
 5. In the inventory, each row for the five plugins, the `platform_control` server and the
    AgentPlugin CRD names its destination: a row of this design, another issue, or "not needed".
    That includes `fleet_scope` and the run limits that have no owner here.
@@ -271,6 +271,8 @@ For the group issue (#6671):
    adapter's log line, and the comment of its worked `platform` profile does not list
    `mcp-platform_control`.
 8. The memory ask of the issue is recorded as moved to #2903.
+9. The skill-invocation metric counts a skill of a profile task from the skill's name field of
+   the adapter's line, with a test.
 
 ## Checked, and not checked
 
@@ -295,10 +297,11 @@ nothing in the bus code produces a `notice` artifact.
 Not checked: the hooks, the span kinds and the metrics of `hermes_otel` (its source is not in
 this repository); each reader of the `pr_opened` event and of `audit.jsonl` (taken from a code
 search, not a complete list); that no log line of the broker carries the task for a `/v1/vcs/`
-call that succeeds (none was found by search; the success path of the version-control broker
-was not read in full); if `proposal-create` can answer with a proposal that exists already; if
-a process in the worker can write to the harness's output pipe; that the pinned harness returns
-the stderr of a shell call to the model; if the text of a profile task's result can reach a
-terminal that `pr_opened` reads; which hook events and stream fields (the call id, the error
-flag) the pinned Claude Code version has, because the repository has hand-written fixtures
-only; if Antigravity has a hook mechanism; a running install.
+call that succeeds (none was found by search; the success path of the version-control broker was
+not read in full); if `proposal-create` can answer with a proposal that exists already; if a
+process in the worker can write to the harness's output pipe; that the pinned harness returns the
+stderr of a shell call to the model; if the text of a profile task's result can reach a terminal
+that `pr_opened` reads; how a worker's line reaches the reader of the skill metric, which follows
+the `audit.jsonl` files on the agent's volume today; which hook events and stream fields (the
+call id, the error flag) the pinned Claude Code version has, because the repository has
+hand-written fixtures only; if Antigravity has a hook mechanism; a running install.
