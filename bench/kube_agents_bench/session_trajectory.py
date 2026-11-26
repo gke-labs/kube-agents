@@ -83,6 +83,9 @@ CALL_TOOL_KEY = "tool"
 CALL_INPUT_KEY = "input"
 # How much of kubectl's stderr a failed exec logs.
 STDERR_LOG_CHARS = 200
+# How many session pods without a conversation's annotation are tried when
+# no pod carries it (:func:`unbound_pods`).
+UNBOUND_PODS_TRIED = 8
 
 
 @dataclass
@@ -161,6 +164,35 @@ def parse(reply: str, task_id: str) -> SessionCapture | None:
     if not isinstance(dropped, int) or isinstance(dropped, bool) or dropped < 0:
         dropped = 0
     return SessionCapture(task=task_id, known=True, calls=calls, dropped=dropped)
+
+
+def unbound_pods(pods_json: str | None, session_key_annotation: str) -> list[str]:
+    """The live session pods that carry no conversation's annotation, oldest first.
+
+    A pod the gateway claimed from its warm pool runs a conversation without
+    its session-key annotation: the warm pod is created without one and the
+    gateway can't patch pods. So when no pod carries the conversation's
+    annotation, the capture is looked for on these, at most
+    :data:`UNBOUND_PODS_TRIED`; only the pod that ran the task answers
+    ``known: true`` for it, and task ids are unique, so the one that does is
+    the one. Live as ``idle_reply.session_pod`` counts it: not being deleted,
+    not exited.
+    """
+    if pods_json is None:
+        return []
+    try:
+        items = json.loads(pods_json).get("items") or []
+    except (ValueError, AttributeError):
+        return []
+    live = []
+    for pod in items:
+        meta = pod.get("metadata") or {}
+        if meta.get("deletionTimestamp") or (pod.get("status") or {}).get("phase") in ("Succeeded", "Failed"):
+            continue
+        if (meta.get("annotations") or {}).get(session_key_annotation):
+            continue
+        live.append((str(meta.get("creationTimestamp") or ""), str(meta.get("name") or "")))
+    return [name for _, name in sorted(live) if name][:UNBOUND_PODS_TRIED]
 
 
 def capture(target: list[str], task_id: str, timeout: float) -> SessionCapture | None:

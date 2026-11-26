@@ -23,7 +23,7 @@ import subprocess
 from typing import Any
 
 import pytest
-from kube_agents_bench import harness, session_trajectory
+from kube_agents_bench import harness, idle_reply, session_trajectory
 from kube_agents_bench import inject_transport as inject
 
 TASK = "task-7"
@@ -239,14 +239,16 @@ def test_a_failed_exec_is_unread(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- the harness hook ----------------------------------------------------------
 
 
-def exchange_of(parts: list[dict[str, Any]]) -> inject.Exchange:
-    return inject.Exchange(fold=fold_of(parts), outcome=inject.OUTCOME_TERMINAL, conversation="inject:run/case/1", task_id=TASK)
+def exchange_of(parts: list[dict[str, Any]], *, child_count: int | None = 0) -> inject.Exchange:
+    fold = fold_of(parts)
+    fold.child_count = child_count
+    return inject.Exchange(fold=fold, outcome=inject.OUTCOME_TERMINAL, conversation="inject:run/case/1", task_id=TASK)
 
 
 def test_inject_result_fills_args_from_the_session_pod(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
     monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
-    monkeypatch.setattr(harness, "_session_pod_of", lambda conversation: POD)
+    monkeypatch.setattr(harness, "_capture_pods", lambda conversation: [POD])
     run = FakeRun(reply_of(CAPTURE))
     monkeypatch.setattr(session_trajectory.subprocess, "run", run)
     result = harness._inject_result(exchange_of(STRIPPED_PARTS), {})
@@ -256,7 +258,7 @@ def test_inject_result_fills_args_from_the_session_pod(monkeypatch: pytest.Monke
 
 
 def test_inject_result_without_a_session_pod_reads_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(harness, "_session_pod_of", lambda conversation: "")
+    monkeypatch.setattr(harness, "_capture_pods", lambda conversation: [])
     run = FakeRun(reply_of(CAPTURE))
     monkeypatch.setattr(session_trajectory.subprocess, "run", run)
     result = harness._inject_result(exchange_of(STRIPPED_PARTS), {})
@@ -265,17 +267,74 @@ def test_inject_result_without_a_session_pod_reads_nothing(monkeypatch: pytest.M
 
 
 def test_inject_result_with_inputs_on_every_part_never_looks(monkeypatch: pytest.MonkeyPatch) -> None:
-    def no_lookup(conversation: str) -> str:
+    def no_lookup(conversation: str) -> list[str]:
         raise AssertionError("looked up a session pod for parts that carry their input")
 
-    monkeypatch.setattr(harness, "_session_pod_of", no_lookup)
+    monkeypatch.setattr(harness, "_capture_pods", no_lookup)
     parts = [{**STRIPPED_PARTS[0], "input": BASH_INPUT}]
     result = harness._inject_result(exchange_of(parts), {})
     assert [e["args"] for e in result.trajectory if e["name"] == "Bash"] == [BASH_INPUT]
 
 
 def test_inject_result_on_a_pod_without_the_capture_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(harness, "_session_pod_of", lambda conversation: POD)
+    monkeypatch.setattr(harness, "_capture_pods", lambda conversation: [POD])
     monkeypatch.setattr(session_trajectory.subprocess, "run", FakeRun("usage: worker-adapter ...", returncode=1))
     result = harness._inject_result(exchange_of(STRIPPED_PARTS), {})
     assert [e["args"] for e in result.trajectory if e["name"] in ("Bash", "Read")] == [{}, {}]
+
+
+# --- which pod, which turn ---------------------------------------------------
+
+
+class PodRun:
+    """A stub ``subprocess.run`` answering each pod's exec with that pod's reply."""
+
+    def __init__(self, replies: dict[str, str]) -> None:
+        self.replies = replies
+        self.pods: list[str] = []
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        pod = next(a for a in argv if a.startswith("pod/"))[len("pod/") :]
+        self.pods.append(pod)
+        return subprocess.CompletedProcess(argv, 0, self.replies.get(pod, ""), "")
+
+
+def test_a_warm_claimed_pod_is_found_by_the_task_it_holds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No pod carries the conversation's annotation (a pod claimed from the
+    # warm pool): the capture comes from the unbound pod that holds the task.
+    monkeypatch.setattr(harness, "_capture_pods", lambda conversation: ["warm-a", "warm-b"])
+    run = PodRun({"warm-a": reply_of(capture_doc([], known=False)), "warm-b": reply_of(CAPTURE)})
+    monkeypatch.setattr(session_trajectory.subprocess, "run", run)
+    result = harness._inject_result(exchange_of(STRIPPED_PARTS), {})
+    assert run.pods == ["warm-a", "warm-b"]
+    assert [e["args"] for e in result.trajectory if e["name"] in ("Bash", "Read")] == [BASH_INPUT, READ_INPUT]
+
+
+@pytest.mark.parametrize("child_count", [1, None])
+def test_a_turn_that_delegated_or_cant_say_reads_nothing(monkeypatch: pytest.MonkeyPatch, child_count: int | None) -> None:
+    # After a delegation the parts are the wake turn's while the id is the
+    # root's: the capture asked for would be another turn's.
+    monkeypatch.setattr(harness, "_capture_pods", lambda conversation: [POD])
+    run = FakeRun(reply_of(CAPTURE))
+    monkeypatch.setattr(session_trajectory.subprocess, "run", run)
+    result = harness._inject_result(exchange_of(STRIPPED_PARTS, child_count=child_count), {})
+    assert run.calls == []
+    assert [e["args"] for e in result.trajectory if e["name"] in ("Bash", "Read")] == [{}, {}]
+
+
+def test_capture_pods_prefer_the_annotated_pod_then_the_unbound_ones(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = "inject:run/case/1"
+
+    def pod(name: str, created: str, *, annotations: dict[str, str] | None = None, **extra: Any) -> dict[str, Any]:
+        return {"metadata": {"name": name, "creationTimestamp": created, "annotations": annotations or {}, **extra}, "status": {"phase": "Running"}}
+
+    other = pod("bound-other", "2026-11-26T10:00:00Z", annotations={idle_reply.SESSION_KEY_ANNOTATION: "inject:other"})
+    warm_new = pod("warm-new", "2026-11-26T10:05:00Z", annotations={"a2a.kubeagents.dev/warm": "true"})
+    warm_old = pod("warm-old", "2026-11-26T10:01:00Z")
+    gone = pod("warm-gone", "2026-11-26T09:00:00Z", deletionTimestamp="2026-11-26T10:06:00Z")
+    items = [other, warm_new, warm_old, gone]
+    monkeypatch.setattr(harness, "_kubectl_read", lambda argv, what: json.dumps({"items": items}))
+    assert harness._capture_pods(key) == ["warm-old", "warm-new"]
+    mine = pod("bound-mine", "2026-11-26T10:02:00Z", annotations={idle_reply.SESSION_KEY_ANNOTATION: key})
+    items.append(mine)
+    assert harness._capture_pods(key) == ["bound-mine"]

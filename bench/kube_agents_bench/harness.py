@@ -3390,21 +3390,51 @@ def _fill_session_args(exchange: inject.Exchange) -> None:
     """Fill the turn's inputless activity parts from its session pod's capture.
 
     Only when a call part arrived without ``input`` (a gateway that strips
-    them), and only on the session route: a conversation with no live
-    session pod (the platform route, or a pod already gone) reads nothing.
-    A pod whose adapter has no capture, or a capture that disagrees with the
-    parts, fills nothing (:mod:`session_trajectory`).
+    them), and only for a turn that delegated nothing (the probe's
+    ``childCount`` is ``0``). After a delegation the door reads the trace of
+    the chain's last task, the wake, while it reports the root task's id, and
+    the capture is kept by the id of the turn that ran: the capture this
+    could ask for belongs to another turn, so the parts keep their empty args
+    rather than another turn's. A door that can't say (``None``) is not read
+    either.
+
+    The pod is the one whose session-key annotation is the conversation; when
+    none carries it (a pod claimed from the warm pool), the live pods with no
+    such annotation are tried, and the capture taken from the one that holds
+    the task (:func:`session_trajectory.unbound_pods`). The platform route has
+    no session pod and reads nothing. A pod whose adapter has no capture, or a
+    capture that disagrees with the parts, fills nothing
+    (:mod:`session_trajectory`).
     """
     fold = exchange.fold
     parts = fold.call_parts()
     if not exchange.task_id or not any(part.get(inject.ACTIVITY_INPUT_KEY) is None for _, part in parts):
         return
-    pod = _session_pod_of(exchange.conversation)
-    if not pod:
+    if fold.child_count != 0:
+        _log.info(
+            "session trajectory for %s not read: the turn delegated (childCount %s), so its trace is another turn's",
+            exchange.task_id,
+            fold.child_count,
+        )
         return
-    captured = session_trajectory.capture(_kubectl_target(f"pod/{pod}"), exchange.task_id, _EXEC_TIMEOUT)
-    if captured is not None:
-        fold.fill_inputs(session_trajectory.merge(parts, captured))
+    for pod in _capture_pods(exchange.conversation):
+        captured = session_trajectory.capture(_kubectl_target(f"pod/{pod}"), exchange.task_id, _EXEC_TIMEOUT)
+        if captured is not None and captured.known:
+            fold.fill_inputs(session_trajectory.merge(parts, captured))
+            return
+
+
+def _capture_pods(conversation: str) -> list[str]:
+    """The session pods to look for a turn's capture on, in order: the one
+    annotated with ``conversation``, or else the live pods with no
+    conversation's annotation (:func:`_fill_session_args`)."""
+    pods = _kubectl_read(
+        ["get", "pods", "-l", idle_reply.SESSION_POD_SELECTOR, "-o", "json"], f"the session pods for {conversation}"
+    )
+    bound = idle_reply.session_pod(pods, conversation)
+    if bound:
+        return [bound]
+    return session_trajectory.unbound_pods(pods, idle_reply.SESSION_KEY_ANNOTATION)
 
 
 def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
