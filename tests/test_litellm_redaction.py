@@ -561,6 +561,25 @@ class TestCallback(unittest.TestCase):
                 self._run({"input": [{"type": "message", "role": "user", "content": [part]}]}, "aresponses")
             self.assertEqual(refused.exception.status_code, 400)
 
+    def test_a_responses_function_call_outputs_parts_keep_binary_and_refuse_text(self) -> None:
+        image_url = "data:image/png;base64," + _RULE_MATCHING_BASE64
+        data = {"input": [{"type": "function_call_output", "call_id": "c", "output": [
+            {"type": "input_text", "text": "on prod-eu-1"},
+            {"type": "input_image", "image_url": image_url},
+        ]}]}
+        text, image = self._run(data, "aresponses")["input"][0]["output"]
+        self.assertNotIn("prod-eu-1", text["text"])
+        self.assertEqual(image["image_url"], image_url)
+        refused = {"input": [{"type": "function_call_output", "call_id": "c", "output": [
+            {"type": "input_file", "file_data": "data:text/plain;base64,cHJvZC1ldS0x"},
+        ]}]}
+        with self.assertRaises(HTTPException) as caught:
+            self._run(refused, "aresponses")
+        self.assertEqual(caught.exception.status_code, 400)
+        # A string output is still walked as text.
+        walked = self._run({"input": [{"type": "function_call_output", "call_id": "c", "output": "on prod-eu-1"}]}, "aresponses")
+        self.assertNotIn("prod-eu-1", walked["input"][0]["output"])
+
     def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
         # Forms providers accept: the URL-safe alphabet, no padding, and the
         # common image/jpg label. Each is kept byte for byte as it came.

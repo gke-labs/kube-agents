@@ -20,9 +20,10 @@ Anthropic tool input sent as a string) are decoded, walked as a document and
 re-encoded only if a rule changed them, so they stay valid JSON.
 
 Left exactly as they came, and only at the positions the provider APIs
-define (content parts, a Responses `input` item's included, a tool result's
-own content list, `system`, `thinking_blocks`, Gemini parts and the parts
-inside a Gemini function response; never inside a tool's input or output or a
+define (content parts, including a Responses `input` item's and a Responses
+function call output's, a tool result's own content list, `system`,
+`thinking_blocks`, Gemini parts and the parts inside a Gemini function
+response; beyond those parts, never inside a tool's input or output or a
 function's arguments): in an assistant's or the model's own turn, a thinking
 block's text and signature (the provider checks the text against the
 signature, and the model wrote it from input this hook had already redacted),
@@ -39,7 +40,7 @@ settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, or anything at a
 payload position that is not binary base64, answered with 400 since the same
-request is refused every time. Responses are not touched.
+request is refused every time. Model responses are not touched.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
@@ -151,6 +152,8 @@ TOOL_CALLS_KEY = "tool_calls"
 RESPONSES_INPUT_KEY = "input"
 # A Responses input part whose base64 payload sits at the part's own file_data.
 RESPONSES_INPUT_FILE_TYPE = "input_file"
+RESPONSES_FUNCTION_CALL_OUTPUT_TYPE = "function_call_output"
+RESPONSES_OUTPUT_KEY = "output"
 # A media type the refusal message may name: anything else is reported in
 # fixed words, since the value comes from the request.
 NAMEABLE_MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}$")
@@ -439,6 +442,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
             # chat parts are, never as an assistant's (no thinking exemption).
             if isinstance(item, dict) and isinstance(item.get(CONTENT_KEY), list):
                 self._carve_parts(item[CONTENT_KEY], (RESPONSES_INPUT_KEY, i, CONTENT_KEY), kept)
+            # A function_call_output's output may be a list of the same parts.
+            if isinstance(item, dict) and item.get(TYPE_KEY) == RESPONSES_FUNCTION_CALL_OUTPUT_TYPE and isinstance(item.get(RESPONSES_OUTPUT_KEY), list):
+                self._carve_parts(item[RESPONSES_OUTPUT_KEY], (RESPONSES_INPUT_KEY, i, RESPONSES_OUTPUT_KEY), kept)
         if isinstance(data.get(SYSTEM_KEY), list):
             self._carve_parts(data[SYSTEM_KEY], (SYSTEM_KEY,), kept)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):

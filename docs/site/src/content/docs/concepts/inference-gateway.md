@@ -282,7 +282,7 @@ Before LiteLLM calls the provider, the hook rewrites every top-level field of th
 
 Each field is walked whole, so a value is redacted wherever it sits: a tool's input, what a tool returned, or an assistant message's other fields. A tool call's arguments held as JSON in a string are decoded first. A key name such as `password` then counts as it does in a mapping, and the arguments stay valid JSON.
 
-A few fields are left as they came. They are kept only where the provider APIs put them: content parts (a Responses `input` item's included), a tool result's own content list, the system blocks, Gemini parts and the parts inside a Gemini function response. Nothing inside a tool's input or output is kept. The kept fields are:
+A few fields are left as they came. They are kept only where the provider APIs put them: content parts, a tool result's own content list, the system blocks and Gemini parts. That includes the parts of a Responses `input` item or function call output, and the parts inside a Gemini function response. Beyond those parts, nothing inside a tool's input or output is kept. The kept fields are:
 
 - in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
 - redacted thinking and a thought signature, in the same turn;
