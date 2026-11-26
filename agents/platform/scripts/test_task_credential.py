@@ -124,6 +124,25 @@ class GoldenFixtureTest(unittest.TestCase):
             "an over-long trigger script",
             "a case-variant trigger script key",
             "a null trigger script",
+            "the unattended permit, a builtin schedule trigger with a stream",
+            "the unattended permit on a report credential",
+            "the unattended permit, a schedule trigger with a stream and a script",
+            "minted by taskcred.Mint with the unattended permit",
+            "the confirmed permit beside a builtin schedule trigger with a stream",
+            "the unattended permit and no trigger",
+            "the unattended permit, a collector trigger",
+            "the unattended permit, a schedule trigger with no stream",
+            "the unattended permit, a schedule trigger with an explicit empty stream",
+            "the unattended permit, a schedule trigger with a script and no stream",
+            "the unattended permit on a report credential with a collector trigger",
+            "both permits, the unattended one first",
+            "both permits, the confirmed one first",
+            "the unattended permit twice",
+            "a case variant of the unattended permit",
+            "the unattended permit on the nats audience",
+            "the unattended permit, a trigger with a user origin",
+            "the unattended permit and a null trigger",
+            "the unattended permit and a null trigger stream",
         ):
             with self.subTest(name=name):
                 self.assertIn(name, names)
@@ -139,6 +158,53 @@ class GoldenFixtureTest(unittest.TestCase):
 
     def test_no_permit_reads_as_none(self):
         self.assertEqual(frozenset(), self.verify(self._case("valid")).permits)
+
+    def test_the_unattended_permit_is_read_out_with_its_trigger(self):
+        for name in (
+            "the unattended permit, a builtin schedule trigger with a stream",
+            "the unattended permit on a report credential",
+            "minted by taskcred.Mint with the unattended permit",
+        ):
+            with self.subTest(case=name):
+                claims = self.verify(self._case(name))
+                self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), claims.permits)
+                self.assertEqual("compliance-audit", claims.trigger.stream)
+
+    def test_the_unattended_permit_is_refused_for_its_own_rule(self):
+        # Each credential is valid without the permit, so these messages show
+        # that the permit's rule is what refused it.
+        for name in ("both permits, the unattended one first", "both permits, the confirmed one first"):
+            with self.subTest(case=name), self.assertRaisesRegex(TaskCredentialError, "may not carry both"):
+                self.verify(self._case(name))
+        for name in (
+            "the unattended permit and no trigger",
+            "the unattended permit, a collector trigger",
+            "the unattended permit, a schedule trigger with no stream",
+            "the unattended permit, a schedule trigger with an explicit empty stream",
+            "the unattended permit, a schedule trigger with a script and no stream",
+            "the unattended permit on a report credential with a collector trigger",
+        ):
+            with self.subTest(case=name), self.assertRaisesRegex(TaskCredentialError, "needs a builtin schedule trigger"):
+                self.verify(self._case(name))
+
+    def test_the_unattended_trigger_rule_stands_without_the_trigger_shape_check(self):
+        # _trigger refuses some of these shapes first today (another origin, a
+        # stream that is not the schedule's own name), so only a direct call
+        # shows that the permit's rule refuses them by itself.
+        trigger = task_credential.TaskTrigger
+        for name, value, want in (
+            ("a builtin schedule trigger with its stream", trigger("schedule/nightly", "builtin", "nightly"), True),
+            ("the same, naming a script", trigger("schedule/nightly", "builtin", "nightly", "nightly"), True),
+            ("no trigger", None, False),
+            ("no stream", trigger("schedule/nightly", "builtin"), False),
+            ("no stream and an empty schedule name", trigger("schedule/", "builtin"), False),
+            ("a user origin", trigger("schedule/nightly", "user", "nightly"), False),
+            ("another schedule's stream", trigger("schedule/nightly", "builtin", "weekly"), False),
+            ("a stream on another source", trigger("watch/nightly", "builtin", "nightly"), False),
+            ("a stream on a bare source", trigger("nightly", "builtin", "nightly"), False),
+        ):
+            with self.subTest(case=name):
+                self.assertEqual(want, task_credential._unattended_write_trigger(value))
 
     def test_permits_on_the_nats_audience_are_refused_for_the_permits(self):
         # The audience check would refuse this credential anyway; the
