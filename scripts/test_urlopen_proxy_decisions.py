@@ -20,6 +20,11 @@ egress proxy needs it.
 source today (`takes` the proxy, or `refuses` it). A row with the decision
 `refuse` and the state `takes` is a call that still has to change.
 
+`agents/platform/scripts/test_broker_openers_refuse_proxy.py` reads the rows too.
+For each row of a platform script with a module-level `build_opener` and the
+state `refuses`, it loads the module with a proxy variable set and reads the
+opener that the import made.
+
 The tests fail when:
 
 - an audited file gets a new `urlopen` or `build_opener` call, loses one, or

@@ -413,6 +413,16 @@ def healthy_world(*projects):
             "deployment/app-worker-b": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "8Mi"}}}]}}}},
             "deployment/batch-worker-a": {"status": {"readyReplicas": 1, "replicas": 1}, "spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/compute-class": "general-ccc"}, "tolerations": [{"key": "cloud.google.com/compute-class", "value": "general-ccc", "effect": "NoSchedule"}], "containers": [{"name": "worker", "resources": {"requests": {"cpu": "10m", "memory": "8Mi"}, "limits": {"memory": "16Mi"}}}]}}}},
             "computeclass/general-ccc": {"spec": {"priorities": [{"nodepools": ["default-pool"]}, {"machineFamily": "n4"}, {"machineFamily": "c3"}], "nodePoolAutoCreation": {"enabled": False}}},
+            "computeclass/reserved-ccc": {
+                "spec": {
+                    "priorities": [{"machineType": "n2-standard-2", "reservations": {"affinity": "Specific", "specific": [{"name": "seeded-absent-reservation"}]}}, {"machineType": "e2-standard-4"}],
+                    "nodePoolAutoCreation": {"enabled": True},
+                    "nodePoolConfig": {"taints": [{"key": "dedicated", "value": "reserved-ccc", "effect": "NoSchedule"}]},
+                    "whenUnsatisfiable": "DoNotScaleUp",
+                },
+                "status": {"conditions": [{"type": "CrdMisconfigured", "status": "True", "reason": "ReservationNotFound"}, {"type": "Health", "status": "False", "reason": "Health"}]},
+            },
+            "node?cloud.google.com/compute-class=reserved-ccc": {"items": []},
             "node?cloud.google.com/compute-class=general-ccc": {"items": [{"metadata": {"name": "gke-seeded-c-default-pool-4q2m", "labels": {"cloud.google.com/compute-class": "general-ccc"}}, "spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
             "namespace/seeded-reliability": {"metadata": {"name": "seeded-reliability"}},
             "deployment/payments-api": {"status": {"readyReplicas": 0}},
@@ -714,10 +724,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 59, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 60, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 59, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 60, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -784,7 +794,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 117, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 119, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -803,7 +813,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 58, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 59, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})

@@ -250,6 +250,18 @@ it, and is refused at startup with more than one mode in `--auth-mode`, where tw
 could name different callers alike. The binary's upstreams pick no credential per caller, so the
 partition separates what callers can read from the cache, not what the upstream authorizes.
 
+[`examples/`](examples/) holds two reference deployments for a sandbox runtime outside
+kube-agents. In [`examples/egress-gateway/`](examples/egress-gateway/), one Deployment serves every
+tenant: the runtime's egress gateway injects a signed token per sandbox, the proxy verifies it with
+`--auth-mode=jwt` and separates tenants in its cache with `--partition-by-caller=partition`, and
+the manifests cover the serving certificate, the Service name the certificate, the kubeconfig and
+the gateway rule share, and the NetworkPolicy that admits the gateway's pods. In
+[`examples/local-bridge/`](examples/local-bridge/), one process per sandbox listens on loopback
+with `--auth-mode=none` and forwards to a local `--upstream-url`.
+`cmd/k8s-api-proxy/examples_test.go` builds the binary's handler from the container `args` in the
+manifests and from the fenced flag blocks in the two example READMEs, so an unknown flag or a
+refused combination there fails the module's tests; flags named in prose are not checked.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash

@@ -90,7 +90,7 @@ The `hermes-bridge` container the operator adds to the `<name>-gateway` pod. It 
 
 ### Session pod
 
-A pod the A2A gateway starts for one conversation moved onto the `/session` route, or for one `delegate` message, from the `chat` profile. It is deleted 30 minutes after the last message and after 4 hours at most. An [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) resource describes further kinds of agent pod on the bus.
+A pod the A2A gateway starts for one conversation moved onto the `/session` route, or for one `delegate` message, from the `chat` profile. It is deleted 30 minutes after the last message (5 for a DM conversation with one message so far) and after 4 hours at most. An [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) resource describes further kinds of agent pod on the bus.
 
 ### A2A console
 

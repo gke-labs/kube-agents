@@ -10211,6 +10211,19 @@ spec:
                             - session
                             - platform
                           type: string
+                        dmSessionIdleMinutes:
+                          description: |-
+                            DMSessionIdleMinutes replaces SessionIdleMinutes for a DM conversation
+                            with one message so far (A2A_DM_IDLE_TTL): most DMs are a single
+                            question, and a session pod held for the full idle time after its answer
+                            takes a slot of maxSessions. A delegation the pod makes to answer doesn't
+                            count as a message. A second message puts the conversation back
+                            on SessionIdleMinutes. Unset, the gateway's default of 5 applies. A
+                            value above SessionIdleMinutes has no effect beyond it.
+                          format: int32
+                          maximum: 10080
+                          minimum: 1
+                          type: integer
                         maxInProgress:
                           description: |-
                             MaxInProgress caps how many kanban workers run concurrently across the whole
@@ -10471,6 +10484,20 @@ spec:
                                 "(has(self.restartGraceSeconds) ? self.restartGraceSeconds
                                 : 60) >= 2 * (has(self.renewSeconds) ? self.renewSeconds
                                 : 20)"
+                        sessionIdleMinutes:
+                          description: |-
+                            SessionIdleMinutes is how long a session pod is kept after the last
+                            message in its conversation before the gateway reaps it (A2A_IDLE_TTL).
+                            A running task always keeps its pod, and the next message after a reap
+                            gets a new pod with the conversation's history. Unset, the gateway's
+                            default of 30 applies. It also bounds how long a Slack thread stays live
+                            without a fresh mention after its last task. A session pod also ends at
+                            its 4-hour maximum lifetime, so above 240 the value only lengthens that
+                            Slack thread liveness.
+                          format: int32
+                          maximum: 10080
+                          minimum: 1
+                          type: integer
                         sessionResources:
                           description: |-
                             SessionResources are the A2A session pods' CPU and memory requests and
@@ -12903,6 +12930,17 @@ spec:
                         SecretUIDs maps each such Secret's name to the UID it was created with.
                         A tier key's Secret is in the profile namespace; every other one is in
                         the PlatformAgent's namespace.
+                      type: object
+                    tierUnboundAt:
+                      additionalProperties:
+                        format: date-time
+                        type: string
+                      description: |-
+                        TierUnboundAt maps a tier whose key Secret is recorded to when the
+                        operator first found no bound profile listing it. While the applied
+                        dispatch config still lists such a tier as live, its key is kept for at
+                        most the drain window from then. An entry goes when a bound profile
+                        lists the tier again, and on the pass after its key is deleted.
                       type: object
                   type: object
                 lastReconcileTime:

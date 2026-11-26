@@ -48,6 +48,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_DELEGATION_ROUNDS_MAX", "")
 	t.Setenv("A2A_BUSY_NOTICE_AT", "")
 	t.Setenv("A2A_IDLE_TTL", "")
+	t.Setenv("A2A_DM_IDLE_TTL", "")
 	for _, k := range []string{"A2A_SESSION_CPU_REQUEST", "A2A_SESSION_MEMORY_REQUEST", "A2A_SESSION_CPU_LIMIT", "A2A_SESSION_MEMORY_LIMIT"} {
 		t.Setenv(k, "")
 	}
