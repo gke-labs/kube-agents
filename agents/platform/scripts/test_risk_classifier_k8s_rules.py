@@ -460,12 +460,12 @@ class PodAndContainerSecuritySmugglingTests(unittest.TestCase):
             "          secret:\n"
             "            secretName: web-tls\n"
         )
-        # Pure pinned image bump on workload with existing unchanged secret -> LOW!
+        # Pure pinned image bump on workload with existing unchanged secret -> LOW (rolling pod restart is disruptive)!
         r_bump = classify_changes(
             [_mod("clusters/dev/web.yaml", dep_with_sec, dep_with_sec.replace("v1.2.3", "v1.2.4"))]
         )
         self.assertEqual(r_bump.risk_level, RISK_LOW)
-        self.assertEqual(r_bump.disruptiveness, DISRUPT_NONE)
+        self.assertEqual(r_bump.disruptiveness, DISRUPT_DISRUPTIVE)
 
         # Changing WHICH secret is mounted -> HIGH!
         r_swap = classify_changes(

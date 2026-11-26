@@ -221,7 +221,7 @@ class WorkloadScenarioTests(unittest.TestCase):
         self.assertEqual(r.risk_level, RISK_LOW)
         self.assertEqual(r.blast_radius, BLAST_LOW)
         self.assertEqual(r.revertability, REVERT_EASY)
-        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
+        self.assertEqual(r.disruptiveness, DISRUPT_DISRUPTIVE)
         self.assertTrue(r.supported)
         self.assertTrue(r.effective_changes)
         self.assertEqual(r.risk_label, "risk:low")
@@ -258,6 +258,7 @@ class WorkloadScenarioTests(unittest.TestCase):
         r = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace("replicas: 4", "replicas: 3"))])
         self.assertEqual(r.risk_level, RISK_MEDIUM)
         self.assertEqual(r.disruptiveness, DISRUPT_NONE)
+        self.assertEqual(r.revertability, REVERT_MODERATE)
 
     def test_steep_scale_down_and_zero_are_high_disruptive_easy_revert(self) -> None:
         for target in (1, 0):
@@ -326,7 +327,7 @@ class WorkloadScenarioTests(unittest.TestCase):
         after = before.replace('cpu: "50m"', 'cpu: "100m"').replace('cpu: "100m"\n              memory: "128Mi"', 'cpu: "200m"\n              memory: "128Mi"')
         r = classify_changes([_mod("clusters/dev/web.yaml", before, after)])
         self.assertEqual(r.risk_level, RISK_LOW)
-        self.assertEqual(r.disruptiveness, DISRUPT_NONE)
+        self.assertEqual(r.disruptiveness, DISRUPT_DISRUPTIVE)
 
     def test_request_exceeds_limit_is_high_disruptive(self) -> None:
         after = BASE_DEPLOY.replace('cpu: "100m"', 'cpu: "800m"')
@@ -2315,6 +2316,163 @@ class TriageEngineHardeningTests(unittest.TestCase):
         self.assertEqual(r_meta_unmod.risk_level, RISK_MEDIUM)
         self.assertEqual(r_meta_unmod.revertability, REVERT_MODERATE)
         self.assertIn("UNALLOWLISTED_METADATA_EDIT", {x.code for x in r_meta_unmod.reasons})
+
+        # 21. Runtime-risky medium edits set non-easy revertability (and resource reduction is disruptive)
+        r_res_red = classify_changes(
+            [_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace('cpu: "100m"', 'cpu: "80m"'))]
+        )
+        self.assertEqual(r_res_red.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_res_red.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertEqual(r_res_red.revertability, REVERT_MODERATE)
+
+        r_res_big = classify_changes(
+            [_mod("clusters/dev/web.yaml", BASE_DEPLOY, BASE_DEPLOY.replace('cpu: "100m"', 'cpu: "450m"'))]
+        )
+        self.assertEqual(r_res_big.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_res_big.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertEqual(r_res_big.revertability, REVERT_MODERATE)
+
+        cm_mod_b = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-cm\n  namespace: shop\ndata:\n  LOG_LEVEL: info\n"
+        cm_mod_a = cm_mod_b.replace("LOG_LEVEL: info", "LOG_LEVEL: debug")
+        r_cm_mod = classify_changes([_mod("clusters/dev/cm.yaml", cm_mod_b, cm_mod_a)])
+        self.assertEqual(r_cm_mod.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_cm_mod.revertability, REVERT_MODERATE)
+
+        cm_url_a = cm_mod_b + "  UPSTREAM_URL: https://api.internal.example/v1\n"
+        r_cm_url = classify_changes([_mod("clusters/dev/cm.yaml", cm_mod_b, cm_url_a)])
+        self.assertEqual(r_cm_url.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_cm_url.revertability, REVERT_MODERATE)
+
+        r_hpa_low = classify_changes(
+            [_mod("clusters/dev/hpa.yaml", BASE_HPA, BASE_HPA.replace("maxReplicas: 6", "maxReplicas: 4"))]
+        )
+        self.assertEqual(r_hpa_low.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_hpa_low.revertability, REVERT_MODERATE)
+
+        dep_strat_mod = BASE_DEPLOY.replace(
+            "  replicas: 4\n",
+            "  replicas: 4\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 2\n",
+        )
+        r_strat_mod = classify_changes([_mod("clusters/dev/web.yaml", BASE_DEPLOY, dep_strat_mod)])
+        self.assertEqual(r_strat_mod.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_strat_mod.revertability, REVERT_MODERATE)
+
+    def test_argo_rollout_and_keda_autoscaling_kinds(self) -> None:
+        rollout = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: web-ro
+  namespace: shop
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    canary:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: app
+          image: gcr.io/acme/web:v1.0.0
+"""
+        # New Rollout is MEDIUM + supported
+        r_ro_add = classify_changes([_add("clusters/dev/ro.yaml", rollout)])
+        self.assertTrue(r_ro_add.supported)
+        self.assertEqual(r_ro_add.risk_level, RISK_MEDIUM)
+        self.assertEqual(r_ro_add.revertability, REVERT_EASY)
+        self.assertEqual(r_ro_add.disruptiveness, DISRUPT_NONE)
+
+        # Modest replica bump on Rollout is LOW + non_disruptive + easy
+        r_ro_rep = classify_changes(
+            [_mod("clusters/dev/ro.yaml", rollout, rollout.replace("replicas: 3", "replicas: 4"))]
+        )
+        self.assertEqual(r_ro_rep.risk_level, RISK_LOW)
+        self.assertEqual(r_ro_rep.disruptiveness, DISRUPT_NONE)
+        self.assertEqual(r_ro_rep.revertability, REVERT_EASY)
+
+        # Pinned image bump on Rollout is LOW + disruptive
+        r_ro_img = classify_changes(
+            [_mod("clusters/dev/ro.yaml", rollout, rollout.replace("v1.0.0", "v1.0.1"))]
+        )
+        self.assertEqual(r_ro_img.risk_level, RISK_LOW)
+        self.assertEqual(r_ro_img.disruptiveness, DISRUPT_DISRUPTIVE)
+
+        # Canary / blueGreen strategy edit on Rollout is HIGH + disruptive
+        r_ro_strat = classify_changes(
+            [_mod("clusters/dev/ro.yaml", rollout, rollout.replace("maxSurge: 1", "maxSurge: 2"))]
+        )
+        self.assertEqual(r_ro_strat.risk_level, RISK_HIGH)
+        self.assertEqual(r_ro_strat.disruptiveness, DISRUPT_DISRUPTIVE)
+        self.assertEqual(r_ro_strat.revertability, REVERT_MODERATE)
+
+        # Rollout referencing external Deployment via workloadRef (no inline spec.template) is supported
+        rollout_wref = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: ref-ro
+  namespace: shop
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  strategy:
+    blueGreen:
+      activeService: web-active
+"""
+        r_wref = classify_changes(
+            [_mod("clusters/dev/ref-ro.yaml", rollout_wref, rollout_wref.replace("replicas: 3", "replicas: 4"))]
+        )
+        self.assertTrue(r_wref.supported)
+        self.assertEqual(r_wref.risk_level, RISK_LOW)
+
+        # KEDA ScaledObject: omitted minReplicaCount defaults to 0 (scales to zero -> HIGH disruptive)
+        scaled_zero = """\
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scaler
+  namespace: shop
+spec:
+  scaleTargetRef:
+    name: worker
+  maxReplicaCount: 6
+  triggers:
+    - type: cpu
+      metadata:
+        value: "70"
+"""
+        r_keda_zero = classify_changes([_add("clusters/dev/so.yaml", scaled_zero)])
+        self.assertTrue(r_keda_zero.supported)
+        self.assertEqual(r_keda_zero.risk_level, RISK_HIGH)
+        self.assertEqual(r_keda_zero.disruptiveness, DISRUPT_DISRUPTIVE)
+
+        # KEDA ScaledObject with minReplicaCount >= 1: modest replica bound bump is LOW non_disruptive
+        scaled_safe = scaled_zero.replace("  maxReplicaCount: 6\n", "  minReplicaCount: 2\n  maxReplicaCount: 6\n")
+        r_keda_bump = classify_changes(
+            [_mod("clusters/dev/so.yaml", scaled_safe, scaled_safe.replace("maxReplicaCount: 6", "maxReplicaCount: 8"))]
+        )
+        self.assertEqual(r_keda_bump.risk_level, RISK_LOW)
+        self.assertEqual(r_keda_bump.disruptiveness, DISRUPT_NONE)
+        self.assertEqual(r_keda_bump.revertability, REVERT_EASY)
+
+        # KEDA TriggerAuthentication -> HIGH, ClusterTriggerAuthentication -> CRITICAL
+        ta = "apiVersion: keda.sh/v1alpha1\nkind: TriggerAuthentication\nmetadata:\n  name: ta\n  namespace: shop\nspec: {}\n"
+        cta = "apiVersion: keda.sh/v1alpha1\nkind: ClusterTriggerAuthentication\nmetadata:\n  name: cta\nspec: {}\n"
+        self.assertEqual(classify_changes([_add("clusters/dev/ta.yaml", ta)]).risk_level, RISK_HIGH)
+        self.assertEqual(classify_changes([_add("clusters/dev/cta.yaml", cta)]).risk_level, RISK_CRITICAL)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -43,6 +43,14 @@ KNOWN_FIX_TYPES = registry.kinds()
 ALLOWABLE_RISK_LEVELS = ("low", "medium")
 CONCRETE_RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 INSTALL_MAX_RISK_ENV = "KUBEAGENTS_AUTOMERGE_MAX_RISK"
+# Unearned `max_risk` rules do not go through per-recipe clean-merge proof or
+# post-merge health checks, so only dev/test environments may opt into them.
+UNEARNED_RISK_ENVIRONMENTS = frozenset(
+    {"dev", "development", "test", "testing", "sandbox", "ephemeral", "qa"}
+)
+_NON_DEV_ENV_TOKENS = frozenset(
+    {"prod", "production", "prd", "live", "staging", "stage", "stg", "preprod", "uat", "canary"}
+)
 # What a person calls each of them, for text kube-agents writes; one per known type.
 FIX_TYPE_NAMES = {recipe.kind: recipe.name for recipe in registry.recipes()}
 WILDCARD = "*"
@@ -71,10 +79,42 @@ LOADED = "loaded"
 _FIX_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # A GKE label value: lowercase letters, digits, `_` and `-`, at most 63.
 _ENV_RE = re.compile(r"[a-z0-9_-]{1,63}")
-_TOP_KEYS = frozenset({"version", "automerge"})
+_GLOB_PATH_RE = re.compile(r"[A-Za-z0-9._/*?-]{1,256}")
+_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+_TOP_KEYS = frozenset({"version", "automerge", "environments"})
 _AUTOMERGE_KEYS = frozenset({"allow", "deny"})
 _ALLOW_RULE_KEYS = frozenset({"fix", "max_risk", "environments"})
 _DENY_RULE_KEYS = frozenset({"fix", "risk", "environments"})
+_ENV_BINDING_KEYS = frozenset({"paths", "branches"})
+
+
+def is_unearned_risk_environment(env: str) -> bool:
+    """Return True iff `env` is a valid dev/test environment name eligible for `max_risk` allow rules."""
+    if not isinstance(env, str) or not _ENV_RE.fullmatch(env):
+        return False
+    tokens = [tok for tok in re.split(r"[-_]+", env) if tok]
+    if not tokens:
+        return False
+    if any(tok in _NON_DEV_ENV_TOKENS for tok in tokens):
+        return False
+    return any(tok in UNEARNED_RISK_ENVIRONMENTS for tok in tokens)
+
+
+@dataclass(frozen=True)
+class EnvironmentBinding:
+    """Optional repository-declared mapping of path globs and/or target branches to an environment."""
+
+    name: str
+    paths: tuple[str, ...] = ()
+    branches: tuple[str, ...] = ()
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.paths:
+            out["paths"] = list(self.paths)
+        if self.branches:
+            out["branches"] = list(self.branches)
+        return out
 
 
 @dataclass(frozen=True)
@@ -99,6 +139,8 @@ class Rule:
         if risk_level not in ALLOWABLE_RISK_LEVELS or self.max_risk not in ALLOWABLE_RISK_LEVELS:
             return False
         if environment == WILDCARD or WILDCARD in self.environments:
+            return False
+        if not is_unearned_risk_environment(environment):
             return False
         return (
             CONCRETE_RISK_ORDER[risk_level] <= CONCRETE_RISK_ORDER[self.max_risk]
@@ -138,6 +180,7 @@ class Rules:
     status: str
     allow: tuple[Rule, ...] = ()
     deny: tuple[Rule, ...] = ()
+    environments: tuple[EnvironmentBinding, ...] = ()
     # Why the file was refused (`INVALID`), for the operator's log.
     error: str = ""
     # Rules that parse but can never match, e.g. an unknown fix type.
@@ -241,6 +284,12 @@ def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str])
         if not isinstance(max_risk, str) or max_risk not in ALLOWABLE_RISK_LEVELS:
             allowed_str = ", ".join(f"`{r}`" for r in ALLOWABLE_RISK_LEVELS)
             raise RulesError(f"{where}.max_risk: expected one of {allowed_str} (`high`, `critical`, `unknown`, and `*` cannot be allowed)")
+        for index, env in enumerate(envs):
+            if not is_unearned_risk_environment(env):
+                raise RulesError(
+                    f"{where}.environments[{index}]: `max_risk` is restricted to dev/test environments "
+                    f"(such as `dev`, `test`, `qa`, `sandbox`), not `{env}`"
+                )
         return Rule(max_risk=max_risk, environments=tuple(envs))
 
     risk = data["risk"]
@@ -250,6 +299,60 @@ def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str])
         allowed_str = ", ".join(f"`{r}`" for r in (*deny_risk_levels, WILDCARD))
         raise RulesError(f"{where}.risk: expected one of {allowed_str}")
     return Rule(risk=risk, environments=tuple(envs))
+
+
+def _parse_environments(raw: Any) -> tuple[EnvironmentBinding, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise RulesError("environments: expected a mapping")
+    bindings: list[EnvironmentBinding] = []
+    for env_name, spec in raw.items():
+        if not isinstance(env_name, str) or not _ENV_RE.fullmatch(env_name):
+            raise RulesError(f"environments.{env_name}: expected an environment label value such as `dev`")
+        where = f"environments.{env_name}"
+        entry = _require_keys(spec, where, _ENV_BINDING_KEYS)
+        if not entry:
+            raise RulesError(f"{where}: specify `paths` and/or `branches`")
+        paths: list[str] = []
+        if "paths" in entry:
+            raw_paths = entry["paths"]
+            if not isinstance(raw_paths, list) or not raw_paths:
+                raise RulesError(f"{where}.paths: expected a non-empty list")
+            for idx, pat in enumerate(raw_paths):
+                if (
+                    not isinstance(pat, str)
+                    or not pat.strip()
+                    or pat != pat.strip()
+                    or pat.startswith("/")
+                    or pat.endswith("/")
+                    or "\\" in pat
+                    or "//" in pat
+                    or not _GLOB_PATH_RE.fullmatch(pat)
+                    or any(seg in ("", ".", "..") for seg in pat.split("/"))
+                ):
+                    raise RulesError(
+                        f"{where}.paths[{idx}]: expected a clean relative path glob such as `envs/dev/**`"
+                    )
+                paths.append(pat)
+        branches: list[str] = []
+        if "branches" in entry:
+            raw_branches = entry["branches"]
+            if not isinstance(raw_branches, list) or not raw_branches:
+                raise RulesError(f"{where}.branches: expected a non-empty list")
+            for idx, br in enumerate(raw_branches):
+                if (
+                    not isinstance(br, str)
+                    or not _BRANCH_RE.fullmatch(br)
+                    or ".." in br
+                    or "@{" in br
+                    or br.endswith(".lock")
+                    or br == "HEAD"
+                ):
+                    raise RulesError(f"{where}.branches[{idx}]: expected a valid git branch name")
+                branches.append(br)
+        bindings.append(EnvironmentBinding(name=env_name, paths=tuple(paths), branches=tuple(branches)))
+    return tuple(bindings)
 
 
 def parse(text: str) -> Rules:
@@ -278,9 +381,10 @@ def parse(text: str) -> Rules:
         version = top["version"]
         if type(version) is not int or version != SCHEMA_VERSION:
             raise RulesError(f"version: expected {SCHEMA_VERSION}")
+        env_bindings = _parse_environments(top.get("environments"))
         automerge = top.get("automerge")
         if automerge is None:
-            return Rules(status=LOADED)
+            return Rules(status=LOADED, environments=env_bindings)
         section = _require_keys(automerge, "automerge", _AUTOMERGE_KEYS)
         parsed: dict[str, tuple[Rule, ...]] = {}
         for key in ("allow", "deny"):
@@ -299,7 +403,13 @@ def parse(text: str) -> Rules:
         # A key too large to print (a YAML 1.1 base-60 integer past Python's
         # 4300-digit str limit) fails while the error message is built.
         return Rules(status=INVALID, error=f"not a rules file ({exc})")
-    return Rules(status=LOADED, allow=parsed["allow"], deny=parsed["deny"], warnings=tuple(warnings))
+    return Rules(
+        status=LOADED,
+        allow=parsed["allow"],
+        deny=parsed["deny"],
+        environments=env_bindings,
+        warnings=tuple(warnings),
+    )
 
 
 def _symlinked_component(tree: Path, relative: str) -> str | None:
@@ -346,6 +456,68 @@ def read_rules(tree: Path, *, automerge: str | None = None) -> Rules:
     if automerge not in READING_SWITCH_VALUES:
         return Rules(status=SWITCH_OFF)
     return load(tree)
+
+
+def _segment_matches_glob(seg: str, pat: str) -> bool:
+    rx = "^" + "".join("[^/]*" if ch == "*" else ("[^/]" if ch == "?" else re.escape(ch)) for ch in pat) + "$"
+    return bool(re.match(rx, seg))
+
+
+def _path_matches_glob(rel_path: str, pattern: str) -> bool:
+    if not isinstance(rel_path, str) or not rel_path or rel_path.startswith("/") or "\\" in rel_path:
+        return False
+    p_parts = tuple(p for p in rel_path.split("/") if p)
+    g_parts = tuple(g for g in pattern.split("/") if g)
+    if not p_parts or not g_parts or any(seg in (".", "..") for seg in p_parts):
+        return False
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _match(pi: int, gi: int) -> bool:
+        if (pi, gi) in memo:
+            return memo[(pi, gi)]
+        if gi == len(g_parts):
+            ans = pi == len(p_parts)
+        elif g_parts[gi] == "**":
+            if gi == len(g_parts) - 1:
+                ans = pi < len(p_parts)
+            else:
+                ans = _match(pi, gi + 1) or (pi < len(p_parts) and _match(pi + 1, gi))
+        else:
+            ans = pi < len(p_parts) and _segment_matches_glob(p_parts[pi], g_parts[gi]) and _match(pi + 1, gi + 1)
+        memo[(pi, gi)] = ans
+        return ans
+
+    return _match(0, 0)
+
+
+def resolve_declared_environment(
+    rules: Rules,
+    changed_paths: Sequence[str],
+    target_branch: str,
+) -> tuple[str, str]:
+    """Resolve an environment from `rules.environments` path/branch bindings.
+
+    Returns `(environment, error_reason)`. Fails closed if zero or multiple
+    declared environments match all `changed_paths` and `target_branch`.
+    """
+    if rules.status != LOADED or not rules.environments:
+        return UNKNOWN_ENVIRONMENT, ""
+    if not changed_paths:
+        return UNKNOWN_ENVIRONMENT, "no changed files to bind to an environment"
+    matched: list[str] = []
+    for binding in rules.environments:
+        if binding.branches and target_branch not in binding.branches:
+            continue
+        if binding.paths and not all(
+            any(_path_matches_glob(path, pat) for pat in binding.paths) for path in changed_paths
+        ):
+            continue
+        matched.append(binding.name)
+    if len(matched) == 1:
+        return matched[0], ""
+    if len(matched) > 1:
+        return UNKNOWN_ENVIRONMENT, "changed files match multiple declared environments"
+    return UNKNOWN_ENVIRONMENT, "changed files do not match any declared environment"
 
 
 def cluster_environment(labels: Mapping[str, Any] | None) -> str:
@@ -467,6 +639,11 @@ def decide_risk(
         return Decision(False, "the cluster declares no environment label")
     if not _ENV_RE.fullmatch(environment):
         return Decision(False, f"invalid cluster environment label `{environment}`")
+    if not is_unearned_risk_environment(environment):
+        return Decision(
+            False,
+            f"risk-based auto-merge (`max_risk`) is restricted to dev/test environments, not `{environment}`",
+        )
     for index, rule in enumerate(rules.deny):
         if rule.matches_risk_deny(risk_level, environment):
             return Decision(False, f"denied by automerge.deny[{index}]")
@@ -576,7 +753,7 @@ def _with_rule(text: str, section: str, fix_type: str, environment: str, note: s
         expected = (before.allow + (added,), before.deny)
     else:
         expected = (before.allow, before.deny + (added,))
-    if edited.status != LOADED or (edited.allow, edited.deny) != expected:
+    if edited.status != LOADED or (edited.allow, edited.deny) != expected or edited.environments != before.environments:
         raise RulesError(f"could not add {what} rule to this layout of {RULES_FILE}")
     if section == "allow" and not decide(edited, fix_type, environment).allowed:
         # A deny already covers it, so the edit would allow nothing.
@@ -636,6 +813,8 @@ def main(argv: list[str] | None = None) -> int:
         "allow": [r.to_summary_dict() for r in rules.allow],
         "deny": [r.to_summary_dict() for r in rules.deny],
     }
+    if rules.environments:
+        out["environments"] = {b.name: b.to_summary_dict() for b in rules.environments}
     if rules.error:
         out["error"] = rules.error
     if rules.warnings:

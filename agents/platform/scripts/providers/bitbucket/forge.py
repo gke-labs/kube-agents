@@ -44,13 +44,17 @@ from ..base import Forge, WorkspaceError, listing
 from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
+    MAX_STATUS_DESCRIPTION,
     repo_segments,
     validate_branch,
     validate_comment_limit,
     validate_limit,
     validate_number,
     validate_page,
+    validate_revision,
     validate_state,
+    validate_status_context,
+    validate_status_state,
     validate_text,
 )
 from . import translate
@@ -157,6 +161,7 @@ class BitbucketCloudForge(Forge):
     git_refused = GIT_REFUSED
     acknowledges = False
     labels = False
+    commit_statuses = True
     # A Bitbucket token always acts as an account: a person's, a dedicated
     # account's, or the bot user of an access token. An unknown login is a
     # fault, so the ownership checks refuse rather than skip.
@@ -604,6 +609,34 @@ class BitbucketCloudForge(Forge):
         )
         commits = [translate.commit(node) for node in reversed(nodes)]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
+
+    def commit_status_set(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        revision = validate_revision(payload.get("revision"), "revision")
+        state = validate_status_state(payload.get("state"))
+        context = validate_status_context(payload.get("context"))
+        description = validate_text(payload.get("description"), "description", required=False)[
+            :MAX_STATUS_DESCRIPTION
+        ]
+        bb_state = {"success": "SUCCESSFUL", "failure": "FAILED", "pending": "INPROGRESS"}[state]
+        api(
+            "POST",
+            f"{self._repo(repo)}/commit/{revision}/statuses/build",
+            body={
+                "key": context[:40],
+                "name": context,
+                "state": bb_state,
+                "description": description,
+                "url": f"https://{HOST}/{repo}/commits/{revision}",
+            },
+        )
+        return {
+            "status": {
+                "revision": revision,
+                "state": state,
+                "context": context,
+                "description": description,
+            }
+        }
 
     # -- the readings sweep's calls -------------------------------------------
 

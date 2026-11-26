@@ -69,12 +69,12 @@ spec:
           image: gcr.io/acme/worker:v1.0.0
 """
 
-AUTOMATION_LOW_STAGING_MEDIUM_DEV = """\
+AUTOMATION_LOW_TEST_MEDIUM_DEV = """\
 version: 1
 automerge:
   allow:
     - max_risk: low
-      environments: [staging]
+      environments: [test]
     - max_risk: medium
       environments: [dev]
   deny:
@@ -123,8 +123,21 @@ class _FakeForge:
         p = dict(self.proposals[num])
         p["labels"] = list(p.get("labels") or [])
         out: dict[str, Any] = {"proposal": p}
-        if payload.get("diff") and "_diff" in p:
-            out["diff"] = p["_diff"]
+        if payload.get("diff"):
+            if "_diff" in p:
+                out["diff"] = p["_diff"]
+            else:
+                target = str(p.get("target") or "main")
+                src_rev = str(p.get("sourceRevision") or "")
+                remote_dir = self._url[len("file://") :] if self._url.startswith("file://") else self._url
+                proc = subprocess.run(
+                    ["git", "--git-dir=.", "diff", f"refs/heads/{target}...{src_rev}"],
+                    cwd=remote_dir,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                out["diff"] = proc.stdout if proc.returncode == 0 else ""
         return out
 
     def proposal_commits(self, api: Any, repo: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -264,9 +277,11 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         subprocess.run(["git", "remote", "add", "origin", str(self.remote)], cwd=self.work, check=True)
 
         (self.work / ".kube-agents").mkdir()
-        (self.work / ".kube-agents" / "automation.yaml").write_text(AUTOMATION_LOW_STAGING_MEDIUM_DEV, encoding="utf-8")
+        (self.work / ".kube-agents" / "automation.yaml").write_text(AUTOMATION_LOW_TEST_MEDIUM_DEV, encoding="utf-8")
         (self.work / "clusters" / "dev-c1").mkdir(parents=True)
         (self.work / "clusters" / "dev-c1" / "web.yaml").write_text(DEPLOY_V1, encoding="utf-8")
+        (self.work / "clusters" / "test-c1").mkdir(parents=True)
+        (self.work / "clusters" / "test-c1" / "web.yaml").write_text(DEPLOY_V1, encoding="utf-8")
         (self.work / "clusters" / "staging-c1").mkdir(parents=True)
         (self.work / "clusters" / "staging-c1" / "web.yaml").write_text(DEPLOY_V1, encoding="utf-8")
         (self.work / "clusters" / "prod-c1").mkdir(parents=True)
@@ -283,6 +298,12 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
                 "location": "us-east4",
                 "selfLink": "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-east4/clusters/dev-c1",
                 "resourceLabels": {"environment": "dev"},
+            },
+            {
+                "name": "test-c1",
+                "location": "us-east4",
+                "selfLink": "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-east4/clusters/test-c1",
+                "resourceLabels": {"environment": "test"},
             },
             {
                 "name": "staging-c1",
@@ -390,12 +411,12 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(refusal, f"{verb} {payload} should be refused")
 
     def test_autonomy_dial_levels_low_vs_medium_and_prod_deny_with_auto_cluster_resolution(self) -> None:
-        # 1. Low-risk bump in staging -> allowed by `max_risk: low` in staging!
-        sha_stg = self._push_branch("platform-agent/stg-bump", {"clusters/staging-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")})
+        # 1. Low-risk bump in test -> allowed by `max_risk: low` in test!
+        sha_tst = self._push_branch("platform-agent/tst-bump", {"clusters/test-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")})
         self.forge.proposals[1] = {
             "number": 1, "state": "open", "author": "kube-agents-bot",
-            "source": "platform-agent/stg-bump", "sourceRepo": "acme/infra",
-            "sourceRevision": sha_stg, "target": "main", "labels": [],
+            "source": "platform-agent/tst-bump", "sourceRepo": "acme/infra",
+            "sourceRevision": sha_tst, "target": "main", "labels": [],
         }
         # 2. Medium-risk new Deployment in dev -> allowed by `max_risk: medium` in dev!
         sha_dev = self._push_branch("platform-agent/dev-new", {"clusters/dev-c1/worker.yaml": NEW_DEPLOY})
@@ -404,12 +425,12 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             "source": "platform-agent/dev-new", "sourceRepo": "acme/infra",
             "sourceRevision": sha_dev, "target": "main", "labels": [],
         }
-        # 3. Medium-risk new Deployment in staging -> refused (staging only allows `max_risk: low`)!
-        sha_stg_med = self._push_branch("platform-agent/stg-new", {"clusters/staging-c1/worker.yaml": NEW_DEPLOY})
+        # 3. Medium-risk new Deployment in test -> refused (test only allows `max_risk: low`)!
+        sha_tst_med = self._push_branch("platform-agent/tst-new", {"clusters/test-c1/worker.yaml": NEW_DEPLOY})
         self.forge.proposals[3] = {
             "number": 3, "state": "open", "author": "kube-agents-bot",
-            "source": "platform-agent/stg-new", "sourceRepo": "acme/infra",
-            "sourceRevision": sha_stg_med, "target": "main", "labels": [],
+            "source": "platform-agent/tst-new", "sourceRepo": "acme/infra",
+            "sourceRevision": sha_tst_med, "target": "main", "labels": [],
         }
         # 4. Low-risk bump in prod -> denied by `fix: "*"` deny in prod!
         sha_prod = self._push_branch("platform-agent/prod-bump", {"clusters/prod-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")})
@@ -1058,7 +1079,7 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
         """Concurrent `proposal_classify_risk` requests isolate scratch dirs and `out_context`."""
         sha_low = self._push_branch(
             "platform-agent/conc-low",
-            {"clusters/staging-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+            {"clusters/test-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
         )
         sha_med = self._push_branch(
             "platform-agent/conc-med",
@@ -1343,6 +1364,266 @@ class RiskBrokerIntegrationTests(unittest.TestCase):
             self.assertTrue(r_deep["labelled"])
             self.assertEqual(sorted(self.forge.proposals[97]["labels"]), ["kube-agents:auto-merge", "risk:low"])
 
+    def test_commit_statuses_reach_text_label_and_labelless_forges_without_touching_labels(self) -> None:
+        """Forges where text_sets_labels=True or labels=False still receive SHA-bound commit statuses on create and publish."""
+        sha = self._push_branch(
+            "platform-agent/status-only",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        for mode_name, has_labels, text_sets in (("text-labels", True, True), ("no-labels", False, False)):
+            with self.subTest(mode=mode_name):
+                self.forge.labels = has_labels
+                self.forge.text_sets_labels = text_sets
+                self.forge.statuses.clear()
+                self.forge.label_adds.clear()
+                self.forge.ensured_labels.clear()
+                self.forge.proposals[110] = {
+                    "number": 110,
+                    "state": "open",
+                    "author": "kube-agents-bot",
+                    "source": "platform-agent/status-only",
+                    "sourceRepo": "acme/infra",
+                    "sourceRevision": sha,
+                    "target": "main",
+                    "labels": [],
+                }
+                broker = self._make_broker(switch="on", auto_label_risk=True)
+                with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+                    res = self._risk_label(broker, 110)
+                    cls_res = broker.proposal_classify_risk({"repository": "acme/infra", "number": 110})
+                self.assertEqual(res["risk_level"], "low")
+                self.assertTrue(res["commit_status_posted"])
+                self.assertTrue(res["automerge_status_posted"])
+                self.assertFalse(res["labelled"])
+                self.assertIsNone(res["risk_label"])
+                self.assertEqual(self.forge.label_adds, [])
+                self.assertEqual(self.forge.ensured_labels, [])
+                self.assertIn((sha, vcs_broker.RISK_VERDICT_STATUS_CONTEXT), self.forge.statuses)
+                self.assertEqual(
+                    self.forge.statuses[(sha, vcs_broker.RISK_AUTOMERGE_STATUS_CONTEXT)][0],
+                    "success",
+                )
+                self.assertTrue(cls_res["automerge"]["eligible_for_automerge"])
+                self.assertIsNone(cls_res["automerge"]["would_label"])
+                # `_drop_practice_label` still collects open proposal numbers for status re-evaluation on `publish`
+                bound = broker._bind({"repository": "acme/infra"})
+                self.assertEqual(broker._drop_practice_label(bound, "platform-agent/status-only"), [110])
+        self.forge.labels = True
+        self.forge.text_sets_labels = False
+
+    def test_pod_restarting_and_runtime_medium_edits_withheld_from_automerge(self) -> None:
+        """Pod-restarting image/resource edits and runtime-risky medium edits never receive auto-merge."""
+        cm_base = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-cm\n  namespace: shop\ndata:\n  MODE: fast\n"
+        self._push_branch("main", {"clusters/dev-c1/cm.yaml": cm_base}, base="main")
+        cases = (
+            ("img-bump", {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("v1.0.0", "v1.0.1")}, "low", "disruptive", "easy"),
+            ("res-bump", {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace('cpu: "100m"', 'cpu: "150m"')}, "low", "disruptive", "easy"),
+            ("res-reduce", {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace('cpu: "100m"', 'cpu: "80m"')}, "medium", "disruptive", "moderate"),
+            ("scale-down", {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 2")}, "medium", "non_disruptive", "moderate"),
+            ("cm-mod", {"clusters/dev-c1/cm.yaml": cm_base.replace("MODE: fast", "MODE: slow")}, "medium", "non_disruptive", "moderate"),
+        )
+        broker = self._make_broker(switch="on")
+        for idx, (slug, edits, exp_level, exp_disrupt, exp_revert) in enumerate(cases, start=120):
+            with self.subTest(case=slug):
+                sha = self._push_branch(f"platform-agent/{slug}", edits)
+                self.forge.proposals[idx] = {
+                    "number": idx,
+                    "state": "open",
+                    "author": "kube-agents-bot",
+                    "source": f"platform-agent/{slug}",
+                    "sourceRepo": "acme/infra",
+                    "sourceRevision": sha,
+                    "target": "main",
+                    "labels": [],
+                }
+                with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+                    res = self._risk_label(broker, idx)
+                self.assertEqual(res["risk_level"], exp_level)
+                self.assertEqual(res["disruptiveness"], exp_disrupt)
+                self.assertEqual(res["revertability"], exp_revert)
+                self.assertFalse(res["labelled"], f"{slug} must not auto-merge")
+                self.assertNotIn("kube-agents:auto-merge", self.forge.proposals[idx]["labels"])
+
+    def test_edit_manifest_recipe_pr_never_falls_through_to_max_risk(self) -> None:
+        """A verified `edit-manifest` recipe PR is blocked from falling through to `max_risk` on both broker paths."""
+        import types
+        from fix_recipes import registry as fix_reg
+
+        fake_recipe = fix_reg.Recipe(
+            kind="scale-floor",
+            name="scale floor",
+            title="Scale floor",
+            dial_environment="dev",
+            verify="edit-manifest",
+            edit_api_version="apps/v1",
+            edit_kind="Deployment",
+            edit_paths="spec.replicas",
+        )
+        fake_fix_mod = types.SimpleNamespace(allowed_edit=lambda path, old, new: True)
+
+        sha = self._push_branch(
+            "platform-agent/edit-recipe",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        self.forge.proposals[130] = {
+            "number": 130,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/edit-recipe",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha,
+            "target": "main",
+            "labels": [],
+        }
+        broker = self._make_broker(switch="on")
+        with (
+            mock.patch.object(fix_reg, "recipes", return_value=(*fix_reg.recipes(), fake_recipe)),
+            mock.patch.object(fix_reg, "generator", return_value=fake_fix_mod),
+            mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True),
+        ):
+            prac = broker.proposal_practice_label({"repository": "acme/infra", "number": 130})
+            self.assertFalse(prac["labelled"])
+            self.assertIn("scale-floor recipe's", prac["reason"])
+
+            risk_res = self._risk_label(broker, 130)
+            self.assertEqual(risk_res["risk_level"], "low")
+            self.assertFalse(risk_res["labelled"])
+            self.assertIn("fix recipe", risk_res["reason"])
+            self.assertEqual(self.forge.proposals[130]["labels"], ["risk:low"])
+
+    def test_declared_environments_paths_and_multi_project_gke_lookup(self) -> None:
+        """Repos using `envs/dev/**` or `apps/*/envs/dev/**` and multi-project `GKE_PROJECTS` fleets resolve cleanly."""
+        flex_rules = """\
+version: 1
+environments:
+  dev:
+    paths: ["envs/dev/**", "apps/*/envs/dev/**"]
+    branches: [main]
+  prod:
+    paths: ["envs/prod/**"]
+automerge:
+  allow:
+    - max_risk: low
+      environments: [dev]
+  deny:
+    - fix: "*"
+      environments: [prod]
+"""
+        self._push_branch(
+            "main",
+            {
+                ".kube-agents/automation.yaml": flex_rules,
+                "envs/dev/web.yaml": DEPLOY_V1,
+                "apps/shop/envs/dev/web.yaml": DEPLOY_V1,
+                "envs/prod/web.yaml": DEPLOY_V1,
+            },
+            base="main",
+        )
+        sha_overlay = self._push_branch(
+            "platform-agent/overlay-bump",
+            {
+                "envs/dev/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4"),
+                "apps/shop/envs/dev/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4"),
+            },
+        )
+        self.forge.proposals[140] = {
+            "number": 140,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/overlay-bump",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha_overlay,
+            "target": "main",
+            "labels": [],
+        }
+        broker = self._make_broker(switch="on")
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            r_ov = self._risk_label(broker, 140)
+        self.assertEqual(r_ov["risk_level"], "low")
+        self.assertTrue(r_ov["labelled"])
+        self.assertEqual(sorted(self.forge.proposals[140]["labels"]), ["kube-agents:auto-merge", "risk:low"])
+
+        # Multi-project `GKE_PROJECTS` resolves `dev-c1` across projects cleanly
+        sha_mp = self._push_branch(
+            "platform-agent/mp-bump",
+            {"clusters/dev-c1/web.yaml": DEPLOY_V1.replace("replicas: 3", "replicas: 4")},
+        )
+        self.forge.proposals[141] = {
+            "number": 141,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/mp-bump",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha_mp,
+            "target": "main",
+            "labels": [],
+        }
+
+        def mp_cluster_read(argv: list[str], context: str) -> tuple[int, str, str]:
+            proj = argv[argv.index("--project") + 1] if "--project" in argv else ""
+            if proj == "empty-fleet-proj":
+                return 0, "[]", ""
+            if proj == "my-gcp-project":
+                return self._cluster_read(argv, context)
+            return 1, "", "unexpected project"
+
+        broker._cluster_read = mp_cluster_read
+        with (
+            mock.patch.dict(os.environ, {"GKE_PROJECTS": "empty-fleet-proj,my-gcp-project"}),
+            mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True),
+        ):
+            r_mp = self._risk_label(broker, 141)
+        self.assertTrue(r_mp["labelled"])
+
+    def test_packaging_unsupported_posts_unsupported_status_without_noisy_risk_unknown_label(self) -> None:
+        """Helm/Kustomize/Terraform PRs record `unsupported` status without adding `risk:unknown`, while parse errors still apply `risk:unknown`."""
+        sha_pkg = self._push_branch(
+            "platform-agent/helm-vals",
+            {"charts/web/values.yaml": "replicaCount: 4\n"},
+        )
+        self.forge.proposals[150] = {
+            "number": 150,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/helm-vals",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha_pkg,
+            "target": "main",
+            "labels": ["risk:low", "kube-agents:auto-merge"],
+        }
+        broker = self._make_broker(switch="on")
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            r_pkg = self._risk_label(broker, 150)
+        self.assertEqual(r_pkg["risk_level"], "unknown")
+        self.assertFalse(r_pkg["supported"])
+        self.assertIsNone(r_pkg["risk_label"])
+        self.assertFalse(r_pkg["labelled"])
+        self.assertEqual(self.forge.proposals[150]["labels"], [])
+        st_state, st_desc = self.forge.statuses[(sha_pkg, vcs_broker.RISK_VERDICT_STATUS_CONTEXT)]
+        self.assertEqual(st_state, "success")
+        self.assertTrue(st_desc.startswith("unsupported "), st_desc)
+
+        # Genuine YAML syntax error still applies `risk:unknown` PR label!
+        sha_bad_yaml = self._push_branch(
+            "platform-agent/bad-yaml",
+            {"clusters/dev-c1/broken.yaml": "apiVersion: v1\nkind: [unclosed\n"},
+        )
+        self.forge.proposals[151] = {
+            "number": 151,
+            "state": "open",
+            "author": "kube-agents-bot",
+            "source": "platform-agent/bad-yaml",
+            "sourceRepo": "acme/infra",
+            "sourceRevision": sha_bad_yaml,
+            "target": "main",
+            "labels": [],
+        }
+        with mock.patch.object(vcs_broker, "dial_allows_automerge", return_value=True):
+            r_bad = self._risk_label(broker, 151)
+        self.assertEqual(r_bad["risk_level"], "unknown")
+        self.assertEqual(r_bad["risk_label"], "risk:unknown")
+        self.assertEqual(self.forge.proposals[151]["labels"], ["risk:unknown"])
+
 
 class CommitStatusForgeTests(unittest.TestCase):
     """Verify broker-internal `commit_status_set` across forge providers via the public `providers` surface."""
@@ -1360,9 +1641,11 @@ class CommitStatusForgeTests(unittest.TestCase):
             self.assertTrue(insts)
             by_name[cls.name] = insts[0]
 
-        self.assertTrue({"github", "gitlab", "gitea"}.issubset(set(by_name.keys())))
+        self.assertTrue(
+            {"github", "gitlab", "gitea", "bitbucket", "bitbucket-datacenter"}.issubset(set(by_name.keys()))
+        )
         sha = "a" * 40
-        for name in ("github", "gitlab", "gitea"):
+        for name in ("github", "gitlab", "gitea", "bitbucket", "bitbucket-datacenter"):
             inst = by_name[name]
             self.assertTrue(inst.commit_statuses)
             calls: list[tuple] = []
@@ -1389,6 +1672,10 @@ class CommitStatusForgeTests(unittest.TestCase):
             self.assertIn(sha, path)
             if name == "gitlab":
                 self.assertEqual(body["state"], "failed")
+                self.assertEqual(body["name"], "kube-agents/auto-merge")
+            elif name in ("bitbucket", "bitbucket-datacenter"):
+                self.assertEqual(body["state"], "FAILED")
+                self.assertEqual(body["key"], "kube-agents/auto-merge")
                 self.assertEqual(body["name"], "kube-agents/auto-merge")
             else:
                 self.assertEqual(body["state"], "failure")

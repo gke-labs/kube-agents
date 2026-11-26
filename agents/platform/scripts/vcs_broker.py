@@ -537,8 +537,28 @@ _MAX_STATUS_REASON_CODES = 4
 _RISK_SHALLOW_FETCH_DEPTH = 64
 _RISK_DEEPEN_STEP = 192
 _MAX_PUBLISH_RISK_PROPOSALS = 3
+_PUBLISH_SYNC_DELAYS: tuple[float, ...] = (0.5, 1.0)
+_GKE_PROJECT_ID_RE = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
+_PACKAGING_UNSUPPORTED_CODES: frozenset[str] = frozenset(
+    {
+        "UNRENDERED_PACKAGE_OR_OVERLAY",
+        "UNRENDERED_TEMPLATE",
+        "KUSTOMIZE_OVERLAY",
+        "TERRAFORM_OR_HCL_CHANGE",
+    }
+)
 RISK_VERDICT_STATUS_CONTEXT = "kube-agents/risk"
 RISK_AUTOMERGE_STATUS_CONTEXT = "kube-agents/auto-merge"
+
+
+def _is_packaging_unsupported(verdict: risk_classifier.ClassificationResult) -> bool:
+    """Return True when `unknown` comes solely from unrendered packaging, overlay, or IaC files."""
+    return (
+        verdict.risk_level == risk_classifier.RISK_UNKNOWN
+        and not verdict.supported
+        and bool(verdict.reasons)
+        and all(r.code in _PACKAGING_UNSUPPORTED_CODES for r in verdict.reasons)
+    )
 
 
 def _format_risk_status_description(
@@ -556,8 +576,9 @@ def _format_risk_status_description(
             break
     base_short = base_rev[:12] if base_rev else "unknown"
     code_part = f" [{','.join(codes)}]" if codes else ""
+    level_part = "unsupported" if _is_packaging_unsupported(verdict) else f"risk:{verdict.risk_level}"
     text = (
-        f"{prefix}risk:{verdict.risk_level} ({verdict.disruptiveness}, {verdict.revertability}) "
+        f"{prefix}{level_part} ({verdict.disruptiveness}, {verdict.revertability}) "
         f"base:{base_short}{code_part}"
     )
     return text[:_MAX_STATUS_DESC_LEN]
@@ -3425,15 +3446,13 @@ class VcsBroker:
                 LOGGER.warning("practice label: a read failed repo=%s number=%s type=%s: %s",
                                bound.repo, number, type(exc).__name__, str(exc)[:400])
                 reason, checks = "a read the judgement needs failed", []
-            # If the PR is NOT a known recipe fix (e.g. not `no-pdb`), check whether
-            # `.kube-agents/automation.yaml` defines `max_risk` rules that qualify it,
-            # so periodic `fleet-audit` sweeps never strip valid risk-based auto-merge
-            # labels. A failed or denied `no-pdb` recipe fix is NEVER overridden here.
+            # If the PR is NOT a known recipe fix (add-manifest or edit-manifest),
+            # check whether `.kube-agents/automation.yaml` defines `max_risk` rules
+            # that qualify it, so periodic `fleet-audit` sweeps never strip valid
+            # risk-based auto-merge labels. Any registered recipe fix is NEVER overridden here.
             is_recipe_pr = (
-                automerge_eligibility.verify_added_manifest(
-                    automerge_eligibility.FIX_TYPE, view.get("diff"), check_path=False
-                )
-                is not None
+                (reason is not None and " is the " in reason and " recipe's," in reason)
+                or self._is_recognized_recipe_proposal(bound, payload, proposal, view.get("diff"))
             )
             if (
                 reason is not None
@@ -3665,6 +3684,46 @@ class VcsBroker:
         LOGGER.info("practice label: edit verified kind=%s path=%s changes=%s", edit.kind, path, edit.changes)
         return f"the edit is the {edit.kind} recipe's, but edited manifests are not labelled yet"
 
+    def _is_recognized_recipe_proposal(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        proposal: dict[str, Any],
+        diff: Any,
+    ) -> bool:
+        """Return True if `diff` matches any registered `add-manifest` or `edit-manifest` fix recipe."""
+        if not isinstance(diff, str) or not diff:
+            return False
+        for recipe in fix_recipes_registry.recipes():
+            if recipe.verify == "add-manifest":
+                if automerge_eligibility.verify_added_manifest(recipe.kind, diff, check_path=False) is not None:
+                    return True
+        edit_recipes = [r for r in fix_recipes_registry.recipes() if r.verify == "edit-manifest"]
+        mod = automerge_edit.modified_file_from_diff(diff) if edit_recipes else None
+        if mod is None:
+            return False
+        path = mod[0]
+        base = self._practice_base(bound)
+        if not base:
+            return False
+        text, _, _ = self._base_file(payload, base, path)
+        if text is None:
+            return False
+        source, revision = str(proposal.get("source") or ""), str(proposal.get("sourceRevision") or "")
+        if not source or not revision:
+            return False
+        head, _, read_at = self._base_file(payload, source, path)
+        if head is None or read_at != revision:
+            return False
+        for recipe in edit_recipes:
+            try:
+                fix = fix_recipes_registry.generator(recipe.kind)
+                automerge_edit.verify_edited_manifest(recipe, fix, diff, path, text, head)
+                return True
+            except (automerge_edit.EditRefused, fix_recipes_registry.RecipeError):
+                continue
+        return False
+
     def _base_file(self, payload: dict[str, Any], ref: str, path: str) -> tuple[str | None, str, str]:
         """`(text, "", revision)` for `path` on `ref`, or `(None, why, "")`: one
         regular, non-executable file of at most `automerge_edit.MAX_FILE_BYTES`
@@ -3709,7 +3768,14 @@ class VcsBroker:
         push, not this one. Returns the open proposal numbers found. Logged and
         left on a forge that cannot be asked, rather than failing a publish
         that has already landed."""
-        if not getattr(bound.forge, "labels", False):
+        has_labels = bool(getattr(bound.forge, "labels", False))
+        can_strip_labels = has_labels and not bound.forge.text_sets_labels
+        wants_open_for_status = (
+            self._auto_label_risk
+            and bool(getattr(bound.forge, "commit_statuses", False))
+            and "proposal-list" in getattr(bound.forge, "verbs", ())
+        )
+        if not has_labels and not wants_open_for_status:
             return []
         open_numbers: list[int] = []
         try:
@@ -3718,6 +3784,8 @@ class VcsBroker:
                 num = proposal.get("number")
                 if type(num) is int and num > 0:
                     open_numbers.append(num)
+                if not can_strip_labels:
+                    continue
                 carried = _reserved_labels_on(proposal) + _risk_labels_on(proposal)
                 if carried:
                     try:
@@ -4213,27 +4281,18 @@ class VcsBroker:
         self,
         payload: dict[str, Any],
         changed_paths: list[str],
+        *,
+        rules: automation_rules.Rules | None = None,
+        base: str = "",
     ) -> tuple[str, str]:
-        """Resolve verified cluster environment from PR paths + broker cluster reads.
+        """Resolve verified environment from `clusters/<name>/` cluster labels or declared `rules.environments`.
 
         Returns `(environment, error_reason)`. Fails closed when paths span
-        multiple clusters, sit outside `clusters/<name>/`, touch an excluded
-        cluster, or cluster labels cannot be uniquely verified.
+        multiple clusters or declared environments, touch an excluded cluster,
+        or cluster labels cannot be uniquely verified.
         """
         if not changed_paths:
             return automation_rules.UNKNOWN_ENVIRONMENT, "no changed files to bind to a cluster"
-        clusters = {automerge_edit.cluster_of(p) for p in changed_paths}
-        if None in clusters or len(clusters) != 1:
-            return (
-                automation_rules.UNKNOWN_ENVIRONMENT,
-                "changed files do not all belong to a single cluster's tree (`clusters/<name>/`)",
-            )
-        short_name = next(iter(clusters))
-        assert short_name is not None
-        if not _GKE_CLUSTER_SHORT_NAME.fullmatch(short_name):
-            return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster directory name"
-        if self._cluster_read is None:
-            return automation_rules.UNKNOWN_ENVIRONMENT, "this broker has no cluster reader"
 
         explicit_target: tuple[str, str, str] | None = None
         if "cluster" in payload and payload["cluster"] is not None:
@@ -4243,41 +4302,89 @@ class VcsBroker:
             explicit_target = _gke_cluster(explicit.strip())
             if explicit_target is None:
                 return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster coordinate"
-            if explicit_target[2] != short_name:
+
+        clusters = {automerge_edit.cluster_of(p) for p in changed_paths}
+        if None in clusters or len(clusters) != 1:
+            if explicit_target is not None:
                 return (
                     automation_rules.UNKNOWN_ENVIRONMENT,
                     "cluster coordinate does not match changed paths",
                 )
+            if rules is not None and rules.environments:
+                decl_env, decl_err = automation_rules.resolve_declared_environment(rules, changed_paths, base)
+                if decl_err:
+                    return automation_rules.UNKNOWN_ENVIRONMENT, decl_err
+                if decl_env:
+                    try:
+                        self._cluster_exclusions.check_unnamed(include_holds=False)
+                    except scope_exclude.ExcludedCluster as exc:
+                        LOGGER.info("risk label: unnamed scope exclusion active for declared env=%s: %s", decl_env, exc)
+                        return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+                    return decl_env, ""
+            return (
+                automation_rules.UNKNOWN_ENVIRONMENT,
+                "changed files do not all belong to a single cluster's tree (`clusters/<name>/`)",
+            )
 
-        # Broker-side cluster resolution: never let a caller-supplied `cluster`
-        # steer `--project` or bypass uniqueness across same-named clusters.
-        argv = [
-            "gcloud", "container", "clusters", "list",
-            f"--filter=name={short_name}",
-            "--format=json(name,location,selfLink,resourceLabels)",
-        ]
-        project_id = os.environ.get("GKE_PROJECT_ID", "").strip()
-        if project_id:
-            argv.extend(["--project", project_id])
-        code, out, err = self._cluster_read(argv, "")
-        if code != 0:
-            LOGGER.info("risk label: cluster list failed name=%s exit=%s: %s", short_name, code, err[:400])
-            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
-        try:
-            items = json.loads(out or "[]")
-        except json.JSONDecodeError:
-            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
-        if not isinstance(items, list):
-            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
-        matches = [item for item in items if isinstance(item, dict) and item.get("name") == short_name]
+        short_name = next(iter(clusters))
+        assert short_name is not None
+        if not _GKE_CLUSTER_SHORT_NAME.fullmatch(short_name):
+            return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster directory name"
+        if explicit_target is not None and explicit_target[2] != short_name:
+            return (
+                automation_rules.UNKNOWN_ENVIRONMENT,
+                "cluster coordinate does not match changed paths",
+            )
+        if self._cluster_read is None:
+            return automation_rules.UNKNOWN_ENVIRONMENT, "this broker has no cluster reader"
+
+        # Broker-side cluster resolution across configured fleet projects:
+        # never let a caller-supplied `cluster` steer `--project` or bypass
+        # uniqueness across same-named clusters.
+        raw_projects = os.environ.get("GKE_PROJECTS", "").strip() or os.environ.get("GKE_PROJECT_ID", "").strip()
+        project_ids: list[str] = []
+        if raw_projects:
+            for part in raw_projects.split(","):
+                cand = part.strip()
+                if not cand:
+                    continue
+                if not _GKE_PROJECT_ID_RE.fullmatch(cand):
+                    return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+                if cand not in project_ids:
+                    project_ids.append(cand)
+
+        matches: list[tuple[str, dict[str, Any]]] = []
+        query_projects = project_ids if project_ids else [""]
+        for proj in query_projects:
+            argv = [
+                "gcloud", "container", "clusters", "list",
+                f"--filter=name={short_name}",
+                "--format=json(name,location,selfLink,resourceLabels)",
+            ]
+            if proj:
+                argv.extend(["--project", proj])
+            code, out, err = self._cluster_read(argv, "")
+            if code != 0:
+                LOGGER.info("risk label: cluster list failed name=%s project=%s exit=%s: %s", short_name, proj, code, err[:400])
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+            try:
+                items = json.loads(out or "[]")
+            except json.JSONDecodeError:
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+            if not isinstance(items, list):
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+            for item in items:
+                if isinstance(item, dict) and item.get("name") == short_name:
+                    matches.append((proj, item))
+
         if len(matches) != 1:
             LOGGER.info("risk label: expected 1 cluster named %r, found %s", short_name, len(matches))
             return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
 
-        match = matches[0]
+        queried_proj, match = matches[0]
         raw_loc = match.get("location")
         item_location = raw_loc.strip() if isinstance(raw_loc, str) else ""
-        item_project = project_id
+        item_project = queried_proj
         raw_link = match.get("selfLink")
         self_link = raw_link if isinstance(raw_link, str) else ""
         m_link = re.search(r"/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/?#]+)", self_link)
@@ -4439,7 +4546,7 @@ class VcsBroker:
             return None, f"{automation_rules.RULES_FILE} on {base} allows nothing ({rules.status})"
         if not automation_rules.has_risk_allow_rules(rules):
             return None, f"{automation_rules.RULES_FILE} has no max_risk allow rules"
-        env, env_err = self._resolve_risk_environment(payload, changed_paths)
+        env, env_err = self._resolve_risk_environment(payload, changed_paths, rules=rules, base=base)
         if env_err:
             return None, env_err
         ceiling = automation_rules.install_max_risk_ceiling()
@@ -4509,7 +4616,16 @@ class VcsBroker:
             LOGGER.info("practice risk fallback failed repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
             return False, "", None
 
-    def _risk_proposal_gate(
+    @staticmethod
+    def _risk_label_gate(bound: Binding) -> tuple[bool, str]:
+        """Check whether this forge supports broker-exclusive proposal labels."""
+        if not getattr(bound.forge, "labels", False):
+            return False, "this forge has no labels"
+        if bound.forge.text_sets_labels:
+            return False, "on this forge a comment or a description can set a label, so no label is the broker's alone"
+        return True, ""
+
+    def _risk_proposal_provenance(
         self,
         bound: Binding,
         proposal: dict[str, Any],
@@ -4517,11 +4633,7 @@ class VcsBroker:
         base_override: str | None = None,
         expected_head_sha: str = "",
     ) -> tuple[bool, str, str]:
-        """Check forge capabilities, proposal state, fork/SHA provenance, author, and target base branch."""
-        if not getattr(bound.forge, "labels", False):
-            return False, "this forge has no labels", ""
-        if bound.forge.text_sets_labels:
-            return False, "on this forge a comment or a description can set a label, so no label is the broker's alone", ""
+        """Check proposal state, non-fork/SHA provenance, credential authorship, and target base branch."""
         if proposal.get("state") != OPEN_PROPOSAL_STATE:
             return False, "the proposal is not open", ""
         source_repo = str(proposal.get("sourceRepo") or "")
@@ -4547,6 +4659,25 @@ class VcsBroker:
             return False, f"the proposal does not target the repository's base branch ({base or 'unknown'})", base
         return True, "", base
 
+    def _risk_proposal_gate(
+        self,
+        bound: Binding,
+        proposal: dict[str, Any],
+        *,
+        base_override: str | None = None,
+        expected_head_sha: str = "",
+    ) -> tuple[bool, str, str]:
+        """Check forge label capability plus proposal provenance."""
+        labels_ok, label_reason = self._risk_label_gate(bound)
+        if not labels_ok:
+            return False, label_reason, ""
+        return self._risk_proposal_provenance(
+            bound,
+            proposal,
+            base_override=base_override,
+            expected_head_sha=expected_head_sha,
+        )
+
     def proposal_classify_risk(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Deterministically classify a pull request's risk from broker-verified git state.
 
@@ -4571,19 +4702,24 @@ class VcsBroker:
             read_rules=wants_rules,
         )
         want_label: str | None = None
+        eligible_for_automerge = False
         if switch not in automerge_eligibility.LABELLING_SWITCH_VALUES:
             am_reason = "KUBEAGENTS_AUTOMERGE is off"
         else:
-            gate_ok, gate_reason, base = self._risk_proposal_gate(
+            prov_ok, prov_reason, base = self._risk_proposal_provenance(
                 bound,
                 proposal,
                 base_override=git_ctx.get("base"),
                 expected_head_sha=expected_sha,
             )
-            if not gate_ok:
-                am_reason = gate_reason
+            labels_ok, label_reason = self._risk_label_gate(bound)
+            has_statuses = bool(getattr(bound.forge, "commit_statuses", False))
+            if not prov_ok:
+                am_reason = prov_reason
+            elif not labels_ok and not has_statuses:
+                am_reason = label_reason
             else:
-                want_label, am_reason = self._evaluate_risk_automerge(
+                want_eval, am_reason = self._evaluate_risk_automerge(
                     payload,
                     base,
                     switch,
@@ -4592,6 +4728,19 @@ class VcsBroker:
                     stale_base,
                     rules_override=git_ctx.get("rules"),
                 )
+                if want_eval is not None:
+                    diff_view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": True}) or {}
+                    if self._is_recognized_recipe_proposal(bound, payload, proposal, diff_view.get("diff")):
+                        want_eval = None
+                        am_reason = "the proposal matches a registered fix recipe and must pass its recipe safety checks"
+                if want_eval is not None:
+                    if labels_ok:
+                        want_label = want_eval
+                        eligible_for_automerge = True
+                    elif want_eval == automerge_eligibility.AUTOMERGE_LABEL and has_statuses:
+                        eligible_for_automerge = True
+                    else:
+                        am_reason = label_reason
 
         out = verdict.to_dict()
         out["number"] = number
@@ -4602,7 +4751,7 @@ class VcsBroker:
             "dial_allows_automerge": dial_ok,
             "dial_level": level,
             "install_max_risk": ceiling,
-            "eligible_for_automerge": want_label is not None,
+            "eligible_for_automerge": eligible_for_automerge,
             "would_label": want_label,
             "reason": am_reason,
         }
@@ -4630,21 +4779,21 @@ class VcsBroker:
         transient_mismatch = any(
             r.code in ("PROPOSAL_BRANCH_MOVED", "HEAD_SHA_MISMATCH") for r in verdict.reasons
         )
-        want_risk_label = None if transient_mismatch else verdict.risk_label
-        gate_ok, gate_reason, base = self._risk_proposal_gate(
+        packaging_unsupported = _is_packaging_unsupported(verdict)
+        want_risk_label = None if (transient_mismatch or packaging_unsupported) else verdict.risk_label
+        prov_ok, prov_reason, base = self._risk_proposal_provenance(
             bound,
             proposal,
             base_override=git_ctx.get("base"),
             expected_head_sha=expected_sha,
         )
+        labels_ok, label_reason = self._risk_label_gate(bound)
+        gate_ok = prov_ok and labels_ok
 
-        want_auto: str | None = None
-        if not gate_ok:
-            reason = gate_reason
-            want_risk_apply: str | None = None
-        else:
-            want_risk_apply = want_risk_label
-            want_auto, reason = self._evaluate_risk_automerge(
+        want_auto_eval: str | None = None
+        eval_reason = ""
+        if prov_ok:
+            want_auto_eval, eval_reason = self._evaluate_risk_automerge(
                 payload,
                 base,
                 switch,
@@ -4653,6 +4802,11 @@ class VcsBroker:
                 stale_base,
                 rules_override=git_ctx.get("rules"),
             )
+            if want_auto_eval is not None:
+                diff_view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": True}) or {}
+                if self._is_recognized_recipe_proposal(bound, payload, proposal, diff_view.get("diff")):
+                    want_auto_eval = None
+                    eval_reason = "the proposal matches a registered fix recipe and must pass its recipe safety checks"
 
         carried_risk = _risk_labels_on(proposal)
         carried_auto = _reserved_labels_on(proposal)
@@ -4660,7 +4814,7 @@ class VcsBroker:
         # rules didn't independently grant one.
         keep_auto: set[str] = set()
         if (
-            want_auto is None
+            want_auto_eval is None
             and carried_auto
             and gate_ok
             and not transient_mismatch
@@ -4678,11 +4832,12 @@ class VcsBroker:
                 pass
 
         # Bind the verdict and any auto-merge eligibility to the exact judged head SHA
-        # and base revision via broker-owned commit statuses.
+        # and base revision via broker-owned commit statuses on every status-capable forge.
         head_rev = str(proposal.get("sourceRevision") or "")
         base_rev = str(git_ctx.get("target_tip") or git_ctx.get("diff_base") or "")
-        status_posted = False
-        if gate_ok and not transient_mismatch and _OBJECT_ID.fullmatch(head_rev):
+        verdict_status_posted = False
+        auto_status_posted = False
+        if prov_ok and not transient_mismatch and _OBJECT_ID.fullmatch(head_rev):
             if getattr(bound.forge, "commit_statuses", False):
                 try:
                     bound.forge.commit_status_set(
@@ -4695,15 +4850,16 @@ class VcsBroker:
                             "description": _format_risk_status_description(verdict, base_rev),
                         },
                     )
+                    verdict_status_posted = True
                 except Exception as exc:  # noqa: BLE001 -- informational risk status is best-effort
                     LOGGER.info(
                         "risk commit status failed repo=%s number=%s rev=%s: %s",
                         bound.repo, number, head_rev[:12], str(exc)[:300],
                     )
-            if want_auto == automerge_eligibility.AUTOMERGE_LABEL:
+            if want_auto_eval == automerge_eligibility.AUTOMERGE_LABEL:
                 if not getattr(bound.forge, "commit_statuses", False):
-                    want_auto = None
-                    reason = "forge cannot record a commit-bound auto-merge status"
+                    want_auto_eval = None
+                    eval_reason = "forge cannot record a commit-bound auto-merge status"
                 else:
                     try:
                         bound.forge.commit_status_set(
@@ -4718,14 +4874,14 @@ class VcsBroker:
                                 ),
                             },
                         )
-                        status_posted = True
+                        auto_status_posted = True
                     except Exception as exc:  # noqa: BLE001 -- fail closed when status cannot be recorded
                         LOGGER.warning(
                             "auto-merge commit status failed repo=%s number=%s rev=%s: %s",
                             bound.repo, number, head_rev[:12], str(exc)[:300],
                         )
-                        want_auto = None
-                        reason = "could not record commit-bound auto-merge status on head revision"
+                        want_auto_eval = None
+                        eval_reason = "could not record commit-bound auto-merge status on head revision"
             elif (
                 getattr(bound.forge, "commit_statuses", False)
                 and any(
@@ -4742,7 +4898,7 @@ class VcsBroker:
                             "revision": head_rev,
                             "state": "pending",
                             "context": RISK_AUTOMERGE_STATUS_CONTEXT,
-                            "description": f"held: {reason}"[:_MAX_STATUS_DESC_LEN],
+                            "description": f"held: {eval_reason}"[:_MAX_STATUS_DESC_LEN],
                         },
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -4750,6 +4906,20 @@ class VcsBroker:
                         "auto-merge status revocation failed repo=%s number=%s: %s",
                         bound.repo, number, str(exc)[:300],
                     )
+
+        if not prov_ok:
+            want_risk_apply: str | None = None
+            want_auto: str | None = None
+            reason = prov_reason
+        elif not labels_ok:
+            want_risk_apply = None
+            want_auto = None
+            reason = eval_reason if auto_status_posted else label_reason
+        else:
+            want_risk_apply = want_risk_label
+            want_auto = want_auto_eval
+            reason = eval_reason
+        status_posted = verdict_status_posted or auto_status_posted
 
         carried_risk_fold = {lbl.casefold() for lbl in carried_risk}
         carried_auto_fold = {lbl.casefold() for lbl in carried_auto}
@@ -4872,6 +5042,7 @@ class VcsBroker:
                 "sourceRevision": head_rev,
                 "baseRevision": base_rev,
                 "commit_status_posted": status_posted,
+                "automerge_status_posted": auto_status_posted,
                 "stale_base": stale_base,
                 "risk_level": verdict.risk_level,
                 "blast_radius": verdict.blast_radius,
@@ -4906,7 +5077,19 @@ class VcsBroker:
                 req["cluster"] = payload["cluster"]
             if expected_head_sha:
                 req["expected_head_sha"] = expected_head_sha
-            return self.proposal_risk_label(req)
+            res = self.proposal_risk_label(req)
+            if expected_head_sha:
+                for delay in _PUBLISH_SYNC_DELAYS:
+                    codes = {
+                        r.get("code")
+                        for r in (res.get("reasons") or [])
+                        if isinstance(r, Mapping)
+                    }
+                    if "HEAD_SHA_MISMATCH" not in codes:
+                        break
+                    time.sleep(delay)
+                    res = self.proposal_risk_label(req)
+            return res
         except Exception as exc:  # noqa: BLE001 -- never fail proposal_create or publish
             LOGGER.warning("auto risk label skipped repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
             return None

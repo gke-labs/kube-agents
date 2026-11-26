@@ -419,14 +419,14 @@ class TestRiskRules(unittest.TestCase):
             "    - fix: no-pdb\n"
             "      environments: [dev]\n"
             "    - max_risk: low\n"
-            "      environments: [staging]\n"
+            "      environments: [test]\n"
             "    - max_risk: medium\n"
             "      environments: [dev]\n"
             "  deny:\n"
             "    - fix: '*'\n"
             "      environments: [prod]\n"
             "    - risk: medium\n"
-            "      environments: [staging]\n"
+            "      environments: [test]\n"
         )
         rules = ar.parse(text)
         self.assertEqual(rules.status, ar.LOADED, rules.error)
@@ -434,10 +434,10 @@ class TestRiskRules(unittest.TestCase):
         # dev allows low and medium
         self.assertTrue(ar.decide_risk(rules, "low", "dev").allowed)
         self.assertTrue(ar.decide_risk(rules, "medium", "dev").allowed)
-        # staging allows low, denies medium
-        self.assertTrue(ar.decide_risk(rules, "low", "staging").allowed)
-        self.assertFalse(ar.decide_risk(rules, "medium", "staging").allowed)
-        # prod denied by wildcard `fix: "*"`
+        # test allows low, denies medium
+        self.assertTrue(ar.decide_risk(rules, "low", "test").allowed)
+        self.assertFalse(ar.decide_risk(rules, "medium", "test").allowed)
+        # prod denied by wildcard `fix: "*"` and non-dev/test guard
         self.assertFalse(ar.decide_risk(rules, "low", "prod").allowed)
         # high / critical / unknown are NEVER allowed
         for blocked in ("high", "critical", "unknown"):
@@ -485,16 +485,16 @@ class TestRiskRules(unittest.TestCase):
             "automerge:\n"
             "  allow:\n"
             "    - max_risk: low\n"
-            "      environments: [dev, staging]\n"
+            "      environments: [dev, test]\n"
             "  deny:\n"
             "    - risk: medium\n"
-            "      environments: [staging]\n"
+            "      environments: [test]\n"
         )
         added_allow = ar.with_allow(text, "no-pdb", "dev")
         parsed_allow = ar.parse(added_allow)
         self.assertEqual(parsed_allow.status, ar.LOADED)
         self.assertTrue(ar.decide(parsed_allow, "no-pdb", "dev").allowed)
-        self.assertTrue(ar.decide_risk(parsed_allow, "low", "staging").allowed)
+        self.assertTrue(ar.decide_risk(parsed_allow, "low", "test").allowed)
 
         added_deny = ar.with_deny(added_allow, "no-pdb", "dev", note="step down after revert")
         parsed_deny = ar.parse(added_deny)
@@ -561,7 +561,7 @@ class TestRiskRules(unittest.TestCase):
             self.assertFalse(dec.allowed)
 
     def test_cli_risk_flags_and_mutual_exclusion(self):
-        text = "version: 1\nautomerge:\n  allow:\n    - max_risk: low\n      environments: [staging]\n"
+        text = "version: 1\nautomerge:\n  allow:\n    - max_risk: low\n      environments: [test]\n"
         root = _tree(text)
         fake = types.ModuleType("kubeagents_switches")
         fake.switch = lambda name: "on"
@@ -574,7 +574,7 @@ class TestRiskRules(unittest.TestCase):
             mock.patch.dict(sys.modules, {"kubeagents_switches": fake}),
             redirect_stdout(buf_unset),
         ):
-            rc_unset = ar.main([str(root), "--risk", "low", "--environment", "staging"])
+            rc_unset = ar.main([str(root), "--risk", "low", "--environment", "test"])
         self.assertEqual(rc_unset, 0)
         self.assertFalse(json.loads(buf_unset.getvalue())["decision"]["allowed"])
 
@@ -586,10 +586,14 @@ class TestRiskRules(unittest.TestCase):
         ):
             code = ar.main([
                 str(root),
-                "--risk", "low",
-                "--disruptiveness", "non_disruptive",
-                "--revertability", "easy",
-                "--environment", "staging",
+                "--risk",
+                "low",
+                "--disruptiveness",
+                "non_disruptive",
+                "--revertability",
+                "easy",
+                "--environment",
+                "test",
             ])
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(buf.getvalue())["decision"]["allowed"])
@@ -602,10 +606,14 @@ class TestRiskRules(unittest.TestCase):
         ):
             code2 = ar.main([
                 str(root),
-                "--risk", "low",
-                "--disruptiveness", "destructive",
-                "--revertability", "easy",
-                "--environment", "staging",
+                "--risk",
+                "low",
+                "--disruptiveness",
+                "destructive",
+                "--revertability",
+                "easy",
+                "--environment",
+                "test",
             ])
         self.assertEqual(code2, 0)
         dec2 = json.loads(buf2.getvalue())["decision"]
@@ -614,7 +622,77 @@ class TestRiskRules(unittest.TestCase):
 
         err_buf = io.StringIO()
         with contextlib.redirect_stderr(err_buf), self.assertRaises(SystemExit):
-            ar.main([str(root), "--fix", "no-pdb", "--risk", "low", "--environment", "staging"])
+            ar.main([str(root), "--fix", "no-pdb", "--risk", "low", "--environment", "test"])
+
+    def test_max_risk_refuses_staging_prod_and_supports_declared_environments(self):
+        for non_dev in ("staging", "stage", "stg", "preprod", "uat", "canary", "prod", "production", "prd", "live", "staging-dev", "cluster1"):
+            with self.subTest(env=non_dev):
+                bad = ar.parse(
+                    f"version: 1\nautomerge:\n  allow:\n    - max_risk: low\n      environments: [{non_dev}]\n"
+                )
+                self.assertEqual(bad.status, ar.INVALID)
+                self.assertIn("dev/test", bad.error)
+                hand = ar.Rules(status=ar.LOADED, allow=(ar.Rule(max_risk="low", environments=(non_dev,)),))
+                self.assertFalse(ar.decide_risk(hand, "low", non_dev).allowed)
+
+        for ok_dev in ("dev", "development", "test", "testing", "qa", "sandbox", "ephemeral", "dev-us", "test_1"):
+            with self.subTest(env=ok_dev):
+                good = ar.parse(
+                    f"version: 1\nautomerge:\n  allow:\n    - max_risk: low\n      environments: [{ok_dev}]\n"
+                )
+                self.assertEqual(good.status, ar.LOADED, good.error)
+                self.assertTrue(ar.decide_risk(good, "low", ok_dev).allowed)
+
+        env_yaml = (
+            "version: 1\n"
+            "environments:\n"
+            "  dev:\n"
+            "    paths: ['envs/dev/**', 'apps/*/overlays/dev/**']\n"
+            "    branches: [main, dev]\n"
+            "  prod:\n"
+            "    paths: ['envs/prod/**']\n"
+            "automerge:\n"
+            "  allow:\n"
+            "    - max_risk: medium\n"
+            "      environments: [dev]\n"
+        )
+        rules = ar.parse(env_yaml)
+        self.assertEqual(rules.status, ar.LOADED, rules.error)
+        self.assertEqual(
+            ar.resolve_declared_environment(rules, ["envs/dev/web.yaml", "apps/shop/overlays/dev/ns/hpa.yaml"], "main"),
+            ("dev", ""),
+        )
+        # Wrong target branch or cross-environment paths fail closed
+        env_wrong_br, err_br = ar.resolve_declared_environment(rules, ["envs/dev/web.yaml"], "release")
+        self.assertEqual(env_wrong_br, "")
+        self.assertTrue(err_br)
+        env_mixed, err_mixed = ar.resolve_declared_environment(rules, ["envs/dev/web.yaml", "envs/prod/web.yaml"], "main")
+        self.assertEqual(env_mixed, "")
+        self.assertTrue(err_mixed)
+
+        # Overlapping declared environments fail closed
+        overlap = ar.parse(
+            "version: 1\nenvironments:\n  dev:\n    paths: ['envs/**']\n  test:\n    paths: ['envs/dev/**']\n"
+        )
+        self.assertEqual(overlap.status, ar.LOADED)
+        ov_env, ov_err = ar.resolve_declared_environment(overlap, ["envs/dev/web.yaml"], "main")
+        self.assertEqual(ov_env, "")
+        self.assertIn("multiple", ov_err)
+
+        # `with_allow` and `with_deny` preserve declared `environments:`
+        with_pdb = ar.with_allow(env_yaml, "no-pdb", "dev")
+        parsed_pdb = ar.parse(with_pdb)
+        self.assertEqual(parsed_pdb.status, ar.LOADED)
+        self.assertEqual(parsed_pdb.environments, rules.environments)
+
+        # Invalid environment bindings refuse the whole file
+        for bad_env_yaml in (
+            "version: 1\nenvironments:\n  dev: {}\n",
+            "version: 1\nenvironments:\n  dev:\n    paths: ['/abs/path/**']\n",
+            "version: 1\nenvironments:\n  dev:\n    paths: ['envs/../dev/**']\n",
+            "version: 1\nenvironments:\n  dev:\n    branches: [HEAD]\n",
+        ):
+            self.assertEqual(ar.parse(bad_env_yaml).status, ar.INVALID, bad_env_yaml)
 
 
 if __name__ == "__main__":

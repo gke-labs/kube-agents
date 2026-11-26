@@ -139,12 +139,14 @@ CLUSTER_SCOPED_KINDS: frozenset[tuple[str, str]] = frozenset(
         ("kueue.x-k8s.io", "ClusterQueue"),
         ("kueue.x-k8s.io", "ResourceFlavor"),
         ("kueue.x-k8s.io", "WorkloadPriorityClass"),
+        ("keda.sh", "ClusterTriggerAuthentication"),
     }
 )
 
 WORKLOAD_KINDS: frozenset[tuple[str, str]] = frozenset(
     {
         ("apps", "Deployment"),
+        ("argoproj.io", "Rollout"),
         ("apps", "StatefulSet"),
         ("apps", "DaemonSet"),
         ("apps", "ReplicaSet"),
@@ -158,8 +160,10 @@ WORKLOAD_KINDS: frozenset[tuple[str, str]] = frozenset(
 LOW_RISK_EDITABLE_KINDS: frozenset[tuple[str, str]] = frozenset(
     {
         ("apps", "Deployment"),
+        ("argoproj.io", "Rollout"),
         ("batch", "CronJob"),
         ("autoscaling", "HorizontalPodAutoscaler"),
+        ("keda.sh", "ScaledObject"),
         ("", "ConfigMap"),
         ("", "Service"),
     }
@@ -385,6 +389,10 @@ CORE_KNOWN_KINDS: frozenset[tuple[str, str]] = (
             ("policy", "PodDisruptionBudget"),
             ("autoscaling", "HorizontalPodAutoscaler"),
             ("autoscaling.k8s.io", "VerticalPodAutoscaler"),
+            ("keda.sh", "ScaledObject"),
+            ("keda.sh", "ScaledJob"),
+            ("keda.sh", "TriggerAuthentication"),
+            ("keda.sh", "ClusterTriggerAuthentication"),
             ("networking.k8s.io", "Ingress"),
             ("networking.k8s.io", "NetworkPolicy"),
             ("gateway.networking.k8s.io", "Gateway"),
@@ -2748,18 +2756,19 @@ def _is_aggressive_max_unavailable(max_unavail: Any, replicas_est: int = 1) -> b
 
 
 def _check_workload_add(ev: ResourceEval, obj: dict[str, Any]) -> None:
-    """Evaluate creation (ACTION_ADD) of Deployment, StatefulSet, DaemonSet, ReplicaSet, ReplicationController, Job, CronJob, Pod."""
+    """Evaluate creation (ACTION_ADD) of Deployment, Rollout, StatefulSet, DaemonSet, ReplicaSet, ReplicationController, Job, CronJob, Pod."""
     kind = ev.ref.kind
     is_daemonset = kind == "DaemonSet"
     spec = _as_dict(ev, obj.get("spec"), "spec")
     ps = _extract_pod_spec(kind, obj) or {}
+    has_workload_ref = kind == "Rollout" and isinstance(spec.get("workloadRef"), dict) and "template" not in spec
 
     _check_pod_template_metadata(ev, kind, None, obj, action=ACTION_ADD)
-    _check_pod_spec_posture(ev, ps, is_daemonset=is_daemonset)
+    _check_pod_spec_posture(ev, ps, is_daemonset=is_daemonset, require_containers=not has_workload_ref)
 
     # Validate replicas on new controller workloads
     rep = 1
-    if kind in ("Deployment", "StatefulSet", "ReplicaSet", "ReplicationController") and "replicas" in spec and spec["replicas"] is not None:
+    if kind in ("Deployment", "Rollout", "StatefulSet", "ReplicaSet", "ReplicationController") and "replicas" in spec and spec["replicas"] is not None:
         rep_raw = spec.get("replicas")
         if not _is_strict_int(rep_raw) or rep_raw < 0:
             ev.add(
@@ -2791,6 +2800,12 @@ def _check_workload_add(ev: ResourceEval, obj: dict[str, Any]) -> None:
                     blast=BLAST_HIGH if rep >= 50 else BLAST_MEDIUM,
                     field_path="spec.replicas",
                 )
+
+    if kind == "Rollout" and "strategy" in spec and spec.get("strategy") is not None:
+        rstrat = _as_dict(ev, spec.get("strategy"), "spec.strategy")
+        for rkey in ("canary", "blueGreen"):
+            if rkey in rstrat and rstrat.get(rkey) is not None:
+                _as_dict(ev, rstrat.get(rkey), f"spec.strategy.{rkey}")
 
     if kind == "Deployment" and "strategy" in spec and spec.get("strategy") is not None:
         strat = _as_dict(ev, spec.get("strategy"), "spec.strategy")
@@ -3163,6 +3178,7 @@ def _check_workload_modify(
                         DIM_BLAST_RADIUS,
                         RISK_MEDIUM,
                         f"modifies Deployment {ev.ref.name!r} rollout strategy",
+                        revert=REVERT_MODERATE,
                         field_path="spec.strategy",
                     )
         else:
@@ -3193,6 +3209,39 @@ def _check_workload_modify(
                     disrupt=DISRUPT_DISRUPTIVE,
                     field_path="spec.template",
                 )
+
+    if kind == "Rollout":
+        if a_spec.get("strategy") != b_spec.get("strategy"):
+            a_rstrat = a_spec.get("strategy")
+            if a_rstrat is not None and not isinstance(a_rstrat, dict):
+                ev.add(
+                    "MALFORMED_FIELD_TYPE",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    "Rollout spec.strategy is not a mapping",
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.strategy",
+                )
+            else:
+                ev.add(
+                    "ROLLOUT_STRATEGY_MODIFIED",
+                    DIM_DISRUPTIVENESS,
+                    RISK_HIGH,
+                    f"modifies Argo Rollout {ev.ref.name!r} progressive delivery strategy",
+                    revert=REVERT_MODERATE,
+                    disrupt=DISRUPT_DISRUPTIVE,
+                    field_path="spec.strategy",
+                )
+        if a_spec.get("workloadRef") != b_spec.get("workloadRef"):
+            ev.add(
+                "ROLLOUT_STRATEGY_MODIFIED",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"modifies Argo Rollout {ev.ref.name!r} workloadRef target",
+                revert=REVERT_MODERATE,
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.workloadRef",
+            )
 
     if kind in ("DaemonSet", "StatefulSet"):
         a_ustrat = a_spec.get("updateStrategy")
@@ -3302,6 +3351,7 @@ def _check_workload_modify(
                         DIM_BLAST_RADIUS,
                         RISK_MEDIUM,
                         f"resumes suspended {kind} {ev.ref.name!r}",
+                        revert=REVERT_MODERATE,
                         field_path="spec.suspend",
                     )
         if kind == "CronJob" and a_spec.get("concurrencyPolicy") != b_spec.get("concurrencyPolicy"):
@@ -3387,6 +3437,7 @@ def _check_workload_modify(
                         DIM_BLAST_RADIUS,
                         RISK_MEDIUM,
                         f"reduces {kind} {ev.ref.name!r} replicas from {b_rep} to {a_rep}",
+                        revert=REVERT_MODERATE,
                         field_path="spec.replicas",
                     )
             else:
@@ -3436,7 +3487,15 @@ def _check_workload_modify(
     # 4. PodSpec posture & container-level diffs
     b_ps = _extract_pod_spec(kind, before_obj) or {}
     a_ps = _extract_pod_spec(kind, after_obj) or {}
-    _check_pod_spec_posture(ev, a_ps, before_pod_spec=b_ps, is_daemonset=is_daemonset)
+    has_workload_ref = (
+        kind == "Rollout"
+        and isinstance(a_spec.get("workloadRef"), dict)
+        and "template" not in a_spec
+        and "template" not in b_spec
+    )
+    _check_pod_spec_posture(
+        ev, a_ps, before_pod_spec=b_ps, is_daemonset=is_daemonset, require_containers=not has_workload_ref
+    )
 
     # DaemonSet always fans out across every matching node
     if is_daemonset:
@@ -3446,6 +3505,7 @@ def _check_workload_modify(
             RISK_MEDIUM,
             f"modifies DaemonSet {ev.ref.name!r} (rolls out across every matching cluster node)",
             blast=BLAST_HIGH,
+            revert=REVERT_MODERATE,
         )
 
     # Track per-container diffs (images, resources, command/args/lifecycle, removals/additions)
@@ -3454,6 +3514,7 @@ def _check_workload_modify(
         ("spec", "replicas"),
         ("spec", "selector"),
         ("spec", "strategy"),
+        ("spec", "workloadRef"),
         ("spec", "suspend"),
     }
     pod_prefix: tuple[str, ...]
@@ -3558,6 +3619,7 @@ def _check_workload_modify(
                         DIM_BLAST_RADIUS,
                         RISK_LOW,
                         f"updates container {cname!r} image to pinned reference {a_img!r}",
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=f"{c_path}.image",
                     )
 
@@ -3938,6 +4000,8 @@ def _check_container_resources(
                         DIM_BLAST_RADIUS,
                         RISK_MEDIUM,
                         f"sets large {section}.{rname}={av_raw!r} on container {cname!r}",
+                        revert=REVERT_MODERATE,
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=fp,
                     )
                 else:
@@ -3946,6 +4010,7 @@ def _check_container_resources(
                         DIM_BLAST_RADIUS,
                         RISK_LOW,
                         f"sets bounded {section}.{rname}={av_raw!r} on container {cname!r}",
+                        disrupt=DISRUPT_DISRUPTIVE,
                         field_path=fp,
                     )
             elif bv is not None and av is not None:
@@ -3963,9 +4028,11 @@ def _check_container_resources(
                     else:
                         ev.add(
                             "CONTAINER_RESOURCE_REDUCED",
-                            DIM_BLAST_RADIUS,
+                            DIM_DISRUPTIVENESS,
                             RISK_MEDIUM,
                             f"reduces {section}.{rname} on container {cname!r} ({bv_raw} -> {av_raw})",
+                            revert=REVERT_MODERATE,
+                            disrupt=DISRUPT_DISRUPTIVE,
                             field_path=fp,
                         )
                 else:
@@ -3976,6 +4043,7 @@ def _check_container_resources(
                             DIM_BLAST_RADIUS,
                             RISK_LOW,
                             f"modestly increases {section}.{rname} on container {cname!r} ({bv_raw} -> {av_raw})",
+                            disrupt=DISRUPT_DISRUPTIVE,
                             field_path=fp,
                         )
                     else:
@@ -3984,6 +4052,8 @@ def _check_container_resources(
                             DIM_BLAST_RADIUS,
                             RISK_MEDIUM,
                             f"large increase of {section}.{rname} on container {cname!r} ({bv_raw} -> {av_raw})",
+                            revert=REVERT_MODERATE,
+                            disrupt=DISRUPT_DISRUPTIVE,
                             field_path=fp,
                         )
 
@@ -3993,10 +4063,12 @@ _CONFIGMAP_ALLOWED_TOP_KEYS = frozenset({"apiVersion", "kind", "metadata", "data
 _KNOWN_GROUP_VERSIONS: dict[str, frozenset[str]] = {
     "": frozenset({"v1"}),
     "apps": frozenset({"v1"}),
+    "argoproj.io": frozenset({"v1alpha1"}),
     "batch": frozenset({"v1", "v1beta1"}),
     "rbac.authorization.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
     "policy": frozenset({"v1", "v1beta1"}),
     "autoscaling": frozenset({"v2", "v2beta2", "v2beta1", "v1"}),
+    "keda.sh": frozenset({"v1alpha1"}),
     "networking.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
     "storage.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
     "scheduling.k8s.io": frozenset({"v1", "v1beta1", "v1alpha1"}),
@@ -4159,6 +4231,7 @@ def _check_configmap(
                                 DIM_BLAST_RADIUS,
                                 RISK_MEDIUM,
                                 f"modifies existing ConfigMap {ev.ref.name!r} key {ks!r}",
+                                revert=REVERT_MODERATE,
                                 field_path=f"data.{ks}",
                             )
                     elif is_complex:
@@ -4167,6 +4240,7 @@ def _check_configmap(
                             DIM_BLAST_RADIUS,
                             RISK_MEDIUM,
                             f"adds structured/multiline/URL value to ConfigMap {ev.ref.name!r} key {ks!r}",
+                            revert=REVERT_MODERATE,
                             field_path=f"data.{ks}",
                         )
                     else:
@@ -4611,6 +4685,7 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
             DIM_BLAST_RADIUS,
             RISK_MEDIUM,
             f"lowers HPA {ev.ref.name!r} replica bounds",
+            revert=REVERT_MODERATE,
             field_path="spec",
         )
     elif (b_min_valid and a_min_raw > b_min_raw) or (b_max_valid and a_max_raw > b_max_raw):
@@ -4636,6 +4711,7 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
                 RISK_MEDIUM,
                 f"raises HPA {ev.ref.name!r} replica bounds steeply ({b_min_raw}..{b_max_raw} -> {a_min_raw}..{a_max_raw})",
                 blast=BLAST_MEDIUM,
+                revert=REVERT_MODERATE,
                 field_path="spec",
             )
     for d in diffs:
@@ -4647,6 +4723,193 @@ def _check_hpa(ev: ResourceEval, action: str, before_obj: dict[str, Any] | None,
                 DIM_BLAST_RADIUS,
                 RISK_MEDIUM,
                 f"modifies HPA field {d.dotted!r}",
+                revert=REVERT_MODERATE,
+                field_path=d.dotted,
+            )
+
+
+def _check_keda_scaled_object(
+    ev: ResourceEval,
+    action: str,
+    before_obj: dict[str, Any] | None,
+    after_obj: dict[str, Any],
+    diffs: list[FieldDiff],
+) -> None:
+    """Evaluate KEDA ScaledObject (where omitted minReplicaCount defaults to 0 and maxReplicaCount to 100)."""
+    a_spec = _as_dict(ev, after_obj.get("spec"), "spec")
+    if "scaleTargetRef" in a_spec and a_spec.get("scaleTargetRef") is not None:
+        _as_dict(ev, a_spec.get("scaleTargetRef"), "spec.scaleTargetRef")
+
+    a_triggers = _as_list(ev, a_spec.get("triggers"), "spec.triggers") if "triggers" in a_spec else []
+    b_spec = before_obj.get("spec") if isinstance(before_obj, dict) and isinstance(before_obj.get("spec"), dict) else {}
+    b_triggers = b_spec.get("triggers") if isinstance(b_spec.get("triggers"), list) else []
+    b_auth_refs = [
+        t.get("authenticationRef")
+        for t in b_triggers
+        if isinstance(t, dict) and t.get("authenticationRef") is not None
+    ]
+    a_auth_refs = [
+        t.get("authenticationRef")
+        for t in a_triggers
+        if isinstance(t, dict) and t.get("authenticationRef") is not None
+    ]
+    if (action == ACTION_ADD and a_auth_refs) or (action == ACTION_MODIFY and a_auth_refs != b_auth_refs):
+        ev.add(
+            "KEDA_TRIGGER_AUTH_CHANGED",
+            DIM_SECURITY,
+            RISK_HIGH,
+            f"{_action_verb(action)} KEDA ScaledObject {ev.ref.name!r} trigger authenticationRef",
+            revert=REVERT_MODERATE,
+            field_path="spec.triggers",
+            security=True,
+        )
+
+    a_min_raw = 0 if a_spec.get("minReplicaCount") is None else a_spec.get("minReplicaCount")
+    a_max_raw = 100 if a_spec.get("maxReplicaCount") is None else a_spec.get("maxReplicaCount")
+    a_min_valid = _is_strict_int(a_min_raw) and a_min_raw >= 0
+    a_max_valid = _is_strict_int(a_max_raw) and a_max_raw >= 1
+    a_idle = a_spec.get("idleReplicaCount")
+    a_paused = a_spec.get("pausedReplicaCount")
+
+    if action == ACTION_ADD:
+        if not a_min_valid or not a_max_valid or a_min_raw > a_max_raw:
+            ev.add(
+                "INVALID_HPA_REPLICAS",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"sets invalid KEDA ScaledObject {ev.ref.name!r} minReplicaCount={a_min_raw!r} / maxReplicaCount={a_max_raw!r}",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec",
+            )
+        elif a_min_raw == 0 or (_is_strict_int(a_idle) and a_idle == 0) or a_paused is not None:
+            ev.add(
+                "HPA_SCALED_TO_ZERO",
+                DIM_DISRUPTIVENESS,
+                RISK_HIGH,
+                f"creates KEDA ScaledObject {ev.ref.name!r} capable of scaling to zero or paused replicas",
+                disrupt=DISRUPT_DISRUPTIVE,
+                field_path="spec.minReplicaCount",
+            )
+        elif a_max_raw > MAX_LOW_REPLICA_TOTAL or a_min_raw > MAX_LOW_REPLICA_TOTAL:
+            ev.add(
+                "HPA_LARGE_INCREASE",
+                DIM_BLAST_RADIUS,
+                RISK_HIGH,
+                f"creates KEDA ScaledObject {ev.ref.name!r} with high replica ceiling ({a_max_raw} > {MAX_LOW_REPLICA_TOTAL})",
+                blast=BLAST_MEDIUM,
+                field_path="spec.maxReplicaCount",
+            )
+        ev.add(
+            "NEW_KEDA_SCALED_OBJECT",
+            DIM_BLAST_RADIUS,
+            RISK_MEDIUM,
+            f"creates new KEDA ScaledObject {ev.ref.name!r}",
+            revert=REVERT_MODERATE,
+        )
+        return
+
+    if b_spec.get("scaleTargetRef") != a_spec.get("scaleTargetRef"):
+        ev.add(
+            "HPA_TARGET_CHANGED",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"changes KEDA ScaledObject {ev.ref.name!r} scaleTargetRef",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec.scaleTargetRef",
+        )
+    if b_spec.get("idleReplicaCount") != a_idle or b_spec.get("pausedReplicaCount") != a_paused:
+        ev.add(
+            "HPA_SCALED_TO_ZERO",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"modifies KEDA ScaledObject {ev.ref.name!r} idleReplicaCount or pausedReplicaCount",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec",
+        )
+
+    b_min_raw = 0 if b_spec.get("minReplicaCount") is None else b_spec.get("minReplicaCount")
+    b_max_raw = 100 if b_spec.get("maxReplicaCount") is None else b_spec.get("maxReplicaCount")
+    b_min_valid = _is_strict_int(b_min_raw) and b_min_raw >= 0
+    b_max_valid = _is_strict_int(b_max_raw) and b_max_raw >= 1
+
+    if not a_min_valid or not a_max_valid or a_min_raw > a_max_raw:
+        ev.add(
+            "INVALID_HPA_REPLICAS",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"sets invalid KEDA ScaledObject {ev.ref.name!r} minReplicaCount={a_min_raw!r} / maxReplicaCount={a_max_raw!r}",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec",
+        )
+    elif a_min_raw == 0 and (b_min_raw != 0 or a_max_raw != b_max_raw):
+        ev.add(
+            "HPA_SCALED_TO_ZERO",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"sets KEDA ScaledObject {ev.ref.name!r} minReplicaCount=0",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec.minReplicaCount",
+        )
+    elif (
+        (b_min_valid and a_max_raw < b_min_raw)
+        or (b_min_valid and a_min_raw < b_min_raw and ((b_min_raw - a_min_raw) / max(b_min_raw, 1) > 0.5 or (b_min_raw >= 2 and a_min_raw <= 1)))
+        or (b_max_valid and a_max_raw < b_max_raw and (b_max_raw - a_max_raw) / max(b_max_raw, 1) > 0.5)
+    ):
+        ev.add(
+            "HPA_CAPACITY_REDUCED",
+            DIM_DISRUPTIVENESS,
+            RISK_HIGH,
+            f"sharply reduces KEDA ScaledObject {ev.ref.name!r} replica bounds ({b_min_raw}..{b_max_raw} -> {a_min_raw}..{a_max_raw})",
+            disrupt=DISRUPT_DISRUPTIVE,
+            field_path="spec",
+        )
+    elif (b_min_valid and a_min_raw < b_min_raw) or (b_max_valid and a_max_raw < b_max_raw):
+        ev.add(
+            "HPA_BOUNDS_LOWERED",
+            DIM_BLAST_RADIUS,
+            RISK_MEDIUM,
+            f"lowers KEDA ScaledObject {ev.ref.name!r} replica bounds",
+            revert=REVERT_MODERATE,
+            field_path="spec",
+        )
+    elif (b_min_valid and a_min_raw > b_min_raw) or (b_max_valid and a_max_raw > b_max_raw):
+        base_min = max(b_min_raw if b_min_valid else 1, 1)
+        min_delta = a_min_raw - (b_min_raw if b_min_valid else 1)
+        min_factor = a_min_raw / base_min
+        if (
+            1 <= a_min_raw <= MAX_LOW_REPLICA_TOTAL
+            and a_max_raw <= MAX_LOW_REPLICA_TOTAL
+            and min_delta <= MAX_LOW_REPLICA_DELTA
+            and min_factor <= MAX_LOW_REPLICA_FACTOR
+        ):
+            ev.add(
+                "HPA_BOUNDS_BUMPED",
+                DIM_BLAST_RADIUS,
+                RISK_LOW,
+                f"modestly increases KEDA ScaledObject {ev.ref.name!r} replica bounds within safe ceiling",
+                field_path="spec",
+            )
+        else:
+            ev.add(
+                "HPA_LARGE_INCREASE",
+                DIM_BLAST_RADIUS,
+                RISK_MEDIUM,
+                f"raises KEDA ScaledObject {ev.ref.name!r} replica bounds steeply ({b_min_raw}..{b_max_raw} -> {a_min_raw}..{a_max_raw})",
+                blast=BLAST_MEDIUM,
+                revert=REVERT_MODERATE,
+                field_path="spec",
+            )
+    for d in diffs:
+        if d.tokens and d.tokens[0] != "metadata" and not (
+            d.tokens[0] == "spec"
+            and len(d.tokens) >= 2
+            and d.tokens[1] in ("minReplicaCount", "maxReplicaCount", "scaleTargetRef", "idleReplicaCount", "pausedReplicaCount")
+        ):
+            ev.add(
+                "HPA_POLICY_MODIFIED",
+                DIM_BLAST_RADIUS,
+                RISK_MEDIUM,
+                f"modifies KEDA ScaledObject field {d.dotted!r}",
                 revert=REVERT_MODERATE,
                 field_path=d.dotted,
             )
@@ -6189,7 +6452,31 @@ def evaluate_resource(
         )
         return _finalize()
 
-    # 21. Remaining modify-capable kinds (PodTemplate, ConfigMap, Service, HPA, Workloads)
+    # 20b. KEDA TriggerAuthentication / ClusterTriggerAuthentication / ScaledJob
+    if gk in (("keda.sh", "TriggerAuthentication"), ("keda.sh", "ClusterTriggerAuthentication")):
+        ev.add(
+            "KEDA_AUTH_CHANGE",
+            DIM_SECURITY,
+            RISK_CRITICAL if is_cluster_scoped else RISK_HIGH,
+            f"{_action_verb(action)} KEDA {ref.kind} {ref.name!r}",
+            blast=BLAST_HIGH if is_cluster_scoped else BLAST_MEDIUM,
+            revert=REVERT_DIFFICULT,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+            security=True,
+        )
+        return _finalize()
+    if gk == ("keda.sh", "ScaledJob"):
+        ev.add(
+            "KEDA_SCALED_JOB_CHANGE",
+            DIM_DISRUPTIVENESS if action == ACTION_MODIFY else DIM_BLAST_RADIUS,
+            RISK_HIGH if action == ACTION_MODIFY else RISK_MEDIUM,
+            f"{_action_verb(action)} KEDA ScaledJob {ref.name!r}",
+            revert=REVERT_MODERATE,
+            disrupt=DISRUPT_DISRUPTIVE if action == ACTION_MODIFY else DISRUPT_NONE,
+        )
+        return _finalize()
+
+    # 21. Remaining modify-capable kinds (PodTemplate, ConfigMap, Service, HPA, KEDA ScaledObject, Workloads)
     if gk == ("", "PodTemplate"):
         _check_pod_template(ev, action, before.obj if before else None, primary.obj, diffs)
     elif gk == ("", "ConfigMap"):
@@ -6198,6 +6485,8 @@ def evaluate_resource(
         _check_service(ev, action, before.obj if before else None, primary.obj, diffs)
     elif gk == ("autoscaling", "HorizontalPodAutoscaler"):
         _check_hpa(ev, action, before.obj if before else None, primary.obj, diffs)
+    elif gk == ("keda.sh", "ScaledObject"):
+        _check_keda_scaled_object(ev, action, before.obj if before else None, primary.obj, diffs)
     elif gk in WORKLOAD_KINDS:
         if action == ACTION_ADD:
             _check_workload_add(ev, primary.obj)
