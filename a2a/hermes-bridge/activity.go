@@ -1217,6 +1217,11 @@ func (b *Bridge) listenActivity() error {
 	b.activityLn = ln
 	b.activityDone = make(chan struct{})
 	b.activitySrv = &http.Server{
+		// net/http logs a handler panic it recovers with the panic's value,
+		// which may carry model or user text. The handler's own stages are
+		// guarded (taskguard), and anything net/http still recovers is
+		// logged here without it.
+		ErrorLog:          quietServerLog(b.cfg.Logger),
 		Handler:           mux,
 		ReadHeaderTimeout: activityReadHeaderTimeout,
 		ReadTimeout:       activityReadTimeout,
@@ -1308,7 +1313,8 @@ func (b *Bridge) closeActivity() {
 // handleActivity is the door. Every answer past the method check is 204:
 // hermes retries connection errors and 5xx and warns on 4xx, and a delivery
 // the door cannot use (unsigned, unmatched, unparseable, or one whose
-// handling panicked: takeDelivery) is not the sender's problem to hear
+// routing or handling panicked: routeGuarded, takeDelivery) is not the
+// sender's problem to hear
 // about per call. An entry is published on this request,
 // under run.mu: hermes delivers from one background thread in order, so
 // the trace keeps call order, a publish costs the tool call nothing, and
@@ -1331,7 +1337,14 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sig := r.Header.Get(hookSignatureHeader)
-	run, decoded, runs := b.routeDelivery(sig, body)
+	run, decoded, runs, ok := b.routeGuarded(sig, body)
+	if !ok {
+		// Routing panicked: the delivery is dropped and its candidate runs
+		// are marked (routeGuarded). Still 204, so hermes doesn't retry a
+		// panic one delivery triggers into one per retry.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if run == nil {
 		if decoded != nil {
 			b.collectCardWorkerSecrets(runs, decoded)
@@ -1460,15 +1473,23 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 // when the pod's shared secret signed it and it decoded (nil otherwise),
 // and the snapshot of tasks it matched against.
 func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery, []*taskRun) {
+	return b.routeDeliveryNarrowing(sig, body, nil)
+}
+
+// routeDeliveryNarrowing is routeDelivery, keeping in *cands, when cands
+// is set, the runs the delivery could still be for as routing narrows
+// them: every run in flight, then, once a pod-wide delivery's session is
+// read, the runs on that session. routeGuarded marks those runs if
+// routing panics.
+func (b *Bridge) routeDeliveryNarrowing(sig string, body []byte, cands *[]*taskRun) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
 		return nil, nil, nil
 	}
-	b.mu.Lock()
-	runs := make([]*taskRun, 0, len(b.tasks))
-	for _, r := range b.tasks {
-		runs = append(runs, r)
+	runs := b.runsInFlight()
+	if cands != nil {
+		*cands = runs
 	}
-	b.mu.Unlock()
+	b.routeStage("in-flight")
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
 			return r, nil, runs
@@ -1484,12 +1505,75 @@ func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery
 	if d.SessionID == "" {
 		return nil, d, runs
 	}
+	if cands != nil {
+		if on := runsOnSession(runs, d.SessionID); len(on) > 0 {
+			*cands = on
+		}
+	}
+	b.routeStage("session")
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
 			return r, d, runs
 		}
 	}
 	return matchWorkerDeliveryRun(runs, *d), d, runs
+}
+
+// routeStage calls b.routeHook, when a test set it, at a routing stage.
+func (b *Bridge) routeStage(stage string) {
+	if b.routeHook != nil {
+		b.routeHook(stage)
+	}
+}
+
+// runsInFlight is every task run the bridge holds, read under b.mu,
+// released by defer.
+func (b *Bridge) runsInFlight() []*taskRun {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	runs := make([]*taskRun, 0, len(b.tasks))
+	for _, r := range b.tasks {
+		runs = append(runs, r)
+	}
+	return runs
+}
+
+// runsOnSession is the runs of runs whose hermes session is session.
+func runsOnSession(runs []*taskRun, session string) []*taskRun {
+	var on []*taskRun
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID == session {
+			on = append(on, r)
+		}
+	}
+	return on
+}
+
+// routeGuarded is routeDelivery under taskguard.Guard. A panic in routing
+// is recovered, logged and counted, and the delivery is dropped (ok is
+// false). Which task it was for can't be known, and a dropped
+// post_tool_call can carry a secret value the answer's scrub needed, so
+// every run it could still have been for is marked panicked (fails closed:
+// each ends failed internal-panic with no answer). That is the runs on its
+// session once routing had read one, and every run in flight before that.
+// One bad delivery can so fail several concurrent tasks, deliberately: a
+// missed secret is worse than a failed task. The count marked is logged,
+// never their ids or the delivery's text.
+func (b *Bridge) routeGuarded(sig string, body []byte) (run *taskRun, decoded *hookDelivery, runs []*taskRun, ok bool) {
+	var cands []*taskRun
+	if taskguard.Guard(b.cfg.Logger, "activity routing", nil, func() {
+		run, decoded, runs = b.routeDeliveryNarrowing(sig, body, &cands)
+	}) == nil {
+		return run, decoded, runs, true
+	}
+	if cands == nil {
+		cands = b.runsInFlight()
+	}
+	for _, r := range cands {
+		markPanicked(r)
+	}
+	b.cfg.Logger.Error("activity routing panic: delivery dropped and its candidate runs failed closed", "marked", len(cands))
+	return nil, nil, nil, false
 }
 
 // collectCardWorkerSecrets reads the Secret values of a post_tool_call

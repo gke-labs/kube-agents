@@ -1,12 +1,17 @@
 package hermesbridge
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -460,5 +465,131 @@ func TestPanic_ObservationMarksTheRunBeforeReleasingItsLock(t *testing.T) {
 		if !<-saw {
 			t.Fatalf("iteration %d: run.mu was released before the run was marked panicked; a finalize waiting on it would publish the answer", i)
 		}
+	}
+}
+
+// routeTestBridge is a bridge with two runs in flight, on hermes sessions
+// s1 and s2, whose door logs to logs, for the routing-panic tests.
+func routeTestBridge(t *testing.T, logs *lockedBuffer) (*Bridge, *taskRun, *taskRun) {
+	t.Helper()
+	b := &Bridge{cfg: Config{ActivitySecret: "pod-wide-shared-secret", Logger: slog.New(slog.NewJSONHandler(logs, nil))}, tasks: make(map[string]*taskRun)}
+	newRun := func(task, session string) *taskRun {
+		a := newActivityState(false)
+		a.sessionID = session
+		a.inTurn.Store(true)
+		run := &taskRun{origin: &lib.Envelope{TaskID: task}, state: stateRunning}
+		run.act.Store(a)
+		b.tasks[task] = run
+		return run
+	}
+	return b, newRun("task-route-1", "a2a-route-s1"), newRun("task-route-2", "a2a-route-s2")
+}
+
+// postSigned posts a pod-wide signed delivery on session to the door and
+// returns the status code.
+func postSigned(t *testing.T, b *Bridge, session, text string) int {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostToolCall, "tool_name": "terminal", "session_id": session,
+		"delivery_id": "route-" + session, "extra": map[string]any{"tool_call_id": "c1", "status": "ok", "result": text},
+	})
+	mac := hmac.New(sha256.New, []byte(b.cfg.ActivitySecret))
+	mac.Write(body)
+	req := httptest.NewRequest(http.MethodPost, ActivityPath, bytes.NewReader(body))
+	req.Header.Set(hookSignatureHeader, hookSignaturePrefix+hex.EncodeToString(mac.Sum(nil)))
+	rec := httptest.NewRecorder()
+	b.handleActivity(rec, req)
+	return rec.Code
+}
+
+// A panic in the door's routing before it has read the delivery's session
+// can't know which task the delivery was for, and a dropped post_tool_call
+// can carry a secret value a task's answer needed scrubbed: every run in
+// flight is marked (each then fails closed). The door still answers 204, so
+// hermes doesn't retry it, and the panic's text stays out of the log, which
+// carries the count marked and no task ids.
+func TestPanic_RoutingBeforeTheSessionMarksEveryRunInFlight(t *testing.T) {
+	logs := &lockedBuffer{}
+	b, r1, r2 := routeTestBridge(t, logs)
+	b.routeHook = func(stage string) {
+		if stage == "in-flight" {
+			panic("injected panic in routing carrying synthroutesecret0001")
+		}
+	}
+	before := taskguard.Count()
+	if code := postSigned(t, b, "a2a-route-s1", "nothing"); code != http.StatusNoContent {
+		t.Fatalf("door answered %d after a routing panic, want 204", code)
+	}
+	if !r1.panicked.Load() || !r2.panicked.Load() {
+		t.Fatalf("marked: run 1 %v, run 2 %v; want both (routing hadn't read the session)", r1.panicked.Load(), r2.panicked.Load())
+	}
+	if got := taskguard.Count() - before; got != 1 {
+		t.Fatalf("recovered panics = %d, want 1", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `"msg":"`+taskguard.LogMessage+`"`) || !strings.Contains(out, `"marked":2`) {
+		t.Fatalf("want taskguard's record and the count marked:\n%s", out)
+	}
+	if strings.Contains(out, "synthroutesecret0001") || strings.Contains(out, "task-route-") {
+		t.Fatalf("the routing panic's log carries the panic's text or a task id:\n%s", out)
+	}
+}
+
+// Once routing has read the delivery's session, a panic marks only the runs
+// on that session.
+func TestPanic_RoutingAfterTheSessionMarksOnlyThatSessionsRuns(t *testing.T) {
+	logs := &lockedBuffer{}
+	b, r1, r2 := routeTestBridge(t, logs)
+	b.routeHook = func(stage string) {
+		if stage == "session" {
+			panic("injected panic in routing after the session")
+		}
+	}
+	if code := postSigned(t, b, "a2a-route-s1", "nothing"); code != http.StatusNoContent {
+		t.Fatalf("door answered %d, want 204", code)
+	}
+	if !r1.panicked.Load() || r2.panicked.Load() {
+		t.Fatalf("marked: run on s1 %v, run on s2 %v; want only s1's", r1.panicked.Load(), r2.panicked.Load())
+	}
+	if out := logs.String(); !strings.Contains(out, `"marked":1`) {
+		t.Fatalf("want marked 1:\n%s", out)
+	}
+	// The door keeps serving: with the panic gone, the next delivery on s2
+	// reaches its run and leaves it unmarked.
+	b.routeHook = nil
+	if code := postSigned(t, b, "a2a-route-s2", "nothing"); code != http.StatusNoContent || r2.panicked.Load() {
+		t.Fatalf("after the panic, a delivery answered %d and marked run 2 %v; want 204 and unmarked", code, r2.panicked.Load())
+	}
+}
+
+// What net/http still recovers is logged without the panic's value or
+// stack; its other messages pass through, first line only.
+func TestPanic_TheDoorServerLogsNoPanicValue(t *testing.T) {
+	logs := &lockedBuffer{}
+	l := quietServerLog(slog.New(slog.NewJSONHandler(logs, nil)))
+	l.Print("http: panic serving 127.0.0.1:5555: synthpanicvalue0002\ngoroutine 7 [running]:\nmain.handler()")
+	l.Print("http: TLS handshake error from 127.0.0.1:5556: EOF")
+	out := logs.String()
+	if strings.Contains(out, "synthpanicvalue0002") || strings.Contains(out, "goroutine 7") {
+		t.Fatalf("the server log carries the panic's value or stack:\n%s", out)
+	}
+	if !strings.Contains(out, "net/http recovered a handler panic") || !strings.Contains(out, "TLS handshake error") {
+		t.Fatalf("want the panic's fixed record and the other message:\n%s", out)
+	}
+}
+
+// The door's server is built with the quiet ErrorLog, so a handler panic
+// net/http recovers never prints its value.
+func TestPanic_TheDoorServerUsesTheQuietLog(t *testing.T) {
+	b := &Bridge{cfg: Config{ActivityListen: "127.0.0.1:0", ScratchDir: t.TempDir(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: make(map[string]*taskRun)}
+	if err := b.listenActivity(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.activityLn.Close()
+	if b.activitySrv.ErrorLog == nil {
+		t.Fatal("the door's http.Server has no ErrorLog: net/http would print a recovered panic's value to stderr")
+	}
+	if _, ok := b.activitySrv.ErrorLog.Writer().(serverLogWriter); !ok {
+		t.Fatalf("the door's ErrorLog writes to %T, want serverLogWriter", b.activitySrv.ErrorLog.Writer())
 	}
 }
