@@ -947,9 +947,8 @@ chain's end, delegated or not. A stop while the child runs cancels the child and
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
 `{"v":1,"taskId":…}` on `a2a.stop.<profile>.<task>` in the `DISPATCH_STOPS` stream, for the
 dispatcher, which has no read on `.in`. The gateway is the record's one writer, and a task
-addressed to platform or a session gets none. The stream and the dispatcher's reader aren't
-built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
-queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
+addressed to platform or a session gets none. The dispatcher ends a task it still holds queued
+when it finds the record. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
