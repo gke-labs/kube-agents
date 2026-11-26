@@ -403,6 +403,8 @@ def healthy_world(*projects):
         "firewall-rules": [
             {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
             {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"]},
+            {"name": "hc-shadow-allow-seeded", "disabled": False, "priority": 1000, "sourceRanges": ["35.191.0.0/16", "130.211.0.0/22"], "allowed": [{"IPProtocol": "tcp", "ports": ["80"]}]},
+            {"name": "hc-shadow-deny-seeded", "disabled": False, "priority": 900, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["80"]}]},
         ],
         # The declared-mtu-peering role's pair as `networks list` prints it:
         # `default` on GCP's 1460 default, which the listing omits.
@@ -888,7 +890,7 @@ class NotChecked(ScanHarness):
         states = self.states(doc)
         # The project-scoped roles are read with gcloud compute, not through a
         # cluster, so a refused cluster list leaves them readable.
-        project_roles = {"startup-fail-vm", "rotated-console-vm", "world-open-ingress", "declared-mtu-peering", "declared-orphan-snapshot", "orphan-snapshot"}
+        project_roles = {"startup-fail-vm", "rotated-console-vm", "world-open-ingress", "health-check-shadowed", "declared-mtu-peering", "declared-orphan-snapshot", "orphan-snapshot"}
         self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
         self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]

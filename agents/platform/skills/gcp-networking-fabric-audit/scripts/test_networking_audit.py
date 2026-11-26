@@ -1638,7 +1638,11 @@ PROJECT_SLUGS = [
     "cloud-armor-false-positive",
     "firewall-world-open-ingress",
     "missing-nodelocal-dnscache",
+    "firewall-health-check-shadowed",
 ]
+# Every project check but the add-on check, which the clusters read alone
+# feeds.
+NOT_DNS_CACHE_SLUGS = [slug for slug in PROJECT_SLUGS if slug != "missing-nodelocal-dnscache"]
 
 
 def dynamic_router(name="nat-router", nat="nat-gw"):
@@ -2123,7 +2127,7 @@ class ProjectTargetTest(unittest.TestCase):
                 patch("sys.stderr", new_callable=io.StringIO):
             return networking_audit.collect_project_target("p1")
 
-    def test_a_quiet_project_records_all_six_checks_as_run(self):
+    def test_a_quiet_project_records_all_seven_checks_as_run(self):
         entry = self.collect()
         self.assertEqual(entry["name"], "project/p1")
         self.assertEqual(entry["outcome"], "collected")
@@ -2187,16 +2191,18 @@ class ProjectTargetTest(unittest.TestCase):
         self.assertEqual(
             [c["check"] for c in entry["commands"]],
             ["psc-routing-deadlock", "mtu-packet-fragmentation", "cloud-armor-false-positive",
-             "firewall-world-open-ingress", "missing-nodelocal-dnscache"],
+             "firewall-world-open-ingress", "missing-nodelocal-dnscache", "firewall-health-check-shadowed"],
         )
         self.assertEqual(
             sorted(c["check"] for c in entry["candidates"]),
             ["firewall-world-open-ingress", "psc-routing-deadlock"],
         )
 
-    def test_a_firewall_read_failure_lists_only_the_firewall_check(self):
+    def test_a_firewall_read_failure_lists_only_the_two_firewall_checks(self):
+        """Both firewall checks read `firewall-rules list`; a failed read costs
+        both and nothing else."""
         entry = self.collect(**{"firewall-rules list": (1, "PERMISSION_DENIED compute.firewalls.list")})
-        self.assertEqual(unevaluated_slugs(entry), ["firewall-world-open-ingress"])
+        self.assertEqual(unevaluated_slugs(entry), ["firewall-world-open-ingress", "firewall-health-check-shadowed"])
         self.assertEqual(len(entry["commands"]), 5)
 
     def test_a_get_status_that_is_not_an_object_costs_the_nat_check(self):
@@ -2300,13 +2306,13 @@ class NodeLocalDnsCacheTest(unittest.TestCase):
         entry = self.collect(**{"clusters list": (1, self.GKE_API_OFF)})
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual([d["check"] for d in entry["checks_not_applicable"]], ["missing-nodelocal-dnscache"])
-        self.assertEqual([c["check"] for c in entry["commands"]], PROJECT_SLUGS[:-1])
+        self.assertEqual([c["check"] for c in entry["commands"]], NOT_DNS_CACHE_SLUGS)
         self.assertEqual(unevaluated_slugs(entry), [])
 
     def test_a_failed_clusters_read_costs_the_add_on_check_alone(self):
         entry = self.collect(**{"clusters list": (1, "PERMISSION_DENIED container.clusters.list")})
         self.assertEqual(unevaluated_slugs(entry), ["missing-nodelocal-dnscache"])
-        self.assertEqual([c["check"] for c in entry["commands"]], PROJECT_SLUGS[:-1])
+        self.assertEqual([c["check"] for c in entry["commands"]], NOT_DNS_CACHE_SLUGS)
         self.assertIn("missing-nodelocal-dnscache could not be evaluated", entry["limitations"])
 
     def test_a_partial_listing_and_a_cluster_with_no_add_ons_are_limitations(self):
@@ -2778,6 +2784,357 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+HC_RANGES = ["35.191.0.0/16", "130.211.0.0/22"]
+
+
+def hc_allow(name="allow-hc", ports=("80",), priority=1000, **extra):
+    """A health-check allow, the shape GKE and a user write for a backend."""
+    return {
+        "name": name,
+        "network": NETWORK,
+        "direction": "INGRESS",
+        "priority": priority,
+        "sourceRanges": list(HC_RANGES),
+        "allowed": [{"IPProtocol": "tcp", "ports": list(ports)}],
+        **extra,
+    }
+
+
+def blanket_deny(name="deny-web", ports=("80",), priority=900, **extra):
+    """A user DENY from the whole IPv4 internet."""
+    rule = {
+        "name": name,
+        "network": NETWORK,
+        "direction": "INGRESS",
+        "priority": priority,
+        "sourceRanges": ["0.0.0.0/0"],
+        # No `ports` key (ports=None) denies every TCP port.
+        "denied": [{"IPProtocol": "tcp"} if ports is None else {"IPProtocol": "tcp", "ports": list(ports)}],
+    }
+    rule.update(extra)
+    return rule
+
+
+def backend(name="backend-1", **extra):
+    """A live instance on NETWORK: a load balancer backend, internal only."""
+    return {"name": name, "status": "RUNNING", "networkInterfaces": [{"network": NETWORK}], **extra}
+
+
+def shadowed(firewalls, instances=None, **kwargs):
+    return na.health_check_shadowed(firewalls, [backend()] if instances is None else instances, "p1", **kwargs)
+
+
+class HealthCheckShadowedTest(unittest.TestCase):
+    def test_a_higher_priority_deny_over_the_probe_ranges_is_flagged_once(self):
+        hits, undecided = shadowed([hc_allow(), blanket_deny()])
+        self.assertEqual(undecided, [])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "FirewallRule/deny-web")
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("allow rule(s) allow-hc admit on tcp:80", excerpt)
+        self.assertIn("backend-1", excerpt)
+        self.assertIn("priority 900", excerpt)
+        self.assertIn(na.HC_SHADOW_BLIND_SPOT, excerpt)
+        # The allow is named without the object prefix, so a phrase graded on
+        # `FirewallRule/` can only match the DENY.
+        self.assertNotIn("FirewallRule/allow-hc", excerpt)
+
+    def test_a_deny_wins_a_tie_and_loses_below(self):
+        self.assertEqual(len(shadowed([hc_allow(priority=1000), blanket_deny(priority=1000)])[0]), 1)
+        self.assertEqual(shadowed([hc_allow(priority=1000), blanket_deny(priority=1001)])[0], [])
+
+    def test_a_missing_priority_is_the_default_on_both_sides(self):
+        allow = hc_allow()
+        allow.pop("priority")
+        deny = blanket_deny()
+        deny.pop("priority")
+        self.assertEqual(len(shadowed([allow, deny])[0]), 1)
+
+    def test_gke_destination_scoped_denies_are_never_flagged(self):
+        """GKE 1.35.1+ writes `k8s-fw-<hash>-deny` from 0.0.0.0/0, all
+        protocols, priority 1000, aimed at one load balancer's IP: beside an
+        internal LB's node health-check allow at 1000, the tie would otherwise
+        flag every cluster with an internal and an external LoadBalancer."""
+        gke_deny = {
+            "name": "k8s-fw-a1b2c3-deny",
+            "network": NETWORK,
+            "direction": "INGRESS",
+            "priority": 1000,
+            "sourceRanges": ["0.0.0.0/0"],
+            "destinationRanges": ["198.51.100.20/32"],
+            "denied": [{"IPProtocol": "all"}],
+        }
+        node_hc = hc_allow(name="k8s-1234abcd-node-hc", ports=("10256",), targetTags=["gke-c-node"])
+        node = backend(tags={"items": ["gke-c-node"]})
+        self.assertEqual(shadowed([node_hc, gke_deny], [node])[0], [])
+
+    def test_a_deny_covering_part_of_the_ports_is_not_flagged(self):
+        """`gke-<cluster>-exkubelet` denies tcp:10255 from the internet; a
+        common deny of tcp:22 sits under GKE's tcp:1-65535 health-check allows.
+        Neither covers what the allow opens."""
+        wide_allow = hc_allow(name="gkegw1-l7-hc", ports=("1-65535",))
+        self.assertEqual(shadowed([wide_allow, blanket_deny(name="deny-ssh", ports=("22",))])[0], [])
+        exkubelet = blanket_deny(name="gke-c-exkubelet", ports=("10255",), priority=1000, targetTags=["gke-c-node"])
+        allow = hc_allow(ports=("10255-10256",), targetTags=["gke-c-node"])
+        self.assertEqual(shadowed([allow, exkubelet], [backend(tags={"items": ["gke-c-node"]})])[0], [])
+
+    def test_ranges_and_unported_entries_cover_whole_spans(self):
+        self.assertEqual(len(shadowed([hc_allow(ports=("80-90",)), blanket_deny(ports=("1-100",))])[0]), 1)
+        self.assertEqual(len(shadowed([hc_allow(ports=("80", "443")), blanket_deny(ports=None)])[0]), 1)
+        deny_all = blanket_deny(denied=[{"IPProtocol": "all"}])
+        self.assertEqual(len(shadowed([hc_allow(), deny_all])[0]), 1)
+        deny_iana = blanket_deny(denied=[{"IPProtocol": "6", "ports": ["80"]}])
+        self.assertEqual(len(shadowed([hc_allow(), deny_iana])[0]), 1)
+        deny_udp = blanket_deny(denied=[{"IPProtocol": "udp", "ports": ["80"]}])
+        self.assertEqual(shadowed([hc_allow(), deny_udp])[0], [])
+
+    def test_the_deny_must_cover_every_probe_range_the_allow_names(self):
+        narrow = blanket_deny(sourceRanges=["35.191.0.0/16"])
+        self.assertEqual(shadowed([hc_allow(), narrow])[0], [])
+        both = blanket_deny(sourceRanges=["35.191.0.0/16", "130.211.0.0/22"])
+        self.assertEqual(len(shadowed([hc_allow(), both])[0]), 1)
+        supernet = blanket_deny(sourceRanges=["35.0.0.0/8", "130.0.0.0/8"])
+        self.assertEqual(len(shadowed([hc_allow(), supernet])[0]), 1)
+
+    def test_an_ipv4_deny_does_not_cover_an_ipv6_probe_allow(self):
+        v6_allow = hc_allow(sourceRanges=["2600:2d00:1:b029::/64"])
+        self.assertEqual(shadowed([v6_allow, blanket_deny()])[0], [])
+        v6_deny = blanket_deny(sourceRanges=["::/0"])
+        self.assertEqual(len(shadowed([v6_allow, v6_deny])[0]), 1)
+
+    def test_an_allow_naming_no_probe_range_is_not_a_health_check_allow(self):
+        self.assertEqual(shadowed([hc_allow(sourceRanges=["10.0.0.0/8"]), blanket_deny()])[0], [])
+
+    def test_sources_are_a_union_and_tags_alone_match_no_probe(self):
+        with_tag = blanket_deny(sourceTags=["bastion"])
+        self.assertEqual(len(shadowed([hc_allow(), with_tag])[0]), 1)
+        tags_only = blanket_deny(sourceTags=["bastion"])
+        tags_only.pop("sourceRanges")
+        self.assertEqual(shadowed([hc_allow(), tags_only])[0], [])
+        no_source = blanket_deny()
+        no_source.pop("sourceRanges")
+        self.assertEqual(len(shadowed([hc_allow(), no_source])[0]), 1)
+
+    def test_the_deny_target_must_include_every_allow_target(self):
+        tagged = backend(tags={"items": ["web"]})
+        allow = hc_allow(targetTags=["web"])
+        self.assertEqual(len(shadowed([allow, blanket_deny(targetTags=["web", "api"])], [tagged])[0]), 1)
+        self.assertEqual(shadowed([allow, blanket_deny(targetTags=["api"])], [tagged])[0], [])
+        # Sharing some tags is not covering them: the DENY misses `api` instances.
+        both = hc_allow(targetTags=["web", "api"])
+        self.assertEqual(shadowed([both, blanket_deny(targetTags=["web"])], [tagged])[0], [])
+        # A narrower deny does not cover an allow with no target.
+        self.assertEqual(shadowed([hc_allow(), blanket_deny(targetTags=["web"])], [tagged])[0], [])
+        # Tags against service accounts cannot be compared without instances.
+        by_account = blanket_deny(targetServiceAccounts=["web@p1.iam.gserviceaccount.com"])
+        self.assertEqual(shadowed([allow, by_account], [tagged])[0], [])
+
+    def test_disabled_egress_or_other_network_rules_are_never_flagged(self):
+        for label, deny in (
+            ("disabled", blanket_deny(disabled=True)),
+            ("egress", blanket_deny(direction="EGRESS")),
+            ("other network", blanket_deny(network=OTHER_NETWORK)),
+        ):
+            with self.subTest(label):
+                self.assertEqual(shadowed([hc_allow(), deny])[0], [])
+        self.assertEqual(shadowed([hc_allow(disabled=True), blanket_deny()])[0], [])
+
+    def test_no_live_backend_means_no_finding(self):
+        """A DENY over the probe ranges on a network with no live backend blocks
+        nothing anyone uses, the reading §2.6 gives a rule reaching no
+        instance."""
+        self.assertEqual(shadowed([hc_allow(), blanket_deny()], [])[0], [])
+        stopped = backend(status="TERMINATED")
+        self.assertEqual(shadowed([hc_allow(), blanket_deny()], [stopped])[0], [])
+        elsewhere = {"name": "vm", "networkInterfaces": [{"network": OTHER_NETWORK}]}
+        self.assertEqual(shadowed([hc_allow(), blanket_deny()], [elsewhere])[0], [])
+
+    def test_a_target_no_visible_instance_carries_is_undecided(self):
+        hits, undecided = shadowed([hc_allow(targetTags=["gk3-pool"]), blanket_deny()], [backend()])
+        self.assertEqual(hits, [])
+        self.assertEqual(undecided, ["deny-web (shadowing allow-hc)"])
+        self.assertIn("deny-web (shadowing allow-hc)", na.hc_shadow_limitation(undecided))
+        self.assertEqual(na.hc_shadow_limitation([]), "")
+
+    def test_an_untargeted_allow_on_an_autopilot_network_is_undecided(self):
+        network = na._network_key(NETWORK, "p1")
+        hits, undecided = shadowed([hc_allow(), blanket_deny()], [], autopilot_networks={network: {"ap-1"}})
+        self.assertEqual(hits, [])
+        self.assertEqual(undecided, ["deny-web (shadowing allow-hc)"])
+        # With no Autopilot cluster on the network, the same rules are clear.
+        self.assertEqual(shadowed([hc_allow(), blanket_deny()], []), ([], []))
+
+    def test_one_finding_per_deny_names_each_shadowed_allow(self):
+        allows = [hc_allow(name=f"allow-hc-{i}") for i in range(5)]
+        hits, _ = shadowed([*allows, blanket_deny()])
+        self.assertEqual([h["object"] for h in hits], ["FirewallRule/deny-web"])
+        self.assertIn("allow-hc-0, allow-hc-1, allow-hc-2, +2 more", hits[0]["excerpt"])
+
+    def test_an_allow_above_the_deny_that_admits_the_probes_clears_it(self):
+        """The remediation §2.8 names: an allow of the probe ranges at a higher
+        priority than the DENY. Once it is in place the DENY blocks no probe."""
+        self.assertEqual(shadowed([hc_allow(), blanket_deny(), hc_allow(name="allow-hc-fix", priority=800)])[0], [])
+        world = dict(hc_allow(name="allow-web", priority=800), sourceRanges=["0.0.0.0/0"])
+        self.assertEqual(shadowed([hc_allow(), blanket_deny(), world])[0], [])
+
+    def test_an_allow_that_does_not_admit_every_probe_first_leaves_the_deny_flagged(self):
+        both = ("80", "443")
+        allow = hc_allow(ports=both)
+        not_first = [
+            # A tie goes to the DENY. From 0.0.0.0/0, so it is not a health-check
+            # allow the DENY could be flagged through on its own.
+            dict(hc_allow(name="fix", priority=900, ports=both), sourceRanges=["0.0.0.0/0"]),
+            hc_allow(name="fix", priority=800, ports=("80",)),  # not every port
+            dict(hc_allow(name="fix", priority=800, ports=both), sourceRanges=["35.191.0.0/16"]),  # not every range
+            hc_allow(name="fix", priority=800, ports=both, targetTags=["other"]),  # not every target
+            hc_allow(name="fix", priority=800, ports=both, network=OTHER_NETWORK),
+            hc_allow(name="fix", priority=800, ports=both, disabled=True),
+            hc_allow(name="fix", priority=800, ports=both, destinationRanges=["10.0.0.5/32"]),
+        ]
+        for rule in not_first:
+            with self.subTest(rule=rule):
+                hits, _ = shadowed([allow, blanket_deny(ports=None), rule])
+                self.assertEqual([h["object"] for h in hits], ["FirewallRule/deny-web"])
+
+    def test_allows_above_the_deny_that_admit_the_probes_between_them_clear_it(self):
+        """The remediation split across rules: one allow per probe range, or
+        one per port. Together they admit every probe before the DENY."""
+        by_range = [
+            dict(hc_allow(name=f"fix-{i}", priority=800), sourceRanges=[source])
+            for i, source in enumerate(HC_RANGES)
+        ]
+        self.assertEqual(shadowed([hc_allow(), blanket_deny(), *by_range])[0], [])
+        both = ("80", "443")
+        by_port = [hc_allow(name="fix-80", priority=800), hc_allow(name="fix-443", priority=800, ports=("443",))]
+        self.assertEqual(shadowed([hc_allow(ports=both), blanket_deny(ports=None), *by_port])[0], [])
+        # One range left without its port, and the DENY still blocks those probes.
+        partial = [by_range[0], dict(hc_allow(name="fix-1", priority=800, ports=("443",)), sourceRanges=[HC_RANGES[1]])]
+        hits, _ = shadowed([hc_allow(), blanket_deny(), *partial])
+        self.assertEqual([h["object"] for h in hits], ["FirewallRule/deny-web"])
+
+    def test_two_backends_of_one_name_are_told_apart_by_zone(self):
+        pair = [backend(name="web", zone=f"zones/{zone}") for zone in ("us-central1-a", "us-central1-b")]
+        hits, _ = shadowed([hc_allow(), blanket_deny()], pair)
+        self.assertIn("2 instance(s)", hits[0]["excerpt"])
+        self.assertIn("web in us-central1-a, web in us-central1-b", hits[0]["excerpt"])
+
+    def test_an_untargeted_allow_where_the_clusters_were_unread_is_undecided(self):
+        hits, undecided = shadowed([hc_allow(), blanket_deny()], [], clusters_unread=["p1"])
+        self.assertEqual(hits, [])
+        self.assertEqual(undecided, ["deny-web (shadowing allow-hc)"])
+
+    def test_the_excerpt_names_only_the_allows_that_reach_a_backend(self):
+        unreached = hc_allow(name="allow-gk3", ports=("8080",), targetTags=["gk3-pool"])
+        hits, _ = shadowed([hc_allow(), unreached, blanket_deny(ports=None)])
+        excerpt = hits[0]["excerpt"]
+        self.assertIn("allow rule(s) allow-hc admit on tcp:80;", excerpt)
+        self.assertNotIn("allow-gk3", excerpt)
+        self.assertNotIn("8080", excerpt)
+
+
+class HealthCheckShadowedCollectTest(unittest.TestCase):
+    def setUp(self):
+        networking_audit.PROJECT_NUMBERS.clear()
+        self.addCleanup(networking_audit.PROJECT_NUMBERS.clear)
+        self.addCleanup(networking_audit.FIREWALL_READS.clear)
+
+    def test_the_project_target_carries_the_candidate_and_its_reads(self):
+        answers = project_answers(**{"firewall-rules list": [hc_allow(), blanket_deny()], "instances list": [backend()]})
+        with patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd({"p1": answers})), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            entry = networking_audit.collect_project_target("p1")
+        found = [c for c in entry["candidates"] if c["check"] == "firewall-health-check-shadowed"]
+        self.assertEqual([c["object"] for c in found], ["FirewallRule/deny-web"])
+        self.assertEqual(found[0]["severity"], "major")
+        self.assertIn("gcloud compute firewall-rules list --project=p1", found[0]["command"])
+        self.assertIn("gcloud compute instances list --project=p1", found[0]["command"])
+
+    def test_a_host_projects_deny_reaches_a_service_project_backend(self):
+        """The rules live in the Shared VPC host and the backend in a service
+        project: measured against its own project's instances alone, the host
+        never fires."""
+        allow = dict(hc_allow(name="host-allow-hc"), network=HOST_NETWORK)
+        deny = dict(blanket_deny(name="host-deny-web"), network=HOST_NETWORK)
+        vm = {"name": "svc-backend", "status": "RUNNING", "networkInterfaces": [{"network": HOST_NETWORK}]}
+        per_project = {
+            "host": project_answers(**{"firewall-rules list": [allow, deny]}),
+            "svc": project_answers(**{"instances list": [vm]}),
+        }
+        with patch.object(networking_audit, "get_target_projects", return_value=["host", "svc"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        by_name = {e["name"]: e for e in manifest["clusters"]}
+        found = [c for c in by_name["project/host"]["candidates"] if c["check"] == "firewall-health-check-shadowed"]
+        self.assertEqual([c["object"] for c in found], ["FirewallRule/host-deny-web"])
+        self.assertIn("svc-backend", found[0]["excerpt"])
+        self.assertIn("gcloud compute instances list --project=svc", found[0]["command"])
+
+    def test_same_named_backends_in_two_service_projects_are_two_instances(self):
+        """`gcloud` gives every instance its selfLink, which names its project."""
+        allow = dict(hc_allow(name="host-allow-hc"), network=HOST_NETWORK)
+        deny = dict(blanket_deny(name="host-deny-web"), network=HOST_NETWORK)
+        vm = {"name": "web", "status": "RUNNING", "networkInterfaces": [{"network": HOST_NETWORK}]}
+        per_project = {
+            "host": project_answers(**{"firewall-rules list": [allow, deny]}),
+            "svc-a": project_answers(**{"instances list": [dict(vm, zone="zones/us-central1-a", selfLink="https://www.googleapis.com/compute/v1/projects/svc-a/zones/us-central1-a/instances/web")]}),
+            "svc-b": project_answers(**{"instances list": [dict(vm, zone="zones/us-central1-a", selfLink="https://www.googleapis.com/compute/v1/projects/svc-b/zones/us-central1-a/instances/web")]}),
+        }
+        with patch.object(networking_audit, "get_target_projects", return_value=["host", "svc-a", "svc-b"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        by_name = {e["name"]: e for e in manifest["clusters"]}
+        found = [c for c in by_name["project/host"]["candidates"] if c["check"] == "firewall-health-check-shadowed"]
+        self.assertIn("2 instance(s)", found[0]["excerpt"])
+        self.assertIn("web (svc-a), web (svc-b)", found[0]["excerpt"])
+        self.assertIn("gcloud compute instances list --project=svc-a", found[0]["command"])
+        self.assertIn("gcloud compute instances list --project=svc-b", found[0]["command"])
+
+    def test_a_failed_instance_read_costs_the_check_without_a_second_read(self):
+        """A project whose firewall reads failed is left out of the fleet pass,
+        so a verdict from a second read would stand on its own instances alone."""
+        calls = []
+        answers = project_answers(**{
+            "firewall-rules list": [hc_allow(), blanket_deny()],
+            "instances list": (1, "ERROR: PERMISSION_DENIED"),
+        })
+        with patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd({"p1": answers}, calls)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            entry = networking_audit.collect_project_target("p1")
+        unevaluated = {u["check"]: u["reason"] for u in entry["checks_unevaluated"]}
+        self.assertIn("PERMISSION_DENIED", unevaluated["firewall-health-check-shadowed"])
+        self.assertEqual(sum("instances list" in " ".join(c) for c in calls), 1)
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == "firewall-health-check-shadowed"], [])
+
+    def fleet_target(self, **answers):
+        per_project = {"p1": project_answers(**{"firewall-rules list": [hc_allow(), blanket_deny()], **answers})}
+        with patch.object(networking_audit, "get_target_projects", return_value=["p1"]), \
+                patch.object(networking_audit, "run_cmd", side_effect=fake_run_cmd(per_project)), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            manifest = networking_audit.collect_fleet()
+        return {e["name"]: e for e in manifest["clusters"]}["project/p1"]
+
+    def test_the_fleet_pass_keeps_the_undecided_sentence_for_an_autopilot_network(self):
+        cluster = {
+            "name": "ap-1",
+            "location": "us-central1",
+            "autopilot": {"enabled": True},
+            "networkConfig": {"network": "projects/p1/global/networks/default"},
+        }
+        target = self.fleet_target(**{"clusters list": [cluster]})
+        self.assertIn(networking_audit.hc_shadow_limitation(["deny-web (shadowing allow-hc)"]), target["limitations"])
+
+    def test_the_fleet_pass_keeps_the_undecided_sentence_when_the_clusters_were_unread(self):
+        target = self.fleet_target(**{"clusters list": (1, "ERROR: PERMISSION_DENIED")})
+        self.assertIn(networking_audit.hc_shadow_limitation(["deny-web (shadowing allow-hc)"]), target["limitations"])
+        # With the clusters read and none on the network, the same rules are clear.
+        self.assertNotIn(
+            networking_audit.hc_shadow_limitation(["deny-web (shadowing allow-hc)"]),
+            self.fleet_target().get("limitations", []),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

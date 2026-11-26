@@ -1850,6 +1850,95 @@
         }
       ]
     },
+    "health-check-shadowed": {
+      "cluster_slot": null,
+      "namespace": null,
+      "probes": [
+        "firewall/hc-shadow-allow-*",
+        "firewall/hc-shadow-deny-*",
+        "instance/world-open-*"
+      ],
+      "fixture": "hc-shadow-deny-<prefix>, an INGRESS DENY of tcp:80 from 0.0.0.0/0 at priority 900, above hc-shadow-allow-<prefix>, an INGRESS allow of tcp:80 from the health-check ranges 35.191.0.0/16 and 130.211.0.0/22 at priority 1000; both on the tag of world-open-<prefix>, the live VM that carries it. Project-scoped, as world-open-ingress is",
+      "state": [
+        {
+          "subject": "firewall/hc-shadow-allow-*",
+          "path": "sourceRanges[*]",
+          "op": "any_eq",
+          "value": "35.191.0.0/16",
+          "why": "the networking audit's firewall-health-check-shadowed check reads an allow of the health-check probe ranges; an allow without them is no health-check allow, and networking-health-check-shadowed has nothing to grade"
+        },
+        {
+          "subject": "firewall/hc-shadow-allow-*",
+          "path": "allowed[*].ports[*]",
+          "op": "any_eq",
+          "value": "80",
+          "why": "the DENY shadows the allow only while it denies every port the allow opens; the allow moved to another port is no longer covered"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "denied[*].ports[*]",
+          "op": "any_eq",
+          "value": "80",
+          "why": "the DENY must cover tcp:80, the port the allow opens"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "priority",
+          "op": "eq",
+          "value": 900,
+          "why": "the DENY shadows the allow only at its priority or above (a number of 1000 or lower); moved below it, the allow wins and there is no finding"
+        },
+        {
+          "subject": "firewall/hc-shadow-allow-*",
+          "path": "priority",
+          "op": "eq",
+          "value": 1000,
+          "why": "the DENY at 900 shadows the allow only while the allow sits at its priority or below; moved to 900 or above it, the allow wins and there is no finding"
+        },
+        {
+          "subject": "firewall/hc-shadow-allow-*",
+          "path": "allowed[*].IPProtocol",
+          "op": "any_eq",
+          "value": "tcp",
+          "why": "the check reads the TCP ports an allow opens; an allow of udp:80 is no TCP health-check allow and there is no finding"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "denied[*].IPProtocol",
+          "op": "any_eq",
+          "value": "tcp",
+          "why": "the DENY covers the allow's tcp:80 only over TCP; a DENY of udp:80 blocks no probe and there is no finding"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "sourceRanges[*]",
+          "op": "any_eq",
+          "value": "0.0.0.0/0",
+          "why": "the DENY shadows the allow only while its sources contain the probe ranges; narrowed, it blocks no probe and there is no finding"
+        },
+        {
+          "subject": "firewall/hc-shadow-allow-*",
+          "path": "disabled",
+          "op": "none_eq",
+          "value": true,
+          "why": "the check reads enabled rules only; a disabled allow admits nothing to shadow"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "disabled",
+          "op": "none_eq",
+          "value": true,
+          "why": "the check reads enabled rules only; a disabled DENY blocks nothing"
+        },
+        {
+          "subject": "instance/world-open-*",
+          "path": "status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the check fires only when a live instance is in the allow's target; a stopped VM leaves the rules a latent misconfiguration"
+        }
+      ]
+    },
     "declared-mtu-peering": {
       "cluster_slot": null,
       "namespace": null,

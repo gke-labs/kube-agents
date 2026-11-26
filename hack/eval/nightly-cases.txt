@@ -1493,6 +1493,16 @@
 # characters. deployer: noop, read-only on the project.
 ./tasks/networking-declared-intent-no-finding/task.yaml
 
+# The networking audit's firewall-health-check-shadowed check (#2587) over a
+# standing plant: the health-check-shadowed role, a DENY of tcp:80 from the
+# internet at priority 900 above an allow of tcp:80 from the load-balancer
+# health-check ranges at 1000, both on the world-open VM's tag, which is the
+# live instance the check needs. deployer: noop, read-only on the project; a
+# full audit, in the band of the other fleet-audit cases. Its two firewall
+# rules are created by the fleet reconcile that runs on merge, before the
+# next nightly.
+./tasks/networking-health-check-shadowed/task.yaml
+
 # The networking audit's firewall-world-open-ingress check over a standing
 # plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
 # the internet on one VM with an external IP. deployer: noop, read-only on the

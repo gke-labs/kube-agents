@@ -470,10 +470,11 @@ AUDITS: dict[str, AuditSpec] = {
             "cloud-armor-false-positive",
             "firewall-world-open-ingress",
             "missing-nodelocal-dnscache",
+            "firewall-health-check-shadowed",
         ),
         # SOP §2's target rule: one `<project>/<region>/<subnet>` entry per
         # subnet for the IPAM check, one `project/<id>` entry for the other
-        # six. This stream enumerates no clusters.
+        # seven. This stream enumerates no clusters.
         scopes=(
             ("subnet", ("subnet-ip-exhaustion",)),
             (
@@ -485,6 +486,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "cloud-armor-false-positive",
                     "firewall-world-open-ingress",
                     "missing-nodelocal-dnscache",
+                    "firewall-health-check-shadowed",
                 ),
             ),
         ),
@@ -492,12 +494,13 @@ AUDITS: dict[str, AuditSpec] = {
         # sets, each peered network's MTU, and reads nothing live, so the only
         # one a repository declaration may keep off the ledger (a jumbo-frame
         # network peered with a 1460 one on purpose). One arm, one object kind
-        # (`NetworkPeering/<a>--<b>`), so no arm rule. The other six are
+        # (`NetworkPeering/<a>--<b>`), so no arm rule. The other seven are
         # faults no declaration excuses: a range under 15% free, a VM at its
         # NAT port ceiling, a rejected PSC connection, a preview or duplicate
         # Cloud Armor rule on a production backend, a management port open to
         # the internet on a live external address, a Standard cluster without
-        # NodeLocal DNSCache.
+        # NodeLocal DNSCache, a DENY that blocks the health-check probes of
+        # live backends.
         declarable=("mtu-packet-fragmentation",),
     ),
     "gce-compute-fleet-audit": AuditSpec(
@@ -1385,6 +1388,7 @@ CHECK_PHRASES = {
     "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
     "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
     "missing-nodelocal-dnscache": "{object} cluster runs without NodeLocal DNSCache",
+    "firewall-health-check-shadowed": "{object} firewall rule blocks load-balancer health checks",
     # GCE Compute Engine and MIG Fleet Audit
     "gce-startup-script-status": "{object} startup script failed",
     "mig-convergence-stalled": "{object} instance group isn't converging",
