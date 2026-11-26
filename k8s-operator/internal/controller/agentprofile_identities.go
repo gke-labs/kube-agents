@@ -42,10 +42,14 @@ import (
 // profile pod can reach, exactly as for the session entry.
 //
 // The operator's entry IS static, and it is the narrowest principal in the map:
-// publish on the directory, read the directory, its own inbox. It exists to
-// publish profile cards and their tombstones, which the spec gives to the
-// operator because a card is presence derived from desired state, and the
-// operator is the one component that holds the desired state.
+// publish on the directory, read the directory, append missing rendered
+// subjects to TOPICS-STATE on upgrade (STREAM.INFO and STREAM.UPDATE on
+// TOPICS-STATE, held to added subjects by StreamPolicy.CheckSubjectAppend),
+// and its own inbox. It exists to publish profile cards and their tombstones,
+// which the spec gives to the operator because a card is presence derived from
+// desired state, and the operator is the one component that holds the desired
+// state, and to converge TOPICS-STATE's rendered subject list while provision
+// remains create-only.
 
 const (
 	// a2aNarrowingProfile is the callout's NarrowingProfile, duplicated here

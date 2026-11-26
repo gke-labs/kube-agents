@@ -51,7 +51,12 @@ const busMigrationConvertDeadline = 15 * time.Minute
 // (busMigrationWorkloadName).
 const busMigrationNameHashLength = 10
 
-const errNoStreamPolicyFmt = "no stream policy for %s"
+const (
+	errNoStreamPolicyFmt     = "no stream policy for %s"
+	errOperatorBusConnectFmt = "connecting to the bus at %s as the operator: %w"
+	operatorBusConnName      = "kubeagents-operator"
+	operatorInboxPrefix      = "_INBOX." + a2aOperatorBusUser
+)
 
 // busMigrationLeg is the direction of a run.
 type busMigrationLeg string
@@ -1260,21 +1265,53 @@ func a2aTopicsStatePolicy(agent *agentv1alpha1.PlatformAgent) (busmigrate.Stream
 	return busmigrate.StreamPolicy{}, false
 }
 
+// operatorTopicsStateConn opens a bus connection as the operator principal to
+// append missing rendered subjects to TOPICS-STATE on upgrade. When the
+// manager's own namespace and ServiceAccount are not configured
+// (operatorBusPrincipal), the operator renders no bus identity for itself and
+// returns (nil, nil) so reportA2AProvisionFindings falls back to recording the
+// TopicsStateSubjectMissing Event.
+func (r *PlatformAgentReconciler) operatorTopicsStateConn(_ context.Context, agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
+	if _, _, ok := operatorBusPrincipal(); !ok {
+		return nil, nil
+	}
+	url := a2aNATSClientURL(agent)
+	tokenFile := operatorBusAuthFile()
+	nc, err := nats.Connect(url, (&natsCardPublisher{reader: r.a2aReader()}).busTLS(agent),
+		nats.Name(operatorBusConnName),
+		nats.TokenHandler(func() string {
+			b, err := os.ReadFile(tokenFile) // #nosec G304 -- the manager's own projected token path
+			if err != nil {
+				return ""
+			}
+			return string(b)
+		}),
+		nats.CustomInboxPrefix(operatorInboxPrefix),
+		nats.Timeout(cardBusTimeout),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(errOperatorBusConnectFmt, url, err)
+	}
+	return nc, nil
+}
+
 // appendTopicsStateSubjects appends missing rendered subjects to TOPICS-STATE
 // through busmigrate.AppendMissingSubjects, which refuses any change other
 // than added policy subjects (no removed subject, no changed limit or
-// retention, no RePublish). When no bus connection is configured, it returns
-// (nil, nil) so reportA2AProvisionFindings falls back to recording the
+// retention, no RePublish). When the operator's bus identity is not configured
+// (and no test seam is set), it returns (nil, nil) so
+// reportA2AProvisionFindings falls back to recording the
 // TopicsStateSubjectMissing Event.
 func (r *PlatformAgentReconciler) appendTopicsStateSubjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
-	if r.busTopicsStateConn == nil {
-		return nil, nil
+	connFn := r.busTopicsStateConn
+	if connFn == nil {
+		connFn = r.operatorTopicsStateConn
 	}
 	policy, ok := a2aTopicsStatePolicy(agent)
 	if !ok {
 		return nil, fmt.Errorf(errNoStreamPolicyFmt, a2aTopicsStateStream)
 	}
-	nc, err := r.busTopicsStateConn(ctx, agent)
+	nc, err := connFn(ctx, agent)
 	if err != nil || nc == nil {
 		return nil, err
 	}

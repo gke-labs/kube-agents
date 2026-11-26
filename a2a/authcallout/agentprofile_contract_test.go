@@ -126,11 +126,17 @@ func TestTheRenderedOperatorReachesTheDirectoryAndNothingElse(t *testing.T) {
 
 	checkPublish(t, op, violations, map[string]bool{
 		"a2a.agents.another-profile":                false,
+		"$JS.API.STREAM.INFO.TOPICS-STATE":          false,
+		"$JS.API.STREAM.UPDATE.TOPICS-STATE":        false,
 		lib.TaskInSubject(cardProfile, "t"):         true,
 		lib.TaskEventsSubject(cardProfile, "t"):     true,
 		lib.TaskSupervisorSubject(cardProfile, "t"): true,
 		"a2a.topics.shared.blueprint":               true,
 		"$JS.API.STREAM.INFO.DIRECTORY":             true,
+		"$JS.API.STREAM.UPDATE.DIRECTORY":           true,
+		"$JS.API.STREAM.UPDATE.TASKS":               true,
+		"$JS.API.STREAM.DELETE.TOPICS-STATE":        true,
+		"$JS.API.STREAM.PURGE.TOPICS-STATE":         true,
 		"$JS.API.STREAM.DELETE.DIRECTORY":           true,
 		"$JS.API.STREAM.PURGE.DIRECTORY":            true,
 		"$JS.API.STREAM.MSG.GET.DIRECTORY":          true,

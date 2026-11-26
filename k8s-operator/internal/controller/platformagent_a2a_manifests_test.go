@@ -3345,24 +3345,15 @@ func a2aWithStaticTrustedUser(t *testing.T, conf string, id a2aIdentity, pw stri
 }
 
 func TestProvisionCannotUpdateTopicsStateOnARealServer(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	op, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("operatorIdentity() not configured")
+	}
 	creds := a2aFullCreds("p", "1")
 	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
-	const (
-		updaterUser = "topics-updater"
-		updaterPW   = "pw-topics-updater"
-	)
-	conf = a2aWithStaticTrustedUser(t, conf, a2aIdentity{
-		user:    updaterUser,
-		account: a2aAccountControl,
-		publish: []string{
-			"$JS.API.STREAM.INFO." + a2aTopicsStateStream,
-			"$JS.API.STREAM.UPDATE." + a2aTopicsStateStream,
-			"$JS.API.STREAM.INFO." + a2aTasksStream,
-			a2aSharedBlueprintSubject,
-			"_INBOX." + updaterUser + ".>",
-		},
-		subscribe: []string{"_INBOX." + updaterUser + ".>"},
-	}, updaterPW)
+	const operatorPW = "pw-operator-stand-in"
+	conf = a2aWithStaticTrustedUser(t, conf, op, operatorPW)
 
 	s, log := a2aStartRenderedServer(t, conf)
 
@@ -3436,14 +3427,14 @@ func TestProvisionCannotUpdateTopicsStateOnARealServer(t *testing.T) {
 	}
 
 	// The operator's subject-append path (busmigrate.AppendMissingSubjects with
-	// a2aTopicsStatePolicy) appends the missing topology-skew subject and
-	// refuses any other change.
-	updaterNC, updaterJS := a2aConnectAs(t, s.ClientURL(), updaterUser, updaterPW)
+	// a2aTopicsStatePolicy under operatorIdentity's rendered grants) appends
+	// the missing topology-skew subject and refuses any other change.
+	operatorNC, operatorJS := a2aConnectAs(t, s.ClientURL(), a2aOperatorBusUser, operatorPW)
 	policy, ok := a2aTopicsStatePolicy(a2aTestAgent())
 	if !ok {
 		t.Fatalf("no stream policy for %s", a2aTopicsStateStream)
 	}
-	added, err := busmigrate.AppendMissingSubjects(ctx, updaterNC, policy)
+	added, err := busmigrate.AppendMissingSubjects(ctx, operatorNC, policy)
 	if err != nil {
 		t.Fatalf("busmigrate.AppendMissingSubjects(%s): %v", a2aTopicsStateStream, err)
 	}
@@ -3492,7 +3483,7 @@ func TestProvisionCannotUpdateTopicsStateOnARealServer(t *testing.T) {
 	); err == nil {
 		t.Fatal("policy.CheckSubjectAppend accepted a RePublish/limit/subject-removal edit")
 	}
-	republished, err := updaterJS.UpdateStream(ctx, republishCfg)
+	republished, err := operatorJS.UpdateStream(ctx, republishCfg)
 	if err != nil {
 		t.Fatalf("raw UpdateStream(%s) with RePublish/limit/subject-removal: %v", a2aTopicsStateStream, err)
 	}
@@ -3501,12 +3492,12 @@ func TestProvisionCannotUpdateTopicsStateOnARealServer(t *testing.T) {
 		!slices.Equal(republished.CachedInfo().Config.Subjects, []string{a2aSharedBlueprintSubject}) {
 		t.Fatalf("unexpected %s config after raw RePublish update: %+v", a2aTopicsStateStream, republished.CachedInfo().Config)
 	}
-	if _, err := updaterJS.Publish(ctx, a2aSharedBlueprintSubject, []byte("via-republish")); err != nil {
-		t.Fatalf("publishing starter topic %s: %v", a2aSharedBlueprintSubject, err)
+	if _, err := provisionJS.Publish(ctx, a2aSharedBlueprintSubject, []byte("via-republish")); err != nil {
+		t.Fatalf("publishing starter topic %s as provision: %v", a2aSharedBlueprintSubject, err)
 	}
-	tasksAfter, err := updaterJS.Stream(ctx, a2aTasksStream)
+	tasksAfter, err := provisionJS.Stream(ctx, a2aTasksStream)
 	if err != nil {
-		t.Fatalf("reading %s info: %v", a2aTasksStream, err)
+		t.Fatalf("reading %s info as provision: %v", a2aTasksStream, err)
 	}
 	if gotMsgs := tasksAfter.CachedInfo().State.Msgs; gotMsgs != 1 {
 		t.Errorf("%s message count after TOPICS-STATE RePublish = %d, want 1", a2aTasksStream, gotMsgs)

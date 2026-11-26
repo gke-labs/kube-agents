@@ -63,6 +63,17 @@ const (
 	a2aAuthStatic
 )
 
+const (
+	a2aJSStreamInfoPrefix      = "$JS.API.STREAM.INFO."
+	a2aJSStreamUpdatePrefix    = "$JS.API.STREAM.UPDATE."
+	a2aOperatorIdentityComment = "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
+		"on the directory, reads one back to tell a missing card from a current\n" +
+		"one, and appends missing rendered subjects to TOPICS-STATE on upgrade\n" +
+		"(STREAM.INFO and STREAM.UPDATE on TOPICS-STATE, held to added subjects by\n" +
+		"StreamPolicy.CheckSubjectAppend). Nothing on the task plane, and no\n" +
+		"blackboard topic publishes."
+)
+
 // a2aIdentity is one bus principal: what it is called on the bus, what it may
 // say, and how it proves it is itself.
 type a2aIdentity struct {
@@ -476,16 +487,20 @@ const (
 )
 
 // operatorIdentity is the operator as a bus principal: publish a card or a
-// tombstone on a2a.agents.<profile>, read one back, and its own inbox. The
+// tombstone on a2a.agents.<profile>, read one back, append missing rendered
+// subjects to TOPICS-STATE on upgrade, and its own inbox. The
 // subject is a wildcard over the profile token because a callout grant is
 // fixed for the life of a connection: a profile created after the operator
 // connected must still be publishable without a reconnect. Nothing else: no
-// task plane, no topics, no stream verb beyond the one direct read.
+// task plane, no topic publishes, and no stream verb beyond the directory's
+// direct read and STREAM.INFO/STREAM.UPDATE on TOPICS-STATE (which the
+// operator holds to added subjects through StreamPolicy.CheckSubjectAppend
+// while provision stays create-only).
 //
-// The read is DIRECT.GET by subject, which nats.go spells as the subject's
-// trailing tokens, so it is scoped to the directory's own subjects; it is how
-// reconcile tells a missing or stale card from a current one without holding
-// STREAM.INFO.
+// The directory read is DIRECT.GET by subject, which nats.go spells as the
+// subject's trailing tokens, so it is scoped to the directory's own subjects;
+// it is how reconcile tells a missing or stale card from a current one without
+// holding STREAM.INFO on DIRECTORY.
 //
 // ok is false when the manager's own namespace and ServiceAccount are missing
 // from the environment or malformed (agentprofile_identities.go); the caller
@@ -497,12 +512,12 @@ func operatorIdentity() (a2aIdentity, bool) {
 		account:        a2aAccountControl,
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, sa),
-		comment: "the operator. Publishes each AgentProfile's agent card and its tombstone\n" +
-			"on the directory, and reads one back to tell a missing card from a current\n" +
-			"one. Nothing on the task plane or the blackboard.",
+		comment:        a2aOperatorIdentityComment,
 		publish: []string{
 			a2aDirectorySubjectPrefix + "*",
 			"$JS.API.DIRECT.GET." + a2aDirectoryStream + "." + a2aDirectorySubjectPrefix + "*",
+			a2aJSStreamInfoPrefix + a2aTopicsStateStream,
+			a2aJSStreamUpdatePrefix + a2aTopicsStateStream,
 		},
 		subscribe: []string{"_INBOX." + a2aOperatorBusUser + ".>"},
 	}

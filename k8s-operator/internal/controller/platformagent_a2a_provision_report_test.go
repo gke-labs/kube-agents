@@ -502,22 +502,15 @@ func TestTheMissingTopologySkewSubjectIsAnEventOnTheCR(t *testing.T) {
 }
 
 func TestTheOperatorAppendsTheMissingTopologySkewSubjectThroughReconcile(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	op, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("operatorIdentity() not configured")
+	}
 	creds := a2aFullCreds("p", "1")
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
-	const (
-		updaterUser = "topics-updater"
-		updaterPW   = "pw-topics-updater"
-	)
-	conf = a2aWithStaticTrustedUser(t, conf, a2aIdentity{
-		user:    updaterUser,
-		account: a2aAccountControl,
-		publish: []string{
-			"$JS.API.STREAM.INFO." + a2aTopicsStateStream,
-			"$JS.API.STREAM.UPDATE." + a2aTopicsStateStream,
-			"_INBOX." + updaterUser + ".>",
-		},
-		subscribe: []string{"_INBOX." + updaterUser + ".>"},
-	}, updaterPW)
+	const operatorPW = "pw-operator-stand-in"
+	conf = a2aWithStaticTrustedUser(t, conf, op, operatorPW)
 
 	s, _ := a2aStartRenderedServer(t, conf)
 	ctx := context.Background()
@@ -542,7 +535,7 @@ func TestTheOperatorAppendsTheMissingTopologySkewSubjectThroughReconcile(t *test
 	rec := record.NewFakeRecorder(8)
 	r.Recorder = rec
 	r.busTopicsStateConn = func(_ context.Context, _ *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
-		return nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo(updaterUser, updaterPW), nats.CustomInboxPrefix("_INBOX."+updaterUser))
+		return nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo(a2aOperatorBusUser, operatorPW), nats.CustomInboxPrefix(operatorInboxPrefix))
 	}
 	jobName := provisionedInstall(t, ctx, cl, r, agent, `{"topics_state_subject":{"missing":1}}`)
 

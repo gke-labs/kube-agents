@@ -532,7 +532,8 @@ func TestAMalformedOperatorPrincipalRendersNoEntryAndFailsNothing(t *testing.T) 
 	}
 }
 
-// With them, its entry is the directory and its inbox, nothing else.
+// With them, its entry is the directory, TOPICS-STATE subject convergence, and
+// its inbox, nothing else.
 func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	// With the dispatcher off: on, the operator also syncs the profiles'
@@ -546,7 +547,12 @@ func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	if e.ServiceAccount != "system:serviceaccount:"+testOperatorNamespace+":"+testOperatorSA {
 		t.Errorf("serviceAccount = %q", e.ServiceAccount)
 	}
-	wantPub := []string{"a2a.agents.*", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*"}
+	wantPub := []string{
+		"a2a.agents.*",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+		"$JS.API.STREAM.INFO.TOPICS-STATE",
+		"$JS.API.STREAM.UPDATE.TOPICS-STATE",
+	}
 	wantSub := []string{"_INBOX.operator.>"}
 	if !slices.Equal(e.Grants.Publish, wantPub) || !slices.Equal(e.Grants.Subscribe, wantSub) {
 		t.Errorf("grants = %+v, want publish %v subscribe %v", e.Grants, wantPub, wantSub)
