@@ -307,8 +307,12 @@ For the security approver:
    task's cluster?
 
    Recommendation: a row for each built-in schedule, which the operator renders, as columns of the
-   permit's table. The read allowlist is a list of its own. A read needs no schedule trigger and
-   no hold to the task's cluster.
+   permit's table. The read allowlist is a list of its own. A read needs no schedule trigger. A
+   task with a cluster target reads the findings of that cluster only. A task with no cluster
+   target reads each cluster. A team profile's task is held to its namespaces when the namespace
+   bound of [#7354](https://github.com/gke-labs/kube-agents/pull/7354) exists. Until then, no
+   team profile is on the read allowlist. With a yes, "Who may read" changes: it says today that a
+   read is not held to the task's target.
 
    Reason: a stream is the schedule's own name and a task cannot choose it, so the schedule is a
    bind that the broker can check. The write-permit design offers these columns, and its
@@ -323,9 +327,13 @@ For the security approver:
 
    The queue holds today what no stored report holds: each person's decision, and the findings of
    the sweep and of the readiness review. So the report list does not say who needs the queue. A
-   person's question about the fleet is a task with no trigger, and the weekly brief reads each
-   cluster. A read with no hold has a cost. A task that is confined to one cluster reads the
-   findings of each cluster, and the text of a finding can come from a tenant.
+   person's question about the fleet is a task with no trigger, so a read cannot need one. The
+   nudge, the weekly review and the weekly brief have no cluster target and need each cluster, so
+   they keep the whole read. A task that is confined to one cluster needs only the findings of its
+   cluster. The text of a finding can come from a tenant. The list route takes a cluster filter
+   today, so the broker can set it from the task's target. The ranked list and the day's additions
+   return the whole queue. They need a filter in Session KV, or they stay with the tasks that have
+   no cluster target.
 
 5. Is a verb that names a finding id held to the findings of the row's source? That needs a check
    in Session KV. Is a register held to the findings that its source wrote? Which stream may act
