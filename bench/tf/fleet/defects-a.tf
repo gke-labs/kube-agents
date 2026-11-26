@@ -2818,6 +2818,62 @@ resource "kubernetes_manifest" "scaled_zero_gateway_class" {
   }
 }
 
+# Defect (role unaccepted-gateway-class, #1982, #7097): a cluster-scoped
+# GatewayClass referencing an unsupported controllerName (RFC 2606 example.com)
+# so no controller accepts it, plus a Gateway and HTTPRoute bound to it in
+# seeded-shapes. Because no controller owns this class, no Gateway Deployment,
+# Service, or cloud load balancer is provisioned, and the HTTPRoute stays
+# unprogrammed with zero pod/CPU footprint. The HTTPRoute carries no
+# backendRefs so obtainability §3.26 (ingress-gateway-healthcheck-mismatch)
+# stays silent on it. Both the Gateway and HTTPRoute carry the stall-watch
+# opt-out annotation (`kubeagents.x-k8s.io/stall-watch: exempt`) so the
+# periodic stall-watch cron does not fire controller-stall alerts on
+# seeded-shapes while the Gateway sits in GKE's default Accepted=Unknown /
+# Programmed=Unknown Pending state. GatewayClass seeded-envoy (Accepted=True
+# written by gateway_status.py below) and GKE's built-in GatewayClasses serve
+# as the accepted-class negative control on the same cluster. Asserted by
+# networking-unaccepted-gatewayclass.
+resource "kubernetes_manifest" "unaccepted_gateway_class" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "GatewayClass"
+    metadata   = { name = "seeded-unaccepted-gw" }
+    spec       = { controllerName = "example.com/unsupported-controller" }
+  }
+}
+
+resource "kubernetes_manifest" "unaccepted_gateway" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "Gateway"
+    metadata = {
+      name        = "seeded-unaccepted-gateway"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
+    }
+    spec = {
+      gatewayClassName = kubernetes_manifest.unaccepted_gateway_class.manifest.metadata.name
+      listeners        = [{ name = "http", protocol = "HTTP", port = 80 }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "unaccepted_route" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "HTTPRoute"
+    metadata = {
+      name        = "seeded-unaccepted-route"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
+    }
+    spec = {
+      parentRefs = [{ name = kubernetes_manifest.unaccepted_gateway.manifest.metadata.name }]
+      rules      = [{ matches = [{ path = { type = "PathPrefix", value = "/" } }] }]
+    }
+  }
+}
+
 resource "kubernetes_manifest" "scaled_zero_gateway" {
   manifest = {
     apiVersion = "gateway.networking.k8s.io/v1"
