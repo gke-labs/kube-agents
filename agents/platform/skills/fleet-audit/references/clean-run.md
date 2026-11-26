@@ -71,8 +71,8 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, nothing retired unread, no new or changed coverage gap, no held close, no
-> remediation pull request opened or
+> new, nothing resolved, nothing retired unread, no new or changed coverage gap, no change in the
+> set of noted objects, no held close, no remediation pull request opened or
 > closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
 > dropped.
 
@@ -84,7 +84,11 @@ Two rules follow, and they are the whole rule:
   this run opened. A `NO_FORGE` run has no `issue_url`; its report is `summary` (see
   [No forge configured](finish.md#no-forge-configured)). A `STORE_LEDGER` run has no `issue_url`
   either; its report is `summary`, with the pull request links (see
-  [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)).
+  [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)). Every forge-path
+  report also carries each line of `report_notes` on the JSON line, copied verbatim directly
+  before the closing ledger line — or as the report's last lines when the run has no ledger
+  line (`issue_url` is null) ([`finish`](finish.md)); the `summary` statuses carry the notes
+  inside `summary`, and a run that answers `[SILENT]` copies nothing.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?". `finish` returns `true` only when it gets `--scheduled`, and only the cron
   prompt tells you to pass that flag. If someone dispatched this job, from a kanban card or straight
@@ -140,6 +144,12 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **A dropped collector candidate** — on a stream that passes `--manifest-file`, the collector
   flagged something the document did not carry. The check reads as having run and found nothing;
   the JSON line's `unpublished_candidates` says otherwise, and it must not arrive as silence.
+- **`noted_changed: true`** — the set of noted objects is not the set of the last scheduled run:
+  a check read a new object it could not see, or an object a note named is visible again. The
+  channel hears each change once, and when objects left the set, `noted_cleared` names them —
+  the notes list names only what is still noted, so relay that line too. When the set is the
+  same, the notes do not stop `silent_ok`: one long-lived noted object does not wake the channel
+  each day, and the notes stay on the JSON line and in the stored report ([`finish`](finish.md)).
 
 There is one case where the harness reports `new: 0, resolved: 0` without knowing it: when the
 report store's record of the open ledger is missing, unreadable, written for a different issue, or
