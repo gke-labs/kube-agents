@@ -90,8 +90,9 @@ Our recommendation is A. Each rule in the profile namespace is a grant that a pr
 can use, and A adds none. C adds a reader of the bus that inherits the limits of the stream (72
 hours, 4096 messages, best effort) and writes what a pod can forge or flood into a second log. B
 gives the most detail, and it is the form to take only if the approver wants spans from inside
-the worker. A's cost is the list in "What the platform has and this proposal does not give", and
-A depends on the open fact.
+the worker. A's cost is the list in "What the platform has and this proposal does not give". A
+needs the node log agent to ship the worker's stderr; "The open fact" has the answer, yes, and
+its limits.
 
 The issue asks for telemetry that the operator declares for each profile. Under A the operator
 declares nothing on a profile pod: each signal comes from a path that each profile already has.
@@ -201,18 +202,31 @@ the worker, that paragraph of the spec needs an edit.
 
 ## The open fact
 
-Does the node log agent ship the stderr of a profile pod? The published telemetry page says that
-the node log agent ships the logs of all containers, and it names no profile pod.
+Does the node log agent ship the stderr of a profile pod? Answered on 2026-11-26: yes. A JSON
+line of the adapter arrives as a `jsonPayload`.
 
-Two reads of Cloud Logging, on two test installs of release 0.38.0, found no line and no pod event
-from a profile namespace in two days. The same reads found the lines of the platform namespace.
-No profile worker pod ran in that time: on the install that has the profile namespace, the
-profiles of the eval runs ran inside the platform agent's pod. So the reads do not answer the
-question, and the fact stays open until a read on an install where a profile worker pod ran.
+The read was of Cloud Logging, on a GKE test install. The cluster's audit log shows warm worker
+pods made there for the built-in `tse` profile on 2026-11-11 and for the built-in `cluster`
+profile on 2026-11-13. On 2026-11-13 the install ran a build of `main` of 2026-11-09 with the
+changes of two pull requests. The log has lines of the `worker` container of the profile
+namespace. The read printed the shape of the newest of them, which are from one `cluster` pod at
+its start: each is from stderr and has a `jsonPayload`. The keys are in the payload as the
+adapter writes them: `msg`, `level` and `time`, and the keys of the line, for example `profile`,
+`tier`, `pod` and `oneShot` on the line that a worker writes at its start. The read printed the
+names of the keys only, and no printed line is a line of a task.
 
-If the node log agent ships those lines, the log row needs no new object. If it does not, option
-A needs a decision: a sidecar in the profile pod with its own output, or a log path through the
-bus.
+What follows:
+
+- The log row needs no new object. Option A's path for a log line exists.
+- A filter in Cloud Logging on the namespace and the container can then find a line by
+  `jsonPayload.msg` and read one of its keys. The per-tool line of the hooks design is read the
+  same way when the adapter writes it, for example its field for the skill's name.
+
+The limits of the answer: it is from one install on GKE. The read did not check the cluster's
+version, its logging settings or its log sinks. An install that turns workload logs off, or that
+excludes the profile namespace from its sink, has no such line in Cloud Logging. Two earlier
+reads, on two test installs of release 0.38.0, found no line from a profile namespace, because
+no profile worker pod ran there in the two days of the read.
 
 ## What stays out
 
