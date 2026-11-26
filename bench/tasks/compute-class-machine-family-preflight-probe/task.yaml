@@ -67,7 +67,7 @@ expected_output: >-
   Boot).
 infrastructure:
   deployer: noop
-validated: false
+validated: true
 
 verification_spec:
   - name: the-machine-family-preflight-validator-ran
