@@ -3,6 +3,7 @@ package answerscrub
 import (
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
 )
 
 // scrubFuzzSeeds are inputs that have reached the scrub's edges: table cells
@@ -27,21 +28,22 @@ var scrubFuzzSeeds = []string{
 }
 
 // FuzzScrub runs the whole answer path on one text: the text's own secrets
-// collected from it as a tool result, then Scrub with that seen set. A panic
-// anywhere in it is the failure: the bridge runs this on model and user text,
-// and a panic there ends the task.
+// collected from it as a tool result (when it is valid UTF-8), then Scrub
+// with that seen set. A panic anywhere in it is the failure: the bridge runs
+// this on model and user text, and a panic there ends the task.
 func FuzzScrub(f *testing.F) {
 	for _, s := range scrubFuzzSeeds {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
 		_ = ScrubInline(s)
-		raw, err := json.Marshal(s)
-		if err != nil {
-			t.Skip()
-		}
 		var seen Seen
-		seen.CollectToolResult(raw)
+		// json.Marshal turns invalid UTF-8 into U+FFFD, so values collected
+		// from such a text no longer match it; the shape rules still run.
+		if utf8.ValidString(s) {
+			raw, _ := json.Marshal(s)
+			seen.CollectToolResult(raw)
+		}
 		_ = Scrub(s, &seen)
 		_ = seen.Redact(s)
 	})

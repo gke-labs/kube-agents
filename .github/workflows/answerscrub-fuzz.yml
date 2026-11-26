@@ -43,8 +43,9 @@ jobs:
         with:
           go-version-file: "a2a/go.mod"
           # No cache: the fuzzed package imports only the standard library,
-          # so a cache saves nothing here, and no cache restore can stall
-          # the run.
+          # and no cache restore can stall the run. Go keeps the corpus it
+          # generates in its build cache, so each night starts again from
+          # the seeds rather than building on the last.
           cache: false
 
       - name: Fuzz
@@ -54,8 +55,11 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: go test ./lib/answerscrub -run '^$' -fuzz "^${TARGET}\$" -fuzztime 10m
 
+      # Go writes a crashing input under testdata/fuzz/<target>/. A failure
+      # without one (a compile error, a toolchain download, a runner OOM) is
+      # not a crasher, and reports nothing.
       - name: Upload the crasher
-        if: failure() && steps.fuzz.outcome == 'failure'
+        if: failure() && steps.fuzz.outcome == 'failure' && hashFiles(format('a2a/lib/answerscrub/testdata/fuzz/{0}/*', matrix.target)) != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: answerscrub-crasher-${{ matrix.target }}
@@ -63,7 +67,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Report the crasher
-        if: failure() && steps.fuzz.outcome == 'failure'
+        if: failure() && steps.fuzz.outcome == 'failure' && hashFiles(format('a2a/lib/answerscrub/testdata/fuzz/{0}/*', matrix.target)) != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET: ${{ matrix.target }}
@@ -72,7 +76,11 @@ jobs:
         run: |
           title="answerscrub fuzz: ${TARGET} found a crasher"
           body="The nightly fuzz of \`${TARGET}\` failed: ${RUN_URL}. The crashing input is the run's \`answerscrub-crasher-${TARGET}\` artifact. Copy it into \`a2a/lib/answerscrub/testdata/fuzz/${TARGET}/\`, then reproduce from \`a2a/\` with \`go test ./lib/answerscrub -run ${TARGET}\`. A scrub panic ends a bridge task (#7276)."
-          existing=$(gh issue list --repo "$REPO" --state open --search "\"${title}\" in:title" --json number --jq '.[0].number')
+          # Only an open issue this workflow opened, with exactly this title:
+          # an issue anyone else opens can't capture the reports.
+          existing=$(TITLE="$title" gh issue list --repo "$REPO" --state open --limit 100 \
+            --search "author:app/github-actions \"${title}\" in:title" \
+            --json number,title --jq '[.[] | select(.title == env.TITLE)][0].number // empty')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "Again: ${RUN_URL}"
           else
