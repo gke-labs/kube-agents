@@ -479,11 +479,12 @@ FIXTURE_NOT_READY = {
     # Needs a node pool with accelerators and no blocking taint beside an
     # untainted pool without accelerators. The case header has what was read
     # live; in short, a GPU pool added to a seeded cluster is tainted by GKE.
-    # #2566 owns the check; the fixture is the cost decision the header states.
+    # #2566 owns the check and #7383 owns the fixture, which is the cost
+    # decision the header states.
     "gpu-pool-missing-taint": (
-        "#2566: needs a cluster created with a GPU node pool, so that the pool carries no taint; "
+        "#7383: needs a cluster created with a GPU node pool, so that the pool carries no taint; "
         "every seeded cluster has a non-GPU pool, where GKE taints a new GPU pool, and a standing "
-        "cluster costs a management fee of about $73 a month in each pool project"
+        "cluster costs a management fee of about $73 a month in each pool project (the check: #2566)"
     ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the
