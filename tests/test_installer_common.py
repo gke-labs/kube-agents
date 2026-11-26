@@ -268,6 +268,8 @@ class InstallerCommonTest(unittest.TestCase):
                     # And the data volume size and sizing profile, refused when malformed.
                     "PLATFORM_AGENT_STORAGE_SIZE": "",
                     "PLATFORM_AGENT_SIZING_PROFILE": "",
+                    "CHAT_PROJECT_ID": "",
+                    "CHAT_MANAGE_PROJECT": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -3569,6 +3571,54 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("vertex_manage_serving_project = false", dest.read_text())
+
+    def test_tfvars_generation_carries_chat_project_id_and_chat_manage_project(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_project_id           = ""', content)
+            self.assertIn("chat_manage_project       = true", content)
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "CHAT_PROJECT_ID": "workspace-chat-proj",
+                    "CHAT_MANAGE_PROJECT": "false",
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_project_id           = "workspace-chat-proj"', content)
+            self.assertIn("chat_manage_project       = false", content)
+
+    def test_tfvars_refuse_a_misspelt_chat_manage_project(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "flase", "managed"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "CHAT_MANAGE_PROJECT": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"CHAT_MANAGE_PROJECT='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+            for value, expected in (("False", "false"), ("yes", "true")):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "CHAT_MANAGE_PROJECT": value},
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(f"chat_manage_project       = {expected}", dest.read_text())
 
 
 class InstallDefaultsFileTest(unittest.TestCase):

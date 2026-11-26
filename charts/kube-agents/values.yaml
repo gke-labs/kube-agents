@@ -2098,9 +2098,13 @@ platformAgent:
       gitRepo: ""
     googleChat:
       # Requires the Chat Pub/Sub backend (terraform/modules/chat-pubsub).
-      # projectId is taken from
-      # platformAgent.harness.projectId.
+      # Empty projectId falls back to platformAgent.harness.projectId.
+      # serviceAccountEmail names a dedicated Chat service account in projectId
+      # that the credential broker impersonates when the Chat project lives in
+      # another GCP project or organization.
       enabled: false
+      projectId: ""
+      serviceAccountEmail: ""
       topicName: platform-agent-chat-events
       subscriptionName: platform-agent-chat-events-sub
       # Empty list = all users allowed.

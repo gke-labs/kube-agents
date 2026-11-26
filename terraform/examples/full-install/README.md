@@ -37,7 +37,27 @@ install without the interview.
   module resolves them to at plan time.
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
-  subscription, and Chat integration wiring.
+  subscription, and Chat integration wiring. By default these live in
+  `project_id`. When the Google Workspace organization and its Chat app live in
+  a separate GCP project or organization from the GKE cluster, set
+  `chat_project_id`: the composition enables `chat.googleapis.com`,
+  `gsuiteaddons.googleapis.com`, and `pubsub.googleapis.com` in
+  `chat_project_id`, creates a dedicated service account
+  (`kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com`) there,
+  grants the Platform Agent GSA `roles/iam.serviceAccountTokenCreator` on that
+  service account as a resource, binds `roles/pubsub.subscriber` and
+  `roles/pubsub.viewer` on the subscription to the Chat service account, and
+  wires `googleChat.projectId` and `googleChat.serviceAccountEmail` into the
+  Helm chart so the credential broker impersonates the Chat service account for
+  Chat API calls and Pub/Sub pulls without hitting Domain Restricted Sharing on
+  the Pub/Sub subscription. When the applying identity cannot administer
+  `chat_project_id`, set `chat_manage_project = false` and have a project admin
+  in `chat_project_id` enable the three APIs, register the Chat and Workspace
+  Add-ons service identities, create `kubeagents-chat-gsa` with the
+  `roles/iam.serviceAccountTokenCreator` binding for the Platform Agent GSA,
+  and create the topic and subscription with their publisher and subscriber IAM
+  bindings (see [`scripts/installer/print_instructions_gchat.sh`](../../../scripts/installer/print_instructions_gchat.sh)
+  or the [ChatOps guide](../../../docs/site/src/content/docs/concepts/chatops.md)).
 - Optionally (`enable_github_minter = true`) the GitHub token minter backend
   ([`github-minter`](../../modules/github-minter) module): minter service
   account plus a KMS key ring and signing key.

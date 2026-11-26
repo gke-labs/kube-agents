@@ -654,6 +654,25 @@ variable "enable_google_chat" {
   default     = false
 }
 
+variable "chat_project_id" {
+  description = "GCP project hosting the Google Workspace Chat app and its Pub/Sub topic and subscription when enable_google_chat is true. Empty (default) uses project_id. When set to a different project (including one in another GCP organization), the composition enables the Chat, Workspace Add-ons, and Pub/Sub APIs there, creates a dedicated Chat service account (kubeagents-chat-gsa) in that project, grants the Platform Agent GSA roles/iam.serviceAccountTokenCreator on it, and binds the Pub/Sub subscription to it unless chat_manage_project is false."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = var.chat_project_id == "" || can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.chat_project_id))
+    error_message = "chat_project_id must be empty or a valid GCP project ID (6–30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit)."
+  }
+}
+
+variable "chat_manage_project" {
+  description = "Enable the Google Chat, Google Workspace Add-ons, and Pub/Sub APIs and provision the Pub/Sub topic, subscription, dedicated Chat service account (when chat_project_id differs from project_id), and IAM bindings in the Chat project when enable_google_chat is true. Set false when the installing identity cannot administer the Chat project and a project admin has provisioned them out of band."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 variable "google_chat_allowed_users" {
   description = "Google Chat users allowed to talk to the agent (empty list = all users allowed). Only used when enable_google_chat is true."
   type        = list(string)

@@ -12875,6 +12875,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
             help_text,
         )
 
+    def test_chat_project_id_and_chat_manage_project_flags_reach_parameters(self):
+        """--chat-project-id and --chat-manage-project populate their PARAM_* vars."""
+        proc = self._parse(
+            "--chat-project-id=chat-host-proj --chat-manage-project=false",
+            'echo "P=[$PARAM_CHAT_PROJECT_ID] M=[$PARAM_CHAT_MANAGE_PROJECT]"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("P=[chat-host-proj] M=[false]", proc.stdout)
+
 
 class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
     """--enable-slack with nobody to ask for the tokens is refused.
@@ -13091,6 +13100,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
     # is applied with ${VAR:-...}, which reads the empty assignment as "unset".
     PARSE_TIME_CHECKED_TOGGLES = [
         "--enable-google-chat",
+        "--chat-manage-project",
         "--enable-slack",
         "--enable-gke-backup-plan",
         "--disallow-secrets-read",
@@ -13148,6 +13158,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
     # The environment key each toggle is seeded from, before parse_args runs.
     SEEDED_TOGGLE_ENV_KEYS = {
         "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
+        "--chat-manage-project": "CHAT_MANAGE_PROJECT",
         "--enable-slack": "SLACK_ENABLED",
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
         "--disallow-secrets-read": "DISALLOW_SECRETS_READ",
@@ -13212,6 +13223,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         )
         seeded_params = [
             "PARAM_ENABLE_GOOGLE_CHAT",
+            "PARAM_CHAT_MANAGE_PROJECT",
             "PARAM_ENABLE_SLACK",
             "PARAM_ENABLE_GKE_BACKUP_PLAN",
             "PARAM_DISALLOW_SECRETS_READ",

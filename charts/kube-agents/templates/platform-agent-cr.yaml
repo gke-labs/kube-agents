@@ -1201,7 +1201,11 @@ spec:
     {{- if $integ.googleChat.enabled }}
     googleChat:
       enabled: true
-      projectId: {{ .Values.platformAgent.harness.projectId | quote }}
+      projectId: {{ ($integ.googleChat.projectId | default .Values.platformAgent.harness.projectId) | quote }}
+      {{- with $integ.googleChat.serviceAccountEmail }}
+      {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.integration.googleChat.serviceAccountEmail" "path" (list "integration" "googleChat") "field" "serviceAccountEmail") }}
+      serviceAccountEmail: {{ . | quote }}
+      {{- end }}
       topicName: {{ required "platformAgent.integration.googleChat.topicName is required when googleChat is enabled" $integ.googleChat.topicName | quote }}
       subscriptionName: {{ required "platformAgent.integration.googleChat.subscriptionName is required when googleChat is enabled" $integ.googleChat.subscriptionName | quote }}
       {{- with $integ.googleChat.allowedUsers }}

@@ -768,6 +768,8 @@ PARAM_THIRD_PARTY_REGISTRY_PREFIX="${THIRD_PARTY_REGISTRY_PREFIX:-}"
 # re-run that did not repeat --enable-google-chat would regenerate
 # google_chat_enabled = false and plan the Pub/Sub topic and subscription away.
 PARAM_ENABLE_GOOGLE_CHAT="${GOOGLE_CHAT_ENABLED:-}"
+PARAM_CHAT_PROJECT_ID="${CHAT_PROJECT_ID:-}"
+PARAM_CHAT_MANAGE_PROJECT="${CHAT_MANAGE_PROJECT:-}"
 PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
@@ -1071,6 +1073,15 @@ Flags for AI Agents & Automation:
   --google-chat-allowed-users=EMAILS
                                 Comma-separated user emails allowed to talk to the
                                 agent over Google Chat. Empty allows all users
+  --chat-project-id=ID          GCP project hosting the Google Workspace Chat app and
+                                its Pub/Sub topic and subscription (default: empty,
+                                uses --gcp-project-id)
+  --chat-manage-project=BOOL    Whether the install enables the Chat, Workspace Add-ons
+                                and Pub/Sub APIs and creates the topic, subscription,
+                                dedicated Chat service account and IAM bindings in
+                                --chat-project-id. Pass false when that project is one
+                                you cannot administer, and provision them by hand
+                                (default: DEFAULT_CHAT_MANAGE_PROJECT, currently true)
   --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat
                                 (default: DEFAULT_CHAT_TOPIC_NAME,
                                 currently platform-agent-chat-events)
@@ -1418,6 +1429,11 @@ parse_args() {
       --slack-home-channel-policy=*)
         PARAM_SLACK_HOME_CHANNEL_POLICY="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_POLICY
+        shift ;;
+      --chat-project-id=*) PARAM_CHAT_PROJECT_ID="${1#*=}"; shift ;;
+      --chat-manage-project|--chat-manage-project=*)
+        PARAM_CHAT_MANAGE_PROJECT="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_CHAT_MANAGE_PROJECT"
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
@@ -3161,6 +3177,8 @@ bootstrap_install_env_file() {
   fi
   write_env_var "$tmp" LITELLM_ENV_SECRET_NAME "${LITELLM_ENV_SECRET_NAME:-}"
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
+  write_env_var "$tmp" CHAT_PROJECT_ID "${CHAT_PROJECT_ID:-}"
+  write_env_var "$tmp" CHAT_MANAGE_PROJECT "${CHAT_MANAGE_PROJECT:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
   write_env_var "$tmp" GOOGLE_CHAT_ENABLED "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
@@ -7167,6 +7185,8 @@ run_menu_system() {
         fi
         save_env_var LITELLM_ENV_SECRET_NAME "$litellm_env_secret_name"
         save_env_var ALLOWED_USERS "$allowed_users"
+        save_env_var CHAT_PROJECT_ID "${CHAT_PROJECT_ID:-}"
+        save_env_var CHAT_MANAGE_PROJECT "${CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
         save_env_var GOOGLE_CHAT_ENABLED "$google_chat_enabled"
@@ -7857,6 +7877,12 @@ main() {
   if [ -z "$allowed_users" ]; then
     allowed_users_hint="empty list"
   fi
+  local chat_project_id="${PARAM_CHAT_PROJECT_ID:-}"
+  local chat_manage_project="${PARAM_CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}"
+  if ! is_bool_spelling "$chat_manage_project"; then
+    print_error "--chat-manage-project must be either true or false."
+    exit 1
+  fi
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
   local chat_sub_name="${PARAM_CHAT_SUB_NAME:-}"
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
@@ -7988,6 +8014,9 @@ main() {
   _prompt_google_chat_settings() {
     prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
       allowed_users "$allowed_users" false "$allowed_users_hint"
+    chat_project_id="${chat_project_id:-}"
+    prompt_read "Google Chat GCP Project ID (optional, empty uses ${project_id:-the install project})" \
+      chat_project_id "$chat_project_id"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
 
     local state_sub="" state_rc=0
@@ -8943,6 +8972,8 @@ main() {
   export OPENAI_COMPATIBLE_API_KEY="$openai_compatible_api_key"
   export LITELLM_ENV_SECRET_NAME="$litellm_env_secret_name"
   export ALLOWED_USERS="$allowed_users"
+  export CHAT_PROJECT_ID="$chat_project_id"
+  export CHAT_MANAGE_PROJECT="$chat_manage_project"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
   export GOOGLE_CHAT_ENABLED="$google_chat_enabled"

@@ -164,6 +164,7 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	"TOKEN_BROKER_URL":              true,
 	execTierDroppedMinterEnv:        true,
 	"GOOGLE_CHAT_PROJECT_ID":        true,
+	googleChatServiceAccountEnvVar:  true,
 	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
 	// The audit-report store's address, token file and profiles
 	// (audit_report_store.go): the store routes are the stateful broker's.

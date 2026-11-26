@@ -11117,6 +11117,13 @@ spec:
                         projectId:
                           description: ProjectID is the target GCP Project ID for Pub/Sub.
                           type: string
+                        serviceAccountEmail:
+                          description: |-
+                            ServiceAccountEmail is an optional Google Service Account email in ProjectID
+                            that the credential broker impersonates for Google Chat API calls and
+                            Pub/Sub subscription pulls when the Chat project lives in a different GCP
+                            project or organization from the Platform Agent.
+                          type: string
                         subscriptionName:
                           description:
                             SubscriptionName is the GCP Chat Subscription

@@ -5939,6 +5939,11 @@ write_tfvars_from_state() {
     print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
     return 1
   fi
+  local chat_manage_project="${CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}"
+  if ! is_bool_spelling "$chat_manage_project"; then
+    print_error "CHAT_MANAGE_PROJECT='${chat_manage_project}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   # The same again: read as off, a misspelt value leaves the release's
   # upgrade_install off, and the apply it was set to rescue fails with the
   # "cannot re-use a name" it was set to prevent, naming nothing (#4108).
@@ -6158,6 +6163,8 @@ write_tfvars_from_state() {
       fi
     fi
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
+    echo "chat_project_id           = $(hcl_str "${CHAT_PROJECT_ID:-}")"
+    echo "chat_manage_project       = $(hcl_bool "$chat_manage_project")"
     echo "chat_topic_name           = $(hcl_str "$chat_topic")"
     echo "chat_subscription_name    = $(hcl_str "$chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"

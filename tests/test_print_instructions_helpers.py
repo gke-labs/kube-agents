@@ -366,6 +366,25 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
         out = self._run(env, {"GOOGLE_CHAT_HOME_CHANNEL": self._SPACE})
         self.assertIn(f"is {self._SPACE}: add the app to that space", out)
 
+    def test_chat_project_id_and_unmanaged_manual_commands(self):
+        env = (
+            self._env()
+            + "PROJECT_ID=gke-host-proj\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+        )
+        out = self._run(env)
+        self.assertIn("?project=workspace-chat-proj", out)
+        self.assertIn("projects/workspace-chat-proj/topics/file-topic", out)
+        self.assertIn("CHAT_MANAGE_PROJECT=false: have an administrator of 'workspace-chat-proj' run:", out)
+        self.assertIn(
+            "gcloud iam service-accounts create kubeagents-chat-gsa --project=workspace-chat-proj",
+            out,
+        )
+        self.assertIn("roles/iam.serviceAccountTokenCreator", out)
+        self.assertIn(
+            "member=\"serviceAccount:kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com\" --role=\"roles/pubsub.subscriber\"",
+            out,
+        )
+
 
 class ChatSetupChecklistsTest(unittest.TestCase):
     """print_chat_setup_checklists, which install.sh calls after its apply and

@@ -439,6 +439,13 @@ type GoogleChatSpec struct {
 	// +optional
 	ProjectID string `json:"projectId,omitempty"`
 
+	// ServiceAccountEmail is an optional Google Service Account email in ProjectID
+	// that the credential broker impersonates for Google Chat API calls and
+	// Pub/Sub subscription pulls when the Chat project lives in a different GCP
+	// project or organization from the Platform Agent.
+	// +optional
+	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
+
 	// TopicName is the GCP Chat Topic Name.
 	// +optional
 	TopicName string `json:"topicName,omitempty"`

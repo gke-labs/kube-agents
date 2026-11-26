@@ -318,6 +318,10 @@ class DefaultOnKeysAreRefusableTest(unittest.TestCase):
         # process environment. Provisions nothing either way, so an environment
         # that cannot override it loses no cloud resource by the omission.
         "PERSIST_SECRETS_ON_DISK",
+        # Acts on a separate Chat project only when CHAT_PROJECT_ID is set and
+        # GOOGLE_CHAT_ENABLED is true; an environment that leaves CHAT_PROJECT_ID
+        # unset provisions in PROJECT_ID as before.
+        "CHAT_MANAGE_PROJECT",
     }
 
     def test_every_default_true_boolean_can_be_refused_by_an_environment(self):

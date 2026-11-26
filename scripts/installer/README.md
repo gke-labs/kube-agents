@@ -27,6 +27,7 @@ their own copies:
 | `DEFAULT_PLATFORM_AGENT_SIZING_PROFILE`                                   | The runtime sizing preset (`auto`), wired to `spec.deployment.sizingProfile`                                                                           |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                                                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)                                                                            |
+| `DEFAULT_CHAT_MANAGE_PROJECT`                                             | Enable the Chat/Workspace Add-ons/Pub/Sub APIs and provision the Pub/Sub topic, subscription, and Chat service account in the Chat project (`true`)    |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                                                                                              |
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them                                                                     |
 | `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`)                                                                 |
@@ -279,9 +280,9 @@ them: `write_tfvars_from_state` has to resolve the key against `install.defaults
 than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR` is
 outside the rule: it reads the live install instead of any default (above). `ENABLE_GKE_BACKUP_PLAN`,
 `ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
-second (`install.sh` still warns when a run passes `--enable-stockout-investigator` or answers the interactive prompt with `ENABLE_STOCKOUT_INVESTIGATOR=true` over an `install.env` that omits or disagrees with it). `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
+second (`install.sh` still warns when a run passes `--enable-stockout-investigator` or answers the interactive prompt with `ENABLE_STOCKOUT_INVESTIGATOR=true` over an `install.env` that omits or disagrees with it). `VERTEX_MANAGE_SERVING_PROJECT` and `CHAT_MANAGE_PROJECT` are the only other keys where both hold: absent, `VERTEX_MANAGE_SERVING_PROJECT`
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
-project. A full
+project, and `CHAT_MANAGE_PROJECT` (when `GOOGLE_CHAT_ENABLED` is `true`) enables the Chat, Workspace Add-ons and Pub/Sub APIs and provisions the Pub/Sub topic, subscription and (when `CHAT_PROJECT_ID` differs from `PROJECT_ID`) the dedicated Chat service account in the Chat project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
 Pub/Sub topic and subscription that carry the project's, and each scoped project's, GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it

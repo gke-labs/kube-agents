@@ -124,6 +124,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_google_chat        = true
 # google_chat_allowed_users = ["you@example.com"]
 # google_chat_home_channel_policy = "auto"   # or "manual": with no google_chat_home_channel, "auto" learns it from the first mention in a named space
+# Separate GCP project (or organization) hosting the Google Workspace Chat app
+# and its Pub/Sub topic and subscription. Empty uses project_id.
+# chat_project_id           = ""
+# false when chat_project_id is a project you cannot administer: an admin in
+# that project enables the APIs, creates kubeagents-chat-gsa and the Pub/Sub
+# topic/subscription, and grants roles/iam.serviceAccountTokenCreator by hand.
+# chat_manage_project       = true
 
 # Model routing for the bundled LiteLLM gateway (defaults: gemini and the
 # provider's default model; set the matching *_api_key above).

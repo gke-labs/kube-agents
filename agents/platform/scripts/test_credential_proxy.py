@@ -11279,6 +11279,109 @@ class GoogleChatRelayTest(unittest.TestCase):
         )
         self.assertIn("type=RuntimeError status=none", "\n".join(captured["logs"]))
 
+    def _init_relay_with_mock_google_modules(self, service_account_email: str = ""):
+        ambient_creds = object()
+        impersonated_creds = object()
+        impersonate_calls = []
+        subscriber_calls = []
+        build_calls = []
+
+        class FakeSubscriberClient:
+            def __init__(self, credentials=None):
+                subscriber_calls.append(credentials)
+
+            def subscription_path(self, project_id, subscription_name):
+                return f"projects/{project_id}/subscriptions/{subscription_name}"
+
+        def fake_impersonated_credentials(**kwargs):
+            impersonate_calls.append(kwargs)
+            return impersonated_creds
+
+        def fake_build(service, version, credentials=None, cache_discovery=None):
+            build_calls.append((service, version, credentials, cache_discovery))
+            return "chat-discovery-client"
+
+        google_pkg = types.ModuleType("google")
+        google_auth = types.ModuleType("google.auth")
+        google_auth.default = lambda scopes=None: (ambient_creds, "ambient-proj")
+        google_impersonated = types.ModuleType("google.auth.impersonated_credentials")
+        google_impersonated.Credentials = fake_impersonated_credentials
+        google_auth.impersonated_credentials = google_impersonated
+        google_cloud = types.ModuleType("google.cloud")
+        google_pubsub = types.ModuleType("google.cloud.pubsub_v1")
+        google_pubsub.SubscriberClient = FakeSubscriberClient
+        google_cloud.pubsub_v1 = google_pubsub
+        google_pkg.auth = google_auth
+        google_pkg.cloud = google_cloud
+        googleapiclient_pkg = types.ModuleType("googleapiclient")
+        googleapiclient_discovery = types.ModuleType("googleapiclient.discovery")
+        googleapiclient_discovery.build = fake_build
+        googleapiclient_pkg.discovery = googleapiclient_discovery
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "google": google_pkg,
+                "google.auth": google_auth,
+                "google.auth.impersonated_credentials": google_impersonated,
+                "google.cloud": google_cloud,
+                "google.cloud.pubsub_v1": google_pubsub,
+                "googleapiclient": googleapiclient_pkg,
+                "googleapiclient.discovery": googleapiclient_discovery,
+            },
+        ):
+            relay = GoogleChatRelay(
+                "workspace-chat-proj",
+                "platform-agent-chat-events-sub",
+                service_account_email=service_account_email,
+            )
+        return (
+            relay,
+            ambient_creds,
+            impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        )
+
+    def test_init_without_service_account_uses_ambient_credentials(self):
+        (
+            relay,
+            ambient_creds,
+            _impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        ) = self._init_relay_with_mock_google_modules()
+        self.assertEqual([], impersonate_calls)
+        self.assertEqual([ambient_creds], subscriber_calls)
+        self.assertEqual([("chat", "v1", ambient_creds, False)], build_calls)
+        self.assertIs(ambient_creds, relay._credentials)
+
+    def test_init_with_service_account_wraps_ambient_credentials_in_impersonated_credentials(self):
+        target_sa = "kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"
+        (
+            relay,
+            ambient_creds,
+            impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        ) = self._init_relay_with_mock_google_modules(service_account_email=f"  {target_sa}  ")
+        self.assertEqual(
+            [
+                {
+                    "source_credentials": ambient_creds,
+                    "target_principal": target_sa,
+                    "target_scopes": list(GoogleChatRelay.SCOPES),
+                }
+            ],
+            impersonate_calls,
+        )
+        self.assertEqual([impersonated_creds], subscriber_calls)
+        self.assertEqual([("chat", "v1", impersonated_creds, False)], build_calls)
+        self.assertIs(impersonated_creds, relay._credentials)
+
 
 class ChatEventPullLegibilityTest(unittest.TestCase):
     """A Chat event pull says which subscription it reads and what refused it.
@@ -23987,6 +24090,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
             "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
             "WATCHER_PUBSUB_SUBSCRIPTION": "projects/p/subscriptions/drift",
             "GOOGLE_CHAT_PROJECT_ID": "p",
+            "GOOGLE_CHAT_SERVICE_ACCOUNT": "kubeagents-chat-gsa@p.iam.gserviceaccount.com",
             "GOOGLE_CHAT_SUBSCRIPTION_NAME": "chat",
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "a2a-chat",
             "SLACK_BOT_TOKEN": "xoxb-test",
@@ -24031,6 +24135,20 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
     def test_the_stateful_broker_starts_them(self):
         relays, pubsub, metrics_listener, thread_targets = self._serve("broker")
         self.assertEqual(2, relays["GoogleChatRelay"].call_count)
+        relays["GoogleChatRelay"].assert_has_calls(
+            [
+                mock.call(
+                    "p",
+                    "chat",
+                    service_account_email="kubeagents-chat-gsa@p.iam.gserviceaccount.com",
+                ),
+                mock.call(
+                    "p",
+                    "a2a-chat",
+                    service_account_email="kubeagents-chat-gsa@p.iam.gserviceaccount.com",
+                ),
+            ]
+        )
         relays["TeamsRelay"].assert_called_once()
         pubsub.assert_called_once()
         self.assertIn("initialize_slack_relay", thread_targets)
