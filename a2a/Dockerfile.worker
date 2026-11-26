@@ -44,7 +44,10 @@ RUN CGO_ENABLED=0 GOOS=linux \
 # session by cmd/session-persona. agents/cluster/skills stays the one source
 # of the skills; the build fails if one of them stops parsing as a skill.
 COPY agents/cluster/skills/ /skills/
-RUN go run ./cmd/session-persona -skills /skills -persona persona/session/persona.md -out /out/claude
+# The same persona and skills in the core-agent harness's layout
+# (instructions.md and skills/), for a core-agent session pod.
+RUN go run ./cmd/session-persona -skills /skills -persona persona/session/persona.md -out /out/claude \
+    -core-agent-out /out/core-agent-session
 
 # --- runtime ---
 FROM ${NODE_IMAGE}:${NODE_VERSION}
@@ -304,6 +307,14 @@ COPY --from=build /out/claude/skills/ /home/node/.claude/skills/
 # The build-time content manifest of the two above; the worker checks them
 # against it at start (worker-adapter CheckSessionHome).
 COPY --from=build /out/claude/skills_manifest.sha256 /home/node/.claude/skills_manifest.sha256
+# A core-agent session pod's persona: the tree above in core-agent's layout,
+# with its own content manifest, at the path the worker passes as
+# --persona-dir on a session pod (cmd/worker-adapter, coreAgentSessionPersonaDir).
+# Root-owned with every write bit cleared, which the harness's required-persona
+# check (coreagent.VerifyRendering) insists on. A profile pod never reads it:
+# its persona is the operator's rendering at /var/lib/agent-persona.
+COPY --from=build /out/core-agent-session/ /usr/share/kube-agents/persona/session/
+RUN chmod -R a-w /usr/share/kube-agents/persona/session
 USER node
 # vcs_client's git and working copies: the image's git, and the worker's
 # scratch volume, which the worker empties after every task (the root

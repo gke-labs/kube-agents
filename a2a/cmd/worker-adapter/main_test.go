@@ -750,8 +750,13 @@ func TestACoreAgentWorkerChecksItsOwnPersonaTree(t *testing.T) {
 	activeHarness = coreAgentBuilder{}
 	t.Setenv(claudeConfigDirEnv, "/cfg")
 	t.Setenv("HOME", "/home/u")
-	if got := harnessConfigDir(); got != coreAgentPersonaDir {
-		t.Errorf("harnessConfigDir() = %q, want %q", got, coreAgentPersonaDir)
+	t.Setenv(lib.EnvProfileWorker, "")
+	if got := harnessConfigDir(); got != coreAgentSessionPersonaDir {
+		t.Errorf("harnessConfigDir() on a session pod = %q, want %q", got, coreAgentSessionPersonaDir)
+	}
+	t.Setenv(lib.EnvProfileWorker, "true")
+	if got := harnessConfigDir(); got != coreAgentProfilePersonaDir {
+		t.Errorf("harnessConfigDir() on a profile pod = %q, want %q", got, coreAgentProfilePersonaDir)
 	}
 	for rel, want := range map[string]bool{
 		"instructions.md": true, "skills/triage/SKILL.md": true,
