@@ -464,6 +464,33 @@ func TestTeamsReAskBeforeTheRedrawKeepsItsChoices(t *testing.T) {
 	}
 }
 
+// A code fence a section leaves open is closed where the section ends, so
+// the sections after it are not drawn as code.
+func TestTeamsChatClosesAFenceASectionLeavesOpen(t *testing.T) {
+	m := &chatmsg.Message{
+		Schema: chatmsg.Schema, Headline: "Found one thing.", Detail: "Output:\n```\nline one",
+		Fold: &chatmsg.Fold{Title: "why", Text: "````\nstill open"},
+	}
+	layout, err := renderTeamsChat(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(layout.Text, "line one\n```\n\n") {
+		t.Errorf("the detail's open fence was not closed at its end:\n%s", layout.Text)
+	}
+	if !strings.HasSuffix(layout.Text, "still open\n````") {
+		t.Errorf("the fold's open fence was not closed with its own length:\n%s", layout.Text)
+	}
+	closed := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Found one thing.", Detail: "Output:\n```\nline one\n```"}
+	layout, err = renderTeamsChat(closed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasSuffix(layout.Text, "```\n```") {
+		t.Errorf("a closed fence got a second closing line:\n%s", layout.Text)
+	}
+}
+
 // One message's edit lock holds up no other message's edit, holds up a
 // second edit of its own message, and leaves no entry behind.
 func TestTeamsEditLockIsPerMessage(t *testing.T) {

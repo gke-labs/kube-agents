@@ -137,7 +137,8 @@ func teamsBoldLine(text string) string {
 }
 
 // teamsChatFlat is text with each markdown heading line outside a code
-// fence drawn as a bold line.
+// fence drawn as a bold line, and a fence the text leaves open closed at
+// its end, so the code block stops with the section that opened it.
 func teamsChatFlat(text string) string {
 	lines := strings.Split(text, "\n")
 	fence := 0
@@ -158,6 +159,9 @@ func teamsChatFlat(text string) string {
 			continue
 		}
 		lines[i] = teamsBoldLine(strings.TrimSpace(title))
+	}
+	if fence > 0 {
+		lines = append(lines, strings.Repeat(teamsCodeTick, fence))
 	}
 	return strings.Join(lines, "\n")
 }
