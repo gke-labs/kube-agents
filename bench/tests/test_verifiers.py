@@ -1781,6 +1781,69 @@ def test_delegated_to_needs_a_list_and_no_empty_matcher():
         DelegatedToVerifier(type="delegated_to", required_addressees=[".*"])
 
 
+def _counted(addressees: list[str] | None, count: int | None) -> None:
+    transcript.set("ok", _TRAJECTORY, child_addressees=addressees, child_count=count)
+
+
+def test_delegated_to_passes_on_exactly_one_child():
+    _counted(["platform"], 1)
+    res = DelegatedToVerifier(type="delegated_to", min_children=1, max_children=1).verify(5.0)
+    assert res.success, res.reason
+    assert "1 child task(s)" in res.reason
+
+
+def test_delegated_to_fails_a_chain_that_delegated_to_the_same_addressee_twice():
+    _counted(["platform"], 2)
+    res = DelegatedToVerifier(type="delegated_to", min_children=1, max_children=1).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "more than max_children 1" in res.reason and "['platform']" in res.reason
+
+
+def test_delegated_to_fails_a_chain_that_delegated_nothing_under_a_minimum():
+    _counted([], 0)
+    res = DelegatedToVerifier(type="delegated_to", min_children=1).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "fewer than min_children 1" in res.reason and "nobody" in res.reason
+
+
+def test_delegated_to_count_bounds_are_inclusive_and_combine_with_the_lists():
+    _counted(["tse", "platform"], 3)
+    assert DelegatedToVerifier(type="delegated_to", min_children=3, max_children=3).verify(5.0).success
+    assert DelegatedToVerifier(type="delegated_to", max_children=3, required_addressees=["tse"]).verify(5.0).success
+    res = DelegatedToVerifier(type="delegated_to", max_children=3, forbidden_addressees=["platform"]).verify(5.0)
+    assert not res.success and "forbidden" in res.reason
+
+
+def test_delegated_to_is_an_error_when_a_bound_is_set_and_the_count_is_unknown():
+    _counted(["platform"], None)
+    for check in (
+        DelegatedToVerifier(type="delegated_to", min_children=1),
+        DelegatedToVerifier(type="delegated_to", max_children=1),
+        DelegatedToVerifier(type="delegated_to", max_children=1, required_addressees=["platform"]),
+    ):
+        res = check.verify(5.0)
+        assert res.status == "error"
+        assert not res.success
+        assert "childCount" in res.reason
+    # A check without a bound never reads the count.
+    assert DelegatedToVerifier(type="delegated_to", required_addressees=["platform"]).verify(5.0).success
+
+
+def test_delegated_to_rejects_bad_count_bounds():
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", min_children=-1)
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", max_children=-1)
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", min_children=2, max_children=1)
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", min_children=0)
+    assert DelegatedToVerifier(type="delegated_to", max_children=0).max_children == 0
+    assert DelegatedToVerifier(type="delegated_to", min_children=0, max_children=1).max_children == 1
+
+
 def test_delegated_to_is_published_and_registered():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
@@ -2165,6 +2228,64 @@ def test_an_any_of_pattern_is_an_alternative_to_the_phrases():
 def test_an_any_of_pattern_that_does_not_compile_is_rejected():
     with pytest.raises(re.error):
         ReportContainsVerifier(type="report_contains", any_of_patterns=["("])
+
+
+@pytest.mark.parametrize("field", ["required_patterns", "forbidden_patterns", "any_of_patterns"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "KA-7741-ORCHID",
+        r"\bticket KA-\d+",
+        "(?m)^(?:Status|state): ready$",
+        "(?i:ka)-7741-ORCHID",
+        "(?i)ka-(?-i:ORCHID)",
+        "(?=Ready)ready",
+        "(?!Ready)ready",
+        "{cluster:a}: Ready",
+        r"ka-[A-Z]+",
+        r"tier (?:A|B)\b",
+        "class [A]",
+    ],
+)
+def test_a_pattern_with_an_uppercase_literal_is_rejected(field, pattern):
+    """The report is lowercased before a pattern runs, so an uppercase letter
+    outside ``(?i)``, alone or in a class of nothing but such letters, is text
+    no report carries: where the pattern needs it, the required pattern misses
+    on every run and the forbid never fires, and in one branch or a negative
+    lookahead it is dead text."""
+    with pytest.raises(ValueError, match="in upper case"):
+        ReportContainsVerifier(type="report_contains", **{field: [pattern]})
+
+
+def test_an_uppercase_pattern_rejection_names_the_letters_once_each():
+    with pytest.raises(ValueError, match=r"spells 'K', 'A', 'O' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["KA-7741-OAK"])
+    with pytest.raises(ValueError, match=r"spells 'A-F', 'X' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["0x[A-FX]+"])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "report", "status"),
+    [
+        ("ka-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i)KA-7741-ORCHID", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i:KA)-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        (r"\Aticket \S+ is\Z", "Ticket KA-7741-ORCHID is", "pass"),
+        ("(?P<ID>ka-[0-9a-fA-F]+) (?P=ID)", "KA-7F KA-7F", "pass"),
+        ("(?x) ka-7741 # The Ticket", "KA-7741", "pass"),
+        (r"ka-[A-Z0-9]+", "KA-7741", "pass"),
+        (r"ka-[^A-Z]", "KA-7741", "pass"),
+        (r"ka[\WA-Z]\d+", "KA-7741", "pass"),
+    ],
+)
+def test_an_uppercase_letter_that_is_not_a_literal_still_loads(pattern, report, status):
+    """An escape, a group name, a ``(?x)`` comment and a character class
+    with a member a lowercased report carries are not refused, and neither is
+    a letter under ``(?i)``; the verdict is the one the pattern gave before
+    the refusal existed."""
+    v = ReportContainsVerifier(type="report_contains", required_patterns=[pattern])
+    _stash(report)
+    assert v.verify(5.0).status == status
 
 
 # ------------------ the healthy-workload objective's shipped phrase list

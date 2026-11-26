@@ -401,7 +401,9 @@ line's decoration folded when the check sets `fold_decoration: true` (indentatio
 numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
 negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
-line break; a phrase that may wrap says `\s+`), for what no substring can
+line break; a phrase that may wrap says `\s+`; the text is lowercased, so a pattern that spells a
+letter in upper case outside `(?i)`, alone or in a character class of nothing but such letters, does
+not load), for what no substring can
 express: a banned word whose negated uses are legitimate, a value only the work produces, such
 as a 32-hex trace id, where the words around it are the prompt's own and a report of failure
 would echo them (`required_patterns` must each match), a phrase that must start at a word
@@ -462,8 +464,11 @@ it, so a quoted mention of the invocation is one word and not a run, and a run m
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
-inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
-error on the api transport, so a case using it runs over the inject transport alone),
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; and
+`min_children` / `max_children`, inclusive bounds on how many child tasks the chain minted, read
+from the route's `childCount`, which counts a repeated addressee each time where
+`childAddressees` names it once; an error on the api transport, so a case using it runs over the
+inject transport alone, and a bound is an error on a door older than `childCount`),
 `worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
@@ -640,8 +645,8 @@ worker filed it reads the tagged call, which is the command as typed, so a `^`-a
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
-delegating turn's chain delegated to, by profile name, from the inject read route's
-`childAddressees`.
+delegating turn's chain delegated to, by profile name, and how many times, from the inject read
+route's `childAddressees` and `childCount`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below

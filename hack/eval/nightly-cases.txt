@@ -1352,6 +1352,18 @@
 # entry.
 ./tasks/gce-chat-request-runs-collector/task.yaml
 
+# The GCE compute audit's rotated-console notes over a standing plant
+# (#5389): the rotated-console-vm role's VM floods its own serial console
+# minutes after boot, so the boot's failure lines are gone; the report
+# names the VM as not visible, with no finding filed on it, and the ledger
+# carries no finding for it. deployer: noop, read-only on the project; a
+# full audit, in the band of the other fleet-audit cases. The fixture-state
+# scan of 2026-11-24 reads the role healthy on every pool project, after
+# the daily reconcile of 2026-11-24 converged every project. No stack, so
+# the main part shards it by checksum. Nightly from the merge that removes
+# its FIXTURE_NOT_READY entry.
+./tasks/gce-rotated-console-notes/task.yaml
+
 # The GCE compute audit end to end over the same standing plant (#2483): the
 # collector's gce-startup-script-status check flags the startup-fail-vm role's
 # VM, and the run files the ledger. deployer: noop, read-only on the project;
@@ -1762,6 +1774,11 @@
 # seeded cluster carrying the rule's own entry as printed, none where it
 # prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
+
+# Managed Cloud Service Mesh (ASM) channel-downgrade guard (#2599, #2797, #7181):
+# switching from rapid to an older stable channel risks control-plane downgrade,
+# sidecar skew, and Envoy xDS NACK loops. deployer: noop, no fixture.
+./tasks/upgrades-managed-mesh-channel-downgrade-guard/task.yaml
 
 # Upgrade-failure catalogue entry 8 through the readiness report's
 # changed-defaults rule: the seeded-defaults namespace on slot a (role
