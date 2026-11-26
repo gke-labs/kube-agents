@@ -1,9 +1,9 @@
 // Package coreagent renders a persona for the core-agent harness: the
 // persona's instructions as one file and its skills as a skills directory in
-// the Agent Skills layout, which the harness reads once at start (its
-// --instructions-file and --skills-dir). The harness adds the instructions on
-// top of its own system prompt and lists the skills to the model, loading a
-// skill's instructions and files when the model uses it.
+// the Agent Skills layout, in one directory the harness reads once per turn
+// (its --persona-dir: instructions.md and skills/). The harness adds the
+// instructions on top of its own system prompt and lists the skills to the
+// model, loading a skill's instructions and files when the model uses it.
 //
 // Each MCP server the persona grants runs as the worker's relay to the
 // credential broker, the same command and environment the Claude Code path

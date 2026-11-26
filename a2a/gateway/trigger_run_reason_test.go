@@ -19,9 +19,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 // TestRunReasonToken: a scheduled run's record carries the bare token of a
@@ -30,6 +32,7 @@ func TestRunReasonToken(t *testing.T) {
 	for _, tc := range []struct{ name, message, want string }{
 		{"a known token with its detail", "reason: deadline-exceeded - the task ran past 15m", "deadline-exceeded"},
 		{"a known bare token", "reason: worker-evicted", "worker-evicted"},
+		{"a recovered panic", taskguard.Reason, taskguard.ReasonToken},
 		{"a detail-shown token", "reason: verifier-refused - the cluster is out of scope", "verifier-refused"},
 		{"a canceled terminal's own token", "reason: canceled-by-request", "canceled-by-request"},
 		{"a stopped run", "reason: stopped - the operator stopped the run", "stopped"},
@@ -129,5 +132,18 @@ func TestACompletedRunCarriesNoReason(t *testing.T) {
 	})
 	if got.State != lib.StateCompleted || got.Reason != "" {
 		t.Fatalf("the completed run's status = %+v, want completed with no reason", got)
+	}
+}
+
+// A recovered panic's terminal (taskguard.Reason, from the hermes-bridge or
+// the worker adapter) reads in chat as the failure notice plus a sentence,
+// not the bare notice: the token is in the gateway's vocabulary.
+func TestTheRecoveredPanicTokenReadsInPlainWords(t *testing.T) {
+	words, ok := reasonInPlainWords(taskguard.Reason)
+	if !ok || words == "" {
+		t.Fatalf("reasonInPlainWords(%q) = %q, %v; want a sentence", taskguard.Reason, words, ok)
+	}
+	if strings.Contains(words, taskguard.ReasonToken) {
+		t.Fatalf("the sentence %q shows the raw token", words)
 	}
 }

@@ -264,12 +264,16 @@ and dispatched through [the rebuild button](../../docs/environment-reconcile.md#
    `REGISTRY_PREFIX` is read too but is **optional and set on no environment**, so do not go
    looking for it: it is set at no scope, the workflows forward an empty
    string, and `get_registry_prefix` falls back to `DEFAULT_REGISTRY_PREFIX`. Set it only to point
-   an environment at a registry other than `ghcr.io/gke-labs/kube-agents`. If you do, note that
-   `registry_image_exists` — the probe `check_commit_images_exist` runs per image — has a docker-free
-   fallback for `ghcr.io` and for Artifact Registry (`*-docker.pkg.dev`, asked with the caller's
-   `gcloud` access token) only. Every release-path caller runs on a GitHub Actions runner with docker
-   and so takes the `docker manifest inspect` branch regardless, which reads a private repository only
-   after a `docker login` to it; a caller without docker gets a warning and a "missing image" answer when
+   an environment at a registry other than `ghcr.io/gke-labs/kube-agents`. If you do, note how
+   `registry_image_exists` — the probe `check_commit_images_exist` runs per image — asks. An Artifact
+   Registry prefix (`*-docker.pkg.dev`) is asked over the registry API with the caller's `gcloud`
+   access token, docker or not, so the job has to be logged in to Google as an identity that can read
+   the repository. `autopush-deploy.yml`'s candidate image check logs in for such a prefix;
+   `staging-deploy.yml`, `rc-create-tag.yml`, `rc-scheduler.yml`, `staging-promotion-pipeline.yml`'s
+   candidate check and `release-publish.yml` do not. Where the API cannot be asked, and for every other
+   registry, a GitHub Actions runner takes the `docker manifest inspect` branch, which reads a private
+   repository only after a `docker login` to it. A caller without docker has a docker-free fallback
+   for `ghcr.io` and Artifact Registry only, and gets a warning and a "missing image" answer when
    pointed at another registry, or at Artifact Registry with no `gcloud` credential it accepts.
 
    Two of those earn a line of their own because getting them wrong is silent rather than loud.

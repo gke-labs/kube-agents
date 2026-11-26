@@ -15,8 +15,8 @@ import (
 
 // For returns the adapter for h, the harness value the worker is started
 // with.
-// Antigravity is a known harness without an adapter yet: its agent file
-// format is being settled, and refusing it by name is clearer than
+// Antigravity is a known harness without an adapter yet (its agent file
+// format is being settled), and refusing it by name is clearer than
 // treating it as unknown.
 func For(h persona.Harness) (persona.Adapter, error) {
 	switch h {

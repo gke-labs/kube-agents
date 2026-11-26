@@ -21,6 +21,7 @@ from tests.testing.release import (
     MOCK_TARGET_RELEASE_TAG,
     commit_required_release_images,
     create_mock_docker_binary,
+    create_mock_gcloud_token_binary,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -370,6 +371,9 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
         """Runs the script against a registry holding `images`; returns the
         process and the (target, source) pair of each tag it created, in order."""
         _, log_path = create_mock_docker_binary(self.bin_dir, image_digests=images)
+        # No Google credential, so the Artifact Registry probe cannot ask and
+        # docker, which the release job logs in, answers.
+        create_mock_gcloud_token_binary(self.bin_dir, token="")
         env = {"CI": "true", "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX}
         if candidate_registry is not None:
             env["CANDIDATE_REGISTRY_PREFIX"] = candidate_registry
@@ -482,6 +486,7 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
                 f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{sha}" for img in MOCK_REQUIRED_RELEASE_IMAGES for sha in holders
             ],
         )
+        create_mock_gcloud_token_binary(bin_dir, token="")
         proc = subprocess.run(
             ["bash", str(_PROMOTE_RELEASE_IMAGES_SH), MOCK_TARGET_RELEASE_TAG],
             capture_output=True,

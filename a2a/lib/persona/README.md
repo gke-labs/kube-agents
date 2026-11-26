@@ -122,7 +122,7 @@ PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
 `core-agent`). A session pod refuses `antigravity` unless
 `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
 unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
-worker refuses `antigravity`, because it has no persona adapter yet.
+worker refuses `antigravity`, which has no persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
