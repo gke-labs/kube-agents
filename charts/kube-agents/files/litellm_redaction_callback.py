@@ -315,7 +315,15 @@ class KubeAgentsRedactionCallback(CustomLogger):
         # Providers take the URL-safe alphabet and unpadded base64 too; both
         # are normalised before the strict decode. The payload is kept as it
         # came either way.
-        text = "".join(data.split()).replace("-", "+").replace("_", "/")
+        # Whitespace only as an encoder wraps lines: a line break, with
+        # every line but the last the same length. Anything else (a space,
+        # a tab, uneven lines) is not a payload as encoded.
+        lines = data.strip("\r\n").replace("\r\n", "\n").split("\n")
+        if any(not line or any(c.isspace() for c in line) for line in lines) or (
+            len(lines) > 1 and (len({len(line) for line in lines[:-1]}) != 1 or len(lines[-1]) > len(lines[0]))
+        ):
+            raise self._refuse(f"a {media} payload that is not base64")
+        text = "".join(lines).replace("-", "+").replace("_", "/")
         text += "=" * (-len(text) % 4)
         try:
             decoded = base64.b64decode(text, validate=True)

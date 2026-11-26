@@ -580,6 +580,42 @@ class TestCallback(unittest.TestCase):
         walked = self._run({"input": [{"type": "function_call_output", "call_id": "c", "output": "on prod-eu-1"}]}, "aresponses")
         self.assertNotIn("prod-eu-1", walked["input"][0]["output"])
 
+    def test_a_payload_takes_whitespace_only_as_line_wraps(self) -> None:
+        import base64 as b64
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 2
+        flat = b64.b64encode(png).decode()
+        wrapped = "\n".join(flat[i:i + 76] for i in range(0, len(flat), 76))
+        crlf = "\r\n".join(flat[i:i + 64] for i in range(0, len(flat), 64)) + "\r\n"
+        for data in (flat, wrapped, crlf):
+            with self.subTest(data=data[:20]):
+                for req, get, call in self._payload_positions(data):
+                    self.assertEqual(get(self._run(req, call)), data)
+        # Words in the base64 alphabet after a real header, with any other
+        # whitespace: refused at every position, never kept as they came.
+        smuggled = [
+            "iVBORw0KGgo the cluster is prod eu one",
+            "iVBORw0KGgo\tAAAA",
+            "iVBORw0KGgo=\nAAAA\nAAAAAAAA",
+            flat[:76] + "\n" + flat[76:100] + "\n" + flat[100:176],
+        ]
+        for data in smuggled:
+            for req, _, call in self._payload_positions(data):
+                with self.subTest(data=data[:24], call=call), self.assertRaises(HTTPException) as refused:
+                    self._run(req, call)
+                self.assertEqual(refused.exception.status_code, 400)
+
+    @staticmethod
+    def _payload_positions(data: str):
+        url = "data:image/png;base64," + data
+        return [
+            ({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": data}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["inlineData"]["data"], "agenerate_content"),
+            ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]},
+             lambda r: r["messages"][0]["content"][0]["image_url"]["url"][len("data:image/png;base64,"):], "completion"),
+            ({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image", "image_url": url}]}]},
+             lambda r: r["input"][0]["content"][0]["image_url"][len("data:image/png;base64,"):], "aresponses"),
+        ]
+
     def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
         # Forms providers accept: the URL-safe alphabet, no padding, and the
         # common image/jpg label. Each is kept byte for byte as it came.
