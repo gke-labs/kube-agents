@@ -2939,10 +2939,46 @@ class ConntrackSaturationTest(unittest.TestCase):
         self.assertNotIn(names[cf.CONNTRACK_NODES_SHOWN], hits[0]["excerpt"])
         self.assertTrue(hits[0]["excerpt"].endswith(" and 2 more."), hits[0]["excerpt"])
 
-    def test_an_instance_that_is_no_listed_node_gets_a_finding_of_its_own(self):
-        hits = cf.check_conntrack_saturation([conntrack_entry("gke-old-node-gone")], self.NODES)
-        self.assertEqual([h["object"] for h in hits], ["ComputeInstance/us-central1-a/gke-old-node-gone"])
+    def test_a_running_instance_that_is_no_listed_node_gets_a_finding_of_its_own(self):
+        running = {(NODE_ZONE, "proxy-vm")}
+        hits = cf.check_conntrack_saturation([conntrack_entry("proxy-vm")], self.NODES, running=running)
+        self.assertEqual([h["object"] for h in hits], ["ComputeInstance/us-central1-a/proxy-vm"])
         self.assertIn("does not show as a RUNNING node of a GKE node pool", hits[0]["excerpt"])
+
+    def test_with_no_running_set_every_instance_counts_as_running(self):
+        hits = cf.check_conntrack_saturation([conntrack_entry("proxy-vm")], self.NODES)
+        self.assertEqual([h["object"] for h in hits], ["ComputeInstance/us-central1-a/proxy-vm"])
+
+    def test_an_instance_that_is_not_running_now_gets_no_finding(self):
+        # A deleted node: its pool cannot be read, and each one would be a new finding.
+        entries = [conntrack_entry("gke-old-node-gone"), conntrack_entry()]
+        hits = cf.check_conntrack_saturation(entries, self.NODES, running={(NODE_ZONE, NODE_A)})
+        self.assertEqual([h["object"] for h in hits], ["NodePool/us-central1-a/seeded-a/default-pool"])
+        self.assertIn("1 kernel line(s)", hits[0]["excerpt"])
+
+    def test_a_listed_node_is_filed_though_the_running_set_does_not_name_it(self):
+        # The two instance reads are apart; the node read is the later one.
+        hits = cf.check_conntrack_saturation([conntrack_entry()], self.NODES, running=set())
+        self.assertEqual([h["object"] for h in hits], ["NodePool/us-central1-a/seeded-a/default-pool"])
+
+    def test_the_same_name_running_in_another_zone_does_not_make_an_instance_running(self):
+        running = {("europe-west1-b", "gke-old-node-gone")}
+        self.assertEqual(cf.check_conntrack_saturation([conntrack_entry("gke-old-node-gone")], self.NODES, running=running), [])
+
+    def test_the_gone_instances_are_named_once_each_and_sorted(self):
+        entries = [
+            conntrack_entry("gke-old-b"), conntrack_entry("gke-old-a"), conntrack_entry("gke-old-b"),
+            conntrack_entry(), conntrack_entry("proxy-vm"), QUIET_ENTRY, "oops",
+        ]
+        running = {(NODE_ZONE, NODE_A), (NODE_ZONE, "proxy-vm")}
+        self.assertEqual(
+            cf.gone_conntrack_instances(entries, running),
+            [(NODE_ZONE, "gke-old-a"), (NODE_ZONE, "gke-old-b")],
+        )
+
+    def test_a_skipped_instance_is_not_a_gone_instance(self):
+        skip = frozenset({(NODE_ZONE, "gke-left-out")})
+        self.assertEqual(cf.gone_conntrack_instances([conntrack_entry("gke-left-out")], set(), skip=skip), [])
 
     def test_a_node_whose_pool_is_not_labelled_is_named_as_an_instance(self):
         nodes = cf.gke_nodes([gke_node(pool="")])
@@ -3239,6 +3275,43 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertIn(f"{NODE_B} (us-central1-a)", entry["notes"])
         self.assertEqual(self.noted(entry), [])
 
+    def test_lines_of_an_instance_that_is_gone_are_a_note_and_no_finding(self):
+        entries = [conntrack_entry("gke-old-node-gone"), conntrack_entry("gke-old-node-gone"), conntrack_entry()]
+        entry, _ = self.collect(self.responses(entries=entries))
+        self.assertEqual([c["object"] for c in self.conntrack(entry)], ["NodePool/us-central1-a/seeded-a/default-pool"])
+        note = cf.GONE_INSTANCES_NOTE.format(count=1, freshness=cf.CONNTRACK_FRESHNESS, names="gke-old-node-gone (us-central1-a)")
+        self.assertIn(note, entry["notes"])
+        self.assertEqual(self.noted(entry), [])
+        self.assertNotIn("limitations", entry)
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertIn(cf.CONNTRACK_SLUG, {c["check"] for c in entry["commands"]})
+
+    def test_a_day_with_only_a_gone_instances_lines_files_nothing_and_asks_no_control(self):
+        # The lines show that the log reaches Cloud Logging, so the control has nothing to add.
+        entry, issued = self.collect(self.responses(entries=[conntrack_entry("gke-old-node-gone")]))
+        self.assertEqual(self.conntrack(entry), [])
+        self.assertIn("gke-old-node-gone (us-central1-a)", entry["notes"])
+        self.assertEqual(len([argv for argv in issued if argv[1:3] == ["logging", "read"]]), 1)
+
+    def test_a_running_instance_that_is_no_gke_node_is_filed_by_its_name(self):
+        entry, _ = self.collect(self.responses(entries=[conntrack_entry("vm-1")]))
+        self.assertEqual([c["object"] for c in self.conntrack(entry)], ["ComputeInstance/us-central1-a/vm-1"])
+        self.assertNotIn("node-conntrack-saturation: 1 instance(s)", entry.get("notes", ""))
+
+    def test_more_gone_instances_than_the_note_shows_are_counted(self):
+        names = [f"gke-old-{i}" for i in range(cf.CONNTRACK_NODES_SHOWN + 2)]
+        entry, _ = self.collect(self.responses(entries=[conntrack_entry(name) for name in names]))
+        self.assertIn(f"{len(names)} instance(s) wrote the kernel's line", entry["notes"])
+        self.assertIn(f"{names[cf.CONNTRACK_NODES_SHOWN - 1]} (us-central1-a) and 2 more", entry["notes"])
+        self.assertNotIn(names[cf.CONNTRACK_NODES_SHOWN], entry["notes"])
+
+    def test_a_gone_instance_of_an_excluded_cluster_is_not_told_apart_and_is_noted(self):
+        # A deleted instance carries no label to read, so the exclusion cannot name it.
+        cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-b")
+        entry, _ = self.collect(self.responses(entries=[conntrack_entry("gke-seeded-b-old-node")]))
+        self.assertEqual(self.conntrack(entry), [])
+        self.assertIn("gke-seeded-b-old-node (us-central1-a)", entry["notes"])
+
     def test_a_listed_instance_that_is_no_node_of_this_project_does_not_count_as_covered(self):
         entry, issued = self.collect(self.responses(logged_names=("some-other-vm",)))
         self.assertIn("not visible on 1 of the 1 RUNNING GKE node(s)", entry["notes"])
@@ -3271,6 +3344,8 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         entry, _ = self.collect(self.responses(nodes=nodes, logged_names=("gke-other-pool-1-abcd",), entries=entries))
         self.assertEqual([c["object"] for c in self.conntrack(entry)], ["NodePool/us-central1-a/other/pool-1"])
         self.assertNotIn("limitations", entry)
+        # Left out, not gone: the note on instances that are not running does not name it.
+        self.assertNotIn(NODE_A, entry.get("notes", ""))
 
     def test_a_project_whose_every_node_is_excluded_declares_the_check_inapplicable(self):
         cf.declared_scope.set("proj-1", None, "proj-1/us-central1-a/seeded-a")

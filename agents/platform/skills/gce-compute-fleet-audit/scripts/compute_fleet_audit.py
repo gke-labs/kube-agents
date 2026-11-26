@@ -67,8 +67,8 @@ Field contracts assumed of `gcloud ... --format=json` output:
   instances have serial console output to read.
 - A GKE node's instance carries the labels `goog-k8s-cluster-name`,
   `goog-k8s-cluster-location` and `goog-k8s-node-pool-name` (read on GKE
-  Standard 1.35.8 nodes, 2026-11-24); an instance without the first is not a
-  GKE node. §2.6 lists the nodes with a read of its own, filtered on that
+  Standard 1.35.8 nodes, 2026-11-24, and on a 1.36.4 node, 2026-11-26); an
+  instance without the first is not a GKE node. §2.6 lists the nodes with a read of its own, filtered on that
   label.
 - A Cloud Logging entry of the serial console log carries the resource type
   `gce_instance` with the zone under `resource.labels.zone`, the instance's
@@ -692,6 +692,17 @@ NO_SERIAL_ENTRIES_NOTE = (
     "node of this project is in Cloud Logging for the last {days} days, so nothing shows "
     "that this log reaches Cloud Logging here (a log exclusion, a sink to another project "
     "or an organization policy can keep it out)."
+)
+# Lines of an instance that is not RUNNING now: a node that the autoscaler, a
+# repair or an upgrade deleted, or a stopped instance. Its labels cannot be
+# read, so its node pool is not known, and a finding on the instance would name
+# an object that is gone and would be a new finding for each deleted node. The
+# lines were read, so this is a note; it names no object, because no finding
+# can be on one.
+GONE_INSTANCES_NOTE = (
+    "node-conntrack-saturation: {count} instance(s) wrote the kernel's line in the last "
+    "{freshness} and are not RUNNING now, so their node pool cannot be read and no finding "
+    "names them: {names}. A node pool whose RUNNING nodes wrote the line has its own finding."
 )
 CONNTRACK_FULL_PAGE_LIMITATION = (
     "node-conntrack-saturation read the newest {limit} serial console entries with the "
@@ -1479,27 +1490,9 @@ def _stamp(timestamp: str) -> str:
     return f"{timestamp[:STAMP_SECONDS_CHARS]}{STAMP_UTC_SUFFIX}" if timestamp else UNKNOWN_TIME_TEXT
 
 
-def check_conntrack_saturation(
-    entries: list,
-    nodes: dict[tuple[str, str], dict],
-    *,
-    skip: frozenset[tuple[str, str]] = frozenset(),
-    at_least: bool = False,
-) -> list[dict]:
-    """§2.6: one hit for each GKE node pool, and one for each other instance,
-    whose serial console log carries the kernel's line for a full connection
-    tracking table.
-
-    `entries` are Cloud Logging entries, `nodes` is `gke_nodes`' answer, `skip`
-    names the instances whose lines are left out (the nodes of a cluster the
-    declared scope excludes), and `at_least` says that the read filled its page,
-    so every count is a floor. A pool is the unit because a node's name changes
-    with each repair and upgrade, and a finding per node would open a new one
-    each time. No text from inside the guest reaches the excerpt: the line it
-    quotes is this file's constant, and the names come from the entry's labels,
-    which the platform sets.
-    """
-    groups: dict[str, dict] = {}
+def _conntrack_lines(entries: list, skip: frozenset[tuple[str, str]]):
+    """`(zone, name, timestamp)` for each Cloud Logging entry that carries the
+    kernel's line and names its instance, without the instances in `skip`."""
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
@@ -1513,15 +1506,58 @@ def check_conntrack_saturation(
         name = str(labels.get(LOG_INSTANCE_NAME_LABEL) or located.get(LOG_INSTANCE_ID_KEY) or "").strip()
         if not name or (zone, name) in skip:
             continue
+        yield zone, name, str(entry.get(LOG_TIMESTAMP_KEY) or "")
+
+
+def gone_conntrack_instances(
+    entries: list,
+    running: set[tuple[str, str]],
+    *,
+    skip: frozenset[tuple[str, str]] = frozenset(),
+) -> list[tuple[str, str]]:
+    """`(zone, name)`, sorted, for each instance with the kernel's line that
+    `running`, the project's RUNNING instances, does not name:
+    `check_conntrack_saturation` files nothing on them."""
+    return sorted({(zone, name) for zone, name, _stamp_text in _conntrack_lines(entries, skip)} - set(running))
+
+
+def check_conntrack_saturation(
+    entries: list,
+    nodes: dict[tuple[str, str], dict],
+    *,
+    running: set[tuple[str, str]] | None = None,
+    skip: frozenset[tuple[str, str]] = frozenset(),
+    at_least: bool = False,
+) -> list[dict]:
+    """§2.6: one hit for each GKE node pool, and one for each other RUNNING
+    instance, whose serial console log carries the kernel's line for a full
+    connection tracking table.
+
+    `entries` are Cloud Logging entries, `nodes` is `gke_nodes`' answer, `skip`
+    names the instances whose lines are left out (the nodes of a cluster the
+    declared scope excludes), and `at_least` says that the read filled its page,
+    so every count is a floor. A pool is the unit because a node's name changes
+    with each repair and upgrade, and a finding per node would open a new one
+    each time. For the same reason an instance that `running`, the `(zone,
+    name)` of the project's RUNNING instances, does not name gets no hit: it is
+    gone, its pool cannot be read, and each deleted node would be a new
+    finding (`gone_conntrack_instances` names them for a note). With `running`
+    None every instance counts as RUNNING. No text from inside the guest
+    reaches the excerpt: the line it quotes is this file's constant, and the
+    names come from the entry's labels, which the platform sets.
+    """
+    groups: dict[str, dict] = {}
+    for zone, name, stamp in _conntrack_lines(entries, skip):
         node = nodes.get((zone, name))
         if node and node["pool"]:
             obj = NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"])
-        else:
+        elif node or running is None or (zone, name) in running:
             node = None
             obj = INSTANCE_OBJECT_FORMAT.format(zone=zone or UNKNOWN_ZONE, name=name)
+        else:
+            continue
         group = groups.setdefault(obj, {"node": node, "zone": zone or UNKNOWN_ZONE, "name": name, "lines": {}, "stamps": []})
         group["lines"][name] = group["lines"].get(name, 0) + 1
-        stamp = str(entry.get(LOG_TIMESTAMP_KEY) or "")
         if stamp:
             group["stamps"].append(stamp)
     hits: list[dict] = []
@@ -2002,9 +2038,21 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                         read_command = shlex.join(read_argv)
                         reads[CONNTRACK_SLUG].add(read_command, read_result)
                         full_page = len(entries) >= CONNTRACK_LOG_LIMIT
-                        for hit in check_conntrack_saturation(entries, nodes, skip=left_out, at_least=full_page):
+                        running_now = {(zone, instance) for instance, zone in running}
+                        for hit in check_conntrack_saturation(
+                            entries, nodes, running=running_now, skip=left_out, at_least=full_page
+                        ):
                             candidates.append(_emit(CONNTRACK_SLUG, hit, read_command))
                             found.add(hit["object"])
+                        gone = gone_conntrack_instances(entries, running_now | set(nodes), skip=left_out)
+                        if gone:
+                            names = [f"{instance} ({zone or UNKNOWN_ZONE})" for zone, instance in gone]
+                            shown = ", ".join(names[:CONNTRACK_NODES_SHOWN])
+                            if len(names) > CONNTRACK_NODES_SHOWN:
+                                shown += CONNTRACK_MORE_NODES.format(more=len(names) - CONNTRACK_NODES_SHOWN)
+                            notes.append(
+                                GONE_INSTANCES_NOTE.format(count=len(gone), freshness=CONNTRACK_FRESHNESS, names=shown)
+                            )
                         if full_page:
                             limitations.append(
                                 CONNTRACK_FULL_PAGE_LIMITATION.format(
