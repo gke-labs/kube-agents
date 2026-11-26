@@ -20,8 +20,9 @@ Anthropic tool input sent as a string) are decoded, walked as a document and
 re-encoded only if a rule changed them, so they stay valid JSON.
 
 Left exactly as they came, and only at the positions the provider APIs
-define (content parts, a tool result's own content list, `system`,
-`thinking_blocks`, Gemini parts; never inside a tool's input or output or a
+define (content parts, a Responses `input` item's included, a tool result's
+own content list, `system`, `thinking_blocks`, Gemini parts and the parts
+inside a Gemini function response; never inside a tool's input or output or a
 function's arguments): in an assistant's or the model's own turn, a thinking
 block's text and signature (the provider checks the text against the
 signature, and the model wrote it from input this hook had already redacted),
@@ -38,11 +39,7 @@ settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, or anything at a
 payload position that is not binary base64, answered with 400 since the same
-request is refused every time. Two payload positions are not carved: a
-Responses `input` item's content parts and the parts inside a Gemini function
-response. The text rules still run over a base64 payload there and can rewrite
-it (a known gap). Responses are not touched; the limitation is documented
-on the site's inference-gateway page.
+request is refused every time. Responses are not touched.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
