@@ -59,7 +59,9 @@ the shape anywhere, and a guess encoded as tested code looks like a fact:
   throwaway cluster (GKE 1.35.8) on 2026-11-18. 3.10(e), a node pool that
   consumes any matching reservation while each such reservation is in
   another zone, is `file_any_reservation_pools`, with shapes read on
-  2026-11-24 and 2026-11-25.
+  2026-11-24 and 2026-11-25. The second arm of 3.10(d), a node pool whose
+  named reservation is in its zone for another machine type, is
+  `file_reserved_pool_machines`, with shapes read on 2026-11-24.
 
 The rest need a read this collector does not make: namespaces for 3.12(a)'s
 namespace default, `advice capacity` for 3.8's obtainability arm, node pool
@@ -579,6 +581,30 @@ URL_SEPARATOR = "/"
 # match to consume each reservation of a project.
 ANY_RESERVATION_POOLS_KEY = "_any_reservation_pools"
 RESERVATION_SHAPES_KEY = "_reservation_shapes"
+# §3.10(d), the machine type arm: a node pool that consumes only a named
+# reservation, where the reservation is in a zone of the pool and is for
+# another machine type. GKE accepts such a pool. In a recorded run
+# (GKE 1.35.8-gke.1796000, 2026-11-24) the pool got no node in 480 s and the
+# autoscaler reported `scale.up.error.other`.
+OTHER_MACHINE_IMPACT = (
+    "This node pool can consume only its named reservations, and each one that is in the pool's zones is for "
+    "another machine type. A reservation serves only machines of its own machine type, so the pool cannot add a "
+    "node. The autoscaler can report `scale.up.error.other` for such a pool, not "
+    "`scale.up.error.reservation.not.found`."
+)
+OTHER_MACHINE_UNREAD = (
+    "{check} did not judge the machine type of these node pools: a reservation that the pool names is in its "
+    "zone for another machine type, and the reservations of another owner project that it names were not read "
+    "in this run: {pools}"
+)
+# An N1 custom machine type has two spellings, with and without the family.
+N1_CUSTOM_PREFIX = "n1-custom-"
+CUSTOM_PREFIX = "custom-"
+OTHER_MACHINE_EXCERPT = "reservationAffinity={affinity}, pool zones {zones}, machine type {machine_type}; {where}"
+OTHER_MACHINE_CLAUSE = "reservation {name}: machine type {machine_type} in {zone} of project {project}"
+# Entry key that carries a cluster's pools bound to named reservations, each
+# with its machine type, to `collect_fleet`, which removes it.
+RESERVED_POOL_MACHINES_KEY = "_reserved_pool_machines"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
@@ -2170,6 +2196,78 @@ def file_any_reservation_pools(entry: dict, shapes_by_project: dict[str, list[di
         )
 
 
+def reserved_pool_machine(pool: dict, project: str) -> dict | None:
+    """`reserved_pool`'s record with the pool's machine type (§3.10(d), the
+    machine type arm); None for a pool that `reserved_pool` leaves out or that
+    names no machine type. Run inside `collect_cluster`, as `reserved_pool` is."""
+    reserved = reserved_pool(pool, project)
+    machine_type = (pool.get("config") or {}).get("machineType")
+    if not reserved or not machine_type:
+        return None
+    return {**reserved, "machine_type": str(machine_type)}
+
+
+def _machine_type_name(value: str) -> str:
+    """A machine type as one name to compare: its last path part in lower
+    case, and an N1 custom type without its family. The two spellings of an N1
+    custom type are not from a recorded read."""
+    name = str(value).rsplit(URL_SEPARATOR, 1)[-1].lower()
+    return CUSTOM_PREFIX + name[len(N1_CUSTOM_PREFIX) :] if name.startswith(N1_CUSTOM_PREFIX) else name
+
+
+def file_reserved_pool_machines(entry: dict, zones_by_project: dict[str, dict[str, list[str]]], shapes_by_project: dict[str, list[dict]]) -> None:
+    """§3.10(d), the machine type arm, for one cluster entry: a node pool that
+    consumes only named reservations, where each named reservation that is in
+    a zone of the pool is for another machine type.
+
+    A pool with no named reservation in its zones is `file_reserved_pools`'s
+    finding or its limitation, so it is not filed here. One named reservation
+    in a zone of the pool that is for the pool's machine type, or whose
+    machine type was not read (`reservation_shapes` leaves it out), can serve
+    the pool: no finding. A reservation of an owner project that was not read
+    can serve the pool too: no finding, and a limitation that names the pool.
+    Run by `collect_fleet` beside `file_reserved_pools`."""
+    unjudged: list[str] = []
+    for reserved in entry.pop(RESERVED_POOL_MACHINES_KEY, []):
+        in_zone = []
+        for owner, name in reserved["reservations"]:
+            for zone in sorted(set(zones_by_project.get(owner, {}).get(name, [])) & set(reserved["zones"])):
+                machine_types = [shape["machine_type"] for shape in shapes_by_project.get(owner, []) if shape["name"] == name and shape["zone"] == zone]
+                in_zone.append((owner, name, zone, machine_types[0] if machine_types else None))
+        pool_machine = _machine_type_name(reserved["machine_type"])
+        if not in_zone or any(machine_type is None or _machine_type_name(machine_type) == pool_machine for _, _, _, machine_type in in_zone):
+            continue
+        unread = sorted({owner for owner, _ in reserved["reservations"] if owner not in zones_by_project})
+        if unread:
+            unjudged.append(f"{reserved['pool']} (project {', '.join(unread)})")
+            continue
+        where = RESERVATION_CLAUSE_JOINER.join(
+            OTHER_MACHINE_CLAUSE.format(name=name, machine_type=machine_type, zone=zone, project=owner) for owner, name, zone, machine_type in in_zone
+        )
+        owners = sorted({owner for owner, _, _, _ in in_zone})
+        entry["candidates"].append(
+            _emit(
+                RESERVATION_MISMATCH_CHECK,
+                {
+                    "object": f"NodePool/{reserved['pool']}",
+                    "severity": MISSING_RESERVATION_SEVERITY,
+                    "excerpt": OTHER_MACHINE_EXCERPT.format(
+                        affinity=POOL_SPECIFIC_RESERVATION, zones=", ".join(reserved["zones"]), machine_type=reserved["machine_type"], where=where
+                    ),
+                    "impact": OTHER_MACHINE_IMPACT,
+                    # A fix is a new reservation, which is billed, or a new
+                    # node pool: no pull request from the sweep.
+                    "needs_triage": RESERVED_POOL_TRIAGE,
+                    "command": RESERVATION_CLAUSE_JOINER.join([reserved["command"], *(shlex.join(reservations_argv(owner)) for owner in owners)]),
+                },
+            )
+        )
+    if unjudged:
+        entry["limitations"] = RESERVATION_CLAUSE_JOINER.join(
+            [*filter(None, [entry.get("limitations")]), OTHER_MACHINE_UNREAD.format(check=RESERVATION_MISMATCH_CHECK, pools=", ".join(unjudged))]
+        )
+
+
 # --------------------------------------------------------------------------- #
 # 3.7 quota-exhaustion-risk
 # --------------------------------------------------------------------------- #
@@ -3210,6 +3308,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     any_reservation_pools = [{**found, "command": pools_record["command"]} for pool in node_pools for found in [any_reservation_pool(pool)] if found]
     if any_reservation_pools:
         entry[ANY_RESERVATION_POOLS_KEY] = any_reservation_pools
+    reserved_pool_machines = [{**found, "command": pools_record["command"]} for pool in node_pools for found in [reserved_pool_machine(pool, project)] if found]
+    if reserved_pool_machines:
+        entry[RESERVED_POOL_MACHINES_KEY] = reserved_pool_machines
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
     if unevaluated:
@@ -3492,6 +3593,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     for cluster_entry in returned_clusters:
         file_reserved_pools(cluster_entry, zones_by_project, frozenset(projects))
         file_any_reservation_pools(cluster_entry, shapes_by_project)
+        file_reserved_pool_machines(cluster_entry, zones_by_project, shapes_by_project)
     entries = returned_clusters + project_entries + failed_entries + not_running + discovery_entries
     # An unreachable cluster evaluated no check, so it leaves `scope.clusters`
     # as empty as no cluster at all; a gate-failed one stays eligible, since

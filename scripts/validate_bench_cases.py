@@ -662,10 +662,14 @@ FIXTURE_NOT_READY = {
     # billed while it exists, in each pool project. The stockout collector's
     # 3.10(e) is graded by its unit tests on shapes read from a throwaway
     # cluster, and by runs on a dev install that plant the pair for the run.
+    # The case's second pair, for the machine type arm of 3.10(d), is a pool
+    # that names a reservation of another machine type in the pool's zone; it
+    # needs a standing reservation in the same way.
     "stockout-any-reservation-other-zone": (
         "#6954: needs a zero-node pool with ANY_RESERVATION and a standing one-VM reservation of "
-        "its machine type in another zone; a reservation is billed while it exists, and no pool "
-        "project carries one"
+        "its machine type in another zone, and a zero-node pool that names a standing one-VM "
+        "reservation of another machine type in its zone; a reservation is billed while it exists, "
+        "and no pool project carries one"
     ),
 }
 

@@ -3226,7 +3226,8 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # one-file pull request, for a person who knows to add the selector to it.
 #
 # The stockout collector also sets `reserved-pool` on a §3.10(d) finding, a
-# node pool whose named reservation is in none of its zones, and on a §3.10(e)
+# node pool whose named reservation is in none of its zones or is there for
+# another machine type, and on a §3.10(e)
 # finding, a node pool whose matching reservations are all in other zones.
 # Each fix creates a reservation, which is billed from the moment it exists,
 # or replaces the pool or changes its zones. The SOP has both findings

@@ -4397,6 +4397,221 @@ class AnyReservationPoolTest(unittest.TestCase):
         self.assertIn(self.SLUG, {c["check"] for c in cluster["commands"]})
 
 
+class ReservedPoolMachineTest(unittest.TestCase):
+    """§3.10(d), the machine type arm (#6954): a node pool that consumes only
+    a named reservation, where the reservation is in a zone of the pool and
+    is for another machine type.
+
+    The pool and the reservation are trimmed copies of a `clusters list` item
+    and a `reservations list` item read from a throwaway cluster
+    (GKE 1.35.8-gke.1796000) on 2026-11-24, with the names replaced: an
+    `n2-standard-2` pool that names an `e2-standard-2` reservation of its
+    zone. GKE accepted the pool; it got no node."""
+
+    SLUG = "reservation-mismatch-risk"
+    POOLS_COMMAND = "gcloud container clusters list --project acme --format json"
+    ZONE = "us-central1-a"
+
+    def pool(self, reservation="res-other-type", zones=(ZONE,), machine_type="n2-standard-2", **config):
+        return reserved_node_pool("othertype-pool", reservation, zones=zones, machineType=machine_type, **config)
+
+    def reservation(self, name="res-other-type", zone=ZONE, machine_type="e2-standard-2", project="acme"):
+        listed = listed_reservation(name, zone, project)
+        listed["specificReservation"]["instanceProperties"] = {"machineType": machine_type}
+        return listed
+
+    def filed(self, pool, *reservations, read=("acme",)):
+        """The candidates of both node pool arms for one pool."""
+        entry = {
+            "name": "acme/us-central1/c1", "project": "acme", "location": "us-central1", "outcome": "collected",
+            "commands": [{"check": self.SLUG, "command": "kubectl get computeclasses", "rc": 0}],
+            "candidates": [],
+            fs.RESERVED_POOLS_KEY: [{**fs.reserved_pool(pool, "acme"), "command": self.POOLS_COMMAND}],
+        }
+        machine = fs.reserved_pool_machine(pool, "acme")
+        if machine:
+            entry[fs.RESERVED_POOL_MACHINES_KEY] = [{**machine, "command": self.POOLS_COMMAND}]
+        of_project = {project: [r for r in reservations if f"/projects/{project}/" in r["zone"]] for project in read}
+        zones = {project: fs.reservation_zones(listed) for project, listed in of_project.items()}
+        shapes = {project: fs.reservation_shapes(listed) for project, listed in of_project.items()}
+        fs.file_reserved_pools(entry, zones, frozenset({"acme", "beta"}))
+        fs.file_reserved_pool_machines(entry, zones, shapes)
+        self.assertNotIn(fs.RESERVED_POOL_MACHINES_KEY, entry)
+        return entry
+
+    def test_the_record_of_the_recorded_pool(self):
+        self.assertEqual(
+            fs.reserved_pool_machine(self.pool(), "acme"),
+            {"pool": "othertype-pool", "zones": [self.ZONE], "reservations": [("acme", "res-other-type")], "machine_type": "n2-standard-2"},
+        )
+
+    def test_a_pool_that_reserved_pool_leaves_out_has_no_record(self):
+        self.assertIsNone(fs.reserved_pool_machine({"name": "plain", "locations": [self.ZONE], "config": {"machineType": "n2-standard-2"}}, "acme"))
+        self.assertIsNone(fs.reserved_pool_machine(reserved_node_pool("dev-pool", "r1", machineType="n2-standard-2"), "acme"))
+        no_machine_type = self.pool()
+        del no_machine_type["config"]["machineType"]
+        self.assertIsNone(fs.reserved_pool_machine(no_machine_type, "acme"))
+
+    def test_a_reservation_of_another_machine_type_in_the_pool_s_zone_is_a_critical_finding(self):
+        entry = self.filed(self.pool(), self.reservation())
+        [candidate] = entry["candidates"]
+        self.assertEqual((candidate["check"], candidate["object"], candidate["severity"]), (self.SLUG, "NodePool/othertype-pool", "critical"))
+        self.assertEqual(
+            candidate["excerpt"],
+            "reservationAffinity=SPECIFIC_RESERVATION, pool zones us-central1-a, machine type n2-standard-2; "
+            "reservation res-other-type: machine type e2-standard-2 in us-central1-a of project acme",
+        )
+        self.assertIn("each one that is in the pool's zones is for another machine type", candidate["impact"])
+        self.assertIn("the pool cannot add a node", candidate["impact"])
+        self.assertIn("The autoscaler can report `scale.up.error.other`", candidate["impact"])
+        self.assertTrue(candidate["impact_authoritative"])
+        self.assertEqual(candidate["needs_triage"], fs.RESERVED_POOL_TRIAGE)
+        self.assertEqual(candidate["command"], f"{self.POOLS_COMMAND}; gcloud compute reservations list --project acme --format json")
+        # The check ran: its record stays and nothing is unevaluated.
+        self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertNotIn("limitations", entry)
+
+    def test_a_machine_type_that_is_a_url_is_compared_by_its_name(self):
+        url = "https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-a/machineTypes/n2-standard-2"
+        self.assertEqual(self.filed(self.pool(), self.reservation(machine_type=url))["candidates"], [])
+
+    def test_a_reservation_of_the_pool_s_machine_type_is_not_flagged(self):
+        self.assertEqual(self.filed(self.pool(), self.reservation(machine_type="n2-standard-2"))["candidates"], [])
+
+    def test_two_spellings_of_one_machine_type_are_not_flagged(self):
+        """Not recorded: a pool's machine type as a URL or in another letter
+        case, and the two spellings of an N1 custom machine type."""
+        url = "https://www.googleapis.com/compute/v1/projects/acme/zones/us-central1-a/machineTypes/n2-standard-2"
+        self.assertEqual(self.filed(self.pool(machine_type=url), self.reservation(machine_type="N2-Standard-2"))["candidates"], [])
+        self.assertEqual(self.filed(self.pool(machine_type="custom-4-8192"), self.reservation(machine_type="n1-custom-4-8192"))["candidates"], [])
+        self.assertEqual(self.filed(self.pool(machine_type="n1-custom-4-8192"), self.reservation(machine_type="custom-4-8192"))["candidates"], [])
+        # Another family's custom type is another machine type.
+        [candidate] = self.filed(self.pool(machine_type="custom-4-8192"), self.reservation(machine_type="n2-custom-4-8192"))["candidates"]
+        self.assertIn("machine type custom-4-8192; reservation res-other-type: machine type n2-custom-4-8192", candidate["excerpt"])
+
+    def test_one_name_in_two_zones_of_the_pool_is_named_zone_by_zone(self):
+        pool = self.pool(zones=("us-central1-b", self.ZONE))
+        [candidate] = self.filed(pool, self.reservation(zone="us-central1-b", machine_type="n1-standard-1"), self.reservation())["candidates"]
+        self.assertTrue(
+            candidate["excerpt"].endswith(
+                "reservation res-other-type: machine type e2-standard-2 in us-central1-a of project acme; "
+                "reservation res-other-type: machine type n1-standard-1 in us-central1-b of project acme"
+            )
+        )
+
+    def test_a_second_named_reservation_of_a_project_that_was_not_read_can_serve_the_pool(self):
+        """The other named reservation can be in the pool's zone for the
+        pool's machine type: no finding, and a limitation that names the pool."""
+        pool = self.pool(reservation="res-other-type,projects/gamma/reservations/r2")
+        entry = self.filed(pool, self.reservation())
+        self.assertEqual(entry["candidates"], [])
+        self.assertEqual(
+            entry["limitations"],
+            "reservation-mismatch-risk did not judge the machine type of these node pools: a reservation that the pool names is in its "
+            "zone for another machine type, and the reservations of another owner project that it names were not read in this run: "
+            "othertype-pool (project gamma)",
+        )
+        # The check ran for the other pools: its record stays.
+        self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
+        # With that project read, and its reservation in no zone of the pool, the pool is filed.
+        [candidate] = self.filed(pool, self.reservation(), read=("acme", "gamma"))["candidates"]
+        self.assertIn("reservation res-other-type: machine type e2-standard-2", candidate["excerpt"])
+
+    def test_the_procedure_describes_the_arm(self):
+        """The procedure's text for the arm, held in step with the collector."""
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        section = text.split(f"(`{self.SLUG}`)")[1].split("\n#### ")[0]
+        lines = {line.split(":**")[0]: line for line in section.splitlines() if line.startswith("- **")}
+        self.assertIn("The collector files (d) also for a pool whose named reservation is in a zone of the pool and is for another machine type than the pool's", lines["- **Flag when"])
+        self.assertIn("the autoscaler can report `scale.up.error.other` for it. The collector compares the machine type only.", lines["- **Flag when"])
+        self.assertIn("a node pool whose named reservation exists in at least one of its zones for the pool's machine type", lines["- **Do NOT flag"])
+        self.assertIn("Where the excerpt of a (d) finding names two machine types", lines["- **Remediation"])
+        self.assertIn("`gcloud container node-pools update --machine-type`", lines["- **Remediation"])
+        self.assertIn("a node pool whose named reservation is in its zone for another machine type", text)
+
+    def test_a_reservation_in_another_zone_is_the_other_arm_s_finding(self):
+        """Not in a zone of the pool: `file_reserved_pools` files it, one time."""
+        entry = self.filed(self.pool(), self.reservation(zone="us-central1-f"))
+        [candidate] = entry["candidates"]
+        self.assertIn("found only in us-central1-f of project acme", candidate["excerpt"])
+        self.assertNotIn("machine type", candidate["excerpt"])
+
+    def test_a_reservation_that_does_not_exist_is_the_other_arm_s_finding(self):
+        [candidate] = self.filed(self.pool())["candidates"]
+        self.assertIn("found in no zone of project acme", candidate["excerpt"])
+
+    def test_one_zone_with_the_pool_s_machine_type_is_enough(self):
+        pool = self.pool(zones=(self.ZONE, "us-central1-b"))
+        entry = self.filed(pool, self.reservation(), self.reservation(zone="us-central1-b", machine_type="n2-standard-2"))
+        self.assertEqual(entry["candidates"], [])
+
+    def test_one_of_two_named_reservations_with_the_pool_s_machine_type_is_enough(self):
+        pool = self.pool(reservation="r1,r2")
+        entry = self.filed(pool, self.reservation("r1"), self.reservation("r2", machine_type="n2-standard-2"))
+        self.assertEqual(entry["candidates"], [])
+
+    def test_two_named_reservations_of_other_machine_types_are_one_finding(self):
+        pool = self.pool(reservation="r1,r2", zones=(self.ZONE, "us-central1-b"))
+        entry = self.filed(pool, self.reservation("r1"), self.reservation("r2", zone="us-central1-b", machine_type="n1-standard-1"))
+        [candidate] = entry["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "reservationAffinity=SPECIFIC_RESERVATION, pool zones us-central1-a, us-central1-b, machine type n2-standard-2; "
+            "reservation r1: machine type e2-standard-2 in us-central1-a of project acme; "
+            "reservation r2: machine type n1-standard-1 in us-central1-b of project acme",
+        )
+
+    def test_a_reservation_whose_machine_type_was_not_read_is_not_flagged(self):
+        """`reservation_shapes` leaves out a reservation with no machine type
+        of its own; it can be for the pool's machine type."""
+        no_type = self.reservation("r1")
+        no_type["specificReservation"] = {"count": "1", "sourceInstanceTemplate": "projects/acme/global/instanceTemplates/t1"}
+        self.assertEqual(self.filed(self.pool(reservation="r1"), no_type)["candidates"], [])
+        pool = self.pool(reservation="r1,r2")
+        self.assertEqual(self.filed(pool, no_type, self.reservation("r2"))["candidates"], [])
+
+    def test_a_shared_reservation_of_a_project_of_the_run_is_compared(self):
+        pool = self.pool(reservation="projects/beta/reservations/r1")
+        entry = self.filed(pool, self.reservation("r1", project="beta"), read=("acme", "beta"))
+        [candidate] = entry["candidates"]
+        self.assertIn("reservation r1: machine type e2-standard-2 in us-central1-a of project beta", candidate["excerpt"])
+        self.assertEqual(candidate["command"], f"{self.POOLS_COMMAND}; gcloud compute reservations list --project beta --format json")
+
+    def test_an_owner_project_that_was_not_read_is_the_other_arm_s_limitation(self):
+        pool = self.pool(reservation="projects/beta/reservations/r1")
+        entry = self.filed(pool, read=("acme",))
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn(self.SLUG, {e["check"] for e in entry["checks_unevaluated"]})
+
+    def test_an_entry_with_no_reserved_pool_is_left_as_it_is(self):
+        entry = {"name": "acme/us-central1/c1", "commands": [], "candidates": []}
+        fs.file_reserved_pool_machines(entry, {}, {})
+        self.assertEqual(entry, {"name": "acme/us-central1/c1", "commands": [], "candidates": []})
+
+    def test_the_fleet_files_the_finding_on_the_cluster_entry(self):
+        manifest, cluster = ReservedPoolTest.fleet(self, self.pool(), reservations=[self.reservation()])
+        self.assertNotIn(fs.RESERVED_POOL_MACHINES_KEY, json.dumps(manifest))
+        [candidate] = [c for c in cluster["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual((candidate["object"], candidate["severity"]), ("NodePool/othertype-pool", "critical"))
+        self.assertIn("reservation res-other-type: machine type e2-standard-2 in us-central1-a of project acme", candidate["excerpt"])
+        # Both reads, each one a command `finish` accepts as evidence.
+        audit_report.validate_check_command(candidate["command"], cluster["name"], self.SLUG)
+        self.assertIn("gcloud container clusters list", candidate["command"])
+        self.assertIn("gcloud compute reservations list --project acme", candidate["command"])
+        self.assertIn(self.SLUG, {c["check"] for c in cluster["commands"]})
+
+    def test_the_fleet_files_nothing_for_the_pool_that_can_grow(self):
+        _, cluster = ReservedPoolTest.fleet(self, self.pool(), reservations=[self.reservation(machine_type="n2-standard-2")])
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+
+    def test_a_failed_reservations_read_files_nothing_here(self):
+        manifest, cluster = ReservedPoolTest.fleet(self, self.pool(), reservations_rc=1)
+        self.assertNotIn(fs.RESERVED_POOL_MACHINES_KEY, json.dumps(manifest))
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+        self.assertIn(self.SLUG, {e["check"] for e in cluster["checks_unevaluated"]})
+
+
 class CrashIsolationTest(unittest.TestCase):
     def test_one_cluster_crashing_costs_that_cluster_and_no_other(self):
         """`future.result()` re-raises, and the SOP redirects this collector's
