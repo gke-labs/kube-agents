@@ -315,7 +315,8 @@ up on the provider's rate limit or billing, Hermes's exit 75 or the API server's
 `hermes-api-unreachable` (the bridge never got a response from the pod's API server),
 `hermes-api-refused` (the API server answered a 4xx other than 429, before any turn ran) and
 `session-busy` (the task's deadline passed while it waited for its session's previous turn, so
-no request was sent), and the worker adapter's `worker-evicted`
+no request was sent) and `internal-panic` (the bridge recovered a panic while handling the
+task and ended it with no answer), and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the

@@ -66,6 +66,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 const (
@@ -1306,8 +1307,9 @@ func (b *Bridge) closeActivity() {
 
 // handleActivity is the door. Every answer past the method check is 204:
 // hermes retries connection errors and 5xx and warns on 4xx, and a delivery
-// the door cannot use (unsigned, unmatched, unparseable) is not the sender's
-// problem to hear about per call. An entry is published on this request,
+// the door cannot use (unsigned, unmatched, unparseable, or one whose
+// handling panicked: takeDelivery) is not the sender's problem to hear
+// about per call. An entry is published on this request,
 // under run.mu: hermes delivers from one background thread in order, so
 // the trace keeps call order, a publish costs the tool call nothing, and
 // there is no queue for finalize to race.
@@ -1337,6 +1339,27 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	b.takeDelivery(run, body, decoded)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// takeDelivery is the door's work for a delivery routed to run, under
+// taskguard.Guard: a panic anywhere in it, the decode and the tool result's
+// secret collection included, is recovered, logged and counted once, and
+// marks the run panicked (markPanicked), so it ends failed with no answer
+// (panic.go) rather than publish one whose scrub missed a value. The
+// delivery is dropped, and the sender still gets the door's 204: the run
+// is already marked, and a 5xx would only make hermes retry it.
+func (b *Bridge) takeDelivery(run *taskRun, body []byte, decoded *hookDelivery) {
+	if taskguard.Guard(b.cfg.Logger, "activity delivery", []any{"task", run.origin.TaskID}, func() {
+		b.takeDeliveryUnguarded(run, body, decoded)
+	}) != nil {
+		markPanicked(run)
+	}
+}
+
+// takeDeliveryUnguarded is takeDelivery's work.
+func (b *Bridge) takeDeliveryUnguarded(run *taskRun, body []byte, decoded *hookDelivery) {
 	var d hookDelivery
 	if decoded != nil {
 		d = *decoded
@@ -1348,7 +1371,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		// trace either way and the marker does not count it. Said in the
 		// log.
 		b.cfg.Logger.Warn("activity delivery unparseable", "task", run.origin.TaskID, "err", err)
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	// observe under run.mu: it closes the call, and a finalize slipping in
@@ -1361,18 +1383,54 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// would hold the heartbeat and a finalize behind it. A value that lands
 	// after the answer was published scrubs nothing; the answer is out.
 	if d.Event == hookPostToolCall {
-		act.secrets.CollectToolResult(d.Extra.Result)
+		b.collectToolResult(act, d.Extra.Result)
 	}
 	b.observeDelivery(run, act, d)
-	w.WriteHeader(http.StatusNoContent)
+}
+
+// collectToolResult reads a tool result's secret values into the task's
+// seen set, for the answer's scrub; b.collectResult when a test set it.
+func (b *Bridge) collectToolResult(act *activityState, result json.RawMessage) {
+	if b.collectResult != nil {
+		b.collectResult(act, result)
+		return
+	}
+	act.secrets.CollectToolResult(result)
+}
+
+// markPanicked marks run touched by a recovered panic, under run.mu, so a
+// finalize that takes mu after it publishes no answer. A finalize already
+// past its check has published what it had, as for a secret value that
+// lands after the answer.
+func markPanicked(run *taskRun) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	run.panicked.Store(true)
 }
 
 // observeDelivery is the door's critical section: under run.mu, released by
-// defer, it observes the delivery and publishes what it closed.
+// defer, it observes the delivery and publishes what it closed. A panic in
+// it is recovered here, still under run.mu, and marks the run panicked
+// before the lock is released, so a finalize that takes mu next already
+// sees the mark and publishes no answer.
 func (b *Bridge) observeDelivery(run *taskRun, act *activityState, d hookDelivery) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
-	entry, ok, steps := act.observe(d)
+	if taskguard.Guard(b.cfg.Logger, "activity observation", []any{"task", run.origin.TaskID}, func() {
+		b.observeDeliveryLocked(run, act, d)
+	}) != nil {
+		run.panicked.Store(true)
+	}
+}
+
+// observeDeliveryLocked observes the delivery and publishes what it
+// closed. Caller holds run.mu.
+func (b *Bridge) observeDeliveryLocked(run *taskRun, act *activityState, d hookDelivery) {
+	observe := b.observe
+	if observe == nil {
+		observe = (*activityState).observe
+	}
+	entry, ok, steps := observe(act, d)
 	b.publishSteps(run, act, steps)
 	if ok {
 		if run.state == stateRunning {
@@ -1446,8 +1504,15 @@ func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
 	if d.Event != hookPostToolCall || d.SessionID == "" {
 		return
 	}
-	if run := cardWorkerRun(runs, *d); run != nil {
-		run.act.Load().secrets.CollectToolResult(d.Extra.Result)
+	// A panic here marks the run it found, as takeDelivery does: that
+	// run's answer folds the card's report in.
+	var run *taskRun
+	if taskguard.Guard(b.cfg.Logger, "card worker delivery", nil, func() {
+		if run = cardWorkerRun(runs, *d); run != nil {
+			b.collectToolResult(run.act.Load(), d.Extra.Result)
+		}
+	}) != nil && run != nil {
+		markPanicked(run)
 	}
 }
 
@@ -1470,7 +1535,11 @@ func (b *Bridge) runActivity(run *taskRun) {
 		case <-a.stop:
 			return
 		case <-tick:
-			b.heartbeatTick(run, a)
+			// A panicking tick is logged and counted and skipped; the
+			// heartbeat goes on (panic.go).
+			_ = taskguard.Guard(b.cfg.Logger, "heartbeat", []any{"task", run.origin.TaskID}, func() {
+				b.heartbeatTick(run, a)
+			})
 		}
 	}
 }
@@ -1480,7 +1549,11 @@ func (b *Bridge) heartbeatTick(run *taskRun, a *activityState) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
 	if run.state == stateRunning && a.heartbeatUnderBudget() {
-		b.publishProgress(run, a.progressLine(time.Now()))
+		line := b.progressLine
+		if line == nil {
+			line = (*activityState).progressLine
+		}
+		b.publishProgress(run, line(a, time.Now()))
 	}
 }
 

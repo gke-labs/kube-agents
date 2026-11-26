@@ -1091,7 +1091,7 @@ agrees with that subject like any executor's. Profile-addressed tasks have no
 supervisor ROLE until the dispatcher lands - though the gateway's rendered grant is an
 addressee wildcard and reaches their `…supervisor` regardless, which the profiles spec
 spells out; that is a gap the profiles
-spec names, not one this sweep fills. Two failure classes:
+spec names, not one this sweep fills. Three failure classes:
 
 - **The subprocess dies under a live bridge.** The runner sees the exit and publishes
   terminal `failed` with the evidence. Ordinary executor path, nothing special.
@@ -1101,6 +1101,19 @@ spec names, not one this sweep fills. Two failure classes:
   deleted after the terminal publish). On startup, before consuming, it sweeps: fold
   each registered task's events, and for any non-final one publish terminal `failed`
   (`reason: bridge-died-without-terminal-event`).
+- **A panic while the bridge handles one task.** It is recovered at that task's goroutine
+  (the worker's task, a card stop, the activity door's handling of a delivery matched to a
+  task, a heartbeat tick), and the bridge keeps serving. The task ends `failed` with
+  `reason: internal-panic`, and the recovery publishes no answer: no result and no further
+  turn artifact. What went out before the panic stays, including the chunks of a result
+  publish it interrupted, as a result publish that fails partway leaves them. A panicked
+  heartbeat tick is only skipped; a door delivery whose handling panicked is dropped and
+  still answered 204. Each recovery is logged at Error with the message
+  `recovered a panic`, the panic's type or runtime error, and the stack. The count of
+  recoveries is kept in the process with no endpoint, so alert on the log message or the
+  reason. A panic anywhere else (the durable's consumer goroutine and the finalizes it
+  runs, the deadline and kill timers, the route-recording and card-abort goroutines)
+  still ends the process, and the sweep above finalizes its tasks.
 
 The sweep's publish is a compare-and-swap per the profiles spec, not a read-then-write:
 expected-last-subject-sequence pinned to the last event the fold saw. A dying

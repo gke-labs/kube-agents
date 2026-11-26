@@ -39,6 +39,8 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 const (
@@ -389,6 +391,17 @@ type taskRun struct {
 	// which publishes the answer before any terminal (the capability check
 	// and the turn artifact between two turns take time).
 	answerHeld bool
+	// terminalTried is set, under mu, once a terminal publish for this run
+	// has been made, whether or not it went out (one that did not is the
+	// sweep's). A recovered panic (panic.go) reads it to tell a finalize
+	// that panicked after stateDone, with no terminal written, from one
+	// that finished.
+	terminalTried bool
+
+	// panicked is set when a recovered panic touched this run (panic.go):
+	// every later finalize ends it failed with taskguard.Reason and
+	// publishes no answer, and no further turn artifact goes out.
+	panicked atomic.Bool
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -477,6 +490,19 @@ type Bridge struct {
 	// when the fold returns against the publish window finalizeResult opens
 	// after it, without an answer whose fold is slow enough to time.
 	chatPart func(answer string) (lib.Part, bool)
+	// observe reads one activity-door delivery into the task's trace under
+	// run.mu, (*activityState).observe when nil; progressLine is the
+	// heartbeat's line, (*activityState).progressLine when nil. Fields so a
+	// test can make either panic with the lock held (panic.go).
+	observe      func(a *activityState, d hookDelivery) (ActivityEntry, bool, []stepmsg.Step)
+	progressLine func(a *activityState, now time.Time) string
+	// collectResult reads a tool result into the task's seen set for the
+	// answer's scrub, (*activityState).secrets.CollectToolResult when nil;
+	// a field so a test can make it panic (panic.go).
+	collectResult func(a *activityState, result json.RawMessage)
+	// usagePart builds a turn's usage part, lib.UsagePart when nil; a field
+	// so a test can make a usage publish panic with run.mu held (panic.go).
+	usagePart func(u lib.Usage) (lib.Part, error)
 	// responseCap bounds the API executor's answer read, apiResponseCap by
 	// default; a field so a test can put an answer exactly at the cap
 	// without reading, folding and publishing 8 MiB under the race detector.
@@ -1191,9 +1217,18 @@ func (v boundaryVerdicts) refusal(ctx context.Context, b *Bridge, env *lib.Envel
 // noticeMu. false means the task is final: it already was, or the publish
 // failed and this finalized it with the answer as the result, so the answer
 // is not lost with the turn artifact. Either way the follow-up is still at
-// the head of the queue, and that finalize refused it task-ended.
+// the head of the queue, and that finalize refused it task-ended. A run a
+// recovered panic marked (taskRun.panicked) publishes no turn artifact:
+// this finalizes it failed with taskguard.Reason and no result, and
+// answers false.
 func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 	running, err := b.publishTurnArtifact(run, turn, text)
+	if run.panicked.Load() {
+		// A recovered panic touched the run (the activity door's, say):
+		// no answer of it goes out, and it ends failed here.
+		b.finalize(run, lib.StateFailed, taskguard.Reason, nil)
+		return false
+	}
 	if !running {
 		return false
 	}
@@ -1211,20 +1246,28 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 
 // publishTurnArtifact is publishTurnAnswer's critical section: under
 // noticeMu, released by defer, it publishes the scrubbed answer as a turn
-// artifact if the run is still running. running false means it published
-// nothing.
+// artifact if the run is still running and not marked panicked. running
+// false means it published nothing. The mark is read again after the
+// scrub, just before the publish, but the activity door sets it under
+// run.mu, not noticeMu, so a mark that lands in the moment between that
+// read and the publish still lets this turn's artifact out: scrubbed, as
+// every turn artifact is; unscrubbed text never reaches it.
 func (b *Bridge) publishTurnArtifact(run *taskRun, turn int, text string) (running bool, err error) {
 	run.noticeMu.Lock()
 	defer run.noticeMu.Unlock()
 	run.mu.Lock()
 	running = run.state == stateRunning
 	run.mu.Unlock()
-	if !running {
+	if !running || run.panicked.Load() {
+		return false, nil
+	}
+	visible := visibleOr(scrubAnswer(run, text))
+	if run.panicked.Load() {
 		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	defer cancel()
-	return true, b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(scrubAnswer(run, text)))
+	return true, b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visible)
 }
 
 // turnNote names the turn in a failed terminal's reason after the first.
@@ -1366,7 +1409,9 @@ func (b *Bridge) worker(ctx context.Context) {
 		}
 		run.state = stateRunning
 		run.mu.Unlock()
-		b.runTask(ctx, run)
+		// One task's panic ends that task, failed closed, and the worker
+		// goes on to the next (panic.go).
+		b.guardTask("task", run, func() { b.runTask(ctx, run) })
 	}
 }
 
@@ -2013,6 +2058,14 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// serialized on noticeMu, so the state is still not done below.
 	b.refuseQueued(context.Background(), run)
 	state, err := b.finalizeLocked(run, state, msg, resultOutput, data, copyOnly)
+	b.afterTerminal(run, state, err)
+}
+
+// afterTerminal is what follows a run's terminal publish, with run.mu
+// released: the heartbeat joined, then, if the terminal went out, the run
+// cleared from the KV registry and the task table. One that did not go out
+// stays registered for the sweep.
+func (b *Bridge) afterTerminal(run *taskRun, state lib.TaskState, err error) {
 	b.waitActivity(run)
 	if err != nil {
 		// The task stays in the KV registry, so a restart's sweep writes the
@@ -2043,6 +2096,13 @@ func (b *Bridge) finalizeLocked(run *taskRun, state lib.TaskState, msg string, r
 	// complete and nothing of it can follow the final event.
 	b.drainActivity(run)
 	run.state = stateDone
+	if run.panicked.Load() {
+		// Fail closed: a recovered panic touched this run, so whatever
+		// answer the caller had is not published, and the terminal says
+		// why. Read under mu, which the activity door holds when it marks
+		// the run (observeDelivery).
+		state, msg, resultOutput, data = lib.StateFailed, taskguard.Reason, nil, nil
+	}
 	// The answer folded for a chat renderer, on a completed task only: any
 	// other state's result is a copy beside the terminal's reason. A
 	// caller's own data part (finalizeData) takes its place. Folded before
@@ -2074,6 +2134,7 @@ func (b *Bridge) finalizeLocked(run *taskRun, state lib.TaskState, msg string, r
 	}
 	b.publishHandoff(ctx, run, state)
 	err := b.publishTerminal(ctx, run, state, msg)
+	run.terminalTried = true
 	cancel()
 	// The task's answers are out: the values seen for their scrub go.
 	b.clearSeenSecrets(run)
@@ -2136,7 +2197,11 @@ func (b *Bridge) publishHandoff(ctx context.Context, run *taskRun, state lib.Tas
 // after it. Best-effort, like every artifact but the result; a usage with no
 // figure publishes nothing, so a reader sees absence rather than zeroes.
 func (b *Bridge) publishUsageLocked(run *taskRun, u lib.Usage) {
-	part, err := lib.UsagePart(u)
+	usagePart := b.usagePart
+	if usagePart == nil {
+		usagePart = lib.UsagePart
+	}
+	part, err := usagePart(u)
 	if err != nil {
 		if u != (lib.Usage{Model: u.Model}) {
 			// A figure was there and the part was refused (a negative
