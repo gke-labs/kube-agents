@@ -86,9 +86,9 @@ func claudeGrant(t *testing.T, out persona.Output) grantSummary {
 }
 
 // coreAgentGrant reads the wire policy a core-agent turn receives, and
-// checks each grant has exactly the rules it should: the narrowings the
-// persona grant names (workspace-scoped reads, a shell of simple commands
-// only) are pinned here, so neither drifts.
+// checks each grant has exactly the rules it should: the read tools' and the
+// shell's rules, the any-command flag that comes with a persona's shell, and
+// no rule or deny outside the grant, so none of them drifts.
 func coreAgentGrant(t *testing.T, p coreagentwire.Policy, workdir string) grantSummary {
 	t.Helper()
 	g := grantSummary{WebSearch: p.WebSearch}
