@@ -250,7 +250,17 @@ func TestTheHealIgnoresAFiveTokenTerminalOnAProfileTaskAfterTheCutoff(t *testing
 			}
 			continue
 		}
-		if len(got) != 1 || got[0].source != TerminalFromSupervisor || rec.ActiveTask != nil {
+		// The rig's relay consumes the same supervisor subject the heal reads,
+		// so on a loaded runner both can record this terminal (#7206). What
+		// the heal owes is the record released and the supervisor's terminal
+		// observed: at least one, and none from another source.
+		healed := rec.ActiveTask == nil && len(got) >= 1
+		for _, o := range got {
+			if o.source != TerminalFromSupervisor {
+				healed = false
+			}
+		}
+		if !healed {
 			t.Errorf("the session task did not heal on its supervisor's terminal: terminals %+v, active %+v", got, rec.ActiveTask)
 		}
 	}
