@@ -299,10 +299,11 @@ Each of these needs the secret of that sender, or the power to write labels in t
 
 The design for external MCP servers (#1989) is the read path to a vendor. This design is the inbound path. They share no code.
 
-- The receiver takes only what the source pushes, and it makes no call to the source. Each read of Datadog (monitor details, logs, incidents) is a tool call of the session through the external MCP path.
+- The receiver takes only what the source pushes, and it makes no call to the source. A read of Datadog (monitor details, logs, incidents) is a tool call of a session through the external MCP path, for a caller that the read path admits.
 - The two paths hold credentials of different kinds. The receiver holds a secret that verifies the sender. The read path holds the vendor's API credential in the credential proxy.
 - The shared names are the four fields of `source` in the normalized alert: `site`, `monitorId`, `incidentId` and `url`. `site` has the form of the Datadog site domain (`datadoghq.com`, `datadoghq.eu`, `us5.datadoghq.com`), which is also the value that the read path configures. A session gives `monitorId` and `incidentId` to the vendor's own tools with no change.
-- The session reads the source only when the alert's `source.site` is the configured site of the read path, because that path has a credential and an egress rule for one site. This design adds no check of its own. An alert from another site gets a triage from cluster state only.
+- Which caller gets the read is a decision of the read path's design, not of this one. A triage run of this design has the `unattended` tier and a trigger, and the read path can refuse such a caller. This design does not depend on the read: the triage works from the alert's own content and from cluster state. With no read for the triage run, the read of the source is for the session of a person who follows up.
+- Where a session has the read, it works only when the alert's `source.site` is the configured site of the read path, because that path has a credential and an egress rule for one site. This design adds no check of its own.
 
 ## 11. What a person sees when it breaks
 
@@ -323,3 +324,4 @@ The design for external MCP servers (#1989) is the read path to a vendor. This d
 3. Does the first user's alert path go from the monitor to chat only, or can the monitor also call a webhook? The answer decides which of the two ways of §6 that user needs.
 4. Is one triage for an episode right when the first run failed, or when the incident stays open for days? A second run needs a way to see the state of the first one.
 5. Does the receiver need a durable state, so that a restart starts no extra triage and loses no held notice?
+6. Does the read path of #1989 admit a triage run that a trigger started? Without it, the triage of a Datadog alert reads no Datadog data.
