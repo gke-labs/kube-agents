@@ -349,8 +349,9 @@ func (c teamsChatCard) actions() []map[string]any {
 
 // chatCard lays m's chat message out as the card messageID shows next
 // (empty for a new message), with the Stop button of a running task's line
-// and the rating controls of an answer marked for feedback, and refuses a
-// layout that draws nothing or does not fit one activity. An answered
+// and the rating controls of a message marked for feedback when the card
+// still fits with them, and refuses a layout that draws nothing or does
+// not fit one activity. An answered
 // question keeps its line through an edit that lays out no choices.
 func (a *TeamsAdapter) chatCard(messageID string, m OutMessage) (teamsChatCard, error) {
 	layout, err := renderTeamsChat(m.Chat)

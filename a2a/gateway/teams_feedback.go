@@ -6,8 +6,9 @@ import (
 )
 
 // Answer feedback on Teams (spec-chatops-gateway.md, "Answer feedback"): the
-// two rating controls on the card of an answer the relay marked
-// (OutMessage.Feedback), drawn once the gateway has handed the adapter its
+// two rating controls on the card of a message marked for feedback
+// (OutMessage.Feedback), an answer the relay marked or a post the agent
+// made on its own, drawn once the gateway has handed the adapter its
 // recorder, as on Google Chat and Slack.
 //
 // 👍 is an Action.Submit, a press like the Stop button's (teams_press.go).
@@ -118,7 +119,8 @@ func teamsRatingActions(task string, days int) []map[string]any {
 	}
 }
 
-// postRated posts an answer with its rating controls and remembers it.
+// postRated posts a message marked for feedback with its rating controls
+// and remembers it.
 func (a *TeamsAdapter) postRated(conversation string, m OutMessage) (string, error) {
 	id, err := a.post(conversation, m.Text, teamsRatingActions(m.Feedback, a.feedbackRecorder().KeptDays()))
 	if err == nil {

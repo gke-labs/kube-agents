@@ -327,8 +327,21 @@ func TestTeamsHomeCardTakesAPressFromItsThread(t *testing.T) {
 	a.mu.Lock()
 	q := a.uxLocked().questions[id]
 	a.mu.Unlock()
-	if want := teamsConversationID(landed); q.conversation != want {
-		t.Fatalf("the home card's question is filed under %q, want its thread %q", q.conversation, want)
+	a.mu.Lock()
+	open, stale := a.uxLocked().open[teamsConversationID(landed)], a.uxLocked().open[teamsConversationID(home)]
+	a.mu.Unlock()
+	if want := teamsConversationID(landed); q.conversation != want || open != id || stale != "" {
+		t.Fatalf("the home card's question is filed under %q (open there %q, open under the channel %q), want its thread %q alone", q.conversation, open, stale, want)
+	}
+	// A keyed edit of the post, which names the thread, agrees with it.
+	if err := a.EditNotifyMessage(home, landed, id, OutMessage{Text: "fallback", Chat: testTeamsQuestion(), Feedback: mark}); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	q, open = a.uxLocked().questions[id], a.uxLocked().open[teamsConversationID(landed)]
+	a.mu.Unlock()
+	if want := teamsConversationID(landed); q.conversation != want || open != id {
+		t.Fatalf("after a keyed edit the question is filed under %q (open %q), want %q", q.conversation, open, want)
 	}
 	press := testTeamsPress("f:80", id, teamsChoice("yes, restart it", 0, "Yes"))
 	press["conversation"] = map[string]any{"id": landed, "conversationType": "channel", "tenantId": testTeamsTenant}
@@ -359,8 +372,34 @@ func TestTeamsHomeCardTakesAPressFromItsThread(t *testing.T) {
 	if _, _, err := a.PostNotifyMessage(home, "", tight); err != nil {
 		t.Fatalf("a card the rating controls do not fit beside was refused: %v", err)
 	}
-	if actions := teamsLineActions(t, relay, 1); len(actions) != len(plain.actions()) {
+	if actions := teamsLineActions(t, relay, 2); len(actions) != len(plain.actions()) {
 		t.Errorf("the tight card's actions: %d, want its own %d and no rating controls", len(actions), len(plain.actions()))
+	}
+}
+
+// A reply typed in the thread a home card started answers its question: the
+// card is drawn again with the answered line.
+func TestTeamsHomeCardTakesATypedAnswerFromItsThread(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	home, _, _ := strings.Cut(testTeamsChannel, teamsThreadToken)
+	id, landed, err := a.PostNotifyMessage(home, "", OutMessage{Text: "fallback", Chat: testTeamsQuestion()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typed := testTeamsActivity("f:81", "<at>Kage</at> yes please")
+	typed["conversation"] = map[string]any{"id": landed, "conversationType": "channel", "tenantId": testTeamsTenant}
+	msg, reason := a.classify(decodeTeamsActivity(t, typed))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != 2 {
+		t.Fatalf("%d calls, want the post and the answered redraw of %s", n, id)
+	}
+	if text := teamsCallText(t, relay, 1); !strings.Contains(text, "✓ hangdng: yes please") {
+		t.Errorf("the answered home card reads %q", text)
 	}
 }
 

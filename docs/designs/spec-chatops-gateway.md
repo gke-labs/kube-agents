@@ -3296,7 +3296,8 @@ bullets with the severity in bold, the `after` lines, and the fold drawn open wi
 the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
 carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
 line's Stop button and the rating controls. A row's Retry and Drop are not drawn. A home post
-goes through `PostNotifyMessage`, laid out the same way. A
+goes through `PostNotifyMessage`, laid out the same way. A card that fits one activity only
+without the rating controls is posted without them. A
 layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
 (`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
 `ErrTextOnly` as before. The shared cases lay out as the golden files in

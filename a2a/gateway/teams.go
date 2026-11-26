@@ -905,7 +905,7 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 // so the gateway posts its text; with cards off a chat message falls back
 // to its text (ErrTextOnly). Text is rendered as a card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
-// (teams_press.go); an edit that names no task removes it. An answer marked
+// (teams_press.go); an edit that names no task removes it. A message marked
 // for feedback (m.Feedback) carries the rating controls on its card, once
 // the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
