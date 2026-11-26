@@ -117,7 +117,10 @@ Only run the real install after I say yes.
    <Aside type="caution">
      **Working on `main` (Developers only):** If you clone the repository from
      `main` without `--branch`, `install.sh` defaults to your local `HEAD`
-     commit SHA and requires candidate images built from that commit in GHCR. Do
+     commit SHA and requires images built from that commit in the registry the
+     install pulls from. GHCR carries releases, not `main` commits, so [build
+     the images](/kube-agents/deploy/docker-images/#local-builds) from your
+     checkout and pass `--registry-prefix` for the registry that holds them. Do
      not install an older release from a `main` checkout: manifests and CRD
      schemas on `main` evolve continuously and are incompatible with older
      release images. The installer's `verify_local_source_ref` checks revision

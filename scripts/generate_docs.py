@@ -780,7 +780,7 @@ ORIGIN_SECTIONS: list[tuple[str, str, str]] = [
     (
         "first-party",
         "Built and published by this repo",
-        "Tagged with the release version; `:latest` on every push to `main`.",
+        "Tagged with the release version; `:latest` is the newest release.",
     ),
     (
         "third-party",

@@ -78,7 +78,7 @@ Several images keep a second copy of their pin elsewhere in the tree: a chart va
 
 ### Built and published by this repo
 
-Tagged with the release version; `:latest` on every push to `main`.
+Tagged with the release version; `:latest` is the newest release.
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
@@ -144,7 +144,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `kube-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. `k8s-operator` and the A2A `next`-stack images are not built by that workflow (the [image inventory](#built-and-published-by-this-repo) above lists every first-party image). Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
+Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` by each release, tagged with the release version; `:latest` is the newest release (the [image inventory](#built-and-published-by-this-repo) above lists every first-party image). A release retags the images built for its commit without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
 
 ### `platform-agent`
 

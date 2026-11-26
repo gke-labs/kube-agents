@@ -117,8 +117,11 @@ after the upgrade.
 
 The `appVersion` in a checkout's `Chart.yaml` is a placeholder that never
 corresponds to a published image tag, so checkout installs must override
-**both** image tags with tags that exist (`latest` or a commit SHA — published
-on every push to `main`):
+**both** image tags with tags that exist. A `main` checkout's chart can be
+ahead of the newest release, so for a commit of `main` build its images, and
+set `global.imageRegistry` to the registry that holds them and both tags to the
+tag you pushed. GHCR carries releases: a release version, or `latest` for the
+newest release, as here:
 
 ```bash
 helm install kube-agents ./charts/kube-agents \

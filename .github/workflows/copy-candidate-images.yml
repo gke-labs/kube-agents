@@ -4,11 +4,12 @@ name: Copy Images to the Candidate Repository
 # repository in Artifact Registry, under the same `:<sha>` tags and at the same
 # digests, for a commit that is on GHCR and not there.
 #
-# "Publish Images to GHCR" pushes every commit it builds to both registries, so
-# nothing starts this on its own. A dispatch copies one commit by hand: one
-# published by a release line whose own copy of the publish workflow pushes to
-# GHCR alone, or one published before the publish workflow pushed to both.
-# Unsigned on purpose: the signatures are on the GHCR references.
+# "Publish Images to GHCR" pushes every commit it builds to the candidate
+# repository itself, so nothing starts this on its own. A dispatch copies one
+# commit by hand: one published by a release line whose own copy of the publish
+# workflow pushes to GHCR, or a `main` commit published before the workflow
+# pushed to the candidate repository.
+# Unsigned on purpose: nothing verifies a commit image's signature.
 
 on:
   #checkov:skip=CKV_GHA_7:A hand-started copy has to name the commit whose images it copies

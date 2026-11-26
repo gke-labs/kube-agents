@@ -145,6 +145,31 @@ class DecideImagePublishTest(unittest.TestCase):
                 self.assertIn(f"/v2/mock-project/mock-candidates/platform-agent/manifests/{_SHA}", log_path.read_text())
                 log_path.unlink()
 
+    def test_the_candidate_registry_is_the_one_asked_when_it_is_named(self):
+        """The workflow pushes to CANDIDATE_REGISTRY_PREFIX and nowhere else, so
+        that registry says whether the commit was built; the registry prefix,
+        where a release is published, holds no commit image to find."""
+        _, log_path, _ = create_mock_ar_curl_binary(self.bin_dir, manifest_http_status=200)
+        create_mock_gcloud_token_binary(self.bin_dir)
+        self.output.write_text("")
+        env = get_isolated_test_env(
+            overrides={
+                "PATH": str(self.bin_dir),
+                "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX,
+                "GITHUB_REF": _LINE_REF,
+                "GITHUB_SHA": _SHA,
+                "GITHUB_ACTOR": _MERGER,
+                "GITHUB_OUTPUT": str(self.output),
+            }
+        )
+        proc = subprocess.run(["bash", str(_SCRIPT)], capture_output=True, text=True, env=env, cwd=_REPO_ROOT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("build=false", self.output.read_text())
+        requests = pathlib.Path(log_path).read_text()
+        self.assertIn(f"/v2/mock-project/mock-candidates/platform-agent/manifests/{_SHA}", requests)
+        self.assertNotIn(MOCK_DEFAULT_REGISTRY_PREFIX.split("/", 1)[0], requests)
+
     def test_an_artifact_registry_that_refuses_fails_the_decision(self):
         """A 403 from Artifact Registry is "could not ask", as on GHCR: never a build."""
         proc, outputs, _ = self._run_against_artifact_registry(403)

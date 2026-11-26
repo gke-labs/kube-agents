@@ -6,7 +6,7 @@
 # `git tag -a` — and a push event's github.sha is the new value of the ref, which
 # for an annotated tag is the tag object's SHA rather than the commit's. The
 # staging redeploys pass that value to `helm upgrade --set …image.tag`, and the
-# GHCR images are published under the commit SHA, so the unpeeled value names an
+# images are published under the commit SHA, so the unpeeled value names an
 # image that was never pushed: the `--wait` deploy times out on ImagePullBackOff
 # and strands the shared kube-agents release in pending-upgrade.
 #

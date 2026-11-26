@@ -355,7 +355,8 @@ class CopyCandidateImagesWorkflowTest(unittest.TestCase):
 
     def test_the_publish_workflow_pushes_where_the_copy_copies_to_as_the_same_identity(self):
         """One destination and one Google identity, spelled in two files: a
-        typo in the publish workflow's copy would fail every publish."""
+        typo in the publish workflow's copy would fail every publish. Its
+        decide job signs in as that identity too, to ask the destination."""
         self.assertEqual(self.publish["env"]["CANDIDATE_REGISTRY_PREFIX"], self.job["env"]["CANDIDATE_REGISTRY_PREFIX"])
         auth_action = "google-github-actions/auth"
         (copy_auth,) = [step for step in self.job["steps"] if str(step.get("uses", "")).split("@")[0] == auth_action]
@@ -365,7 +366,7 @@ class CopyCandidateImagesWorkflowTest(unittest.TestCase):
             for step in job["steps"]
             if str(step.get("uses", "")).split("@")[0] == auth_action
         ]
-        self.assertEqual(len(publish_auths), 2)
+        self.assertEqual(len(publish_auths), len(self.publish["jobs"]))
         for step in publish_auths:
             self.assertEqual(step["uses"], copy_auth["uses"])
             self.assertEqual(step["with"], copy_auth["with"])

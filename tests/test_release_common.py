@@ -134,6 +134,27 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_release_is_newest_ga(self):
+        """The highest X.Y.Z tag is the newest release; a lower one, one with
+        no tag of its own and an empty version are not."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        git("tag", "-a", "0.1.0", "-m", "Release 0.1.0")
+        git("tag", "-a", "0.2.0", "-m", "Release 0.2.0")
+        git("tag", "-a", "0.1.5", "-m", "Release 0.1.5")
+        untagged_dir, untagged_repo, _ = create_mock_git_repo()
+        self.addCleanup(untagged_dir.cleanup)
+        cases = (
+            (repo_dir, "0.2.0", True),
+            (repo_dir, "0.1.5", False),
+            (repo_dir, "0.3.0", False),
+            (untagged_repo, "", False),
+        )
+        for cwd, version, newest in cases:
+            with self.subTest(version=version):
+                proc = self._run_common_func(f'release_is_newest_ga "{version}"', cwd=cwd)
+                self.assertEqual(proc.returncode == 0, newest, proc.stderr)
+
     # ─── get_base_ga_tag_for_commit ───────────────────────────────────────────
     # The base a version bump, the scheduled-release range and the release notes
     # start from, found by ancestry rather than by number. The graph: main
@@ -2616,7 +2637,7 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
         proc = self._run("find_latest_built_commit", cwd=repo_dir, bin_dir=bin_dir, env=self._REGISTRY)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), older)
-        self.assertIn(f"Images not ready yet in GHCR for commit {newer[:7]}", proc.stderr)
+        self.assertIn(f"Images not ready yet in {MOCK_DEFAULT_REGISTRY_PREFIX} for commit {newer[:7]}", proc.stderr)
 
     def test_the_fallback_is_this_checkouts_list_and_says_why(self):
         """Every way the candidate's list cannot be read falls back to this

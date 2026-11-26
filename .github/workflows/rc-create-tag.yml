@@ -79,7 +79,7 @@ jobs:
       # that registry as the environment's deploy identity, which has to
       # hold read on it (registry_image_exists asks Artifact Registry over
       # its API with the job's Google credential, before docker). With
-      # REGISTRY_PREFIX unset the images are on GHCR, which answers without a
+      # REGISTRY_PREFIX unset the check asks GHCR, which answers without a
       # login, and these two steps are skipped.
       - name: Authenticate to Google Cloud for the image check
         if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
