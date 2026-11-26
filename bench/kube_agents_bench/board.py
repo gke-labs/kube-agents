@@ -334,13 +334,15 @@ if out["error"] is None:
         for tid in out["created"]:
             if isinstance(tid, str) and tid and tid not in ids:
                 ids.append(tid)
-        # Every scanned card's status; a deliverable only for the ids wanted.
+        # Every scanned card's status and creation time; a deliverable only
+        # for the ids wanted. A board without ``created_at`` reads it as None.
+        created_col = "created_at" if "created_at" in columns(board, "tasks") else "NULL"
         for part in chunks(ids):
-            for tid, status in board.execute(
-                "SELECT id, status FROM tasks WHERE id IN (%s)" % marks(part), part
+            for tid, status, created_at in board.execute(
+                "SELECT id, status, %s FROM tasks WHERE id IN (%s)" % (created_col, marks(part)), part
             ):
                 out["cards"][str(tid)] = {"status": str(status), "result": None, "summary": None,
-                                          "block": None}
+                                          "block": None, "created_at": created_at}
         wanted = [t for t in WANT if t in out["cards"]]
         if wanted:
             if "result" in columns(board, "tasks"):
@@ -499,7 +501,9 @@ class SessionCards:
     ids the read was asked for (``want``), its ``result`` (``tasks.result``)
     and ``summary`` (the newest non-empty ``task_runs.summary``), and for a
     blocked one its ``block`` (the newest stop event's ``kind`` and
-    ``reason`` when that stop is a ``blocked`` one); ``None`` for the rest. An id in ``card_ids`` and not in
+    ``reason`` when that stop is a ``blocked`` one); ``None`` for the rest. Every
+    card carries its ``created_at`` in epoch seconds, ``None`` when the board
+    has no such column or no number in it. An id in ``card_ids`` and not in
     ``cards`` is one the board has no row for.
     """
 
@@ -573,6 +577,13 @@ def _block(raw: Any) -> dict[str, str] | None:
     }
 
 
+def _epoch(raw: Any) -> int | None:
+    """A card's ``created_at`` as the read reported it, in whole epoch seconds, or ``None``."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return int(raw)
+
+
 def read_session_cards(
     shell: Callable[[str, float], str],
     session_id: str,
@@ -638,6 +649,7 @@ def read_session_cards(
                     if isinstance(card.get("summary"), str)
                     else None,
                     "block": _block(card.get("block")),
+                    "created_at": _epoch(card.get("created_at")),
                 }
     return SessionCards(
         session_found=bool(payload.get("session")),

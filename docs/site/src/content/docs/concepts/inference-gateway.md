@@ -124,7 +124,7 @@ The gateway checks the key each caller sends. The chart runs LiteLLM with a mast
 - A key listed under the reserved class `gateway-probe` reaches `GET /v1/models` and nothing else. It lets a readiness check confirm that a gateway pod has loaded the current map without sending any caller's key.
 - Any other key is refused with HTTP 401.
 
-An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
+An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`, and the Gemini-format generation calls `/v1beta/models/<model>:generateContent`, `:streamGenerateContent` and `:countTokens`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
 
 `litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart.
 
@@ -289,7 +289,9 @@ A few fields are left as they came. They are kept only where the provider APIs p
 - provider-encrypted content, which the provider checks byte for byte. That is a Responses reasoning item's `encrypted_content`, and in the assistant's turn a web search result's `encrypted_content`, the `reasoning_details` data and signature, and the `thought_signature` LiteLLM carries on the message and its tool calls;
 - binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
 
-A request the hook cannot walk is refused. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64. Two payload positions are not among them: the content parts of a Responses `input` item (`input_file`, `input_image`) and the parts inside a Gemini function response. A base64 payload there isn't checked as a payload. The text rules still run over it, and a rule whose pattern happens to appear in the base64 text rewrites it, which corrupts the payload. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
+A request the hook cannot walk is refused with 400, since the same request is refused every time and a caller shouldn't retry it. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64.
+
+Two payload positions are not among them: the content parts of a Responses `input` item (`input_file`, `input_image`) and the parts inside a Gemini function response. A base64 payload there isn't checked as a payload. The text rules still run over it, and a rule whose pattern happens to appear in the base64 text rewrites it, which corrupts the payload. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 
 The rendered default config does not change while the value is off.
 

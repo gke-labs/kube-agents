@@ -14,7 +14,15 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 `tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
-server directly; the operator picks them. A review that fails is a 503 rather than a 401.
+server directly; the operator picks them. A review that fails is a 503 rather than a 401. It also
+holds each request to the pod its token was issued to (`podbinding.go`): the TokenReview names the pod
+(`user.extra` `authentication.kubernetes.io/pod-name` and `pod-uid`), the proxy reads it (`get` on
+pods in the caller's namespace), checks its UID, and requires the request's direct peer
+(`RemoteAddr`, never a header) to be one of its `status.podIPs`. Anything short of that, a token
+without a pod or an error reading the pod included, is the same 401 as an unknown token, so a
+token is only good from its own pod and `kubectl port-forward` to the proxy is refused. In an `--auth-mode` chain that refusal is final (it wraps
+`k8sapiproxy.ErrCallerRefused`), and `jwtauth` refuses a token with the `kubernetes.io` claim, so
+no other authenticator admits a ServiceAccount token.
 
 `jwtauth.NewAuthenticator` (`pkg/jwtauth`, `--auth-mode=jwt` in the binary) is for a platform that
 mints a signed token per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer

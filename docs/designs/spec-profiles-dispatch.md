@@ -388,6 +388,8 @@ leave open:
   `proxyToken` with no cluster that carries the trigger. The broker admits a report credential to
   the audit-report routes only and refuses it on every other route, `/v1/exec` included (#5619). The worker sends a report credential
   only on the audit-report routes, so its other calls go as a task with no `proxyToken`'s do.
+  The [unattended write permit](unattended-write-permit.md) design proposes named version-control
+  routes on both lists for a run that holds its permit; the lists are as stated here until then.
   Any other task with a trigger and no cluster gets no `proxyToken`, and the dispatcher logs the
   trigger as dropped. The tier must be `unattended` exactly, because that's the only tier a grant
   binds a trigger at. When the submission's
@@ -623,17 +625,19 @@ leave open:
   regrant normally clears that in seconds, well inside the bound. A profile that has left the
   install config keeps its own give-up and log line above, not `terminal-unpublished`. An
   unlatched install keeps retrying, as before.
-  A terminal's envelope id is fixed per task, so a retry after a lost ack is a duplicate the stream
-  drops. The duplicate window is keyed on the id alone, whatever the subject, so on the six-token
-  form a duplicate ack is checked: a direct get of the task's six-token subject must find the
-  dispatcher's final status under the terminal's own envelope id, so another tier's or kind's
-  terminal for the same task id doesn't confirm it. With none there, the terminal is published
-  again under a fresh id, kept for the rest of that retry loop so its re-publishes dedupe onto
-  each other. A re-publish that fails is an ordinary failure, retried under the bound above. Only
-  a fresh id taken as a duplicate on its first send takes the `terminal-unpublished` settle at
-  once. A direct get that fails is not taken as the write landing: the terminal is re-published
-  under a fresh id the same way, so a retry whose first write did land can leave two identical
-  terminals, and readers fold past the second.
+  On the five-token form a terminal's envelope id is fixed per task, so a retry after a lost ack
+  is a duplicate the stream drops. The duplicate window is keyed on the id alone, whatever the
+  subject, so a fixed id is one another writer could store a message under first. On the
+  six-token form the id is therefore 128 random bits from crypto/rand, kept in the dispatcher's
+  memory while sends succeed and drawn again after any that fails (#6883): no other writer can
+  predict it, or plant one it saw on a send that reached subscribers without being stored, so a
+  duplicate ack is always the terminal's own earlier send. There is no read-back and no grant for
+  one. The cost: a send stored but whose ack was lost, or a dispatcher that restarts between the
+  publish and the settle of a held task, writes the terminal again under a new id, so the subject
+  can hold two identical final statuses. Every reader takes the first final status as the task's
+  end; a later one is a post-final drop (`PostFinalDropped`), counted and logged on each read. The
+  five-token form keeps the fixed id, and with it the planting gap this closes on the six-token
+  form: on an unlatched install readers take any supervisor terminal anyway.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for

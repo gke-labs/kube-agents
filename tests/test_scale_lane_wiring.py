@@ -25,7 +25,7 @@ _BASELINE = _LANE / "baseline.sh"
 _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "scale-lane.yml"
 _PROXY_DIR = _REPO_ROOT / "k8s-api-proxy" / "pkg" / "k8sapiproxy"
 _WATCHER_DIR = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher"
-_OPERATOR_BROKER = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_broker_split.go"
+_PROXY_MAIN = _REPO_ROOT / "k8s-api-proxy" / "cmd" / "k8s-api-proxy" / "main.go"
 
 #: `readonly NAME="value"` lines of the script, the only form its constants take.
 _READONLY = re.compile(r'^readonly (?P<name>[A-Z_]+)="(?P<value>[^"]*)"', re.MULTILINE)
@@ -78,9 +78,9 @@ class ScaleLaneWiringTest(unittest.TestCase):
             _go_string_constant(_PROXY_DIR / "policy.go", "InClusterID"),
         )
 
-    def test_proxy_audience_matches_the_install(self):
-        """The caller token's audience is the one the operator hands the proxy."""
-        self.assertIn(f'"{self.script["PROXY_AUDIENCE"]}"', _OPERATOR_BROKER.read_text())
+    def test_proxy_auth_mode_is_the_binarys_none_mode(self):
+        """The lane runs an auth mode the binary already has, not a switch of its own."""
+        self.assertEqual(self.script["PROXY_AUTH_MODE"], _go_string_constant(_PROXY_MAIN, "authModeNone"))
 
     def test_watcher_metric_families_are_registered(self):
         metrics = (_WATCHER_DIR / "metrics.go").read_text()
