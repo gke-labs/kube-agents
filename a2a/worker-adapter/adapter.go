@@ -430,6 +430,10 @@ type adapter struct {
 	// that a later one replaced (respawn): the driver holds that turn in its
 	// conversation, whatever the task's own end.
 	turnCommitted bool
+	// respawnRefused is true when a later process of this task couldn't be
+	// prepared or started: the same faults in the pod's own state that end
+	// the pod before a task's first process (podBroken).
+	respawnRefused bool
 	// harnessModel is the model the harness named at init, carried onto
 	// each turn's usage part.
 	harnessModel string
@@ -736,8 +740,9 @@ type turnOutcome struct {
 	task string
 	// podBroken is a turn refused after working and before its harness ran,
 	// for a reason in the pod's own state (the per-turn socket, the user
-	// settings file, the listener, the harness binary). The next turn here
-	// would be refused the same way, so a reused pod ends instead.
+	// settings file, the listener, the harness binary), or a later process
+	// of the same task that couldn't be prepared or started. The next turn
+	// here would be refused the same way, so a reused pod ends instead.
 	podBroken bool
 }
 
@@ -1012,7 +1017,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	}
 
 	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh, respawn)
-	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession, turnCommitted: a.turnCommitted}
+	// A later process that couldn't be prepared or started is the pod's
+	// fault, as it is before the first process: the pod ends (podBroken).
+	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession, turnCommitted: a.turnCommitted, podBroken: a.respawnRefused}
 }
 
 // respawner is a one-turn-per-process driver's next process: prepare runs
@@ -1542,6 +1549,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		if err := respawn.prepare(a.turnDirs(proc.cmd.Env)); err != nil {
 			log.Warn("preparing the next turn failed; ending the task", "task", a.taskID, "err", err)
 			sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+			a.respawnRefused = true
 			halt(stopDecided)
 			break
 		}
@@ -1556,6 +1564,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		if err != nil {
 			log.Warn("starting the next harness process failed; ending the task", "task", a.taskID, "err", err)
 			sawResult, resultErr, resultText = true, "spawn-failed"+reasonDetailSeparator+err.Error(), ""
+			a.respawnRefused = true
 			halt(stopDecided)
 			a.publishSteerRefusal(prompt, "")
 			break

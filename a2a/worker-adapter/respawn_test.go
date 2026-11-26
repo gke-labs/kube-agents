@@ -537,3 +537,39 @@ func TestATurnThatCompletedBeforeAFailedRespawnIsKept(t *testing.T) {
 	cancel()
 	waitOutcome(t, done, 30*time.Second)
 }
+
+// TestARefusedRespawnEndsAReusedPod: on a reused pod, a later process of a
+// task that can't be prepared (the boundary check refusing, say, with a
+// leftover alive) ends the pod, as the same refusal does before a task's
+// first process, rather than leaving it to take, and refuse, the next task.
+func TestARefusedRespawnEndsAReusedPod(t *testing.T) {
+	dir := t.TempDir()
+	const session = "chat-respawn-refused"
+	url := startServer(t)
+	c := testClient(t, url)
+	origin := submit(t, c, session, "task-refused-1", "first question")
+	cfg := reuseConfig(url, "task-refused-1", session, toyRespawnStub(t, dir, "task-refused-1"))
+	_, d := useToyRespawn(t, &cfg)
+	d.prepare = func(n int, _ TurnDirs) error {
+		if n == 2 {
+			return errors.New("1 process outlived the turn")
+		}
+		return nil
+	}
+	done := runAdapter(context.Background(), cfg)
+
+	waitFileFor(t, filepath.Join(dir, "turn1.1"), 10*time.Second)
+	publishSteerFor(t, c, origin, session, respawnSteer)
+	time.Sleep(300 * time.Millisecond) // the steer reaches the adapter and is held
+	if err := os.WriteFile(filepath.Join(dir, "steer-sent"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, session, "task-refused-1", lib.StateFailed)
+	out := waitOutcome(t, done, 30*time.Second)
+	if out.res.State != lib.StateFailed {
+		t.Errorf("the pod ended with state %q, want the refused task's failed", out.res.State)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "runs")); strings.TrimSpace(string(b)) != "1" {
+		t.Errorf("%q processes ran, want 1", strings.TrimSpace(string(b)))
+	}
+}
