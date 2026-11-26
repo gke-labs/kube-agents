@@ -1,0 +1,826 @@
+[
+  {
+    "insertId": "example-insert-1",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-1"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "id": "operation-example-1",
+      "last": true,
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "methodName": "v1.compute.reservations.delete",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.delete"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {}
+      },
+      "resourceName": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:44:10.435972987Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-a",
+        "method": "compute.reservations.delete",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:44:10.033257Z"
+  },
+  {
+    "insertId": "example-insert-2",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-1"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "first": true,
+      "id": "operation-example-1",
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "permission": "compute.reservations.delete",
+          "permissionType": "ADMIN_WRITE",
+          "resource": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+          "resourceAttributes": {
+            "name": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+            "service": "compute",
+            "type": "compute.reservations"
+          }
+        }
+      ],
+      "methodName": "v1.compute.reservations.delete",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.delete"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {
+          "auth": {},
+          "time": "2026-11-25T16:43:53.708708Z"
+        }
+      },
+      "resourceLocation": {
+        "currentLocations": [
+          "us-central1-a"
+        ]
+      },
+      "resourceName": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+      "response": {
+        "@type": "type.googleapis.com/operation",
+        "id": "100000000001",
+        "insertTime": "2026-11-25T08:43:53.660-08:00",
+        "name": "operation-example-1",
+        "operationType": "delete",
+        "progress": "0",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a/operations/operation-example-1",
+        "startTime": "2026-11-25T08:43:53.670-08:00",
+        "status": "RUNNING",
+        "targetId": "100000000002",
+        "targetLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+        "user": "operator@example.com",
+        "zone": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a"
+      },
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:43:53.830047123Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-a",
+        "method": "compute.reservations.delete",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:43:53.445918Z"
+  },
+  {
+    "insertId": "example-insert-3",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-2"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "id": "operation-example-2",
+      "last": true,
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "methodName": "v1.compute.reservations.insert",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.insert"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {}
+      },
+      "resourceName": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:32:30.393091721Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-a",
+        "method": "compute.reservations.insert",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:32:29.740415Z"
+  },
+  {
+    "insertId": "example-insert-4",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-2"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "first": true,
+      "id": "operation-example-2",
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "permission": "compute.reservations.create",
+          "permissionType": "ADMIN_WRITE",
+          "resource": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+          "resourceAttributes": {
+            "name": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+            "service": "compute",
+            "type": "compute.reservations"
+          }
+        }
+      ],
+      "methodName": "v1.compute.reservations.insert",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.insert",
+        "name": "res-same-zone",
+        "specificReservation": {
+          "count": "1",
+          "instanceProperties": {
+            "machineType": "e2-highmem-2"
+          }
+        },
+        "specificReservationRequired": false,
+        "zone": "us-central1-a"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {
+          "auth": {},
+          "time": "2026-11-25T16:32:12.926391Z"
+        }
+      },
+      "resourceLocation": {
+        "currentLocations": [
+          "us-central1-a"
+        ]
+      },
+      "resourceName": "projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+      "response": {
+        "@type": "type.googleapis.com/operation",
+        "id": "100000000003",
+        "insertTime": "2026-11-25T08:32:12.729-08:00",
+        "name": "operation-example-2",
+        "operationType": "insert",
+        "progress": "0",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a/operations/operation-example-2",
+        "startTime": "2026-11-25T08:32:12.734-08:00",
+        "status": "RUNNING",
+        "targetId": "100000000002",
+        "targetLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a/reservations/res-same-zone",
+        "user": "operator@example.com",
+        "zone": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a"
+      },
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:32:13.842545773Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-a",
+        "method": "compute.reservations.insert",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:32:12.473244Z"
+  },
+  {
+    "insertId": "example-insert-5",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-3"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "id": "operation-example-3",
+      "last": true,
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "methodName": "v1.compute.reservations.delete",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.delete"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {}
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:32:10.756864567Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.delete",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:32:10.599938Z"
+  },
+  {
+    "insertId": "example-insert-6",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-3"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "first": true,
+      "id": "operation-example-3",
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "permission": "compute.reservations.delete",
+          "permissionType": "ADMIN_WRITE",
+          "resource": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+          "resourceAttributes": {
+            "name": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+            "service": "compute",
+            "type": "compute.reservations"
+          }
+        }
+      ],
+      "methodName": "v1.compute.reservations.delete",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.delete"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {
+          "auth": {},
+          "time": "2026-11-25T16:31:54.466390Z"
+        }
+      },
+      "resourceLocation": {
+        "currentLocations": [
+          "us-central1-b"
+        ]
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "response": {
+        "@type": "type.googleapis.com/operation",
+        "id": "100000000004",
+        "insertTime": "2026-11-25T08:31:54.416-08:00",
+        "name": "operation-example-3",
+        "operationType": "delete",
+        "progress": "0",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/operations/operation-example-3",
+        "startTime": "2026-11-25T08:31:54.427-08:00",
+        "status": "RUNNING",
+        "targetId": "100000000005",
+        "targetLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+        "user": "operator@example.com",
+        "zone": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b"
+      },
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:31:55.071046410Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.delete",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:31:54.264813Z"
+  },
+  {
+    "insertId": "example-insert-7",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-4"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "id": "operation-example-4",
+      "last": true,
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "methodName": "v1.compute.reservations.resize",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.resize"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {}
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:31:53.297233916Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.resize",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:31:52.538409Z"
+  },
+  {
+    "insertId": "example-insert-8",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-4"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "first": true,
+      "id": "operation-example-4",
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "permission": "compute.reservations.resize",
+          "permissionType": "ADMIN_WRITE",
+          "resource": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+          "resourceAttributes": {
+            "name": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+            "service": "compute",
+            "type": "compute.reservations"
+          }
+        }
+      ],
+      "methodName": "v1.compute.reservations.resize",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.resize",
+        "specificSkuCount": "1"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {
+          "auth": {},
+          "time": "2026-11-25T16:31:38.475297Z"
+        }
+      },
+      "resourceLocation": {
+        "currentLocations": [
+          "us-central1-b"
+        ]
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "response": {
+        "@type": "type.googleapis.com/operation",
+        "id": "100000000006",
+        "insertTime": "2026-11-25T08:31:38.332-08:00",
+        "name": "operation-example-4",
+        "operationType": "resize",
+        "progress": "0",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/operations/operation-example-4",
+        "startTime": "2026-11-25T08:31:38.343-08:00",
+        "status": "RUNNING",
+        "targetId": "100000000005",
+        "targetLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+        "user": "operator@example.com",
+        "zone": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b"
+      },
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:31:39.010802368Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.resize",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:31:38.187457Z"
+  },
+  {
+    "insertId": "example-insert-9",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-5"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "id": "operation-example-5",
+      "last": true,
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "methodName": "v1.compute.reservations.resize",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.resize"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {}
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:31:37.609007678Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.resize",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:31:36.933593Z"
+  },
+  {
+    "insertId": "example-insert-10",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-5"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "first": true,
+      "id": "operation-example-5",
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "permission": "compute.reservations.resize",
+          "permissionType": "ADMIN_WRITE",
+          "resource": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+          "resourceAttributes": {
+            "name": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+            "service": "compute",
+            "type": "compute.reservations"
+          }
+        }
+      ],
+      "methodName": "v1.compute.reservations.resize",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.resize",
+        "specificSkuCount": "2"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {
+          "auth": {},
+          "time": "2026-11-25T16:31:22.020331Z"
+        }
+      },
+      "resourceLocation": {
+        "currentLocations": [
+          "us-central1-b"
+        ]
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "response": {
+        "@type": "type.googleapis.com/operation",
+        "id": "100000000007",
+        "insertTime": "2026-11-25T08:31:21.870-08:00",
+        "name": "operation-example-5",
+        "operationType": "resize",
+        "progress": "0",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/operations/operation-example-5",
+        "startTime": "2026-11-25T08:31:21.878-08:00",
+        "status": "RUNNING",
+        "targetId": "100000000005",
+        "targetLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+        "user": "operator@example.com",
+        "zone": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b"
+      },
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:31:22.709808361Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.resize",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:31:21.717564Z"
+  },
+  {
+    "insertId": "example-insert-11",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-6"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "id": "operation-example-6",
+      "last": true,
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "methodName": "v1.compute.reservations.insert",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.insert"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {}
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:18:48.861829748Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.insert",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:18:48.448583Z"
+  },
+  {
+    "insertId": "example-insert-12",
+    "labels": {
+      "compute.googleapis.com/root_trigger_id": "example-trigger-6"
+    },
+    "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+    "operation": {
+      "first": true,
+      "id": "operation-example-6",
+      "producer": "compute.googleapis.com"
+    },
+    "protoPayload": {
+      "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+      "apiVersionIdentifier": "v1",
+      "authenticationInfo": {
+        "oauthInfo": {
+          "oauthClientId": "example-client-id"
+        },
+        "principalEmail": "operator@example.com",
+        "principalSubject": "user:operator@example.com"
+      },
+      "authorizationInfo": [
+        {
+          "granted": true,
+          "permission": "compute.reservations.create",
+          "permissionType": "ADMIN_WRITE",
+          "resource": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+          "resourceAttributes": {
+            "name": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+            "service": "compute",
+            "type": "compute.reservations"
+          }
+        }
+      ],
+      "methodName": "v1.compute.reservations.insert",
+      "request": {
+        "@type": "type.googleapis.com/compute.reservations.insert",
+        "name": "res-other-zone",
+        "specificReservation": {
+          "count": "1",
+          "instanceProperties": {
+            "machineType": "e2-highmem-2"
+          }
+        },
+        "specificReservationRequired": false,
+        "zone": "us-central1-b"
+      },
+      "requestMetadata": {
+        "callerIp": "192.0.2.1",
+        "callerSuppliedUserAgent": "google-cloud-sdk gcloud/0.0.0",
+        "destinationAttributes": {},
+        "requestAttributes": {
+          "auth": {},
+          "time": "2026-11-25T16:18:37.341904Z"
+        }
+      },
+      "resourceLocation": {
+        "currentLocations": [
+          "us-central1-b"
+        ]
+      },
+      "resourceName": "projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+      "response": {
+        "@type": "type.googleapis.com/operation",
+        "id": "100000000008",
+        "insertTime": "2026-11-25T08:18:37.233-08:00",
+        "name": "operation-example-6",
+        "operationType": "insert",
+        "progress": "0",
+        "selfLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/operations/operation-example-6",
+        "startTime": "2026-11-25T08:18:37.238-08:00",
+        "status": "RUNNING",
+        "targetId": "100000000005",
+        "targetLink": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b/reservations/res-other-zone",
+        "user": "operator@example.com",
+        "zone": "https://www.googleapis.com/compute/v1/projects/example-project/zones/us-central1-b"
+      },
+      "serviceName": "compute.googleapis.com",
+      "status": {}
+    },
+    "receiveTimestamp": "2026-11-25T16:18:38.228272093Z",
+    "resource": {
+      "labels": {
+        "location": "us-central1-b",
+        "method": "compute.reservations.insert",
+        "project_id": "example-project",
+        "service": "compute.googleapis.com",
+        "version": "v1"
+      },
+      "type": "api"
+    },
+    "severity": "NOTICE",
+    "timestamp": "2026-11-25T16:18:36.931363Z"
+  }
+]

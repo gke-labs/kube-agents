@@ -1,0 +1,86 @@
+# PARKED — FIXTURE_NOT_READY in scripts/validate_bench_cases.py on #6954: it
+# needs a node pool that consumes only a named reservation, and that
+# reservation made and then deleted in the 30 days before the run. A log entry
+# gets old and a reservation is billed while it exists, so no pool project
+# can carry the pair as a standing fixture. When a fixture exists, register
+# the case in hack/eval/nightly-cases.txt.
+#
+# Domain: capacity (stockout-prevention SOP, check 3.10(d)). Journey: the
+# stockout and capacity audit names the delete of the reservation that a node
+# pool needs, with its time and its principal.
+#
+# WHAT THIS GRADES. A node pool that consumes only a named reservation cannot
+# add a node when that reservation is deleted, and GKE gives no warning. The
+# Admin Activity log of the reservation's owner project has two entries for
+# the delete, with its time and its principal (read from a project on
+# 2026-11-25). The audit must file the reservation finding against the pool,
+# and the finding must name the delete.
+#
+# PLANTED SHAPE REQUIRED. A zero-node pool named "deleted-reservation-pool"
+# whose `config.reservationAffinity.consumeReservationType` is
+# `SPECIFIC_RESERVATION` and whose one value names a reservation of the
+# cluster's own project, "run-deleted-reservation". That reservation was made
+# and deleted in the 30 days before the run, and it exists in no zone at the
+# time of the run. The delete is its newest change.
+#
+# RED BEFORE THE CHANGE. The collector files the pool under 3.10(d) with no
+# word on the delete: the first check passes and the second one fails. The
+# SOP on main names no read of the Admin Activity log, so a model does not
+# write the second check's text by hand.
+#
+# Isolation class: cluster-read-only, GitOps-repo write, as
+# stockout-pinned-pool: the audit writes the ledger issue and nothing on a
+# cluster.
+id: stockout-reservation-deleted
+name: Capacity audit names the delete of the reservation that a pool needs
+prompt: >-
+  Run the fleet stockout prevention and capacity audit, following the
+  stockout-prevention SOP.
+expected_output: >-
+  The ledger issue carries a reservation finding against
+  deleted-reservation-pool: the pool consumes only a named reservation that
+  exists in no zone, and the finding says that the reservation was deleted,
+  when, and by which principal. The closing response is the SOP's one line,
+  carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# The planted shape this scenario asserts on, named by ROLE. The role is not
+# in bench/tf/fleet/fixtures.json, and no standing fixture can carry it (the
+# PARKED lines say why): a run on a dev install makes the pair for the run.
+fixtures:
+  - deleted-reservation-pool
+
+# Graded against the LEDGER, not the chat reply: the stockout-prevention SOP
+# mandates a one-line closing response that deliberately restates nothing.
+verification_spec:
+  # scope: finding -- binds the check to the object under the reservation
+  # check. A `finding_ids` phrase for the pool would also pass on another
+  # check's finding against the same pool.
+  - name: a-reservation-finding-was-filed-against-the-pool-whose-reservation-was-deleted
+    role: objective
+    # assert, not the converge default: the ledger is written once, at
+    # `finish`, before the run ends.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding
+      finding_check: reservation-mismatch-risk
+      required_phrases: ["deleted-reservation-pool"]
+  # The collector writes "reservation <name> was deleted in <zone> at <time>
+  # by <principal>" into the finding's evidence (fleet_stockout.py,
+  # reservation_changes_clause). `scope: finding` reads only a finding's
+  # object, so this check reads the body: the planted reservation's name ties
+  # the phrase to the pool that names it.
+  - name: the-ledger-names-the-delete-of-the-planted-reservation
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      required_phrases: ["reservation run-deleted-reservation was deleted in"]
