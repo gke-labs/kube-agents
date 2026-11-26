@@ -743,6 +743,13 @@ const (
 	a2aTeamsHomeChannelEnvVar   = "A2A_TEAMS_HOME_CHANNEL"
 	a2aTeamsTenantIDEnvVar      = "A2A_TEAMS_TENANT_ID"
 	a2aTeamsAdaptiveCardsEnvVar = "A2A_TEAMS_ADAPTIVE_CARDS"
+	// a2aTeamsAnswerFeedbackEnvVar turns answer feedback off on a gateway
+	// that holds the Teams backend: "false" on the controller-manager
+	// Deployment is carried to the gateway under the same name (a2a/gateway's
+	// envTeamsAnswerFeedback), and anything else renders nothing. An operator
+	// switch like a2aTeamsBackendEnvVar, since Teams has no answerFeedback
+	// field on the CR yet.
+	a2aTeamsAnswerFeedbackEnvVar = "A2A_TEAMS_ANSWER_FEEDBACK"
 	// The gateway's rule for a Teams home conversation id
 	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
 	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
@@ -7661,6 +7668,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}
 		if teams.AdaptiveCards != nil && !*teams.AdaptiveCards {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAdaptiveCardsEnvVar, Value: strconv.FormatBool(false)})
+		}
+		// Answer feedback is on unless the operator's switch turns it off;
+		// only the off is rendered, as on Chat and Slack.
+		if os.Getenv(a2aTeamsAnswerFeedbackEnvVar) == strconv.FormatBool(false) {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
 		if len(chatVolumes) == 0 {
 			chatMounts, chatVolumes = a2aChatRelayToken()

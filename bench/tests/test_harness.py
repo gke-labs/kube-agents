@@ -7062,3 +7062,22 @@ def test_a_cancelled_run_skips_all_evaluators_and_scoring(
     pipeline.evaluate_metrics_batch([record], judge_model=None)
     assert record["scores"] == {"prior": 1.0}
     assert "run cancelled: devops-bench judge and verification scores are off for this run" in capsys.readouterr().err
+
+
+
+@pytest.mark.parametrize("created_at,floor,adopted", [
+    (99, 100, True),  # filed before the run started: an earlier run's card handed back by its key
+    (100, 100, False),
+    (101, 100, False),
+    (None, 100, False),  # the board never showed a creation time
+    (99, None, False),  # the pod's clock was not read, so there is no floor to judge by
+])
+def test_a_vanished_card_is_named_as_adopted_only_when_it_predates_the_run(
+    created_at: int | None, floor: int | None, adopted: bool
+) -> None:
+    message = harness._vanished_card_error("t_x", created_at, floor)
+    assert message.startswith(
+        f"card t_x not on the board after {harness._MAX_UNKNOWN_CARD_READS} reads; "
+        "dropped from the delegation wait, nothing graded for it"
+    )
+    assert ("this repetition is not independent" in message) is adopted

@@ -84,7 +84,9 @@ type Task struct {
 	//
 	// Surfaced like it but NOT counted like it: TasksGet logs it, and does
 	// not add it to protocolViolations. PostFinalDropped counts a publisher
-	// breaking the protocol; the common cause of this one is TASKS' own
+	// breaking the protocol, with one expected case: a dispatcher terminal
+	// written twice (a restart between its publish and its settle, or a lost
+	// ack on the six-token form, #6883). The common cause of this one is TASKS' own
 	// per-subject limit doing exactly what it was configured to do, and a
 	// counter that rises when our own retention policy works is a counter
 	// nobody can alert on.

@@ -25,14 +25,23 @@ define (content parts, a tool result's own content list, `system`,
 function's arguments): in an assistant's or the model's own turn, a thinking
 block's text and signature (the provider checks the text against the
 signature, and the model wrote it from input this hook had already redacted),
-redacted thinking's data and a thought signature; and, anywhere a part may
+redacted thinking's data and a thought signature; provider-encrypted
+content the provider checks byte for byte (a Responses reasoning item's
+`encrypted_content`, and in the assistant's turn a web search result's
+`encrypted_content`, `reasoning_details` data and signature, and the
+`thought_signature` LiteLLM carries on the message and its tool calls); and,
+anywhere a part may
 carry one, a binary payload of a listed binary media type (images, PDF,
 audio, video) that decodes as base64 and starts the way that media does; a
 payload of any other type is refused. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, or anything at a
-payload position that is not binary base64. Responses are not touched; the limitation is documented
+payload position that is not binary base64, answered with 400 since the same
+request is refused every time. Two payload positions are not carved: a
+Responses `input` item's content parts and the parts inside a Gemini function
+response. The text rules still run over a base64 payload there and can rewrite
+it (a known gap). Responses are not touched; the limitation is documented
 on the site's inference-gateway page.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
@@ -60,6 +69,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger("kube_agents.litellm_redaction")
@@ -118,7 +128,8 @@ CONTROL_KEY_PREFIXES = ("litellm_", "langfuse_", "_")
 # - a binary payload (base64 image, document, audio or video, as a source, a
 #   `data:` URL or Gemini inline data): no text rule applies, and a
 #   substitution would corrupt it. It is kept only if its media type is a
-#   known binary one and its data is strict base64; anything else in that
+#   known binary one and its data is base64 (standard or URL-safe, padding
+#   optional) that starts the way that type does; anything else in that
 #   position is refused, since it may carry text the walk cannot read.
 TYPE_KEY = "type"
 THINKING_TYPE = "thinking"
@@ -158,6 +169,9 @@ _MPEG_AUDIO = (lambda d: d[:3] == b"ID3" or (len(d) > 1 and d[0] == 0xFF and d[1
 MEDIA_SIGNATURES = {
     "image/png": lambda d: d[:8] == b"\x89PNG\r\n\x1a\n",
     "image/jpeg": lambda d: d[:3] == b"\xff\xd8\xff",
+    # A common mislabel of JPEG, checked as JPEG. Gemini takes the label; a
+    # provider that doesn't still refuses the request itself.
+    "image/jpg": lambda d: d[:3] == b"\xff\xd8\xff",
     "image/gif": lambda d: d[:6] in (b"GIF87a", b"GIF89a"),
     "image/webp": _RIFF(b"WEBP"),
     "image/heic": _FTYP,
@@ -201,7 +215,6 @@ PARTS_KEY = "parts"
 # Tool calls whose arguments are JSON held in a string: a chat tool call's
 # `function.arguments`, a legacy `function_call.arguments`, and an Anthropic
 # `tool_use.input` sent as a string.
-TOOL_CALLS_KEY = "tool_calls"
 FUNCTION_KEY = "function"
 FUNCTION_CALL_KEY = "function_call"
 ARGUMENTS_KEY = "arguments"
@@ -295,8 +308,13 @@ class KubeAgentsRedactionCallback(CustomLogger):
             raise self._refuse("a payload whose media type is not a media type name")
         if not isinstance(data, str):
             raise self._refuse(f"a {media} payload that is not a string")
+        # Providers take the URL-safe alphabet and unpadded base64 too; both
+        # are normalised before the strict decode. The payload is kept as it
+        # came either way.
+        text = "".join(data.split()).replace("-", "+").replace("_", "/")
+        text += "=" * (-len(text) % 4)
         try:
-            decoded = base64.b64decode("".join(data.split()), validate=True)
+            decoded = base64.b64decode(text, validate=True)
         except (binascii.Error, ValueError):
             raise self._refuse(f"a {media} payload that is not base64") from None
         if not starts(decoded):
@@ -551,7 +569,14 @@ class KubeAgentsRedactionCallback(CustomLogger):
         data: dict,
         call_type: str,
     ) -> Optional[dict]:
-        counts = self.redact_request(data)
+        try:
+            counts = self.redact_request(data)
+        except UnwalkableRequestError as exc:
+            # A refused shape is the request's, and the same request is
+            # refused every time: 400, so a caller doesn't retry it as it
+            # would a 5xx. Any other exception stays a 500, a fault in the
+            # hook rather than in the request.
+            raise HTTPException(status_code=400, detail=str(exc)) from None
         if counts:
             logger.info(
                 "redacted %s request: %s",

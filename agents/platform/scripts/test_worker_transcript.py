@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -44,6 +45,42 @@ REDACTOR = _load_redactor()
 
 def _scrub(kind, text):
     return worker_transcript.scrub_step_text(REDACTOR, kind, text, WITHHELD)
+
+
+# A time test with no limit in seconds: it compares two CPU times that it reads
+# one after the other in the same process, so the machine and a tracer (CI
+# runs these tests under `coverage`, which makes each Python line slower) slow
+# the two together. A limit in seconds holds on one machine and fails on a
+# slower one. For a growth test, the second read is the first read on a text
+# `TIME_GROWTH_SHRINK` times longer: a linear read needs that many times as
+# long, and a read whose cost is all quadratic the square of it.
+TIME_GROWTH_SHRINK = 4
+# Between the growth of a linear read (4) and of a quadratic read (16).
+TIME_GROWTH_BOUND = 8
+# Other work on the machine can only add time, so a pair is read again while it is over its bound.
+CPU_TIME_ATTEMPTS = 3
+
+
+def _cpu_seconds(read):
+    start = time.process_time()
+    read()
+    return time.process_time() - start
+
+
+def _cpu_seconds_of_a_pair(first, second, bound):
+    """The CPU time of `first()` and of `second()`, read one after the other.
+
+    A new pair is read, up to `CPU_TIME_ATTEMPTS` pairs, while `second` needs
+    more than `bound` times `first`; the pair with the least ratio counts.
+    """
+    best = None
+    for _ in range(CPU_TIME_ATTEMPTS):
+        pair = (_cpu_seconds(first), _cpu_seconds(second))
+        if best is None or pair[1] * best[0] < best[1] * pair[0]:
+            best = pair
+        if best[1] <= bound * best[0]:
+            break
+    return best
 
 
 class TestScrubStepText(unittest.TestCase):
@@ -1919,6 +1956,9 @@ class TestLongSimpleCommandIsWithheld(unittest.TestCase):
 
     LIMIT = worker_transcript.MAX_SIMPLE_COMMAND_CHARS
     UNIT = "gh ab cde oc "
+    # The limit's check cuts the line two times at most and takes its comments
+    # off one time: the decision needs 1.0 to 1.5 times the CPU time of one cut.
+    DECISION_CUTS_BOUND = 4
 
     def test_the_limit_is_on_one_simple_command_and_is_strict(self):
         at_the_limit = "echo " + "a" * (self.LIMIT - len("echo "))
@@ -1954,27 +1994,42 @@ class TestLongSimpleCommandIsWithheld(unittest.TestCase):
         # 270 KB to 1 MB in one shell word: quoted, with the quote not closed,
         # a quoted body with line breaks, with no quote, behind a comment with
         # an apostrophe, and short commands behind such a comment. With no
-        # limit, `shlex` needs 1 s to 8 s of CPU time for each; the limit
-        # decides each after one or two cuts of the line, in 0.1 s or less. The
-        # bound is on CPU time, as in the other linear-time tests of this file.
-        import time
-
-        for command in (
-            "echo '" + self.UNIT * 80000 + "'",
-            "echo '" + self.UNIT * 80000,
-            "cat > notes.txt <<< '" + "line of a file body\n" * 52000 + "'",
-            "echo " + "ghabcdeoc/" * 40000,
+        # limit, a reader takes the words of each from `shlex`, in 20 to 200
+        # times the CPU time of the decision here. The limit decides each
+        # after one or two cuts of the line. Three checks hold that, with no
+        # limit in seconds: no reader gets the line; the decision needs no
+        # more than `DECISION_CUTS_BOUND` times the CPU time of one cut of the
+        # same line; and it needs no more than `TIME_GROWTH_BOUND` times the
+        # CPU time of the decision for the line `TIME_GROWTH_SHRINK` times
+        # shorter.
+        for build, count in (
+            (lambda count: "echo '" + self.UNIT * count + "'", 80000),
+            (lambda count: "echo '" + self.UNIT * count, 80000),
+            (lambda count: "cat > notes.txt <<< '" + "line of a file body\n" * count + "'", 52000),
+            (lambda count: "echo " + "ghabcdeoc/" * count, 40000),
             # An apostrophe in a comment: the cut of the line as it is gives short
             # pieces, and the cut with the comments off gives the long quoted body.
-            "echo ok # don't stop\nprintf '%s' '" + "reset the dataset; abc def\n" * 10000 + "' > notes.txt",
+            (lambda count: "echo ok # don't stop\nprintf '%s' '" + "reset the dataset; abc def\n" * count + "' > notes.txt", 10000),
             # Short commands behind that comment: only the cut of the line as it
             # is gives the long piece, because the apostrophe opens a quote there.
-            "echo ok # don't stop\n" + "\n".join(["echo ok"] * 70000),
+            (lambda count: "echo ok # don't stop\n" + "\n".join(["echo ok"] * count), 70000),
         ):
-            with self.subTest(command=command[:24]):
-                start = time.process_time()
-                self.assertTrue(worker_transcript.command_reads_a_secret(command))
-                self.assertLess(time.process_time() - start, 1.0)
+            command, short = build(count), build(count // TIME_GROWTH_SHRINK)
+
+            def decide(line=command):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+
+            def cut(line=command):
+                worker_transcript.split_shell_commands(worker_transcript.fold_shell_continuations(line))
+
+            with self.subTest(command=command[:24], chars=len(command)):
+                self.assertGreater(len(short), self.LIMIT)
+                with mock.patch.object(shlex, "shlex", side_effect=AssertionError("a reader took the words of the line")) as reader:
+                    cut_seconds, decision_seconds = _cpu_seconds_of_a_pair(cut, decide, self.DECISION_CUTS_BOUND)
+                    short_seconds, full_seconds = _cpu_seconds_of_a_pair(lambda: decide(short), decide, TIME_GROWTH_BOUND)
+                reader.assert_not_called()
+                self.assertLessEqual(decision_seconds, self.DECISION_CUTS_BOUND * cut_seconds)
+                self.assertLessEqual(full_seconds, TIME_GROWTH_BOUND * short_seconds)
 
 
 class TestSecretReadDetector(unittest.TestCase):

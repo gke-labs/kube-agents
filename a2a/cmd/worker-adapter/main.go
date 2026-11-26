@@ -141,7 +141,8 @@ func main() {
 // at the socket the adapter named and with the delegate targets it wrote into
 // this process's env for the turn.
 func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
-	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+	return workeradapter.ServeDelegateMCPWith(ctx, in, out, workeradapter.DelegateSocketPath(),
+		workeradapter.DelegateTargetsFromEnv(log), workeradapter.ScopeClustersFromEnv(log), log)
 }
 
 func run() int {
@@ -208,6 +209,19 @@ func run() int {
 	// one-line result and exits 0 (workeradapter.Run).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	// A core-agent worker's model calls go through the adapter's loopback
+	// proxy, started once and closed when the worker exits
+	// (startHarnessGateway). A proxy that can't start refuses the worker:
+	// the harness never runs pointed at anything else.
+	gatewayProxy, err := applyHarnessGateway(&cfg, os.Getenv, gatewayProxyStarterFromEnv(os.Getenv, log), log)
+	if err != nil {
+		log.Error("worker refused", "err", err)
+		return 1
+	}
+	if gatewayProxy != nil {
+		defer func() { _ = gatewayProxy.Close() }()
+	}
 
 	if os.Getenv(lib.EnvProfileWorker) == "true" {
 		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
@@ -374,6 +388,20 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
 	log.Info("harness selected", "harness", string(harness))
+	// Every harness runs its tools as the adapter's user, so the adapter is
+	// made non-dumpable before any turn: those processes then can't read its
+	// environment or memory, open its /proc fds (the harness's pipes, where a
+	// forged event line could be written), or attach to it. A harness
+	// process is unaffected: exec makes it dumpable again. Where it fails,
+	// a harness that depends on isolation (core-agent, Antigravity) is
+	// refused; Claude Code runs as it did before, with a warning.
+	if err := protectAdapter(); err != nil {
+		if harness == persona.CoreAgent || harness == persona.Antigravity {
+			log.Error("the adapter could not be made non-dumpable; refusing the harness", "harness", string(harness), "err", err)
+			return workeradapter.Config{}, false
+		}
+		log.Warn("the adapter could not be made non-dumpable", "harness", string(harness), "err", err)
+	}
 
 	originSeq, originSeqStated := originSeq(log)
 	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
@@ -812,6 +840,9 @@ func selfPath() string {
 // the harness's stream driver and argv builder. A value the worker doesn't
 // know is an error, never a fall back to Claude Code: a typo would otherwise
 // run the wrong harness without a word.
+// protectAdapter is workeradapter.ProtectProcess, swapped in tests.
+var protectAdapter = workeradapter.ProtectProcess
+
 func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
 	h := persona.Harness(getenv(lib.EnvHarness))
 	if h == "" && getenv(lib.EnvProfileWorker) == "true" {

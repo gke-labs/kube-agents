@@ -401,6 +401,7 @@ func buildHandler(
 				Audience:        cfg.audience,
 				AllowedCallers:  callers,
 				AudienceCallers: audienceCallers,
+				Logger:          logger,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize TokenReview authenticator: %w", err)

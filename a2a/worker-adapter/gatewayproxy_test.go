@@ -36,7 +36,11 @@ func (g *fakeGateway) handler(w http.ResponseWriter, r *http.Request) {
 	g.mu.Unlock()
 	w.Header().Set("Content-Type", "text/event-stream")
 	for i := 1; i <= 3; i++ {
-		fmt.Fprintf(w, "data: {\"chunk\":%d}\n\n", i)
+		finish := ""
+		if i == 3 {
+			finish = `,"finishReason":"STOP"`
+		}
+		fmt.Fprintf(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"%d\"}]}%s}]}\n\n", i, finish)
 		w.(http.Flusher).Flush()
 	}
 }
@@ -202,13 +206,11 @@ func TestTheGatewayProxyBoundsWhatPassesThrough(t *testing.T) {
 		t.Errorf("the response passed %d bytes; want it cut off at the %d cap", n, gatewayProxyMaxResponseBytes)
 	}
 
+	// A whole answer of exactly the cap passes.
+	head, tail := `{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"`, `"}]}}]}`
+	exactBody := head + strings.Repeat("z", gatewayProxyMaxResponseBytes-len(head)-len(tail)) + tail
 	exact := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		chunk := bytes.Repeat([]byte("z"), 1<<20)
-		for i := 0; i < gatewayProxyMaxResponseBytes>>20; i++ {
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-		}
+		_, _ = io.WriteString(w, exactBody)
 	}))
 	t.Cleanup(exact.Close)
 	ep := startProxyFor(t, exact.URL)

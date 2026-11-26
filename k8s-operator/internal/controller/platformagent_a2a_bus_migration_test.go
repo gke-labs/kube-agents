@@ -1755,6 +1755,7 @@ func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
 		"buildA2AGatewayRole":                  buildA2AGatewayRole(agent).Rules,
 		"buildCredentialBrokerTokenReviewRole": buildCredentialBrokerTokenReviewRole(agent).Rules,
 		"buildCredentialBrokerPodReadRole":     buildCredentialBrokerPodReadRole(agent, agent.Namespace).Rules,
+		"buildKubeProxyPodReadRole":            buildKubeProxyPodReadRole(agent).Rules,
 		"buildMinimalPlatformRole":             buildMinimalPlatformRole(agent).Rules,
 		"buildPlatformLocalRole":               buildPlatformLocalRole(agent).Rules,
 		"buildPlatformLeaderRole":              buildPlatformLeaderRole(agent).Rules,
