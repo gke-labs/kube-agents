@@ -1586,6 +1586,10 @@ class InjectTask:
         # The task whose relayed report the turn answers (REPLY_TO_FIELD);
         # empty sends the turn under no report, as every turn was sent before.
         self.reply_to = reply_to
+        # The conversation's session record (its contextId) as the last read
+        # the door answered reported it, kept across a transport failure so a
+        # caller that has to clean up after the turn still knows its session.
+        self.last_context_id = ""
         self.token = token
         self.author = author
         # The backend message id, which the gateway's ingress log joins to the
@@ -2013,6 +2017,7 @@ class InjectTask:
             adopted = False
             if answered is not None:
                 probe = answered
+                self.last_context_id = answered.context_id or self.last_context_id
                 adopted = self._note(fold, task_id, answered)
                 if answered.could_look and answered.concerns(task_id) and not fold.final:
                     if answered.final:

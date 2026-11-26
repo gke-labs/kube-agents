@@ -470,6 +470,7 @@ class _StubDoor(ThreadingHTTPServer):
         self.answers = [OPENING_ANSWER, *REPLY_ANSWERS]
         self.sessions = ["ctx-a", "ctx-a", "ctx-a"]
         self.states = ["completed", "completed", "completed"]
+        self.sources = [inject.TERMINAL_SOURCE_EXECUTOR] * 3
         # The live session pod after each turn; None is a pod read that failed.
         self.pods: list[str | None] = ["pod-a", "pod-a", "pod-a"]
         self.child_addressees: list[str] | None = None
@@ -504,7 +505,7 @@ class _StubDoor(ThreadingHTTPServer):
         self._append(conversation, inject.ENTRY_TASK, taskId=task_id)
         self._append(conversation, inject.ENTRY_POST, text=answer, messageId=f"inj-{turn}-answer")
         self._append(conversation, inject.ENTRY_TERMINAL, taskId=task_id, state=self.states[turn],
-                     source=inject.TERMINAL_SOURCE_EXECUTOR)
+                     source=self.sources[turn])
         self.context_ids[conversation] = self.sessions[turn]
         if turn == 0:
             for target, reply_to in self.relayed:
@@ -804,6 +805,32 @@ def test_inject_the_openings_card_is_archived_and_purged_when_no_report_comes(do
     assert _infra(got)
     assert door.archived == ["card-1"] and door.purged == ["card-1"]
 
+
+
+def test_inject_an_opening_ended_as_infrastructure_still_cleans_up_its_session(door):
+    # The supervisor declared the opening's terminal: infrastructure, built
+    # fresh, but the door had already reported the conversation's session.
+    door.states[0] = "failed"
+    door.sources[0] = inject.TERMINAL_SOURCE_SUPERVISOR
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert len(door.submissions) == 1
+    assert set(door.session_reads) == {board.api_session_id("ctx-a")}
+    assert door.archived == ["card-1"] and door.purged == ["card-1"]
+
+
+def test_inject_an_opening_whose_door_is_lost_after_a_read_still_cleans_up_its_session(door, monkeypatch):
+    # The door answered a read naming the session, then went away before the
+    # turn's end was taken.
+    def _lost(self, *args, **kwargs):
+        raise inject.InjectUnavailable("connection refused", retryable=False)
+
+    monkeypatch.setattr(inject.InjectTask, "_ended", _lost)
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert len(door.submissions) == 1
+    assert set(door.session_reads) == {board.api_session_id("ctx-a")}
+    assert door.archived == ["card-1"] and door.purged == ["card-1"]
 
 
 def test_inject_the_cleanup_leaves_a_sibling_sessions_cards_alone(door, monkeypatch):

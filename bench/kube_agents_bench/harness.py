@@ -3216,6 +3216,23 @@ def _infra_failure(detail: str) -> AgentResult:
     )
 
 
+def _with_context(result: AgentResult, context_id: str) -> AgentResult:
+    """``result`` with the conversation's session record (``context_id``) in
+    its metadata when one is known and it carries none. An infrastructure
+    result is built fresh, so without this a caller that cleans up after the
+    turn by its session (the relayed-report run's card cleanup) would lose a
+    session the door had already reported.
+    """
+    if context_id and not result.metadata.get("context_id"):
+        result.metadata["context_id"] = context_id
+    return result
+
+
+def _last_context_id(task: inject.InjectTask) -> str:
+    """The contextId the last read ``task``'s door answered reported, or ""."""
+    return str(getattr(task, "last_context_id", "") or "")
+
+
 def _queued_wait(opening: bool, budget: float) -> float:
     """How long a turn the gateway queued at the session cap is followed
     before it is given up on: the line's backstop for the opening turn, whose
@@ -5861,11 +5878,12 @@ class KubeAgentsHarness(AgentHarness):
             # non-numeric budget, and nothing ran.
             return AgentResult.errored(f"AGENT_INJECT_TIMEOUT: {exc}")
         except inject.InjectUnavailable as exc:
-            return _infra_failure(
-                f"the inject exchange on {conversation} failed: {exc}{_abandon(task)}"
+            return _with_context(
+                _infra_failure(f"the inject exchange on {conversation} failed: {exc}{_abandon(task)}"),
+                _last_context_id(task),
             )
         except _TransportError as exc:
-            return _infra_failure(f"{exc}{_abandon(task)}")
+            return _with_context(_infra_failure(f"{exc}{_abandon(task)}"), _last_context_id(task))
         identity["inject_only"] = task.inject_only
         identity["backend"] = task.backend
 
@@ -5873,7 +5891,11 @@ class KubeAgentsHarness(AgentHarness):
 
         infrastructure = _inject_infrastructure(task, exchange, timeout, timed_out, stop_pending)
         if infrastructure is not None:
-            return infrastructure
+            # The relayed-report run cleans up by the conversation's session,
+            # which a fresh infrastructure result would otherwise drop.
+            return _with_context(
+                infrastructure, (exchange.probe.context_id if exchange.probe else "") or _last_context_id(task)
+            )
 
         opening_took = opening_ended - opening_accepted[0] if opening_accepted else None
         if (
