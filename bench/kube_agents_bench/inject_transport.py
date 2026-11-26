@@ -435,6 +435,9 @@ REASON_HERMES_API_REFUSED = "hermes-api-refused"
 # The task waited out its deadline behind an earlier turn in the same session
 # and was never sent: the persona never saw the prompt.
 REASON_SESSION_BUSY = "session-busy"
+# The bridge recovered a panic while handling the task and ended it failed
+# with no answer: the bridge's own fault, not the persona's.
+REASON_INTERNAL_PANIC = "internal-panic"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -448,6 +451,7 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_HERMES_API_UNREACHABLE,
         REASON_HERMES_API_REFUSED,
         REASON_SESSION_BUSY,
+        REASON_INTERNAL_PANIC,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
