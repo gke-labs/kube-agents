@@ -434,6 +434,44 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertIn("FILE=removed", proc.stdout)
         self.assertIn("NEXT=removed", proc.stdout)
 
+    def test_a_stop_during_a_renewal_mint_leaves_no_scratch_token_behind(self):
+        # A SIGTERM that arrives while _ledger_token_mint is running triggers the
+        # renewer's TERM trap as soon as _ledger_token_mint returns, before
+        # mint_ledger_token reaches its own rm -rf "${scratch}".
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                _ledger_token_mint() {
+                  local n=$(( $(cat "${COUNT_FILE}") + 1 ))
+                  echo "${n}" > "${COUNT_FILE}"
+                  if [ -e "${STALL}" ]; then
+                    : > "${STALLED}"
+                    command sleep "${WRITE_STALL_SECONDS}"
+                  fi
+                  echo "tok-renewed 2026-10-17T09:00:00Z"
+                }
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                : > "${STALL}"
+                wait_until test -e "${STALLED}"
+                [ -e "${STALLED}" ] && echo "MINT=stalled" || echo "MINT=never"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                command sleep "${AFTER_STALL_SECONDS}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+                [ -e "${TOKEN_FILE}.mint" ] && echo "SCRATCH=left" || echo "SCRATCH=removed"
+                """
+            ),
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(RENEWAL_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(RENEWAL_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("MINT=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
+        self.assertIn("SCRATCH=removed", proc.stdout)
+
     def test_a_failed_renewal_is_retried_soon_rather_than_a_period_later(self):
         # Two refusals, then a mint. The renewer sleeps one tick per second:
         # at the retry step the mint that succeeds is on the fourth tick (two

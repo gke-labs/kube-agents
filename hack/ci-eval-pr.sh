@@ -1612,42 +1612,43 @@ mint_ledger_token() { # <label>
   # The ladder stays at LEDGER_MINT_ATTEMPTS whatever GitHub is doing: an
   # incident lasts longer than any wait a unit holding its locks can afford,
   # and the not-run record is what keeps that from reading as a red.
-  local token expires line rc attempt=1 delay=2 scratch minted diagnostics
+  local token expires line rc attempt=1 delay=2 scratch minted diagnostics minted_ok=""
   LEDGER_MINT_LAST_FAILURE=""
   # The mint's stdout and stderr go through files in a mode-0700 directory
   # rather than command substitutions so start_ledger_token_renewal can call
   # this function while its TERM trap is armed; stderr is echoed to this
   # shell's stderr as before.
-  scratch="${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.${RANDOM:-0}"
+  scratch="${LEDGER_TOKEN_RENEW_SCRATCH:-${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.${RANDOM:-0}}"
   rm -rf "${scratch}"
   mkdir -m 0700 "${scratch}" || return 1
   minted="${scratch}/out"
   diagnostics="${scratch}/err"
-  while :; do
+  while [ -z "${minted_ok}" ]; do
     rc=0
     LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint >"${minted}" 2>"${diagnostics}" || rc=$?
     cat "${diagnostics}" >&2
     if [ "${rc}" -eq 0 ]; then
       LEDGER_MINT_LAST_FAILURE=""
-      break
-    fi
-    while IFS= read -r line; do
-      LEDGER_MINT_LAST_FAILURE="${line}"
-    done <"${diagnostics}"
-    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
-      rm -rf "${scratch}"
-      echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
-           "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
-      echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
-      if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
-        return "${LEDGER_MINT_RETRYABLE}"
+      minted_ok=1
+    else
+      while IFS= read -r line; do
+        LEDGER_MINT_LAST_FAILURE="${line}"
+      done <"${diagnostics}"
+      if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
+        rm -rf "${scratch}"
+        echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
+             "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
+        echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
+        if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+          return "${LEDGER_MINT_RETRYABLE}"
+        fi
+        return 1
       fi
-      return 1
+      echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
+      sleep "${delay}"
+      attempt=$((attempt + 1))
+      delay=$((delay * 4))
     fi
-    echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
-    sleep "${delay}"
-    attempt=$((attempt + 1))
-    delay=$((delay * 4))
   done
   read -r token expires <"${minted}" || true
   # The installation's hourly budget as the mint read it (LEDGER_BUDGET_PREFIX
@@ -1658,8 +1659,7 @@ mint_ledger_token() { # <label>
   while IFS= read -r line; do
     case "${line}" in
       "${LEDGER_BUDGET_PREFIX}"*)
-        budget="${line}"
-        break
+        [ -n "${budget}" ] || budget="${line}"
         ;;
     esac
   done <"${diagnostics}"
@@ -1700,14 +1700,16 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
+    LEDGER_TOKEN_RENEW_SCRATCH="${file}.mint"
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
     # command only once it has returned. The nap is the renewer's only job, so
-    # the trap ends it by job spec (`kill %%`) without a command substitution.
-    trap 'kill %% 2>/dev/null || true; exit 0' TERM
+    # the trap ends it by job spec (`kill %%`) without a command substitution,
+    # and removes any scratch directory a mint in progress left behind.
+    trap 'kill %% 2>/dev/null || true; rm -rf "${LEDGER_TOKEN_RENEW_SCRATCH}"; exit 0' TERM
     while :; do
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
       wait $! 2>/dev/null || true
-      kill -0 "${owner}" 2>/dev/null || exit 0
+      kill -0 "${owner}" 2>/dev/null || { rm -rf "${LEDGER_TOKEN_RENEW_SCRATCH}"; exit 0; }
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       if [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ]; then
         if mint_ledger_token "${label} renewal" 2>/dev/null \
@@ -1739,15 +1741,15 @@ start_ledger_token_renewal() { # <label> <file>
 # one command under way and the renewer runs nothing after it: the rm is final.
 # Killed outright, the renewer would leave that command running to write a live
 # token after the rm. A mint under way here is abandoned after its current
-# command (a mint call or a retry sleep), which leaves mint_ledger_token's
-# temporary files behind.
+# command (a mint call or a retry sleep), and both the trap and the rm below
+# clean up mint_ledger_token's "${file}.mint" scratch directory.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
     wait "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
   fi
   LEDGER_TOKEN_RENEWER=""
-  rm -f "$1" "$1.next"
+  rm -rf "$1" "$1.next" "$1.mint"
   unset BENCH_GITHUB_TOKEN_FILE
 }
 
@@ -1820,14 +1822,16 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
+    LEDGER_RESET_MINT_SCRATCH="${file}.mint"
     # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
     # command only once it has returned. The nap is the renewer's only job, so
-    # the trap ends it by job spec (`kill %%`) without a command substitution.
-    trap 'kill %% 2>/dev/null || true; exit 0' TERM
+    # the trap ends it by job spec (`kill %%`) without a command substitution,
+    # and removes any scratch directory a mint in progress left behind.
+    trap 'kill %% 2>/dev/null || true; rm -rf "${LEDGER_RESET_MINT_SCRATCH}"; exit 0' TERM
     while :; do
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
       wait $! 2>/dev/null || true
-      kill -0 "${owner}" 2>/dev/null || exit 0
+      kill -0 "${owner}" 2>/dev/null || { rm -rf "${LEDGER_RESET_MINT_SCRATCH}"; exit 0; }
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       if [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ]; then
         if (umask 077 && forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" > "${file}.next" 2>/dev/null) \
@@ -1863,7 +1867,7 @@ stop_gitops_write_token() { # <file>
     wait "${GITOPS_WRITE_TOKEN_RENEWER}" 2>/dev/null || true
   fi
   GITOPS_WRITE_TOKEN_RENEWER=""
-  rm -f "$1" "$1.next"
+  rm -rf "$1" "$1.next" "$1.mint"
   if [ -n "${GITOPS_WRITE_TOKEN_MINTED:-}" ]; then
     unset TF_VAR_bench_gitops_write_token_file
   fi
@@ -2094,7 +2098,7 @@ ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omit
   local body token scratch minted rc attempt=1 permissions='{"issues":"write"}'
   [ -n "${2:-}" ] && permissions="$2"
   body="{\"repositories\":[\"${1##*/}\"],\"permissions\":${permissions}}"
-  scratch="${TMPDIR:-/tmp}/ledger-reset-mint.$$.${BASHPID:-0}.${RANDOM:-0}"
+  scratch="${LEDGER_RESET_MINT_SCRATCH:-${TMPDIR:-/tmp}/ledger-reset-mint.$$.${BASHPID:-0}.${RANDOM:-0}}"
   rm -rf "${scratch}"
   mkdir -m 0700 "${scratch}" || return 1
   minted="${scratch}/out"

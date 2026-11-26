@@ -216,6 +216,42 @@ class GitopsWriteTokenTest(_Harness):
         self.assertIn("FILE=removed", proc.stdout)
         self.assertIn("NEXT=removed", proc.stdout)
 
+    def test_a_stop_during_a_renewal_mint_leaves_no_scratch_token_behind(self):
+        # A SIGTERM that arrives while _ledger_token_mint is running triggers the
+        # renewer's TERM trap as soon as _ledger_token_mint returns, before
+        # ledger_reset_token reaches its own rm -rf "${scratch}".
+        proc = self._run(
+            """\
+            _ledger_token_mint() {
+              local n=$(( $(cat "${COUNT_FILE}") + 1 ))
+              echo "${n}" > "${COUNT_FILE}"
+              if [ -e "${STALL}" ]; then
+                : > "${STALLED}"
+                command sleep "${WRITE_STALL_SECONDS}"
+              fi
+              echo "tok-write-${n} 2026-11-03T18:00:00Z"
+            }
+            start_gitops_write_token "case rep 1" "${TOKEN_FILE}" >/dev/null
+            : > "${STALL}"
+            for _ in $(seq 1 50); do [ -e "${STALLED}" ] && break; command sleep 0.2; done
+            [ -e "${STALLED}" ] && echo "MINT=stalled" || echo "MINT=never"
+            stop_gitops_write_token "${TOKEN_FILE}"
+            command sleep "${AFTER_STALL_SECONDS}"
+            [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+            [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+            [ -e "${TOKEN_FILE}.mint" ] && echo "SCRATCH=left" || echo "SCRATCH=removed"
+            """,
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(RENEWAL_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(RENEWAL_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("MINT=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
+        self.assertIn("SCRATCH=removed", proc.stdout)
+
     def test_a_refused_mint_writes_nothing_and_says_so(self):
         proc = self._run(
             """\

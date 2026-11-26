@@ -200,7 +200,7 @@ def find_renewal_trap_offenders(scopes):
                 continue
             if RENEWAL_SUBSTITUTION_RE.search(line) or RENEWAL_UNCLOSED_ARITHMETIC_RE.search(line):
                 offenders.append(f"{scope}:{number} (substitution): {line.strip()}")
-            if scope.endswith("subshell") and RENEWAL_LOOP_JUMP_RE.search(line):
+            if RENEWAL_LOOP_JUMP_RE.search(line):
                 offenders.append(f"{scope}:{number} (loop jump): {line.strip()}")
     return offenders
 
