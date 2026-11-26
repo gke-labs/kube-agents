@@ -1363,7 +1363,15 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if d.Event == hookPostToolCall {
 		act.secrets.CollectToolResult(d.Extra.Result)
 	}
+	b.observeDelivery(run, act, d)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// observeDelivery is the door's critical section: under run.mu, released by
+// defer, it observes the delivery and publishes what it closed.
+func (b *Bridge) observeDelivery(run *taskRun, act *activityState, d hookDelivery) {
 	run.mu.Lock()
+	defer run.mu.Unlock()
 	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
 	if ok {
@@ -1377,8 +1385,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
 		}
 	}
-	run.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // runForSignature finds the in-flight task a delivery belongs to: the CLI
@@ -1464,12 +1470,17 @@ func (b *Bridge) runActivity(run *taskRun) {
 		case <-a.stop:
 			return
 		case <-tick:
-			run.mu.Lock()
-			if run.state == stateRunning && a.heartbeatUnderBudget() {
-				b.publishProgress(run, a.progressLine(time.Now()))
-			}
-			run.mu.Unlock()
+			b.heartbeatTick(run, a)
 		}
+	}
+}
+
+// heartbeatTick is one heartbeat publish, under run.mu, released by defer.
+func (b *Bridge) heartbeatTick(run *taskRun, a *activityState) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state == stateRunning && a.heartbeatUnderBudget() {
+		b.publishProgress(run, a.progressLine(time.Now()))
 	}
 }
 

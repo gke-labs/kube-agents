@@ -1143,19 +1143,27 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 			// task-ended.
 			return nil, ""
 		}
-		run.noticeMu.Lock()
-		run.mu.Lock()
-		took := run.state == stateRunning && takeSteerLocked(run, steer)
-		run.mu.Unlock()
-		if took {
-			b.publishSteerNotices(ctx, run, []lib.SteerNotice{
-				{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonCapability}})
-		}
-		run.noticeMu.Unlock()
-		if !took {
+		if !b.refuseSteerCapability(ctx, run, steer) {
 			return nil, "" // finalized meanwhile; it refused this one with the rest
 		}
 	}
+}
+
+// refuseSteerCapability takes a follow-up its capability check refused off
+// the queue and publishes its refusal notice, under noticeMu, released by
+// defer. false means the run was finalized meanwhile, and that finalize
+// refused it with the rest.
+func (b *Bridge) refuseSteerCapability(ctx context.Context, run *taskRun, steer *lib.Envelope) bool {
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
+	run.mu.Lock()
+	took := run.state == stateRunning && takeSteerLocked(run, steer)
+	run.mu.Unlock()
+	if took {
+		b.publishSteerNotices(ctx, run, []lib.SteerNotice{
+			{Steer: lib.SteerRefused, EnvelopeID: steer.EnvelopeID, Reason: lib.SteerReasonCapability}})
+	}
+	return took
 }
 
 // boundaryVerdicts is one turn boundary's capability verdicts, by the
@@ -1185,18 +1193,10 @@ func (v boundaryVerdicts) refusal(ctx context.Context, b *Bridge, env *lib.Envel
 // is not lost with the turn artifact. Either way the follow-up is still at
 // the head of the queue, and that finalize refused it task-ended.
 func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
-	run.noticeMu.Lock()
-	run.mu.Lock()
-	running := run.state == stateRunning
-	run.mu.Unlock()
+	running, err := b.publishTurnArtifact(run, turn, text)
 	if !running {
-		run.noticeMu.Unlock()
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(scrubAnswer(run, text)))
-	cancel()
-	run.noticeMu.Unlock()
 	if err != nil {
 		// The answer is still the task's: it goes out as the result, and
 		// the follow-up that was to run after it is refused task-ended. A
@@ -1207,6 +1207,24 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	return true
+}
+
+// publishTurnArtifact is publishTurnAnswer's critical section: under
+// noticeMu, released by defer, it publishes the scrubbed answer as a turn
+// artifact if the run is still running. running false means it published
+// nothing.
+func (b *Bridge) publishTurnArtifact(run *taskRun, turn int, text string) (running bool, err error) {
+	run.noticeMu.Lock()
+	defer run.noticeMu.Unlock()
+	run.mu.Lock()
+	running = run.state == stateRunning
+	run.mu.Unlock()
+	if !running {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	defer cancel()
+	return true, b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(scrubAnswer(run, text)))
 }
 
 // turnNote names the turn in a failed terminal's reason after the first.
@@ -1626,29 +1644,15 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
 	}
 
-	run.mu.Lock()
-	if run.state != stateRunning {
+	started, spawned, startErr := b.startChild(run, act, cmd)
+	if startErr != nil {
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", startErr), nil)
+		return
+	}
+	if !spawned {
 		// Shutdown or cancel finalized first.
-		run.mu.Unlock()
 		return
 	}
-	run.act.Store(act)
-	started := time.Now()
-	if err := cmd.Start(); err != nil {
-		// No child, so no publisher to join and nothing to drain.
-		run.act.Store(nil)
-		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
-		return
-	}
-	run.proc = cmd
-	go b.runActivity(run)
-	// Cancel may have raced the spawn: its kill saw no process, so re-check
-	// under the same lock its kill path takes.
-	if run.canceled.Load() {
-		b.killGroup(run, cmd.Process.Pid)
-	}
-	run.mu.Unlock()
 
 	deadline := b.afterDeadline(b.cfg.TaskDeadline, func() {
 		run.deadlineHit.Store(true)
@@ -1661,15 +1665,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	err := cmd.Wait()
 	reaped := time.Now()
 	deadline.Stop()
-	// The group is gone; stop any armed grace-period SIGKILLs before the
-	// pgid can be recycled onto an innocent process.
-	run.mu.Lock()
-	for _, t := range run.killTimers {
-		t.Stop()
-	}
-	run.killTimers = nil
-	note := reapCutNote(run.killedAt, reaped, cmd.WaitDelay)
-	run.mu.Unlock()
+	note := stopKillTimers(run, reaped, cmd.WaitDelay)
 
 	if errors.Is(err, exec.ErrWaitDelay) {
 		// Hermes exited 0, and only the copy of output a process it started
@@ -1688,11 +1684,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// per the payload spec's cancel mapping, unless its answer is
 		// withheld below, which ends it failed. The CLI reports no tokens,
 		// so the turn's usage is its wall time alone.
-		run.mu.Lock()
-		if run.state == stateRunning {
-			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
-		}
-		run.mu.Unlock()
+		b.publishUsage(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		if dropped := stdout.Dropped(); dropped > 0 {
 			// Refused, not truncated, as on the API executor: a cut answer
 			// published as complete would read as the whole one.
@@ -1722,15 +1714,62 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	default:
 		// A run that failed on its own still took its time; a killed one
 		// (the arms above) has no turn to account for.
-		run.mu.Lock()
-		if run.state == stateRunning {
-			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
-		}
-		run.mu.Unlock()
+		b.publishUsage(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		// The tails can carry what the answer would (stdout is the answer
 		// stream): each window scrubbed as an answer is (scrubAnswer),
 		// then cut to its tail (failureReason).
 		b.finalize(run, lib.StateFailed, failureReason(err, scrubAnswer(run, stdoutTail.String()), scrubAnswer(run, stderr.String()))+cliStdoutCutNote(b.stdoutCap, stdout.Dropped()), nil)
+	}
+}
+
+// startChild starts the cli executor's child under run.mu, released by
+// defer, with the task's activity state stored first. spawned false with a
+// nil error means shutdown or cancel finalized the run first; an error is
+// cmd.Start's, with no child and so no publisher to join and nothing to
+// drain.
+func (b *Bridge) startChild(run *taskRun, act *activityState, cmd *exec.Cmd) (started time.Time, spawned bool, err error) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning {
+		return time.Time{}, false, nil
+	}
+	run.act.Store(act)
+	started = time.Now()
+	if err := cmd.Start(); err != nil {
+		run.act.Store(nil)
+		return started, false, err
+	}
+	run.proc = cmd
+	go b.runActivity(run)
+	// Cancel may have raced the spawn: its kill saw no process, so re-check
+	// under the same lock its kill path takes.
+	if run.canceled.Load() {
+		b.killGroup(run, cmd.Process.Pid)
+	}
+	return started, true, nil
+}
+
+// stopKillTimers runs once the child's group is gone: under run.mu,
+// released by defer, it stops any armed grace-period SIGKILLs before the
+// pgid can be recycled onto an innocent process, and returns the reap note
+// (reapCutNote).
+func stopKillTimers(run *taskRun, reaped time.Time, bound time.Duration) string {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	for _, t := range run.killTimers {
+		t.Stop()
+	}
+	run.killTimers = nil
+	return reapCutNote(run.killedAt, reaped, bound)
+}
+
+// publishUsage publishes one finished turn's usage (publishUsageLocked) if
+// the run is still running, under run.mu, released by defer.
+func (b *Bridge) publishUsage(run *taskRun, u lib.Usage) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state == stateRunning {
+		b.publishUsageLocked(run, u)
 	}
 }
 
@@ -1973,7 +2012,31 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// empty from here; nothing but finalize sets stateDone, and finalize is
 	// serialized on noticeMu, so the state is still not done below.
 	b.refuseQueued(context.Background(), run)
+	state, err := b.finalizeLocked(run, state, msg, resultOutput, data, copyOnly)
+	b.waitActivity(run)
+	if err != nil {
+		// The task stays in the KV registry, so a restart's sweep writes the
+		// terminal event this publish could not.
+		b.cfg.Logger.Error("terminal publish failed; sweep will finalize",
+			"task", run.origin.TaskID, "state", state, "err", err)
+		return
+	}
+	cctx, ccancel := context.WithTimeout(context.Background(), registryClearTimeout)
+	b.clearInFlight(cctx, run.origin.TaskID)
+	ccancel()
+	b.mu.Lock()
+	delete(b.tasks, run.origin.TaskID)
+	b.mu.Unlock()
+	b.cfg.Logger.Info("task finished", "task", run.origin.TaskID, "state", state)
+}
+
+// finalizeLocked is finalizeResult's critical section under run.mu,
+// released by defer: the activity drain, the result and the terminal. It
+// returns the state the terminal carried (a result that failed to publish
+// turns it failed) and the terminal publish's error.
+func (b *Bridge) finalizeLocked(run *taskRun, state lib.TaskState, msg string, resultOutput *string, data []byte, copyOnly bool) (lib.TaskState, error) {
 	run.mu.Lock()
+	defer run.mu.Unlock()
 	// The trace first, while the state still admits it: any call still
 	// open, and the budget marker if calls were cut, go out ahead of the
 	// result inside this critical section, so the activity artifact is
@@ -1996,6 +2059,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	defer cancel()
 	if resultOutput != nil {
 		// The chat message is read from the scrubbed answer (resultOutput was
 		// replaced with scrubAnswer's copy above); the text a person sees
@@ -2013,22 +2077,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	cancel()
 	// The task's answers are out: the values seen for their scrub go.
 	b.clearSeenSecrets(run)
-	run.mu.Unlock()
-	b.waitActivity(run)
-	if err != nil {
-		// The task stays in the KV registry, so a restart's sweep writes the
-		// terminal event this publish could not.
-		b.cfg.Logger.Error("terminal publish failed; sweep will finalize",
-			"task", run.origin.TaskID, "state", state, "err", err)
-		return
-	}
-	cctx, ccancel := context.WithTimeout(context.Background(), registryClearTimeout)
-	b.clearInFlight(cctx, run.origin.TaskID)
-	ccancel()
-	b.mu.Lock()
-	delete(b.tasks, run.origin.TaskID)
-	b.mu.Unlock()
-	b.cfg.Logger.Info("task finished", "task", run.origin.TaskID, "state", state)
+	return state, err
 }
 
 func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.TaskState, msg string) error {

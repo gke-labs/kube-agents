@@ -195,8 +195,10 @@ func (b *Bridge) runCardStop(ctx context.Context, run *taskRun) {
 		b.finalizeCardStopError(run, fmt.Errorf("the session's turn did not end within %s; no card was stopped", cardStopTurnWait))
 		return
 	}
-	resp, err := b.postCardStop(stopCtx, sessionID, run.origin)
-	release()
+	resp, err := func() (*cardStopResponse, error) {
+		defer release()
+		return b.postCardStop(stopCtx, sessionID, run.origin)
+	}()
 	if err != nil {
 		b.finalizeCardStopError(run, err)
 		return
