@@ -374,6 +374,11 @@ func (a *TeamsAdapter) postChat(conversation string, m OutMessage) (string, erro
 func (a *TeamsAdapter) editChat(conversation, messageID string, m OutMessage) error {
 	card, err := a.chatCard(messageID, m)
 	if err != nil {
+		if errors.Is(err, ErrLayoutRefused) && len(m.Chat.Choices) > 0 {
+			// A question asked again that cannot be drawn goes out as
+			// text next: the earlier answer is not that text's.
+			a.forgetAnswer(messageID)
+		}
 		return err
 	}
 	if err := a.edit(conversation, messageID, card.text, card.actions()); err != nil {

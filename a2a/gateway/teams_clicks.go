@@ -171,6 +171,17 @@ func (a *TeamsAdapter) trackQuestion(id, conversation string, m *chatmsg.Message
 	forget(&ux.answeredRing, id)
 }
 
+// forgetAnswer drops the answered line message id carries, for a question
+// asked again on it.
+func (a *TeamsAdapter) forgetAnswer(id string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	delete(ux.answered, id)
+	delete(ux.lines, id)
+	forget(&ux.answeredRing, id)
+}
+
 // dropQuestionLocked forgets a question, and the open slot that names it.
 func (ux *teamsUX) dropQuestionLocked(id string) {
 	if q, ok := ux.questions[id]; ok && ux.open[q.conversation] == id {

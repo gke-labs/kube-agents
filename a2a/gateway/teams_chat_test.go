@@ -286,6 +286,30 @@ func TestTeamsAnsweredLineSurvivesEditsUntilAReAsk(t *testing.T) {
 	}
 }
 
+// A question asked again on an answered message with a card too large to
+// draw is refused, and the text edit that follows carries no old answer.
+func TestTeamsRefusedReAskCarriesNoStaleAnswer(t *testing.T) {
+	a, relay := askedTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	msg, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:30", testTeamsPosted, teamsChoice("yes, restart it", 0, "Yes"))))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.rewrites.Wait()
+	big := testTeamsQuestion()
+	big.Detail = strings.Repeat("a long line of evidence\n", 2000)
+	if err := a.EditMessage(conversation, testTeamsPosted, OutMessage{Text: "fallback", Chat: big}); !errors.Is(err, ErrLayoutRefused) {
+		t.Fatalf("edit error %v, want a refused layout", err)
+	}
+	if err := a.EditMessage(conversation, testTeamsPosted, OutMessage{Text: "asked again, as text"}); err != nil {
+		t.Fatal(err)
+	}
+	if text := teamsCallText(t, relay, 2); !strings.HasPrefix(text, "asked again, as text") || strings.Contains(text, "✓") {
+		t.Errorf("the text of a refused re-ask kept the old answer:\n%s", text)
+	}
+}
+
 // An edit that lays the message out without choices, or as text, closes
 // the question: a late press on buttons a client still shows is a turn the
 // gateway handles, and writes nothing back on the card.
