@@ -72,8 +72,9 @@ func splitList(raw string) []string {
 	return entries
 }
 
-// parseAuthModes reads --auth-mode: none alone, or token-review and jwt, either or both, in
-// the order their authenticators are tried.
+// parseAuthModes reads --auth-mode: none alone, or any of token-review, jwt, mtls and
+// requestheader, as listed. orderedAuthModes says in what order their authenticators are
+// tried.
 func parseAuthModes(raw string) ([]string, error) {
 	modes := splitList(raw)
 	if len(modes) == 0 {
@@ -81,7 +82,7 @@ func parseAuthModes(raw string) ([]string, error) {
 	}
 	for i, mode := range modes {
 		switch mode {
-		case authModeTokenReview, authModeJWT:
+		case authModeTokenReview, authModeJWT, authModeMTLS, authModeRequestHeader:
 		case authModeNone:
 			if len(modes) > 1 {
 				return nil, fmt.Errorf("invalid --%s %q: %q cannot be combined with another mode", authModeFlag, raw, authModeNone)
@@ -97,12 +98,12 @@ func parseAuthModes(raw string) ([]string, error) {
 }
 
 func invalidAuthModeError(raw string) error {
-	return fmt.Errorf("invalid --%s %q: expected %q, or a comma-separated list of %q and %q",
-		authModeFlag, raw, authModeNone, authModeTokenReview, authModeJWT)
+	return fmt.Errorf("invalid --%s %q: expected %q, or a comma-separated list of %q, %q, %q and %q",
+		authModeFlag, raw, authModeNone, authModeTokenReview, authModeJWT, authModeMTLS, authModeRequestHeader)
 }
 
-// trimAuthFlags drops the whitespace around the values --jwt-* and --partition-by-caller
-// carry, such as the newline of a value read from a file, so a value is checked and used in
+// trimAuthFlags drops the whitespace around the values --jwt-*, --mtls-*, --requestheader-*
+// and --partition-by-caller carry, such as the newline of a value read from a file, so a value is checked and used in
 // one form and a whitespace-only one is unset.
 func trimAuthFlags(cfg *proxyConfig) {
 	for _, value := range []*string{
@@ -111,6 +112,9 @@ func trimAuthFlags(cfg *proxyConfig) {
 		&cfg.jwtCAFile, &cfg.partitionByCaller,
 	} {
 		*value = strings.TrimSpace(*value)
+	}
+	for _, f := range cfg.clientCert.flags() {
+		*f.value = strings.TrimSpace(*f.value)
 	}
 }
 
@@ -142,6 +146,9 @@ func jwtFlagsSet(cfg proxyConfig) []string {
 // would be ignored, and the operator who set an allowlist or an issuer would believe it
 // applied. The none mode makes its own checks.
 func validateAuthFlags(cfg proxyConfig, modes []string) error {
+	if err := validateClientCertFlags(cfg, modes); err != nil {
+		return err
+	}
 	if !slices.Contains(modes, authModeJWT) {
 		if set := jwtFlagsSet(cfg); len(set) > 0 {
 			return fmt.Errorf("%s requires %q in --%s", strings.Join(set, ", "), authModeJWT, authModeFlag)
@@ -215,9 +222,20 @@ func callerPartitionFunc(cfg proxyConfig, modes []string) (func(*k8sapiproxy.Cal
 		}
 		return nil, nil
 	case partitionByPartition:
-		// Without the claim every caller's Partition is "", and the flag would separate nobody.
-		if !slices.Contains(modes, authModeJWT) || cfg.jwtPartitionClaim == "" {
+		// A client certificate names no partition: every mtls caller would share the empty one.
+		if slices.Contains(modes, authModeMTLS) {
+			return nil, fmt.Errorf("--%s=%s cannot be combined with %q in --%s: a client certificate names no partition", partitionByCallerFlag, partitionByPartition, authModeMTLS, authModeFlag)
+		}
+		if slices.Contains(modes, authModeRequestHeader) && cfg.clientCert.headerPartitionHeaders == "" {
+			return nil, fmt.Errorf("--%s=%s with %q in --%s requires --%s", partitionByCallerFlag, partitionByPartition, authModeRequestHeader, authModeFlag, headerPartitionHeadersFlag)
+		}
+		// Without the claim every JWT caller's Partition is "", and the flag would separate
+		// nobody; requestheader is the other mode that names one.
+		if slices.Contains(modes, authModeJWT) && cfg.jwtPartitionClaim == "" {
 			return nil, fmt.Errorf("--%s=%s requires %q in --%s and --%s", partitionByCallerFlag, partitionByPartition, authModeJWT, authModeFlag, jwtPartitionClaimFlag)
+		}
+		if !slices.Contains(modes, authModeJWT) && !slices.Contains(modes, authModeRequestHeader) {
+			return nil, fmt.Errorf("--%s=%s requires %q in --%s and --%s, or %q and --%s", partitionByCallerFlag, partitionByPartition, authModeJWT, authModeFlag, jwtPartitionClaimFlag, authModeRequestHeader, headerPartitionHeadersFlag)
 		}
 		return func(caller *k8sapiproxy.CallerIdentity) string { return caller.Partition }, nil
 	case partitionByUsername:

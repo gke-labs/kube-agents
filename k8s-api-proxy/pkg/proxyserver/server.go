@@ -215,6 +215,7 @@ type proxyConfig struct {
 	jwtCAFile                string
 	partitionByCaller        string
 	partitionByCallerSet     bool
+	clientCert               clientCertConfig
 }
 
 func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
@@ -225,7 +226,8 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.StringVar(&cfg.tlsCertFile, tlsCertFileFlag, envOrDefault(tlsCertFileEnv, defaultTLSCertFile), "TLS server certificate chain PEM file, re-read when it changes; give the same path as --"+tlsKeyFileFlag+" for one PEM file holding the chain and its private key (empty for plain HTTP)")
 	fs.StringVar(&cfg.tlsKeyFile, tlsKeyFileFlag, envOrDefault(tlsKeyFileEnv, defaultTLSKeyFile), "TLS server private key PEM file, re-read when it changes; the --"+tlsCertFileFlag+" path when that file holds the key (empty for plain HTTP)")
 	fs.StringVar(&cfg.modeRaw, "mode", envOrDefault(modeEnv, string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
-	fs.StringVar(&cfg.authMode, authModeFlag, envOrDefault(authModeEnv, authModeTokenReview), "Caller authentication mode: none, or a comma-separated list of token-review and jwt, tried in that order")
+	fs.StringVar(&cfg.authMode, authModeFlag, envOrDefault(authModeEnv, authModeTokenReview), "Caller authentication mode: none, or a comma-separated list of token-review, jwt, "+authModeMTLS+" and "+authModeRequestHeader+"; "+authModeRequestHeader+" and "+authModeMTLS+" are tried first, and they alone admit a request whose connection presented a client certificate, then the others in the order listed")
+	registerClientCertFlags(fs, &cfg.clientCert)
 	fs.StringVar(&cfg.jwtIssuer, jwtIssuerFlag, envOrDefault(jwtIssuerEnv, ""), "Issuer (iss) a caller's JWT must carry; required with --"+authModeFlag+"=jwt")
 	fs.StringVar(&cfg.jwtKeySetURL, jwtKeySetURLFlag, envOrDefault(jwtKeySetURLEnv, ""), "https URL of the issuer's JSON Web Key Set (when empty, discovered from <issuer>/.well-known/openid-configuration, which needs an https --"+jwtIssuerFlag+")")
 	fs.StringVar(&cfg.jwtAudiences, jwtAudiencesFlag, envOrDefault(jwtAudiencesEnv, ""), "Comma-separated audiences (aud) accepted in a caller's JWT; required with --"+authModeFlag+"=jwt")
@@ -236,7 +238,7 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.StringVar(&cfg.jwtRequiredSubPrefix, jwtRequiredSubPrefixFlag, envOrDefault(jwtRequiredSubPrefixEnv, ""), "Prefix a caller JWT's sub must start with (optional)")
 	fs.StringVar(&cfg.jwtAllowedPartitions, jwtAllowedPartitionsFlag, envOrDefault(jwtAllowedPartitionsEnv, ""), "Comma-separated --"+jwtPartitionClaimFlag+" values admitted (empty admits any)")
 	fs.StringVar(&cfg.jwtCAFile, jwtCAFileFlag, envOrDefault(jwtCAFileEnv, ""), "PEM bundle of the root CAs the JWT issuer's key set and metadata server is verified against, re-read when it changes (empty uses the system roots)")
-	fs.StringVar(&cfg.partitionByCaller, partitionByCallerFlag, envOrDefault(partitionByCallerEnv, partitionByNone), "Share cached responses and coalesced fetches only among callers with the same: none (all callers share), partition (--"+jwtPartitionClaimFlag+"), or username")
+	fs.StringVar(&cfg.partitionByCaller, partitionByCallerFlag, envOrDefault(partitionByCallerEnv, partitionByNone), "Share cached responses and coalesced fetches only among callers with the same: none (all callers share), partition (--"+jwtPartitionClaimFlag+" or --"+headerPartitionHeadersFlag+"), or username")
 	fs.StringVar(&cfg.upstreamURL, upstreamURLFlag, envOrDefault(upstreamURLEnv, ""), "Static http:// or https:// upstream URL (skips cloud discovery and defaults bare paths to in-cluster)")
 	fs.StringVar(&cfg.upstreamTokenFile, upstreamTokenFileFlag, envOrDefault(upstreamTokenFileEnv, ""), "File holding the bearer token sent to --"+upstreamURLFlag+", which must then be https://; read again when it is rotated (empty sends no credential)")
 	fs.StringVar(&cfg.upstreamCAFile, upstreamCAFileFlag, envOrDefault(upstreamCAFileEnv, ""), "PEM bundle of the root CAs the https:// --"+upstreamURLFlag+" server is verified against, re-read when it changes (empty uses the system roots)")
@@ -505,6 +507,7 @@ func buildHandler(
 	if err := validateAuthFlags(cfg, modes); err != nil {
 		return nil, err
 	}
+	warnSharedClientCA(cfg.clientCert, modes, logger)
 	callerPartition, err := callerPartitionFunc(cfg, modes)
 	if err != nil {
 		return nil, err
@@ -514,10 +517,28 @@ func buildHandler(
 		return nil, err
 	}
 
-	var authenticators []k8sapiproxy.CallerAuthenticator
+	// certificateAuthenticators are the modes that read the connection's client certificate
+	// and authenticators the ones that read a bearer token: newModeAuthenticator says which
+	// of the two a request goes to.
+	var certificateAuthenticators, authenticators []k8sapiproxy.CallerAuthenticator
+	callerHeaders := cfg.embedder.ExtraCallerHeaders
 	var inCluster *rest.Config
-	for _, authMode := range modes {
+	for _, authMode := range orderedAuthModes(modes) {
 		switch authMode {
+		case authModeRequestHeader:
+			frontProxy, err := newRequestHeaderAuthenticator(cfg.clientCert, logger, metrics)
+			if err != nil {
+				return nil, err
+			}
+			// The identity headers are the caller's credential here: none travels upstream.
+			callerHeaders = mergeCallerHeaders(callerHeaders, frontProxy.HeaderNames())
+			certificateAuthenticators = append(certificateAuthenticators, namedAuthenticator{name: authModeRequestHeader, next: frontProxy})
+		case authModeMTLS:
+			clientCert, err := newMTLSAuthenticator(cfg.clientCert, logger, metrics)
+			if err != nil {
+				return nil, err
+			}
+			certificateAuthenticators = append(certificateAuthenticators, namedAuthenticator{name: authModeMTLS, next: clientCert})
 		case authModeTokenReview:
 			callers, err := parseAllowedCallers(cfg.allowedCallers)
 			if err != nil {
@@ -571,7 +592,10 @@ func buildHandler(
 			authenticators = append(authenticators, unauthenticatedAuthenticator{})
 		}
 	}
-	authn := newChainAuthenticator(authenticators)
+	authn := newModeAuthenticator(certificateAuthenticators, authenticators)
+	if len(certificateAuthenticators) > 0 && len(modes) > 1 {
+		logger.Info("caller authenticators are tried in this order, and only "+authModeRequestHeader+" and "+authModeMTLS+" for a connection that presented a client certificate", logKeyOrder, orderedAuthModes(modes))
+	}
 
 	var upstreamTransport k8sapiproxy.UpstreamTransport
 	// The scoped pool does not route the host's gke_ ID in-cluster, so only the default
@@ -674,7 +698,7 @@ func buildHandler(
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
 		Authenticator:      authn,
 		Authorize:          cfg.embedder.Authorize,
-		ExtraCallerHeaders: cfg.embedder.ExtraCallerHeaders,
+		ExtraCallerHeaders: callerHeaders,
 		Upstream:           upstreamTransport,
 		Policy: k8sapiproxy.Policy{
 			Mode:                     mode,
@@ -765,8 +789,12 @@ func assemble(fs *flag.FlagSet, args []string, opts Options) (cfg proxyConfig, m
 // NewHandler is the handler Run would serve for args and opts: the same flags, registered
 // on fs, the same environment and the same startup checks, with nothing started and no
 // listener. It is for a program that serves the handler itself, and for an embedder's
-// tests of the Options it passes. Its audit records go to standard output, as Run's do.
-// Args that ask for the version are an error: they ask for no handler.
+// tests of the Options it passes. With mtls or requestheader in --auth-mode that program's
+// listener must verify client certificates as Run's does (pkg/mtlsauth says how): the
+// handler reads the certificate from Request.TLS and verifies it against its own bundle.
+// --tls-cert-file and --tls-key-file, which only Run's listener reads, are not required.
+// Its audit records go to standard output, as Run's do. Args that ask for the version are
+// an error: they ask for no handler.
 func NewHandler(ctx context.Context, fs *flag.FlagSet, args []string, opts Options) (http.Handler, error) {
 	cfg, mode, versionOnly, err := assemble(fs, args, opts)
 	if err != nil {
@@ -820,8 +848,10 @@ func Run(ctx context.Context, args []string, opts Options) error {
 	return nil
 }
 
-// serve builds the handler from cfg and serves it until ctx ends and the drain is over.
-func serve(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, version string, tp trace.TracerProvider) error {
+// newServer builds the handler from cfg and the server that serves it, started by nothing
+// yet. tlsEnabled says the server takes its certificate from its TLS configuration and is
+// served with ServeTLS; otherwise it speaks plain HTTP.
+func newServer(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, logger *slog.Logger, metrics *k8sapiproxy.Metrics, tp trace.TracerProvider) (srv *http.Server, tlsEnabled bool, err error) {
 	// TLS needs both paths; either one empty serves plain HTTP. The same path for both
 	// means one PEM file holds the certificate chain and its private key.
 	certFile, keyFile := cfg.tlsCertFile, cfg.tlsKeyFile
@@ -829,15 +859,15 @@ func serve(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, version 
 		certFile, keyFile = "", ""
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	metrics := k8sapiproxy.NewMetrics()
+	// This server's listener is the one a certificate mode reads client certificates
+	// from, so those modes need it to serve TLS; NewHandler's caller brings its own.
+	cfg.clientCert.ownListener = true
 	handler, err := buildHandler(ctx, cfg, mode, logger, metrics, tp)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	startMetricsListener(ctx, cfg.metricsPort, metrics, logger)
 
-	srv := &http.Server{
+	srv = &http.Server{
 		Addr:              cfg.listenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -845,19 +875,43 @@ func serve(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, version 
 			MinVersion: tls.VersionTLS12,
 		},
 	}
+	if certFile == "" {
+		return srv, false, nil
+	}
+	serverCert, err := certreload.NewServerCertificate(certFile, keyFile, certreload.Options{
+		OnReloadError: func(err error) {
+			logger.Warn("serving the previous TLS certificate: the changed certificate or key could not be loaded", "err", err)
+			metrics.RecordCertificateReloadFailure()
+		},
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to load the TLS server certificate: %w", err)
+	}
+	srv.TLSConfig.GetCertificate = serverCert.GetCertificate
+	// Without a certificate mode the handshake asks no peer for a certificate, as it never
+	// has; with one, it verifies a certificate that is presented and requires none.
+	clientCAs, err := newClientCAPool(cfg, logger, metrics)
+	if err != nil {
+		return nil, false, err
+	}
+	if clientCAs != nil {
+		srv.TLSConfig.GetConfigForClient = verifyClientCertificates(srv.TLSConfig, clientCAs, newSharedCAWatch(cfg, logger))
+	}
+	return srv, true, nil
+}
+
+// serve builds the handler from cfg and serves it until ctx ends and the drain is over.
+func serve(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, version string, tp trace.TracerProvider) error {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	metrics := k8sapiproxy.NewMetrics()
+	srv, tlsEnabled, err := newServer(ctx, cfg, mode, logger, metrics, tp)
+	if err != nil {
+		return err
+	}
+	startMetricsListener(ctx, cfg.metricsPort, metrics, logger)
 
 	listen := srv.ListenAndServe
-	if certFile != "" {
-		serverCert, err := certreload.NewServerCertificate(certFile, keyFile, certreload.Options{
-			OnReloadError: func(err error) {
-				logger.Warn("serving the previous TLS certificate: the changed certificate or key could not be loaded", "err", err)
-				metrics.RecordCertificateReloadFailure()
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to load the TLS server certificate: %w", err)
-		}
-		srv.TLSConfig.GetCertificate = serverCert.GetCertificate
+	if tlsEnabled {
 		log.Printf("starting %s (TLS) on %s (mode=%s, authMode=%s, redactSecrets=%v, denyStreaming=%v, metricsPort=%d, cacheMaxBytes=%d)", versionString(version), cfg.listenAddr, mode, cfg.authMode, cfg.redactSecrets, cfg.denyStreaming, cfg.metricsPort, cfg.cacheMaxBytes)
 		// Empty file names make the server take certificates from TLSConfig.GetCertificate.
 		listen = func() error { return srv.ListenAndServeTLS("", "") }

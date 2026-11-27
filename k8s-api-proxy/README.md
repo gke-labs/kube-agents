@@ -61,8 +61,9 @@ followed only on `https://` to the host and port being fetched, a configured `Ke
 verified against instead of the system roots; it is re-read when it changes, like the server
 certificate below, and the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
-`pkg/mtlsauth` holds two authenticators for an embedder whose callers arrive over mutual TLS. The
-binary has no `--auth-mode` for them. Neither imports `client-go`.
+`pkg/mtlsauth` holds two authenticators for callers that arrive over mutual TLS. The binary runs
+them as `--auth-mode=mtls` and `--auth-mode=requestheader`, with the flags further down; an
+embedder builds them itself. Neither imports `client-go`.
 
 ```go
 // The caller is the certificate: a workload's SPIFFE X.509-SVID, for example.
@@ -145,9 +146,9 @@ repeated or name a partition that is not allowed is refused with an error wrappi
 on a credential the proxy only forwarded. That holds only for the authenticators after it, so
 the front-proxy authenticator must come first: with a bearer-token authenticator ahead of it, a
 request from an allowed proxy that forwards a token is admitted under the token's identity and
-the empty partition, and the headers are never read. The binary's chain is not exported and has
-no mode for these authenticators, so an embedder that combines them writes its own chain, which
-must stop at an error wrapping `ErrCallerRefused`.
+the empty partition, and the headers are never read. The binary tries it first whatever order
+`--auth-mode` lists. Its chain is not exported, so an embedder that combines these authenticators
+writes its own chain, which must stop at an error wrapping `ErrCallerRefused`.
 
 Only the header failures of a front proxy that verifies now are final. A proxy whose certificate
 expired, or whose CA was rotated out of the bundle, is a peer like any other to the
@@ -155,7 +156,9 @@ authenticator, and its requests fall through. With a bearer-token authenticator 
 request such a proxy forwards with the caller's own `Authorization` header is then admitted
 under the token's identity and that authenticator's partition. Do not chain a bearer-token
 authenticator behind the front-proxy authenticator on a listener where the proxy forwards
-callers' `Authorization`, or have the proxy strip it. A certificate that verified but whose name
+callers' `Authorization`, or have the proxy strip it. The binary's chain closes this itself: a
+connection that presented a client certificate is never admitted on a bearer token (the
+certificate rule, further down). A certificate that verified but whose name
 `AllowedIdentities`, `RequiredURIPrefix` or `AllowedNames` does not admit is the authenticator's
 to judge, and is still a plain error by choice, so a chain can admit the caller another way, as
 `jwtauth`'s filters do.
@@ -287,7 +290,7 @@ only through client-go's retries of the `429`s, and a request answered `429` ten
 
 The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
 and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
-empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
+empty serves plain HTTP, which `mtls` or `requestheader` in `--auth-mode` refuses to start with. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
 give its path to both flags. Files without a matching certificate and key stop the proxy at
 startup. The files are reloaded
 without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
@@ -295,7 +298,8 @@ modification time, device and inode (so a Secret or projected volume's `..data` 
 seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
 not load, such as one read mid-rotation, is logged, counted in
 `kubeagents_kube_proxy_certificate_reload_failures_total` (which also counts a changed
-`--upstream-ca-file` that does not load), and the last good certificate keeps
+`--upstream-ca-file`, `--mtls-client-ca-file` or `--requestheader-client-ca-file` that does not
+load), and the last good certificate keeps
 being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
 `Transport` verifies each new connection against the current bundle, with hostname and IP SAN
 checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
@@ -337,8 +341,9 @@ audit sink does not log it. `Config.ExtraCallerHeaders` names further request he
 before forwarding, on plain, watch and upgrade requests alike, for a deployment that passes a
 caller's identity or credential in headers of its own; the authenticator and `Config.Authorize`
 still read them. An entry that is not an HTTP header name, or is `Host`, `Content-Length`,
-`Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets
-neither option.
+`Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets no
+`Config.Authorize`, and puts in `Config.ExtraCallerHeaders` only the headers
+`--auth-mode=requestheader` reads.
 
 A program that needs only those two options on top of the binary, or one more TokenReview audience
 with callers of its own, does not rebuild the server from the packages: its `main` calls `proxyserver.Run` (`pkg/proxyserver`), which is what
@@ -379,7 +384,10 @@ of its own can find it with `errors.As` and name those settings. An empty map ch
 
 `proxyserver.NewHandler` returns the handler `Run` would serve for the same arguments and options,
 with the flags registered on a `flag.FlagSet` the caller passes and nothing started. It is for a
-program that serves the handler itself and for an embedder's tests of its `Options`.
+program that serves the handler itself and for an embedder's tests of its `Options`. With `mtls`
+or `requestheader` in `--auth-mode`, that program's own listener must verify client certificates
+as `Run`'s does; `NewHandler` does not require `--tls-cert-file` and `--tls-key-file`, which only
+`Run`'s listener reads.
 
 Everything else is the binary's: the same flags, environment variables and
 defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
@@ -474,34 +482,195 @@ Values are trimmed, and a whitespace-only value is unset.
 | `--jwt-ca-file`             | `KUBE_PROXY_JWT_CA_FILE`             | PEM bundle of the roots the issuer's server is verified against (`Config.CAFile`).                                 |
 | `--partition-by-caller`     | `KUBE_PROXY_PARTITION_BY_CALLER`     | `none` (default), `partition` or `username`: what `Config.CallerPartition` separates by. Passed empty is an error. |
 
-A list of several authenticators tries them in order and admits the caller the first one accepts.
+A list of `token-review` and `jwt` tries them in order and admits the caller the first one accepts;
+with `mtls` or `requestheader` also listed, that holds for a request whose connection presented no
+client certificate (the certificate rule, further down).
 When none does, the answer is a 503 if any of them could not decide (a failed TokenReview, a key
-set or metadata that could not be fetched), and a 401 only when every one refused. Every listed
-authenticator sees the request's original `Authorization` header until one accepts it, so with `token-review` first a
+set or metadata that could not be fetched), and a 401 only when every one refused. Each of these
+bearer-token authenticators sees the request's original `Authorization` header until one accepts it, so with `token-review` first a
 platform-issued token is sent to the host cluster's TokenReview API before `jwt` verifies it;
 list `jwt` first to keep it local. The audit record's `caller_authenticator` is the mode that
-admitted the caller (`token-review` or `jwt`, set by the binary for a single mode too), so a JWT
-caller named like a ServiceAccount is told apart from it.
+admitted the caller (`token-review`, `jwt`, `mtls` or `requestheader`, set by the binary for a
+single mode too), so a JWT caller named like a ServiceAccount is told apart from it.
 
 `--partition-by-caller=partition` keeps cached responses and coalesced fetches within one
-`CallerIdentity.Partition`, and needs `jwt` with `--jwt-partition-claim`; in a list with
+`CallerIdentity.Partition`, and needs a mode that names one: `jwt` with `--jwt-partition-claim`,
+or `requestheader` with `--requestheader-partition-headers`. Each of those two modes that is
+listed needs its flag, and `mtls` cannot be listed at all, since a certificate names no
+partition. A partition is one partition whichever of the two modes named it. In a list with
 `token-review`, the callers TokenReview admits carry no partition and share the empty one.
 `--partition-by-caller=username` keeps them within one username, whichever authenticator named
 it, and is refused at startup with more than one mode in `--auth-mode`, where two authenticators
-could name different callers alike. The binary's upstreams pick no credential per caller, so the
+could name different callers alike; `mtls` alone and `requestheader` alone take it. The binary's upstreams pick no credential per caller, so the
 partition separates what callers can read from the cache, not what the upstream authorizes.
+
+`--auth-mode` also takes `mtls` and `requestheader`, the two authenticators of `pkg/mtlsauth`
+above, alone or in a list with each other, `token-review` and `jwt`. The rules for certificates,
+names and headers are the library's, as described there.
+
+| Flag                                 | Environment variable                          | Meaning                                                                                                     |
+| ------------------------------------ | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `--mtls-client-ca-file`              | `KUBE_PROXY_MTLS_CLIENT_CA_FILE`              | PEM bundle of the CAs a caller's certificate must chain to. Required with `mtls`.                           |
+| `--mtls-identity-source`             | `KUBE_PROXY_MTLS_IDENTITY_SOURCE`             | Certificate field the username is read from: `uri`, `dns` or `cn`. Required with `mtls`.                    |
+| `--mtls-allowed-identities`          | `KUBE_PROXY_MTLS_ALLOWED_IDENTITIES`          | Comma-separated identities admitted, compared exactly; empty admits every certificate the CA issues.        |
+| `--mtls-required-uri-prefix`         | `KUBE_PROXY_MTLS_REQUIRED_URI_PREFIX`         | Prefix the certificate's URI must start with, ending in `/`; needs `--mtls-identity-source=uri`.            |
+| `--requestheader-client-ca-file`     | `KUBE_PROXY_REQUESTHEADER_CLIENT_CA_FILE`     | PEM bundle of the CAs a front proxy's certificate must chain to. Required with `requestheader`.             |
+| `--requestheader-name-source`        | `KUBE_PROXY_REQUESTHEADER_NAME_SOURCE`        | Certificate field the front proxy's name is read from: `uri`, `dns` or `cn`. Required with `requestheader`. |
+| `--requestheader-allowed-names`      | `KUBE_PROXY_REQUESTHEADER_ALLOWED_NAMES`      | Comma-separated names of the front proxies whose headers are believed. At least one is required.            |
+| `--requestheader-username-headers`   | `KUBE_PROXY_REQUESTHEADER_USERNAME_HEADERS`   | Comma-separated headers holding the username; the first one present is read. At least one is required.      |
+| `--requestheader-uid-headers`        | `KUBE_PROXY_REQUESTHEADER_UID_HEADERS`        | Comma-separated headers holding the UID; when set, a front proxy's request without one is refused.          |
+| `--requestheader-group-headers`      | `KUBE_PROXY_REQUESTHEADER_GROUP_HEADERS`      | Comma-separated headers whose every value is a group.                                                       |
+| `--requestheader-partition-headers`  | `KUBE_PROXY_REQUESTHEADER_PARTITION_HEADERS`  | Comma-separated headers holding the partition; when set, a front proxy's request without one is refused.    |
+| `--requestheader-allowed-partitions` | `KUBE_PROXY_REQUESTHEADER_ALLOWED_PARTITIONS` | Comma-separated partitions admitted; needs `--requestheader-partition-headers`.                             |
+
+`mtls` admits the holder of a client certificate that chains to `--mtls-client-ca-file`. The
+certificate's name is the username; there is no UID, group or partition.
+
+```bash
+k8s-api-proxy \
+  --auth-mode=mtls \
+  --tls-cert-file=/etc/proxy/tls/tls.crt \
+  --tls-key-file=/etc/proxy/tls/tls.key \
+  --mtls-client-ca-file=/etc/proxy/workload-ca/ca.crt \
+  --mtls-identity-source=uri \
+  --mtls-required-uri-prefix=spiffe://example.org/ns/agents/ \
+  --upstream-url=https://kubernetes.default.svc \
+  --upstream-token-file=/var/run/secrets/proxy/upstream/token \
+  --upstream-ca-file=/var/run/secrets/proxy/upstream/ca.crt
+```
+
+A sandbox whose certificate carries the URI `spiffe://example.org/ns/agents/sa/sandbox` is the
+caller `spiffe://example.org/ns/agents/sa/sandbox`; a certificate from the same CA for another
+namespace is answered `401`.
+
+`requestheader` admits whoever an allowed front proxy names. The proxy is known by its client
+certificate, under a CA of its own, and the caller by the headers the flags list.
+
+```bash
+k8s-api-proxy \
+  --auth-mode=requestheader \
+  --tls-cert-file=/etc/proxy/tls/tls.crt \
+  --tls-key-file=/etc/proxy/tls/tls.key \
+  --requestheader-client-ca-file=/etc/proxy/gateway-ca/ca.crt \
+  --requestheader-name-source=uri \
+  --requestheader-allowed-names=spiffe://example.org/ns/gateways/sa/egress \
+  --requestheader-username-headers=X-Caller-User \
+  --requestheader-group-headers=X-Caller-Group \
+  --requestheader-partition-headers=X-Caller-Tenant \
+  --partition-by-caller=partition \
+  --upstream-url=https://kubernetes.default.svc \
+  --upstream-token-file=/var/run/secrets/proxy/upstream/token \
+  --upstream-ca-file=/var/run/secrets/proxy/upstream/ca.crt
+```
+
+The gateway connects with its certificate and sends `X-Caller-User: alice` and
+`X-Caller-Tenant: team-a`. The proxy takes the request to be from `alice` in partition `team-a`,
+and forwards it without those headers: every header the flags name goes into
+`Config.ExtraCallerHeaders`, with any an embedder passes in `Options.ExtraCallerHeaders`. The
+header names have no defaults.
+
+Trusting a front proxy means believing whatever it sends. Every holder of a certificate that
+chains to `--requestheader-client-ca-file` and carries a name in `--requestheader-allowed-names`
+can act as any caller in any partition, and the audit record names the caller it sent and not the
+proxy. So the CA signs front proxies and nothing else, the list holds only proxies that
+authenticate their callers, and the headers are ones the proxy overwrites on every request. When
+both modes are listed and one CA certificate vouches for both (the two CA flags name one file, or
+the two bundles hold a certificate with the same bytes, as one Secret mounted twice does), the
+proxy stops at startup if
+`--mtls-identity-source` and `--requestheader-name-source` differ, since a workload's certificate
+could then carry an allowed front proxy's name in the other field, and otherwise starts with a
+warning that every certificate under that CA with an allowed name is a front proxy. Bundles that
+come to share a certificate through a reload cannot be refused: the proxy logs that warning once,
+at the next handshake, each time they do. Two different certificates of one CA key, and a CA both
+bundles reach through cross-signed intermediates, are not detected: keeping the two CAs apart
+stays the operator's to do. A
+peer that is not an allowed front proxy gains nothing by sending them: they are ignored, and
+stripped before the request is forwarded.
+
+With either mode, each TLS handshake asks for a client certificate and verifies one that is given
+(`tls.VerifyClientCertIfGiven`) against the union of the listed modes' CA files, through
+`GetConfigForClient` and `certreload.NewCAPoolUnion`. It requires none, so a health probe and a
+bearer-token caller still connect, and `/_kube_proxy/healthz` answers without a certificate. A
+peer that presents a certificate no listed CA signed fails the handshake. The CA files are
+reloaded like the serving certificate: a rotated CA is accepted, and the one it replaced refused,
+by the next handshake and the next request, and a certificate that expired or whose CA left its
+bundle is answered `401` on the next request of a connection that is already open, HTTP/2
+included. A changed file that does not load keeps the bundle it replaced, and is logged and
+counted in the reload failure metric once for each pool that reads the file: the listener's and
+each authenticator's that the file is given to. With neither mode the handshake asks no peer for a certificate.
+
+The order of `--auth-mode` does not set the precedence of these two modes. The binary tries
+`requestheader` first and `mtls` second, then `token-review` and `jwt` in the order listed. The
+front proxy's final refusal binds only the authenticators after it, so its place is fixed and not
+left to the order an operator wrote; refusing a list written in another order would add a startup
+error and no safety.
+
+The certificate rule: a request whose connection presented a client certificate is admitted
+by `requestheader` or `mtls`, or not at all: when neither admits it the answer is `401`, and
+`token-review` and `jwt` are not consulted. A request on a connection without a certificate goes
+to `token-review` and `jwt` as it does without the certificate modes. The rule is there for a
+front proxy whose certificate expired, or whose CA was rotated out, on a connection it still
+holds open: it is no longer a front proxy to `requestheader`, and a request it forwards with the
+caller's own `Authorization` header would otherwise be admitted under the token's identity, with
+the proxy's identity headers ignored. The connection still carries the certificate it opened
+with, and that decides.
+
+| The connection presented                                                             | Answer                                                                     |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| An allowed front proxy's certificate, with identity headers                          | The caller the headers name (`requestheader`); a bearer token is ignored.  |
+| An allowed front proxy's certificate, with a header missing, empty or repeated       | `401`; a bearer token is not consulted.                                    |
+| A front proxy's certificate that expired, lost its CA or is not in the allowed names | `401`; a bearer token is not consulted.                                    |
+| A certificate `mtls` admits                                                          | The certificate's name (`mtls`); a token and identity headers are ignored. |
+| A certificate under the `mtls` CA that expired, or that the prefix or list refuses   | `401`; a bearer token is not consulted.                                    |
+| No certificate, and a bearer token                                                   | `token-review` and `jwt` in the order listed.                              |
+| No certificate and no token                                                          | `401`.                                                                     |
+
+The rows hold for every list: `requestheader,jwt`, `mtls,token-review` and
+`mtls,requestheader,jwt` differ only in which rows can occur. What the rule costs is that a
+certificate and a bearer token are not alternatives on one connection. A peer that presents a
+certificate under one of the client CAs cannot fall back to its token, where the library alone
+would let a chain admit it another way. A workload meant to authenticate with a token connects
+without a certificate, or holds one whose CA is in neither client CA file (Go's TLS client, for
+one, then sends none, since the listener names the CAs it accepts). `token-review` is unchanged
+for the pods it serves: they present no certificate, and its pod check still requires the
+request's direct peer to be the pod, so a ServiceAccount token that a front proxy forwards was
+refused before and is now not reviewed. Neither certificate mode answers `503`, so a request on a
+connection with a certificate is admitted or answered `401`.
+
+The proxy stops at startup, naming the flag, when:
+
+- `mtls` or `requestheader` is listed and `--tls-cert-file` or `--tls-key-file` is empty;
+- both are listed, their CA files are one file or hold a common certificate, and their two source
+  flags differ;
+- `mtls` is listed without `--mtls-client-ca-file` or `--mtls-identity-source`, or
+  `requestheader` without `--requestheader-client-ca-file`, `--requestheader-name-source`,
+  `--requestheader-allowed-names` or `--requestheader-username-headers`;
+- `--mtls-required-uri-prefix` is set and `--mtls-identity-source` is not `uri`;
+- `mtls` is listed with another mode without `--mtls-identity-source=uri` and
+  `--mtls-required-uri-prefix`, which keep a certificate from carrying a username another
+  authenticator issues, such as `system:serviceaccount:<namespace>:<name>`;
+- `--requestheader-allowed-partitions` is set without `--requestheader-partition-headers`;
+- a `--mtls-*` or `--requestheader-*` flag is set without its mode, or a list-valued one holds
+  only separators;
+- a name, a prefix or a header is one the library refuses (a URI with a second spelling, a prefix
+  that does not end in `/`, a header in two lists or one the proxy needs), or a CA file does not
+  load;
+- `--partition-by-caller` is `partition` or `username` in a combination the paragraph above
+  refuses.
 
 [`examples/`](examples/) holds two reference deployments for a sandbox runtime outside
 kube-agents. In [`examples/egress-gateway/`](examples/egress-gateway/), one Deployment serves every
 tenant: the runtime's egress gateway injects a signed token per sandbox, the proxy verifies it with
 `--auth-mode=jwt` and separates tenants in its cache with `--partition-by-caller=partition`, and
 the manifests cover the serving certificate, the Service name the certificate, the kubeconfig and
-the gateway rule share, and the NetworkPolicy that admits the gateway's pods. In
+the gateway rule share, and the NetworkPolicy that admits the gateway's pods; its README has the
+`requestheader` flags for a gateway that authenticates with its own certificate instead. In
 [`examples/local-bridge/`](examples/local-bridge/), one process per sandbox listens on loopback
 with `--auth-mode=none` and forwards to a local `--upstream-url`.
 `pkg/proxyserver/examples_test.go` builds the binary's handler from the container `args` in the
-manifests and from the fenced flag blocks in the two example READMEs, so an unknown flag or a
-refused combination there fails the module's tests; flags named in prose are not checked.
+manifests, from the fenced flag blocks in the two example READMEs and from the two command
+blocks above, so an unknown flag or a refused combination there fails the module's tests; flags
+named in prose are not checked.
 
 It is a self-contained Go module. Run its checks from this directory:
 

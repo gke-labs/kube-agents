@@ -32,6 +32,8 @@ const (
 	egressGatewayConfig    = egressGatewayDir + "/sandbox-kubeconfig.yaml"
 	egressGatewayReadme    = egressGatewayDir + "/README.md"
 	localBridgeReadme      = examplesDir + "/local-bridge/README.md"
+	moduleReadme           = "../../README.md"
+	exampleJWTFlagPrefix   = "jwt-"
 	exampleManifestSuffix  = ".yaml"
 	exampleDecodeBuffer    = 4096
 	exampleProxyRepository = "/kube-proxy"
@@ -55,8 +57,10 @@ const (
 	kubeTokenFileFlag      = "kube-token-file"
 	kubeCAFileFlag         = "kube-ca-file"
 	// The fenced flag blocks each example README holds.
-	egressGatewayReadmeBlocks = 2
+	egressGatewayReadmeBlocks = 3
 	localBridgeReadmeBlocks   = 2
+	// The module README's command blocks: one for each certificate mode.
+	moduleReadmeBlocks = 2
 )
 
 // binaryEnvPrefixes are the prefixes of the variables the binary owns; proxyEnvVars lists
@@ -281,11 +285,13 @@ func withLocalFiles(t *testing.T, args []string) []string {
 	t.Helper()
 	caFile := newTLSUpstream(t).caFile
 	local := map[string]string{
-		exampleFlagPrefix + upstreamTokenFileFlag: writeTokenFile(t, testUpstreamToken),
-		exampleFlagPrefix + upstreamCAFileFlag:    caFile,
-		exampleFlagPrefix + jwtCAFileFlag:         caFile,
-		exampleFlagPrefix + kubeTokenFileFlag:     writeTokenFile(t, testUpstreamToken),
-		exampleFlagPrefix + kubeCAFileFlag:        caFile,
+		exampleFlagPrefix + upstreamTokenFileFlag:  writeTokenFile(t, testUpstreamToken),
+		exampleFlagPrefix + upstreamCAFileFlag:     caFile,
+		exampleFlagPrefix + jwtCAFileFlag:          caFile,
+		exampleFlagPrefix + kubeTokenFileFlag:      writeTokenFile(t, testUpstreamToken),
+		exampleFlagPrefix + kubeCAFileFlag:         caFile,
+		exampleFlagPrefix + mtlsClientCAFileFlag:   caFile,
+		exampleFlagPrefix + headerClientCAFileFlag: caFile,
 	}
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -319,6 +325,9 @@ func buildFromArgs(t *testing.T, args []string) (proxyConfig, error) {
 	}
 	written := parse(args)
 	cfg := parse(withLocalFiles(t, args))
+	// As newServer does for Run: the example's listener is the binary's own, so a
+	// certificate mode needs its serving files.
+	cfg.clientCert.ownListener = true
 	mode, err := k8sapiproxy.ParseMode(cfg.modeRaw)
 	if err != nil {
 		return written, err
@@ -626,9 +635,10 @@ func TestEgressGatewayManifestWiring(t *testing.T) {
 	}
 }
 
-// The two edits the egress gateway README describes to the manifest's args start the
-// binary: a TLS Secret in place of the certificate bundle, and GKE routing in place of the
-// static upstream, which reads the host cluster's token and CA from the mounted volume.
+// The three edits the egress gateway README describes to the manifest's args start the
+// binary: a TLS Secret in place of the certificate bundle, a front proxy's identity headers
+// in place of the injected token, and GKE routing in place of the static upstream, which
+// reads the host cluster's token and CA from the mounted volume.
 func TestEgressGatewayReadmeVariantsStartTheBinary(t *testing.T) {
 	_, pod, container := egressGatewayPod(t)
 	blocks := flagBlocks(t, egressGatewayReadme)
@@ -664,10 +674,38 @@ func TestEgressGatewayReadmeVariantsStartTheBinary(t *testing.T) {
 		}
 	})
 
-	t.Run("GKE routing", func(t *testing.T) {
+	t.Run("front proxy headers", func(t *testing.T) {
 		block := blocks[1]
-		if got, want := flagNames(block.flags), []string{kubeCAFileFlag, kubeTokenFileFlag}; !slices.Equal(got, want) {
+		want := []string{authModeFlag, headerAllowedNamesFlag, headerAllowedPartitionsFlag, headerClientCAFileFlag, headerNameSourceFlag, headerPartitionHeadersFlag, headerUsernameHeadersFlag}
+		if got := flagNames(block.flags); !slices.Equal(got, want) {
 			t.Fatalf("the second block sets %q, want %q", got, want)
+		}
+		// The README's edit: every --jwt-* flag goes, and --auth-mode is replaced.
+		var jwtFlags []string
+		for _, name := range flagNames(container.Args) {
+			if strings.HasPrefix(name, exampleJWTFlagPrefix) {
+				jwtFlags = append(jwtFlags, name)
+			}
+		}
+		if len(jwtFlags) == 0 {
+			t.Fatal("the manifest sets no --jwt-* flag for the variant to delete")
+		}
+		clearHostEnv(t)
+		cfg := startFromArgs(t, replaceFlags(container.Args, jwtFlags, block.flags))
+		if cfg.authMode != authModeRequestHeader || cfg.partitionByCaller != partitionByPartition || cfg.clientCert.headerPartitionHeaders == "" {
+			t.Errorf("--auth-mode=%q --partition-by-caller=%q --requestheader-partition-headers=%q, want front proxy callers partitioned by a header",
+				cfg.authMode, cfg.partitionByCaller, cfg.clientCert.headerPartitionHeaders)
+		}
+		// Left out, the flags take default paths this pod does not mount.
+		if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" || cfg.tlsCertFile == defaultTLSCertFile || cfg.tlsKeyFile == defaultTLSKeyFile {
+			t.Errorf("--tls-cert-file=%q --tls-key-file=%q, want the serving files a client certificate needs, named by the manifest", cfg.tlsCertFile, cfg.tlsKeyFile)
+		}
+	})
+
+	t.Run("GKE routing", func(t *testing.T) {
+		block := blocks[2]
+		if got, want := flagNames(block.flags), []string{kubeCAFileFlag, kubeTokenFileFlag}; !slices.Equal(got, want) {
+			t.Fatalf("the third block sets %q, want %q", got, want)
 		}
 		clearHostEnv(t)
 		args := replaceFlags(container.Args, []string{upstreamURLFlag, upstreamTokenFileFlag, upstreamCAFileFlag}, block.flags)
@@ -680,6 +718,28 @@ func TestEgressGatewayReadmeVariantsStartTheBinary(t *testing.T) {
 			t.Errorf("--kube-token-file=%q --kube-ca-file=%q, want the mounted files, not the defaults this pod does not mount", cfg.kubeTokenFile, cfg.kubeCAFile)
 		}
 	})
+}
+
+// The module README's two commands, one for each certificate mode, start the binary.
+func TestModuleReadmeCertificateModeCommandsStartTheBinary(t *testing.T) {
+	blocks := flagBlocks(t, moduleReadme)
+	if len(blocks) != moduleReadmeBlocks {
+		t.Fatalf("%s holds %d fenced blocks with flags, want %d", moduleReadme, len(blocks), moduleReadmeBlocks)
+	}
+	for i, wantMode := range []string{authModeMTLS, authModeRequestHeader} {
+		t.Run(wantMode, func(t *testing.T) {
+			clearHostEnv(t)
+			cfg := startFromArgs(t, blocks[i].flags)
+			if cfg.authMode != wantMode {
+				t.Errorf("--auth-mode=%q, want %q", cfg.authMode, wantMode)
+			}
+			// A command that leaves the serving files out gets the flags' default paths,
+			// which exist only in the kube-agents deployment.
+			if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" || cfg.tlsCertFile == defaultTLSCertFile || cfg.tlsKeyFile == defaultTLSKeyFile || cfg.upstreamURL == "" {
+				t.Errorf("--tls-cert-file=%q --tls-key-file=%q --upstream-url=%q, want all three given by the command", cfg.tlsCertFile, cfg.tlsKeyFile, cfg.upstreamURL)
+			}
+		})
+	}
 }
 
 // The local bridge command, and its sidecar form, start an unauthenticated plain-HTTP

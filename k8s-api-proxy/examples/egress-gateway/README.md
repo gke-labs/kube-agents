@@ -96,6 +96,33 @@ at once across all tenants, so one tenant's concurrent requests can get another'
 The example does not set `--max-in-flight-per-caller` or `--max-long-running-per-caller`, which
 bound what one username holds of that capacity and how many watches it opens.
 
+## A gateway that authenticates with its own certificate
+
+Some gateways mint no token: they authenticate the sandbox themselves, connect to the proxy with
+a client certificate, and forward the sandbox's identity in request headers. For such a gateway,
+delete `--auth-mode=jwt` and every `--jwt-*` flag from the container's `args` and add the flags
+below; `--partition-by-caller=partition` stays, and now separates tenants by the partition header.
+
+```yaml
+args:
+  - --auth-mode=requestheader
+  - --requestheader-client-ca-file=/var/run/secrets/k8s-api-proxy/gateway-ca/ca.crt
+  - --requestheader-name-source=uri
+  - --requestheader-allowed-names=spiffe://example.test/ns/egress/sa/gateway
+  - --requestheader-username-headers=X-Sandbox-User
+  - --requestheader-partition-headers=X-Sandbox-Tenant
+  - --requestheader-allowed-partitions=tenant-a,tenant-b
+```
+
+Mount at that path the bundle of the CA that signs the gateway's client certificate, and nothing
+else: the proxy believes the headers of every request from a certificate under that CA with an
+allowed name, so that certificate, not a token, is the boundary. Replace the name with the one in
+your gateway's certificate (`--requestheader-name-source` picks the field) and the header names
+with ones your gateway overwrites on every request. The proxy asks for the certificate in the TLS
+handshake and never forwards the headers. The
+[module README](../../README.md) has the rules, among them that a connection with a client
+certificate is never admitted on a bearer token.
+
 ## The sandbox kubeconfig and kubectl versions
 
 `token: placeholder` gives `kubectl` an `Authorization` header for the gateway to replace, and
