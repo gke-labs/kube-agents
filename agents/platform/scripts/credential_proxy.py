@@ -138,6 +138,11 @@ SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 # request that names no cluster resolves to this rather than to whatever the
 # base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+GOOGLE_CHAT_PROJECT_ID_ENV = "GOOGLE_CHAT_PROJECT_ID"
+GOOGLE_CHAT_SERVICE_ACCOUNT_ENV = "GOOGLE_CHAT_SERVICE_ACCOUNT"
+GOOGLE_CHAT_SUBSCRIPTION_PREFIX = "projects/"
+GOOGLE_CHAT_DISCOVERY_SERVICE = "chat"
+GOOGLE_CHAT_DISCOVERY_VERSION = "v1"
 
 # A kubectl read that names no cluster -- no `--context`, no `--kubeconfig`, no
 # KUBECONFIG forwarded by the shim -- runs on the host cluster through the
@@ -8786,19 +8791,38 @@ class GoogleChatRelay:
         "https://www.googleapis.com/auth/pubsub",
     )
 
-    def __init__(self, project_id: str, subscription_name: str) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        subscription_name: str,
+        service_account_email: str = "",
+    ) -> None:
         import google.auth
         from google.cloud import pubsub_v1
         from googleapiclient.discovery import build
 
         credentials, _ = google.auth.default(scopes=self.SCOPES)
+        target_principal = service_account_email.strip()
+        if target_principal:
+            from google.auth import impersonated_credentials
+
+            credentials = impersonated_credentials.Credentials(
+                source_credentials=credentials,
+                target_principal=target_principal,
+                target_scopes=list(self.SCOPES),
+            )
         self.subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
         self.subscription_path = (
             subscription_name
-            if subscription_name.startswith("projects/")
+            if subscription_name.startswith(GOOGLE_CHAT_SUBSCRIPTION_PREFIX)
             else self.subscriber.subscription_path(project_id, subscription_name)
         )
-        self.chat = build("chat", "v1", credentials=credentials, cache_discovery=False)
+        self.chat = build(
+            GOOGLE_CHAT_DISCOVERY_SERVICE,
+            GOOGLE_CHAT_DISCOVERY_VERSION,
+            credentials=credentials,
+            cache_discovery=False,
+        )
         self._credentials = credentials
         # build() hands the discovery resource a single AuthorizedHttp, and so
         # a single httplib2.Http holding a single TLS socket. httplib2 is not
@@ -22017,18 +22041,23 @@ def serve(args: argparse.Namespace) -> None:
         CredentialProxyHandler.slack_max_request_bytes = int(
             os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
         )
-        chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
+        chat_project = os.getenv(GOOGLE_CHAT_PROJECT_ID_ENV, "").strip()
+        chat_service_account = os.getenv(GOOGLE_CHAT_SERVICE_ACCOUNT_ENV, "").strip()
         chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
         if chat_project and chat_subscription:
             CredentialProxyHandler.chat_relay = GoogleChatRelay(
-                chat_project, chat_subscription
+                chat_project,
+                chat_subscription,
+                service_account_email=chat_service_account,
             )
             LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
         # The A2A gateway's relay instance on the same topic and credential;
         # armed independently so an install can run either consumer alone.
         if chat_project and a2a_subscription:
             CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
-                chat_project, a2a_subscription
+                chat_project,
+                a2a_subscription,
+                service_account_email=chat_service_account,
             )
             LOGGER.info(
                 "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project

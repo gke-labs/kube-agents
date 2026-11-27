@@ -68,6 +68,67 @@ A file the card produced is not attached: Chat's `media.upload` refuses app auth
 
 Every Chat message carries session context (space, user, thread) that flows through Hermes and out as OpenTelemetry spans. The full trace is documented in [`docs/designs/gchat-session-metadata-data-flow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
 
+### A Google Chat app in another GCP project or organization
+
+When your Google Workspace domain lives in a different GCP organization or project from the GKE cluster, set `CHAT_PROJECT_ID` (`--chat-project-id` in `install.sh`, or `chat_project_id` in `terraform.tfvars`) to the GCP project that hosts the Google Chat app.
+
+Google Chat authenticates outbound `spaces.messages.*` API calls by the calling service account's owning GCP project, so a service account in the GKE project cannot post as a Chat app registered in the Workspace project. Across GCP organizations, Domain Restricted Sharing (`iam.allowedPolicyMemberDomains`) on the Workspace project also blocks granting `roles/pubsub.subscriber` on the Chat Pub/Sub subscription directly to `kubeagents-platform-gsa@<project_id>.iam.gserviceaccount.com`. In the other direction, the GKE organization's policy typically blocks granting `roles/iam.workloadIdentityUser` to a service account from the Workspace organization.
+
+When `CHAT_PROJECT_ID` differs from `PROJECT_ID`, the install provisions around both constraints:
+
+1. It enables `chat.googleapis.com`, `gsuiteaddons.googleapis.com`, and `pubsub.googleapis.com` in `CHAT_PROJECT_ID` instead of enabling the Chat and Workspace Add-ons APIs in `PROJECT_ID`.
+2. It creates a dedicated service account `kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com` in `CHAT_PROJECT_ID`, and binds `roles/pubsub.subscriber` and `roles/pubsub.viewer` on the Chat subscription to that service account (same-org binding inside `CHAT_PROJECT_ID`).
+3. It grants `kubeagents-platform-gsa@<project_id>.iam.gserviceaccount.com` `roles/iam.serviceAccountTokenCreator` on `kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com` as a service-account resource.
+4. It sets `spec.integration.googleChat.projectId` and `spec.integration.googleChat.serviceAccountEmail` on the `PlatformAgent` resource. The operator passes `GOOGLE_CHAT_SERVICE_ACCOUNT` to the credential broker, whose `GoogleChatRelay` impersonates `kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com` for both Chat API calls and Pub/Sub subscription pulls.
+
+When the identity running `install.sh` or `terraform apply` cannot administer `CHAT_PROJECT_ID`, set `CHAT_MANAGE_PROJECT=false` (`--chat-manage-project=false`, or `chat_manage_project = false` in `terraform.tfvars`). The install then creates nothing in `CHAT_PROJECT_ID` and still wires `projectId` and `serviceAccountEmail` into the `PlatformAgent` resource. Have an administrator of `CHAT_PROJECT_ID` run these commands before configuring the Chat app in the console:
+
+```bash
+CHAT_PROJECT_ID="your-workspace-chat-project"
+CHAT_PROJECT_NUMBER="$(gcloud projects describe "${CHAT_PROJECT_ID}" --format='value(projectNumber)')"
+GKE_PROJECT_ID="your-gke-host-project"
+AGENT_GSA="kubeagents-platform-gsa@${GKE_PROJECT_ID}.iam.gserviceaccount.com"
+CHAT_GSA="kubeagents-chat-gsa@${CHAT_PROJECT_ID}.iam.gserviceaccount.com"
+CHAT_TOPIC="platform-agent-chat-events"
+CHAT_SUB="platform-agent-chat-events-sub"
+
+gcloud services enable chat.googleapis.com gsuiteaddons.googleapis.com pubsub.googleapis.com \
+  --project="${CHAT_PROJECT_ID}"
+gcloud beta services identity create --service=gsuiteaddons.googleapis.com --project="${CHAT_PROJECT_ID}"
+gcloud beta services identity create --service=chat.googleapis.com --project="${CHAT_PROJECT_ID}"
+
+gcloud iam service-accounts create kubeagents-chat-gsa \
+  --project="${CHAT_PROJECT_ID}" \
+  --display-name="Platform Agent Google Chat Service Account"
+gcloud iam service-accounts add-iam-policy-binding "${CHAT_GSA}" \
+  --project="${CHAT_PROJECT_ID}" \
+  --member="serviceAccount:${AGENT_GSA}" \
+  --role="roles/iam.serviceAccountTokenCreator"
+
+gcloud pubsub topics create "${CHAT_TOPIC}" --project="${CHAT_PROJECT_ID}"
+gcloud pubsub subscriptions create "${CHAT_SUB}" \
+  --topic="${CHAT_TOPIC}" --ack-deadline=60 --project="${CHAT_PROJECT_ID}"
+
+gcloud pubsub topics add-iam-policy-binding "${CHAT_TOPIC}" \
+  --project="${CHAT_PROJECT_ID}" \
+  --member="serviceAccount:chat-api-push@system.gserviceaccount.com" \
+  --role="roles/pubsub.publisher"
+gcloud pubsub topics add-iam-policy-binding "${CHAT_TOPIC}" \
+  --project="${CHAT_PROJECT_ID}" \
+  --member="serviceAccount:service-${CHAT_PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com" \
+  --role="roles/pubsub.publisher"
+gcloud pubsub subscriptions add-iam-policy-binding "${CHAT_SUB}" \
+  --project="${CHAT_PROJECT_ID}" \
+  --member="serviceAccount:${CHAT_GSA}" \
+  --role="roles/pubsub.subscriber"
+gcloud pubsub subscriptions add-iam-policy-binding "${CHAT_SUB}" \
+  --project="${CHAT_PROJECT_ID}" \
+  --member="serviceAccount:${CHAT_GSA}" \
+  --role="roles/pubsub.viewer"
+```
+
+See [Security and IAM](/kube-agents/reference/security-and-iam/#cross-project-google-chat-is-an-impersonated-identity) for the identity boundary and lifecycle.
+
 ## Slack
 
 Slack is opt-in. Enable it in the installer's chat menu, where the installer prompts for the token values below, or pass `--enable-slack` with the tokens as flags.

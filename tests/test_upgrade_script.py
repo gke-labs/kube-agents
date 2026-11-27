@@ -3884,7 +3884,15 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         start = source.index('  print_step "🎉 Upgrade Complete!"\n')
         return source[start:source.index("\n}\n", start)]
 
-    def _run(self, mode, keys, helper=_STUB_HELPER, install_env_file="/x/install.env", env=None):
+    def _run(
+        self,
+        mode,
+        keys,
+        helper=_STUB_HELPER,
+        install_env_file="/x/install.env",
+        env=None,
+        gcloud_body="echo 123456",
+    ):
         """Runs the tail; returns the process and the gcloud calls it made."""
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
         with tempfile.TemporaryDirectory() as tmp:
@@ -3893,7 +3901,7 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
                 f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
                 f"{helper}"
-                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; echo 123456; }}\n'
+                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; {gcloud_body}; }}\n'
                 "print_step() { :; }\n"
                 'print_gateway_home_channel_unset_summary() { echo "SUMMARY"; }\n'
                 "set -Eeuo pipefail\n"
@@ -3965,6 +3973,65 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST args=[] number=987654321 env=/x/install.env topic=t", "SUMMARY"])
         self.assertEqual(calls, "")
+
+    def test_a_full_upgrade_reads_chat_project_number_when_chat_project_id_differs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text(
+                "PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+            )
+            proc, calls = self._run(
+                "full",
+                {
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_PROJECT_ID": "workspace-chat-proj",
+                    "CHAT_MANAGE_PROJECT": "false",
+                    "NAMESPACE": "kubeagents-system",
+                },
+                helper="",
+                install_env_file=str(install_env),
+                env={"HOME": tmp, "TERM": "dumb"},
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(calls, "projects describe workspace-chat-proj --format=value(projectNumber)\n")
+        self.assertIn("projects/workspace-chat-proj/topics/platform-agent-chat-events", out)
+        self.assertIn("service-123456@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn("https://chat.google.com/dm/123456", out)
+
+    def test_a_full_upgrade_does_not_leak_host_project_number_when_chat_project_id_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text(
+                "PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+            )
+            proc, calls = self._run(
+                "full",
+                {
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_PROJECT_ID": "workspace-chat-proj",
+                    "CHAT_MANAGE_PROJECT": "false",
+                    "PROJECT_NUMBER": "111111",
+                    "NAMESPACE": "kubeagents-system",
+                },
+                helper="",
+                install_env_file=str(install_env),
+                env={"HOME": tmp, "TERM": "dumb"},
+                gcloud_body="return 1",
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(calls, "projects describe workspace-chat-proj --format=value(projectNumber)\n")
+        self.assertIn("service-<CHAT_PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertNotIn("service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn("CHAT_PROJECT_NUMBER is unavailable;", out)
+        self.assertIn(
+            "have an administrator of 'workspace-chat-proj' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above",
+            out,
+        )
+        self.assertNotIn("re-run install.sh (it re-applies the Chat Pub/Sub resources)", out)
+        self.assertNotIn("111111", out)
+        self.assertNotIn("https://chat.google.com/dm/", out)
 
 
 class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):

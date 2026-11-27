@@ -2078,6 +2078,12 @@
                 "enabled": {
                   "type": "boolean"
                 },
+                "projectId": {
+                  "type": "string"
+                },
+                "serviceAccountEmail": {
+                  "type": "string"
+                },
                 "topicName": {
                   "type": "string"
                 },

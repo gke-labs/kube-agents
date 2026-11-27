@@ -2699,11 +2699,18 @@ main() {
   # since the generator keeps it local.
   if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
     local project_number="${PROJECT_NUMBER:-}"
-    if [ -z "$project_number" ] && is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
-      project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+    local chat_project_number="${CHAT_PROJECT_NUMBER:-}"
+    if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+      if [ -n "${CHAT_PROJECT_ID:-}" ] && [ "${CHAT_PROJECT_ID}" != "${PROJECT_ID:-}" ]; then
+        if [ -z "$chat_project_number" ]; then
+          chat_project_number="$(gcloud projects describe "$CHAT_PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+        fi
+      elif [ -z "$project_number" ]; then
+        project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+      fi
     fi
     CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
-      PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
+      PROJECT_NUMBER="$project_number" CHAT_PROJECT_NUMBER="$chat_project_number" INSTALL_ENV_FILE="$install_env_file" \
       print_chat_setup_checklists
   fi
   if declare -F print_gateway_home_channel_unset_summary >/dev/null; then

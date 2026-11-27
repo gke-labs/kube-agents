@@ -548,6 +548,10 @@ class GoogleChatIntegrationService:
             if isinstance(annotations, dict)
             else ""
         )
+        chat_service_account = self._text(chat.get("serviceAccountEmail"))
+        subscriber_service_account = (
+            chat_service_account or agent_service_account
+        )
         allowed_users = [
             self._text(value)
             for value in chat.get("allowedUsers", [])
@@ -668,8 +672,8 @@ class GoogleChatIntegrationService:
             else ""
         )
         subscriber = (
-            f"serviceAccount:{agent_service_account}"
-            if agent_service_account
+            f"serviceAccount:{subscriber_service_account}"
+            if subscriber_service_account
             else ""
         )
         required_subscriber_bindings = {
@@ -794,10 +798,10 @@ class GoogleChatIntegrationService:
                         "Platform Agent access is unverified."
                         if cloud["subscription_policy"].returncode != 0
                         else (
-                            f"{agent_service_account} is missing an "
+                            f"{subscriber_service_account} is missing an "
                             "unconditional subscriber or viewer binding on "
                             "the subscription."
-                            if agent_service_account
+                            if subscriber_service_account
                             else (
                                 "The PlatformAgent does not declare its "
                                 "Google service account."
@@ -807,7 +811,7 @@ class GoogleChatIntegrationService:
                 ),
             ],
             f"{subscription_path} is active, uses pull delivery, and "
-            f"{agent_service_account} can read it.",
+            f"{subscriber_service_account} can read it.",
         )
         checks.append(
             LiveCheck(
