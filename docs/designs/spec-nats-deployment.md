@@ -912,7 +912,7 @@ keeping its consumer-create wildcard on `TASKS` off the pre-created durables is 
 deny naming them. It uses the entry only at `A2A_GATEWAY_BUS_AUTH=token`; its static user
 stays until a release after that flip, so rolling back across it is the flag. **Amended 10/6:** the `AgentProfile` CRD adds two kinds of entry. The
 operator has one for itself, keyed on the manager's own ServiceAccount: publish on
-`a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. Each
+`a2a.agents.*` and direct-get on the directory, for the agent cards, plus its own inbox. **Amended 11/26:** the operator's entry also carries `$JS.API.STREAM.INFO.TOPICS-STATE` and `$JS.API.STREAM.UPDATE.TOPICS-STATE` so the operator can append missing rendered subjects to `TOPICS-STATE` on upgrade while `provision` stays create-only. At the NATS layer, `STREAM.UPDATE.TOPICS-STATE` permits changing any `TOPICS-STATE` config field (including limits, retention, subject removal, and `RePublish` onto `a2a.tasks.>`); only `StreamPolicy.CheckSubjectAppend` in operator code holds the update to added subjects, accepted on the operator because it already renders the callout identity map. Each
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
 grants and no subjects. The callout derives that profile pod's task subjects from the
 profile, and its consumer names and inbox from the attested pod name (see the subagent
