@@ -3,7 +3,7 @@
 An environment or the release reads a commit's images from the candidate
 repository when its registry variable names it, and autopush starts when this
 workflow completes. So the one
-build that pushes an image to GHCR pushes it there too, under the same tags,
+build that pushes an image to GHCR pushes it there too, under the commit tag,
 which also makes it one digest in both; the job is logged in to both before
 the first build. The signatures stay on the GHCR references.
 """
@@ -49,15 +49,16 @@ class PublishToBothRegistriesTest(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(self.doc["env"]["CANDIDATE_REGISTRY_HOST"], match.group(1))
 
-    def test_every_release_image_is_built_once_and_pushed_to_both_under_the_same_tags(self):
-        """The commit tag always, `latest` on main alone, in each registry."""
+    def test_every_release_image_is_built_once_and_pushed_to_both_under_the_commit_tag(self):
+        """The commit tag in each registry; `latest`, on main alone, on GHCR
+        alone: nothing reads a moving tag in the candidate repository."""
         names = []
         for step in self.builds:
             with self.subTest(step=step.get("name")):
                 self.assertIs(step["with"]["push"], True)
                 tags = self._tags(step)
-                self.assertEqual(len(tags), 4, tags)
-                ghcr_latest, ghcr_sha, candidate_latest, candidate_sha = tags
+                self.assertEqual(len(tags), 3, tags)
+                ghcr_latest, ghcr_sha, candidate_sha = tags
                 name = re.fullmatch(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([a-z0-9-]+):\$\{\{ github\.sha \}\}", ghcr_sha)
                 self.assertIsNotNone(name, ghcr_sha)
                 image = name.group(1)
@@ -67,12 +68,17 @@ class PublishToBothRegistriesTest(unittest.TestCase):
                     ghcr_latest,
                     f"${{{{ {_MAIN_ONLY} && format('ghcr.io/{{0}}/{image}:latest', env.IMAGE_REPOSITORY) || '' }}}}",
                 )
-                self.assertEqual(
-                    candidate_latest,
-                    f"${{{{ {_MAIN_ONLY} && format('{{0}}/{image}:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}}}",
-                )
         self.assertEqual(len(names), len(set(names)), "an image is built twice")
         self.assertEqual(sorted(names), sorted(parse_required_release_images(_COMMON_SH.read_text())))
+
+    def test_only_a_push_starts_it_and_the_workflow_itself_holds_no_credential(self):
+        """Its jobs mint a Google credential that writes the candidate
+        repository, so a pull request must not start it, and the token and
+        package permissions stay on the jobs that are guarded to this
+        repository."""
+        on = self.doc.get("on", self.doc.get(True))
+        self.assertEqual(list(on), ["push"])
+        self.assertEqual(self.doc["permissions"], {"contents": "read"})
 
     def test_each_job_is_logged_in_to_both_registries_before_its_first_build(self):
         for job_name, job in self.jobs.items():

@@ -120,7 +120,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/k8s-operator:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/k8s-operator:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/k8s-operator:${{ github.sha }}
           build-args: |
             VERSION=latest
@@ -206,7 +205,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/platform-agent:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/platform-agent:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/platform-agent:${{ github.sha }}
           # KUBE_AGENTS_VERSION is the commit SHA the image is tagged with: it
           # becomes the version in the User-Agent the agent's remote MCP calls
@@ -224,7 +222,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/replay-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/replay-proxy:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/replay-proxy:${{ github.sha }}
 
       - name: Build and Push Credential Sidecar
@@ -239,7 +236,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/credential-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/credential-proxy:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/credential-proxy:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/credential-proxy:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
@@ -255,7 +251,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/kube-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/kube-proxy:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/kube-proxy:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/kube-proxy:${{ github.sha }}
           # The SHA it is tagged with, for `k8s-api-proxy --version` and the startup log.
           build-args: |
@@ -272,7 +267,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/agent-sandbox:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/agent-sandbox:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/agent-sandbox:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/agent-sandbox:${{ github.sha }}
 
       - name: Build and Push Pubsub Platform Plugin
@@ -285,7 +279,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/pubsub-platform:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/pubsub-platform:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/pubsub-platform:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/pubsub-platform:${{ github.sha }}
 
       - name: Build and Push GKE Stockout Investigator Plugin
@@ -298,7 +291,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/gke-stockout-investigator:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/gke-stockout-investigator:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/gke-stockout-investigator:${{ github.sha }}
 
       # The A2A next stack: the gateway, the callout, the verifier, the
@@ -322,7 +314,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-gateway:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-gateway:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-gateway:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-gateway:${{ github.sha }}
 
       - name: Build and Push A2A Worker
@@ -336,7 +327,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-worker:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-worker:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-worker:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-worker:${{ github.sha }}
 
       # The cluster agent's persona image (#3658): the persona directory is
@@ -353,7 +343,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-cluster:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-cluster:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/persona-cluster:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/persona-cluster:${{ github.sha }}
 
       # The GKE Support Agent's persona image: the persona directory is the
@@ -370,7 +359,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-tse:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-tse:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/persona-tse:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/persona-tse:${{ github.sha }}
 
       # The fleet-audit AgentProfile's persona image (#5623), the same shape:
@@ -386,7 +374,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-fleet-audit:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-fleet-audit:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/persona-fleet-audit:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/persona-fleet-audit:${{ github.sha }}
 
       - name: Build and Push A2A Auth Callout
@@ -400,7 +387,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-authcallout:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-authcallout:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-authcallout:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-authcallout:${{ github.sha }}
 
       - name: Build and Push A2A Console
@@ -414,7 +400,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-console:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-console:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-console:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-console:${{ github.sha }}
 
       - name: Build and Push A2A Teams Inbound Receiver
@@ -428,7 +413,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-teams-inbound:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-teams-inbound:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-teams-inbound:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-teams-inbound:${{ github.sha }}
 
       - name: Build and Push A2A Capability Verifier
@@ -442,7 +426,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-verifier:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-verifier:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-verifier:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-verifier:${{ github.sha }}
 
       - name: Build and Push A2A Profile Dispatcher
@@ -456,7 +439,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-dispatcher:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-dispatcher:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/a2a-dispatcher:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-dispatcher:${{ github.sha }}
 
       - name: Build and Push Hermes Bridge
@@ -470,7 +452,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/hermes-bridge:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/hermes-bridge:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/hermes-bridge:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/hermes-bridge:${{ github.sha }}
           build-args: |
             PLATFORM_AGENT_IMAGE=ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
@@ -486,7 +467,6 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/web-console:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/web-console:${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && format('{0}/web-console:latest', env.CANDIDATE_REGISTRY_PREFIX) || '' }}
             ${{ env.CANDIDATE_REGISTRY_PREFIX }}/web-console:${{ github.sha }}
 
       - name: Install Cosign
