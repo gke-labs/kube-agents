@@ -16,9 +16,10 @@ repository's `knowledge/` root, a dedicated knowledge repository, Google Drive, 
 OneDrive, and Confluence) and to a separate agent output store behind one credential-brokered
 interface.
 
-**Does not cover:** per-user OAuth brokering (declined under Decision D12; see
+**Does not cover:** per-user OAuth token brokering (excluded so headless cluster pods never store,
+refresh, or act on per-user interactive OAuth grants; see
 [#1720](https://github.com/gke-labs/kube-agents/issues/1720)), direct agent writes to curated
-runbooks without pull-request review, media/OCR conversion of images or video, or replacing
+runbooks without pull-request review, media or OCR conversion of images and video, or replacing
 Hindsight Layer 1 conversational memory.
 
 ## Summary
@@ -29,42 +30,42 @@ Drive folders, SharePoint libraries, and Confluence spaces. Today `kube-agents` 
 has nowhere to read curated knowledge at all, and an install whose runbooks live outside the
 GitOps repository has no brokered path to reach them. Pasting runbooks into chat fails on
 staleness, length limits, and missing citations
-([#2296](https://github.com/gke-labs/kube-agents/issues/2296)). At the same time, scheduled
-audits, investigations, and watches generate unreviewed reports that chat should link to rather
-than paste ([#5047](https://github.com/gke-labs/kube-agents/issues/5047)), and those unreviewed
-outputs must stay separated from human-curated runbooks.
+([#2296](https://github.com/gke-labs/kube-agents/issues/2296)). Scheduled audits, investigations,
+and watches also produce unreviewed reports that chat should link to rather than paste
+([#5047](https://github.com/gke-labs/kube-agents/issues/5047)), and those unreviewed outputs must
+stay separate from human-curated runbooks.
 
-This design introduces a **knowledge broker** inside `<agent>-credential-proxy` backed by modular
-build-time **knowledge providers**, mirroring the version-control seam in
-[`version-control-support.md`](version-control-support.md):
+This design adds a **knowledge broker** inside `<agent>-credential-proxy` backed by build-time
+**knowledge providers**, mirroring [`version-control-support.md`](version-control-support.md).
+Agents, skills, profile workers, and the Curator call neutral `/v1/knowledge/<verb>` routes
+(`capabilities`, `list`, `read`, `search`, `propose`, `write`) naming a declared logical store
+rather than a backend URL or SDK. Every credential stays inside the credential broker pod.
 
-- **Neutral verbs at the credential boundary.** Agents, skills, profile workers, and the Curator
-  call `/v1/knowledge/<verb>` (`capabilities`, `list`, `read`, `search`, `propose`, `write`) naming
-  a configured logical store rather than a backend URL or SDK. Credentials remain inside the
-  credential broker pod.
-- **Two store classes with distinct permissions and trust.** **Curated stores** (`role: curated`)
-  hold human-reviewed OKF knowledge; agents read them and may only `propose` changes through a pull
-  or merge request that a human merges. **Agent output stores** (`role: output`) hold unreviewed
-  machine output (`generated` set, `verified` absent, `stale_after` set); agents may `write` to
-  bound prefixes there, and nothing in an output store is ever followed as a procedure or enforced
-  as a guard. External non-Git sources (`role: external`) are read-only by default and feed the
-  PR-mediated OKF converter ([#5045](https://github.com/gke-labs/kube-agents/issues/5045)).
-- **One directory per provider.** Adding a backend adds one package under
-  `agents/platform/scripts/knowledge_providers/` and one entry in its `registry.py`, enforced by
-  import-boundary and provider-name CI tests rather than runtime plugin loading.
-- **Zero disruption to existing installs.** When `spec.integration.knowledge` is omitted, an
-  install with a `role: gitops` repository defaults its curated store to that repository's
-  `knowledge/` root and its output store to today's brokered report store; an install with no
-  GitOps repository disables curated reads and keeps the local output store.
+Curated team knowledge (`role: curated`) and unreviewed agent output (`role: output`) share the
+same protocol with opposite permissions. Agents read curated stores and may only `propose` changes
+through a pull or merge request that a human reviews and merges. Agents may `write` to bound
+prefixes of an output store (with OKF `generated` and `stale_after` set and `verified` forbidden),
+and nothing in an output store is ever followed as a procedure or enforced as a guard. External
+non-Git sources (`role: external`) are read-only by default and feed the PR-mediated OKF converter
+([#5045](https://github.com/gke-labs/kube-agents/issues/5045)).
 
-| Layer                  | Proposed home                                                                    | Modeled on                                                     |
-| ---------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Sandbox / agent client | `agents/platform/scripts/knowledge_client.py` (stdlib HTTP client + CLI)         | `agents/platform/scripts/vcs_client.py` / `vcs.py`             |
-| Broker routes & policy | `agents/platform/scripts/knowledge_broker.py` (zero provider names)              | `agents/platform/scripts/vcs_broker.py`                        |
-| Shared provider seam   | `agents/platform/scripts/knowledge_providers/{base,validate,errors,credentials}` | `agents/platform/scripts/providers/`                           |
-| Provider packages      | `knowledge_providers/{git_repo,local_store,google_drive,sharepoint,confluence}/` | `providers/{github,gitlab,gitea,bitbucket}/`                   |
-| Provider registration  | `agents/platform/scripts/knowledge_providers/registry.py` (`AVAILABLE`)          | `agents/platform/scripts/providers/registry.py`                |
-| Declarative surface    | `spec.integration.knowledge` on `PlatformAgent` + `KNOWLEDGE_STORES_CONFIG`      | `spec.integration.{forges,repositories}` + `VCS_FORGES_CONFIG` |
+Adding a backend means adding one directory under `agents/platform/scripts/knowledge_providers/`
+and one entry in its `registry.py`, guarded by AST import-boundary and provider-name checks in CI
+rather than a runtime plugin loader. Existing installs need no configuration change: when
+`spec.integration.knowledge` is omitted, an install with a `role: gitops` repository defaults its
+curated store to `<gitops-repo>/knowledge/` and its output store to a brokered local store beside
+`audit_report_store`; an install with no GitOps repository disables curated reads and keeps the
+local output store.
+
+| Layer                  | Proposed home                                                                                                      | Modeled on                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Sandbox / agent client | `agents/platform/scripts/knowledge_client.py` (stdlib HTTP client + CLI)                                           | `agents/platform/scripts/vcs_client.py`, `agents/platform/skills/version-control/scripts/vcs.py` |
+| Broker routes & policy | `agents/platform/scripts/knowledge_broker.py` (zero provider names)                                                | `agents/platform/scripts/vcs_broker.py`                                                          |
+| Shared provider seam   | `agents/platform/scripts/knowledge_providers/{base,validate,errors,credentials}` + shared `providers/transport.py` | `agents/platform/scripts/providers/`                                                             |
+| Provider packages      | `knowledge_providers/{git_repo,local_store,google_drive,sharepoint,confluence}/`                                   | `providers/{github,gitlab,gitea,bitbucket,bitbucket_datacenter}/`                                |
+| Gateway local listener | Companion routes in `agent-api-auth` on `/opt/data/knowledge-output/` (for `local-store`)                          | `agents/platform/scripts/audit_report_store.py` (port `8700`)                                    |
+| Provider registration  | `agents/platform/scripts/knowledge_providers/registry.py` (`AVAILABLE`)                                            | `agents/platform/scripts/providers/registry.py`                                                  |
+| Declarative surface    | `spec.integration.knowledge` on `PlatformAgent` + `KNOWLEDGE_STORES_CONFIG`                                        | `spec.integration.{forges,repositories}` + `VCS_FORGES_CONFIG`                                   |
 
 ---
 
@@ -73,52 +74,48 @@ build-time **knowledge providers**, mirroring the version-control seam in
 ### The gap on `main`
 
 Three adjacent systems on `main` already depend on operational knowledge, yet each stops at the
-same boundary:
+same boundary.
 
-1. **OKF contract (`06` §5) and CI validation.** `docs/architecture/06-api-and-data-contracts.md`
-   §5 aligns `knowledge/` with the published
-   [Open Knowledge Format v0.2 `SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)
-   and `scripts/check_okf_knowledge.py` validates `knowledge/` trees in CI. That contract still
-   assumes `knowledge/` sits inside the GitOps repository and leaves a dedicated repository for
-   later.
-2. **Layer 2 decision memory (`docs/designs/memory.md`).** `sweep_repo_memory` and `a2a/memory`
-   (`curator`) snapshot `managed_repos` and `context_repos` via `/v1/vcs/snapshot` and index
-   `knowledge/`, ADRs, RFCs, and Markdown runbooks into `kube-agents-decisions`. They cannot read
-   a Google Drive folder, a SharePoint library, or a Confluence space, and no skill yet looks up a
-   matching runbook before acting (`agents/platform/docs/autoops-architecture.md` Contract 4 still
-   lists `Runbook / knowledge retrieval` as `Future`).
-3. **Report storage (`docs/designs/fleet-audit-report-store.md`).** `audit_report_store.py` and
-   `/v1/audit-reports` store structured fleet-audit JSON envelopes on the gateway pod's `/opt/data`
-   volume so ephemeral profile workers can write and the A2A gateway can read them. There is no
-   general, backend-pluggable store for non-audit reports and investigation notes that chat posts
-   can link to ([#4053](https://github.com/gke-labs/kube-agents/issues/4053),
-   [#5047](https://github.com/gke-labs/kube-agents/issues/5047)).
+First, `docs/architecture/06-api-and-data-contracts.md` §5 aligns `knowledge/` with the published
+[Open Knowledge Format v0.2 `SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md),
+and `scripts/check_okf_knowledge.py` validates `knowledge/` trees in CI. That contract still
+assumes `knowledge/` sits inside the GitOps repository and leaves dedicated repositories and
+external stores undesigned.
+
+Second, Layer 2 decision memory (`docs/designs/memory.md`) indexes `knowledge/`, ADRs, RFCs, and
+Markdown runbooks from registered Git repositories into `kube-agents-decisions`, yet it cannot read
+Google Drive, SharePoint, or Confluence. No skill looks up a matching runbook before acting:
+[`agents/platform/docs/autoops-architecture.md`](../../agents/platform/docs/autoops-architecture.md#contract-4--context-reach)
+Contract 4 still lists `Runbook / knowledge retrieval` as `Future`.
+
+Third, `audit_report_store.py` and `/v1/audit-reports` (`docs/designs/fleet-audit-report-store.md`)
+store structured fleet-audit JSON envelopes on the gateway pod's `/opt/data` volume so ephemeral
+profile workers can write and the A2A gateway can read them. There is no general,
+backend-pluggable store for non-audit reports and investigation notes that chat posts can link to
+([#4053](https://github.com/gke-labs/kube-agents/issues/4053),
+[#5047](https://github.com/gke-labs/kube-agents/issues/5047)).
 
 Every install on `main` runs the A2A stack (NATS bus, A2A gateway, session pods, profile workers,
 and the optional Curator pod; `PlatformAgentSpec.Mode` is deprecated and always reconciled to
 `"next"`). Because profile workers and session pods mount no shared `/opt/data` volume and hold no
-external credentials, any knowledge backend that works across the Platform Agent shell, Cluster
-Agent sessions, profile workers, and Curator has to cross the credential broker over HTTP.
+external credentials, any knowledge backend that serves the Platform Agent shell, Cluster Agent
+sessions, profile workers, and Curator must cross the credential broker over HTTP.
 
 ### Why a broker + provider seam instead of per-backend skills or direct MCP
 
-Threading Drive, SharePoint, and Confluence APIs directly into skills would duplicate
-authentication, redaction, egress control, and OKF handling across every skill and would place
-provider credentials inside agent pods, violating
-[`docs/credential-isolation-design.md`](../credential-isolation-design.md).
+Threading Drive, SharePoint, and Confluence APIs directly into skills duplicates authentication,
+redaction, egress control, and OKF handling across every skill and puts provider tokens inside
+agent pods, breaking [`docs/credential-isolation-design.md`](../credential-isolation-design.md).
 
-Using remote MCP servers as the sole integration mechanism fails for the same two reasons recorded
-in [`version-control-support.md` §9](version-control-support.md#9-why-an-mcp-server-is-an-addition-not-the-mechanism):
-
-- **Non-agent callers need the same backend.** `sweep_repo_memory`, the Go Curator pod
-  (`a2a/cmd/curator`), scheduled conversion jobs ([#5045](https://github.com/gke-labs/kube-agents/issues/5045)),
-  and the A2A gateway's report link retrieval run with no LLM in the loop. They need a typed HTTP
-  broker route and library client, not an interactive MCP tool surface.
-- **Credential and policy enforcement belong in one broker.** Putting authentication, root-scope
-  checks, query sanitization, redaction, and read-only enforcement in `<agent>-credential-proxy`
-  means every caller — interactive chat, Cluster Agent, profile worker, and Curator — goes through
-  the same chokepoint. An optional MCP tool wrapper can sit in front of `/v1/knowledge/*` later
-  without duplicating provider code.
+Using remote MCP servers as the primary integration mechanism fails for the same two reasons
+recorded in [`version-control-support.md` §9](version-control-support.md#9-why-an-mcp-server-is-an-addition-not-the-mechanism).
+Half the consumers run with no LLM in the loop: `sweep_repo_memory`, the Go Curator pod
+(`a2a/cmd/curator`), scheduled conversion jobs
+([#5045](https://github.com/gke-labs/kube-agents/issues/5045)), and the A2A gateway's report link
+retrieval need a typed HTTP route and library client, not an interactive MCP surface. Keeping
+authentication, root-scope checks, query sanitization, redaction, and read-only enforcement in
+`<agent>-credential-proxy` routes every caller through one chokepoint. An optional MCP tool wrapper
+can sit in front of `/v1/knowledge/*` later without duplicating provider code.
 
 ---
 
@@ -126,8 +123,8 @@ in [`version-control-support.md` §9](version-control-support.md#9-why-an-mcp-se
 
 ### Two store classes plus read-only external sources
 
-Curated team knowledge and agent-generated output share the same protocol verbs, yet they have
-opposite review, trust, and permission requirements
+Curated team knowledge and agent-generated output share the same protocol verbs, yet they carry
+opposite review, trust, and permission rules
 ([#3045](https://github.com/gke-labs/kube-agents/issues/3045),
 [#5047](https://github.com/gke-labs/kube-agents/issues/5047)):
 
@@ -137,58 +134,60 @@ opposite review, trust, and permission requirements
 | `external` | Team-owned non-Git sources (Drive folder, SharePoint site, Confluence) | `capabilities`, `list`, `read`, `search` (read-only by default)     | Tagged `trust:untrusted` in recall and tool output. Primary v1 use is feeding PR-mediated OKF conversion (#5045).                   |
 | `output`   | Unreviewed agent reports, audit summaries, investigation drafts        | `capabilities`, `list`, `read`, `search`, `write` (bound prefix)    | Tagged `trust:untrusted`, `generated` required, `verified` forbidden, `stale_after` required. Never followed as a runbook or guard. |
 
-Three invariants follow from this split:
+Three invariants hold across every backend:
 
 1. **No direct writes to curated knowledge.** `POST /v1/knowledge/write` always returns `403
-KNOWLEDGE_WRITE_FORBIDDEN` for any store whose role is `curated` or `external`. Curated
+KNOWLEDGE_WRITE_FORBIDDEN` for any store with `role: curated` or `role: external`. Curated
    knowledge changes exclusively via `propose`, which opens a reviewable pull or merge request on a
    Git-backed store.
-2. **Output never becomes guidance automatically.** Runbook lookup (#5044), `declares:` posture
-   resolution, and `decision`/`lesson` guard evaluation never query `role: output` stores. Turning
-   an investigation report into a runbook or lesson requires an explicit promotion flow that calls
-   `propose` against the `curated` store with `sources` pointing to the output record's stable
-   reference.
-3. **Read-only by default.** Every declared store defaults to `mode: read-only`. Enabling `propose`
-   on a `curated` store or `write` on an `output` store requires explicit configuration (or the
-   default local output store's narrow built-in schedule bindings).
+2. **Output never becomes guidance automatically.** Runbook lookup, `declares:` posture resolution,
+   and `decision`/`lesson` guard evaluation never query `role: output` stores. Promoting an
+   investigation report into a runbook or lesson requires an explicit flow that calls `propose`
+   against the `curated` store with `sources` pointing to the output record's stable reference.
+3. **Read-only by default.** Every explicitly declared store defaults to `mode: read-only`.
+   Enabling `propose` on a `curated` store or `write` on an `output` store requires setting `mode`
+   explicitly. Two narrow implicit defaults preserve existing install behavior when
+   `spec.integration.knowledge` is omitted: a `role: gitops` repository synthesizes an implicit
+   `curated` store at `<gitops-repo>/knowledge/` with `mode: propose` (matching `06` §5
+   curate-as-code), and the default `local-store` output backend allows `write` within the caller's
+   permitted prefix.
 
 ### Store addressing and server-side root confinement
 
 Callers never pass raw external URLs, hostnames, Drive IDs outside a configured root, or
-Confluence base URLs to the broker. Instead, the administrator declares each store by a DNS-1123
-logical `name` (for example `curated`, `output`, `sre-drive`, `platform-confluence`), and every
-broker request names `{store, ...}`:
+Confluence base URLs to the broker. The administrator declares each store by a DNS-1123 logical
+`name` (for example `curated`, `output`, `sre-drive`, `platform-confluence`), and every broker
+request names `{store, ...}`.
 
-- **Canonical document identifier:** `<store>:<opaque-relative-id>`, where the suffix is a
-  normalized relative path (for Git and local stores, checked against traversal, leading slashes,
-  null bytes, and symlinks) or a provider item ID whose ancestry under the configured root is
-  verified by the broker on every `read`.
-- **Canonical citation URL:** Every `list`, `read`, and `search` response carries a broker-composed
-  `webUrl` (for example the forge's `fileUrl` at the resolved commit SHA, a Drive file URL, a
-  SharePoint item URL, or a Confluence page URL) so agents cite exact locations in PRs and chat
-  cards without constructing URLs in the sandbox.
+Each document carries a canonical identifier `<store>:<opaque-relative-id>`, where the suffix is a
+normalized relative path (checked against traversal, leading slashes, null bytes, and symlinks) or
+a provider item ID whose ancestry under the configured root is verified by the broker on every
+`read`. Every `list`, `read`, and `search` response also includes a broker-composed `webUrl` (for
+example the forge's `fileUrl` at the resolved commit SHA, a Drive file URL, a SharePoint item URL,
+or a Confluence page URL) so agents cite exact locations without building URLs in the sandbox.
 
 ---
 
 ## 3. The Seam: `/v1/knowledge/*` Protocol
 
 All knowledge routes live on the **stateful credential broker** (`<agent>-credential-proxy`, port
-`8765`, alongside `/v1/vcs/*` and `/v1/audit-reports`). They are **not** served on the exec tier
-(`credential-broker-exec-tier.md`), which handles `/v1/exec` and `/v1/gcp/`.
+`8765`, alongside `/v1/vcs/*` and `/v1/audit-reports`). Once the exec-tier split proposed in
+[`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) lands, knowledge routes remain on
+the stateful broker rather than moving to the exec tier.
 
 Like `/v1/vcs/*`, every knowledge route is stateless to its caller: no server-side session handle
 and no shared checkout across requests.
 
 ### Verbs
 
-| Route (`POST`)               | Request payload                                                                  | Response payload                                                                                                                                  | Notes                                                                                                     |
-| ---------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `/v1/knowledge/capabilities` | `{store?}`                                                                       | `{stores: [{name, provider, role, mode, verbs, maxReadBytes, supportsSearch, configured, missing?}]}`                                             | Zero network/credential spend. Omit `store` to list every configured store on the install.                |
-| `/v1/knowledge/list`         | `{store, prefix?, types?, statuses?, cursor?, limit?}`                           | `{store, provider, role, items: [{id, path, title, type?, status?, staleAfter?, mimeType, revision, updatedAt, webUrl}], nextCursor?, truncated}` | Lists entries under the declared store root. Excludes reserved `index.md` / `log.md` when `types` is set. |
-| `/v1/knowledge/read`         | `{store, id, revision?, format?}`                                                | `{store, id, path, title, revision, updatedAt, webUrl, mimeType, content, frontmatter?, trust, stale?, redacted}`                                 | Enforces `maxReadBytes` (default `4 MiB` text). `format: "markdown"\|"text"\|"raw"` (provider-bounded).   |
-| `/v1/knowledge/search`       | `{store, query?, types?, tags?, resource?, includeStale?, limit?}`               | `{store, hits: [{id, path, title, type?, status?, stale?, snippet, revision, webUrl, trust}], truncated}`                                         | Frontmatter filters + sanitized plain-text query. Default excludes `deprecated` and past-`stale_after`.   |
-| `/v1/knowledge/propose`      | `{store, files: [{path, content}], title, body, branch?, baseBranch?, sources?}` | `{store, proposal: {url, number, branch, revision, forge, repo}}`                                                                                 | Curated Git stores only. Validates OKF v0.2 + `okf_guard.py`, then delegates to `vcs_broker` primitives.  |
-| `/v1/knowledge/write`        | `{store, path, content, frontmatter}`                                            | `{store, id, path, revision, webUrl, writer, writtenAt}`                                                                                          | Output stores only. Requires `generated` and `stale_after`, forbids `verified`, stamps server `writer`.   |
+| Route (`POST`)               | Request payload                                                                  | Response payload                                                                                                                                  | Notes                                                                                                                  |
+| ---------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `/v1/knowledge/capabilities` | `{store?}`                                                                       | `{curatedStore, outputStore, stores: [{name, provider, role, mode, verbs, maxReadBytes, supportsSearch, configured, missing?}]}`                  | Zero network/credential spend. `curatedStore` / `outputStore` are `null` when unconfigured.                            |
+| `/v1/knowledge/list`         | `{store, prefix?, types?, statuses?, cursor?, limit?}`                           | `{store, provider, role, items: [{id, path, title, type?, status?, staleAfter?, mimeType, revision, updatedAt, webUrl}], nextCursor?, truncated}` | Lists entries under the declared store root. Excludes reserved `index.md` and `log.md` when `types` is set.            |
+| `/v1/knowledge/read`         | `{store, id, revision?, format?}`                                                | `{store, id, path, title, revision, updatedAt, webUrl, mimeType, content, frontmatter?, trust, stale?, redacted}`                                 | Enforces `maxReadBytes` (default `4 MiB` text). `format` is `"markdown"`, `"text"`, or `"raw"` (provider-bounded).     |
+| `/v1/knowledge/search`       | `{store, query?, types?, tags?, resource?, includeStale?, limit?}`               | `{store, hits: [{id, path, title, type?, status?, stale?, snippet, revision, webUrl, trust}], truncated}`                                         | Frontmatter filters + strict plain-text query. Default excludes `deprecated` and past-`stale_after` entries.           |
+| `/v1/knowledge/propose`      | `{store, files: [{path, content}], title, body, branch?, baseBranch?, sources?}` | `{store, proposal: {url, number, branch, revision, forge, repo}}`                                                                                 | Curated Git stores only. Validates OKF v0.2 + `okf_guard.py`, then commits via `VcsBroker.publish_files` and opens PR. |
+| `/v1/knowledge/write`        | `{store, path, content, frontmatter}`                                            | `{store, id, path, revision, webUrl, writer, writtenAt}`                                                                                          | Output stores only. Requires `generated` and `stale_after`, forbids `verified`, stamps server `writer`.                |
 
 ### Error contract
 
@@ -211,9 +210,9 @@ for the calling agent rather than forwarding raw upstream bodies, matching `prov
 | 503  | `KNOWLEDGE_CREDENTIAL_UNAVAILABLE` | Mounted credential Secret or WIF token is absent; broker stays healthy for other stores.           |
 | 503  | `KNOWLEDGE_UNAVAILABLE`            | Upstream 5xx or timeout; safe to retry once unchanged, or degrade gracefully for triage.           |
 
-Per-provider `error_overrides` allow a provider to refine status guidance (for example, Microsoft
-Graph `403` when `Sites.Selected` site grant was not granted versus tenant admin consent missing,
-or Drive `404` when a folder was not shared with the service account).
+Per-provider `error_overrides` allow a provider to refine status guidance, such as distinguishing a
+missing Microsoft Graph `Sites.Selected` site grant from missing tenant admin consent on `403`, or
+a Drive `404` caused by a folder not shared with the service account.
 
 ---
 
@@ -232,13 +231,12 @@ agents/platform/scripts/
   knowledge_providers/
     __init__.py                  # public surface: KnowledgeProvider, KnowledgeRegistry
     base.py                      # KnowledgeProvider ABC, normalized dataclasses, StubKnowledgeProvider
-    validate.py                  # store-name, path, query-grammar, size-cap, and OKF validators
+    validate.py                  # store-name, path, query-grammar, size-cap, and mirrored OKF v0.2 checks
     errors.py                    # shared status-to-guidance table
-    transport.py                 # HttpTransport (host allowlist, no redirects, per-store CA, byte cap)
-    credentials.py               # WIF/SA impersonation, OAuth2 client_credentials, static token file
+    credentials.py               # WIF/SA impersonation, OAuth2 client_credentials; reuses StaticFileCredential
     registry.py                  # AVAILABLE, load_store_entries(KNOWLEDGE_STORES_CONFIG), build_stores()
-    git_repo/                    # Provider 1 & 2: GitOps knowledge/ and dedicated knowledge Git repo
-    local_store/                 # Output fallback: brokered on-volume store (beside audit_report_store)
+    git_repo/                    # Providers 1 & 2: GitOps knowledge/ and dedicated knowledge Git repo
+    local_store/                 # Output fallback: relays to gateway agent-api-auth listener (/opt/data/knowledge-output)
     google_drive/                # Provider 3: Google Drive folder / Shared Drive (read-only)
     sharepoint/                  # Provider 4: Microsoft SharePoint / OneDrive site (read-only)
     confluence/                  # Provider 5: Confluence Cloud / Data Center spaces (read-only)
@@ -247,43 +245,55 @@ agents/platform/scripts/
       git_repo/  local_store/  google_drive/  sharepoint/  confluence/
 ```
 
+External HTTP providers reuse `HttpTransport` from `agents/platform/scripts/providers/transport.py`
+(which already enforces host pinning, `_RefuseRedirect`, per-call CA bundles, timeouts, and byte
+caps) and `StaticFileCredential` from `agents/platform/scripts/providers/credentials.py` rather
+than duplicating transport or token-file code. `local_store` relays to the gateway pod's
+`agent-api-auth` listener over the same authenticated in-cluster HTTP pattern as `ReportStoreRelay`
+in `credential_proxy.py` (port `8700`, projected ServiceAccount token), because
+`<agent>-credential-proxy` mounts no `/opt/data` volume.
+
 ### `KnowledgeProvider` contract
 
-Each provider class declares:
-
-| Member                                       | Responsibility                                                                                  |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `name`                                       | Provider discriminator (`git-repo`, `local-store`, `google-drive`, `sharepoint`, `confluence`). |
-| `allowed_hosts(cfg)`                         | Exact outbound FQDNs this store instance may dial (feeds `HttpTransport` and egress policy).    |
-| `supported_roles`                            | Subset of `{"curated", "external", "output"}` the provider can serve.                           |
-| `verbs(cfg)`                                 | Supported verb set for this store instance, narrowed by `role` and `mode`.                      |
-| `credential(cfg)`                            | Credential strategy object (`ensure`, `headers`), read fresh per call or cached with expiry.    |
-| `for_config(config)`                         | Classmethod building `0..n` configured instances from `KNOWLEDGE_STORES_CONFIG`.                |
-| `list`, `read`, `search`, `propose`, `write` | Request descriptors + response translators returning normalized dataclasses.                    |
-| `error_overrides`                            | Optional per-provider status-to-guidance overrides.                                             |
+| Member                                       | Responsibility                                                                                         |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `name`                                       | Provider discriminator (`git-repo`, `local-store`, `google-drive`, `sharepoint`, `confluence`).        |
+| `allowed_hosts(cfg)`                         | Exact outbound FQDNs this store instance may dial (feeds `HttpTransport` and egress policy).           |
+| `supported_roles`                            | Subset of `{"curated", "external", "output"}` the provider can serve.                                  |
+| `verbs(cfg)`                                 | Supported verb set for this store instance, narrowed by `role` and `mode`.                             |
+| `credential(cfg)`                            | Credential strategy object (`ensure`, `headers`), read fresh per call or cached in memory with expiry. |
+| `for_config(config)`                         | Classmethod building `0..n` configured instances from `KNOWLEDGE_STORES_CONFIG`.                       |
+| `list`, `read`, `search`, `propose`, `write` | Request descriptors and response translators returning normalized dataclasses.                         |
+| `error_overrides`                            | Optional per-provider status-to-guidance overrides.                                                    |
 
 ### Prohibitions, boundary enforcement, and why no runtime plugins
 
 Knowledge providers execute inside `<agent>-credential-proxy`, the same process that holds cluster,
-forge, and chat credentials. Therefore:
+forge, and chat credentials. Build-time packages are mandatory: adding a runtime plugin loader to
+the broker container would create a code-execution and credential-exfiltration surface beside live
+tokens, for the exact reason stated in
+[`version-control-support.md` §5](version-control-support.md#why-not-a-runtime-plugin).
 
-- **Build-time packages only.** No runtime plugin loader or dynamic import path is allowed in the
-  broker container, for the same credential-exfiltration reason stated in
-  [`version-control-support.md` §5](version-control-support.md#why-not-a-runtime-plugin).
-- **No subprocesses or direct network sockets.** A provider may not call `subprocess`, open raw
-  sockets, pick scratch paths, set timeouts, or bypass byte ceilings. Git providers delegate
-  repository operations to the broker's existing `VcsBroker` (`snapshot`, `clone`, `publish`,
-  `proposal-create`); HTTP providers emit request descriptors executed by the shared `HttpTransport`
-  with `allow_redirects=False` and strict host pinning.
-- **Two CI tests enforce the seam.** An AST import-boundary test verifies that no module outside
-  `knowledge_providers/` imports a concrete provider package (only `registry.py` imports classes
-  listed in `AVAILABLE`) and that a provider imports only `knowledge_providers.{base,validate,errors,transport,credentials}`
-  and the standard library (plus `vcs_broker` for `git_repo` alone). A grep guard fails CI if any
-  provider name (`google_drive`, `sharepoint`, `confluence`, `git_repo`) appears in
-  `knowledge_broker.py` or shared contract modules.
-- **Parameterized contract suite.** One pytest suite runs over `AVAILABLE` using recorded fixtures
-  under `testdata/knowledge_providers/<provider>/`, verifying normalized shapes, root-confinement
-  refusals, query-injection refusals, byte caps, and redaction for every provider.
+A knowledge provider may not spawn subprocesses, open raw sockets, choose scratch paths, set
+timeouts, or bypass byte ceilings. External HTTP providers emit request descriptors executed by the
+shared `HttpTransport` (`allow_redirects=False`, pinned hosts). The `git_repo` provider delegates
+reads to `VcsBroker.snapshot` and proposals to a new `VcsBroker.publish_files` helper owned by
+`vcs_broker.py` (see §5.1), so `git_repo` runs no `git` subprocesses of its own.
+
+Two CI boundary tests enforce this layout, mirroring `agents/platform/scripts/test_providers_boundary.py`.
+An AST import-boundary test verifies that no module outside `knowledge_providers/` imports a
+concrete provider package (only `registry.py` imports classes listed in `AVAILABLE`) and that each
+provider imports only `knowledge_providers.{base,validate,errors,credentials}`,
+`providers.{transport,credentials}`, and the standard library (plus `vcs_broker` for `git_repo` and
+`ReportStoreRelay` primitives for `local_store`). A grep guard derives provider package names
+dynamically from `AVAILABLE` and fails CI if any provider name appears in `knowledge_broker.py` or
+shared contract modules.
+
+One parameterized `unittest` contract suite under `agents/platform/scripts/` (picked up by
+`PYTHON_TEST_FILES` in `Makefile`, matching `test_providers_contract.py`) runs over `AVAILABLE`
+against recorded fixtures in `testdata/knowledge_providers/<provider>/`. It verifies normalized
+response shapes, root-confinement refusals, search-query injection refusals, byte caps, and
+redaction for every provider.
 
 ---
 
@@ -291,88 +301,105 @@ forge, and chat credentials. Therefore:
 
 ### 1. GitOps repository `knowledge/` root (`git-repo`, default)
 
-Reuses the install's existing `role: gitops` repository from `spec.integration.repositories` with
-zero new credentials and zero new egress hosts. `list`, `read`, and `search` operate on a
-short-lived `VcsBroker.snapshot` of the configured `rootPath` (default `knowledge/`) at the
-repository's pinned `baseBranch` (or default branch), cached briefly by `(repo, head_sha)` on the
-broker's scratch `emptyDir` with bounded LRU eviction so repeated runbook searches in one turn do
-not re-clone. `propose` validates OKF frontmatter and `okf_guard.py`, then creates a branch under
-`platform-agent/knowledge/` and opens a proposal through `VcsBroker` (`clone`, `publish`,
-`proposal-create`).
+This provider reuses the install's existing `role: gitops` repository from
+`spec.integration.repositories` with zero new credentials and zero new egress hosts. `list`,
+`read`, and `search` operate on a short-lived `VcsBroker.snapshot` of the configured `rootPath`
+(default `knowledge/`) at the repository's pinned `baseBranch` or default branch, cached briefly by
+`(repo, head_sha)` on the broker's scratch `emptyDir` with bounded LRU eviction so repeated runbook
+searches in one turn do not re-clone.
+
+Because `VcsBroker.publish` takes a caller-built git bundle and checks out nothing on the broker
+side (`agents/platform/scripts/vcs_broker.py`), `propose` requires one new broker-owned helper:
+`VcsBroker.publish_files(repo, files, target, branch, commit_message)`. That helper runs entirely
+inside `vcs_broker.py` against a bare scratch clone using plumbing commands (`git hash-object -w`,
+`git read-tree`, `git update-index --cacheinfo`, `git write-tree`, `git commit-tree`) with zero
+working-tree checkout, runs `okf_guard.py` and mirrored OKF v0.2 validation on the proposed files,
+pushes the branch under `platform-agent/knowledge/`, and delegates proposal creation to
+`VcsBroker.proposal_create`. No repository contents are ever checked out beside forge tokens, and
+`git_repo` itself remains subprocess-free.
 
 ### 2. Dedicated knowledge Git repository (`git-repo`)
 
-Points at a separate repository declared on any forge in `spec.integration.forges` (GitHub, GitHub
-Enterprise Server, GitLab, Gitea, Bitbucket Cloud, Bitbucket Data Center), with a configurable
-`rootPath` (default `knowledge/`, or `.` for a dedicated OKF-only repo). When the repository has
-`role: context` (or the store sets `mode: read-only`), the broker reads it with the forge's
-read-only credential (`read_credential` / `read-token`) and refuses `propose`. When declared with
-write access (`role: managed`) and `mode: propose`, the agent can open PRs/MRs against the
-knowledge repository without mixing runbook churn into cluster-manifest history.
+This reuses the `git_repo` provider against a separate repository on any forge declared in
+`spec.integration.forges` (GitHub, GitHub Enterprise Server, GitLab, Gitea, Bitbucket Cloud, or
+Bitbucket Data Center), with a configurable `rootPath` (default `knowledge/`, or `.` for a
+dedicated OKF-only repo). Under `mode: read-only`, the broker reads it with the forge's read-only
+credential (`read_credential` / `read-token`) and refuses `propose`. Under `mode: propose`, the
+broker opens PRs/MRs against the knowledge repository without mixing runbook churn into
+cluster-manifest history. How the repository is declared relative to `spec.integration.repositories`
+is tracked in Open Question 4 (§12).
 
 ### 3. Google Drive folder (`google-drive`, read-only)
 
-- **Identity (respecting D12):** Uses a Google Service Account — either the install's Workload
-  Identity GSA or a dedicated impersonated GSA (matching `spec.integration.googleChat.serviceAccountEmail`)
-  scoped to `https://www.googleapis.com/auth/drive.readonly`. The customer shares one specific
-  Drive folder or Shared Drive (`viewer` role) with that service account email. No per-user OAuth
-  browser flow or user refresh tokens exist anywhere in the cluster.
-- **Root confinement:** Every `list` and `search` constrains Drive API v3 queries to descendants of
-  the configured `folderId` (and optional `driveId` with `supportsAllDrives=true`). Every `read`
-  walks the file's `parents` chain up to `folderId` before returning bytes, refusing files outside
-  the declared root (`403 KNOWLEDGE_SCOPE_VIOLATION`) even if the service account was granted
-  access elsewhere.
-- **Export & format handling:** Native Google Docs (`application/vnd.google-apps.document`) export
-  via `files.export` to `text/markdown` (or `text/plain` fallback); plain Markdown/text files read
-  via `files.get?alt=media`; PDF/DOCX return bounded raw bytes for the conversion pipeline (#5045)
-  when `format: "raw"` is requested by an authorized converter caller. Images, audio, and video
-  MIME types are skipped.
-- **Universe domain:** Respects `spec.harness.universeDomain` (`GOOGLE_CLOUD_UNIVERSE_DOMAIN`),
-  composing the Drive endpoint under the install's universe rather than hardcoding
-  `www.googleapis.com`.
+The Google Drive provider uses a service identity rather than per-user OAuth so headless cluster
+pods hold no interactive user tokens. The install uses either the broker's Workload Identity GSA or
+a dedicated impersonated GSA (matching `spec.integration.googleChat.serviceAccountEmail`) scoped to
+`https://www.googleapis.com/auth/drive.readonly`. The customer shares one Drive folder or Shared
+Drive (`viewer` role) with that service account email.
+
+Every `list` and `search` request restricts Drive API v3 queries to descendants of the configured
+`folderId` (plus optional `driveId` with `supportsAllDrives=true`), wrapping the provider root
+predicate and escaped user query as `(<root_clause>) and (<escaped_user_clause>)`. Every `read`
+walks the file's `parents` chain up to `folderId` before returning bytes, refusing any file outside
+the declared root (`403 KNOWLEDGE_SCOPE_VIOLATION`) even if the service account can see other
+folders. Native Google Docs (`application/vnd.google-apps.document`) export via `files.export` to
+`text/markdown` (or `text/plain` fallback); Markdown and plain text files read via
+`files.get?alt=media`; PDF and DOCX return bounded raw bytes when an authorized converter caller
+sends `format: "raw"` in the `POST /v1/knowledge/read` JSON body. Images, audio, and video MIME
+types are skipped. Endpoints respect `spec.harness.universeDomain` (`GOOGLE_CLOUD_UNIVERSE_DOMAIN`)
+rather than hardcoding `www.googleapis.com`.
 
 ### 4. OneDrive / SharePoint (`sharepoint`, read-only)
 
-- **Identity (respecting D12):** App-only Microsoft Entra ID OAuth 2.0 `client_credentials` grant
-  against `https://login.microsoftonline.com/<tenantId>/oauth2/v2.0/token` for scope
-  `https://graph.microsoft.com/.default`, reusing the exact token-exchange and in-memory caching
-  pattern already shipped in `TeamsRelay` (`agents/platform/scripts/credential_proxy.py`). The
-  Entra app registration holds `Sites.Selected` (never tenant-wide `Sites.Read.All`), and the
-  SharePoint site admin grants that app read-only (`read`) permission to the single declared site.
-  Credentials live in a Kubernetes Secret (`client-id`, `client-secret`) mounted only into
-  `<agent>-credential-proxy`.
-- **Root confinement:** The broker resolves the declared `(siteUrl, driveName, folderPath)` to
-  immutable `(siteId, driveId, rootItemId)` and restricts every Graph `/drives/{driveId}/items`
-  call to descendants of `rootItemId`, verifying `parentReference.path` on `read`.
+The SharePoint provider uses an app-only Microsoft Entra ID OAuth 2.0 `client_credentials` grant
+against `https://login.microsoftonline.com/<tenantId>/oauth2/v2.0/token` for scope
+`https://graph.microsoft.com/.default`, reusing the token-exchange and in-memory caching pattern
+already shipped in `TeamsRelay` (`agents/platform/scripts/credential_proxy.py`). The Entra app
+registration holds `Sites.Selected` (never tenant-wide `Sites.Read.All`), and the SharePoint site
+administrator grants that app read-only (`read`) access to the single declared site. Credentials
+live in a Kubernetes Secret (`client-id`, `client-secret`) mounted only into
+`<agent>-credential-proxy`.
 
-### 5. Confluence (`confluence`, read-only, reusing #1987)
+The broker resolves the declared `(siteUrl, driveName, folderPath)` to immutable
+`(siteId, driveId, rootItemId)` and restricts every Microsoft Graph `/drives/{driveId}/items` call
+to descendants of `rootItemId`, verifying `parentReference.path` on `read`.
 
-- **Identity:** Reuses the service-identity and broker boundary designed for Atlassian integrations
-  ([#1987](https://github.com/gke-labs/kube-agents/issues/1987)): a dedicated read-only Atlassian
-  service account API token (Confluence Cloud, `Basic` auth over HTTPS) or Personal Access Token
-  (Confluence Data Center, `Bearer` auth over HTTPS with optional `caBundleRef`), stored in a
-  Kubernetes Secret mounted only into `<agent>-credential-proxy`.
-- **Root confinement:** Declares an explicit non-empty `spaceKeys` list (and optional `rootPageId`
-  ancestor filter). Every CQL search query is constructed server-side by the provider with
-  `space in (...)` appended outside the sanitized plain-text query, and every `read` checks the
-  returned page's `spaceId`/`spaceKey` (and ancestor list when `rootPageId` is set) before
-  returning content.
-- **Conversion:** Reads Confluence REST API v2 `body.storage` (XHTML) or `body.atlas_doc_format`
-  and returns bounded text/HTML for the converter (#5045) or deterministic XHTML-to-Markdown
-  conversion on read. Write endpoints are never called.
+### 5. Confluence (`confluence`, read-only)
+
+Issue [#1987](https://github.com/gke-labs/kube-agents/issues/1987) tracks Atlassian's hosted
+Cloud-only MCP server (`https://mcp.atlassian.com/v1/mcp/authv2`), which has not yet settled a
+non-interactive service credential and does not cover Confluence Data Center. Rather than waiting
+on hosted MCP or limiting installs to Confluence Cloud, this provider speaks Confluence's REST API
+through the same broker credential, egress, and redaction posture described in #1987: a dedicated
+read-only Atlassian service account API token (`Basic` auth over HTTPS on Confluence Cloud) or a
+Personal Access Token (`Bearer` auth over HTTPS with optional `caBundleRef` on Confluence Data
+Center), stored in a Kubernetes Secret mounted only into `<agent>-credential-proxy`. If #1987 later
+ships an interactive Atlassian MCP server, it remains an additive interactive tool surface.
+
+Every Confluence store declares a non-empty `spaceKeys` allowlist (and optional `rootPageId`
+ancestor filter). The provider builds CQL queries server-side as
+`(space in (...)) AND (<escaped_user_clause>)` and verifies the returned page's `spaceKey` (and
+ancestor chain when `rootPageId` is set) on every `read`. It reads REST API v2 `body.storage`
+(XHTML) or `body.atlas_doc_format` and returns bounded text/XHTML for the converter (#5045) or
+deterministic XHTML-to-Markdown conversion on read. Write endpoints are never called.
 
 ### Agent output store backends (`role: output`)
 
-1. **Default local brokered store (`local-store`):** Available on every install, including installs
-   with no GitOps repository. Stores OKF Markdown reports under a dedicated root beside
-   `audit_report_store.py` (never inside `fleet-audit/reports/runs/`, preserving audit ring
-   invariants in `fleet-audit-report-store.md` §2), served through the same authenticated gateway
-   listener with fd-relative no-symlink writes, per-writer stamping (`X-Knowledge-Writer`), and
-   `stale_after` pruning.
-2. **Optional external output stores (Phase 4):** A dedicated output Git repository/branch, a GCS
-   bucket (via Workload Identity), or a dedicated Drive/SharePoint folder can back `role: output`
-   when a team wants reports directly linkable outside the cluster console. Curated stores remain
-   strictly separate regardless of which backend backs `output`.
+The default `local-store` backend works on every install, including installs with no GitOps
+repository. Because `<agent>-credential-proxy` mounts no `/opt/data` PVC, `local-store` follows the
+exact two-hop architecture of [`fleet-audit-report-store.md` §3](fleet-audit-report-store.md#3-where-it-lives):
+a companion route group on the gateway pod's `agent-api-auth` listener (port `8700`) stores OKF
+Markdown reports under a sibling root `/opt/data/knowledge-output/` — strictly outside
+`/opt/data/fleet-audit/reports/` so it cannot collide with `<audit-id>` stream enumeration or per-stream
+`runs/` and `run-starts/` ring invariants. `agent-api-auth` authenticates the broker via its
+projected ServiceAccount token (`kubeagents-audit-report-store` or a dedicated audience), enforces
+fd-relative no-symlink atomic writes, records server-stamped writer provenance
+(`X-Knowledge-Writer`), and prunes entries past `stale_after`.
+
+Optional external output backends (Phase 4) — such as a customer GCS bucket via Workload Identity
+or a dedicated output Git/Drive folder — can back `role: output` when a team wants reports directly
+linkable outside the cluster console. Curated stores stay separate regardless of which backend
+backs `output`.
 
 ---
 
@@ -380,10 +407,10 @@ knowledge repository without mixing runbook churn into cluster-manifest history.
 
 ### Caller-role authorization (`ROUTE_ROLES` and `ROLE_KNOWLEDGE_VERBS`)
 
-`<agent>-credential-proxy` enforces caller identity via projected Kubernetes ServiceAccount tokens
+`<agent>-credential-proxy` authenticates callers using projected Kubernetes ServiceAccount tokens
 with per-pod audiences (`credential_proxy.py` `ROUTE_ROLES`, `platformagent_broker_split.go`). The
-knowledge routes extend that exact model with `KNOWLEDGE_ROUTE_PREFIX = "/v1/knowledge/"` and a
-per-role verb allowlist (`ROLE_KNOWLEDGE_VERBS`):
+knowledge routes extend that model with `KNOWLEDGE_ROUTE_PREFIX = "/v1/knowledge/"` and a per-role
+verb allowlist (`ROLE_KNOWLEDGE_VERBS`):
 
 | Caller role   | Audience / source pod                      | Allowed `/v1/knowledge/*` verbs                                                      | Store & write constraints                                                                                                                                                                       |
 | ------------- | ------------------------------------------ | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -391,45 +418,55 @@ per-role verb allowlist (`ROLE_KNOWLEDGE_VERBS`):
 | `profile`     | Ephemeral profile workers (`AgentProfile`) | `capabilities`, `list`, `read`, `search`; `propose` and `write` gated by task claims | Requires verified task credential. `propose` requires `vcs:proposal-create` (or `knowledge:propose`) permit; `write` is bound to the task's own stream/prefix (mirroring `audit_report_store`). |
 | `curator`     | Go Curator pod (`a2a/cmd/curator`)         | `capabilities`, `list`, `read`                                                       | Read-only across configured `curated` and opted-in `external` stores. Never `propose` or `write`.                                                                                               |
 | `session`     | Per-conversation A2A session pod           | `capabilities`, `list`, `read`, `search` (opt-in / curated read-only)                | Redacted reads of `curated` stores only. Never `propose`, never `write`.                                                                                                                        |
-| `a2a-reports` | A2A gateway report relay                   | `read` (exact `role: output` ID only)                                                | Redacted single-document fetch for chat/console/MCP report links (#4056, #5047). No `list`/`search`/`write`.                                                                                    |
+| `a2a-reports` | A2A gateway report relay                   | `read` (exact `role: output` ID only)                                                | Redacted single-document fetch for chat/console/MCP report links (#4056, #5047). No `list`, `search`, or `write`.                                                                               |
 | `mcp`         | A2A MCP server pod (`a2a/cmd/mcp`)         | `read` (exact `role: output` ID only, if exposed)                                    | Same narrow read-only boundary as `a2a-reports`; no curated write or arbitrary search.                                                                                                          |
 
 Roles absent from this table (`chat`, `a2a-chat`, `watcher`, `scope`, `teams-inbound`) receive
 `403 CALLER_ROLE_FORBIDDEN` on `/v1/knowledge/*`.
 
-### Query sanitization, redaction, and egress
+### Query sanitization, redaction, egress, and secret confinement
 
-- **Search-grammar allowlist:** Free-text `query` inputs to `/v1/knowledge/search` pass the same
-  plain-word allowlist used by `profile_issue_query_refusal` in `credential_proxy.py` (length cap
-  256 characters, refusing colons, quotes, backslashes, parentheses, and boolean operators
-  `AND`/`OR`/`NOT`) so untrusted model prompts cannot inject provider search operators (Drive
-  `parents in`, Confluence CQL `space =`, SharePoint KQL `path:`) to escape the declared root.
-- **Inbound and outbound redaction:** Every document body and search snippet returned to
-  `REDACTED_OUTPUT_ROLES` (`profile`, `session`, `a2a-reports`, `mcp`), and every broker log line,
-  passes through `credential_shapes.py` redaction (masking private keys, cloud tokens, GitHub/GitLab
-  PATs, and Bearer/Basic headers). Outbound search queries sent to external SaaS APIs pass through
-  the same redactor before leaving the cluster so accidental tokens in a cluster error message are
-  never transmitted to Google Drive, SharePoint, or Confluence.
-- **Egress allowlist alignment:** Today `buildFQDNNetworkPolicy`
-  (`k8s-operator/internal/controller/platformagent_manifests.go`) selects `<agent>-gateway` only,
-  while `<agent>-credential-proxy` has open egress (tracked in
-  [`version-control-support.md` §12 #5](version-control-support.md#12-open-questions)). Each
-  knowledge provider implements `allowed_hosts()` and the operator exposes
-  `KnowledgeEgressPatterns(integration)` beside `ForgeEgressPatterns(integration)` so that:
-  1. `HttpTransport` inside the broker enforces the exact host allowlist and refuses all HTTP
-     redirects (`allow_redirects=False`) from day one, preventing SSRF and credential forwarding on
-     any cluster (including clusters without Dataplane V2).
-  2. When a broker-scoped `FQDNNetworkPolicy` is enabled, external knowledge provider hosts are
-     derived automatically from `spec.integration.knowledge` without manual allowlist edits.
-- **Nothing leaves the install automatically:** External providers are contacted only when an
-  agent, user, or explicitly configured schedule invokes a verb on that store. No cluster
-  telemetry, pod logs, or unrequested data is pushed outward.
-- **Secret handling:** Provider Secrets are projected read-only (`0400`, `Optional: true`) under
-  `/var/run/kube-agents/knowledge-credentials/<store>/` into `<agent>-credential-proxy` alone,
-  never into the gateway, sandbox, session, profile, or Curator pods. `KNOWLEDGE_STORES_CONFIG`
-  (`/etc/credential-proxy/knowledge-stores.json`) is added to `SensitiveEnvVars` in
-  `k8s-operator/api/v1alpha1/common_types.go` and dropped by `mergeCredentialProxyEnv` so
-  `spec.deployment.env` cannot redirect the broker's store registry.
+Search queries sent to `/v1/knowledge/search` cannot reuse `profile_issue_query_refusal` from
+`credential_proxy.py` as-is: that helper omits single quotes (`'`), comparison operators (`=`, `~`,
+`<`, `>`), and lowercase boolean words (`or`, `and`, `not`, `in`, `contains`), which would allow
+root-escape injection in Google Drive `q` and Confluence CQL. Instead, `knowledge_providers/validate.py`
+enforces a dedicated plain-text allowlist (`KNOWLEDGE_QUERY_MAX_LENGTH = 256`, permitting only
+alphanumerics, spaces, and `._/-`, refusing quotes, backslashes, colons, brackets, comparison
+operators, and case-insensitive query keywords `and`, `or`, `not`, `in`, `contains`), and every
+provider escapes literals and parenthesizes `(<root_clause>) AND (<escaped_user_clause>)`.
+
+For response redaction, `credential_proxy.py` defines a dedicated
+`REDACTED_KNOWLEDGE_READ_ROLES = REDACTED_OUTPUT_ROLES | {CALLER_ROLE_A2A_REPORTS, CALLER_ROLE_MCP}`,
+mirroring `REDACTED_VCS_READ_ROLES` and `REDACTED_REPORT_READ_ROLES` without altering
+`REDACTED_OUTPUT_ROLES` (`profile` and `session` only). Every document body and search snippet
+returned to those roles, every broker log line, and every outbound search query sent to an external
+SaaS provider passes through `credential_shapes.py` redaction (private keys, GitHub `gh*` /
+`github_pat_` tokens, AWS/Google/Slack/`sk-` keys, Bearer/Basic headers, JWTs, and URL passwords).
+As a Phase 1 prerequisite, `credential_shapes.py` also adds GitLab PAT (`glpat-`) and provider
+token shapes so secrets accidentally pasted into a wiki or runbook are masked consistently.
+
+Egress control aligns with `buildFQDNNetworkPolicy`
+(`k8s-operator/internal/controller/platformagent_manifests.go`). Today that policy selects
+`<agent>-gateway` only while `<agent>-credential-proxy` has open egress
+([`version-control-support.md` §12 #5](version-control-support.md#12-open-questions)). Each
+knowledge provider implements `allowed_hosts()` and the operator adds
+`KnowledgeEgressPatterns(integration)` beside `ForgeEgressPatterns(integration)`. From day one,
+`HttpTransport` inside the broker enforces the per-store host allowlist and refuses all HTTP
+redirects (`allow_redirects=False`), preventing SSRF and token forwarding even on clusters without
+Dataplane V2. When a broker-scoped `FQDNNetworkPolicy` is enabled, external knowledge hosts are
+derived automatically from `spec.integration.knowledge`. External providers are contacted only on
+explicit request or administrator-configured schedule; nothing leaves the install automatically.
+
+Provider Secrets are projected read-only (`0400`, `Optional: true`) under
+`/var/run/kube-agents/knowledge-credentials/<store>/` (and optional CA bundles under
+`/etc/kube-agents/knowledge-ca/<store>/`) into `<agent>-credential-proxy` alone — never into the
+gateway, sandbox, session, profile, or Curator pods. To preserve parity with forge credentials
+(`k8s-operator/internal/controller/vcs_forges.go` and `k8s-operator/api/v1alpha1/common_types.go`),
+the operator adds `KNOWLEDGE_STORES_CONFIG` (`/etc/credential-proxy/knowledge-stores.json`) to
+`SensitiveEnvVars` (and drops it in `mergeCredentialProxyEnv`) and adds `knowledge-credentials-`
+and `knowledge-ca-` to `ReservedVolumePrefixes` (enforced in both the validating webhook and
+render-time stripping across `extraVolumes`, `sidecarVolumes`, `extraVolumeMounts`,
+`sidecars[].volumeMounts`, and `initContainers[].volumeMounts`).
 
 ---
 
@@ -438,95 +475,105 @@ Roles absent from this table (`chat`, `a2a-chat`, `watcher`, `scope`, `teams-inb
 This backend enforces the published
 [Open Knowledge Format v0.2](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)
 contract codified in `docs/architecture/06-api-and-data-contracts.md` §5 and
-`scripts/check_okf_knowledge.py`:
+`scripts/check_okf_knowledge.py`. Because `scripts/check_okf_knowledge.py` is repository CI tooling
+not copied into the broker image, Phase 1 mirrors its frontmatter and reserved-filename checks in
+`agents/platform/scripts/knowledge_providers/validate.py` with a unit parity test holding the two
+in step.
 
-- **Reserved filenames (`index.md`, `log.md`) and root overviews:** `index.md` and `log.md` are
-  reserved at every directory level (and `STATE_OF_BEING.md` / `README.md` at the `knowledge/`
-  root). `list` and `search` with `types` filters skip them; `propose` rejects any file named
-  `index.md` or `log.md` that declares a `type` key, and rejects `type: index` or `type: log`.
-- **Required frontmatter & status vocabularies:** Every curated OKF entry must carry valid YAML
-  frontmatter with a non-empty string `type`. Standard types (`runbook`, `cluster-blueprint`,
-  `tenancy-model`, `metric-definition`, `escalation`, `observation`) use OKF v0.2 `status` values
-  (`draft`, `stable`, `deprecated`); `decision` and `lesson` use the `kube-agents` lifecycle
-  values (`proposed`, `active`, `rejected`, `superseded`, `retired`). As aligned in
-  `a2a/memory/types.go` and `decision_memory.py` (`EXTERNAL_DOC_STATUS_MAP`), `status: stable`
-  maps to `active` for retrieval and recall.
-- **Provenance and freshness (`sources`, `generated`, `verified`, `stale_after`):**
-  - Converted runbooks (#5045) arrive via `propose` with `type: runbook`, `sources` containing the
-    upstream document URL and revision, `generated: {by, at}`, `status: draft`, and no `verified`
-    field until human PR review.
-  - Agent output entries (#5047) arrive via `write` with `generated: {by, at}`, `stale_after`
-    within the store's retention cap (default 30 days), and no `verified` field (the broker
-    rejects `write` requests that set `verified`).
-  - Runbook readers (#5044) check `status` and `stale_after`: entries with `status: deprecated` or
-    `stale_after < today (UTC)` are flagged `stale: true` in `read`/`search` responses and are
-    reported as stale rather than followed.
-- **Posture declarations (`declares:`):** `declares:` exceptions and `.kube-agents/intent.yaml` are
-  honored strictly from Git-backed curated/context repositories (`git-repo` provider). External
-  SaaS stores (`google-drive`, `sharepoint`, `confluence`) and `role: output` stores never grant
-  audit posture declarations or `severity: block` guards.
+`index.md` and `log.md` are reserved at every directory level (alongside root overviews
+`STATE_OF_BEING.md` and `README.md` at the `knowledge/` root). `list` and `search` with `types`
+filters skip them; `propose` rejects any `index.md` or `log.md` carrying a `type` key and rejects
+`type: index` or `type: log`.
+
+Every curated OKF entry requires valid YAML frontmatter with a non-empty string `type`. Standard
+types (`runbook`, `cluster-blueprint`, `tenancy-model`, `metric-definition`, `escalation`,
+`observation`) use OKF v0.2 `status` values (`draft`, `stable`, `deprecated`); `decision` and
+`lesson` use the `kube-agents` lifecycle values (`proposed`, `active`, `rejected`, `superseded`,
+`retired`). Matching `a2a/memory/types.go` and
+`agents/platform/skills/decision-memory/scripts/decision_memory.py` (`EXTERNAL_DOC_STATUS_MAP`),
+`status: stable` maps to `active` for retrieval and recall.
+
+Provenance and freshness fields enforce trust boundaries across workflows. Converted runbooks
+([#5045](https://github.com/gke-labs/kube-agents/issues/5045)) arrive via `propose` with
+`type: runbook`, `sources` pointing at the upstream document URL and revision, `generated: {by, at}`,
+`status: draft`, and no `verified` field until human PR review. Agent output entries
+([#5047](https://github.com/gke-labs/kube-agents/issues/5047)) arrive via `write` with
+`generated: {by, at}`, `stale_after` within the store's retention cap (default 30 days), and no
+`verified` field (the broker rejects any `write` setting `verified`). Runbook readers check
+`status` and `stale_after`: entries with `status: deprecated` or `stale_after < today (UTC)` return
+`stale: true` so agents report staleness rather than following stale procedures.
+
+Audit posture declarations (`declares:`) and `.kube-agents/intent.yaml` are honored strictly from
+Git-backed curated and context repositories (`git-repo` provider). External SaaS stores
+(`google-drive`, `sharepoint`, `confluence`) and `role: output` stores never grant posture
+declarations or `severity: block` guards.
 
 ---
 
 ## 8. Integration with Existing Subsystems
 
-### Layer 2 organizational memory (`a2a/memory`, Curator, `decision_memory.py`, #2903)
+### Layer 2 organizational memory (`a2a/memory`, Curator, `decision_memory.py`)
 
-Today `sweep_repo_memory` (`agents/platform/scripts/github_scan_gate.py`) and `a2a/memory/curator.go`
-pull Git snapshots via `CALLER_ROLE_CURATOR` on `/v1/vcs/snapshot` and index `knowledge/` plus
-`EXTERNAL_DOC_DIRS` into Hindsight bank `kube-agents-decisions`. With the knowledge broker:
+On `main`, two distinct code paths ingest Git knowledge into Hindsight bank `kube-agents-decisions`:
+`sweep_repo_memory` (`agents/platform/scripts/github_scan_gate.py`) runs in the sandbox under
+`CALLER_ROLE_SHELL`, snapshots both `managed_repos` and `context_repos` via `forge.call("snapshot", ...)`,
+and invokes the local `curator index` binary; the standalone Curator pod (`a2a/memory/curator.go`)
+authenticates to `/v1/vcs/snapshot` under `CALLER_ROLE_CURATOR`, which `credential_proxy.py`
+currently restricts to `managed` repositories only.
 
-- **Curator read unification:** `Curator` keeps `/v1/vcs/snapshot` for GitOps manifest/diff checks
-  and adds `/v1/knowledge/list` + `/v1/knowledge/read` (under the same `curator` role) to index
-  configured `curated` stores (including a dedicated knowledge repository) and any external stores
-  explicitly marked `indexInMemory: true`. Every indexed chunk carries `store:<name>` and
-  `provider:<provider>` tags alongside `scope:shared`.
-- **Untrusted provenance preservation:** Records indexed from `role: external` stores or
-  `role: context` repositories are tagged `trust:untrusted`, have `guard.expect` cleared, have
-  `severity: block` capped at `warn`, and are wrapped in `<untrusted_memory_data source="...">` on
-  recall (reusing the exact sanitizer in `a2a/memory/curator.go` and `decision_memory.py`).
-- **Deterministic pre-push guards stay fast and local to Git:** `okf_guard.py` inside
-  `/v1/vcs/publish` continues to evaluate `decision` and `lesson` guards strictly against Git
-  objects, with zero Hindsight calls and zero network calls to external SaaS knowledge providers.
+With the knowledge broker, `Curator` keeps `/v1/vcs/snapshot` for GitOps manifest and diff checks
+and adds `/v1/knowledge/list` + `/v1/knowledge/read` under `CALLER_ROLE_CURATOR` to index declared
+`curated` stores (including a dedicated knowledge repository) and any `external` stores explicitly
+marked `indexInMemory: true`. Every indexed chunk carries `store:<name>` and `provider:<provider>`
+tags alongside `scope:shared`. Records indexed from `role: external` stores or `role: context`
+repositories carry `trust:untrusted`, have `guard.expect` cleared, have `severity: block` capped at
+`warn`, and return wrapped in `<untrusted_memory_data source="...">` on recall (reusing the
+sanitizer in `a2a/memory/curator.go` and `decision_memory.py`).
 
-### Runbook lookup and citation (#5044, #2296, AutoOps Contract 4)
+Deterministic pre-push guards (`okf_guard.py` inside `/v1/vcs/publish`) remain fast and strictly
+local to Git, making zero Hindsight calls and zero network calls to external SaaS knowledge
+providers.
 
-- **Contract 4 closure:** Adding `knowledge_client.py` (and its skill wrapper) wires the
-  `Runbook / knowledge retrieval` row of
-  [`agents/platform/docs/autoops-architecture.md`](../../agents/platform/docs/autoops-architecture.md#contract-4--context-reach)
-  without changing the AutoOps ingestion, session, judgment, or remediation spine.
-- **Lookup behavior:** Before acting, Platform and Cluster agents call `knowledge search` against
-  the `curated` store filtering `type: runbook` plus matching `tags` / `resource` / plain-text
-  terms, starting with deterministic frontmatter and text search (adding Hindsight semantic recall
-  only where evals show text search misses, per `02-agent-personas.md` and #5044). When a runbook
-  applies, the plan names it, the PR or chat card cites its `webUrl` (and upstream `sources` when
-  converted), and every action still passes normal read-only tools, RBAC, and human approval gates.
-- **Replacing chat-pasted SOPs (#2296):** When no curated store is configured, onboarding and triage
-  never ask users to paste runbooks into chat; they inform the user that curated knowledge is
-  unconfigured and point to the CR / installer configuration.
+### Runbook lookup, citation, and AutoOps Contract 4
 
-### Document conversion pipeline (#5045)
+Adding `knowledge_client.py` and its runbook-lookup skill wires the `Runbook / knowledge retrieval`
+row of [`agents/platform/docs/autoops-architecture.md`](../../agents/platform/docs/autoops-architecture.md#contract-4--context-reach)
+Contract 4 without changing the AutoOps ingestion, session, judgment, or remediation spine.
 
-Non-Markdown runbooks in Google Drive, SharePoint, or Confluence are converted into reviewed OKF
-v0.2 Markdown files via PR rather than read as authoritative instructions live in v1:
+Before acting, Platform and Cluster agents call `knowledge search` on the `curated` store filtering
+`type: runbook` alongside `tags`, `resource`, and plain-text terms. Per
+[`docs/architecture/02-agent-personas.md` §2.3](../architecture/02-agent-personas.md#23-coordination-is-indirect-durable-state-not-synchronous-calls),
+OKF retrieval must work under `--memory=file` and `--memory=off` without Hindsight; per
+[#5044](https://github.com/gke-labs/kube-agents/issues/5044), lookup starts with deterministic
+frontmatter and text search and adds Hindsight semantic recall only where evaluations show text
+search misses. When a runbook applies, the plan names it, the PR or chat card cites its `webUrl`
+(and upstream `sources` when converted), and every action still runs through normal read-only
+tools, RBAC, and human approval gates. When no curated store is configured, onboarding and triage
+never ask users to paste runbooks into chat ([#2296](https://github.com/gke-labs/kube-agents/issues/2296));
+they point the operator to the CR or installer configuration.
 
-1. A scheduled or user-requested conversion task calls `/v1/knowledge/list` and `/v1/knowledge/read`
-   against a configured `role: external` store.
-2. The converter tracks `(sourceId, revision)` against existing `sources` entries in the `curated`
-   store so unchanged documents are skipped and modified upstream documents generate a diffable
-   update PR rather than silently overwriting curated text.
-3. The converter emits an OKF v0.2 `type: runbook` document (`sources`, `generated`, `status:
-draft`, no `verified`) and submits it via `/v1/knowledge/propose` against the `curated` Git
-   store. A human reviews and merges (and promotes `status` to `stable` / sets `verified`).
+### Document conversion pipeline
 
-### Agent output store and linkable reports (#4053, #5047)
+Non-Markdown runbooks in Google Drive, SharePoint, or Confluence convert into reviewed OKF v0.2
+Markdown files via PR rather than acting as live authoritative instructions in v1
+([#5045](https://github.com/gke-labs/kube-agents/issues/5045)). A scheduled or user-requested
+conversion task calls `/v1/knowledge/list` and `/v1/knowledge/read` against a configured
+`role: external` store, compares `(sourceId, revision)` against existing `sources` entries in the
+`curated` store so unchanged files are skipped and changed upstream docs produce an update PR, and
+submits the resulting OKF v0.2 `type: runbook` document (`sources`, `generated`, `status: draft`,
+no `verified`) via `/v1/knowledge/propose`. A human reviews and merges the PR before the agent
+follows it.
+
+### Agent output store and linkable reports
 
 [`docs/designs/fleet-audit-report-store.md`](fleet-audit-report-store.md) keeps structured audit
 envelopes (`latest.json`, 14-run ring, `run-starts/`) as the fleet-audit delta engine. That
 structured JSON ring stays intact. The knowledge broker's `role: output` store complements it by
 giving scheduled jobs, investigations, and audits a uniform `write` / `read` surface for
 human-readable OKF reports that chat posts link to across Slack, Google Chat, Teams, the web
-console, and the MCP door (#4056, #5047).
+console, and the MCP door
+([#4056](https://github.com/gke-labs/kube-agents/issues/4056),
+[#5047](https://github.com/gke-labs/kube-agents/issues/5047)).
 
 ---
 
@@ -535,7 +582,9 @@ console, and the MCP door (#4056, #5047).
 ### `PlatformAgent` CR (`spec.integration.knowledge`)
 
 `IntegrationSpec` (`k8s-operator/api/v1alpha1/common_types.go`) gains an optional `knowledge` block
-beside `forges` and `repositories`:
+beside `forges` and `repositories`. The example below illustrates the recommended single-block
+declaration from Open Question 4 (§12), where a dedicated Git knowledge repository is declared
+directly inside `spec.integration.knowledge.stores[]` referencing a forge in `spec.integration.forges`:
 
 ```yaml
 spec:
@@ -548,9 +597,6 @@ spec:
       - forge: github
         repository: platform-gitops
         role: gitops
-      - forge: github
-        repository: sre-runbooks
-        role: managed
     knowledge:
       curatedStore: sre-runbooks-kb # optional; defaults to gitops repo's knowledge/ when omitted
       outputStore: local-reports # optional; defaults to built-in local-store when omitted
@@ -563,7 +609,7 @@ spec:
             forge: github
             repository: sre-runbooks
             rootPath: knowledge
-            baseBranch: main
+            baseBranch: main # allowed when mode is propose; omitted or ref-pinned when read-only
         - name: team-drive-sops
           role: external
           mode: read-only
@@ -594,74 +640,73 @@ spec:
             # caBundleRef optional for self-hosted Confluence Data Center
 ```
 
-**CRD validation rules (CEL + admission webhook, so rules hold even with `ENABLE_WEBHOOKS=false`):**
+Schema validation uses CEL rules on the CRD alongside the validating webhook so every invariant
+holds even when `ENABLE_WEBHOOKS=false`:
 
-- `stores[].name` is unique, DNS-1123 lowercase (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`, max 63 chars).
+- `stores[].name` is unique and matches DNS-1123 lowercase (`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`, max
+  63 chars).
 - `mode: write` is rejected unless `role == "output"`; `mode: propose` is rejected unless
   `role == "curated"` and `provider == "git-repo"`.
-- `gitRepo.forge` must reference a declared entry in `spec.integration.forges`.
-- `confluence.spaceKeys` must be non-empty; `googleDrive.folderId` must be non-empty;
-  `sharePoint.tenantId` and `siteUrl` must be valid HTTPS host/path values with no query or
-  fragment.
+- `gitRepo.forge` must reference a declared entry in `spec.integration.forges`; `gitRepo.baseBranch`
+  is rejected when `mode == "read-only"` (mirroring `RepositorySpec.BaseBranch`).
+- `confluence.spaceKeys` must be non-empty; `googleDrive.folderId` must be non-empty.
+- `sharePoint.tenantId` must be a UUID or single-label Entra tenant domain (`^[A-Za-z0-9.-]+$`, no
+  `/`, `?`, `#`, or `..`); `sharePoint.siteUrl` must be an `https://` URL with host and path only
+  and no query string or fragment.
 - `curatedStore` and `outputStore`, when set, must name entries in `stores` with matching `role`.
 
-**Backward compatibility and no-GitOps installs:**
-
-- **GitOps repo present, `spec.integration.knowledge` omitted:** The operator synthesizes one
-  implicit `curated` store (`git-repo` at `<gitops-repo>/knowledge/`, `mode: propose`) and one
-  implicit `output` store (`local-store`). Existing installs require zero CR edits.
-- **No GitOps repo, `spec.integration.knowledge` omitted:** Curated knowledge is disabled
-  (`capabilities` reports `curatedStore: null`) and `output` resolves to `local-store` (matching
-  today's no-forge report store behavior in `fleet-audit-report-store.md` §2).
+When `spec.integration.knowledge` is omitted and a `role: gitops` repository exists, the operator
+synthesizes one implicit `curated` store (`git-repo` at `<gitops-repo>/knowledge/`, `mode: propose`)
+and one implicit `output` store (`local-store`), so existing installs need zero CR edits. When no
+GitOps repository exists and `spec.integration.knowledge` is omitted, curated reads are disabled
+(`/v1/knowledge/capabilities` returns `curatedStore: null`) and `outputStore` resolves to
+`local-store` (matching today's no-forge report store behavior in `fleet-audit-report-store.md` §2).
 
 ### Installer (`install.sh`, Terraform, and Helm)
 
-Per `AGENTS.md`, `terraform/examples/full-install` + the `kube-agents` Helm chart remain the single
-installation engine; `install.sh` and `upgrade.sh` only collect inputs and generate
-`terraform.tfvars`:
-
-- During interactive `install.sh`, if no GitOps repository is configured (or when the admin opts
-  into a separate knowledge location), the installer prompts for a knowledge backend (`git-repo`,
-  `google-drive`, `sharepoint`, `confluence`, or `none`).
-- Non-interactive installs accept declarative keys in `install.env` (for example
-  `KNOWLEDGE_CURATED_PROVIDER`, `KNOWLEDGE_CURATED_REPO`, `KNOWLEDGE_DRIVE_FOLDER_ID`) and pipe any
-  static credentials (`--knowledge-token-file` or no-echo prompt) directly into a Kubernetes Secret
-  in the agent namespace, keeping tokens out of `install.env`, Helm values, and Terraform state.
-- Changing the knowledge location post-install is a declarative update to `PlatformAgent` (or
-  `install.env` + `upgrade.sh`), which re-renders `knowledge-stores.json` in the broker's policy
-  ConfigMap and rolls only `<agent>-credential-proxy`.
+Per `AGENTS.md`, `terraform/examples/full-install` and the `kube-agents` Helm chart remain the
+single installation engine; `install.sh` and `upgrade.sh` only collect inputs and generate
+`terraform.tfvars`. During interactive `install.sh`, if no GitOps repository is configured (or when
+the admin opts into a separate knowledge location), the installer prompts for a knowledge backend
+(`git-repo`, `google-drive`, `sharepoint`, `confluence`, or `none`). Non-interactive installs
+accept declarative keys in `install.env` (such as `KNOWLEDGE_CURATED_PROVIDER`,
+`KNOWLEDGE_CURATED_REPO`, `KNOWLEDGE_DRIVE_FOLDER_ID`) and pipe any static credentials
+(`--knowledge-token-file` or no-echo prompt) directly into a Kubernetes Secret in the agent
+namespace, keeping tokens out of `install.env`, Helm values, and Terraform state. Changing the
+knowledge location post-install updates the CR (or `install.env` + `upgrade.sh`), re-rendering
+`knowledge-stores.json` in the broker's policy ConfigMap and rolling only `<agent>-credential-proxy`.
 
 ---
 
 ## 10. Failure Modes and Operational Bounds
 
-| Failure mode                                   | System behavior                                                                                                                                                                                                                                    |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Missing or rotated provider Secret             | Optional volume mount (`Optional: true`) lets broker start normally; calls to that store return `503 KNOWLEDGE_CREDENTIAL_UNAVAILABLE`. Updating the Secret takes effect on the next call without restart (per-call file read).                    |
-| Revoked Drive share / missing SharePoint grant | Provider returns `403 KNOWLEDGE_FORBIDDEN` (or `404` with explicit share-check guidance); other stores and cluster operations stay unaffected.                                                                                                     |
-| External provider outage or latency spike      | Per-request timeout (default `15s` for `list`/`read`/`search`) caps broker worker tie-up; triage degrades gracefully to built-in skills and notes that runbook lookup was unavailable. `/v1/vcs/publish` never calls external knowledge providers. |
-| Oversized file or binary export (large PDF)    | `HttpTransport` aborts reads above `maxReadBytes` (`4 MiB` default, `16 MiB` converter cap) with `413 KNOWLEDGE_DOC_TOO_LARGE` before buffering whole payloads in broker memory.                                                                   |
-| Prompt injection inside a runbook or wiki page | External and unverified outputs carry `trust:untrusted` and `<untrusted_memory_data>` framing; curated runbooks shape plans only and never bypass RBAC, read-only guards, or human approval.                                                       |
-| Malformed OKF frontmatter on `propose`         | Broker runs `check_okf_knowledge.py` rules before pushing any branch; returns `400 KNOWLEDGE_INVALID_REQUEST` naming the exact key/line so broken PRs are never opened.                                                                            |
-| Secret accidentally committed to a wiki or doc | Broker redacts `credential_shapes.py` patterns on responses to `REDACTED_OUTPUT_ROLES` and on all logs, setting `redacted: true` in the response metadata.                                                                                         |
-| Broker memory / concurrency exhaustion         | Knowledge routes run on the stateful broker with bounded concurrency slots and memory reservations, never competing with exec-tier `kubectl`/`gcloud` slots once the exec split is active.                                                         |
+| Failure mode                                   | System behavior                                                                                                                                                                                                                         |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Missing or rotated provider Secret             | Optional volume mount (`Optional: true`) lets the broker start normally; calls to that store return `503 KNOWLEDGE_CREDENTIAL_UNAVAILABLE`. Updating the Secret takes effect on the next call without restart (per-call file read).     |
+| Revoked Drive share / missing SharePoint grant | Provider returns `403 KNOWLEDGE_FORBIDDEN` (or `404` with explicit share-check guidance); other stores and cluster operations stay unaffected.                                                                                          |
+| External provider outage or latency spike      | Per-request timeout (default `15s` for `list`/`read`/`search`) caps broker worker tie-up; triage degrades to built-in skills and notes that runbook lookup was unavailable. `/v1/vcs/publish` never calls external knowledge providers. |
+| Oversized file or binary export (large PDF)    | `HttpTransport` aborts reads above `maxReadBytes` (`4 MiB` default, `16 MiB` converter cap) with `413 KNOWLEDGE_DOC_TOO_LARGE` before buffering whole payloads in broker memory.                                                        |
+| Prompt injection inside a runbook or wiki page | External and unverified outputs carry `trust:untrusted` and `<untrusted_memory_data>` framing; curated runbooks shape plans only and never bypass RBAC, read-only guards, or human approval.                                            |
+| Malformed OKF frontmatter on `propose`         | Broker runs the mirrored OKF v0.2 checks in `knowledge_providers/validate.py` before pushing any branch; returns `400 KNOWLEDGE_INVALID_REQUEST` naming the exact key/line so broken PRs are never opened.                              |
+| Secret accidentally committed to a wiki or doc | Broker redacts `credential_shapes.py` patterns on responses to `REDACTED_KNOWLEDGE_READ_ROLES` and on all logs, setting `redacted: true` in the response metadata.                                                                      |
+| Broker memory / concurrency exhaustion         | Knowledge routes run on the stateful broker with bounded concurrency slots and memory reservations, staying separate from exec-tier `kubectl`/`gcloud` slots once the exec split lands.                                                 |
 
 Observability follows the existing credential-proxy metrics surface (`kubeagents_*` scraped by
 `<name>-credential-proxy-monitoring`): the broker exports
 `kubeagents_knowledge_requests_total{store,provider,verb,status}` and
-`kubeagents_knowledge_request_duration_seconds{store,provider,verb}` (label cardinality bounded to
-declared store names).
+`kubeagents_knowledge_request_duration_seconds{store,provider,verb}`, with label cardinality
+bounded to declared store names.
 
 ---
 
 ## 11. Phased Delivery Plan
 
-| Phase | Deliverables                                                                                                                                                                                                                                    | Unblocks                                                             |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| **1** | `knowledge_broker.py`, `knowledge_providers/{base,validate,errors,transport,credentials,registry,git_repo,local_store}`, `knowledge_client.py`, `spec.integration.knowledge` CRD + operator Secret/ConfigMap render, AST + contract test suite. | #5044 (runbook lookup & citation), #2296, #5047 (local output store) |
-| **2** | `knowledge_providers/google_drive/` (service account + `folderId` confinement + Docs export), PR-mediated OKF converter workflow (#5045) for Google Docs and PDFs.                                                                              | #5045 (Drive + PDF conversion)                                       |
-| **3** | `knowledge_providers/sharepoint/` (Entra `client_credentials` + `Sites.Selected`) and `knowledge_providers/confluence/` (reusing #1987 boundary), plus Curator `/v1/knowledge/*` indexing for dedicated knowledge repos.                        | #5045 (Confluence), #2903 multi-repo knowledge                       |
-| **4** | Externally linkable `role: output` store (console link surface and/or optional GCS/folder backend) and broker-scoped `FQDNNetworkPolicy` wiring.                                                                                                | #4056 / #5047 clickable report links                                 |
+| Phase | Deliverables                                                                                                                                                                                                                                                                                                                                                                                                                         | Unblocks                                                             |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| **1** | `knowledge_broker.py`, `knowledge_providers/{base,validate,errors,credentials,registry,git_repo,local_store}`, `VcsBroker.publish_files`, gateway `agent-api-auth` listener routes on `/opt/data/knowledge-output/`, `knowledge_client.py`, `glpat-` pattern in `credential_shapes.py`, `spec.integration.knowledge` CRD + operator Secret/ConfigMap/volume-prefix reservations, `unittest` boundary + contract + OKF-parity suites. | #5044 (runbook lookup & citation), #2296, #5047 (local output store) |
+| **2** | `knowledge_providers/google_drive/` (service account + `folderId` confinement + Docs export), PR-mediated OKF converter workflow (#5045) for Google Docs and PDFs.                                                                                                                                                                                                                                                                   | #5045 (Drive + PDF conversion)                                       |
+| **3** | `knowledge_providers/sharepoint/` (Entra `client_credentials` + `Sites.Selected`) and `knowledge_providers/confluence/` (REST API + `spaceKeys` confinement + `caBundleRef`), plus Curator `/v1/knowledge/*` indexing for dedicated knowledge repos.                                                                                                                                                                                 | #5045 (Confluence), #2903 multi-repo knowledge                       |
+| **4** | Externally linkable `role: output` store (console link surface and/or optional GCS/folder backend) and broker-scoped `FQDNNetworkPolicy` wiring.                                                                                                                                                                                                                                                                                     | #4056 / #5047 clickable report links                                 |
 
 ---
 
@@ -672,45 +717,45 @@ declared store names).
    target GitOps repository, should deterministic `okf_guard.py` checks on `/v1/vcs/publish` stay
    scoped strictly to the target repository's own `knowledge/` tree, or also fetch and evaluate
    `decision`/`lesson` records from the dedicated knowledge repository?
-   - _Trade-off:_ evaluating only the target repository preserves sub-100ms, single-repo atomic
-     publish checks; evaluating a second repository adds a second snapshot fetch on every publish
-     and introduces cross-repo version skew.
-   - _Recommendation:_ keep `/v1/vcs/publish` blocking guards scoped to the target repository in
-     Phase 1, index the dedicated knowledge repository into `kube-agents-decisions` for recall and
-     `why` queries, and add cross-repo blocking guards only if multi-repo fleet teams ask for them.
+   Evaluating only the target repository preserves sub-100ms, single-repo atomic publish checks,
+   whereas evaluating a second repository adds a second snapshot fetch on every publish and
+   introduces cross-repo version skew. _Recommendation:_ keep `/v1/vcs/publish` blocking guards
+   scoped to the target repository in Phase 1, index the dedicated knowledge repository into
+   `kube-agents-decisions` for recall and `why` queries, and add cross-repo blocking guards only if
+   multi-repo fleet teams need centralized enforcement.
 
 2. **Where untrusted binary conversion (PDF / DOCX) executes (`@dshnayder`, `@bradhoekstra`).**
    Google Docs export and Confluence XHTML are API-level text conversions, whereas parsing
-   arbitrary customer PDFs and Word documents (#5045) invokes complex binary parsers that are a
-   poor fit inside the credentialed `<agent>-credential-proxy` pod. Which boundary should parse
-   binary attachments: a credential-free conversion profile worker receiving bounded raw bytes from
-   `/v1/knowledge/read?format=raw`, or a separate unprivileged converter sidecar/Job?
-   - _Recommendation:_ keep `<agent>-credential-proxy` free of binary document parsers; return
-     bounded raw bytes to a credential-free profile Job pod that extracts text, drafts the OKF v0.2
-     Markdown, and submits it via `/v1/knowledge/propose`.
+   arbitrary customer PDFs and Word documents (#5045) invokes binary parsers that do not belong
+   inside the credentialed `<agent>-credential-proxy` pod. Which boundary should parse binary
+   attachments: a credential-free conversion profile worker requesting `POST /v1/knowledge/read`
+   with `format: "raw"` for bounded raw bytes, or a separate unprivileged converter Job?
+   _Recommendation:_ keep `<agent>-credential-proxy` free of binary document parsers; return
+   bounded raw bytes to a credential-free profile Job pod that extracts text, drafts the OKF v0.2
+   Markdown, and submits it via `POST /v1/knowledge/propose`.
 
 3. **First clickable URL surface for `role: output` reports (`@bradhoekstra`).**
    Chat posts need a URL a human can open from Slack or Google Chat (#5047). The built-in
-   `local-store` lives inside the cluster on `/opt/data` and has no external URL unless fronted by
-   the A2A web console. Which linkable backend should Phase 4 prioritize: authenticated report
-   routes on the A2A web console reading `/v1/knowledge/read` via `a2a-reports`, a customer GCS
-   bucket, or a dedicated Git/Drive output folder?
-   - _Recommendation:_ front `local-store` through the A2A web console first (zero new cloud
-     storage or IAM grants on default installs), and offer a customer GCS bucket as the first
-     optional external `output` provider.
+   `local-store` lives inside the cluster on `/opt/data/knowledge-output/` and has no external URL
+   unless fronted by the A2A web console. Which linkable backend should Phase 4 prioritize:
+   authenticated report routes on the A2A web console reading `/v1/knowledge/read` via
+   `a2a-reports`, a customer GCS bucket, or a dedicated Git/Drive output folder?
+   _Recommendation:_ front `local-store` through the A2A web console first (zero new cloud storage
+   or IAM grants on default installs), and offer a customer GCS bucket as the first optional
+   external `output` provider.
 
 4. **Dedicated Git knowledge repository declaration shape (`@dshnayder`, `@bradhoekstra`).**
-   Should a dedicated Git knowledge repository be registered only inside
-   `spec.integration.knowledge.stores[]` (referencing a declared forge in `spec.integration.forges`),
-   or also appear in `spec.integration.repositories` with a new `role: knowledge`?
-   - _Trade-off:_ reusing `spec.integration.repositories` keeps all GitHub App minter policy and
-     `managed_repos`/`context_repos` seeding in one list; keeping knowledge stores exclusively in
-     `spec.integration.knowledge` avoids splitting knowledge configuration across two CR lists when
-     mixing Git and non-Git backends.
-   - _Recommendation:_ declare every knowledge store uniformly under `spec.integration.knowledge`,
-     and have the operator automatically include any `git-repo` store's repository in the token
-     minter policy and broker repository gate with the permission matching its `mode` (`read-only`
-     versus `propose`).
+   Should a dedicated Git knowledge repository be declared exclusively inside
+   `spec.integration.knowledge.stores[]` (referencing a forge in `spec.integration.forges`, as
+   shown in §9), or also appear in `spec.integration.repositories` with a new `role: knowledge`?
+   Reusing `spec.integration.repositories` keeps all GitHub App minter policy and
+   `managed_repos`/`context_repos` seeding in one list, while declaring every store exclusively
+   under `spec.integration.knowledge` avoids splitting knowledge configuration across two CR lists
+   and avoids duplicate `baseBranch` fields when mixing Git and non-Git backends.
+   _Recommendation:_ declare every knowledge store uniformly under `spec.integration.knowledge`,
+   and have the operator automatically include any `git-repo` store's repository in the token
+   minter policy and broker repository gate with the permission matching its `mode` (`read-only`
+   versus `propose`).
 
 5. **Broker-scoped `FQDNNetworkPolicy` gating for external SaaS providers (`@bradhoekstra`).**
    Shared with [`version-control-support.md` §12 #5](version-control-support.md#12-open-questions).
@@ -731,7 +776,9 @@ declared store names).
 - [`memory.md`](memory.md) — Layer 1 conversational memory and Layer 2 decision/lesson memory
   (`a2a/memory`, Curator, `decision_memory.py`).
 - [`fleet-audit-report-store.md`](fleet-audit-report-store.md) — the brokered on-volume report
-  store that serves as the default local output fallback.
+  store whose gateway listener pattern `local-store` reuses.
+- [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) — proposed broker split
+  keeping stateful routes off the exec tier.
 - [`../credential-isolation-design.md`](../credential-isolation-design.md) — the three-pod
   credential isolation invariant.
 - [`../../agents/platform/docs/autoops-architecture.md`](../../agents/platform/docs/autoops-architecture.md#contract-4--context-reach) —
@@ -743,5 +790,8 @@ declared store names).
   [#5047](https://github.com/gke-labs/kube-agents/issues/5047),
   [#2296](https://github.com/gke-labs/kube-agents/issues/2296),
   [#2903](https://github.com/gke-labs/kube-agents/issues/2903),
-  [#4053](https://github.com/gke-labs/kube-agents/issues/4053), and
+  [#3045](https://github.com/gke-labs/kube-agents/issues/3045),
+  [#4053](https://github.com/gke-labs/kube-agents/issues/4053),
+  [#4056](https://github.com/gke-labs/kube-agents/issues/4056),
+  [#1720](https://github.com/gke-labs/kube-agents/issues/1720), and
   [#1987](https://github.com/gke-labs/kube-agents/issues/1987).
