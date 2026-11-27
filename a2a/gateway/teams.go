@@ -253,12 +253,30 @@ type TeamsAdapter struct {
 	// so a rating and the redraw it causes are never interleaved with
 	// another's. It does not order two presses pulled back to back.
 	rateMu sync.Mutex
+	// editing is the lock each message's edits hold, by message id, from
+	// reading what the message shows to writing it back: the gateway's
+	// edit, a rating's redraw and an answered question's (lockEdit). An
+	// entry lives only while an edit holds or waits on it.
+	editing map[string]*teamsEditLock
 	// rating counts the ratings in flight, for a test to wait on.
 	rating sync.WaitGroup
+	// ux is the adapter's record of its laid-out messages: the questions
+	// open, the answers waiting on the gateway's verdict, and what each
+	// card shows (teams_clicks.go). rewrites counts the answered
+	// questions being drawn again, for a test to wait on.
+	ux       *teamsUX
+	rewrites sync.WaitGroup
 
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
 	countInterval time.Duration
+	// typing is the conversations with a task running or an ask open,
+	// each with the loop that keeps Teams's typing indicator on while only
+	// the ask is (teams_typing.go);
+	// typingInterval and typingMax pace and bound it (tests shorten both).
+	typing         map[string]*teamsTyping
+	typingInterval time.Duration
+	typingMax      time.Duration
 }
 
 // NewTeamsAdapter builds the adapter against the credential proxy's relay
@@ -272,17 +290,21 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		return nil, fmt.Errorf("teams: relay token path is required")
 	}
 	return &TeamsAdapter{
-		relayURL:      strings.TrimSuffix(relayURL, "/"),
-		tokenPath:     tokenPath,
-		tenantID:      strings.TrimSpace(tenantID),
-		adaptiveCards: adaptiveCards,
-		client:        &http.Client{Timeout: teamsRelayTimeout},
-		log:           log,
-		seen:          map[string]bool{},
-		serviceURLs:   map[string]string{},
-		rated:         map[string]teamsRated{},
-		allowed:       map[string]bool{},
-		countInterval: teamsEventCountInterval,
+		relayURL:       strings.TrimSuffix(relayURL, "/"),
+		tokenPath:      tokenPath,
+		tenantID:       strings.TrimSpace(tenantID),
+		adaptiveCards:  adaptiveCards,
+		client:         &http.Client{Timeout: teamsRelayTimeout},
+		log:            log,
+		seen:           map[string]bool{},
+		serviceURLs:    map[string]string{},
+		rated:          map[string]teamsRated{},
+		editing:        map[string]*teamsEditLock{},
+		allowed:        map[string]bool{},
+		countInterval:  teamsEventCountInterval,
+		typing:         map[string]*teamsTyping{},
+		typingInterval: teamsTypingInterval,
+		typingMax:      teamsTypingMax,
 	}, nil
 }
 
@@ -409,6 +431,7 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + act.ID
 	}
+	a.noteTypedAnswer(teamsConversationID(conversation), act.ID, text, act.From.Name)
 	return InboundMessage{
 		Conversation: teamsConversationID(conversation),
 		Kind:         kind,
@@ -700,10 +723,13 @@ func (a *TeamsAdapter) post(conversation, text string, actions []map[string]any)
 	if err != nil {
 		return "", fmt.Errorf("teams: encoding activity: %w", err)
 	}
+	a.quietTyping(conversation)
 	raw, err := a.apiPost(context.Background(), http.MethodPost, endpoint, payload)
+	a.quietTyping(conversation)
 	if err != nil {
 		return "", err
 	}
+	a.typingShown(conversation, false)
 	var body struct {
 		Response struct {
 			ID string `json:"id"`
@@ -837,18 +863,25 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	if err != nil {
 		return fmt.Errorf("teams: encoding activity update: %w", err)
 	}
-	_, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload)
-	return err
+	if _, err = a.apiPost(context.Background(), http.MethodPut, endpoint, payload); err != nil {
+		return err
+	}
+	a.typingShown(conversation, true)
+	return nil
 }
 
-// PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
+// PostMessage and EditMessage lay a chat message out as an Adaptive Card
+// with its buttons (teams_chat.go), or refuse the layout (ErrLayoutRefused)
+// so the gateway posts its text; with cards off a chat message falls back
+// to its text (ErrTextOnly). Text is rendered as a card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
 // (teams_press.go); an edit that names no task removes it. An answer marked
 // for feedback (m.Feedback) carries the rating controls on its card, once
 // the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
 	switch {
+	case m.Chat != nil && a.adaptiveCards:
+		return a.postChat(conversation, m)
 	case m.Chat == nil && m.Stop != "":
 		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
 	case a.rates(m):
@@ -858,13 +891,36 @@ func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, e
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
-	switch {
-	case m.Chat == nil && m.Stop != "":
-		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
-	case a.rates(m):
-		return a.editRated(conversation, messageID, m)
+	// One edit of a message at a time, in step with the redraws a rating
+	// and an answered question cause (teams_feedback.go, teams_clicks.go):
+	// each reads what the message shows and writes it back, and two of
+	// them interleaved would leave the older text or lose the answered
+	// line. The lock is the message's own, so a slow call on one message
+	// holds up no other.
+	defer a.lockEdit(messageID)()
+	if m.Chat != nil && a.adaptiveCards {
+		return a.editChat(conversation, messageID, m)
 	}
-	return editTextOnly(a.Edit, conversation, messageID, m)
+	if m.Chat != nil {
+		return ErrTextOnly
+	}
+	// The message is text from here: an answered question keeps its line,
+	// and once the edit has landed it asks nothing any more
+	// (teams_clicks.go).
+	m.Text = a.withAnsweredLine(messageID, m.Text)
+	var err error
+	switch {
+	case m.Stop != "":
+		err = a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		err = a.editRated(conversation, messageID, m)
+	default:
+		err = a.Edit(conversation, messageID, m.Text)
+	}
+	if err == nil {
+		a.trackQuestion(messageID, conversation, nil, nil)
+	}
+	return err
 }
 
 // EditNotifyMessage is EditMessage for the chat.notify route's home posts

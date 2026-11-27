@@ -913,6 +913,27 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertIn('"DependencyNotFound"', (root / "k8s-operator/cmd/k8s-event-watcher/filter.go").read_text())
         self.assertIn("DependencyNotFound", (root / "deploy/shared/start-services.sh").read_text())
 
+    def test_every_lane_excludes_the_fleets_pending_pod_namespace_from_the_event_watcher(self) -> None:
+        """The seeded fleet holds one pod Pending for ever in seeded-reservation
+        (role missing-reservation-autoscaled), and FailedScheduling is on the
+        watcher's list. Every lane's install excludes that namespace, by the
+        name the catalogue and the stack use."""
+        script = _CI_DEPLOY.read_text()
+        self.assertIn('readonly EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE="seeded-reservation"', script)
+        release = re.search(r"helm upgrade --install.*?--wait --timeout", script, re.DOTALL)
+        assert release is not None
+        self.assertIn(
+            '--set-string "platformAgent.harness.eventWatcher.alertExclude[1].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE}"',
+            release.group(0),
+        )
+        root = _CI_DEPLOY.parent.parent
+        catalog = json.loads((root / "bench/tf/fleet/fixtures.json").read_text())
+        self.assertEqual(catalog["roles"]["missing-reservation-autoscaled"]["namespace"], "seeded-reservation")
+        self.assertIn('name   = "seeded-reservation"', (root / "bench/tf/fleet/defects-a.tf").read_text())
+        reasons = re.search(r"^readonly EVENT_WATCHER_REASONS=.*$", (root / "deploy/shared/start-services.sh").read_text(), re.MULTILINE)
+        assert reasons is not None
+        self.assertIn("FailedScheduling", reasons.group(0).split("=", 1)[1].split(","))
+
     def test_the_install_carries_the_sized_max_sessions_and_step_6b_changes_nothing(self) -> None:
         consts = constants()
         self.assertEqual(consts["MAX_SESSIONS_HELM_VALUE"], "platformAgent.harness.tuning.maxSessions")

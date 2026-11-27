@@ -32,6 +32,45 @@ const clusterStartAttempts = 3
 // listen.
 const serverReadyTimeout = 10 * time.Second
 
+// clusterRouteTimeout is how long tryStartCluster waits for every server in
+// the cluster to connect its route mesh to the other clusterSize-1 peers.
+const clusterRouteTimeout = 10 * time.Second
+
+// clusterTestTimeout bounds the full cross-route hand-back test across R3
+// stream/consumer Raft setup and all delivery rounds.
+const clusterTestTimeout = 90 * time.Second
+
+// clusterMetaWaitTimeout is how long the cluster test waits for JetStream
+// R3 stream and consumer leader election.
+const clusterMetaWaitTimeout = 20 * time.Second
+
+// clusterStreamAttemptTimeout bounds a single R3 stream or consumer API
+// call while waiting for Raft leader election under load.
+const clusterStreamAttemptTimeout = 5 * time.Second
+
+// clusterHandBackRounds is how many cross-route SubscribeHeld/Stop hand-offs
+// the test runs across the follower nodes.
+const clusterHandBackRounds = 50
+
+// clusterHandBackWait bounds how long a round waits for cross-route
+// redelivery or subscription drain after Stop.
+const clusterHandBackWait = 5 * time.Second
+
+// clusterTasksSubjects and clusterTasksMaxAge match the TASKS stream
+// configuration used by held-delivery tests.
+const (
+	clusterTasksSubjects = "a2a.tasks.>"
+	clusterTasksMaxAge   = 72 * time.Hour
+)
+
+// clusterProfile, clusterTaskID, and clusterConsumerAckWait configure the
+// durable consumer and test message for the cross-route hand-back test.
+const (
+	clusterProfile         = "cluster"
+	clusterTaskID          = "task-cluster"
+	clusterConsumerAckWait = time.Minute
+)
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -63,6 +102,7 @@ func startClusterOn(t *testing.T, pick func(*testing.T) int) []*natsserver.Serve
 		}
 		for _, s := range servers {
 			s.Shutdown()
+			s.WaitForShutdown()
 		}
 		if attempt == clusterStartAttempts {
 			t.Fatalf("each of %d clusters had a server that never bound its route port (last: %s)", clusterStartAttempts, unrouted.Name())
@@ -92,12 +132,16 @@ func tryStartCluster(t *testing.T, pick func(*testing.T) int) ([]*natsserver.Ser
 			Cluster: natsserver.ClusterOpts{Name: "held", Host: "127.0.0.1", Port: ports[i]},
 			Routes:  routes,
 		}
+		opts.Cluster.PoolSize = -1
 		s, err := natsserver.NewServer(opts)
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
 		}
 		go s.Start()
-		t.Cleanup(s.Shutdown)
+		t.Cleanup(func() {
+			s.Shutdown()
+			s.WaitForShutdown()
+		})
 		servers[i] = s
 	}
 	for _, s := range servers {
@@ -112,6 +156,14 @@ func tryStartCluster(t *testing.T, pick func(*testing.T) int) ([]*natsserver.Ser
 		}
 		t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", s.Name(), client, route)
 	}
+	waitFor(t, clusterRouteTimeout, "cluster routes", func() bool {
+		for _, s := range servers {
+			if s.NumRoutes() != clusterSize-1 {
+				return false
+			}
+		}
+		return true
+	})
 	return servers, nil
 }
 
@@ -149,7 +201,8 @@ func TestStartClusterStartsAgainWhenARoutePortIsTaken(t *testing.T) {
 
 func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 	servers := startCluster(t)
-	ctx := testCtx(t)
+	ctx, cancel := context.WithTimeout(context.Background(), clusterTestTimeout)
+	t.Cleanup(cancel)
 	admin, err := nats.Connect(clientURL(servers[0]))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
@@ -159,12 +212,12 @@ func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	waitFor(t, 20e9, "a JetStream meta leader", func() bool {
-		sctx, cancel := context.WithTimeout(ctx, time.Second)
+	waitFor(t, clusterMetaWaitTimeout, "a JetStream meta leader", func() bool {
+		sctx, cancel := context.WithTimeout(ctx, clusterStreamAttemptTimeout)
 		defer cancel()
 		_, err := js.CreateOrUpdateStream(sctx, jetstream.StreamConfig{
-			Name: "TASKS", Subjects: []string{"a2a.tasks.>"}, Retention: jetstream.LimitsPolicy,
-			MaxAge: 72 * time.Hour, Replicas: clusterSize,
+			Name: TasksStream, Subjects: []string{clusterTasksSubjects}, Retention: jetstream.LimitsPolicy,
+			MaxAge: clusterTasksMaxAge, Replicas: clusterSize,
 		})
 		return err == nil
 	})
@@ -173,16 +226,34 @@ func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 		t.Fatalf("Connect requester: %v", err)
 	}
 	t.Cleanup(req.Close)
-	h := &heldHarness{t: t, ctx: ctx, req: req, profile: "cluster", url: clientURL(servers[0])}
-	h.ensure(1, time.Minute)
-	cons, err := js.Consumer(ctx, "TASKS", h.cfg().Durable)
-	if err != nil {
-		t.Fatalf("Consumer: %v", err)
-	}
-	ci, err := cons.Info(ctx)
-	if err != nil || ci.Cluster == nil {
-		t.Fatalf("consumer info: %v %+v", err, ci)
-	}
+	h := &heldHarness{t: t, ctx: ctx, req: req, profile: clusterProfile, url: clientURL(servers[0])}
+	var ci *jetstream.ConsumerInfo
+	waitFor(t, clusterMetaWaitTimeout, "a consumer leader", func() bool {
+		cctx, cancel := context.WithTimeout(ctx, clusterStreamAttemptTimeout)
+		defer cancel()
+		c := h.cfg()
+		if err := req.EnsureHeldConsumer(cctx, HeldConsumerConfig{
+			Stream: c.Stream, Durable: c.Durable, FilterSubject: c.Subject,
+			MaxAckPending: 1, AckWait: clusterConsumerAckWait,
+		}); err != nil {
+			return false
+		}
+		cons, err := js.Consumer(cctx, TasksStream, c.Durable)
+		if err != nil {
+			return false
+		}
+		info, err := cons.Info(cctx)
+		if err != nil || info.Cluster == nil || info.Cluster.Leader == "" {
+			return false
+		}
+		for _, s := range servers {
+			if s.Name() == info.Cluster.Leader {
+				ci = info
+				return true
+			}
+		}
+		return false
+	})
 	// Both holders on followers, so neither talks to the leader directly.
 	var holders []*Client
 	for _, s := range servers {
@@ -199,8 +270,8 @@ func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 	if len(holders) != clusterSize-1 {
 		t.Fatalf("leader %q not among the servers", ci.Cluster.Leader)
 	}
-	h.submit("task-cluster")
-	for round := 0; round < 50; round++ {
+	h.submit(clusterTaskID)
+	for round := 0; round < clusterHandBackRounds; round++ {
 		held := make(chan struct{}, 1)
 		sub, err := holders[round%2].SubscribeHeld(ctx, h.cfg(), func(ctx context.Context, d Delivery) {
 			select {
@@ -214,12 +285,12 @@ func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
 		}
 		select {
 		case <-held:
-		case <-time.After(5 * time.Second):
+		case <-time.After(clusterHandBackWait):
 			sub.Stop()
 			t.Fatalf("round %d: the task wasn't handed back within 5s of the last holder's stop (AckWait is a minute)", round)
 		}
 		sub.Stop()
-		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		wctx, cancel := context.WithTimeout(ctx, clusterHandBackWait)
 		err = sub.Wait(wctx)
 		cancel()
 		if err != nil {

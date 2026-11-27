@@ -291,9 +291,31 @@ _MISSING_RESERVATION_POOL = {
     },
 }
 
+# seeded-a's dev-reserved-pool as `clusters describe` reports it (main.tf):
+# autoscaling from 0 to 1, tainted, no node, bound to the same reservation name.
+_DEV_RESERVED_POOL = {
+    "name": "dev-reserved-pool",
+    "status": "RUNNING",
+    "locations": ["us-central1-a"],
+    "autoscaling": {"enabled": True, "maxNodeCount": 1},
+    "config": {
+        "machineType": "n2-standard-2",
+        "taints": [{"key": "seeded-role", "value": "missing-reservation-autoscaled", "effect": "NO_SCHEDULE"}],
+        "reservationAffinity": {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": ["seeded-absent-reservation"]},
+    },
+}
+
+# The two roles whose pool names the reservation that does not exist.
+_RESERVATION_ROLES = ("missing-reservation-pool", "missing-reservation-autoscaled")
+
 
 def _peer():
-    return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK, "nodePools": [_DECLARED_ZONAL_POOL, _MISSING_RESERVATION_POOL]}
+    return {
+        "currentMasterVersion": "1.34.1-gke.1",
+        "createTime": _CREATED,
+        "masterAuthorizedNetworksConfig": _OPEN_BLOCK,
+        "nodePools": [_DECLARED_ZONAL_POOL, _MISSING_RESERVATION_POOL, _DEV_RESERVED_POOL],
+    }
 
 
 def _cluster_c():
@@ -430,6 +452,19 @@ def healthy_world(*projects):
             "horizontalpodautoscaler/inference-server": {"status": {}},
             "deployment/inference-server": {"status": {"readyReplicas": 1, "replicas": 3}},
             "pod?app=inference-server": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),
+            "namespace/seeded-reservation": {"metadata": {"name": "seeded-reservation", "annotations": {"kubeagents.x-k8s.io/stall-watch": "exempt"}}},
+            "deployment/reserved-batch": {
+                "status": {"replicas": 1},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "nodeSelector": {"cloud.google.com/gke-nodepool": "dev-reserved-pool", "seeded-role": "missing-reservation-autoscaled"},
+                            "tolerations": [{"key": "seeded-role", "operator": "Equal", "value": "missing-reservation-autoscaled", "effect": "NoSchedule"}],
+                        }
+                    }
+                },
+            },
+            "pod?app=reserved-batch": _pods(_pod(restarts=0, last_reason=None, phase="Pending")),
             "deployment/checkout-gateway": {"status": {"readyReplicas": 2, "replicas": 2}},
             "namespace/seeded-intent": {"metadata": {"name": "seeded-intent"}},
             "deployment/notification-relay": {"status": {"readyReplicas": 2, "replicas": 2}},
@@ -579,6 +614,10 @@ def healthy_world(*projects):
             "service/storefront": {"metadata": {"name": "storefront"}},
             "gateway/storefront-edge": {"status": {"conditions": [{"type": "Programmed", "status": "False", "reason": "NoResources"}]}},
             "httproute/storefront": {"metadata": {"name": "storefront"}},
+            "gatewayclass/seeded-envoy": {"status": {"conditions": [{"type": "Accepted", "status": "True", "reason": "Accepted"}]}},
+            "gatewayclass/seeded-unaccepted-gw": {"spec": {"controllerName": "example.com/unsupported-controller"}},
+            "gateway/seeded-unaccepted-gateway": {"spec": {"gatewayClassName": "seeded-unaccepted-gw"}},
+            "httproute/seeded-unaccepted-route": {"spec": {"parentRefs": [{"name": "seeded-unaccepted-gateway"}]}},
             "pod?app=storefront": {"items": []},
             "pod?app.kubernetes.io/name=envoy": {"items": []},
         },
@@ -728,10 +767,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 61, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 63, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 61, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 63, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -780,17 +819,18 @@ class Drift(ScanHarness):
         self.assertIn(f"{PROJECT}: drifted: no-pdb-workload", err)
 
     def test_a_reservation_with_the_fixtures_name_is_drifted_and_named(self):
-        """Someone created the reservation that the pool names: the defect is
-        gone, and nothing on the cluster shows it until the pool's first node."""
+        """Someone created the reservation that the two pools name: the defect
+        is gone, and nothing on the cluster shows it until a pool's first node."""
         world = healthy_world(PROJECT)
         world["compute"][PROJECT] = {**world["compute"][PROJECT], "reservations": [{"name": "seeded-absent-reservation"}]}
         doc, err = self.scan(world)
         states = self.states(doc)
-        self.assertEqual(states["missing-reservation-pool"], "drifted")
-        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
-        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
-        self.assertTrue(detail[0].startswith('reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"'), detail)
-        self.assertIn(f"{PROJECT}: drifted: missing-reservation-pool", err)
+        self.assertEqual({s for r, s in states.items() if r not in _RESERVATION_ROLES}, {"healthy"})
+        for role in _RESERVATION_ROLES:
+            self.assertEqual(states[role], "drifted")
+            detail = doc["projects"][PROJECT]["roles"][role]["detail"]
+            self.assertTrue(detail[0].startswith('reservation/seeded-absent-reservation* name none_eq "seeded-absent-reservation": observed "seeded-absent-reservation"'), detail)
+        self.assertIn(f"{PROJECT}: drifted: missing-reservation-autoscaled, missing-reservation-pool", err)
 
     def test_two_projects_scan_independently(self):
         world = healthy_world(PROJECT, OTHER)
@@ -798,7 +838,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 121, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 125, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -817,7 +857,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 60, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 62, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})
@@ -863,10 +903,11 @@ class NotChecked(ScanHarness):
         world["compute"][PROJECT] = {k: v for k, v in world["compute"][PROJECT].items() if k != "reservations"}
         doc, _ = self.scan(world)
         states = self.states(doc)
-        self.assertEqual(states["missing-reservation-pool"], "not_checked")
-        self.assertEqual({s for r, s in states.items() if r != "missing-reservation-pool"}, {"healthy"})
-        detail = doc["projects"][PROJECT]["roles"]["missing-reservation-pool"]["detail"]
-        self.assertIn("compute reservations list failed", detail[0])
+        self.assertEqual({s for r, s in states.items() if r not in _RESERVATION_ROLES}, {"healthy"})
+        for role in _RESERVATION_ROLES:
+            self.assertEqual(states[role], "not_checked")
+            detail = doc["projects"][PROJECT]["roles"][role]["detail"]
+            self.assertIn("compute reservations list failed", detail[0])
 
     def test_an_unplanted_role_is_absent_with_the_runners_warning_naming_it(self):
         # Absent is a rollout state, not a failed read: the stack has not put

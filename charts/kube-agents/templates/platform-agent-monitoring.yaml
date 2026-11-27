@@ -62,13 +62,15 @@ spec:
       interval: 30s
 ---
 {{- /*
-The credential broker's metrics-only listener (credentialProxyMetricsPort in the
-operator): brokered tool invocations by tool, subcommand and outcome, their
-latency, and the credentialed listener's request counts. Its own PodMonitoring
-because the broker is its own pod with its own labels; the same switch, because
-an install scrapes the agent's pods or none of them. The selector is the
-operator's broker selector and the port is the metrics-only one, never 8765:
-the credentialed listener admits no collector.
+The credential broker's `cred-metrics` listener (credentialProxyMetricsPort in the
+operator, serving `/metrics` plus bearer-authenticated `/control/*` handoffs under
+`sizingProfile: auto` in-cluster, or `404` otherwise):
+brokered tool invocations by tool, subcommand and outcome, their latency, and the
+credentialed listener's request counts. Its own PodMonitoring because the broker is
+its own pod with its own labels; the same switch, because an install scrapes the
+agent's pods or none of them. The selector is the operator's broker selector and
+the port is `cred-metrics` (`8766`), never `8765`: the credentialed listener admits
+no collector.
 */}}
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring

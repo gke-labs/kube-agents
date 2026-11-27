@@ -1646,7 +1646,8 @@ The gateway tells the adapter a task's ends through an optional `TaskObserver` i
 Discord and Google Chat do not implement: a human reads the chat, so the rendered message is their
 whole interface, while a program must not have to parse `✅ **completed**` to know a task is
 over. (The Slack adapter implements it for one reason of its own, given in its section: a task
-starting or ending in a thread is what its session-thread cache keys on.) The
+starting or ending in a thread is what its session-thread cache keys on. The Teams adapter
+implements it for its typing indicator, in its section.) The
 start and the accept are separate calls because the id and the submission are different facts,
 as the refusal above turns on. The terminal says who declared it, which is the difference between
 an executor that failed, a task that never reached the bus, the supervisor's word about an
@@ -2871,8 +2872,8 @@ nothing out. A result recovered by replaying the stream after a restart arrives 
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
-them posts exactly what it posted before chat messages existed; Slack and Google Chat lay the
-message out ("Chat messages on Google Chat" under the Google Chat adapter). The relay never hands the
+them posts exactly what it posted before chat messages existed; Slack, Google Chat and Teams lay the
+message out ("Chat messages on Google Chat" under the Google Chat adapter, "Chat messages on Teams" under the Teams adapter), and Teams with its cards off answers `ErrTextOnly` too. The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
 refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
 the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
@@ -3283,6 +3284,55 @@ The form's kept-for line is drawn before any press, so it always names the quest
 recorded without the answer's text and without the redraw, and a re-rating that carries no
 answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
 names a post (`postKindOf`), so an alert its triage edits stays as it was.
+
+**Chat messages on Teams.** With cards on, a `kube-agents.chat/v1` message is laid out as the
+same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the
+schema's order as the markdown the card builder reads (headline in bold with the note, detail,
+the plan with a status mark per item and a tick or an open mark per step, or the rows as
+bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
+the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
+carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
+line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn, and the adapter has no `PostNotifyMessage`, so an unkeyed home post stays text. A
+layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
+(`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
+`ErrTextOnly` as before. The shared cases lay out as the golden files in
+`a2a/gateway/testdata/teams-chat/` say (`TestTeamsChatGolden`).
+
+A press of a choice (`teams_clicks.go`) arrives as the Stop press does and becomes the turn its
+reply spells, marked a click, from the presser, so the allowlist decides as for a typed
+message. Teams acknowledges a Submit with nothing and leaves the buttons pressable, so the
+adapter keeps the Google Chat adapter's bookkeeping: one press waits on the gateway's verdict
+at a time, the first verified answer stands (`InboundVerified`), and the card is edited to its
+text with `✓ name: choice` under it, its choices gone and its other buttons kept. A typed reply
+in the conversation of an open question answers it the same way, unless it is a command; a
+next step takes no typed reply. The line stays through a later edit that lays out no choices,
+and an edit that lays choices out asks anew. An update replaces the whole card and a press
+carries none of it, so a question the adapter no longer remembers (posted before a restart, or
+past its `uxCap` remembered cards) is answered by a post of the line in the conversation, named by
+the label the button carried, unless the button is a next step's, which answered no question; the same post follows an edit that fails or a card the line
+would push past the budget.
+
+While card work is open in a conversation with nothing on screen that shows it, the adapter
+keeps Teams's typing indicator on there (`teams_typing.go`): a `typing` activity posted through
+the passthrough, and again every three seconds. Teams draws no reaction and no Working… status,
+and an acknowledgement or a plan sitting unchanged does not read as work. The indicator is
+wanted while the conversation's session mark has an open ask that is not blocked
+(`MarkObserver`), which is how card work the gateway cannot see is known, as it is for Slack's
+Working… status (`slackSession.wanted`); a blocked settle (the work waits on the person) stops
+it. It is not posted while a chain the gateway started is running there (`TaskObserver`), nor
+within one interval of that chain's end. A live run showed why: Teams leaves the indicator on
+screen for about twenty seconds after the last post unless a new message from the bot clears
+it, and a chain's answer is an edit of its line, so typing beside a running chain sat under its
+answer. The hand-off's answer is a new message, and each new message the adapter posts holds the
+indicator off for one interval, since a card's answer is posted before its mark settles. The
+indicator stops ten minutes after the ask opened, the newest chain started or ended, or the
+adapter last posted or edited a message in the conversation, whichever is latest
+(`teamsTypingMax`), since only a notify settles an older ask; a later chain, or an edit of a
+message one interval on, starts it again, and a new message does not, since it is usually the
+answer. A post that fails is dropped and the next
+one tries again. Teams accepts the post in every conversation and draws it only in some: a
+live run showed the indicator in a one-to-one chat with the bot and nothing in a channel
+thread, so a channel has the line and the plan alone.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
@@ -3713,7 +3763,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_api_rate_limited_total`                | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_teams_events_received_total`                 | none                                                                                                                                                                                                     | Microsoft Teams activities pulled from the broker's Teams queue, before parsing or classification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_teams_pulls_total`                           | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the broker's Teams queue: one that carried an activity, one that came back empty, one that failed (the broker refused or did not answer, or the pull was never made or could not be read).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `kubeagents_a2a_gateway_teams_api_request_duration_seconds`          | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_teams_api_request_duration_seconds`          | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell; a typing indicator's post counts as `other`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `kubeagents_a2a_gateway_teams_api_rate_limited_total`                | `method`: as above                                                                                                                                                                                       | Each Bot Framework call Microsoft answered 429, as the broker carries its status under `teams.status`; the identity provider's 429 on the token the call needed arrives the same way and counts too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `kubeagents_a2a_gateway_teams_ingress_lag_seconds`                   | none                                                                                                                                                                                                     | A histogram of the time from an activity's own `timestamp` to the gateway's receipt of it, for an activity it takes as a turn; a negative lag is observed as 0 and an activity with no parseable `timestamp` is not observed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_chat_messages_total`                         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
