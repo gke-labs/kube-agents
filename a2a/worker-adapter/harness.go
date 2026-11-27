@@ -247,6 +247,12 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), chatterEchoCap))
 				continue
 			}
+			// Each event carries when its line was read: taken here, not in
+			// the adapter's loop, which a slow publish can hold (Event.At).
+			at := time.Now()
+			for i := range evs {
+				evs[i].At = at
+			}
 			// A line with no events still goes through: the adapter checks
 			// for an abandon on every stdout line, as it always has.
 			events <- evs

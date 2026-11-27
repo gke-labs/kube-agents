@@ -637,6 +637,74 @@ resource "google_container_node_pool" "missing_reservation_pool" {
   }
 }
 
+# Defect (capacity, reservations): the same missing reservation on a pool
+# that the autoscaler tries to grow. The pool autoscales from 0 to 1 node,
+# and deployment/reserved-batch in seeded-reservation (defects-a.tf) has
+# one pod that only this pool can hold. The autoscaler asks for a node, GKE
+# refuses it because the reservation is not found, and the pod stays Pending
+# with the pool at zero nodes; the autoscaler's visibility log repeats
+# scale.up.error.reservation.not.found. Zero nodes cost nothing. The stack
+# plants no reservation: a reservation with the name below would heal the
+# defect and start one node. "dev" in the name makes the pool non-production
+# for the stockout collector, so its reservation check (3.10) does not name
+# this pool and missing-reservation-pool stays that check's only pool; do
+# not rename it to a name without such a token. The collector's 3.9 names
+# the pool, as it names each autoscaled pool in one zone. n2-standard-2 and
+# the 20 GB disk as on missing-reservation-pool. Catalogue role:
+# missing-reservation-autoscaled.
+resource "google_container_node_pool" "dev_reserved_pool" {
+  name       = "dev-reserved-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 1
+  }
+
+  node_config {
+    machine_type    = "n2-standard-2"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, as on the pools above.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "missing-reservation-autoscaled"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "missing-reservation-autoscaled"
+      effect = "NO_SCHEDULE"
+    }
+
+    reservation_affinity {
+      consume_reservation_type = "SPECIFIC_RESERVATION"
+      key                      = "compute.googleapis.com/reservation-name"
+      values                   = ["seeded-absent-reservation"]
+    }
+  }
+
+  # The autoscaler owns the size of this pool, and it asks for one node again
+  # and again. The provider reads node_count from the instance group's target
+  # size, so a plan in the minutes of such a try can see 1 and plan a resize
+  # to 0: a change that means nothing, on a random reconcile pass. The role's
+  # state assertion holds the pool at zero nodes, not this field.
+  lifecycle {
+    ignore_changes = [node_count]
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's

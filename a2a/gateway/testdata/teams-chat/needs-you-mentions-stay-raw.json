@@ -1,0 +1,29 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "**Question**\n\n<@U123> said so. Which?",
+    "actions": [
+      {
+        "data": {
+          "choice": 0,
+          "kageAction": "choice",
+          "label": "<!here>",
+          "reply": "<!here>"
+        },
+        "title": "<!here>",
+        "type": "Action.Submit"
+      },
+      {
+        "data": {
+          "choice": 1,
+          "kageAction": "choice",
+          "label": "<!channel>",
+          "reply": "<!channel>"
+        },
+        "title": "<!channel>",
+        "type": "Action.Submit"
+      }
+    ]
+  }
+]
