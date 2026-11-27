@@ -438,6 +438,17 @@ FIXTURE_NOT_READY = {
     "networking-unaccepted-gatewayclass": (
         "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw, gateway/seeded-unaccepted-gateway, httproute/seeded-unaccepted-route) applied to every pool project by the postsubmit fleet reconcile"
     ),
+    # Needs a node pool that names a reservation, and that reservation made and
+    # deleted in the 30 days before the run: the stockout collector reads the
+    # delete from the Admin Activity log. A log entry gets old, and a
+    # reservation is billed while it exists, in each pool project. The read is
+    # graded by its unit tests on recorded log entries, and by runs on a dev
+    # install that make and delete the reservation for the run.
+    "stockout-reservation-deleted": (
+        "#6954: needs a zero-node pool that names a reservation which was made and deleted in the "
+        "last 30 days; a log entry gets old, a reservation is billed while it exists, and no pool "
+        "project carries the pair"
+    ),
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of
     # its own and Config Sync to apply the merge, as a customer's reconciler would.

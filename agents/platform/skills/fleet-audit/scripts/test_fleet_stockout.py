@@ -3998,11 +3998,15 @@ class ReservedPoolTest(unittest.TestCase):
         # Stamped, since the slug's record is gone.
         self.assertIn("kubectl get computeclasses", candidate["command"])
 
-    def fleet(self, pool, *, reservations_rc=0, reservations=()):
-        """One project, one cluster whose listing carries `pool`."""
+    def fleet(self, pool, *, reservations_rc=0, reservations=(), admin_activity=None):
+        """One project, one cluster whose listing carries `pool`.
+        `admin_activity` answers the read of a reservation's Admin Activity
+        entries; without it the read finds no entry."""
         listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": [pool]}])
 
         def run(argv, **kwargs):
+            if admin_activity and argv[:3] == ["gcloud", "logging", "read"] and "protoPayload.resourceName:" in argv[3]:
+                return admin_activity(argv)
             if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
                 return run_of(0, listing)
             if "get-credentials" in argv:
@@ -4082,6 +4086,332 @@ class ReservedPoolTest(unittest.TestCase):
         claimed["checks_run"].append({"check": self.SLUG, "command": "kubectl get computeclasses -A -o json"})
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(data, manifest)
+
+
+class ReservationChangesTest(unittest.TestCase):
+    """§3.10(d), the delete and resize race (#6954): a filed pool's finding
+    names the delete, resize or update of its named reservation, the time and
+    the principal, from the Admin Activity log of the owner project.
+
+    The entries are a recorded `gcloud logging read` of a project in which two
+    reservations were made, resized and deleted on 2026-11-25, with the
+    project, the principal, the caller and the ids replaced."""
+
+    SLUG = "reservation-mismatch-risk"
+    ENTRIES = json.loads((Path(__file__).parent / "testdata" / "reservation_admin_activity.json").read_text())
+    DELETED = "deleted in us-central1-b at 2026-11-25T16:31:54Z by operator@example.com"
+    RESIZED_TO_1 = "resized to a count of 1 in us-central1-b at 2026-11-25T16:31:38Z by operator@example.com"
+    RESIZED_TO_2 = "resized to a count of 2 in us-central1-b at 2026-11-25T16:31:21Z by operator@example.com"
+
+    def variant(self, verb, **payload):
+        """A copy of the two recorded entries of the newest operation of this
+        verb on `res-other-zone`, with fields of the payload replaced: a form
+        that no read recorded."""
+        recorded = [e for e in self.ENTRIES if e["protoPayload"]["methodName"].endswith(verb) and e["protoPayload"]["resourceName"].endswith("/res-other-zone")]
+        copies = json.loads(json.dumps(recorded[:2]))
+        self.assertEqual(len({entry["operation"]["id"] for entry in copies}), 1)
+        for entry in copies:
+            entry["protoPayload"].update(payload)
+        return copies
+
+    def filed(self, admin_activity=None, pool="res-other-zone", reservation="res-other-zone"):
+        self.reads = []
+
+        def answer(argv):
+            self.reads.append(argv)
+            return admin_activity(argv)
+
+        _, cluster = ReservedPoolTest.fleet(self, reserved_node_pool(pool, reservation), admin_activity=answer if admin_activity else None)
+        [candidate] = [c for c in cluster["candidates"] if c["check"] == self.SLUG]
+        return cluster, candidate
+
+    def test_the_recorded_read_has_two_entries_for_each_operation(self):
+        self.assertEqual(len(self.ENTRIES), 12)
+        self.assertEqual(len({e["operation"]["id"] for e in self.ENTRIES}), 6)
+        self.assertTrue(all(e["protoPayload"]["authenticationInfo"]["principalEmail"] and e["timestamp"] for e in self.ENTRIES))
+
+    def test_one_change_for_each_operation_newest_first(self):
+        self.assertEqual(
+            fs.reservation_changes(self.ENTRIES, "res-other-zone"),
+            [
+                {"verb": "delete", "at": "2026-11-25T16:31:54.264813Z", "by": "operator@example.com", "count": None, "zone": "us-central1-b"},
+                {"verb": "resize", "at": "2026-11-25T16:31:38.187457Z", "by": "operator@example.com", "count": "1", "zone": "us-central1-b"},
+                {"verb": "resize", "at": "2026-11-25T16:31:21.717564Z", "by": "operator@example.com", "count": "2", "zone": "us-central1-b"},
+            ],
+        )
+
+    def test_the_time_is_the_first_entry_of_the_operation_in_each_order(self):
+        self.assertEqual(fs.reservation_changes(self.ENTRIES, "res-same-zone"), fs.reservation_changes(self.ENTRIES[::-1], "res-same-zone"))
+        [change] = fs.reservation_changes(self.ENTRIES, "res-same-zone")
+        self.assertEqual((change["verb"], change["at"], change["zone"]), ("delete", "2026-11-25T16:43:53.445918Z", "us-central1-a"))
+
+    def test_a_create_is_not_a_change(self):
+        inserts = [e for e in self.ENTRIES if e["protoPayload"]["methodName"] == "v1.compute.reservations.insert"]
+        self.assertEqual(len(inserts), 4)
+        self.assertEqual(fs.reservation_changes(inserts, "res-other-zone"), [])
+
+    def test_a_longer_name_is_another_reservation(self):
+        """The filter is a substring match on the resource name."""
+        self.assertEqual(fs.reservation_changes(self.ENTRIES, "res-other"), [])
+        self.assertEqual(fs.reservation_changes(self.ENTRIES, "other-zone"), [])
+
+    def test_an_update_and_another_api_version_are_changes(self):
+        """Not recorded: the method names follow the form of the recorded three."""
+        update = self.variant("delete", methodName="v1.compute.reservations.update")
+        self.assertEqual([c["verb"] for c in fs.reservation_changes(update, "res-other-zone")], ["update"])
+        beta = self.variant("delete", methodName="beta.compute.reservations.delete")
+        self.assertEqual([c["verb"] for c in fs.reservation_changes(beta, "res-other-zone")], ["delete"])
+        other = self.variant("delete", methodName="v1.compute.instances.delete")
+        self.assertEqual(fs.reservation_changes(other, "res-other-zone"), [])
+
+    def test_a_refused_request_is_not_a_change(self):
+        """Not recorded: a request the API refused carries a status code."""
+        refused = self.variant("resize", status={"code": 3, "message": "Invalid value for field 'specificSkuCount': '0'."})
+        self.assertEqual(fs.reservation_changes(refused, "res-other-zone"), [])
+
+    def test_an_answer_that_is_not_a_list_of_entries_has_no_change(self):
+        self.assertEqual(fs.reservation_changes(None, "r1"), [])
+        self.assertEqual(fs.reservation_changes(["text", {"protoPayload": None}, {}], "r1"), [])
+
+    def test_the_clause_names_the_change_its_time_and_its_principal(self):
+        changes = fs.reservation_changes(self.ENTRIES, "res-other-zone")
+        self.assertEqual(
+            fs.reservation_changes_clause("acme", "res-other-zone", changes),
+            f"Admin Activity log of project acme, last 30 days: reservation res-other-zone was {self.DELETED}, {self.RESIZED_TO_1}, {self.RESIZED_TO_2}",
+        )
+
+    def test_the_clause_shows_the_newest_changes_and_counts_the_rest(self):
+        changes = fs.reservation_changes(self.ENTRIES, "res-other-zone")
+        older = [{**changes[-1], "at": f"2026-11-2{day}T00:00:00Z"} for day in (1, 2)]
+        clause = fs.reservation_changes_clause("acme", "res-other-zone", changes + older[:1])
+        self.assertTrue(clause.endswith(f"{self.RESIZED_TO_2} (1 older change not shown)"))
+        clause = fs.reservation_changes_clause("acme", "res-other-zone", changes + older)
+        self.assertTrue(clause.endswith("(2 older changes not shown)"))
+
+    def test_a_change_with_no_principal_says_so(self):
+        [change] = fs.reservation_changes(self.variant("delete", authenticationInfo={}), "res-other-zone")
+        self.assertIn("by a principal the entry does not name", fs.reservation_changes_clause("acme", "res-other-zone", [change]))
+
+    def test_the_read_is_the_recorded_filter_in_the_owner_project(self):
+        self.assertEqual(
+            fs.reservation_changes_argv("acme", "r1"),
+            [
+                "gcloud", "logging", "read",
+                'logName:"cloudaudit.googleapis.com%2Factivity" AND protoPayload.serviceName="compute.googleapis.com" AND protoPayload.resourceName:"reservations/r1"',
+                "--project", "acme", "--freshness", "30d", "--limit", "200", "--format", "json",
+            ],
+        )
+
+    def test_the_finding_of_a_deleted_reservation_names_the_delete(self):
+        cluster, candidate = self.filed(lambda argv: run_of(0, json.dumps(self.ENTRIES)))
+        self.assertEqual(
+            candidate["excerpt"],
+            "reservationAffinity=SPECIFIC_RESERVATION, pool zones us-central1-c; reservation res-other-zone: found in no zone of project acme; "
+            f"Admin Activity log of project acme, last 30 days: reservation res-other-zone was {self.DELETED}, {self.RESIZED_TO_1}, {self.RESIZED_TO_2}",
+        )
+        self.assertEqual(self.reads, [fs.reservation_changes_argv("acme", "res-other-zone")])
+        # The three reads, each one a command `finish` accepts as evidence.
+        audit_report.validate_check_command(candidate["command"], cluster["name"], self.SLUG)
+        self.assertTrue(candidate["command"].endswith(shlex.join(fs.reservation_changes_argv("acme", "res-other-zone"))))
+        self.assertNotIn("limitations", cluster)
+        self.assertIn(self.SLUG, {c["check"] for c in cluster["commands"]})
+
+    def test_with_no_entry_the_finding_is_as_before(self):
+        for stdout in ("", "[]", json.dumps([e for e in self.ENTRIES if e["protoPayload"]["methodName"].endswith("insert")])):
+            with self.subTest(stdout=stdout[:20]):
+                cluster, candidate = self.filed(lambda argv: run_of(0, stdout))
+                self.assertEqual(len(self.reads), 1)
+                _, before = self.filed()
+                self.assertEqual(candidate, before)
+                self.assertNotIn("limitations", cluster)
+
+    def test_a_read_that_fails_is_named_in_the_finding_and_is_no_gap_of_the_cluster(self):
+        """The check judged the pool; only this evidence is absent. A
+        limitation would make the cluster "partially audited", and such a run
+        resolves no finding."""
+        full_page = json.dumps([e for e in self.ENTRIES if e["protoPayload"]["methodName"].endswith("insert")] * 50)
+        answers = (
+            (run_of(1, "", "ERROR: (gcloud.logging.read) PERMISSION_DENIED:\n  logging.logEntries.list"), "rc=1: ERROR: (gcloud.logging.read) PERMISSION_DENIED: logging.logEntries.list"),
+            (run_of(fs.TIMEOUT_RC, "", ""), f"rc={fs.TIMEOUT_RC}: no stderr"),
+            (run_of(0, "{not json"), "the output is not a JSON list of entries"),
+            (run_of(0, '{"a": 1}'), "the output is not a JSON list of entries"),
+            (run_of(0, full_page), "the read returned its limit of 200 entries with no change of this reservation, and older entries were not read"),
+        )
+        for answer, why in answers:
+            with self.subTest(why=why):
+                cluster, candidate = self.filed(lambda argv: answer)
+                _, before = self.filed()
+                self.assertEqual(
+                    candidate["excerpt"],
+                    before["excerpt"] + f"; the Admin Activity log of project acme was not read for reservation res-other-zone ({why}), "
+                    "so a delete or a resize of it is not named here",
+                )
+                self.assertEqual({k: v for k, v in candidate.items() if k != "excerpt"}, {k: v for k, v in before.items() if k != "excerpt"})
+                self.assertNotIn("limitations", cluster)
+                self.assertIn(self.SLUG, {c["check"] for c in cluster["commands"]})
+                self.assertNotIn(self.SLUG, {e["check"] for e in cluster.get("checks_unevaluated", [])})
+
+    def test_a_full_page_with_a_change_says_that_older_entries_were_not_read(self):
+        page = self.ENTRIES + [e for e in self.ENTRIES if e["protoPayload"]["methodName"].endswith("insert")] * 47
+        self.assertEqual(len(page), fs.RESERVATION_CHANGE_LIMIT)
+        _, candidate = self.filed(lambda argv: run_of(0, json.dumps(page)))
+        self.assertTrue(candidate["excerpt"].endswith(f"{self.RESIZED_TO_2}; the read returned its limit of 200 entries, so older entries were not read"))
+        self.assertIn("gcloud logging read", candidate["command"])
+
+    def test_the_changes_are_newest_first_in_each_order_of_the_read(self):
+        changes = fs.reservation_changes(self.ENTRIES, "res-other-zone")
+        self.assertEqual(fs.reservation_changes(self.ENTRIES[::-1], "res-other-zone"), changes)
+        self.assertEqual([c["at"] for c in changes], sorted((c["at"] for c in changes), reverse=True))
+
+    def test_a_field_of_another_type_costs_that_field_and_not_the_run(self):
+        """Not recorded: an entry in which a nested object is a string."""
+        for field in ("authenticationInfo", "request", "status"):
+            with self.subTest(field=field):
+                [change] = fs.reservation_changes(self.variant("resize", **{field: "text"}), "res-other-zone")
+                self.assertEqual(change["verb"], "resize")
+        odd = self.variant("delete")
+        odd[0]["operation"] = "text"
+        odd[1]["protoPayload"] = "text"
+        self.assertEqual([c["verb"] for c in fs.reservation_changes(odd, "res-other-zone")], ["delete"])
+        self.assertEqual(fs.reservation_changes(["text", 7, None], "res-other-zone"), [])
+
+    def test_the_relay_gets_the_same_read_as_the_command(self):
+        """In the sandbox the broker's relay answers the read; it takes the
+        project, the filter, the window and the limit from the arguments."""
+        with patch.object(fs.logging_reads, "freshness_filter", wraps=fs.logging_reads.freshness_filter) as bound, \
+                patch.object(fs.logging_reads, "read_json", return_value=json.dumps(self.ENTRIES)) as relay:
+            read = fs.read_reservation_changes("beta", "res-other-zone", fs.time.monotonic() + 60, run=lambda argv, **kwargs: self.fail("the relay answered"))
+        self.assertEqual([c["verb"] for c in read["changes"]], ["delete", "resize", "resize"])
+        self.assertEqual(bound.call_args.args, (fs.reservation_changes_argv("beta", "res-other-zone")[3], fs.timedelta(days=30)))
+        self.assertEqual(relay.call_args.args[0], "beta")
+        self.assertIn('protoPayload.resourceName:"reservations/res-other-zone"', relay.call_args.args[1])
+        self.assertEqual(relay.call_args.args[2], 200)
+        self.assertEqual(fs.RESERVATION_CHANGE_FRESHNESS, "30d")
+
+    def test_two_owner_projects_with_one_reservation_name_are_two_reads(self):
+        reads = []
+
+        def run(argv, **kwargs):
+            reads.append(argv[argv.index("--project") + 1])
+            return run_of(0, json.dumps(self.ENTRIES) if reads[-1] == "beta" else "[]")
+
+        cache = {}
+        for owner in ("acme", "beta"):
+            reserved = [{**fs.reserved_pool(reserved_node_pool(f"pool-{owner}", f"projects/{owner}/reservations/res-other-zone"), "acme"), "command": "pools"}]
+            filed = {"name": "acme/us-central1/c1", "project": "acme", "commands": [], "candidates": [], fs.RESERVED_POOLS_KEY: list(reserved)}
+            fs.file_reserved_pools(filed, {"acme": {}, "beta": {}}, frozenset({"acme", "beta"}))
+            fs.add_reservation_changes(filed, reserved, cache, run=run)
+            [candidate] = filed["candidates"]
+            self.assertEqual("Admin Activity log" in candidate["excerpt"], owner == "beta")
+        self.assertEqual(reads, ["acme", "beta"])
+
+    def test_two_clusters_that_name_one_reservation_are_one_read_of_the_run(self):
+        pool = reserved_node_pool("res-missing", "res-other-zone")
+        listing = json.dumps([{"name": name, "location": "us-central1", "status": "RUNNING", "nodePools": [pool]} for name in ("c1", "c2")])
+        reads = []
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "logging", "read"] and "protoPayload.resourceName:" in argv[3]:
+                reads.append(argv)
+                return run_of(0, json.dumps(self.ENTRIES))
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, listing)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, "[]")
+            if argv[:3] == ["gcloud", "compute", "regions"]:
+                return run_of(0, json.dumps({"quotas": []}))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet("acme", run=run)
+        filed = [c for e in manifest["clusters"] for c in e.get("candidates", []) if c["check"] == self.SLUG]
+        self.assertEqual(len(filed), 2)
+        self.assertTrue(all(self.DELETED in c["excerpt"] for c in filed))
+        self.assertEqual(len(reads), 1)
+
+    def test_no_read_starts_after_the_time_for_the_reads_is_spent(self):
+        reads = {fs.RESERVATION_CHANGES_DEADLINE_KEY: fs.time.monotonic() - 1}
+        reserved = [{**fs.reserved_pool(reserved_node_pool("p1", "r1"), "acme"), "command": "pools"}]
+        entry = {"name": "acme/us-central1/c1", "project": "acme", "commands": [], "candidates": [], fs.RESERVED_POOLS_KEY: list(reserved)}
+        fs.file_reserved_pools(entry, {"acme": {}}, frozenset({"acme"}))
+        fs.add_reservation_changes(entry, reserved, reads, run=lambda argv, **kwargs: self.fail("no read can start"))
+        [candidate] = entry["candidates"]
+        self.assertTrue(candidate["excerpt"].endswith("was not read for reservation r1 (the time for these reads was spent), so a delete or a resize of it is not named here"))
+        self.assertNotIn("limitations", entry)
+
+    def test_the_first_read_sets_the_time_for_the_reads_of_the_run(self):
+        reads = {}
+        reserved = [{**fs.reserved_pool(reserved_node_pool("p1", "r1"), "acme"), "command": "pools"}]
+        entry = {"name": "acme/us-central1/c1", "project": "acme", "commands": [], "candidates": [], fs.RESERVED_POOLS_KEY: list(reserved)}
+        fs.file_reserved_pools(entry, {"acme": {}}, frozenset({"acme"}))
+        before = fs.time.monotonic()
+        fs.add_reservation_changes(entry, reserved, reads, run=lambda argv, **kwargs: run_of(0, "[]"))
+        self.assertTrue(before + fs.RESERVATION_CHANGES_BUDGET_S <= reads[fs.RESERVATION_CHANGES_DEADLINE_KEY] <= fs.time.monotonic() + fs.RESERVATION_CHANGES_BUDGET_S)
+
+    def test_an_affinity_value_that_cannot_be_a_reservation_name_gets_no_read(self):
+        """Such a value has no entry, and its text does not go into a filter."""
+        for value in ('r1" OR logName:"x', "R1", "r1 ", "-r1", "r" * 64):
+            with self.subTest(value=value):
+                reserved = [{"pool": "p1", "zones": ["us-central1-c"], "reservations": [("acme", value)], "command": "pools"}]
+                candidate = {"check": self.SLUG, "object": "NodePool/p1", "excerpt": "as filed", "command": "pools"}
+                entry = {"name": "acme/us-central1/c1", "commands": [], "candidates": [dict(candidate)]}
+                fs.add_reservation_changes(entry, reserved, {}, run=lambda argv, **kwargs: self.fail("no read is necessary"))
+                self.assertEqual(entry["candidates"], [candidate])
+
+    def test_the_procedure_names_the_read_that_the_collector_makes(self):
+        """The procedure's text, held in step with the collector."""
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        section = text.split(f"(`{self.SLUG}`)")[1].split("\n#### ")[0]
+        [command] = [line for line in section.splitlines() if line.startswith("- **Command:**")]
+        argv = fs.reservation_changes_argv("<owner>", "<name>")
+        self.assertIn(f"`gcloud logging read '{argv[3]}' --project=<owner> --freshness={fs.RESERVATION_CHANGE_FRESHNESS} --limit={fs.RESERVATION_CHANGE_LIMIT} --format=json`", command)
+        self.assertEqual(fs.RESERVATION_CHANGES_SHOWN, 3)
+        self.assertIn("adds the newest three deletes, resizes or updates of the named reservation to the finding's excerpt", command)
+        self.assertIn(f"With no such change in the {fs.RESERVATION_CHANGE_DAYS} days the excerpt is as before", command)
+        self.assertIn("the Admin Activity audit log of Compute Engine reservations (`cloudaudit.googleapis.com/activity`). **Nothing else**", text)
+
+    def test_a_pool_that_is_not_filed_gets_no_read(self):
+        reads = []
+
+        def answer(argv):
+            reads.append(argv)
+            return run_of(0, json.dumps(self.ENTRIES))
+
+        _, cluster = ReservedPoolTest.fleet(self, reserved_node_pool("res-same-zone", "r1"), reservations=[listed_reservation("r1", "us-central1-c")], admin_activity=answer)
+        self.assertEqual([c for c in cluster["candidates"] if c["check"] == self.SLUG], [])
+        self.assertEqual(reads, [])
+
+    def test_a_shared_reservation_is_read_in_its_owner_project_one_time(self):
+        """Two pools name one reservation of another project of the run."""
+        reads = []
+
+        def run(argv, **kwargs):
+            reads.append(argv)
+            return run_of(0, json.dumps(self.ENTRIES))
+
+        def entry(pool):
+            reserved = [{**fs.reserved_pool(reserved_node_pool(pool, "projects/beta/reservations/res-other-zone"), "acme"), "command": "pools"}]
+            filed = {"name": f"acme/us-central1/{pool}", "project": "acme", "commands": [], "candidates": [], fs.RESERVED_POOLS_KEY: list(reserved)}
+            fs.file_reserved_pools(filed, {"beta": {}}, frozenset({"acme", "beta"}))
+            return filed, reserved
+
+        cache = {}
+        for pool in ("pool-a", "pool-b"):
+            filed, reserved = entry(pool)
+            fs.add_reservation_changes(filed, reserved, cache, run=run)
+            [candidate] = filed["candidates"]
+            self.assertIn(f"Admin Activity log of project beta, last 30 days: reservation res-other-zone was {self.DELETED}", candidate["excerpt"])
+        self.assertEqual(reads, [fs.reservation_changes_argv("beta", "res-other-zone")])
+
+    def test_a_finding_of_another_check_on_the_same_object_is_not_changed(self):
+        reserved = [{**fs.reserved_pool(reserved_node_pool("p1", "r1"), "acme"), "command": "pools"}]
+        other = {"check": "single-zone-nodepool", "object": "NodePool/p1", "excerpt": "one zone", "command": "pools"}
+        entry = {"name": "acme/us-central1/c1", "commands": [], "candidates": [dict(other)]}
+        fs.add_reservation_changes(entry, reserved, {}, run=lambda argv, **kwargs: self.fail("no read is necessary"))
+        self.assertEqual(entry["candidates"], [other])
 
 
 class CrashIsolationTest(unittest.TestCase):

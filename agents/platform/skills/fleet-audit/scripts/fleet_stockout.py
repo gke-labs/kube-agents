@@ -27,7 +27,10 @@ The other two — `spot-scarcity-risk`, off the beta Spot capacity-advice API
 repository had not exercised either response shape anywhere else, and encoding
 an unverified schema as tested code makes a wrong guess look like a fact. Both
 shapes were read live against `adamparco-kage` on 2026-08-29 and are now
-pinned by `test_fleet_stockout.py` against captured responses:
+pinned by `test_fleet_stockout.py` against captured responses. For a node
+pool that 3.10(d) files, `add_reservation_changes` makes one more Cloud
+Logging read, of the Admin Activity entries of the reservation that the pool
+names, with entry shapes read on 2026-11-25. The two shapes:
 
 - `capacity-history` returns `{location, machineType, preemptionHistory:
   [{interval: {startTime, endTime}, preemptionRate: <float>}], priceHistory:
@@ -581,6 +584,54 @@ RESERVED_POOL_TRIAGE = "reserved-pool"
 # `{reservation name: zones}`.
 RESERVED_POOLS_KEY = "_reserved_pools"
 RESERVATION_ZONES_KEY = "_reservation_zones"
+# §3.10(d), the delete and resize race: for a pool that the check files, the
+# Admin Activity entries of the named reservation in its owner project say if
+# the reservation was deleted, resized or updated, when, and by whom. The
+# filter is the one a recorded read used; the method is matched in the entry.
+RESERVATION_CHANGE_FILTER = (
+    'logName:"cloudaudit.googleapis.com%2Factivity" AND protoPayload.serviceName="compute.googleapis.com" '
+    'AND protoPayload.resourceName:"{segment}/{name}"'
+)
+# A reservation name as Compute Engine permits it. An affinity value of another
+# form names no reservation, and it does not go into a filter.
+RESERVATION_NAME_RE = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
+# The path segment before the zone in the entry's resource name.
+RESERVATION_ZONE_SEGMENT = "zones"
+# The method name is `<API version>.compute.reservations.<verb>`. The verbs
+# that change what a reservation can serve, and the word the finding uses.
+RESERVATION_METHOD_MARKER = ".compute.reservations."
+RESERVATION_CHANGE_WORDS = {"delete": "deleted", "resize": "resized", "update": "updated"}
+RESERVATION_RESIZE_VERB = "resize"
+RESERVATION_CHANGE_DAYS = 30
+RESERVATION_CHANGE_FRESHNESS = f"{RESERVATION_CHANGE_DAYS}d"
+# Two entries for each operation, newest first: a hundred operations.
+RESERVATION_CHANGE_LIMIT = 200
+# The finding names the newest changes of each reservation, this many.
+RESERVATION_CHANGES_SHOWN = 3
+# The reads of one run share this time. No read starts after it, so the reads
+# of a run end within it plus the limit of one read.
+RESERVATION_CHANGES_BUDGET_S = 60
+# The key of the run's read cache that holds the time at which that budget ends.
+RESERVATION_CHANGES_DEADLINE_KEY = "deadline"
+# The texts that a filed pool's excerpt gets.
+RESERVATION_CHANGES_CLAUSE = "Admin Activity log of project {project}, last {days} days: reservation {name} was {changes}{more}{cut}"
+RESERVATION_CHANGE_TEXT = "{what}{count}{where} at {when}Z by {principal}"
+RESERVATION_CHANGE_COUNT = " to a count of {count}"
+RESERVATION_CHANGE_ZONE = " in {zone}"
+RESERVATION_CHANGE_UNKNOWN_PRINCIPAL = "a principal the entry does not name"
+RESERVATION_CHANGES_MORE = " ({count} older {noun} not shown)"
+RESERVATION_CHANGE_NOUNS = ("change", "changes")
+RESERVATION_CHANGES_CUT = "; the read returned its limit of {limit} entries, so older entries were not read"
+RESERVATION_CHANGES_UNREAD = (
+    "the Admin Activity log of project {project} was not read for reservation {name} ({why}), so a delete or a "
+    "resize of it is not named here"
+)
+# Why a read gave no usable answer.
+RESERVATION_READ_FAILED = "rc={rc}: {stderr}"
+RESERVATION_READ_NOT_ENTRIES = "the output is not a JSON list of entries"
+RESERVATION_READ_FULL_PAGE = "the read returned its limit of {limit} entries with no change of this reservation, and older entries were not read"
+RESERVATION_READ_NO_TIME = "the time for these reads was spent"
+NO_STDERR = "no stderr"
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
@@ -2024,6 +2075,145 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
         )
     if limitations:
         entry["limitations"] = "; ".join([*filter(None, [entry.get("limitations")]), *limitations])
+
+
+def reservation_changes_argv(project: str, name: str) -> list[str]:
+    filter_text = RESERVATION_CHANGE_FILTER.format(segment=RESERVATION_NAME_SEGMENT, name=name)
+    return [
+        "gcloud", "logging", "read", filter_text,
+        "--project", project, "--freshness", RESERVATION_CHANGE_FRESHNESS,
+        "--limit", str(RESERVATION_CHANGE_LIMIT), "--format", "json",
+    ]
+
+
+def _as_dict(value: object) -> dict:
+    """`value` when it is a dict, else an empty one: a log entry with a field
+    of another type costs that field and not the run."""
+    return value if isinstance(value, dict) else {}
+
+
+def reservation_changes(entries: object, name: str) -> list[dict]:
+    """The deletes, resizes and updates of the reservation `name` in a read of
+    the Admin Activity log, newest first, one for each operation.
+
+    An operation has two entries, its first and its last, with one operation
+    id; the first has the request (for a resize, the new count) and the time
+    the change was asked for. A filter on the resource name also matches a
+    longer name, so the name is compared here. A request that the API refused
+    has a status code and changed nothing."""
+    operations: dict[str, dict] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        payload = _as_dict(_as_dict(entry).get("protoPayload"))
+        parts = str(payload.get("resourceName") or "").split("/")
+        if parts[-2:] != [RESERVATION_NAME_SEGMENT, name]:
+            continue
+        _, marker, verb = str(payload.get("methodName") or "").rpartition(RESERVATION_METHOD_MARKER)
+        if not marker or verb not in RESERVATION_CHANGE_WORDS:
+            continue
+        stamp = str(entry.get("timestamp") or "")
+        operation = operations.setdefault(
+            str(_as_dict(entry.get("operation")).get("id") or entry.get("insertId") or stamp),
+            {"verb": verb, "at": stamp, "by": "", "count": None, "zone": "", "refused": False},
+        )
+        operation["at"] = min(operation["at"] or stamp, stamp or operation["at"])
+        operation["by"] = operation["by"] or str(_as_dict(payload.get("authenticationInfo")).get("principalEmail") or "")
+        if RESERVATION_ZONE_SEGMENT in parts[:-1]:
+            operation["zone"] = parts[parts.index(RESERVATION_ZONE_SEGMENT) + 1]
+        count = _as_dict(payload.get("request")).get("specificSkuCount")
+        if verb == RESERVATION_RESIZE_VERB and count is not None:
+            operation["count"] = str(count)
+        if _as_dict(payload.get("status")).get("code"):
+            operation["refused"] = True
+    changes = [operation for operation in operations.values() if not operation.pop("refused")]
+    return sorted(changes, key=lambda change: change["at"][:TIMESTAMP_TO_SECONDS_CHARS], reverse=True)
+
+
+def reservation_changes_clause(project: str, name: str, changes: list[dict], cut: bool = False) -> str:
+    """The sentence a filed pool's excerpt gets for one named reservation:
+    its newest changes, and how many older ones the sentence leaves out.
+    `cut` says that the read returned a full page."""
+    said = [
+        RESERVATION_CHANGE_TEXT.format(
+            what=RESERVATION_CHANGE_WORDS[change["verb"]],
+            count=RESERVATION_CHANGE_COUNT.format(count=change["count"]) if change["count"] is not None else "",
+            where=RESERVATION_CHANGE_ZONE.format(zone=change["zone"]) if change["zone"] else "",
+            when=change["at"][:TIMESTAMP_TO_SECONDS_CHARS],
+            principal=change["by"] or RESERVATION_CHANGE_UNKNOWN_PRINCIPAL,
+        )
+        for change in changes[:RESERVATION_CHANGES_SHOWN]
+    ]
+    older = len(changes) - len(said)
+    return RESERVATION_CHANGES_CLAUSE.format(
+        project=project,
+        days=RESERVATION_CHANGE_DAYS,
+        name=name,
+        changes=", ".join(said),
+        more=RESERVATION_CHANGES_MORE.format(count=older, noun=RESERVATION_CHANGE_NOUNS[older > 1]) if older else "",
+        cut=RESERVATION_CHANGES_CUT.format(limit=RESERVATION_CHANGE_LIMIT) if cut else "",
+    )
+
+
+def read_reservation_changes(project: str, name: str, deadline: float, *, run: RunFn) -> dict:
+    """One read of the Admin Activity entries of a reservation: the command,
+    the changes (None when the read gave no usable answer, with `why`), and
+    whether the read returned a full page, so that older entries were not
+    read. No read starts after `deadline`."""
+    argv = reservation_changes_argv(project, name)
+    if not _before(deadline):
+        return {"argv": argv, "changes": None, "why": RESERVATION_READ_NO_TIME, "cut": False}
+    entries, result = run_and_gate(
+        argv,
+        run=functools.partial(
+            run_logging_read, run=run, project=project, filter_text=argv[3],
+            freshness=timedelta(days=RESERVATION_CHANGE_DAYS), limit=RESERVATION_CHANGE_LIMIT,
+        ),
+    )
+    if result.rc != 0:
+        stderr = " ".join(result.stderr.split())[:STDERR_EXCERPT_CHARS] or NO_STDERR
+        return {"argv": argv, "changes": None, "why": RESERVATION_READ_FAILED.format(rc=result.rc, stderr=stderr), "cut": False}
+    # Empty output at rc 0 is a window with no entry, as in §3.11.
+    if result.stdout.strip() and object_list(entries) is None:
+        return {"argv": argv, "changes": None, "why": RESERVATION_READ_NOT_ENTRIES, "cut": False}
+    changes = reservation_changes(entries, name)
+    cut = isinstance(entries, list) and len(entries) >= RESERVATION_CHANGE_LIMIT
+    if cut and not changes:
+        # The filter also matches a longer name, and gcloud returns the newest
+        # entries first: a full page can hide an older change of this name.
+        return {"argv": argv, "changes": None, "why": RESERVATION_READ_FULL_PAGE.format(limit=RESERVATION_CHANGE_LIMIT), "cut": True}
+    return {"argv": argv, "changes": changes, "why": "", "cut": cut}
+
+
+def add_reservation_changes(entry: dict, reserved_pools: list[dict], reads: dict, *, run: RunFn) -> None:
+    """§3.10(d), the delete and resize race: for each node pool that
+    `file_reserved_pools` filed in `entry`, read the Admin Activity entries of
+    the reservations it names and add the newest changes, each with its time
+    and its principal, to the finding. With no change in the window the
+    finding stays as it is.
+
+    `reserved_pools` is the entry's `RESERVED_POOLS_KEY` list from before the
+    filing. `reads` is the run's cache: one read for each `(owner project,
+    name)`, and the time at which the reads' shared budget ends. A read that
+    gave no usable answer is named in the finding's excerpt. It is not a
+    limitation of the entry: the check judged the pool, and only this
+    evidence is absent."""
+    slug = "reservation-mismatch-risk"
+    named = {f"NodePool/{reserved['pool']}": reserved for reserved in reserved_pools}
+    for candidate in entry.get("candidates", []):
+        reserved = named.get(candidate.get("object")) if candidate.get("check") == slug else None
+        if reserved is None:
+            continue
+        for owner, name in reserved["reservations"]:
+            if not RESERVATION_NAME_RE.match(name):
+                continue
+            deadline = reads.setdefault(RESERVATION_CHANGES_DEADLINE_KEY, time.monotonic() + RESERVATION_CHANGES_BUDGET_S)
+            if (owner, name) not in reads:
+                reads[(owner, name)] = read_reservation_changes(owner, name, deadline, run=run)
+            read = reads[(owner, name)]
+            if read["changes"] is None:
+                candidate["excerpt"] += "; " + RESERVATION_CHANGES_UNREAD.format(project=owner, name=name, why=read["why"])
+            elif read["changes"]:
+                candidate["excerpt"] += "; " + reservation_changes_clause(owner, name, read["changes"], read["cut"])
+                candidate["command"] += "; " + shlex.join(read["argv"])
 
 
 # --------------------------------------------------------------------------- #
@@ -3560,8 +3750,11 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
     returned_clusters = [e for e in cluster_entries if e]
     zones_by_project = {e["project"]: e.pop(RESERVATION_ZONES_KEY) for e in project_entries if RESERVATION_ZONES_KEY in e}
+    change_reads: dict = {}
     for cluster_entry in returned_clusters:
+        reserved_pools = list(cluster_entry.get(RESERVED_POOLS_KEY, []))
         file_reserved_pools(cluster_entry, zones_by_project, frozenset(projects))
+        add_reservation_changes(cluster_entry, reserved_pools, change_reads, run=run)
     entries = returned_clusters + project_entries + failed_entries + not_running + discovery_entries
     # An unreachable cluster evaluated no check, so it leaves `scope.clusters`
     # as empty as no cluster at all; a gate-failed one stays eligible, since
