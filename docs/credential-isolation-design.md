@@ -1104,6 +1104,14 @@ token-issuing hosts are refused before the table, redirects are not followed, an
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.
 
+### Remote MCP servers
+
+`POST /v1/mcp/<server>` relays one JSON-RPC message to a remote MCP server on the credential
+runtime's own identity. The code table in `agents/platform/scripts/mcp_policy.py` names each
+server and the exact tools it may call; each server in the table today is a Google API host. A
+proposal to add servers that are not Google's, with a credential that only this runtime mounts, is
+in [`designs/external-mcp-servers.md`](designs/external-mcp-servers.md); nothing of it is built.
+
 ### Chat
 
 Slack and Google Chat adapters send credential-free request payloads to Envoy.
