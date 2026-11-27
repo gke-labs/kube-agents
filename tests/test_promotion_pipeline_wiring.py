@@ -708,7 +708,7 @@ class StagingTagContractTest(unittest.TestCase):
         steps = doc["jobs"]["resolve-commit"]["steps"]
         self.assertTrue(
             any("verify_candidate_images.sh" in step.get("run", "") for step in steps),
-            "resolve-commit must verify candidate images in GHCR",
+            "resolve-commit must verify candidate images in the environment's registry",
         )
 
     def test_staging_deploy_workflow_dispatch_defaults_lease_policy_to_fail(self):

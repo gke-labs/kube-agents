@@ -48,6 +48,11 @@ jobs:
     environment: rc
     permissions:
       contents: write
+      # For the Google login the image check takes when the registry is an
+      # Artifact Registry repository. A caller has to grant it too
+      # (rc-release-pipeline.yml): a called workflow cannot hold a permission
+      # its caller did not pass.
+      id-token: write
     outputs:
       commit_sha: ${{ steps.resolve_target.outputs.commit_sha }}
       rc_tag: ${{ steps.resolve_target.outputs.rc_tag }}
@@ -68,6 +73,24 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.release-token.outputs.token }}
+
+      # Only when the environment's registry is an Artifact Registry
+      # repository: the steps below that look for a commit's images then ask
+      # that registry as the environment's deploy identity, which has to
+      # hold read on it (registry_image_exists asks Artifact Registry over
+      # its API with the job's Google credential, before docker). With
+      # REGISTRY_PREFIX unset the images are on GHCR, which answers without a
+      # login, and these two steps are skipped.
+      - name: Authenticate to Google Cloud for the image check
+        if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK for the image check
+        if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       - name: Resolve Commit SHA and Tag Name
         id: resolve_target
