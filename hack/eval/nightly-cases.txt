@@ -1407,7 +1407,9 @@
 # three, which with the other two drift cases' six is over the default
 # ALERT_DAILY_LIMIT_DRIFT of 20, so on a dev install carrying the default the
 # last repetition can lose a card to the ceiling and red as
-# late-edit-not-carded. The eval install runs uncapped. Priced at the drift
+# late-edit-not-carded. Where a person runs the case, the fixture's own seven
+# kubectl writes are carded and counted too, so the default is reached in the
+# second repetition. The eval install runs uncapped. Priced at the drift
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
