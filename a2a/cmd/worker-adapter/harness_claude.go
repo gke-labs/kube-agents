@@ -121,9 +121,10 @@ func (claudeBuilder) command(spec harnessSpec) []string {
 			"--allowedTools", spec.allowed,
 			"--disallowedTools", spec.disallowed,
 			settingSourcesFlag, adapterSettingSources,
-			// With or without the delegate tool: a wake's argv has no
-			// --mcp-config, and without this flag it would load whatever MCP
-			// config an earlier turn in the same pod left on disk.
+			// With or without the delegate tool: a wake the gateway didn't
+			// let delegate again has no --mcp-config, and without this flag
+			// it would load whatever MCP config an earlier turn in the same
+			// pod left on disk.
 			strictMCPConfigFlag,
 		)
 		if d := spec.delegate; d != nil {

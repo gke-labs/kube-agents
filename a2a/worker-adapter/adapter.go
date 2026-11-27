@@ -923,8 +923,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return done(Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err))
 	}
 
-	// The delegate tool is decided per task: off on a wake, whatever the
-	// pod was started with (delegateOffForTask). A task with the tool off
+	// The delegate tool is decided per task: off on a wake the gateway
+	// didn't let delegate again (its via without delegate: true), whatever
+	// the pod was started with (delegateOffForTask). A task with the tool off
 	// gets neither the listener nor the harness flags, the same shape as a
 	// pod started with A2A_DELEGATE_TOOL=off.
 	delegate := cfg.DelegateSocket != "" && !delegateOffForTask(origin)

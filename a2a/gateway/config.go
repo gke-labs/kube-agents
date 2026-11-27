@@ -892,10 +892,10 @@ type Config struct {
 	// parent's depth plus one, and a turn already at the bound may not
 	// delegate again. One child at a time means the chain is a line, and
 	// this bounds its length: a harness that delegates in a loop stops at
-	// the bound instead of walking the session cap. Since a wake's pod has
-	// no delegate tool (delegateToolFor), a chain from a stock worker is a
-	// human turn and its child, so the bound is the backstop for a worker
-	// that delegates without the tool, not the everyday limit.
+	// the bound instead of walking the session cap. Since #6861 a session
+	// wake under the bound may delegate again (wakeMayDelegate), so the
+	// bound is the everyday limit on a session's chain: a wake's child is
+	// one level deeper, and a wake at the bound gets no tool and is refused.
 	//
 	// Zero means 3. FromEnv refuses a value under 1 rather than clamping
 	// it: 0 would be "delegation off", which is a different switch
