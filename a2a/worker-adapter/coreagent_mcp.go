@@ -1,11 +1,14 @@
 package workeradapter
 
 import (
+	"fmt"
 	"maps"
 	"slices"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/toolgrant"
 )
 
 // mcpDriver is a driver that takes a turn's MCP servers in-process, in its
@@ -51,4 +54,58 @@ func withTurnMCP(d Driver, servers []coreagentwire.MCPServer) Driver {
 		return m.WithMCP(servers)
 	}
 	return d
+}
+
+// turnDelegateServer is one turn's delegate server: tmpl with the turn's
+// socket, and the submission's delegateTargets part (with any scopeClusters
+// part beside it) as JSON when it has one that parses, in its env. Nil when there is no template or the turn may not
+// delegate (a task with a via, a wake, a pod with the tool off). tmpl is not
+// modified.
+func turnDelegateServer(tmpl *persona.MCPServer, delegate bool, socket string, origin *lib.Envelope) *persona.MCPServer {
+	if tmpl == nil || !delegate || socket == "" {
+		return nil
+	}
+	s := persona.MCPServer{Name: tmpl.Name, Command: tmpl.Command, Args: slices.Clone(tmpl.Args), Env: maps.Clone(tmpl.Env), Tools: slices.Clone(tmpl.Tools)}
+	if s.Env == nil {
+		s.Env = map[string]string{}
+	}
+	s.Env[EnvDelegateSocket] = socket
+	delete(s.Env, EnvDelegateTargets)
+	delete(s.Env, EnvScopeClusters)
+	if raw, ok := delegateTargetsJSON(origin); ok {
+		s.Env[EnvDelegateTargets] = raw
+		// A scopeClusters part goes beside the targets, as it does on
+		// Claude Code's delegate server (withDelegateTargetsFor).
+		if scope, ok := delegateScopeJSON(origin); ok {
+			s.Env[EnvScopeClusters] = scope
+		}
+	}
+	return &s
+}
+
+// allowDriver is a driver whose harness gates every call, MCP calls
+// included, by its policy's allow rules (core-agent).
+type allowDriver interface {
+	Driver
+	WithAllow(patterns []string) Driver
+}
+
+// mcpGrantWorkspace is the workspace toolgrant renders an MCP-only grant
+// under. An MCP rule names no path, so its value never reaches a rule.
+const mcpGrantWorkspace = "/workspace"
+
+// withDelegateGrant is d with the gate's allow rules for s's tools (the
+// delegate tool: "mcp:a2a_delegate" and "mcp:a2a_delegate *", nothing
+// wider), rendered by toolgrant as any MCP grant is. A driver whose harness
+// has no such gate, or s nil, gives d unchanged.
+func withDelegateGrant(d Driver, s *persona.MCPServer) (Driver, error) {
+	a, ok := d.(allowDriver)
+	if !ok || s == nil {
+		return d, nil
+	}
+	g, err := toolgrant.Policy{MCP: []toolgrant.MCPGrant{{Server: s.Name, Tools: s.Tools}}}.CoreAgent(mcpGrantWorkspace)
+	if err != nil {
+		return d, fmt.Errorf("the delegate tool's grant: %w", err)
+	}
+	return a.WithAllow(g.Allow), nil
 }

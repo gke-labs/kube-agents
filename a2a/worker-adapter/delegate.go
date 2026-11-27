@@ -238,28 +238,56 @@ func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
 
 // withDelegateTargetsFor is withDelegateTargets for the harness d drives.
 func withDelegateTargetsFor(d Driver, argv []string, origin *lib.Envelope) ([]string, bool) {
-	var m lib.Message
-	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+	raw, ok := delegateTargetsJSON(origin)
+	if !ok {
 		return argv, false
 	}
-	targets, ok, err := lib.DelegateTargetsOf(m.Parts)
-	if !ok || err != nil {
-		return argv, false
-	}
-	raw, err := json.Marshal(targets)
-	if err != nil {
-		return argv, false
-	}
-	out, rewrote := d.WithDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+	out, rewrote := d.WithDelegateServerEnv(argv, EnvDelegateTargets, raw)
 	if !rewrote {
 		return out, false
 	}
-	if scope, ok, err := lib.ScopeClustersOf(m.Parts); ok && err == nil {
-		if raw, err := json.Marshal(scope); err == nil {
-			out, _ = d.WithDelegateServerEnv(out, EnvScopeClusters, string(raw))
-		}
+	if scope, ok := delegateScopeJSON(origin); ok {
+		out, _ = d.WithDelegateServerEnv(out, EnvScopeClusters, scope)
 	}
 	return out, true
+}
+
+// delegateScopeJSON is the submission's scopeClusters part as the JSON the
+// delegate server reads from EnvScopeClusters, and false when it has none or
+// one that doesn't parse (the targets still go).
+func delegateScopeJSON(origin *lib.Envelope) (string, bool) {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return "", false
+	}
+	scope, ok, err := lib.ScopeClustersOf(m.Parts)
+	if !ok || err != nil {
+		return "", false
+	}
+	raw, err := json.Marshal(scope)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+// delegateTargetsJSON is the submission's delegateTargets part as the JSON
+// the delegate server reads from EnvDelegateTargets, and false when it has no
+// part or one that doesn't parse (the server then names platform only).
+func delegateTargetsJSON(origin *lib.Envelope) (string, bool) {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return "", false
+	}
+	targets, ok, err := lib.DelegateTargetsOf(m.Parts)
+	if !ok || err != nil {
+		return "", false
+	}
+	raw, err := json.Marshal(targets)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
 }
 
 // delegateWidthOf is the batch width the submission's delegateTargets part

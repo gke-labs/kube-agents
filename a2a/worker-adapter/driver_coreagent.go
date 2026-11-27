@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -26,9 +27,11 @@ import (
 type coreAgentDriver struct {
 	// Policy is the turn's tool policy, set by NewCoreAgentDriver from the
 	// worker's grant: the session allowlist on a session pod, the persona's on
-	// a profile worker (WithPolicy). MCP is the turn's MCP servers, set each
-	// turn by WithMCP from the persona's (adapter.run, turnDriver); the pod's
-	// driver carries none.
+	// a profile worker (WithPolicy). A session turn that may delegate adds the
+	// delegate tool's allow rules to its own copy (WithAllow,
+	// withDelegateGrant). MCP is the turn's MCP servers, set each turn by
+	// WithMCP from the persona's (adapter.run, turnDriver); the pod's driver
+	// carries none.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 	// Instructions are the session pod's system-prompt lines, sent in each
@@ -67,6 +70,30 @@ func (d coreAgentDriver) WithPolicy(p coreagentwire.Policy) Driver {
 // history it holds is shared, as every turn of the pod's needs it.
 func (d coreAgentDriver) WithMCP(servers []coreagentwire.MCPServer) Driver {
 	d.MCP = servers
+	return d
+}
+
+// WithAllow is the driver with patterns added to its policy's allow rules,
+// each once. The receiver's policy is not modified.
+func (d coreAgentDriver) WithAllow(patterns []string) Driver {
+	allow := slices.Clone(d.Policy.Allow)
+	for _, p := range patterns {
+		if !slices.Contains(allow, p) {
+			allow = append(allow, p)
+		}
+	}
+	d.Policy.Allow = allow
+	return d
+}
+
+// withTurnInstructions is d with lines added after its system-prompt lines,
+// for one turn (a core-agent driver), else d unchanged. The receiver's lines
+// are not modified.
+func withTurnInstructions(d Driver, lines []string) Driver {
+	if c, ok := d.(coreAgentDriver); ok && len(lines) > 0 {
+		c.Instructions = append(slices.Clone(c.Instructions), lines...)
+		return c
+	}
 	return d
 }
 
