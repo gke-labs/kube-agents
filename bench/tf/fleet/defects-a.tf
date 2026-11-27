@@ -151,6 +151,74 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
   }
 }
 
+# Fixture (reliability), for post-merge-verified-fixed alone: the checkout-gateway
+# shape in a namespace of its own, budgeted at steady state. Config Sync syncs
+# the pool repository's clusters/seeded-a/seeded-post-merge/ into the namespace
+# (post-merge-sync.tf), and the repository holds this Deployment's declaration
+# and its PodDisruptionBudget there, so no audit finds it unbudgeted. That case
+# removes the budget for its own run and the audit's fix puts it back through
+# the merge; it cannot use checkout-gateway, which eight cases read as
+# unbudgeted. The declaration carries configmanagement.gke.io/managed:
+# disabled, so Config Sync leaves the Deployment to this stack. Planted only on
+# a project listed in post_merge_sync_projects (config-sync.tf): without Config
+# Sync to apply its budget it would be unbudgeted, a finding every audit reads.
+resource "kubernetes_namespace_v1" "seeded_post_merge" {
+  count = local.post_merge_sync_enabled ? 1 : 0
+
+  metadata {
+    name   = "seeded-post-merge"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "order_ledger" {
+  count = local.post_merge_sync_enabled ? 1 : 0
+
+  metadata {
+    name      = "order-ledger"
+    namespace = kubernetes_namespace_v1.seeded_post_merge[0].metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "order-ledger" }
+    }
+    template {
+      metadata {
+        labels = { app = "order-ledger" }
+      }
+      # checkout-gateway's spec above, for the same reasons.
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "order-ledger" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "ledger"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
 # Declared postures (reliability and compliance): two replicas, no
 # PodDisruptionBudget, in a namespace of its own that carries no NetworkPolicy. The same shape as checkout-gateway above, planted so
 # that a repository declaration can cover it without touching the cases
@@ -1562,7 +1630,8 @@ resource "kubernetes_deployment_v1" "inventory_api" {
 # zero-workload suppression already exempts it, and an object it does not
 # need would only blur what the fixture asserts.
 resource "kubernetes_network_policy_v1" "default_deny" {
-  for_each = {
+  # seeded-post-merge's, on a project that plants it (post_merge_sync_projects).
+  for_each = merge({
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
@@ -1579,7 +1648,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.
-  }
+  }, { for name in kubernetes_namespace_v1.seeded_post_merge[*].metadata[0].name : "post_merge" => name })
 
   metadata {
     name      = "default-deny"

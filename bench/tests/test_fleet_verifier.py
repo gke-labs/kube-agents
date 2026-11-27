@@ -1899,6 +1899,15 @@ def test_a_cluster_with_no_ca_data_omits_the_key_rather_than_writing_it_empty(
     assert "fleet-reader-credential.sh" in body
 
 
+def _listed_variables(tmp_path, *projects) -> Path:
+    """A variables.tf whose post_merge_sync_projects lists `projects`."""
+    path = tmp_path / f"variables-{'-'.join(projects) or 'none'}.tf"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    items = ", ".join(f'"{p}"' for p in projects)
+    path.write_text(f'variable "post_merge_sync_projects" {{\n  type    = list(string)\n  default = [{items}]\n}}\n')
+    return path
+
+
 def _provision(shell, tmp_path, **env) -> Path:
     out = tmp_path / "out"
     settings = {
@@ -1912,15 +1921,33 @@ def _provision(shell, tmp_path, **env) -> Path:
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
             " seeded-token seeded-headroom seeded-family seeded-long-name seeded-cpu-cycle seeded-reservation seeded-qos seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
-            " seeded-scaled-zero seeded-compute-class"
+            " seeded-scaled-zero seeded-compute-class seeded-post-merge"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.
         "FLEET_ALLOW_RUNNER_CREDENTIAL": "1",
     }
     settings.update(env)
+    # The project the stub plays is listed, so every role is planted there;
+    # test_a_role_the_project_does_not_list_is_not_probed covers the rest.
+    settings.setdefault("FLEET_VARIABLES", str(_listed_variables(tmp_path, settings["FLEET_PROJECT_ID"])))
     _provision.last = shell("write_fleet_kubeconfigs", **settings)  # type: ignore[attr-defined]
     return out
+
+
+def test_a_role_the_project_does_not_list_is_not_probed(shell, tmp_path):
+    # post-merge-sync-workload is planted only on projects in
+    # post_merge_sync_projects (its projects_var); elsewhere it is neither
+    # written nor counted as unplanted, and the summary says why.
+    out = _provision(shell, tmp_path, FLEET_VARIABLES=str(_listed_variables(tmp_path, "some-other-project")))
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert not (out / "post-merge-sync-workload.kubeconfig").exists()
+    assert "fixture role 'post-merge-sync-workload' is not planted on project kube-agents-evals by design" in done.stderr
+    assert "never planted" not in done.stderr
+    gated = [r for r, e in _catalog()["roles"].items() if e.get("projects_var")]
+    assert f", 0 whose fixtures were not present, {len(gated)} not planted on this project by design" in done.stderr
+    assert "slot.post-merge-sync-workload=" not in (out / ".fleet-context").read_text()
 
 
 def test_the_runner_writes_one_kubeconfig_per_catalog_role(shell, tmp_path):

@@ -728,6 +728,24 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertEqual([], result.warnings)
         self.assertIn("in their designed state", result.message)
 
+    def test_a_role_the_project_does_not_plant_by_design_is_not_expected(self):
+        # A role with projects_var (post-merge-sync-workload) on a project its
+        # list leaves out: the runner writes it nowhere and counts it apart, so
+        # every other role written is a full pass, not a fleet incomplete.
+        gated_line = self._summary(self._roles() - 1).replace(
+            " (project kube-agents-evals-5)", ", 1 not planted on this project by design (project kube-agents-evals-5)"
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", gated_line),
+                (0, "", self._state(self._roles() - 1)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual([], result.warnings)
+        self.assertIn(f"All {self._roles() - 1} fixture roles planted", checker._fleet_presence_result("n", "p", self._roles(), 0, gated_line).message)
+
     def test_an_assertion_the_script_had_no_credential_for_is_advice_not_an_unread(self):
         # The declared-intent note with no `gh` login: the roles were read and
         # are in shape, the note was not asserted. The script's own line is
@@ -5006,6 +5024,11 @@ FLEET_RESOURCE_ROLES = {
     "google_gke_hub_membership": {"roles/gkehub.editor", "roles/container.admin"},
     "google_gke_hub_feature": {"roles/gkehub.editor"},
     "google_gke_hub_feature_membership": {"roles/gkehub.editor"},
+    # The post-merge sync's deploy key: no project role. The provisioning
+    # script grants secretAccessor on that one secret
+    # (scripts/provision_ci_pool_post_merge_sync.sh), so the reconciler reads
+    # no other secret in the project.
+    "google_secret_manager_secret_version": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
@@ -5073,7 +5096,7 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # config_connector.py and orphan_snapshot.py the ones the terraform_data
     # local-execs run, not something tofu loads; their calls are accounted for
     # on the external and terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py"}
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py", "orphan_snapshot.py", "repo_sync.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.
