@@ -50,14 +50,31 @@ cut from `main`, lists every pull request it will contain if it is cut from the 
 
 ## What a release publishes
 
-1. The container images built for the release's commit are retagged to `X.Y.Z` in GHCR without being rebuilt, and signed with keyless Cosign through GitHub Actions OIDC.
-2. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed with Cosign.
+1. The container images built for the release's commit are retagged to `X.Y.Z` in GHCR without being rebuilt, and signed with keyless Cosign through GitHub Actions OIDC. The same images go to a public Artifact Registry repository, signed there too ([Pulling a release from Artifact Registry](#pulling-a-release-from-artifact-registry)).
+2. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed with Cosign. The Artifact Registry repository gets the same chart, pushed and signed there as well.
 3. The tag sits on a stamped release commit: `BAKED_RELEASE_VERSION="X.Y.Z"` is written into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`). Both `install.sh` and `upgrade.sh` check that a Git checkout matches the tag's commit and that a tree outside Git carries a matching stamp or bundle marker; `upgrade.sh` also refuses a tree whose stamp names another release. [Provenance attribution](#provenance-attribution-and-release-bundle-marker) has the steps.
 4. The offline bundle is staged from the tagged commit with `git archive`, carries the `.release-bundle` provenance marker, and is packaged as `.tar.gz` and `.zip`.
 5. Software Bills of Materials are generated with Syft, SPDX 2.3 JSON and CycloneDX 1.5 JSON for the bundle and SPDX 2.3 JSON for each container image, and published with `checksums.txt`, which carries SHA256 checksums for every release asset.
 6. The `k8s-api-proxy` Go module is tagged `k8s-api-proxy/vX.Y.Z` at the release commit, so `go get github.com/gke-labs/kube-agents/k8s-api-proxy@vX.Y.Z` builds the proxy library that release ships. The module is v0 and its API may change in any release; a release at `1.0.0` or later tags no module until its own versioning is decided. See the [module README](https://github.com/gke-labs/kube-agents/tree/main/k8s-api-proxy).
 7. The `k8s-api-proxy` binary is attached for Linux and macOS on amd64 and arm64, as `k8s-api-proxy_X.Y.Z_<os>_<arch>.tar.gz` with its license and README, built from the release commit and covered by `checksums.txt`. Releases published before this step existed, and patches on lines older than 0.24, carry none. No SBOM is generated for these archives; the `kube-proxy` image SBOM covers the same module and dependencies.
 8. The `kube-agents-mcp` workstation MCP bridge is attached for macOS and Linux on amd64 and arm64, as `kube-agents-mcp_X.Y.Z_<os>_<arch>.tar.gz`; there is no Windows build yet. Each archive carries the license and the repository README, is built from the release commit, and is covered by `checksums.txt`. `kube-agents-mcp --version` prints the release. A release whose bridge build fails on any platform is published without any `kube-agents-mcp` archive, and releases published before this step existed carry none. No SBOM is generated for these archives.
+
+## Pulling a release from Artifact Registry
+
+Each release is also published to a public Artifact Registry repository,
+`us-docker.pkg.dev/kube-agents-release/kube-agents`. It holds the same images as GHCR, under the
+same names and the same `X.Y.Z` tag, at the same digests, and the chart at
+`oci://us-docker.pkg.dev/kube-agents-release/kube-agents/charts/kube-agents`. Both are signed
+there as they are on GHCR. A release published before the repository existed is on GHCR alone.
+
+GHCR stays the default. To install from Artifact Registry, set the prefix for the images this
+project builds to that repository: `--registry-prefix` for `install.sh`, `global.imageRegistry`
+for the chart, `image_registry` for the Terraform composition. The repository holds release
+versions only: run `install.sh` from a release checkout or bundle, and with the chart or the
+composition set the image tag to the release version. It does not carry the third-party images, so
+leave their prefix unset.
+[Point the install at it](/kube-agents/deploy/docker-images/#2-point-the-install-at-it) describes
+the three settings; that page's first step, mirroring the images, does not apply here.
 
 ## Offline distribution bundles and SBOMs
 
