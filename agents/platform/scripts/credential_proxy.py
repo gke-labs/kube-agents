@@ -1767,6 +1767,8 @@ AGENT_API_METRIC_CLUSTER_LABEL = "cluster"
 AGENT_API_METRIC_PROJECT_LABEL = "project"
 AGENT_API_METRIC_LOCATION_LABEL = "location"
 AGENT_API_METRIC_PROFILE_LABEL = "profile"
+AGENT_API_METRIC_NO_PROFILE_VALUE = "-"
+AGENT_API_EVENT_WATCHER_DIRECT_PROFILE = "direct"
 AGENT_API_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
 AGENT_API_IDENTITY_CACHE_MAX_ENTRIES = 1024
 _PROMETHEUS_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
@@ -7857,8 +7859,12 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         except Exception as exc:
             LOGGER.debug("could not read %s: %s", snapshot_path, exc)
 
-        profile_identities = cls._read_profile_identities(root)
-        event_watcher = cls._read_event_watcher_status()
+        profile_identities, present_profiles, profiles_dir_unreadable = cls._inspect_profiles(root)
+        event_watcher = cls._read_event_watcher_status(
+            profile_identities=profile_identities,
+            present_profiles=present_profiles,
+            profiles_dir_unreadable=profiles_dir_unreadable,
+        )
         raw_max_projects = snapshot.get("maxProjects")
         max_projects = (
             raw_max_projects
@@ -7880,28 +7886,45 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         }
 
     @classmethod
-    def _read_profile_identities(cls, root: Path) -> list[dict[str, Any]]:
+    def _inspect_profiles(cls, root: Path) -> tuple[list[dict[str, Any]], set[str], bool]:
+        """Inspect `<root>/profiles` once for identities, on-disk profile dirs, and dir readability.
+
+        Returns `(profile_identities, present_profiles, profiles_dir_unreadable)`.
+        `present_profiles` contains every non-hidden, non-reserved directory entry
+        currently on disk (including directories whose `config.yaml` is missing,
+        corrupt, or unreadable) so cumulative watcher discovery-error counters can
+        drop removed profiles without hiding genuinely broken ones.
+        """
         profiles_dir = root / AGENT_API_PROFILES_DIR
         try:
+            if not profiles_dir.exists():
+                return [], set(), False
             if not profiles_dir.is_dir():
-                return []
+                return [], set(), True
             dir_entries = sorted(profiles_dir.iterdir(), key=lambda p: p.name)
+        except FileNotFoundError:
+            return [], set(), False
         except OSError as exc:
             LOGGER.debug("could not list %s: %s", profiles_dir, exc)
-            return []
+            return [], set(), True
         try:
             import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
         except ImportError:
             yaml = None
         entries: list[dict[str, Any]] = []
+        present_profiles: set[str] = set()
         for entry in dir_entries:
+            if entry.name.startswith(".") or entry.name in AGENT_API_RESERVED_PROFILES:
+                continue
             try:
-                if (
-                    not entry.is_dir()
-                    or entry.name.startswith(".")
-                    or entry.name in AGENT_API_RESERVED_PROFILES
-                ):
+                if not entry.is_dir():
                     continue
+            except OSError as exc:
+                LOGGER.debug("could not inspect profile %s: %s", entry, exc)
+                present_profiles.add(entry.name)
+                continue
+            present_profiles.add(entry.name)
+            try:
                 config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
                 if not config_path.is_file():
                     continue
@@ -7924,6 +7947,11 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "ready": is_ready,
                 }
             )
+        return entries, present_profiles, False
+
+    @classmethod
+    def _read_profile_identities(cls, root: Path) -> list[dict[str, Any]]:
+        entries, _, _ = cls._inspect_profiles(root)
         return entries
 
     @staticmethod
@@ -7982,7 +8010,13 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return result
 
     @classmethod
-    def _read_event_watcher_status(cls) -> dict[str, Any]:
+    def _read_event_watcher_status(
+        cls,
+        *,
+        profile_identities: list[dict[str, Any]] | None = None,
+        present_profiles: set[str] | None = None,
+        profiles_dir_unreadable: bool = False,
+    ) -> dict[str, Any]:
         raw_enabled = os.getenv(
             AGENT_API_EVENT_WATCHER_ENABLED_ENV,
             AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT,
@@ -8050,7 +8084,12 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             }
         finally:
             conn.close()
-        return cls._parse_event_watcher_metrics(raw_metrics)
+        return cls._parse_event_watcher_metrics(
+            raw_metrics,
+            profile_identities=profile_identities,
+            present_profiles=present_profiles,
+            profiles_dir_unreadable=profiles_dir_unreadable,
+        )
 
     @classmethod
     def _read_tracked_event_watcher_metrics(cls, resp: Any) -> str:
@@ -8095,7 +8134,14 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return "\n".join(kept_lines)
 
     @classmethod
-    def _parse_event_watcher_metrics(cls, text: str) -> dict[str, Any]:
+    def _parse_event_watcher_metrics(
+        cls,
+        text: str,
+        *,
+        profile_identities: list[dict[str, Any]] | None = None,
+        present_profiles: set[str] | None = None,
+        profiles_dir_unreadable: bool = False,
+    ) -> dict[str, Any]:
         watch_set_ready = False
         clusters: list[dict[str, Any]] = []
         clusters_up = 0
@@ -8153,15 +8199,97 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 c[AGENT_API_METRIC_CLUSTER_LABEL],
             )
         )
+        discovery_errors = cls._count_active_discovery_errors(
+            discovery_error_profiles,
+            clusters,
+            profile_identities=profile_identities,
+            present_profiles=present_profiles,
+            profiles_dir_unreadable=profiles_dir_unreadable,
+        )
         return {
             "enabled": True,
             "reachable": True,
             "watch_set_ready": watch_set_ready,
             "clusters_up": clusters_up,
             "clusters_total": len(clusters),
-            "discovery_errors": len(discovery_error_profiles),
+            "discovery_errors": discovery_errors,
             "clusters": clusters,
         }
+
+    @classmethod
+    def _count_active_discovery_errors(
+        cls,
+        discovery_error_profiles: set[str],
+        clusters: list[dict[str, Any]],
+        *,
+        profile_identities: list[dict[str, Any]] | None = None,
+        present_profiles: set[str] | None = None,
+        profiles_dir_unreadable: bool = False,
+    ) -> int:
+        """Count profiles in `discovery_error_profiles` that are still actively failing.
+
+        `k8s_event_watcher_cluster_discovery_errors_total{profile="..."}` is a
+        cumulative Prometheus counter that never resets inside a watcher pod's
+        lifetime. When on-disk profile state is supplied (`present_profiles is
+        not None`), drop stale counter entries for profiles that were removed
+        from disk or that recovered and now uniquely map to a watched cluster in
+        `clusters` (even when `up=False`, where discovery succeeded and informer
+        health is tracked separately via `clusters_up`).
+        """
+        if not discovery_error_profiles:
+            return 0
+        if present_profiles is None or profiles_dir_unreadable:
+            return len(discovery_error_profiles)
+
+        watched_triples = {
+            (
+                c[AGENT_API_METRIC_PROJECT_LABEL],
+                c[AGENT_API_METRIC_LOCATION_LABEL],
+                c[AGENT_API_METRIC_CLUSTER_LABEL],
+            )
+            for c in clusters
+            if c.get(AGENT_API_METRIC_PROJECT_LABEL)
+            and c.get(AGENT_API_METRIC_LOCATION_LABEL)
+            and c.get(AGENT_API_METRIC_CLUSTER_LABEL)
+        }
+
+        ident_by_profile: dict[str, tuple[str, str, str]] = {}
+        claimants_by_triple: dict[tuple[str, str, str], set[str]] = {}
+        for entry in profile_identities or ():
+            prof = entry.get(AGENT_API_METRIC_PROFILE_LABEL, "")
+            triple = (
+                entry.get(AGENT_API_METRIC_PROJECT_LABEL, ""),
+                entry.get(AGENT_API_METRIC_LOCATION_LABEL, ""),
+                entry.get(AGENT_API_METRIC_CLUSTER_LABEL, ""),
+            )
+            if prof and all(triple):
+                ident_by_profile[prof] = triple
+                if prof != AGENT_API_EVENT_WATCHER_DIRECT_PROFILE:
+                    claimants_by_triple.setdefault(triple, set()).add(prof)
+
+        active = 0
+        watched_errored_by_triple: dict[tuple[str, str, str], int] = {}
+        for prof in discovery_error_profiles:
+            if not prof or prof == AGENT_API_METRIC_NO_PROFILE_VALUE:
+                continue
+            if prof not in present_profiles:
+                continue
+            if prof == AGENT_API_EVENT_WATCHER_DIRECT_PROFILE:
+                active += 1
+                continue
+            triple = ident_by_profile.get(prof)
+            if triple is None or triple not in watched_triples:
+                active += 1
+                continue
+            watched_errored_by_triple[triple] = watched_errored_by_triple.get(triple, 0) + 1
+
+        for triple, errored_count in watched_errored_by_triple.items():
+            # One on-disk profile owns the watch for this triple; at most
+            # len(claimants) - 1 errored profiles can remain active duplicates.
+            non_owners = max(0, len(claimants_by_triple.get(triple, ())) - 1)
+            active += min(errored_count, non_owners)
+
+        return active
 
     @classmethod
     def _collect_session_id(cls, raw_session_id: Any, candidates: set[str]) -> bool:

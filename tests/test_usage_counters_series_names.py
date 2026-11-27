@@ -32,6 +32,8 @@ sys.path.insert(0, str(_REPO_ROOT / "agents" / "platform" / "scripts"))
 _SCRAPE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_counters_scrape.go"
 _DISPATCHER_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_kanban_dispatcher.go"
 _WATCHER_METRICS_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "metrics.go"
+_WATCHER_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "watcher.go"
+_CLUSTERPROFILES_DISCOVER_GO = _REPO_ROOT / "k8s-operator" / "internal" / "clusterprofiles" / "discover.go"
 _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
 _READINGS_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "vcs_readings.py"
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
@@ -252,6 +254,14 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(
             {_py_const("AGENT_API_METRIC_PROFILE_LABEL", _BROKER_PY)},
             set(_go_words(_WATCHER_METRICS_GO, match.group(1))),
+        )
+        self.assertEqual(
+            _go_const(_CLUSTERPROFILES_DISCOVER_GO, "NoProfile"),
+            _py_const("AGENT_API_METRIC_NO_PROFILE_VALUE", _BROKER_PY),
+        )
+        self.assertEqual(
+            _go_const(_WATCHER_GO, "directProfile"),
+            _py_const("AGENT_API_EVENT_WATCHER_DIRECT_PROFILE", _BROKER_PY),
         )
 
     def test_the_watchers_watch_set_ready_gauge_is_the_one_the_poller_reads(self):

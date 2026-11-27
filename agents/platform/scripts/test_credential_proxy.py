@@ -1118,6 +1118,11 @@ class AgentAPIProxyTest(unittest.TestCase):
         )
         (prof_unready / "USER.md").write_text("# Unregistered skeleton\n", encoding="utf-8")
 
+        # Broken profile still present on disk with unparseable config.yaml must count as 1 active error.
+        prof_broken = root / "profiles" / "cluster-proj-host-c3-broken"
+        prof_broken.mkdir(parents=True)
+        (prof_broken / "config.yaml").write_text(":::not valid yaml\n", encoding="utf-8")
+
         # Reserved profiles (platform, default, tse) are ignored even if they have config.yaml.
         prof_reserved = root / "profiles" / "platform"
         prof_reserved.mkdir(parents=True)
@@ -1133,8 +1138,11 @@ class AgentAPIProxyTest(unittest.TestCase):
             for i in range(18000)
         )
         metrics_body = (
+            # Stale error for c2 (already recovered and present in cluster_up) and c4 (removed from disk)
+            # must be filtered out; only c3-broken (still on disk and unwatched) counts as active.
             'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 5\n'
             'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c3-broken"} 3\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c4-removed"} 2\n'
             'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c1-us-central1"} 0\n'
             'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
             'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
@@ -1206,7 +1214,7 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertTrue(watcher["watch_set_ready"])
         self.assertEqual(1, watcher["clusters_up"])
         self.assertEqual(2, watcher["clusters_total"])
-        self.assertEqual(2, watcher["discovery_errors"])
+        self.assertEqual(1, watcher["discovery_errors"])
 
     def test_parse_event_watcher_metrics_counts_distinct_error_profiles_across_ticks(self):
         # Cumulative rescan counter increments for one broken profile must count as 1 affected profile, not 7.
@@ -1228,6 +1236,199 @@ class AgentAPIProxyTest(unittest.TestCase):
         )
         multi = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(multi_profile_text)
         self.assertEqual(2, multi["discovery_errors"])
+
+    def test_parse_event_watcher_metrics_filters_recovered_and_removed_profiles(self):
+        # Transient skip that recovered (profile now maps to a watched cluster) and a profile
+        # later removed from disk must both drop to 0, while genuinely failing profiles stay counted.
+        identities = [
+            {
+                "profile": "cluster-proj-a-recovered-us-central1",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+            {
+                "profile": "cluster-proj-a-still-denied-us-east1",
+                "project": "proj-a",
+                "cluster": "still-denied",
+                "location": "us-east1",
+                "ready": True,
+            },
+        ]
+        present = {
+            "cluster-proj-a-recovered-us-central1",
+            "cluster-proj-a-still-denied-us-east1",
+        }
+
+        # Recovered + removed only => 0 active discovery errors.
+        stale_only_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-us-central1"} 1\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-deleted-us-west1"} 4\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="-"} 1\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        stale_only = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            stale_only_text,
+            profile_identities=identities,
+            present_profiles=present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(0, stale_only["discovery_errors"])
+
+        # Genuinely failing profile (valid identity on disk, still absent from cluster_up) stays 1.
+        still_failing_text = (
+            stale_only_text
+            + 'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-still-denied-us-east1"} 3\n'
+        )
+        still_failing = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            still_failing_text,
+            profile_identities=identities,
+            present_profiles=present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, still_failing["discovery_errors"])
+
+        # Duplicate on-disk profile claiming an already-watched cluster remains counted as 1 active error
+        # (even if both profiles carry historical counter increments), and clears once the duplicate is removed.
+        dup_identities = [
+            *identities,
+            {
+                "profile": "cluster-proj-a-recovered-copy",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+        ]
+        dup_present = present | {"cluster-proj-a-recovered-copy"}
+        dup_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-us-central1"} 1\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-copy"} 2\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        dup_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            dup_text,
+            profile_identities=dup_identities,
+            present_profiles=dup_present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, dup_res["discovery_errors"])
+
+        # Reserved "direct" profile directory is always refused by the watcher while present on disk.
+        direct_identities = [
+            {
+                "profile": "direct",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+        ]
+        direct_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="direct"} 2\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        direct_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            direct_text,
+            profile_identities=direct_identities,
+            present_profiles={"direct"},
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, direct_res["discovery_errors"])
+
+        # Unreadable profiles directory preserves the NoProfile ("-") discovery error.
+        unreadable_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="-"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        unreadable_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            unreadable_text,
+            profile_identities=[],
+            present_profiles=set(),
+            profiles_dir_unreadable=True,
+        )
+        self.assertEqual(1, unreadable_res["discovery_errors"])
+
+    def test_scope_route_clears_recovered_and_removed_discovery_errors_end_to_end(self):
+        root = Path(self.workspace_dir.name)
+        profiles_dir = root / "profiles"
+
+        recovered = profiles_dir / "cluster-proj-a-c1-us-central1"
+        recovered.mkdir(parents=True)
+        (recovered / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-a\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (recovered / "profile.yaml").write_text("name: cluster-proj-a-c1-us-central1\n", encoding="utf-8")
+        (recovered / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        failing = profiles_dir / "cluster-proj-a-c2-us-east1"
+        failing.mkdir(parents=True)
+        (failing / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-a\n  cluster: c2\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        (failing / "profile.yaml").write_text("name: cluster-proj-a-c2-us-east1\n", encoding="utf-8")
+        (failing / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        # c1 transiently failed then recovered (cluster_up=1); c3 was removed from disk; c2 is still failing.
+        metrics_state = {
+            "body": (
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 1\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 2\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c3-removed"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-a"} 1\n'
+                "k8s_event_watcher_watch_set_ready 1\n"
+            ).encode("utf-8")
+        }
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = metrics_state["body"]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _message, *_args):
+                return
+
+        metrics_srv = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        threading.Thread(target=metrics_srv.serve_forever, daemon=True).start()
+        self.addCleanup(metrics_srv.server_close)
+        self.addCleanup(metrics_srv.shutdown)
+
+        env = {
+            "EVENT_WATCHER_ENABLED": "true",
+            "EVENT_WATCHER_METRICS_PORT": str(metrics_srv.server_port),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                first = json.loads(resp.read())
+            self.assertEqual(1, first["event_watcher"]["discovery_errors"])
+
+            # Once c2 also recovers (now in cluster_up) while all cumulative counters stay >= 1,
+            # /api/scope reports 0 active discovery errors without a watcher pod restart.
+            metrics_state["body"] = (
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 1\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 2\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c3-removed"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-a"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-a"} 1\n'
+                "k8s_event_watcher_watch_set_ready 1\n"
+            ).encode("utf-8")
+            with urllib.request.urlopen(req) as resp:
+                second = json.loads(resp.read())
+            self.assertEqual(0, second["event_watcher"]["discovery_errors"])
 
     def test_scope_route_skips_unreadable_profile_and_coerces_bool_max_projects(self):
         root = Path(self.workspace_dir.name)
