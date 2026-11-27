@@ -81,7 +81,29 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 	if err != nil {
 		return tools.BuiltinTools{}, permissions.Options{}, nil, err
 	}
-	return b, permissions.Options{Mode: permissions.ModeAllow, Policy: policy, Scope: scope}, []*plugin.Plugin{pl}, nil
+	mode := permissions.ModeAllow
+	if p.AnyShellCommand {
+		// A persona's shell runs any command, compound ones included, which
+		// core-agent's allow mode can't express: its allow rules pass a
+		// shell command only as one plain command, and every tool sees the
+		// agent's one gate. So such a turn runs in the mode that doesn't
+		// refuse an unmatched call. What still holds: registration (only
+		// the policy's built-ins), this plugin (only the policy's tools),
+		// deny rules, and core-agent's built-in shell denylist. The read
+		// tools' workspace scope doesn't, which a shell that reads
+		// anywhere never had; so the grant may not carry a file write,
+		// which would lose its scope too.
+		if !permitted["bash"] {
+			return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command must grant the shell")
+		}
+		for name := range permitted {
+			if toolgrant.CoreAgentWrites(name) {
+				return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command may not grant %s, whose workspace scope that mode drops", name)
+			}
+		}
+		mode = permissions.ModeYolo
+	}
+	return b, permissions.Options{Mode: mode, Policy: policy, Scope: scope}, []*plugin.Plugin{pl}, nil
 }
 
 // refusalLog is where each refused tool call is logged, one line each
