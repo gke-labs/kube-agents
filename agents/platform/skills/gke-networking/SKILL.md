@@ -181,7 +181,10 @@ from the `linear` JSON policy in `ConfigMap/kube-dns-autoscaler` in `kube-system
 `preventSinglePointFailure: true`, `includeUnschedulableNodes: true`, with `min` unset/1 so a
 1-node cluster runs 1 replica and 2+ nodes get a 2-replica floor via `preventSinglePointFailure`)
 lags behind rapid node bursts. (Do not propose `ConfigMap/kube-dns-autoscaler` edits on GKE
-Autopilot or `CLOUD_DNS` clusters.)
+Autopilot, or on `CLOUD_DNS` clusters where `Deployment/kube-dns` is absent or scaled to 0; on a
+Standard cluster mid-migration to `CLOUD_DNS` where `Deployment/kube-dns` still has running
+replicas, pods on un-recreated node pools still resolve through `kube-dns` until those node pools
+are recreated.)
 
 When a Standard cluster stays on `kube-dns`, propose a tighter `ConfigMap/kube-dns-autoscaler`
 manifest through `gke-manifest-generation` and `submit-suggestion` — lowering `nodesPerReplica`
