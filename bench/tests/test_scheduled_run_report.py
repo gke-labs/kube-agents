@@ -442,3 +442,17 @@ def test_the_stack_pins_audit_id_to_the_planted_checks_stream():
     variables = (STACK / "variables.tf").read_text(encoding="utf-8")
     assert f'condition     = var.audit_id == "{plant.PLANT_AUDIT}"' in variables
     assert plant.PLANT_CHECK in audit_report.audit_checks(plant.PLANT_AUDIT)
+
+
+def test_a_repository_of_the_wrong_shape_is_refused_before_any_write(store):
+    # variables.tf checks only gitops_repo's characters; its shape is
+    # audit_report's to check, at apply, before the seed writes anything.
+    with pytest.raises(ValueError):
+        plant.seed(audit_report, AUDIT, MARK, "acme/team/fleet", NOW)
+    assert snapshot(store) == {}
+
+
+def test_the_stack_keeps_shell_syntax_out_of_gitops_repo():
+    variables = (STACK / "variables.tf").read_text(encoding="utf-8")
+    block = variables[variables.index('variable "gitops_repo"') :]
+    assert 'regex("^[A-Za-z0-9._/-]*$", var.gitops_repo)' in block

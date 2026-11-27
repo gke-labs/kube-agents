@@ -55,10 +55,10 @@ variable "mark" {
 
 variable "gitops_repo" {
   type        = string
-  description = "owner/name of the GitOps repository; empty resolves it the way audit_report.py does"
+  description = "owner/name of the GitOps repository; empty resolves it the way audit_report.py does. Only its characters are checked here, so it can't carry shell syntax; audit_report.py checks its shape at apply, and a seed that refuses it runs teardown."
   default     = ""
   validation {
-    condition     = var.gitops_repo == "" || (can(regex("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$", var.gitops_repo)) && !can(regex("(^|/)[.][.]?(/|$)", var.gitops_repo)))
-    error_message = "gitops_repo is empty or owner/name (host/path for another forge): two or more segments of letters, digits, '.', '_' and '-', none of them '.' or '..'."
+    condition     = can(regex("^[A-Za-z0-9._/-]*$", var.gitops_repo)) && !can(regex("(^|/)[.][.]?(/|$)", var.gitops_repo))
+    error_message = "gitops_repo holds only letters, digits, '.', '_', '-' and '/', with no '.' or '..' segment."
   }
 }
