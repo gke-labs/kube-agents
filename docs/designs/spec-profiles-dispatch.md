@@ -134,8 +134,9 @@ What a one-per-cluster design would have bought, and where it lives instead:
   agent, which opts in with `yieldToPinned`, not for a specialist such as `tse`: a task
   addressed to a specialist by name keeps that specialist's persona on a pinned cluster.
 - **A bound to a team's namespaces:** proposed in
-  [`profile-namespace-bound.md`](profile-namespace-bound.md): a pinned profile with a fixed list
-  of namespaces, which the credential proxy would hold its tasks to.
+  [`profile-namespace-bound.md`](profile-namespace-bound.md): a kind of its own for a team's
+  profile, with one cluster and a fixed list of namespaces, which the credential proxy would
+  hold its tasks to.
 
 ## Scale rules
 
