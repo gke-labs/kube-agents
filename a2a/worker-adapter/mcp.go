@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 // The session's one tool: ask the gateway to mint a child task. The harness
@@ -23,7 +24,10 @@ import (
 // turn (spec-chatops-gateway.md, "Sessions by default"); this server only
 // carries the call and reports the adapter's answer.
 const (
-	DelegateToolName      = "delegate"
+	DelegateToolName = "delegate"
+	// DelegateMCPCommand is the subcommand that serves the tool
+	// (cmd/worker-adapter dispatches it).
+	DelegateMCPCommand    = "mcp"
 	DelegateMCPServer     = "a2a"
 	EnvDelegateSocket     = "A2A_DELEGATE_SOCKET"
 	DefaultDelegateSocket = "/scratch/a2a-delegate.sock"
@@ -444,4 +448,19 @@ func forwardDelegate(socketPath string, req lib.DelegateRequest) (delegateReply,
 		return delegateReply{}, fmt.Errorf("reading the adapter's reply: %w", err)
 	}
 	return reply, nil
+}
+
+// ProfileDelegate is the delegate tool's MCP server for a profile worker's
+// persona render (persona.Target.Delegate): this binary, at self, serving
+// DelegateMCPCommand against socket. Either empty is no tool.
+func ProfileDelegate(self, socket string) persona.Delegate {
+	if self == "" || socket == "" {
+		return persona.Delegate{}
+	}
+	return persona.Delegate{
+		Command: self,
+		Args:    []string{DelegateMCPCommand},
+		Env:     map[string]string{EnvDelegateSocket: socket},
+		Tool:    DelegateToolName,
+	}
 }

@@ -277,6 +277,21 @@ func delegateWidthOf(origin *lib.Envelope) int {
 	return targets.Width()
 }
 
+// delegateRoundsOf is the delegation rounds the submission's delegateTargets
+// part advertises (lib.DelegateTargets.Rounds), or one when it has no part or
+// one that doesn't parse: one request a task, which every gateway takes.
+func delegateRoundsOf(origin *lib.Envelope) int {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return 1
+	}
+	targets, ok, err := lib.DelegateTargetsOf(m.Parts)
+	if !ok || err != nil {
+		return 1
+	}
+	return targets.Rounds()
+}
+
 // withDelegateServerEnv sets key to value in the delegate MCP server's env
 // inside the --mcp-config argument, reporting whether the server's entry was
 // found. argv is not modified.

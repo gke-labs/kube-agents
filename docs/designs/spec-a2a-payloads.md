@@ -824,8 +824,9 @@ credential-proxy token.
   would change what runs.
 
 **Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
-carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?, "round"?}}`. The parent's per-task
-reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?, "round"?}}`. The parent's worker
+collects its children's ends and hands them to its model together, as one turn, once each entry has
+one (`spec-chatops-gateway.md`, "The profile parent's wait"). `state` is the child's terminal state. `text` is its deliverable
 when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
 `result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
 

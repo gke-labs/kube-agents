@@ -73,6 +73,12 @@ type ProfileWorkerConfig struct {
 	// relay (ProfileRelay, #5495). Empty drops every MCP server the persona
 	// declares, and the render says so.
 	Relay persona.Relay
+	// Delegate is the delegate tool's MCP server (ProfileDelegate), for a
+	// profile that delegates (lib.EnvProfileDelegates) and a Config with a
+	// delegate socket. It is rendered beside the persona's servers for a
+	// task the tool is on for; a child or a wake (a task with via) gets the
+	// persona without it. Zero renders no tool.
+	Delegate persona.Delegate
 	// ConfigRoot is where each task's config directory is made: its own
 	// emptyDir, not the harness's working directory.
 	ConfigRoot string
@@ -176,10 +182,15 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		return err
 	}
 	if pw.PersonaDir != "" {
-		if w.persona, w.skills, err = renderPersona(pw, cfg.Logger); err != nil {
+		if w.persona, w.skills, err = renderPersona(pw, persona.Delegate{}, cfg.Logger); err != nil {
 			return err
 		}
 		logPersonaWarnings(cfg.Logger, w.persona)
+		if cfg.DelegateSocket != "" && pw.Delegate.Command != "" {
+			if w.personaDelegate, _, err = renderPersona(pw, pw.Delegate, nil); err != nil {
+				return err
+			}
+		}
 	}
 	// core-agent takes its tool grant in each turn's envelope, from the
 	// driver: the persona's replaces the empty grant a profile pod's driver
@@ -231,6 +242,9 @@ type profileWorker struct {
 	// kubeProxy is the loopback in front of the pod's kube-proxy, nil when
 	// the pod names none.
 	kubeProxy *KubeProxyLoopback
+	// personaDelegate is the same persona rendered with the delegate tool,
+	// for a profile that delegates; nil otherwise.
+	personaDelegate *persona.Output
 }
 
 // renderPersona loads the profile's persona and renders it for the harness,
@@ -239,8 +253,9 @@ type profileWorker struct {
 // running pod, and a persona that doesn't load stops the worker before it
 // takes a task. That includes a persona whose files don't match its
 // build-time content manifest, and, under RequirePersonaIntegrity, one with
-// no manifest. Which of verified or unverified it loaded as is logged.
-func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, []string, error) {
+// no manifest. Which of verified or unverified it loaded as is logged, when
+// log is set: the delegate render of the same persona passes nil.
+func renderPersona(pw ProfileWorkerConfig, delegate persona.Delegate, log *slog.Logger) (*persona.Output, []string, error) {
 	// The persona loads, and its files are checked, before the harness is
 	// looked at: the check is the same for every harness, and a persona that
 	// differs from its build is refused as that, whichever driver the
@@ -255,8 +270,10 @@ func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, [
 	}
 	// Logged once the persona is one this harness can use, so a refused
 	// harness doesn't follow a success line.
-	logPersonaIntegrity(log, pw.PersonaDir, p)
-	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
+	if log != nil {
+		logPersonaIntegrity(log, pw.PersonaDir, p)
+	}
+	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay, Delegate: delegate})
 	if err != nil {
 		return nil, nil, fmt.Errorf("rendering the persona: %w", err)
 	}
@@ -671,8 +688,16 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 			// setting sources) after the base argv, which carries none. A
 			// harness that takes MCP in-process (core-agent) has no flags
 			// for it; its servers go in PersonaMCP, for each turn's envelope.
-			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
+			// A profile that delegates runs with the delegate tool rendered
+			// in, and without it for a task the tool is off for
+			// (delegateOffForTask).
+			base := cfg.HarnessCommand
+			cfg.HarnessCommand = append(append([]string(nil), base...), w.persona.Args...)
 			cfg.HarnessCommandNoDelegate = nil
+			if w.personaDelegate != nil {
+				cfg.HarnessCommandNoDelegate = cfg.HarnessCommand
+				cfg.HarnessCommand = append(append([]string(nil), base...), w.personaDelegate.Args...)
+			}
 			// A harness that reads no config dir names none.
 			if kv := cfg.driver().ConfigDirEnv(dir); kv != "" {
 				cfg.HarnessEnv = append(cfg.HarnessEnv, kv)

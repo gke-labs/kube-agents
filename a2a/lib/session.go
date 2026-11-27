@@ -124,6 +124,14 @@ const (
 	// alike, so it is started with the tool on, and its adapter turns the
 	// tool off for each wake whose authority block's via lacks the grant.
 	EnvDelegateTool = "A2A_DELEGATE_TOOL"
+	// EnvProfileDelegates is "true" on a profile worker whose AgentProfile
+	// sets spec.delegates: its tasks get the delegate tool, and a task that
+	// delegates stays open for its children's results. The operator renders
+	// it only for such a profile, and leaves EnvDelegateTool unset there;
+	// every other profile pod keeps EnvDelegateTool "off". Literal "true" is
+	// on, and the worker needs both (the tool's switch not "off") before it
+	// offers the tool.
+	EnvProfileDelegates = "A2A_PROFILE_DELEGATES"
 	// EnvSessionReuse is "true" on a session pod that serves every turn of
 	// its conversation rather than one task: after the task named by
 	// TASK_ID it takes each new task from its own `…in` subjects. The

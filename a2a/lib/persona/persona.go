@@ -167,9 +167,28 @@ type MCPServer struct {
 	Tools   []string
 }
 
+// DelegateServer is the MCP server name the worker's own delegate tool is
+// rendered under (Target.Delegate): ReservedServer, so a persona that
+// declares a server by this name is refused, delegating or not, and none of
+// its tools can pass for the worker's.
+const DelegateServer = ReservedServer
+
+// Delegate is the worker's delegate tool, for a profile that delegates: a
+// stdio MCP server the worker itself answers, rendered under DelegateServer
+// with its one tool, Tool, on the allowlist. Command and Args start it and Env
+// is its environment. The zero Delegate renders none.
+type Delegate struct {
+	Command string
+	Args    []string
+	Env     map[string]string
+	Tool    string
+}
+
 // Target is what an adapter needs from the pod it renders for.
 type Target struct {
 	Relay Relay
+	// Delegate is the worker's delegate tool, when the profile delegates.
+	Delegate Delegate
 }
 
 // Output is one harness's rendering of a persona.

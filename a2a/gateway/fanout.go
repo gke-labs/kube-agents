@@ -434,9 +434,10 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 }
 
 // healProfileBatch heals a waiting profile parent's batch children: a child
-// with no end recorded is healed as a session fan-out's is (healBatchChild),
-// which sends its end to the parent, and an end recorded Unsent is sent
-// again. The parent itself is healed by the caller, as any task is. It
+// with no end recorded is healed as a session fan-out's is (healBatchChild,
+// on a direct-get probe, with one running child spot-checked in full each
+// pass), which sends its end to the parent, and an end recorded Unsent is
+// sent again. The parent itself is healed by the caller, as any task is. It
 // writes the record when anything changed.
 func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, parent TaskRef) {
 	changed := false
