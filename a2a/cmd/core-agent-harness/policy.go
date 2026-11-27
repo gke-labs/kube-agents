@@ -32,7 +32,8 @@ const toolPolicyPluginName = "kube-agents-tool-policy"
 //     offered);
 //   - the gate: allow mode with the policy's patterns, so a call no pattern
 //     allows is refused without a prompt, and deny wins; file tools reach
-//     only workdir, the turn's workspace (the path scope);
+//     only workdir, the turn's workspace (the path scope). A persona's
+//     shell runs in another mode (below);
 //   - the before-tool plugin, returned first: every call, MCP and skills
 //     included, is checked against the turn's tools before it runs, and
 //     one outside them is refused (the tool is skipped and the refusal is
@@ -89,16 +90,25 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 		// agent's one gate. So such a turn runs in the mode that doesn't
 		// refuse an unmatched call. What still holds: registration (only
 		// the policy's built-ins), this plugin (only the policy's tools),
-		// deny rules, and core-agent's built-in shell denylist. The read
-		// tools' workspace scope doesn't, which a shell that reads
-		// anywhere never had; so the grant may not carry a file write,
-		// which would lose its scope too.
+		// deny rules, core-agent's built-in shell denylist, and two of its
+		// gate's checks left at their defaults, each a best-effort narrowing
+		// and neither a boundary: a scan of a command's visible write
+		// targets (a top-level redirection, or a cp, mv, mkdir, tee and the
+		// like) refuses one outside workdir and the temp directories, which
+		// an interpreter (bash -c, python3 -c) passes unseen; and the search
+		// gate refuses a search-shaped command such as grep -rn or find .
+		// while the native grep and glob tools are registered. So "any
+		// command" means any command those pass. The
+		// read tools' workspace scope doesn't hold, which a shell that reads
+		// anywhere never had. The grant may not carry a file write: no
+		// persona grants one, and in this mode the path scope wouldn't
+		// confine it, so such a policy is refused rather than run.
 		if !permitted["bash"] {
 			return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command must grant the shell")
 		}
 		for name := range permitted {
 			if toolgrant.CoreAgentWrites(name) {
-				return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command may not grant %s, whose workspace scope that mode drops", name)
+				return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command may not grant %s, which that mode's path scope wouldn't confine", name)
 			}
 		}
 		mode = permissions.ModeYolo

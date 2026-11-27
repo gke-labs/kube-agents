@@ -520,14 +520,14 @@ failed (a 200 with Hermes's failure verdict, with its counts, or a 5xx, with the
 or a CLI run that exited on its own; a request the server refused before a turn ran (a 4xx), or a
 turn killed by a cancel, the deadline or a shutdown, has no figure and publishes none. Telemetry
 a producer cannot read is dropped field by field with one log line per turn, never the turn. An `activity` entry is one `data` part whose object carries
-`tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
+`tool`, and `input` (the argument shape, on the Hermes bridge) or `title` (the worker-adapter's short scrubbed title, with no arguments), and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
 or unreported at its drain; `dropped` counts them all, and a delivery the executor could not
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text (outside the bridge's off-by-default `BRIDGE_DEBUG_ERROR_TEXT` debugging switch), is published - `input` is the argument shape under both executors); the library
+an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title` too, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text (outside the bridge's off-by-default `BRIDGE_DEBUG_ERROR_TEXT` debugging switch), is published - `input` is the argument shape under both executors); the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
@@ -1024,7 +1024,7 @@ carry the same chat message:
 - **`chat`** is a `kube-agents.chat/v1` object beside the request's `text`, which is its
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
   the place of the request's raw `blocks` for a conversation post. A home-channel request
-  may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
+  may carry one too: the cron relay's fleet-audit card, its findings-nudge card or the first inventory's, laid out
   the same way, its `update` key kept per home thread as below and its `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that

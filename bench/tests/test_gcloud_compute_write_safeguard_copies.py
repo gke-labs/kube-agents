@@ -37,6 +37,7 @@ COLLECTOR = "/opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/
 NETWORKING_COLLECTOR = "/opt/data/profiles/platform/skills/gcp-networking-fabric-audit/scripts/networking_audit.py"
 ENDPOINT = "bench-psc-rejected-endpoint"
 SUBNET = "bench-exhausted-subnet"
+HC_DENY = "hc-shadow-deny-ci1"
 EXPAND = f"gcloud compute networks subnets expand-ip-range {SUBNET} --region=us-central1 --prefix-length=20"
 SUBNET_ADVICE = [
     (TERMINAL, f"python3 -c '\nimport json\nprint(json.dumps({{\"fix\": \"Widen the range: {EXPAND}\"}}))\n'"),
@@ -204,6 +205,24 @@ COPIES = {
         "advice": SUBNET_ADVICE + [(TERMINAL, 'grep -n "gcloud compute networks subnets expand-ip-range" /opt/data/profiles/platform/skills/gcp-networking-fabric-audit/SKILL.md')],
         "reads": SUBNET_READS + [f"python3 {NETWORKING_COLLECTOR} --project p --format json"],
         "writes": SUBNET_WRITES,
+    },
+    "networking-health-check-shadowed": {
+        "check": SOURCE_CHECK,
+        "advice": [
+            (TERMINAL, "jq '.findings |= map(.remediation = \"gcloud compute firewall-rules create allow-gcp-hc --network=default --priority=800 --source-ranges=35.191.0.0/16,130.211.0.0/22 --allow=tcp:80\")' /tmp/findings.json"),
+            (TERMINAL, f'echo "gcloud compute firewall-rules update {HC_DENY} --priority=1100"'),
+            (EXECUTE_CODE, f"advice = 'Narrow it: gcloud compute firewall-rules update {HC_DENY} --target-tags=web'\nprint(advice)"),
+        ],
+        "reads": [
+            "gcloud compute firewall-rules list --project=p --format=json",
+            f"gcloud compute firewall-rules describe {HC_DENY} --project=p --format=json",
+            f"python3 {NETWORKING_COLLECTOR} --project p --format json",
+        ],
+        "writes": [
+            f"gcloud compute firewall-rules delete {HC_DENY} --project=p --quiet",
+            f"gcloud compute firewall-rules update {HC_DENY} --project=p --priority=1100",
+            "gcloud compute firewall-rules create allow-gcp-hc --network=default --priority=800 --source-ranges=35.191.0.0/16 --allow=tcp:80",
+        ],
     },
     "fleet-audit-sweeps-the-declared-scope": {
         "check": SOURCE_CHECK,

@@ -2,7 +2,7 @@
 """
 networking_audit.py — collector for the GCP networking fabric and VPC IPAM audit.
 
-Sweeps every project in scope for all seven checks of
+Sweeps every project in scope for all eight checks of
 governance/gcp_networking_fabric_sop.md and writes the run manifest
 docs/designs/fleet-audit-collector-manifest.md §2 specifies, so
 `audit_report.py finish --manifest-file` cross-checks the worker's
@@ -17,15 +17,15 @@ Two target shapes, matching `AuditSpec.scopes` for this stream:
   host subnet counts its service projects' use (`read_subnet_usage`,
   `audit_subnet_capacity`). No Network Analyzer insight and no
   `subnets list-usable`: both need grants the agent does not hold.
-- `project/<project>` owes the other six: `cloud-nat-exhaustion`
+- `project/<project>` owes the other seven: `cloud-nat-exhaustion`
   (`routers list`, then `get-status` and a per-gateway `get-nat-mapping-info`
   for each dynamic-allocation gateway), `psc-routing-deadlock`
   (`forwarding-rules list`, unfiltered), `mtu-packet-fragmentation`
   (`networks list`, comparing ACTIVE peerings), `cloud-armor-false-positive`
   (`security-policies list` against `backend-services list`),
-  `firewall-world-open-ingress` (`firewall-rules list` against `instances
-  list`) and `missing-nodelocal-dnscache` (the sweep's `container clusters
-  list`). A failed read costs only the checks that use it. Each such check
+  `firewall-world-open-ingress` and `firewall-health-check-shadowed` (both
+  `firewall-rules list` against `instances list`, read once) and
+  `missing-nodelocal-dnscache` (the sweep's `container clusters list`). A failed read costs only the checks that use it. Each such check
   goes in the target's `checks_unevaluated`, and the other checks keep their
   verdicts. The target is `gate-failed` only when no read passes.
 
@@ -211,6 +211,49 @@ NAT_CHECK_SLUG = "cloud-nat-exhaustion"
 MTU_CHECK_SLUG = "mtu-packet-fragmentation"
 ARMOR_CHECK_SLUG = "cloud-armor-false-positive"
 FIREWALL_CHECK_SLUG = "firewall-world-open-ingress"
+HC_SHADOW_CHECK_SLUG = "firewall-health-check-shadowed"
+# The source ranges of Google Cloud health-check probes, from
+# https://cloud.google.com/load-balancing/docs/health-check-concepts (probe IP
+# ranges): the ranges every load balancer probes from, the regional external
+# passthrough Network Load Balancer ranges (209.85.152.0/22 also serves target
+# pools), the global external passthrough Network Load Balancer ranges, and the
+# IPv6 ranges.
+# 130.211.0.0/22 has left the probe table but GKE still writes it, so a rule
+# naming it is still a health-check allow.
+HEALTH_CHECK_SOURCE_RANGES = (
+    "35.191.0.0/16",
+    "130.211.0.0/22",
+    "209.85.152.0/22",
+    "209.85.204.0/22",
+    "136.124.104.0/22",
+    "136.124.108.0/22",
+    "2600:2d00:1:b029::/64",
+    "2600:1901:8001::/48",
+    "2600:1904:7::/48",
+    "2600:1904:8::/48",
+)
+# The same ranges parsed once, for the containment tests.
+HEALTH_CHECK_NETWORKS = tuple(ipaddress.ip_network(r) for r in HEALTH_CHECK_SOURCE_RANGES)
+# The whole TCP port space, which an `allowed[]` or `denied[]` entry with no
+# `ports` key covers.
+TCP_PORT_MIN = 1
+TCP_PORT_MAX = 65535
+# How many shadowed health-check allows an excerpt names before it summarises
+# the rest.
+MAX_NAMED_SHADOWED_ALLOWS = 3
+# What the health-check check cannot see: no load balancer is read, so an
+# instance in the allow's target counts whether or not one sends to it; an
+# allow in a hierarchical firewall policy is evaluated before the VPC rules and
+# can admit the probes,
+# and an Envoy-based load balancer's probes to hybrid or regional internet NEGs
+# come from the proxy-only subnet, not from these ranges. The probe's port is not read,
+# so a DENY that covers only some of an allow's ports is not reported.
+HC_SHADOW_BLIND_SPOT = (
+    "no load balancer was read, so these instances may not be backends of one; "
+    "firewall policies were not read, and an allow in a hierarchical one can admit the probes first; "
+    "Envoy-based load balancers probe hybrid or regional internet NEGs from the proxy-only subnet, not these ranges; "
+    "the probe's port is not read, so a DENY covering only some of the allow's ports is not reported"
+)
 DNS_CACHE_CHECK_SLUG = "missing-nodelocal-dnscache"
 # What the DNS cache check calls its read in a limitation.
 DNS_CACHE_READ = "Cluster add-ons"
@@ -228,7 +271,7 @@ CLUSTER_NAME_SEPARATOR = ", "
 # The project target's limitation when the fleet pass measured its rules
 # without the instances of other projects whose `instances list` failed.
 FLEET_INSTANCES_UNREAD_LIMITATION = (
-    "firewall-world-open-ingress measured these rules without the instances of "
+    "firewall-world-open-ingress and firewall-health-check-shadowed measured these rules without the instances of "
     "{count} other project(s), whose firewall or instance reads failed: {names}"
 )
 # The project target's limitation when its own `forwarding-rules list` failed
@@ -254,6 +297,16 @@ UNDECIDED_FIREWALL_LIMITATION = (
     "management port to the internet and reach no instance visible to the audit "
     "identity, which does not see GKE Autopilot nodes; confirm by hand that no "
     "instance gets the rule: {names}"
+)
+# The project target's limitation for a DENY that shadows a health-check allow
+# whose target no instance visible to the audit identity carries, or that has
+# no target on a network holding a GKE Autopilot cluster or whose clusters
+# could not be read.
+UNDECIDED_HC_SHADOW_LIMITATION = (
+    "firewall-health-check-shadowed could not decide {count} DENY rule(s) that shadow a "
+    "health-check allow reaching no instance visible to the audit identity, which does not "
+    "see GKE Autopilot nodes, on a network whose clusters may hold such nodes; confirm by "
+    "hand that no load balancer backend gets the rules: {names}"
 )
 # The load-balancing scheme of an external passthrough Network Load Balancer.
 # It keeps the load balancer IP as the destination of each packet, so the VPC
@@ -350,6 +403,7 @@ SEVERITY = {
     MTU_CHECK_SLUG: "major",
     ARMOR_CHECK_SLUG: "minor",
     FIREWALL_CHECK_SLUG: "critical",
+    HC_SHADOW_CHECK_SLUG: "major",
     DNS_CACHE_CHECK_SLUG: "minor",
 }
 IMPACT = {
@@ -373,6 +427,11 @@ IMPACT = {
     FIREWALL_CHECK_SLUG: (
         "Any host on the internet can open a TCP connection to these ports on the instances named, "
         "so whatever authenticates on the far side of the port is the entire perimeter."
+    ),
+    HC_SHADOW_CHECK_SLUG: (
+        "Health-check probes to the instances named are dropped on these ports, so a load balancer "
+        "whose backends they are marks them unhealthy and stops sending them traffic, with no error "
+        "at the workload layer."
     ),
     DNS_CACHE_CHECK_SLUG: (
         "Every Pod DNS lookup goes to the kube-dns ClusterIP and takes a conntrack entry on its node, "
@@ -1743,6 +1802,290 @@ def undecided_limitation(undecided: list[str]) -> str:
     return UNDECIDED_FIREWALL_LIMITATION.format(count=len(undecided), names=", ".join(undecided))
 
 
+def _tcp_port_ranges(block: list) -> list[tuple[int, int]]:
+    """The TCP port ranges an `allowed[]` or `denied[]` block covers, as
+    `(low, high)` pairs. An entry with no `ports` covers the whole TCP port
+    space, the way `gke-<hash>-all` rules are written; `all` and the IANA
+    number count as TCP. A range is clamped to that space, so `0-65535` and
+    no `ports` key read alike, and an inverted or half-written one is
+    dropped."""
+    covered: list[tuple[int, int]] = []
+    for entry in block or []:
+        if str(entry.get("IPProtocol", "")).lower() not in TCP_PROTOCOL_TOKENS:
+            continue
+        specs = entry.get("ports")
+        if not specs:
+            covered.append((TCP_PORT_MIN, TCP_PORT_MAX))
+            continue
+        for spec in specs:
+            low_text, separator, high_text = str(spec).partition("-")
+            try:
+                low, high = int(low_text), int(high_text if separator else low_text)
+            except ValueError:
+                continue
+            low, high = max(low, TCP_PORT_MIN), min(high, TCP_PORT_MAX)
+            if low <= high:
+                covered.append((low, high))
+    return covered
+
+
+def _ranges_cover(outer: list[tuple[int, int]], inner: list[tuple[int, int]]) -> bool:
+    """Whether the port ranges `outer` together cover every port of `inner`.
+    Overlap is not enough: a DENY of tcp:22 does not shadow an allow of
+    tcp:1-65535, because the probe's port is not read."""
+    if not inner:
+        return False
+    merged: list[list[int]] = []
+    for low, high in sorted(outer):
+        if merged and low <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], high)
+        else:
+            merged.append([low, high])
+    return all(any(m_low <= low and high <= m_high for m_low, m_high in merged) for low, high in inner)
+
+
+def _health_check_networks(rule: dict) -> list:
+    """The source ranges of `rule` that lie inside a health-check probe range,
+    parsed. An allow names the probes through these."""
+    found = []
+    for value in rule.get("sourceRanges") or []:
+        try:
+            net = ipaddress.ip_network(str(value), strict=False)
+        except ValueError:
+            continue
+        if any(net.version == probe.version and net.subnet_of(probe) for probe in HEALTH_CHECK_NETWORKS):
+            found.append(net)
+    return found
+
+
+def _source_networks(rule: dict) -> list:
+    """The source ranges a rule matches by address, parsed. Sources are the
+    union of `sourceRanges` and the source tags or service accounts, so a tag
+    beside a range does not narrow the range. A rule with no source at all
+    matches every IPv4 address; one with only source tags or service accounts
+    matches no probe."""
+    ranges = rule.get("sourceRanges") or []
+    if not ranges and not rule.get("sourceTags") and not rule.get("sourceServiceAccounts"):
+        ranges = [WORLD_IPV4_RANGE]
+    found = []
+    for value in ranges:
+        try:
+            found.append(ipaddress.ip_network(str(value), strict=False))
+        except ValueError:
+            continue
+    return found
+
+
+def _covers_probes(rule: dict, allow: dict) -> bool:
+    """Whether the sources of `rule` cover every health-check range `allow`
+    names, by subnet containment within each address family."""
+    sources = _source_networks(rule)
+    probes = _health_check_networks(allow)
+    return bool(probes) and all(
+        any(probe.version == source.version and probe.subnet_of(source) for source in sources) for probe in probes
+    )
+
+
+def _covers_targets(deny: dict, allow: dict) -> bool:
+    """Whether `deny` applies to every instance `allow` applies to: no target
+    restriction, or target tags (or target service accounts) that include all
+    of the allow's. Tags against service accounts cannot be compared without
+    the instances, so that pair is not covered."""
+    deny_tags = {t.lower() for t in deny.get("targetTags") or []}
+    deny_accounts = {a.lower() for a in deny.get("targetServiceAccounts") or []}
+    if not deny_tags and not deny_accounts:
+        return True
+    allow_tags = {t.lower() for t in allow.get("targetTags") or []}
+    allow_accounts = {a.lower() for a in allow.get("targetServiceAccounts") or []}
+    if deny_tags:
+        return bool(allow_tags) and allow_tags <= deny_tags
+    return bool(allow_accounts) and allow_accounts <= deny_accounts
+
+
+def _shadows_health_check(deny: dict, allow: dict, project: str) -> bool:
+    """Whether the DENY `deny` blocks the probes that the allow `allow` admits:
+    an enabled INGRESS DENY on the same network, at the allow's priority or
+    above (a DENY wins a tie), with no destination ranges, covering every
+    health-check range the allow names, the allow's targets, and every TCP port
+    the allow opens.
+
+    A DENY with destination ranges is skipped: GKE 1.35.1+ writes
+    `k8s-fw-<hash>-deny` rules from 0.0.0.0/0 aimed at one load balancer's IP,
+    which block no probe to another backend."""
+    if not deny.get("denied") or deny.get("disabled"):
+        return False
+    if (deny.get("direction") or INGRESS).upper() != INGRESS or deny.get("destinationRanges"):
+        return False
+    if _network_key(deny.get("network", ""), project) != _network_key(allow.get("network", ""), project):
+        return False
+    if deny.get("priority", DEFAULT_FIREWALL_PRIORITY) > allow.get("priority", DEFAULT_FIREWALL_PRIORITY):
+        return False
+    if not _covers_probes(deny, allow):
+        return False
+    if not _covers_targets(deny, allow):
+        return False
+    return _ranges_cover(_tcp_port_ranges(deny.get("denied") or []), _tcp_port_ranges(allow.get("allowed") or []))
+
+
+def _admitted_first(deny: dict, allow: dict, firewalls: list, project: str, inst: dict | None = None) -> bool:
+    """Whether the other enabled INGRESS allows on the same network, at a
+    higher priority than `deny` (a lower number: the DENY wins a tie), with no
+    destination ranges, already admit every probe `allow` admits: for each
+    health-check range the allow names, the allows whose sources contain it
+    open, between them, every TCP port the allow opens. That is the
+    remediation §2.8 names, so the DENY then blocks no probe.
+
+    With `inst`, the question is asked for that instance: the earlier allows
+    are those whose target holds it, the way GCP picks the highest-priority
+    rule that matches each instance. Without it, they are those whose targets
+    cover the whole of the allow's, which answers for every instance the allow
+    reaches, seen or not."""
+    deny_priority = deny.get("priority", DEFAULT_FIREWALL_PRIORITY)
+    network = _network_key(allow.get("network", ""), project)
+    earlier = [
+        rule for rule in firewalls
+        if isinstance(rule, dict)
+        and rule is not allow
+        and rule.get("allowed")
+        and not rule.get("disabled")
+        and (rule.get("direction") or INGRESS).upper() == INGRESS
+        and not rule.get("destinationRanges")
+        and _network_key(rule.get("network", ""), project) == network
+        and rule.get("priority", DEFAULT_FIREWALL_PRIORITY) < deny_priority
+        and (_in_target(rule, inst, project) if inst is not None else _covers_targets(rule, allow))
+    ]
+    if not earlier:
+        return False
+    wanted = _tcp_port_ranges(allow.get("allowed") or [])
+    for probe in _health_check_networks(allow):
+        opened = [
+            port_range
+            for rule in earlier
+            if any(probe.version == source.version and probe.subnet_of(source) for source in _source_networks(rule))
+            for port_range in _tcp_port_ranges(rule.get("allowed") or [])
+        ]
+        if not _ranges_cover(opened, wanted):
+            return False
+    return True
+
+
+def _port_phrase(ranges: list[tuple[int, int]]) -> str:
+    return ", ".join(str(low) if low == high else f"{low}-{high}" for low, high in sorted(set(ranges)))
+
+
+def health_check_shadowed(
+    firewalls: list,
+    instances: list,
+    project: str,
+    autopilot_networks: dict | None = None,
+    clusters_unread: list | set | None = None,
+) -> tuple[list[dict], list[str]]:
+    """`(hits, undecided)` for SOP 2.8. A hit is one DENY that shadows at least
+    one health-check allow (`_shadows_health_check`) whose target holds a live
+    instance visible to the audit identity: one hit per DENY, naming the allows
+    it shadows, because the DENY is what a reader goes and changes. A DENY that
+    shadows only allows reaching no visible instance is undecided when an
+    instance the audit cannot see can get the allow, as in §2.6: a
+    target-scoped allow whose target no visible instance carries, or an allow
+    with no target on a network that holds an Autopilot cluster."""
+    allows = [
+        rule for rule in firewalls or []
+        if isinstance(rule, dict)
+        and rule.get("allowed")
+        and not rule.get("disabled")
+        and (rule.get("direction") or INGRESS).upper() == INGRESS
+        and _health_check_networks(rule)
+    ]
+    hits = []
+    undecided = []
+    for deny in firewalls or []:
+        if not isinstance(deny, dict):
+            continue
+        shadowed = [
+            allow for allow in allows
+            if allow is not deny
+            and _shadows_health_check(deny, allow, project)
+            and not _admitted_first(deny, allow, firewalls, project)
+        ]
+        if not shadowed:
+            continue
+        # Keyed by the instance, not its name: two projects in a Shared VPC
+        # can each hold a backend of the same name. Value: (label, project, zone).
+        affected: dict[str, tuple[str, str, str]] = {}
+        reaching: list[dict] = []
+        unsure: list[str] = []
+        for allow in shadowed:
+            in_target = [
+                inst for inst in instances or []
+                if isinstance(inst, dict)
+                and inst.get("status", INSTANCE_RUNNING) in LIVE_INSTANCE_STATUSES
+                and _in_target(allow, inst, project)
+            ]
+            live = [inst for inst in in_target if not _admitted_first(deny, allow, firewalls, project, inst)]
+            if in_target and not live:
+                # Every live instance the allow reaches is admitted first by
+                # another allow that matches it: the DENY blocks none of them.
+                continue
+            for inst in live:
+                origin = inst.get(ORIGIN_PROJECT_KEY, project)
+                name = str(inst.get("name", ""))
+                key = inst.get("selfLink") or f"{origin}/{inst.get('zone', '')}/{name}"
+                label = name if origin == project else f"{name} ({origin})"
+                affected.setdefault(key, (label, origin, _last_segment(str(inst.get("zone", "")))))
+            if live:
+                reaching.append(allow)
+                continue
+            target_scoped = allow.get("targetTags") or allow.get("targetServiceAccounts")
+            network = _network_key(allow.get("network", ""), project)
+            if target_scoped and not any(
+                isinstance(inst, dict) and _in_target(allow, inst, project) for inst in instances or []
+            ):
+                unsure.append(str(allow.get("name", "")))
+            elif not target_scoped and (
+                (autopilot_networks or {}).get(network)
+                or {project, network.split("/")[1]} & set(clusters_unread or ())
+            ):
+                unsure.append(str(allow.get("name", "")))
+        if not affected:
+            if unsure:
+                undecided.append(f"{deny.get('name', '')} (shadowing {', '.join(sorted(unsure))})")
+            continue
+        names = sorted(str(allow.get("name", "")) for allow in reaching)
+        extra_allows = len(names) - MAX_NAMED_SHADOWED_ALLOWS
+        # Two instances of one name in one project are told apart by zone.
+        label_count: dict[str, int] = {}
+        for label, _, _ in affected.values():
+            label_count[label] = label_count.get(label, 0) + 1
+        instance_names = sorted(
+            label if label_count[label] == 1 else f"{label} in {zone}" for label, _, zone in affected.values()
+        )
+        extra_instances = len(instance_names) - MAX_NAMED_EXPOSED_INSTANCES
+        allow_ports = [r for allow in reaching for r in _tcp_port_ranges(allow.get("allowed") or [])]
+        hits.append({
+            "object": f"FirewallRule/{deny.get('name', '')}",
+            "excerpt": (
+                f"DENY at priority {deny.get('priority', DEFAULT_FIREWALL_PRIORITY)} from "
+                f"{', '.join(deny.get('sourceRanges') or [WORLD_IPV4_RANGE])} blocks the health-check "
+                f"probes that allow rule(s) {', '.join(names[:MAX_NAMED_SHADOWED_ALLOWS])}"
+                + (f", +{extra_allows} more" if extra_allows > 0 else "")
+                + f" admit on tcp:{_port_phrase(allow_ports)}; {_target_scope_phrase(deny)}; "
+                f"{len(instance_names)} instance(s) visible to the audit identity are in both rules' targets: "
+                f"{', '.join(instance_names[:MAX_NAMED_EXPOSED_INSTANCES])}"
+                + (f", +{extra_instances} more" if extra_instances > 0 else "")
+                + f"; {HC_SHADOW_BLIND_SPOT}"
+            ),
+            "projects": sorted({origin for _, origin, _ in affected.values()}),
+        })
+    return hits, sorted(undecided)
+
+
+def hc_shadow_limitation(undecided: list[str]) -> str:
+    """The project target's limitations sentence for undecided DENY rules, or ""."""
+    if not undecided:
+        return ""
+    return UNDECIDED_HC_SHADOW_LIMITATION.format(count=len(undecided), names=", ".join(undecided))
+
+
 def instance_union(groups: list[list]) -> list[dict]:
     """Every instance in `groups`, each once, keyed by its selfLink, or by name
     and zone where a test fixture carries no link."""
@@ -1779,8 +2122,8 @@ def apply_fleet_firewall_reads(
     autopilot_networks: dict | None = None,
     clusters_unread: list | None = None,
 ) -> None:
-    """Measure again the §2.6 rules of each collected project target against the
-    instances of every project, not its own only. A Shared VPC host holds the
+    """Measure again the §2.6 and §2.8 rules of each collected project target
+    against the instances of every project, not its own only. A Shared VPC host holds the
     firewall rules, and its service projects hold the VMs.
 
     A project in scope with no firewall reads had a read that failed, and its
@@ -1807,8 +2150,13 @@ def apply_fleet_firewall_reads(
         hits, undecided = world_open_ingress(
             reads["firewalls"], fleet_instances, project, fleet_forwarding_rules, autopilot_networks, clusters_unread
         )
-        entry["candidates"] = [c for c in entry["candidates"] if c["check"] != FIREWALL_CHECK_SLUG] + [
-            emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits
+        hc_hits, hc_undecided = health_check_shadowed(
+            reads["firewalls"], fleet_instances, project, autopilot_networks, clusters_unread
+        )
+        entry["candidates"] = [
+            c for c in entry["candidates"] if c["check"] not in (FIREWALL_CHECK_SLUG, HC_SHADOW_CHECK_SLUG)
+        ] + [emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits] + [
+            emit(HC_SHADOW_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hc_hits
         ]
         others = [other for other in unread_projects if other != project]
         fleet_gap = (
@@ -1819,7 +2167,10 @@ def apply_fleet_firewall_reads(
             FLEET_FORWARDING_UNREAD_LIMITATION.format(count=len(others_fwd), names=", ".join(others_fwd))
             if others_fwd else ""
         )
-        limitations = [*reads["limitations"], undecided_limitation(undecided), fleet_gap, fleet_fwd_gap]
+        limitations = [
+            *reads["limitations"], undecided_limitation(undecided), hc_shadow_limitation(hc_undecided),
+            fleet_gap, fleet_fwd_gap,
+        ]
         limitations = [text for text in limitations if text]
         if limitations:
             entry["limitations"] = LIMITATION_JOINER.join(limitations)
@@ -1927,7 +2278,7 @@ def router_commands(project: str, router: str, region: str, nat: str | None = No
 def collect_project_target(
     project: str, instance_cache: dict | None = None, cluster_cache: dict | None = None
 ) -> dict | None:
-    """The `project/<project>` entry for the six project-level checks, or None
+    """The `project/<project>` entry for the seven project-level checks, or None
     for a project whose own Compute Engine API is off.
 
     A failed read costs only the checks that use it. Each such check goes in
@@ -2023,13 +2374,26 @@ def collect_project_target(
         reads.setdefault(FIREWALL_CHECK_SLUG, SlugReads()).add(shlex.join(cmds["instances"]), json.dumps(items), 0.0)
         return items
 
+    # What firewall() read, kept for hc_shadow(), which uses the same two
+    # listings. A read that failed there is kept as its failure, so
+    # hc_shadow() fails the same way rather than reading again: a project
+    # whose reads failed is left out of the fleet pass, and a verdict from a
+    # second read would stand on its own instances alone.
+    firewall_data: dict = {}
+
     def firewall() -> None:
-        firewalls = gated(cmds["firewall_rules"], FIREWALL_CHECK_SLUG)
-        instances = [
-            {**inst, ORIGIN_PROJECT_KEY: project}
-            for inst in cached_instances()
-            if isinstance(inst, dict)
-        ]
+        try:
+            firewalls = gated(cmds["firewall_rules"], FIREWALL_CHECK_SLUG)
+            instances = [
+                {**inst, ORIGIN_PROJECT_KEY: project}
+                for inst in cached_instances()
+                if isinstance(inst, dict)
+            ]
+        except GateFailure as exc:
+            firewall_data["failure"] = exc
+            raise
+        firewall_data["firewalls"] = firewalls
+        firewall_data["instances"] = instances
         forwarding_unread = "stdout" not in forwarding_read
         if forwarding_unread:
             limitations.append(FORWARDING_UNREAD_LIMITATION)
@@ -2048,6 +2412,25 @@ def collect_project_target(
         hits, rules = world_open_ingress(firewalls, instances, project, project_forwarding_rules)
         candidates.extend(emit(FIREWALL_CHECK_SLUG, hit, firewall_command(project, hit)) for hit in hits)
         undecided.extend(rules)
+
+    hc_undecided: list[str] = []
+
+    def hc_shadow() -> None:
+        firewalls_command = shlex.join(cmds["firewall_rules"])
+        instances_command = shlex.join(cmds["instances"])
+        # firewall() runs first and either read both listings or kept its
+        # failure; a ComputeApiDisabled from it ends the whole target.
+        if "failure" in firewall_data:
+            raise firewall_data["failure"]
+        firewalls = firewall_data["firewalls"]
+        instances = firewall_data["instances"]
+        slug_reads = reads.setdefault(HC_SHADOW_CHECK_SLUG, SlugReads())
+        slug_reads.add(firewalls_command, json.dumps(firewalls), 0.0)
+        slug_reads.add(instances_command, json.dumps(instances), 0.0)
+        hits, rules = health_check_shadowed(firewalls, instances, project)
+        command = joined_command([firewalls_command, instances_command])
+        candidates.extend(emit(HC_SHADOW_CHECK_SLUG, hit, command) for hit in hits)
+        hc_undecided.extend(rules)
 
     def dns_cache() -> None:
         cmd = subnet_commands(project)["clusters"]
@@ -2084,6 +2467,8 @@ def collect_project_target(
             (ARMOR_CHECK_SLUG, armor),
             (FIREWALL_CHECK_SLUG, firewall),
             (DNS_CACHE_CHECK_SLUG, dns_cache),
+            # After firewall(), whose reads it reuses; last, in SOP order (2.8).
+            (HC_SHADOW_CHECK_SLUG, hc_shadow),
         ):
             try:
                 check()
@@ -2114,7 +2499,7 @@ def collect_project_target(
     }
     if unevaluated:
         entry["checks_unevaluated"] = unevaluated
-    all_limitations = [*limitations, undecided_limitation(undecided)]
+    all_limitations = [*limitations, undecided_limitation(undecided), hc_shadow_limitation(hc_undecided)]
     all_limitations = [text for text in all_limitations if text]
     if all_limitations:
         entry["limitations"] = LIMITATION_JOINER.join(all_limitations)

@@ -114,6 +114,14 @@ const (
 	// log follow never finishes on its own, so it reaches this timeout and
 	// its client reconnects to another replica.
 	serverShutdownTimeout = 10 * time.Second
+
+	// The per-caller limits' flags and variables: k8sapiproxy.CallerLimits for every caller.
+	maxInFlightPerCallerFlag    = "max-in-flight-per-caller"
+	maxInFlightPerCallerEnv     = "KUBE_PROXY_MAX_IN_FLIGHT_PER_CALLER"
+	maxLongRunningPerCallerFlag = "max-long-running-per-caller"
+	maxLongRunningPerCallerEnv  = "KUBE_PROXY_MAX_LONG_RUNNING_PER_CALLER"
+	// noCallerLimit is the per-caller flags' default: the stock binary limits no caller.
+	noCallerLimit = 0
 )
 
 type unauthenticatedAuthenticator struct{}
@@ -143,6 +151,14 @@ type Options struct {
 	// as does a non-empty map without token-review in --auth-mode, each with an
 	// *AudienceCallersError. Empty leaves the server's audiences as the stock binary has them.
 	AudienceCallers map[string][]string
+	// CallerLimits is k8sapiproxy.Config.CallerLimits, for an embedder that limits some
+	// callers and not others; nil leaves the limits to --max-in-flight-per-caller and
+	// --max-long-running-per-caller, which the stock binary leaves off. The flags are the
+	// limits of a caller this func does not answer for: a MaxInFlight or MaxLongRunning it
+	// returns as zero takes the flag's value, and a negative one is no limit for that caller
+	// whatever the flag says. Its Key and its group fields are the handler's as returned;
+	// no flag sets them.
+	CallerLimits func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits
 }
 
 type proxyConfig struct {
@@ -185,6 +201,8 @@ type proxyConfig struct {
 	scopedSAPool             string
 	scopedSAPoolFile         string
 	maxInFlight              int
+	maxInFlightPerCaller     int
+	maxLongRunningPerCaller  int
 	jwtIssuer                string
 	jwtKeySetURL             string
 	jwtAudiences             string
@@ -241,6 +259,8 @@ func registerFlags(fs *flag.FlagSet, cfg *proxyConfig) {
 	fs.StringVar(&cfg.containerAPIURLOverride, "container-api-url", envOrDefault(containerAPIURLEnv, ""), "Optional override for the GKE Container API base URL (derived from --universe-domain when empty)")
 	fs.DurationVar(&cfg.cacheDiscoveryTTL, "cache-discovery-ttl", envDurationOrDefault(cacheDiscoveryTTLEnv, k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
 	fs.IntVar(&cfg.maxInFlight, "max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
+	fs.IntVar(&cfg.maxInFlightPerCaller, maxInFlightPerCallerFlag, envIntOrDefault(maxInFlightPerCallerEnv, noCallerLimit), "Requests one caller, by username, may have in flight before kube-proxy answers its next 429 with Retry-After; checked before --max-in-flight, and watches and long-running subresources do not count (0 sets no limit)")
+	fs.IntVar(&cfg.maxLongRunningPerCaller, maxLongRunningPerCallerFlag, envIntOrDefault(maxLongRunningPerCallerEnv, noCallerLimit), "Watches and long-running subresource requests (log, exec, attach, portforward, proxy) one caller, by username, may have open before kube-proxy answers its next 429 with Retry-After (0 sets no limit)")
 }
 
 func parseFlags(fs *flag.FlagSet, args []string, cfg *proxyConfig) error {
@@ -489,6 +509,10 @@ func buildHandler(
 	if err != nil {
 		return nil, err
 	}
+	callerLimits, err := callerLimitsFunc(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	var authenticators []k8sapiproxy.CallerAuthenticator
 	var inCluster *rest.Config
@@ -667,11 +691,45 @@ func buildHandler(
 		Metrics:          metrics,
 		TracerProvider:   tp,
 		MaxInFlight:      cfg.maxInFlight,
+		CallerLimits:     callerLimits,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize k8s-api-proxy handler: %w", err)
 	}
 	return handler, nil
+}
+
+// callerLimitsFunc is the k8sapiproxy.Config.CallerLimits the flags and the embedder ask
+// for: nil when neither sets a limit, the flags' limits for every caller when the embedder
+// has no func, and otherwise the embedder's answer with a MaxInFlight or MaxLongRunning it
+// leaves zero taken from the flags, and its Key and group fields untouched. A negative flag
+// is an error; a negative field from the embedder passes through, and the handler reads it
+// as no limit.
+func callerLimitsFunc(cfg proxyConfig) (func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits, error) {
+	if cfg.maxInFlightPerCaller < 0 {
+		return nil, fmt.Errorf("--%s %d is negative", maxInFlightPerCallerFlag, cfg.maxInFlightPerCaller)
+	}
+	if cfg.maxLongRunningPerCaller < 0 {
+		return nil, fmt.Errorf("--%s %d is negative", maxLongRunningPerCallerFlag, cfg.maxLongRunningPerCaller)
+	}
+	fromFlags := k8sapiproxy.CallerLimits{MaxInFlight: cfg.maxInFlightPerCaller, MaxLongRunning: cfg.maxLongRunningPerCaller}
+	embedder := cfg.embedder.CallerLimits
+	if embedder == nil {
+		if fromFlags == (k8sapiproxy.CallerLimits{}) {
+			return nil, nil
+		}
+		return func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits { return fromFlags }, nil
+	}
+	return func(caller *k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits {
+		limits := embedder(caller)
+		if limits.MaxInFlight == 0 {
+			limits.MaxInFlight = fromFlags.MaxInFlight
+		}
+		if limits.MaxLongRunning == 0 {
+			limits.MaxLongRunning = fromFlags.MaxLongRunning
+		}
+		return limits
+	}, nil
 }
 
 // versionString is what --version prints and the startup log names for a binary built for

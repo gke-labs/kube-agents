@@ -36,7 +36,8 @@ const (
 	// stopping a watch, before the response was complete.
 	OutcomeCanceled Outcome = "canceled"
 	// OutcomeThrottled is a request answered 429 because MaxInFlight requests were already
-	// in flight.
+	// in flight, or because its caller was at a limit of its own (Config.CallerLimits);
+	// Reason is set only for the caller's limit, and says which.
 	OutcomeThrottled Outcome = "throttled"
 )
 
@@ -116,7 +117,7 @@ type slogAuditSink struct {
 }
 
 // NewSlogAuditSink returns an AuditSink that writes each event as one record to logger:
-// refusals and requests over the in-flight cap at warn, upstream errors, aborted responses and
+// refusals and requests over the in-flight cap or a caller's limit at warn, upstream errors, aborted responses and
 // panics at error, the rest at info.
 func NewSlogAuditSink(logger *slog.Logger) AuditSink {
 	if logger == nil {

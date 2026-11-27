@@ -17,9 +17,10 @@ const (
 	// coreAgentPersonaDir is the persona the harness reads once per turn:
 	// rendered by a second UID, read-only to the harness (#6713).
 	coreAgentPersonaDir = "/var/lib/agent-persona"
-	// coreAgentPersonaRequiredEnv, "true" on a pod the operator renders a
-	// persona for, makes a missing persona dir fail the turn
-	// (TODO(#7143): the operator sets it with the persona render).
+	// coreAgentPersonaRequiredEnv, "true" on a core-agent profile pod (set by
+	// the operator with its persona-render init container), makes the harness
+	// refuse a missing, writable or unmanifested persona rather than run
+	// without it.
 	coreAgentPersonaRequiredEnv = "A2A_CORE_AGENT_PERSONA_REQUIRED"
 )
 

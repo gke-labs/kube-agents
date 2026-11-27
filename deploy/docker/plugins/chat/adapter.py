@@ -96,10 +96,19 @@ API_KEY_ENV = "SESSION_KV_API_KEY"
 #: failure. session_kv_server sizes its posts budget at half of this.
 RELAY_TIMEOUT_SECONDS = 360.0
 
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A 3xx from the relay is an error, not a place to send the key to again."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
 #: Session KV is on the pod's loopback address: a proxy from the environment
 #: must not get the report and its bearer token, and urllib does not leave
-#: out a loopback host by itself.
-_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+#: out a loopback host by itself. It follows no redirect either: urllib sends
+#: the `Authorization` header again to the next URL.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects())
 
 #: Markdown a model wraps around a bare token: emphasis, code spans, and the
 #: whitespace either side. Stripped from both ends of a report before it is

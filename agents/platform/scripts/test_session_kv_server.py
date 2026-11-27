@@ -65,6 +65,7 @@ except Exception:  # pragma: no cover
 import chat_notify
 import no_live_kubectl
 import session_kv_server
+from test_session_kv_openers_refuse_proxy import _LiveServer
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
 
 
@@ -3494,7 +3495,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self._inject("aborted-api-6cfdb6b98b-aaaaa")
             pool = self._queue_real_start("sess-aborted", self._rows("aborted-api")[0][0])
             # What the pool does when the gateway refuses the key on the create.
-            with patch("session_kv_server.urllib.request.urlopen", side_effect=[_http_error(401)]):
+            with patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=[_http_error(401)]):
                 pool.run()
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
@@ -3508,16 +3509,16 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             (307, S.START_FATAL), (400, S.START_FATAL), (404, S.START_RETRY),
             (500, S.START_UNKNOWN), (502, S.START_UNKNOWN), (503, S.START_RETRY),
         ):
-            with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
+            with patch("urllib.request.OpenerDirector.open", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
                 self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, outcome, code)
-        with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
+        with patch("urllib.request.OpenerDirector.open", side_effect=TimeoutError("read timed out")):
             self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, S.START_UNKNOWN)
         # An error while connecting or sending: the gateway never had the request.
         for exc in (
             urllib.error.URLError(ConnectionRefusedError(111, "refused")),
             urllib.error.URLError(TimeoutError("connect timed out")),
         ):
-            with patch("urllib.request.urlopen", side_effect=exc):
+            with patch("urllib.request.OpenerDirector.open", side_effect=exc):
                 self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, S.START_RETRY)
 
     def test_a_retry_that_never_starts_releases_the_anchor(self):
@@ -3528,7 +3529,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             # Queued and not yet started: a start is on its way, so a sibling folds.
             self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "folded")
             # The gateway drains for longer than the retry budget.
-            with patch("session_kv_server.urllib.request.urlopen", side_effect=[_answered()] + [_http_error(503)] * 50):
+            with patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=[_answered()] + [_http_error(503)] * 50):
                 pool.run()
             self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-ccccc")["status"], "injected")
             self.send.assert_called_once()
@@ -4594,7 +4595,7 @@ class TestGatewaySessionBody(unittest.TestCase):
         # only when `gateway.multiplex_profiles` is on. A `profile` key in this
         # body is accepted with a 201 and dropped -- which read as success for
         # a whole release while every triage ran on the default profile.
-        with patch("session_kv_server.urllib.request.urlopen") as urlopen:
+        with patch("session_kv_server.urllib.request.OpenerDirector.open") as urlopen:
             urlopen.return_value.__enter__.return_value = MagicMock(status=200)
             ok = session_kv_server._create_gateway_session(
                 "http://127.0.0.1:8642", "k8s-evt-abc123", {"Content-Type": "application/json"}
@@ -4602,6 +4603,25 @@ class TestGatewaySessionBody(unittest.TestCase):
         self.assertTrue(ok)
         body = json.loads(urlopen.call_args[0][0].data.decode("utf-8"))
         self.assertEqual(set(body), {"session_id", "title"})
+
+
+class TestGatewayCallsRefuseAProxy(unittest.TestCase):
+    """The gateway API is on the pod's loopback. With a proxy variable and no
+    NO_PROXY entry for 127.0.0.1, urllib hands a turn's prompt to the proxy."""
+
+    HEADERS = {"Authorization": "Bearer gateway-key"}
+
+    def test_the_session_create_reaches_the_gateway(self):
+        server = _LiveServer(self)
+        attempt = session_kv_server._create_gateway_session(server.url, "k8s-evt-1", self.HEADERS)
+        self.assertEqual(attempt.outcome, session_kv_server.START_OK)
+        self.assertEqual([("POST", "/api/sessions", "Bearer gateway-key")], server.seen)
+
+    def test_the_turn_start_reaches_the_gateway(self):
+        server = _LiveServer(self)
+        attempt = session_kv_server._start_agent_turn(server.url, "k8s-evt-1", "q", self.HEADERS)
+        self.assertEqual(attempt.outcome, session_kv_server.START_OK)
+        self.assertEqual([("POST", "/api/sessions/k8s-evt-1/chat", "Bearer gateway-key")], server.seen)
 
 
 class TestGatewayApiToken(unittest.TestCase):
@@ -4823,7 +4843,7 @@ class TestCronReportRelay(unittest.TestCase):
         report = "**Fleet audit:** 2 findings\n\n- seeded-a: cluster-admin bound to default"
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session") as create, \
-             patch.object(session_kv_server.urllib.request, "urlopen") as urlopen, \
+             patch.object(session_kv_server.urllib.request.OpenerDirector, "open") as urlopen, \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
             response = self.client.post(
                 "/v1/cron-reports",
@@ -6690,6 +6710,228 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(self.posts, [])
         self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+
+
+class TestFindingsNudgeCardRelay(unittest.TestCase):
+    """The findings-morning-nudge cron relay posts its cards and stores hidden thread metadata."""
+
+    SLACK_THREAD = "1712345678.000100"
+    HOME = "C0123456789"
+    BLOCKS_TS = "1712345999.000200"
+    REPORT = (
+        "2 critical issues will block cluster upgrades · 4 open across 2 clusters\n\n"
+        "- critical · kube-system/istiod on prod-central — PodDisruptionBudget blocks drain. "
+        "Allow at least 1 disruption.\n"
+        "- critical · gke-pool-1 on prod-central — Orphan Node has no backing VM. "
+        "Delete the orphan Node object.\n\n"
+        "2 more issues are queued (1 critical, 1 lower priority)."
+    )
+    HIDDEN_CONTEXT = (
+        REPORT
+        + "\n\n[Queued item metadata for thread replies]\n"
+        + "1. [reminder] id=urr-pdb.1 members=urr-pdb.1 location=proj/prod-central/kube-system/istiod covers=1 unreported=0"
+    )
+    CARD = {
+        "version": 1,
+        "text": REPORT,
+        "thread_context": HIDDEN_CONTEXT,
+        "headline": "2 critical issues will block cluster upgrades",
+        "note": "· 4 open across 2 clusters",
+        "tone": "critical",
+        "rows": [
+            {
+                "severity": "critical",
+                "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain",
+                "detail": "Allow at least 1 disruption.",
+            },
+            {
+                "severity": "critical",
+                "text": "**gke-pool-1** on `prod-central` — Orphan Node has no backing VM",
+                "detail": "Delete the orphan Node object.",
+            },
+        ],
+        "after": ["2 more issues are queued (1 critical, 1 lower priority)."],
+        "fold": {
+            "title": "Queue breakdown (2 more queued)",
+            "table": {
+                "columns": ["Cluster", "Critical", "Major", "Lower", "Next queued issue"],
+                "rows": [
+                    ["prod-central", "1", "0", "0", "billing/worker: mounts static key"],
+                    ["staging-east", "0", "1", "0", "ledger: missing ResourceQuota"],
+                ],
+            },
+        },
+        "choices": ["Fix first issue", "See all 4 items"],
+        "replies": {"Fix first issue": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain"},
+        "links": [["Open backlog", "https://github.com/acme/ops/issues/9"]],
+    }
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + (
+            "KAGE_SLACK_UX",
+            "SLACK_RELAY_URL",
+            "A2A_NOTIFY_PLATFORM",
+            "FINDINGS_NUDGE_HOME",
+        ):
+            os.environ.pop(key, None)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        os.environ["KAGE_SLACK_UX"] = "1"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        profile = Path(tmp.name, "profiles", "platform")
+        profile.mkdir(parents=True)
+        os.environ["PLATFORM_AGENT_HOME"] = tmp.name
+        session_kv_server.findings_nudge_card.save(
+            session_kv_server.findings_nudge_card.card_path(profile),
+            self.CARD,
+        )
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(self, report=REPORT, platforms=("slack",), job_id="findings-morning-nudge", blocks_post=None):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": "spaces/AAA/threads/T1"}
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post("/v1/cron-reports", json={"job_id": job_id, "report": report})
+        self.posts = poster.call_args_list
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_slack_relay_posts_blocks_with_collapsible_table_and_stores_hidden_context(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        (args, _kwargs), = [(c.args, c.kwargs) for c in self.posts]
+        channel, text, blocks, _thread = args
+        self.assertEqual((channel, text), (self.HOME, self.REPORT))
+        self.assertNotIn("urr-pdb.1", json.dumps(blocks))
+        self.assertIn("container", [b["type"] for b in blocks])
+        # Hidden finding IDs are stored in incidents for thread replies, never in visible chat.
+        self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.HIDDEN_CONTEXT)])
+
+    def test_gateway_route_posts_v1_chat_message_on_slack_and_google_chat(self):
+        for platform, thread in (("slack", "7.7"), ("google_chat", "spaces/H/threads/T")):
+            with self.subTest(platform=platform):
+                os.environ["A2A_NOTIFY_PLATFORM"] = platform
+                with patch.object(
+                    session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost(thread)
+                ) as via:
+                    response, calls = self._post(platforms=(platform,))
+                self.assertEqual(response.json()["status"], "delivered")
+                self.assertEqual(calls, [])
+                chat, text = via.call_args.args[3:5]
+                self.assertEqual(chat["schema"], "kube-agents.chat/v1")
+                self.assertEqual(chat["tone"], "critical")
+                self.assertEqual(chat["fold"]["title"], "Queue breakdown (2 more queued)")
+                self.assertEqual([c["text"] for c in chat["choices"]], ["Fix first issue", "See all 4 items"])
+                self.assertEqual(text, self.REPORT)
+                self.assertNotIn("urr-pdb.1", json.dumps(chat))
+
+    def test_text_fallback_still_stores_hidden_thread_context_when_ux_flag_is_off(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post()
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.HIDDEN_CONTEXT)])
+
+    EARLY_REPORT = (
+        "1 critical issue will delay or block cluster upgrades · 4 open across 2 clusters\n\n"
+        "- critical · kube-system/istiod on prod-central — PodDisruptionBudget blocks drain. Allow at least 1 disruption."
+    )
+    EARLY_ITEM = "1. [new] id=urr-pdb.1 members=urr-pdb.1 location=proj/prod-central/kube-system/istiod covers=1 unreported=0"
+    LATER_REPORT = (
+        "1 new issue needs review · 5 open across 2 clusters\n\n"
+        "- major · billing/worker on staging-east — Deployment mounts a static key. Use Workload Identity."
+    )
+    LATER_ITEM = "1. [new] id=static-key.9 members=static-key.9 location=proj/staging-east/billing/worker covers=1 unreported=0"
+    ITEMS_HEADER = "\n\n[Queued item metadata for thread replies]\n"
+
+    def test_each_chat_leg_keeps_the_earlier_items_of_its_own_thread(self):
+        """Slack and Google Chat have a thread each. The earlier items come from the row of
+        the leg that is written, so a leg that got only the later card keeps none."""
+        os.environ["KAGE_SLACK_UX"] = "false"
+        early = {"severity": "critical", "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain"}
+        later = {"severity": "major", "text": "**billing/worker** on `staging-east` — Deployment mounts a static key"}
+        self._post_card(self.EARLY_REPORT, self.EARLY_ITEM, early)
+        card = {**self.CARD, "text": self.LATER_REPORT, "thread_context": self.LATER_REPORT + self.ITEMS_HEADER + self.LATER_ITEM, "rows": [later]}
+        profile = Path(os.environ["PLATFORM_AGENT_HOME"], "profiles", "platform")
+        session_kv_server.findings_nudge_card.save(session_kv_server.findings_nudge_card.card_path(profile), card)
+        self._post(report=self.LATER_REPORT, platforms=("slack", "google_chat"))
+        stored = {thread_id: report for _chat_id, thread_id, report in self._stored()}
+        self.assertIn("[id=urr-pdb.1 covers=1]", stored[self.SLACK_THREAD])
+        self.assertEqual(stored["spaces/AAA/threads/T1"], self.LATER_REPORT + self.ITEMS_HEADER + self.LATER_ITEM)
+
+    def _post_card(self, report, item, row):
+        """One nudge of the day: its card saved, then its report relayed."""
+        card = {**self.CARD, "text": report, "thread_context": report + self.ITEMS_HEADER + item, "rows": [row]}
+        profile = Path(os.environ["PLATFORM_AGENT_HOME"], "profiles", "platform")
+        session_kv_server.findings_nudge_card.save(session_kv_server.findings_nudge_card.card_path(profile), card)
+        return self._post(report=report)
+
+    def test_a_later_nudge_of_the_day_keeps_the_earlier_cards_items_in_the_threads_context(self):
+        """The thread and its one stored row are per day, and the card prints no id: a
+        later nudge that replaced the row left a reply or a click under the earlier card
+        with the later card's items."""
+        os.environ["KAGE_SLACK_UX"] = "false"
+        self._post_card(
+            self.EARLY_REPORT,
+            self.EARLY_ITEM,
+            {"severity": "critical", "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain"},
+        )
+        self._post_card(
+            self.LATER_REPORT,
+            self.LATER_ITEM,
+            {"severity": "major", "text": "**billing/worker** on `staging-east` — Deployment mounts a static key"},
+        )
+        ((chat_id, thread_id, stored),) = self._stored()
+        self.assertEqual((chat_id, thread_id), (self.HOME, self.SLACK_THREAD))
+        self.assertEqual(
+            stored,
+            self.LATER_REPORT
+            + self.ITEMS_HEADER
+            + self.LATER_ITEM
+            + "\n\n"
+            + session_kv_server.findings_nudge_card.EARLIER_HEADER
+            + "\n(message 1 before the newest)\n"
+            + "- critical · kube-system/istiod on prod-central — PodDisruptionBudget blocks drain. "
+            + "Allow at least 1 disruption. [id=urr-pdb.1 covers=1]",
+        )
+
+        # A nudge whose card is not to hand stores its text and still keeps the earlier items.
+        bare = "A findings nudge with no matching card file."
+        self._post(report=bare)
+        ((_chat, _thread, stored),) = self._stored()
+        self.assertTrue(stored.startswith(bare + "\n\n" + session_kv_server.findings_nudge_card.EARLIER_HEADER))
+        self.assertIn("[id=static-key.9 covers=1]", stored)
+        self.assertIn("(message 2 before the newest)\n- critical · kube-system/istiod", stored)
+
+        # Only the nudge keeps earlier items: another job's later report replaces what its thread stored.
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM incidents")
+        self._post(job_id="some-other-job")
+        self._post(report="A later report of the same job.", job_id="some-other-job")
+        self.assertEqual([row[2] for row in self._stored()], ["A later report of the same job."])
+
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -13979,7 +14221,7 @@ class TestTriageStartRetry(unittest.TestCase):
         )
 
     def _run(self, urlopen_effects, **start):
-        with patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects) as urlopen, \
+        with patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=urlopen_effects) as urlopen, \
                 self.assertLogs("session_kv_server", level="INFO") as logs:
             session_kv_server._run_triage_start(self._start(**start))
         return urlopen, "\n".join(logs.output)
@@ -14335,16 +14577,17 @@ class TestTriageStartBurst(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-        real_urlopen = session_kv_server.urllib.request.urlopen
+        # A bound method, read before the patch, still calls the real `open`.
+        real_urlopen = session_kv_server._GATEWAY_OPENER.open
         # The probe below must not go through `scaled`, which the patch applies
-        # to every `urllib.request.urlopen` in the process.
+        # to every opener in the process.
         self.real_urlopen = real_urlopen
 
         def scaled(req, timeout=None):
             return real_urlopen(req, timeout=timeout * self.TIMEOUT_SCALE)
 
         patches = [
-            patch.object(session_kv_server.urllib.request, "urlopen", side_effect=scaled),
+            patch.object(session_kv_server.urllib.request.OpenerDirector, "open", side_effect=scaled),
             patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
             patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
             patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
@@ -14882,7 +15125,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
 
     def _run_start(self, start, urlopen_effects):
         with patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"), \
-                patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects), \
+                patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=urlopen_effects), \
                 patch.object(session_kv_server, "_triage_sleep", lambda _s: None), \
                 patch.object(session_kv_server, "_send_to_chat", return_value="thread") as send, \
                 patch.object(session_kv_server, "_start_agent_turn", wraps=session_kv_server._start_agent_turn) as turn:

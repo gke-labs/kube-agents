@@ -290,13 +290,16 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 	}
 }
 
-// TestAPersonaShellIsInEffectUnrestricted: a persona's shell grant
-// (toolgrant.Policy.Shell, which Claude Code grants as an unrestricted Bash)
-// through core-agent's real gate. Top-level composition is refused and the
-// verb checks hold, but a single command may be an interpreter that
-// composes anything (`bash -c`, `python3 -c`), and passes: the grant is in
-// effect an unrestricted shell, as on Claude Code, bounded by the sandbox
-// and the broker. Pinned both ways so neither is misread.
+// TestAPersonaShellIsInEffectUnrestricted: the allow rule of a persona's
+// shell grant (toolgrant.Policy.Shell, which Claude Code grants as an
+// unrestricted Bash) through core-agent's real gate in allow mode, the
+// policy built here without AnyShellCommand. Top-level composition is
+// refused and the verb checks hold, but a single command may be an
+// interpreter that composes anything (`bash -c`, `python3 -c`), and passes:
+// even in allow mode the rule is in effect an unrestricted shell, as on
+// Claude Code, bounded by the sandbox and the broker. Pinned both ways so
+// neither is misread. The harness runs the grant itself with
+// AnyShellCommand (TestAPersonaShellRunsAnyCommand).
 func TestAPersonaShellIsInEffectUnrestricted(t *testing.T) {
 	g, err := toolgrant.Policy{Shell: true}.CoreAgent("/scratch")
 	if err != nil {
@@ -592,6 +595,9 @@ func TestAPersonaShellRunsAnyCommand(t *testing.T) {
 		t.Errorf("registered built-ins %+v, want the policy's only", b)
 	}
 	gate := permissions.New(opts)
+	// As tools.Build tells the gate in a turn: the grant's read tools
+	// include the native grep and glob.
+	gate.SetNativeSearchTools(map[string]bool{"grep": true, "glob": true})
 	const vcs = "python3 /var/run/kube-agents/harness-config/config-task-0016b23ba04607c7-1159668367/skills/version-control/scripts/vcs.py"
 	for cmd, want := range map[string]bool{
 		vcs + " proposal create --repo gke-agentic/kube-agents-evals-3-infra --title \"Add PodDisruptionBudget for checkout-gateway in seeded-reliability\" --body \"Adds a policy/v1 PodDisruptionBudget (`checkout-gateway-pdb`) in `clusters/seeded-a/seeded-reliability/checkout-gateway-pdb.yaml` selecting pods with `app: checkout-gateway` and setting `maxUnavailable: 1` so at least one of the two `checkout-gateway` replicas remains available during voluntary disruptions.\"": true,
@@ -605,16 +611,35 @@ func TestAPersonaShellRunsAnyCommand(t *testing.T) {
 		// not this shell's boundary (the sandbox and the broker are).
 		"echo x; kubectl delete pod p": true,
 		"rm -rf /":                     false,
+		// core-agent's write-target scan, on by default, refuses a visible
+		// write outside the workspace in this mode: a redirection, or a
+		// path a cp, mv, mkdir, tee and the like would write. It is best
+		// effort, not a boundary: a write inside an interpreter's argument
+		// passes unseen.
+		"kubectl get pods -o yaml > /home/agent/pods.yaml": false,
+		"cp /scratch/out /etc/out":                         false,
+		"kubectl get pods > /tmp/pods":                     true,
+		"bash -c 'echo x > /etc/out'":                      true,
+		// Its search gate refuses a search-shaped command while the native
+		// grep and glob tools are registered.
+		"grep -rn checkout-gateway .": false,
+		"find . -name '*.yaml'":       false,
 	} {
 		if got := gate.CheckBash(context.Background(), cmd) == nil; got != want {
 			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
 		}
 	}
+	// Without the native tools, as for a grant of the shell alone, the
+	// search gate lets a search-shaped command run.
+	gate.SetNativeSearchTools(map[string]bool{})
+	if err := gate.CheckBash(context.Background(), "grep -rn checkout-gateway ."); err != nil {
+		t.Errorf("with no native grep, grep -rn was refused: %v", err)
+	}
 }
 
 // TestAnyShellCommandNeedsTheShellAndNoWrite: a policy that runs any shell
-// command must grant the shell, and may not grant a file write, whose
-// workspace scope that mode drops.
+// command must grant the shell, and may not grant a file write, which that
+// mode's path scope wouldn't confine.
 func TestAnyShellCommandNeedsTheShellAndNoWrite(t *testing.T) {
 	for name, p := range map[string]coreagentwire.Policy{
 		"no shell": {Tools: []string{"read_file"}, AnyShellCommand: true},

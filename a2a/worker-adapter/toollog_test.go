@@ -441,9 +441,9 @@ func TestAProfileTaskLeavesItsToolLinesOnTheWorkersLog(t *testing.T) {
 	if err := json.Unmarshal(activity.Parts[0].Data, &entry); err != nil {
 		t.Fatal(err)
 	}
-	if keys := slices.Sorted(maps.Keys(entry)); !slices.Equal(keys, []string{"callId", "input", "tool"}) ||
-		string(entry["tool"]) != `"Skill"` || !strings.Contains(string(entry["input"]), "INPUT-MARKER") ||
+	if keys := slices.Sorted(maps.Keys(entry)); !slices.Equal(keys, []string{"callId", "title", "tool"}) ||
+		string(entry["tool"]) != `"Skill"` || strings.Contains(string(activity.Parts[0].Data), "INPUT-MARKER") ||
 		string(entry["callId"]) != `"toolu_e2e"` {
-		t.Errorf("the activity entry is %s, want the tool, its input and the call's id", activity.Parts[0].Data)
+		t.Errorf("the activity entry is %s, want the tool, its title and the call's id, and none of its input", activity.Parts[0].Data)
 	}
 }

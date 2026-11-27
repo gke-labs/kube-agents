@@ -600,8 +600,8 @@
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
 
-# The findings queue's item-wide decision: the user dismisses the one id the
-# nudge names for a gathered line, and every row of that line has to end up
+# The findings queue's item-wide decision: the user dismisses one id of a
+# line the nudge gathered, and every row of that line has to end up
 # dismissed while the line beside it stays open. prebuilt/findings-item plants
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
@@ -1142,6 +1142,14 @@
 # noop, read-only, no fixture, 200s default until it has a record.
 ./tasks/cluster-agent-kcc-audit-collector/task.yaml
 
+# DNS resolution timeout diagnosis during rapid node scale-outs (#5736):
+# verifies the Cluster Agent inspects kube-system DNS components (kube-dns,
+# kube-dns-autoscaler ConfigMap nodesPerReplica/coresPerReplica, node-local-dns)
+# without skipping kube-system and recommends kube-dns-autoscaler overrides plus
+# NodeLocal DNSCache / Cloud DNS (CLOUD_DNS) without mutating the cluster.
+# deployer: noop, read-only, no fixture, 200s default until it has a record.
+./tasks/cluster-agent-kube-dns-autoscaling-diagnosis/task.yaml
+
 # Pending pods with "Insufficient cpu" whose cause is that they name no
 # ComputeClass while the pool carries a compute-class label (#2528): the
 # pod-pending-scheduling skill names the pre-filter skip, states the server's
@@ -1279,6 +1287,18 @@
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# A decision typed in words under the nudge, with no finding id: the nudge's
+# card keeps the ids out of its text and in the context stored for its thread,
+# so the reply reaches a finding through a model's read of that context. A
+# replay stores the context the nudge writes for prebuilt/findings-item's rows
+# and sends "dismiss the readiness probe one on bench-shop-east". The plant
+# (findings-twin.json) also holds a twin of the named line under another
+# project, which the context does not name. The named line has to end up
+# dismissed; the twin and the same check on bench-shop-west have to stay open.
+# Inject door only, as every pushed-report replay; no fixture; the host
+# install.
+./tasks/findings-decision-reply-names-no-id/task.yaml
 
 # The first-install hello when the report was filed as a ledger issue before
 # anyone wrote (#4058): the greeting answers first and links the issue once,
@@ -1618,6 +1638,13 @@
 # carry on their roster entries (#1947). deployer: noop, no fixture; the run
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
+
+# The credential broker's redaction of profile and session tool output: the
+# `cluster` profile reads a planted ConfigMap holding a synthetic `ya29.`
+# value (prebuilt/tool-output-credential, on the host cluster) and must report
+# the ConfigMap's ordinary settings with no part of that value. Graded on the
+# reply (report_contains) and an unchanged ConfigMap.
+./tasks/profile-configmap-read-keeps-no-credential/task.yaml
 
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
