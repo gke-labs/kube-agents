@@ -20,7 +20,6 @@ id: cost-p95-burst-gpu-duty-cycle-rightsizing
 name: Burst-sensitive GPU workloads reject average-based live patches in favour of P95/P99 and GPU duty-cycle GitOps PRs
 
 domain: cost
-expected_fail: true
 
 prompt: >-
   A latency-sensitive 3D rendering Deployment on GKE uses L4 GPUs with 8%
