@@ -662,6 +662,13 @@ CLUSTER_NAMESPACES_FLAG = "--namespaces"
 CLUSTER_KIND_FLAG = "--kind"
 CLUSTER_EXTRA_KINDS_FLAG = "--extra-kinds"
 CLUSTER_EXTRA_KINDS_SEPARATOR = "="
+#: stall_report.py defaults to bounded parallel reads for standalone runs; the
+#: watch already reads SCAN_WORKERS clusters at once under BROKER_SLOTS, so
+#: every watch-launched report is pinned to one worker (SCAN_WORKERS * 1 = 4),
+#: preserving broker and kubectl-admit slot budgets while keeping in-process
+#: shim dispatch where the broker shim is active.
+REPORT_WORKERS_FLAG = "--workers"
+REPORT_WORKERS = 1
 CLUSTER_REPORT_NAMESPACES_KEY = "namespaces"
 CLUSTER_REPORT_FALLBACK_KEY = "fallback"
 CLUSTER_REPORT_EVENTS_FALLBACK_KEY = "events_fallback"
@@ -913,6 +920,7 @@ def report_source() -> str:
 
 def report_argv(namespace: str, kinds: str | None = None) -> list[str]:
     cmd = [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG, "--namespace", namespace, "--json"]
+    cmd += [REPORT_WORKERS_FLAG, str(REPORT_WORKERS)]
     if kinds:
         cmd += [CLUSTER_KIND_FLAG, kinds]
     return cmd
@@ -924,6 +932,7 @@ def cluster_report_argv(namespaces: list[str], kinds: str | None, extra_kinds: d
     such, so a namespace with only its extras is asked only those), and each
     namespace's extra kinds beside it."""
     cmd = [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG, CLUSTER_NAMESPACES_FLAG, NAMESPACES_SEPARATOR.join(namespaces), "--json"]
+    cmd += [REPORT_WORKERS_FLAG, str(REPORT_WORKERS)]
     if kinds is not None:
         cmd += [CLUSTER_KIND_FLAG, kinds]
     for namespace in sorted(extra_kinds):
