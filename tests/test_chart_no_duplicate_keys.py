@@ -14,6 +14,7 @@ path and `<kind>/<metadata.name>` on any duplicate key.
 Run: python3 -m unittest discover -s tests -p 'test_chart_no_duplicate_keys.py' -v
 """
 
+import functools
 import pathlib
 import shutil
 import subprocess
@@ -203,14 +204,19 @@ class _UniqueKeyLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
-def _render(values):
+@functools.lru_cache(maxsize=None)
+def _render_cached(values):
     proc = subprocess.run(
         [_HELM, "template", _RELEASE, str(_CHART), *_REQUIRED, *values],
         capture_output=True, text=True, check=False,
     )
     if proc.returncode != 0:
-        raise AssertionError(f"helm template failed with {values}: {proc.stderr}")
+        raise AssertionError(f"helm template failed with {list(values)}: {proc.stderr}")
     return proc.stdout
+
+
+def _render(values):
+    return _render_cached(tuple(values))
 
 
 def _template_at(text, line):
@@ -233,12 +239,12 @@ def _resource_at(text, line):
     lines = text.splitlines()
     start = 0
     for idx in range(min(line, len(lines)) - 1, -1, -1):
-        if lines[idx].strip() == _DOCUMENT_SEPARATOR:
+        if lines[idx].rstrip() == _DOCUMENT_SEPARATOR:
             start = idx + 1
             break
     end = len(lines)
     for idx in range(start, len(lines)):
-        if idx >= line and lines[idx].strip() == _DOCUMENT_SEPARATOR:
+        if idx >= line and lines[idx].rstrip() == _DOCUMENT_SEPARATOR:
             end = idx
             break
     kind = None
@@ -327,6 +333,28 @@ class UniqueKeyLoaderTest(unittest.TestCase):
         self.assertIn("kube-agents/templates/web-console.yaml", msg)
         self.assertIn("ClusterRole/test-release-web-console-environment", msg)
         self.assertIn(_INSTANCE_LABEL, msg)
+
+    def test_resource_at_ignores_indented_separator_inside_block_scalar(self):
+        manifest = (
+            "---\n"
+            "# Source: kube-agents/templates/github-minter.yaml\n"
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: github-token-minter-config\n"
+            "data:\n"
+            "  default.yaml: |\n"
+            "    ---\n"
+            "    version: v2\n"
+            "  duplicate: one\n"
+            "  duplicate: two\n"
+        )
+        with self.assertRaises(DuplicateKeyError) as ctx:
+            _load_strict(manifest)
+        self.assertEqual(
+            _resource_at(manifest, ctx.exception.line),
+            "ConfigMap/github-token-minter-config",
+        )
 
     def test_chart_check_target_runs_duplicate_key_suite(self):
         makefile = _MAKEFILE.read_text(encoding="utf-8")
