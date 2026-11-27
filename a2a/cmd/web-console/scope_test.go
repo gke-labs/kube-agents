@@ -255,6 +255,13 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				AbsentSince: "2026-11-26T05:00:00Z",
 				Clusters:    &oneCount,
 			},
+			{
+				ID:       "proj-carried",
+				Via:      []string{"folders/123"},
+				Outcome:  "unreachable",
+				State:    "in-scope",
+				Clusters: &oneCount,
+			},
 		},
 		Profiles: map[string]string{
 			"cluster-proj-host-c1-us-central1":      "proj-host",
@@ -262,12 +269,18 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 			"cluster-proj-host-c3-no-ident":         "proj-host",
 			"cluster-proj-retiring-old-us-central1": "proj-retiring",
 			"cluster-proj-unmanaged-u1-us-central1": "proj-unmanaged",
+			"cluster-proj-carried-c4-us-central1":   "proj-carried",
 		},
 		Unmanaged: []upstreamUnmanagedEntry{
 			{
 				Profile: "cluster-proj-unmanaged-u1-us-central1",
 				Project: "proj-unmanaged",
 				Reason:  "never in scope",
+			},
+			{
+				Profile: "cluster-proj-carried-c4-us-central1",
+				Project: "proj-carried",
+				Reason:  "asset index lag",
 			},
 		},
 		ProfileIdentities: []upstreamProfileIdentity{
@@ -296,6 +309,13 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				Profile:  "cluster-proj-unmanaged-u1-us-central1",
 				Project:  "proj-unmanaged",
 				Cluster:  "u1",
+				Location: "us-central1",
+				Ready:    true,
+			},
+			{
+				Profile:  "cluster-proj-carried-c4-us-central1",
+				Project:  "proj-carried",
+				Cluster:  "c4",
 				Location: "us-central1",
 				Ready:    true,
 			},
@@ -340,12 +360,12 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	}
 	got := decode[scopeResponse](t, rec)
 
-	if got.Summary.TotalProjects != 5 || got.Summary.OKProjects != 1 || got.Summary.ErrorProjects != 4 {
-		t.Errorf("project summary = %+v, want total=5 ok=1 error=4 (retiring project excluded)", got.Summary)
+	if got.Summary.TotalProjects != 6 || got.Summary.OKProjects != 1 || got.Summary.ErrorProjects != 5 {
+		t.Errorf("project summary = %+v, want total=6 ok=1 error=5 (retiring project excluded, carried project included)", got.Summary)
 	}
-	// Only real cluster profiles (c1 ready=ok, c2 unready=error, c3 missing identity=error) are counted in cluster summary.
-	if got.Summary.TotalClusters != 3 || got.Summary.OKClusters != 1 || got.Summary.ErrorClusters != 2 {
-		t.Errorf("cluster summary = %+v, want total=3 ok=1 error=2 (no synthetic placeholder rows or retiring profiles)", got.Summary)
+	// Only real cluster profiles (c1 ready=ok, c2 unready=error, c3 missing identity=error, c4 carried=error) are counted in cluster summary.
+	if got.Summary.TotalClusters != 4 || got.Summary.OKClusters != 1 || got.Summary.ErrorClusters != 3 {
+		t.Errorf("cluster summary = %+v, want total=4 ok=1 error=3 (no synthetic placeholder rows or retiring/never-in-scope profiles)", got.Summary)
 	}
 	if !got.EventWatcher.Enabled || !got.EventWatcher.Healthy || got.EventWatcher.Status != watcherStatusWatching || got.EventWatcher.ClustersUp != 1 {
 		t.Errorf("EventWatcher = %+v", got.EventWatcher)
@@ -360,6 +380,9 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	}
 	if _, exists := byProject["proj-unmanaged"]; exists {
 		t.Errorf("unmanaged never-in-scope project should not be promoted to active scope projects")
+	}
+	if len(byProject["proj-carried"].ClusterRows) != 1 || byProject["proj-carried"].ClusterRows[0].Name != "c4" || byProject["proj-carried"].ClusterRows[0].Outcome != outcomeUnreachable {
+		t.Errorf("proj-carried cluster rows = %+v, want 1 row for c4 with unreachable outcome", byProject["proj-carried"].ClusterRows)
 	}
 	if len(byProject["proj-host"].ClusterRows) != 3 {
 		t.Fatalf("proj-host cluster rows = %+v, want 3", byProject["proj-host"].ClusterRows)

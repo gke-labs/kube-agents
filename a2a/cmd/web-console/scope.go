@@ -431,7 +431,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	identByProfile := map[string]upstreamProfileIdentity{}
 	identByProject := map[string][]upstreamProfileIdentity{}
 	for _, id := range raw.ProfileIdentities {
-		if id.Profile == "" || id.Project == "" || id.Cluster == "" || unmanagedProfiles[id.Profile] {
+		if id.Profile == "" || id.Project == "" || id.Cluster == "" {
 			continue
 		}
 		identByProfile[id.Profile] = id
@@ -440,7 +440,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 
 	profilesByProject := map[string][]string{}
 	for prof, proj := range raw.Profiles {
-		if prof == "" || proj == "" || unmanagedProfiles[prof] {
+		if prof == "" || proj == "" {
 			continue
 		}
 		profilesByProject[proj] = append(profilesByProject[proj], prof)

@@ -1647,6 +1647,7 @@ AGENT_API_EVENT_WATCHER_TRACKED_METRICS = (
 AGENT_API_METRIC_CLUSTER_LABEL = "cluster"
 AGENT_API_METRIC_PROJECT_LABEL = "project"
 AGENT_API_METRIC_LOCATION_LABEL = "location"
+AGENT_API_METRIC_PROFILE_LABEL = "profile"
 AGENT_API_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
 _PROMETHEUS_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 
@@ -7493,7 +7494,8 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         watch_set_ready = False
         clusters: list[dict[str, Any]] = []
         clusters_up = 0
-        discovery_errors = 0
+        failed_profiles: set[str] = set()
+        unlabeled_discovery_errors = 0
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -7538,7 +7540,13 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
             elif name == AGENT_API_DISCOVERY_ERRORS_METRIC:
                 if val > 0:
-                    discovery_errors += int(val)
+                    labels = {m.group(1): m.group(2) for m in _PROMETHEUS_LABEL_RE.finditer(label_text)}
+                    profile_label = labels.get(AGENT_API_METRIC_PROFILE_LABEL, "")
+                    if profile_label:
+                        failed_profiles.add(profile_label)
+                    else:
+                        unlabeled_discovery_errors += 1
+        discovery_errors = len(failed_profiles) + unlabeled_discovery_errors
         clusters.sort(
             key=lambda c: (
                 c[AGENT_API_METRIC_PROJECT_LABEL],

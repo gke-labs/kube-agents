@@ -1133,7 +1133,8 @@ class AgentAPIProxyTest(unittest.TestCase):
             for i in range(18000)
         )
         metrics_body = (
-            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 2\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c1-us-central1"} 0\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 5\n'
             'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
             'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
             + filler_series
@@ -1204,7 +1205,7 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertTrue(watcher["watch_set_ready"])
         self.assertEqual(1, watcher["clusters_up"])
         self.assertEqual(2, watcher["clusters_total"])
-        self.assertEqual(2, watcher["discovery_errors"])
+        self.assertEqual(1, watcher["discovery_errors"])
 
 
 class PolicyTest(unittest.TestCase):

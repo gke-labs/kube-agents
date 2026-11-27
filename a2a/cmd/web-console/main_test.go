@@ -2333,11 +2333,11 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 console.log(JSON.stringify({
   hasEmptyHeadline: htmlWatching.includes(CHANNELS.alerts.empty),
   hasWatcherDetail: htmlWatching.includes("Watching 2 of 2 clusters for Kubernetes Warning events"),
-  hasWatchingBadge: htmlWatching.includes("Watching") && htmlWatching.includes("badge-green"),
-  hasStartingBadge: htmlStarting.includes("Starting") && htmlStarting.includes("badge-amber"),
-  hasDegradedBadge: htmlDegraded.includes("Degraded") && htmlDegraded.includes("badge-amber") && !htmlDegraded.includes("badge-green"),
-  hasDisabledBadge: htmlDisabled.includes("Disabled") && htmlDisabled.includes("badge-grey"),
-  hasLoadingBadge: htmlNull.includes("Loading") && htmlNull.includes("badge-grey") && !htmlNull.includes("Disabled"),
+  hasWatchingBadge: htmlWatching.includes("Watching") && htmlWatching.includes("badge-green") && htmlWatching.includes("Proactive fleet monitoring is active."),
+  hasStartingBadge: htmlStarting.includes("Starting") && htmlStarting.includes("badge-amber") && htmlStarting.includes("Kubernetes Event Watcher is starting up.") && !htmlStarting.includes("Proactive fleet monitoring is active"),
+  hasDegradedBadge: htmlDegraded.includes("Degraded") && htmlDegraded.includes("badge-amber") && !htmlDegraded.includes("badge-green") && htmlDegraded.includes("Kubernetes Event Watcher is degraded") && !htmlDegraded.includes("Proactive fleet monitoring is active"),
+  hasDisabledBadge: htmlDisabled.includes("Disabled") && htmlDisabled.includes("badge-grey") && htmlDisabled.includes("Kubernetes Event Watcher is disabled.") && !htmlDisabled.includes("Proactive fleet monitoring is active"),
+  hasLoadingBadge: htmlNull.includes("Loading") && htmlNull.includes("badge-grey") && !htmlNull.includes("Disabled") && htmlNull.includes("Checking proactive fleet monitoring status.") && !htmlNull.includes("Proactive fleet monitoring is active"),
   hasNextAudit: htmlWatching.includes("Security &amp; RBAC Posture Audit at 2099-03-15T06:20:00Z"),
   hasStarterPrompt: htmlWatching.includes("data-starter-prompt="),
 }));
