@@ -672,7 +672,7 @@ class TestCallback(unittest.TestCase):
             with self.subTest(text=text[:40]):
                 out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
                 self.assertEqual(out, text, "left to the text rules, which don't mask a value only its key names")
-        # One level shallower is within the bound.
+        # Two levels under the bound is decoded.
         ok = '{"auth":"opaque-value-xyz","d":' + "[" * 62 + "1" + "]" * 62 + "}"
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": ok}]})["messages"][0]["content"]
         self.assertIn("[REDACTED_SECRET]", out)
@@ -703,12 +703,19 @@ class TestCallback(unittest.TestCase):
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": secret}]})["messages"][0]["content"]
         self.assertNotIn("opaque-zz", out)
 
-    def test_a_tool_output_with_a_repeated_key_is_re_encoded_from_what_was_walked(self) -> None:
-        text = '{"auth":"opaque-value-xyz","auth":"second-value-abc"}'
+    def test_a_tool_output_with_a_repeated_key_gets_the_text_rules_only(self) -> None:
+        # The decoder would keep one value; what the text says is what counts.
+        text = '{"kind":"Secret","kind":"Other","data":{"k":"opaque-value-xyz"}}'
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
-        self.assertEqual(json.loads(out), {"auth": "[REDACTED_SECRET]"})
         self.assertNotIn("opaque-value-xyz", out)
-        self.assertNotIn("second-value-abc", out)
+        self.assertIn('"kind":"Other"', out, "left as text, both keys kept")
+
+    def test_a_changed_tool_output_stays_valid_json_whatever_whitespace_its_strings_hold(self) -> None:
+        for text in ('["nicole,\u00a0x", {"password":"opaque-abc"}, 1]', '{"a\u2028":"b", "password":"opaque-abc"}'):
+            with self.subTest(text=text):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                json.loads(out)
+                self.assertNotIn("opaque-abc", out)
 
     def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
         # Forms providers accept: the URL-safe alphabet, no padding, and the

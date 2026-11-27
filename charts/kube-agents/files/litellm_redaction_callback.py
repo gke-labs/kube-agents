@@ -18,12 +18,16 @@ redacted wherever it sits -- a tool's input, what a tool returned, a
 per-message field. A tool call's arguments held as JSON in a string (and an
 Anthropic tool input sent as a string) are decoded, walked as a document and
 re-encoded only if a rule changed them, so they stay valid JSON. A tool's
-output that is a whole JSON object or array (a chat tool message, an Anthropic
-tool result, a Responses function call output, a string in a Gemini function
-response) is decoded the same way, up to 256 KiB and 64 levels deep, and so is
-whole JSON inside it, three levels in at most; a changed one keeps its indent
-and separators. Past those bounds, or when it is not whole JSON, it is matched
-as text.
+output that is a whole JSON object or array (a chat tool message's string
+content, an Anthropic tool result's string or text parts, a Responses function
+call output, a top-level string in a Gemini function response's response) is
+decoded the same way, up to 256 KiB and 64 levels deep, and so is whole JSON
+inside it, two levels in at most. It still gets the text rules over its string
+too, and a string the structure rules mask whole where it sits is not opened,
+so decoding only adds to what is masked. One with a repeated key, past the
+bounds, or not whole JSON is matched as text. A changed one keeps its indent
+width and compact or spaced separators; numbers, escapes and other spacing are
+normalised.
 
 Left exactly as they came, and only at the positions the provider APIs
 define (content parts, including a Responses `input` item's and a Responses
@@ -174,7 +178,8 @@ GEMINI_RESPONSE_KEY = "response"
 TOOL_OUTPUT_MAX_BYTES = 256 * 1024
 TOOL_OUTPUT_MAX_DEPTH = 64
 # A string inside a decoded tool output that is itself whole JSON (a shell
-# result's stdout, say) is decoded too, this many levels in at most.
+# result's stdout, say) is decoded too: this many documents deep in all, the
+# tool output itself and two levels inside it.
 TOOL_OUTPUT_MAX_NESTING = 3
 # How many nested strings one tool output may have decoded; past that the
 # rest stay strings inside it.
@@ -549,8 +554,8 @@ class KubeAgentsRedactionCallback(CustomLogger):
 
     @staticmethod
     def _tool_arguments(data: Dict[str, Any]) -> List[tuple]:
-        """(path from the request, string, decoded document) for each tool
-        call's arguments held as JSON in a string: a chat tool call's and a
+        """(path from the request, string, decoded document, None) for each
+        tool call's arguments held as JSON in a string: a chat tool call's and a
         legacy function call's `arguments`, and an Anthropic tool input sent
         as a string. Arguments that are not a JSON object, array or string
         stay a string, walked as text."""
@@ -620,8 +625,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
         if indent is not None:
             separators = (",", ": ")
         else:
-            colon = re.search(r'"\s*:(\s?)', body)
-            comma = re.search(r'[\]}"0-9el],(\s?)', body)
+            # Space or tab only: the whitespace JSON allows, so the separators
+            # chosen always give valid JSON.
+            colon = re.search(r'"[ \t]*:([ \t]?)', body)
+            comma = re.search(r'[\]}"0-9el],([ \t]?)', body)
             separators = ("," + (comma.group(1) if comma else " "), ":" + (colon.group(1) if colon else " "))
         return indent, separators, "\n" if text.endswith("\n") else ""
 
@@ -673,9 +680,12 @@ class KubeAgentsRedactionCallback(CustomLogger):
             return
         if not isinstance(document, (dict, list)) or not self._depth(document, TOOL_OUTPUT_MAX_DEPTH):
             return
-        # A repeated key: the decoder kept one value, so the string is
-        # re-encoded from the document rather than sent as it came.
-        found.append((path, None if repeated else value, document, self._style(value)))
+        # A repeated key: the decoder keeps one value, so what the structure
+        # rules would see differs from the text. Such output stays a string
+        # and gets the text rules only, as before.
+        if repeated:
+            return
+        found.append((path, value, document, self._style(value)))
         if level + 1 >= TOOL_OUTPUT_MAX_NESTING:
             return
         nested = 0
