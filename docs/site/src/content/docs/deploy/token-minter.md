@@ -46,7 +46,7 @@ When the install's GitHub forge is at a GitHub Enterprise Server host, Minty min
 - **API URL.** The chart sets `SOURCE_SYSTEM_API_BASE_URL=https://<host>/api/v3` on the Minty container. Minty then calls the instance's REST API, where it calls `api.github.com` on github.com. A github.com install does not get the variable.
 - **Private CA.** When the GitHub forge names `caBundleRef`, the chart mounts that key of the Secret into the Minty pod at `/etc/kube-agents/minter-ca/ca.crt` and sets `SSL_CERT_DIR=/etc/kube-agents/minter-ca`. Minty is a Go program that uses the default HTTP transport, so it reads the system roots: the CA bundle in its image, and each certificate file in the directories that `SSL_CERT_DIR` names. Minty trusts the configured CA beside the image's bundle, for all of its outbound calls (the instance, and the Google APIs it calls). The CA is one that you trust and install. It is the same Secret that the credential broker reads, in the release namespace. The mount is optional: until the Secret exists, Minty starts, and its calls to the instance fail on TLS. Minty reads `SSL_CERT_DIR` once, when it starts, so after you create or rotate the Secret, restart it: `kubectl rollout restart deployment/github-token-minter -n kubeagents-system`. The credential broker reads the CA on each call and needs no restart; the difference is intended, because the broker reads the CA file on each call, while Go loads its system roots once per process.
 - **Egress.** Minty's NetworkPolicy (`githubMinter.networkPolicy`, on by default) allows TCP port 443 to any address, private ranges included. So Minty reaches an instance on a private network on port 443, if the cluster's network can route to it. An instance on another port is not supported. A firewall or a VPC route outside the cluster is yours to open.
-- **GitHub App.** Create the App on the instance, not on github.com: an App and its installation belong to one GitHub host. Give it the same repository permissions as on github.com (`Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`), and install it on the organization, the GitOps repository and each context repository. The repository must be owned by an organization, for the reason above.
+- **GitHub App.** Create the App on the instance, not on github.com: an App and its installation belong to one GitHub host. Give it the same repository permissions as on github.com (`Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`), and install it on the organization, the GitOps repository, each managed repository and each context repository. The repository must be owned by an organization, for the reason above.
 - **Key import.** `minty tools import-pk` imports the App's private key into the Cloud KMS key, and it calls only Cloud KMS, so the import is the same for an App on a GitHub Enterprise Server. `install.sh` runs it from `--github-pem-path`, as on github.com, into a key that has no `ENABLED` version yet. On the Terraform + Helm method, import the key before the apply, because the apply waits for the minter, which is not Ready without it. With the composition's default names and the minty version `install.sh` pins:
 
   ```bash
@@ -64,7 +64,7 @@ When the install's GitHub forge is at a GitHub Enterprise Server host, Minty min
 
 ## Setup and Key Provisioning
 
-Minty requires a GitHub App private key imported into Google Cloud KMS as an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`). You can either let the `kube-agents` installer import the key automatically during initial setup, or pre-provision it Ahead-Of-Time (AOT).
+Minty requires a GitHub App private key imported into Google Cloud KMS as an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`). You can either let the `kube-agents` installer import the key automatically during initial setup, or pre-provision it Ahead-Of-Time (AOT). An install that Helm made with no installer follows Path 3.
 
 ### Prerequisites Checklist
 
@@ -75,7 +75,7 @@ Before enabling the token minter, ensure you have:
 3. **GitHub App:**
    - Created in GitHub (`Settings -> Developer settings -> GitHub Apps`).
    - Repository permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
-   - Installed onto the target organization, the GitOps repository, and every repository registered under `context_repos`.
+   - Installed onto the target organization, the GitOps repository, every repository registered under `managed_repos`, and every repository registered under `context_repos`.
    - If created under a personal user account, "Where can this GitHub App be installed?" must be set to "Any account (Public)".
 4. **App ID:** The numeric App ID from the GitHub App settings page (**General**, "App ID", a number such as `1234567`), not the App's name or slug. The installer refuses anything else.
 5. **Private Key (`.pem`):** Generated and downloaded from the GitHub App settings page (needed for initial Cloud KMS import).
@@ -124,9 +124,46 @@ For automated CI/CD pipelines, release automation, or production environments wh
      --kms-key="YOUR_KEY"
    ```
 
+### Path 3: Helm with no installer
+
+`helm install` on its own renders the Kubernetes half of the minter and makes nothing in Google Cloud, and the minter is off by default. Make the items below in this order. When one of items 1 to 5 is missing, `helm install` without `--wait` shows no error: the minter does not become Ready, or each token request fails.
+
+On the other paths, Terraform owns these objects: the [`github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter) module owns items 2 and 3, and the [`kube-agents-iam`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) module owns item 5. The `github-minter` module can make items 2 and 3 on this path too; set its `namespace` when the release namespace is not `kubeagents-system`. The names below are the chart's defaults. `PROJECT_ID` is the project of the cluster that runs the agent, and `kubeagents-system` stands for the release namespace.
+
+1. The GitHub App. Complete the [Prerequisites Checklist](#prerequisites-checklist). Install the App on the organization and on each repository that the agent uses: the GitOps repository, each managed repository and each context repository.
+2. The minter's Google service account, `kubeagents-github-minter-gsa` in `PROJECT_ID` (`githubMinter.gsaName`). Grant `roles/iam.workloadIdentityUser` on it to the member `serviceAccount:PROJECT_ID.svc.id.goog[kubeagents-system/kubeagents-github-minter]`, which is the minter's Kubernetes ServiceAccount (`githubMinter.ksaName`).
+3. The Cloud KMS key ring `github-token-minter-keyring` and the import-only asymmetric signing key `github-token-minter-key`, in the cluster's region (`githubMinter.kms.keyring`, `key` and `location`). Step 1 of [Terraform + Helm, without `install.sh`](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#terraform--helm-without-installsh) in INSTALL.md has the `gcloud` commands that make them and the import command of item 4. The commands are the same for github.com. Grant `roles/cloudkms.signerVerifier` on the key to the minter's Google service account.
+4. The App's private key, imported into that key with `minty tools import-pk`. On a new key, the import makes key version `1`, the chart's default (`githubMinter.kms.keyVersion`). The version must be `ENABLED`: the minter does not pass its readiness probe before the import.
+5. The agent's Google service account, `kubeagents-platform-gsa` in `PROJECT_ID`. Minty accepts only a token of a Google service account ([GSA-only auth](#gsa-only-auth)), and the credential broker gets one through Workload Identity. Grant `roles/iam.workloadIdentityUser` on the account to the member `serviceAccount:PROJECT_ID.svc.id.goog[kubeagents-system/kubeagents-platform-agent]`, which is the broker's Kubernetes ServiceAccount (`platformAgent.security.serviceAccountName`).
+6. The chart values. Set them, then run `helm install` or `helm upgrade`:
+
+   ```yaml
+   platformAgent:
+     harness:
+       projectId: PROJECT_ID
+       location: CLUSTER_LOCATION # the cluster's region or zone
+       clusterName: CLUSTER_NAME
+     security:
+       serviceAccountAnnotations:
+         iam.gke.io/gcp-service-account: kubeagents-platform-gsa@PROJECT_ID.iam.gserviceaccount.com
+   githubMinter:
+     enabled: true
+     org: YOUR_GITHUB_ORG
+     repo: YOUR_GITOPS_REPO
+     appId: "YOUR_GITHUB_APP_ID"
+   ```
+
+   `githubMinter.allowedServiceAccount` is the one account that the minter's rule accepts. When it is empty, it is `kubeagents-platform-gsa@PROJECT_ID.iam.gserviceaccount.com`. If the agent's account of item 5 has another name, set its email there and in the annotation. When the two differ, the minter refuses each token request.
+
+   If you used other names in items 2 to 4, set `githubMinter.ksaName`, `githubMinter.gsaName` and the `githubMinter.kms` values to match. When `appId` is empty, the chart renders no `github-app-credentials` Secret, and one with the key `app-id` must exist in the release namespace.
+
+   The `githubMinter` values configure the minter only. Declare the repositories for the agent in `platformAgent.integration.forges` and `repositories` ([`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration)). Without that declaration, the minter works and the agent has no GitOps repository.
+
+7. A check. Wait for the minter with `kubectl rollout status deployment/github-token-minter -n kubeagents-system`. Then ask it for a token as [Manual testing](#manual-testing) shows, with your release namespace and the broker's ServiceAccount name in the commands. A 200 answer with a token shows that each item is in place for that repository.
+
 ### Install variables
 
-The deployment requires the following variables in `install.env` or via CLI flags:
+Paths 1 and 2 require the following variables in `install.env` or via CLI flags:
 
 - `GITHUB_APP_ID` (`--github-app-id`) — numeric App ID.
 - `GITOPS_ORG` (`--gitops-org`) — the organization hosting the GitOps repository.
