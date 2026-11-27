@@ -72,7 +72,7 @@ page under "Why there is no `gke-admin` set".
 - `verify_release_eligibility.sh`: Release gatekeeper. On every path it performs tag collision detection and verifies every image in `REQUIRED_RELEASE_IMAGES`, as `common.sh` lists it at the candidate commit (`required_release_images_at`), exists in registry. The validation gate differs by path: a release from `main` needs a shape-valid staging promotion tag (`staging_<ts>_<sha>`, meaning the full nightly matrix and the release-candidate eval both passed on the commit; it does not also require `rc_*_validated`, since a staging tag is only ever derived from a candidate that carries one, and two gates would be two to keep in step), and with `RELEASE_LINE=X.Y` the candidate must be the line's own (as the calculator resolves it, through `release_line_resolve_candidate`) and the gate is the RC pipeline's own `rc_<ts>_<its short sha>_validated` tag on it (`validated_rc_tags_at_commit`, bound to the candidate's sha), earned by dispatching `rc-release-pipeline.yml` against the line's head. `skip_staging_validation` with an audit reason is the emergency bypass of either gate.
 - `tag_ga_release.sh`: Creates and pushes official GA SemVer Git tags (`X.Y.Z`) on a detached HEAD commit stamped with the release version in installer scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), Helm charts (`charts/kube-agents/Chart.yaml`), and Terraform defaults (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`). It pushes the same commit to the version's _release line_, `release/<X.Y>`, together with the tag (`ensure_ga_release_refs` in `common.sh`): the line's first release creates it at the stamped commit (a minor, or the first patch of a minor that predates the lines), and a later patch — stamped from the line's head, so its single parent is that head — fast-forwards it. Every release commit on a line stays reachable from the branch, nothing is ever force-pushed, and a line anywhere but at the release commit, at its candidate, or already past the release commit (the re-run case below) is an error. Before anything is pushed, `release_branch_placement` makes the same read, so a line already elsewhere stops the run with nothing pushed. The tag and the line then go in one atomic push (`ensure_ga_release_refs`), so neither exists on the remote without the other: a merge that lands on the line meanwhile rejects both and the re-run stamps from the new head, and a run that fails after the push re-runs like one that failed at image promotion, reusing the tagged commit — a line that took a merge in between is already past the release commit and is left where it is. For a patch from a line, name the version on that re-run (`release_line` with `explicit_release_version`): the line's candidate is then the commit that release was cut from, whatever merged since, where a plain re-dispatch would cut the next patch from the new head. A rejected push takes the tag and the line back out of the checkout that ran it, so nothing local outlives it; and in CI both reads — is the tag there, where is the line — are of the remote, never of the checkout, so a tag or line left behind some other way (a dry run, a run killed before its push) is recreated at the release commit and pushed with the other, stamped afresh if the candidate moved, while a local line that has moved on from the remote's is refused rather than moved. Outside CI both are created locally and neither is pushed. A merge Tide pushes to a line publishes SHA-tagged images (`docker-publish-ghcr.yml`; its `decide` job runs `decide_image_publish.sh`, which builds nothing for a push by anyone else — the GA tagger's push of a stamped release commit included, since the tagger pushes as the release App — or for a commit whose images already exist, since a rebuild under the same `:<sha>` tags would replace the manifests the ladder validated, and fails the run rather than build when the registry cannot be asked; `:latest` never moves. The pusher test guards against a mistaken push, not a deliberate one: the script runs from the pushed commit, so who may push a release line at all is a branch rule, not this). Releases 0.1.0 to 0.7.0 predate the lines and sit on per-release `release/<X.Y.Z>` branches, left as they are; pushes to those build nothing. Note: candidate commits must carry the `^BAKED_RELEASE_VERSION=` placeholder line in root installer scripts, `version`/`appVersion` fields in Helm charts, and `image_tag` defaults in Terraform examples.
 - `tag_go_modules.sh`: Tags each Go module listed in its `PUBLISHED_GO_MODULE_DIRS` (today `k8s-api-proxy`) `<dir>/v<X.Y.Z>` at the commit the GA tag `X.Y.Z` points to, so `go get github.com/gke-labs/kube-agents/k8s-api-proxy@v<X.Y.Z>` resolves to the code that release shipped. Go requires the directory prefix and the `v`, which the GA tag has neither of. `release-publish.yml` runs it after `tag_ga_release.sh`; it reads the GA tag rather than stamping anything, and fails only when that tag is missing. Everything else it skips with a notice rather than fail, because the GA tag is already public by then and a failure would hold the release short of its GitHub Release on every re-run: a module whose `go.mod` is absent at the release commit (a patch on a line cut before the module existed), a `go.mod` whose module path is not `github.com/gke-labs/kube-agents/<dir>`, and any release at major 1 or later, where a v1 tag would promise a compatibility nobody has decided on and a v2 tag is one Go rejects on a path without `/v2`. Tagging goes through `ensure_git_tag`, so a re-run skips a tag already at the commit and refuses one elsewhere, and nothing is pushed outside CI. In CI it then asks `proxy.golang.org` for the new version so the first consumer does not wait for the fetch; a failure there is a warning. That request also has `sum.golang.org` record the tag's checksum, so a module tag is permanent once pushed: re-cutting a GA tag by hand cannot move it. Releases before this script existed carry no module tag.
-- `promote_release_images.sh`: Promotes verified container images from candidate commit SHA to GA release tag in GHCR without rebuilding; the images are the ones the candidate's own `common.sh` lists.
+- `promote_release_images.sh`: Promotes verified container images from candidate commit SHA to GA release tag in GHCR without rebuilding; the images are the ones the candidate's own `common.sh` lists. It reads them from the candidate registry and tags the version there too when that is a second registry ([Where a release reads the commit's images](#where-a-release-reads-the-commits-images)).
 - `copy_candidate_images.sh`: Copies a commit's SHA-tagged images from the registry they were published to into a second registry without rebuilding, so that each is there at the source's digest; one already there at another digest is replaced, with a warning. `copy-candidate-images.yml` runs it for each commit `docker-publish-ghcr.yml` has published on `main`, and for one named commit on a dispatch, which is how a `release/<X.Y>` commit is copied; the images are the ones the commit's own `common.sh` lists. The destination repository has to exist, and the workflow's identity needs write on it.
 - `sign_release_images.sh`: Signs promoted GA release container images in GHCR using Keyless Cosign OIDC; the images are the ones `common.sh` lists at the release tag's commit (`required_release_images_for_release`: a stamp changes installer, chart and Terraform files only, so that is the candidate's list).
 - `publish_helm_chart.sh`: Packages, publishes, and signs the official kube-agents Helm chart to GHCR as an OCI artifact. Extracts the chart tree directly from the release commit SHA via `extract_commit_tree`.
@@ -262,14 +262,18 @@ and dispatched through [the rebuild button](../../docs/environment-reconcile.md#
    the legacy `RC_TEARDOWN_STRICT`; nothing forwards it any more, so it can be deleted along with `teardown_common.sh`'s fallback.
 
    `REGISTRY_PREFIX` is read too but is **optional and set on no environment**, so do not go
-   looking for it: the repository scope holds no variables at all, the workflows forward an empty
+   looking for it: it is set at no scope, the workflows forward an empty
    string, and `get_registry_prefix` falls back to `DEFAULT_REGISTRY_PREFIX`. Set it only to point
-   an environment at a registry other than `ghcr.io/gke-labs/kube-agents`. If you do, note that
-   `registry_image_exists` — the probe `check_commit_images_exist` runs per image — has a docker-free
-   fallback for `ghcr.io` and for Artifact Registry (`*-docker.pkg.dev`, asked with the caller's
-   `gcloud` access token) only. Every release-path caller runs on a GitHub Actions runner with docker
-   and so takes the `docker manifest inspect` branch regardless, which reads a private repository only
-   after a `docker login` to it; a caller without docker gets a warning and a "missing image" answer when
+   an environment at a registry other than `ghcr.io/gke-labs/kube-agents`. If you do, note how
+   `registry_image_exists` — the probe `check_commit_images_exist` runs per image — asks. An Artifact
+   Registry prefix (`*-docker.pkg.dev`) is asked over the registry API with the caller's `gcloud`
+   access token, docker or not, so the job has to be logged in to Google as an identity that can read
+   the repository. `autopush-deploy.yml`'s candidate image check logs in for such a prefix;
+   `staging-deploy.yml`, `rc-create-tag.yml`, `rc-scheduler.yml`, `staging-promotion-pipeline.yml`'s
+   candidate check and `release-publish.yml` do not. Where the API cannot be asked, and for every other
+   registry, a GitHub Actions runner takes the `docker manifest inspect` branch, which reads a private
+   repository only after a `docker login` to it. A caller without docker has a docker-free fallback
+   for `ghcr.io` and Artifact Registry only, and gets a warning and a "missing image" answer when
    pointed at another registry, or at Artifact Registry with no `gcloud` credential it accepts.
 
    Two of those earn a line of their own because getting them wrong is silent rather than loud.
@@ -370,6 +374,28 @@ idempotent skip and the emergency-leftover collision return well before
 turns a red run into a green one, rather than on the quiet day, where it turns one green outcome
 into a more legible green outcome. Red is left to mean the machinery is broken.
 
+### Where a release reads the commit's images
+
+`release-publish.yml` reads the candidate commit's SHA-tagged images from the repository variable
+`CANDIDATE_REGISTRY_PREFIX` and publishes the release to `ghcr.io/gke-labs/kube-agents`. Unset, the
+variable falls back to that same registry (`get_candidate_registry_prefix`), and a release is one
+version tag beside the commit's, as it was before the variable existed.
+
+Set to a second registry (the one `copy-candidate-images.yml` copies to; nothing fills another),
+the eligibility check and the promotion both read there, and `promote_release_images` tags each
+image twice from the one source: `<VERSION>` in that registry, where `rollback_environment.sh`
+looks for the previous release when an environment is installed from it, then `<VERSION>` in GHCR,
+at the same digest. Set the variable once the environments that validate a candidate install from
+that registry too, so the images a release publishes are the ones they ran. A re-run skips a tag that already names the source and refuses one that
+names anything else. For an Artifact Registry repository (`*-docker.pkg.dev`) the publish job signs
+in as the workflows' Google service account before the eligibility check; that account needs to
+read and write the repository.
+
+Nothing falls back to GHCR for a commit the registry lacks: the eligibility check fails and names
+the commit. `copy-candidate-images.yml` copies each `main` commit there once its images are
+published; for a commit it has not copied (a release line's head, a failed copy, one published
+before the workflow existed), dispatch it with `commit_sha` first.
+
 ### Read this before you dispatch a release
 
 **Every candidate selected for a GA release from `main` must carry a `staging_<ts>_<sha>` tag
@@ -399,7 +425,8 @@ Before dispatching:
    not checked alongside it: a staging tag is only ever derived from a candidate that already
    carries one.
 3. The release images in `REQUIRED_RELEASE_IMAGES`, as `common.sh` lists them at that commit,
-   exist in GHCR under that commit. The gate reads the
+   exist under that commit
+   [where the release reads them](#where-a-release-reads-the-commits-images). The gate reads the
    candidate's list, not the checkout's (`required_release_images_at`), so a commit or a
    release line from before the list grew needs only the images it was published with.
 4. `gh`, authenticated with `repo` and `workflow` permissions (`gh auth status`).
@@ -437,7 +464,8 @@ prolong user-facing downtime.
 Three invariants hold under the bypass:
 
 1. `verify_release_eligibility.sh` still requires every image in `REQUIRED_RELEASE_IMAGES`, as
-   `common.sh` lists it at `<TARGET_COMMIT>`, to exist in GHCR under that commit; an unbuilt
+   `common.sh` lists it at `<TARGET_COMMIT>`, to exist under that commit
+   [where the release reads them](#where-a-release-reads-the-commits-images); an unbuilt
    commit hard-fails.
 2. `emergency_override_reason` must carry a non-whitespace justification; an empty one aborts the
    workflow.
@@ -500,7 +528,10 @@ line; a patch is validated by the RC pipeline and released by hand.
 1. **Land the fix on the line.** Cherry-pick the merged `main` commit onto a branch cut from
    `upstream/release/<X.Y>`, open a pull request whose base is `release/<X.Y>` with a `fix:`
    title, and let Tide merge it (a `feat:` or a breaking change is refused at release time). The
-   merge builds the commit's SHA-tagged images. The lines carry `main`'s protection in three
+   merge builds the commit's SHA-tagged images; with `CANDIDATE_REGISTRY_PREFIX` set to a second
+   registry, dispatch
+   `copy-candidate-images.yml` with the merged commit before releasing
+   ([why](#where-a-release-reads-the-commits-images)). The lines carry `main`'s protection in three
    repository settings, none of them files in this tree. A `release/*` branch protection rule
    requires conversation resolution and restricts pushes to Tide and the release bot. The
    `kube-agents-release-lines` ruleset lets only those two create, push or delete a line. The

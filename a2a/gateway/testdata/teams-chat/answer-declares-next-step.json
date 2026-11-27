@@ -1,0 +1,20 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "**seeded-c is one minor version behind.**\n\nIt runs 1.32.9 and stable is 1.33.4; seeded-a and seeded-b are current.",
+    "actions": [
+      {
+        "data": {
+          "choice": 0,
+          "kageAction": "choice",
+          "label": "upgrade plan for seeded-c",
+          "next": true,
+          "reply": "upgrade plan for seeded-c"
+        },
+        "title": "upgrade plan for seeded-c",
+        "type": "Action.Submit"
+      }
+    ]
+  }
+]

@@ -102,6 +102,9 @@ One field is not a parameter: `intent=confirm` submits the ask as a structured c
 refuses any other; a directive without it sends a typed message. The door takes the confirm only
 where the gateway runs with `A2A_INJECT_CONFIRM=true` (an eval install) and answers 400 otherwise,
 which is infrastructure, since the agent never saw the ask.
+A case with the directive can be side B of a permit pair: a second case puts the same ask and
+checks to the platform agent, `hack/eval/permit-pairs.txt` names the two, and the lint holds them
+equal ([permit-pairs.md](permit-pairs.md)).
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -398,7 +401,9 @@ line's decoration folded when the check sets `fold_decoration: true` (indentatio
 numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
 negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
-line break; a phrase that may wrap says `\s+`), for what no substring can
+line break; a phrase that may wrap says `\s+`; the text is lowercased, so a pattern that spells a
+letter in upper case outside `(?i)`, alone or in a character class of nothing but such letters, does
+not load), for what no substring can
 express: a banned word whose negated uses are legitimate, a value only the work produces, such
 as a 32-hex trace id, where the words around it are the prompt's own and a report of failure
 would echo them (`required_patterns` must each match), a phrase that must start at a word
@@ -414,7 +419,11 @@ optionally followed by its recorded location, bounded on both sides by the expan
 name looks like; a placeholder naming a slot the runner recorded no cluster for returns
 `status: "error"`, like an unreached `fixture_roles` slot, and because an unreached slot is absent
 from `{cluster:any}` rather than forbidden, a case that forbids through it lists a `fixture_roles`
-entry for every slot it means; its `fixture_roles` names the seeded-fleet
+entry for every slot it means; `{model}` in any of the three lists stands for the backing model the runner
+recorded in its environment (`MODEL_DEFAULT_NAME`, `AGENT_MODEL`, or `AGENT_MODEL_NAME`), returning
+`status: "error"` when none is recorded or when only a router alias (`model-default`, `hermes-agent`,
+`model-fast`, `model-reasoning`, `custom`) is set, and is refused outside `report_contains`'s three pattern
+lists by `validate_bench_cases.py`; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns
@@ -459,8 +468,11 @@ it, so a quoted mention of the invocation is one word and not a run, and a run m
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
 and none of which may match, an addressee the delegating turn's chain delegated to, read from the
-inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
-error on the api transport, so a case using it runs over the inject transport alone),
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; and
+`min_children` / `max_children`, inclusive bounds on how many child tasks the chain minted, read
+from the route's `childCount`, which counts a repeated addressee each time where
+`childAddressees` names it once; an error on the api transport, so a case using it runs over the
+inject transport alone, and a bound is an error on a door older than `childCount`),
 `worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
@@ -637,8 +649,8 @@ worker filed it reads the tagged call, which is the command as typed, so a `^`-a
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
-delegating turn's chain delegated to, by profile name, from the inject read route's
-`childAddressees`.
+delegating turn's chain delegated to, by profile name, and how many times, from the inject read
+route's `childAddressees` and `childCount`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
@@ -769,13 +781,15 @@ in the presubmit or nightly files
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
 indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
-comment, and the validator rejects a case path inside one. The one case that does not go
-in a roster file is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
+comment, and the validator rejects a case path inside one. A case that waits outside
+every lane is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
 entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture. The
 pull request that lands the fixture leaves it there, because merging puts nothing on a
 cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
 request moves it to the nightly file, citing a reconcile report that visited every pool
-project and a scan that reads the role healthy on all of them.
+project and a scan that reads the role healthy on all of them. A parked case of the
+Validated Capabilities suite returns by its `suite:` line instead, with its `suite_part:`
+line for a section other than 1: a suite case is never in a roster file.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly
@@ -816,6 +830,8 @@ drift check, so `validate_all()` does not carry it; the lint asserts on
 `sanitization_findings()` in its own right. The same way, it rejects any file committed under
 a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
 or on the dev install, and the case cites the run by its directory name or build id.
+With no path given, it also rejects a line of `hack/eval/permit-pairs.txt` whose two cases are not
+a pair (`permit_pair_problems()`, [permit-pairs.md](permit-pairs.md)).
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

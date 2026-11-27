@@ -46,7 +46,20 @@ A graded nothing, or the two graded different cases), the runs' ``front-door.txt
 resolved route differs from the one it asked for, or wasn't recorded (#6942). It reads only;
 nothing is written.
 
+With ``--pairs`` it compares the two cases of each permit pair instead, #6539's
+other comparison (docs/designs/permit-pairs.md): side A is a case on the
+default route, which the platform agent does, and side B the same ask
+addressed to a profile. Each line of the pairs file that has a hand-off is
+then a row, with side A in the A column and side B in the B column, in the
+classes and with the exit codes above; a pair that ran nowhere is a note. The
+two sides can be in one run or in several, so it takes one or more artifact
+directories, and prints each one's front door (``front_door``, with its
+refusals) and commit. A side A must come from a run on the platform front
+door; a pair's case with a hand-off in two directories, and no pair graded on
+both sides, are refused too (exit 2). Answer length is not compared.
+
 Usage: scripts/eval_front_door_ab.py <run A artifacts> <run B artifacts>
+       scripts/eval_front_door_ab.py --pairs hack/eval/permit-pairs.txt <artifacts> [<artifacts> ...]
 """
 
 from __future__ import annotations
@@ -77,6 +90,22 @@ INFRA_OUTCOME = "infra"
 # flagged, nor a difference under MIN_EXTRA_WORDS.
 LENGTH_MARGIN = 0.25
 MIN_EXTRA_WORDS = 10
+FRONT_DOOR_TITLE = "Front-door A/B: platform (A) vs the default session (B)"
+# The pair mode (--pairs). The front door a side A must have run on, where the
+# default route reaches the platform agent; the mark of a comment in the pairs
+# file; and where a run's commit is: Prow's record beside the artifact
+# directory, else the first line of the baseline record the run appended. A
+# commit is printed at COMMIT_CHARS.
+PAIRS_TITLE = "Permit pairs: the platform agent (A) vs the profile (B)"
+PLATFORM_DOOR = "platform"
+PAIRS_COMMENT = "#"
+PAIR_SIDES = 2
+STARTED_FILE = "started.json"
+STARTED_COMMIT_KEY = "repo-commit"
+BASELINE_FILE = "baseline-append.jsonl"
+BASELINE_COMMIT_KEY = "commit"
+NOT_RECORDED = "not recorded"
+COMMIT_CHARS = 9
 
 
 class UnreadableRun(Exception):
@@ -195,6 +224,83 @@ def check_comparable(
         )
 
 
+def read_pairs(path: Path) -> list[tuple[str, str]]:
+    """The pairs file's lines: a side A case id, then its side B case id."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError) as err:
+        raise UnreadableRun(f"{path}: {err}") from err
+    pairs = [words for line in lines if (words := line.split(PAIRS_COMMENT, 1)[0].split())]
+    if not pairs or any(len(words) != PAIR_SIDES for words in pairs):
+        raise UnreadableRun(f"{path}: each line is two case ids, side A then side B, and the file has one line or more")
+    return [(side_a, side_b) for side_a, side_b in pairs]
+
+
+def run_commit(directory: Path) -> str:
+    """The commit a run graded, or NOT_RECORDED."""
+    for path, key, first_line in (
+        (directory.resolve().parent / STARTED_FILE, STARTED_COMMIT_KEY, False),
+        (directory / BASELINE_FILE, BASELINE_COMMIT_KEY, True),
+    ):
+        try:
+            text = path.read_text(encoding="utf-8")
+            record: Any = json.loads(text.splitlines()[0] if first_line else text)
+        except (OSError, ValueError, IndexError):
+            continue
+        if isinstance(record, dict) and isinstance(record.get(key), str) and record[key]:
+            return record[key]
+    return NOT_RECORDED
+
+
+def short_commit(commit: str) -> str:
+    return commit if commit == NOT_RECORDED else commit[:COMMIT_CHARS]
+
+
+def read_pair_runs(
+    pairs: list[tuple[str, str]], directories: Sequence[Path]
+) -> tuple[dict[str, Side], dict[str, Side], list[str]]:
+    """Each pair's side A and side B as run A and run B of ``compare``, by the
+    label ``<side A> / <side B>``, and the lines that say where they ran."""
+    where: dict[str, tuple[Path, Side]] = {}
+    wanted = {case for pair in pairs for case in pair}
+    lines: list[str] = []
+    for directory in directories:
+        cases = read_run(directory)
+        if not cases:
+            raise UnreadableRun(f"{directory} has no {CASE_GLOB}; is it the artifact directory itself?")
+        lines.append(f"- `{directory}`: front door {front_door(directory)}, commit {short_commit(run_commit(directory))}")
+        for case in sorted(wanted & cases.keys()):
+            if case in where:
+                raise UnreadableRun(f"{case} has a hand-off in {where[case][0]} and in {directory}; give one run of each case")
+            where[case] = (directory, cases[case])
+    a_run: dict[str, Side] = {}
+    b_run: dict[str, Side] = {}
+    for side_a, side_b in pairs:
+        label = f"{side_a} / {side_b}"
+        a, b = where.get(side_a), where.get(side_b)
+        if a is None and b is None:
+            lines.append(f"- Note: `{label}` ran in none of these directories.")
+            continue
+        if a is not None:
+            if (door := front_door(a[0])) != PLATFORM_DOOR:
+                raise UnreadableRun(
+                    f"side A {side_a} ran in {a[0]}, which deployed {door} ({FRONT_DOOR_FILE}); "
+                    f"only the {PLATFORM_DOOR} front door sends a default-route case to the platform agent"
+                )
+            a_run[label] = a[1]
+            if a[1].scored and not a[1].passes:
+                lines.append(f"- Note: side A of `{label}` never passed, so the pair shows nothing about the capability.")
+        if b is not None:
+            b_run[label] = b[1]
+        if a is not None and b is not None:
+            commits = (run_commit(a[0]), run_commit(b[0]))
+            if NOT_RECORDED not in commits and commits[0] != commits[1]:
+                lines.append(f"- Note: the sides of `{label}` ran at different commits ({short_commit(commits[0])}, {short_commit(commits[1])}).")
+    if not any(a.rate is not None and label in b_run and b_run[label].rate is not None for label, a in a_run.items()):
+        raise UnreadableRun("no pair was graded on both sides in these directories")
+    return a_run, b_run, lines
+
+
 def read_answer_words(directory: Path) -> dict[str, float]:
     """Each case's answer words in a run, from its grading log: the
     nearest-rank median over its repetitions that weren't infrastructure, as
@@ -266,12 +372,13 @@ def markdown(
     rows: list[tuple[str, str, Side | None, Side | None]],
     a_words: dict[str, float] | None = None,
     b_words: dict[str, float] | None = None,
+    title: str = FRONT_DOOR_TITLE,
 ) -> str:
     counts = {kind: sum(1 for row in rows if row[1] == kind) for kind in ORDER}
     summary = ", ".join(f"{counts[kind]} {kind}" for kind in ORDER if counts[kind])
     lengths = bool(a_words) and bool(b_words)
     lines = [
-        "Front-door A/B: platform (A) vs the default session (B)",
+        title,
         "",
         f"{len(rows)} cases: {summary or 'none'}",
     ]
@@ -304,17 +411,39 @@ def markdown(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "run_a", type=Path, help="run A's artifact directory (EVAL_FRONT_DOOR=platform)"
+        "runs",
+        type=Path,
+        nargs="+",
+        metavar="run",
+        help="run A's artifact directory (EVAL_FRONT_DOOR=platform), then run B's (EVAL_FRONT_DOOR=session); "
+        "with --pairs, one or more artifact directories",
     )
     parser.add_argument(
-        "run_b", type=Path, help="run B's artifact directory (EVAL_FRONT_DOOR=session)"
+        "--pairs",
+        type=Path,
+        help="compare the two cases of each line of this pairs file (hack/eval/permit-pairs.txt) instead of one case on two front doors",
     )
     parser.add_argument(
         "--length-gate",
         action="store_true",
         help="also exit 1 when a case is wordier on B (answer length is part of front-door parity)",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_intermixed_args(argv)
+    if args.pairs is not None:
+        if args.length_gate:
+            parser.error("--length-gate compares one case on two front doors; it has no meaning with --pairs")
+        try:
+            pair_a, pair_b, where = read_pair_runs(read_pairs(args.pairs), args.runs)
+        except UnreadableRun as err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
+        pair_rows = compare(pair_a, pair_b)
+        sys.stdout.write(markdown(pair_rows, title=PAIRS_TITLE) + "\n" + "\n".join(where) + "\n")
+        return 1 if any(kind == REGRESSION for _, kind, _, _ in pair_rows) else 0
+    try:
+        args.run_a, args.run_b = args.runs
+    except ValueError:
+        parser.error("give run A's artifact directory, then run B's")
     try:
         a_run, b_run = read_run(args.run_a), read_run(args.run_b)
         check_comparable(args.run_a, args.run_b, a_run, b_run)

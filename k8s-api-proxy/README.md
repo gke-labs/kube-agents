@@ -9,12 +9,21 @@ caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), imp
 the cluster's API server through `pkg/upstream` with credentials the sandbox never holds, and emits
 structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
-`cmd/k8s-api-proxy` builds the production server binary.
+`cmd/k8s-api-proxy` builds the production server binary from `pkg/proxyserver`, which holds its
+flags, environment variables and lifecycle.
 
 `tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
-server directly; the operator picks them. A review that fails is a 503 rather than a 401.
+server directly; the operator picks them. A review that fails is a 503 rather than a 401. It also
+holds each request to the pod its token was issued to (`podbinding.go`): the TokenReview names the pod
+(`user.extra` `authentication.kubernetes.io/pod-name` and `pod-uid`), the proxy reads it (`get` on
+pods in the caller's namespace), checks its UID, and requires the request's direct peer
+(`RemoteAddr`, never a header) to be one of its `status.podIPs`. Anything short of that, a token
+without a pod or an error reading the pod included, is the same 401 as an unknown token, so a
+token is only good from its own pod and `kubectl port-forward` to the proxy is refused. In an `--auth-mode` chain that refusal is final (it wraps
+`k8sapiproxy.ErrCallerRefused`), and `jwtauth` refuses a token with the `kubernetes.io` claim, so
+no other authenticator admits a ServiceAccount token.
 
 `jwtauth.NewAuthenticator` (`pkg/jwtauth`, `--auth-mode=jwt` in the binary) is for a platform that
 mints a signed token per sandbox, such as an agent runtime that injects one at its egress gateway. It accepts a bearer
@@ -148,6 +157,59 @@ partition needs the cache off (`Config.Cache` nil). A write evicts the resource'
 in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
 caller's partition only, since only that credential's access changed.
 
+An embedder with a rule of its own about who may ask what sets `Config.Authorize`. The handler
+calls it for every request that names a cluster and classifies as an API request, after the
+exclusion and hold checks, with the request as received (headers not yet stripped, no body), the
+`CallerIdentity`, the cluster ID and the `RequestInfo`. It runs before the policy, the
+response cache, in-flight coalescing and the upstream, on a cache hit too, so a caller it refuses
+is never served a response fetched for another caller and never joins another's fetch. Any error
+is a `403 Forbidden`, audited as `refused` with `rejection_reason` `authorize.refused`; the caller
+reads a fixed message and the error goes to the audit record only. Returning an `AuthorizeError`
+chooses the reason and the message instead; the rejection metric counts such a reason as `other`.
+There is no "could not decide" answer: a hook whose dependency is unavailable fails closed, and a
+hook that panics refuses the request the same way, with the panic value in the audit record only.
+The hook does not hide a cluster's scope state: route validation, exclusions, holds and
+classification answer before it, so a caller it would refuse still receives those refusals, a
+hold's reason text included, and an embedder that must keep that from unauthorized callers cannot
+rely on the hook for it. It runs before the request takes an in-flight slot and gets no deadline
+beyond the request's context, so a hook that does I/O must bound it itself.
+`CallerIdentity.Extra` carries what else the authenticator verified about the caller, under the
+authenticator's own keys: `pkg/tokenreview` copies the TokenReview's `status.user.extra`, where
+Kubernetes names the pod of a pod-bound ServiceAccount token
+(`authentication.kubernetes.io/pod-name`, `authentication.kubernetes.io/pod-uid`). The default
+audit sink does not log it. `Config.ExtraCallerHeaders` names further request headers to strip
+before forwarding, on plain, watch and upgrade requests alike, for a deployment that passes a
+caller's identity or credential in headers of its own; the authenticator and `Config.Authorize`
+still read them. An entry that is not an HTTP header name, or is `Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets
+neither option.
+
+A program that needs only those two options on top of the binary does not rebuild the server from
+the packages: its `main` calls `proxyserver.Run` (`pkg/proxyserver`), which is what
+`cmd/k8s-api-proxy` calls.
+
+```go
+func main() {
+	err := proxyserver.Run(context.Background(), os.Args[1:], proxyserver.Options{
+		Version:            version,
+		Authorize:          authorize,
+		ExtraCallerHeaders: []string{"X-Example-Credential"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`Options.Authorize` and `Options.ExtraCallerHeaders` become the `Config` fields of the same names,
+and `Options.Version` is what `--version` and the startup log report after the name
+`k8s-api-proxy`. Everything else is the binary's: the same flags, environment variables and
+defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
+the binary exits on, and `nil` after `--version` or a drained shutdown. It registers the flags on
+`flag.CommandLine`, so a process calls it once. A flag that does not parse exits the process there;
+if the program gave `flag.CommandLine` another error handling, `Run` returns the parse error and
+starts nothing.
+
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
 archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
@@ -258,7 +320,7 @@ the manifests cover the serving certificate, the Service name the certificate, t
 the gateway rule share, and the NetworkPolicy that admits the gateway's pods. In
 [`examples/local-bridge/`](examples/local-bridge/), one process per sandbox listens on loopback
 with `--auth-mode=none` and forwards to a local `--upstream-url`.
-`cmd/k8s-api-proxy/examples_test.go` builds the binary's handler from the container `args` in the
+`pkg/proxyserver/examples_test.go` builds the binary's handler from the container `args` in the
 manifests and from the fenced flag blocks in the two example READMEs, so an unknown flag or a
 refused combination there fails the module's tests; flags named in prose are not checked.
 
@@ -280,7 +342,8 @@ so a program can embed the handler with its own authenticator, upstream transpor
 go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 ```
 
-The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
-`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
+`AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
+`AuditEvent`, `proxyserver.Run` and `proxyserver.Options` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

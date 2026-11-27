@@ -216,7 +216,18 @@ type Config struct {
 	// Empty for every other run.
 	TaskStem string
 
+	// ToolLines, when set, writes the per-tool log line for the task
+	// (toollog.go). A profile worker sets it for each task it runs; nil
+	// writes none.
+	ToolLines *ToolLines
+
 	Logger *slog.Logger
+
+	// Trajectory, when set, is the session's tool-call capture for the
+	// evals (trajectory.go): every activity the harness emits is recorded
+	// in it, scrubbed and capped, and served only on the pod's loopback.
+	// nil records nothing.
+	Trajectory *TrajectoryStore
 }
 
 // Addressee is the executor's token on the task subjects.
@@ -420,6 +431,9 @@ type adapter struct {
 	finalized bool
 	finalErr  error
 	appended  map[string]bool // artifact name -> first chunk already out
+	// tools writes the task's per-tool log lines (Config.ToolLines), or is
+	// nil and writes none.
+	tools *toolLog
 	// askKind is the mark.ask token for the task's prompt (lib/askkind),
 	// carried on every progress line as the hermes-bridge carries it, so the
 	// gateway's reaction follows a profile task as it follows a platform one
@@ -703,6 +717,7 @@ func newTaskAdapter(cfg Config, b *busConns) *adapter {
 		js:       b.js,
 		from:     lib.Party{Session: cfg.Addressee(), AgentType: string(cfg.driver().Harness()), Profile: cfg.Profile},
 		appended: map[string]bool{},
+		tools:    newToolLog(cfg.Logger, cfg.TaskID, cfg.ToolLines),
 	}
 }
 
@@ -982,6 +997,8 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
+	// The harness's own log lines (stdout chatter, refused tool calls) name
+	// the task.
 	// A harness with its own wall-clock bound gets it from the task's
 	// deadline less the kill grace, so it ends the turn with a result
 	// before the adapter stops it.
@@ -989,7 +1006,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	if b, ok := drv.(turnBudgeter); ok {
 		firstArgv = b.WithTurnBudget(argv, cfg.TaskDeadline-cfg.KillGrace)
 	}
-	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log)
+	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -1022,7 +1039,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			if b, ok := drv.(turnBudgeter); ok {
 				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
 			}
-			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log)
+			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 		}
 	}
 
@@ -1267,6 +1284,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					}
 					switch ev.Kind {
 					case EventToolResult:
+						a.tools.ended(ev)
 						// A tool step's result is in. Its content, when the
 						// driver carries one, feeds the seen-values set for the
 						// answer's scrub and is never published. And the call
@@ -1318,6 +1336,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(text, a.askKind), false)
 						}
 					case EventActivity:
+						a.tools.started(ev)
+						a.cfg.Trajectory.Record(a.taskID, ev.Tool, ev.Input, nil, time.Now())
 						a.publishActivity(ctx, ev)
 					case EventResult:
 						// What the turn cost goes out first, whatever the turn
@@ -1730,13 +1750,19 @@ func (a *adapter) publishUsage(ctx context.Context, t resultTelemetry) {
 // model cost. (The spec's explicit progress tool is the stage 3 shape;
 // mapping the narration is the playground stand-in, recorded in the
 // findings.) The entry is the bridge's shape: the tool and a short scrubbed
-// title, no arguments (activityTitle). An entry that does not marshal
-// publishes nothing.
+// title, no arguments (activityTitle). A call id, when the harness gives one
+// in the shape activityCallID accepts, goes beside them as callId, so it
+// joins the call to a refused-call log record. An entry that does not
+// marshal publishes nothing.
 func (a *adapter) publishActivity(ctx context.Context, ev Event) {
-	entry, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"tool":  ev.Tool,
 		"title": a.scrub(activityTitle(ev.Tool, ev.Input)),
-	})
+	}
+	if activityCallID.MatchString(ev.CallID) {
+		fields["callId"] = ev.CallID
+	}
+	entry, err := json.Marshal(fields)
 	if err != nil {
 		return
 	}
@@ -2653,6 +2679,13 @@ func activityTitle(tool string, input json.RawMessage) string {
 	}
 	return answerscrub.ScrubInline(title)
 }
+
+// activityCallID is the shape of a call id the activity entry carries. The
+// id is the harness's (ADK's "adk-<uuid>", Claude Code's "toolu_..."), not
+// the model's, but it rides on a published artifact, so anything outside a
+// short token alphabet is left off rather than scrubbed: the entry then has
+// no callId, as from a harness that gives none.
+var activityCallID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // leadingCommand is a shell command's program (its base name) and, when the
 // next word isn't a flag, an assignment or a quoted or path-like value, its

@@ -297,3 +297,23 @@ func TestAuthenticatorRefusesAnOversizedBearerToken(t *testing.T) {
 		t.Errorf("token under the bound: %v", err)
 	}
 }
+
+// A Kubernetes ServiceAccount token, which carries the kubernetes.io claim, is the
+// TokenReview authenticator's to admit (and to hold to its pod), even when this issuer signs
+// it for an accepted audience.
+func TestAuthenticatorRefusesAServiceAccountToken(t *testing.T) {
+	is := newIssuer(t)
+	a := newAuth(t, is.config())
+	if _, err := a.AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatalf("the same token without the claim: %v", err)
+	}
+	for name, claim := range map[string]any{
+		"projected": map[string]any{"namespace": "ns", "pod": map[string]any{"name": "p", "uid": "u"}, "serviceaccount": map[string]any{"name": "sa", "uid": "s"}},
+		"not bound": map[string]any{"namespace": "ns", "serviceaccount": map[string]any{"name": "sa", "uid": "s"}},
+	} {
+		token := is.sign(testKeyID, jose.RS256, func(_ *jwt.Claims, extra map[string]any) { extra[kubernetesClaim] = claim })
+		if _, err := a.AuthenticateRequest(bearer(token)); err == nil {
+			t.Errorf("%s: admitted a ServiceAccount token", name)
+		}
+	}
+}

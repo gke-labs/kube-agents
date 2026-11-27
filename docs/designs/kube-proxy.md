@@ -23,6 +23,7 @@ This document designs **`kube-proxy`** (`k8s-api-proxy`), a standalone Go Kubern
 | Caller authentication (signed JWT)       | [`k8s-api-proxy/pkg/jwtauth/`](../../k8s-api-proxy/pkg/jwtauth/)                                                                     |
 | GKE HTTPS upstream transport             | [`k8s-api-proxy/pkg/upstream/`](../../k8s-api-proxy/pkg/upstream/)                                                                   |
 | Rotated TLS certificate and CA reload    | [`k8s-api-proxy/pkg/certreload/`](../../k8s-api-proxy/pkg/certreload/)                                                               |
+| Server flags, environment and lifecycle  | [`k8s-api-proxy/pkg/proxyserver/`](../../k8s-api-proxy/pkg/proxyserver/)                                                             |
 | Standalone proxy binary                  | [`k8s-api-proxy/cmd/k8s-api-proxy/`](../../k8s-api-proxy/cmd/k8s-api-proxy/)                                                         |
 | Container image                          | [`deploy/kube-proxy/Dockerfile`](../../deploy/kube-proxy/Dockerfile)                                                                 |
 | Sandbox `kubectl` and `kubeconfig` setup | [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile), [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh) |
@@ -128,10 +129,12 @@ k8s-api-proxy/
 ├── go.sum
 ├── cmd/
 │   └── k8s-api-proxy/
-│       ├── main.go               # CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
-│       ├── auth.go               # --auth-mode list, --jwt-* flags, authenticator chain, --partition-by-caller
-│       └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
+│       └── main.go               # Calls proxyserver.Run with the build's version and no other option
 └── pkg/
+    ├── proxyserver/
+    │   ├── server.go             # Run and Options: CLI flags, server lifecycle, wires pkg/k8sapiproxy + pkg/upstream + pkg/certreload
+    │   ├── auth.go               # --auth-mode list, --jwt-* flags, authenticator chain, --partition-by-caller
+    │   └── tokens.go             # Workload Identity Federation and Application Default Credentials token source
     ├── k8sapiproxy/
     │   ├── handler.go            # Core http.Handler: auth -> route -> RequestInfo -> policy -> proxy
     │   ├── policy.go             # Verb allowlist, subresource denylist, dryRun=All check
@@ -174,6 +177,9 @@ type CallerIdentity struct {
 	Partition string
 	// Authenticator names the authenticator that admitted the caller; empty when it does not say.
 	Authenticator string
+	// Extra holds further verified attributes of the caller, under the authenticator's own keys;
+	// pkg/tokenreview copies the TokenReview's status.user.extra. The default audit sink omits it.
+	Extra map[string][]string
 }
 
 // ErrAuthenticationUnavailable is wrapped by an authenticator that could not decide, so the
@@ -224,11 +230,33 @@ type Config struct {
 	TracerProvider   trace.TracerProvider
 	Cache            *CacheConfig
 	Exclusions       *Exclusions
+	Holds            *Holds
+	// Authorize is the embedder's own per-request rule; an error is a 403 before the policy,
+	// the cache, coalescing and the upstream.
+	Authorize func(AuthorizeAttributes) error
+	// ExtraCallerHeaders are further request headers stripped before forwarding.
+	ExtraCallerHeaders []string
 	CallerPartition  func(*CallerIdentity) string
 	MaxInFlight      int
 	DefaultClusterID string
 }
+
+// AuthorizeAttributes is what Config.Authorize decides on.
+type AuthorizeAttributes struct {
+	Request     *http.Request // as received, headers not yet stripped, without its body
+	Caller      *CallerIdentity
+	ClusterID   string
+	RequestInfo *request.RequestInfo
+}
+
+// AuthorizeError lets Config.Authorize choose the audit reason and the caller's message.
+type AuthorizeError struct {
+	Reason  RejectionReason
+	Message string
+}
 ```
+
+The handler decides in a fixed order: it authenticates the caller, computes `Config.CallerPartition`, splits the cluster ID from the path, checks `Exclusions` and `Holds`, classifies the request (`RequestInfo`), calls `Config.Authorize` when one is set, evaluates `Policy`, takes an in-flight slot (a watch or another long-running request takes none), strips the caller's headers, and only then reaches the response cache, the in-flight coalescer and the upstream. `Config.Authorize` sits where it does for two reasons: after classification, because a rule on the verb or the resource needs it, and ahead of the cache and the coalescer, because both share responses across callers, so a check any later could serve a refused caller a response fetched for another. The existing checks keep their order, which is why exclusions and holds still answer before the hook. [`k8s-api-proxy/README.md`](../../k8s-api-proxy/README.md) owns how an embedder uses the hook, `CallerIdentity.Extra` and `Config.ExtraCallerHeaders`: what the hook is handed, what a refusal looks like, and which header names are refused.
 
 ### 2. End-to-end request flow
 
@@ -242,14 +270,16 @@ sequenceDiagram
     K->>P: GET /clusters/gke_proj_loc_clu/api/v1/namespaces/default/secrets<br/>Authorization: Bearer <projected-sa-token>
     P->>P: 1. Verify caller token via CallerAuthenticator (TokenReview cache)
     P->>P: 2. Extract clusterID ("gke_proj_loc_clu") & normalize path ("/api/v1/namespaces/default/secrets")
-    P->>P: 3. Strip caller Authorization, Impersonate-*, X-Remote-* headers
+    P->>P: 3. Refuse an excluded or held cluster (Exclusions, Holds)
     P->>P: 4. Parse RequestInfo (Verb="list", Resource="secrets", Version="v1")
-    P->>P: 5. Enforce Policy (allow "list"; rewrite Accept -> PartialObjectMetadata)
-    P->>T: 6. RoundTripCluster(ctx, "gke_proj_loc_clu", sanitizedReq)
+    P->>P: 5. Call Config.Authorize when the embedder set one (403 on any error)
+    P->>P: 6. Enforce Policy (allow "list"; rewrite Accept -> PartialObjectMetadata)
+    P->>P: 7. Strip caller Authorization, Impersonate-*, X-Remote-* headers
+    P->>T: 8. RoundTripCluster(ctx, "gke_proj_loc_clu", sanitizedReq)
     T->>A: GET /api/v1/namespaces/default/secrets<br/>Authorization: Bearer <upstream-gcp-or-ksa-token>
     A-->>T: 200 OK (PartialObjectMetadataList / SecretList)
     T-->>P: *http.Response
-    P->>P: 7. Redact any residual .data, .stringData, last-applied-configuration
+    P->>P: 9. Redact any residual .data, .stringData, last-applied-configuration
     P-->>K: 200 OK (Metadata only)
 ```
 
@@ -324,6 +354,10 @@ How multi-cluster context switching works:
 2. Verifies the token against the host cluster's `authentication.k8s.io/v1` `TokenReview` API with `spec.audiences` set to all configured audiences (`CREDENTIAL_PROXY_AUDIENCE` for `<agent>-shell`, plus `CREDENTIAL_PROXY_SESSION_AUDIENCE` when the session pods' cluster view is on (the session route's default, or the operator's `A2A_SESSION_CLUSTER_VIEW=true`)).
 3. Checks `AudienceCallers` so `status.user.username` matches the allowlist bound to the specific audience that authenticated (`CREDENTIAL_PROXY_ALLOWED_CALLERS` for `CREDENTIAL_PROXY_AUDIENCE`, and `CREDENTIAL_PROXY_SESSION_CALLERS` for `CREDENTIAL_PROXY_SESSION_AUDIENCE`).
 4. Caches verified token results (`sha256(token)`) in memory for `min(10s, tokenExpiry)` (`defaultTokenReviewCacheTTL`) so repeated `kubectl` calls do not block on `TokenReview` round trips.
+5. Holds the request to the pod the token was issued to ([`pkg/tokenreview/podbinding.go`](../../k8s-api-proxy/pkg/tokenreview/podbinding.go)). The `TokenReview` of a projected token names its pod in `status.user.extra` (`authentication.kubernetes.io/pod-name` and `pod-uid`). `kube-proxy` reads that pod (`get` on pods in the caller's namespace, which is its `ServiceAccount`'s), checks its UID, and requires the request's direct TCP peer to be one of its `status.podIPs` (or `status.podIP`). The peer is the connection's own address, never a header: nothing fronts `kube-proxy`, and the sandbox and session pods dial its ClusterIP Service directly, which keeps the source address. A token that names no pod, a pod that is gone, unreadable or stopped (`Succeeded` or `Failed`), a UID that does not match, an API error, or a peer that is not one of the pod's addresses gets the same `401` as an unknown token. A `403` on the pod read also logs, at most once a minute per namespace, the permission and namespace. A matched pod's addresses are reused for the `TokenReview` cache's TTL (at most 30 seconds); a refusal is not cached, concurrent lookups of one pod share one read, and one pod and UID is read at most once a second, so a token refused on the read costs one read a second however often it is sent. In a chain (`--auth-mode=token-review,jwt`) this refusal is final: the token never reaches the next authenticator. The `jwt` authenticator also refuses any token carrying the `kubernetes.io` claim, which every Kubernetes `ServiceAccount` token carries, so in either order a pod's token is admitted only by `token-review` and only from its pod.
+6. Returns the review's `status.user.extra` as `CallerIdentity.Extra`, so a `Config.Authorize` can decide on more than the caller's name, such as the pod a pod-bound token belongs to.
+
+**`kubectl port-forward` to `kube-proxy` is refused.** A request that reaches `kube-proxy` through a port-forward arrives from the forwarding path, not from the pod its token was issued to, so it fails the pod check above even with a valid sandbox token. To run `kubectl` the way the agent does, run it inside the sandbox (`kubectl exec -it <agent>-shell-0 -c shell -- kubectl ...`), where the pod's own token and address match; to inspect the cluster as an operator, use your own credentials against the API server directly.
 
 **Why the projected `ServiceAccount` token is not a cluster credential**:
 The token mounted at `/var/run/secrets/kubeagents/credential-proxy/token` is a short-lived Kubernetes projected `ServiceAccount` JWT bound to `aud: ["kubeagents-credential-proxy"]` (or `aud: ["kubeagents-credential-proxy-session"]` on session pods). It is not a Kubernetes API token (`aud: "https://kubernetes.default.svc"`) and not a Google Cloud access token (**Asset A1**). If a caller attempts to present this token directly to `kube-apiserver`, `kube-apiserver` rejects it because the audience does not match.
@@ -396,6 +430,9 @@ On every incoming request, before invoking `UpstreamTransport`, `pkg/k8sapiproxy
 - `Impersonate-User`, `Impersonate-Group`, `Impersonate-Uid`, and any header matching `^Impersonate-Extra-` (case-insensitive)
 - `X-Remote-User`, `X-Remote-Group`, and `X-Remote-Extra-*`
 - `Connection` and `Upgrade` (unless `ModeReadWrite` with `AllowUpgradeSubresources` is enabled and `Upgrade` is non-empty, in which case `Connection: Upgrade` is set)
+- Every header `Config.ExtraCallerHeaders` names, for an embedder whose authenticator or `Config.Authorize` reads the caller's identity or credential from headers of its own. The binary sets none.
+
+The authenticator and `Config.Authorize` run on the request as received, so they still read these headers; the handler strips them from its own copy of the request at one point, after the policy admits it, and every forwarded request (plain, watch, and upgrade) is built from that copy.
 
 Today the proxy does not change `User-Agent`: the header reaches `kube-apiserver` as the caller sent it, with no `kproxy/<caller-username>` suffix. The target cluster's audit log therefore shows the proxy's upstream identity and `kubectl`'s own `User-Agent`, and does not name the sandbox caller. The record of the caller is the proxy's own audit record (`caller_username`, `caller_uid`, `caller_groups`, `caller_partition` when the authenticator named one, and `caller_authenticator`, the `--auth-mode` entry that admitted the caller; see section 10). A request that the proxy forwarded is matched to the cluster's audit log by its `cluster`, its time (the record is written when the request ends, and `duration_ms` gives the start) and its request fields (`verb`, `api_group`, `resource`, `namespace`, `name`). A record whose `cache` is `hit` or `coalesced` has no entry of its own in the cluster's audit log. The two logs share no request ID.
 
@@ -443,7 +480,7 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `--upstream-token-file` (`KUBE_PROXY_UPSTREAM_TOKEN_FILE`, `StaticConfig.BearerTokenFile`) is the bearer token the proxy sends in place of the caller's `Authorization` header. It requires an `https://` upstream, loopback included, is re-read at most once a second so a rotated token needs no restart, and fails closed: an unusable file stops the proxy at startup, and a request that reaches the upstream while the file is missing or empty gets `502 Bad Gateway` rather than an earlier token. Three things outlast a withdrawn or changed token: it can still be sent for up to a second, until the file is read again; a request already in flight (a watch, a log follow or an exec) keeps streaming; and answers already in the response cache (section 8a), discovery documents by default, are served until their TTL ends (`--cache-max-bytes=0` turns the cache off). With `--auth-mode=none` every peer that can reach the listener acts with the token's identity, so the listener is bound to loopback or otherwise restricted, and the proxy logs a startup warning for the combination.
    - `--upstream-ca-file` (`KUBE_PROXY_UPSTREAM_CA_FILE`, `StaticConfig.CAFile`) is the PEM bundle the upstream's certificate is verified against, reloaded by `certreload.CAPool` on rotation with hostname verification unchanged; a changed bundle that does not load is logged and counted in `kubeagents_kube_proxy_certificate_reload_failures_total`, and the previous one kept. A removed or permanently unreadable bundle file is reported once and its roots stay trusted until restart, so trust in a CA is withdrawn by replacing the bundle's contents, not by deleting the file.
 
-Neither transport needs Google credentials to start, so a proxy that serves `in-cluster` alone runs on a cluster that has none, and only a `gke_` request fails, naming the missing credentials. The binary's own token source (`cmd/k8s-api-proxy/tokens.go`) looks them up on first use; `upstream.New` does the same for an embedder that passes no `Config.TokenSource`.
+Neither transport needs Google credentials to start, so a proxy that serves `in-cluster` alone runs on a cluster that has none, and only a `gke_` request fails, naming the missing credentials. The binary's own token source (`pkg/proxyserver/tokens.go`) looks them up on first use; `upstream.New` does the same for an embedder that passes no `Config.TokenSource`.
 
 ### 10. Observability: Prometheus metrics, OpenTelemetry tracing, and audit logging (`pkg/k8sapiproxy/metrics.go`, `pkg/k8sapiproxy/telemetry.go`, `pkg/k8sapiproxy/audit.go`)
 
@@ -452,7 +489,7 @@ Neither transport needs Google credentials to start, so a proxy that serves `in-
 1. **Prometheus metrics (`/metrics` on port `8444`)**:
    - All label values come from closed vocabularies so caller-supplied paths or CRD resource names cannot increase series cardinality.
    - `kubeagents_kube_proxy_requests_total` (`verb`, `resource`, `subresource`, `mode`, `dry_run`, `outcome`, `status_code`): Total Kubernetes API requests processed by `kube-proxy`.
-   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `secret_write_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`, `streaming_blocked`, `scope.excluded-cluster`, `scope.exclude-unreadable`).
+   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `secret_write_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`, `streaming_blocked`, `scope.excluded-cluster`, `scope.exclude-unreadable`, `scope.held-cluster`, `scope.hold-unreadable`, `authorize.refused`; a reason of an embedder's own from `Config.Authorize` is counted as `other`).
    - `kubeagents_kube_proxy_secrets_redacted_total` (`action`): Total `core/v1` `Secret` redaction actions (`accept_header_rewritten` and `payload_scrubbed`).
    - `kubeagents_kube_proxy_cache_requests_total` (`result`, `verb`, `resource`): Total cache lookups in `kube-proxy`, labeled by result (`hit`, `miss`, `coalesced`, `bypass`), verb, and resource.
    - `kubeagents_kube_proxy_cache_evictions_total` (`reason`): Total cached responses evicted from the `kube-proxy` cache, labeled by reason (`capacity`, `expired`, `invalidated`).
@@ -477,6 +514,7 @@ The operator reconciles a dedicated **`<agent>-kube-proxy` Deployment and Cluste
 - **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment of two replicas, rolled one at a time with no surge (`maxSurge: 0`, `maxUnavailable: 1`) and covered by a `maxUnavailable: 1` PodDisruptionBudget, with a 5-second `preStop` sleep so a terminating replica keeps listening until its endpoint removal propagates, and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` pod (plus session pods when the session pods' cluster view is on (the session route's default, or the operator's `A2A_SESSION_CLUSTER_VIEW=true`)), and admits `gmp-system` on port `8444`.
 - **In-flight cap**: each replica forwards at most 24 requests at once (`--max-in-flight`, `KUBE_PROXY_MAX_IN_FLIGHT`; `0` turns the cap off) and answers the next with `429 Too Many Requests` and `Retry-After: 1`, which client-go, and so `kubectl`, waits out and retries up to 10 times; a caller that is not client-go sees the 429 unless it retries on its own. Every forwarded list holds upstream response buffers in the proxy, and with no cap concurrent lists drove a replica past its memory limit; 24 keeps one under 512Mi at the roughly 9.5 MiB that a 500-object page held in flight (a redacted Secret response can buffer up to 16 MiB, but Secret lists carry metadata only). Watches and the `log`, `exec`, `attach`, `portforward` and `proxy` subresources stay open as long as the caller follows them, so, as in kube-apiserver's own max-in-flight limit, they take no slot. A request the policy refuses is answered before the cap. A throttled request is audited and counted with outcome `throttled`.
 - **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`; the proxy reloads them when the volume updates (`pkg/certreload`), and the operator also rolls the Deployment when the certificate's hash changes. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`, and the operator publishes `ca.crt` in `<agent>-kube-proxy-ca-bundle` (mounted into session pods under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`).
+- **Caller pod read (`<agent>-kube-proxy-pod-read` Role and RoleBinding)**: `get` on pods in the agent's namespace, the only namespace whose pods call `kube-proxy`, bound to its `ServiceAccount`, for the pod check of section 5. The minimal audit ClusterRole bound to the same `ServiceAccount` already grants pod reads cluster-wide; this Role is the backstop that keeps the check working if that grant is narrowed. The operator renders it, so a chart rollback leaves it in place until the PlatformAgent is deleted.
 - **Upstream identity**: `<agent>-kube-proxy` runs as `agentServiceAccountName(agent)` in its own isolated pod, using the same Workload Identity / Workload Identity Federation configuration, `scopedServiceAccountPool` mapping (`<agent>-credential-proxy-policy`), and `kubeagents:tokenreview:<namespace>:<agent>` / host-cluster reader RBAC bindings as `<agent>-credential-proxy` while restricting network ingress to authorized callers on `:8443` and `gmp-system` on `:8444`.
 - **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765` (plus `kubectl` `/v1/exec` for `AgentProfile` workers). `<agent>-shell` and A2A session pods under the cluster view (the session route's default, or the operator's `A2A_SESSION_CLUSTER_VIEW=true`) receive `KUBE_PROXY_URL=https://<agent>-kube-proxy.<namespace>.svc.cluster.local:8443` and route all `kubectl` operations through `<agent>-kube-proxy`. Session pods also receive `KUBE_PROXY_MODE`, the mode the operator runs `<agent>-kube-proxy` in, passed through the gateway's `A2A_KUBE_PROXY_MODE`, so their kubectl wrapper records a failed write attempt only under a read-only mode ([the subagent-profiles spec](spec-subagent-profiles.md), "Stopped at a write refusal"). The gateway's agent container gets the same URL as `KUBE_PROXY_IN_USE_URL`, a sign only: it runs no `kubectl` through the proxy, and its scripts read the variable to skip choosing `get-credentials` endpoint flags the sandbox would not use.
 
