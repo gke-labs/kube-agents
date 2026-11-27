@@ -247,6 +247,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+import credential_proxy_client  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
 # `fleet_scope` tool (`--scope-projects`, `--scope-unread`), one holder per
@@ -258,7 +259,6 @@ LEDGER_VERSION = 1
 GUARDS_VERSION = 1
 
 HERMES_HOME_ENV = "HERMES_HOME"
-DEFAULT_HERMES_HOME = "/opt/data"
 # The store: ledger, guards and reports. The collector runs in the agent's
 # shell sandbox, whose /opt/data is the sandbox's own volume rather than the
 # gateway's profile volume, so the path is absolute there and not derived
@@ -1437,10 +1437,6 @@ def parse_ts(text: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def hermes_home() -> Path:
-    return Path(os.environ.get(HERMES_HOME_ENV) or DEFAULT_HERMES_HOME)
-
-
 def data_dir() -> Path:
     return Path(os.environ.get(STORE_HOME_ENV) or DEFAULT_STORE_DIR)
 
@@ -2029,7 +2025,9 @@ def what_happened(selection: Selection, ledger: dict) -> dict:
 
 
 def kubeconfig_dir() -> Path:
-    return hermes_home() / KUBECONFIG_SUBDIR
+    """`credential_proxy_client.kubeconfig_dir`, the one resolver, at call time:
+    $KUBE_AGENTS_KUBECONFIG_DIR when set, else `$HERMES_HOME/.kubeconfigs`."""
+    return credential_proxy_client.kubeconfig_dir()
 
 
 def kubeconfig_path(project: str, cluster: str, location: str) -> Path:

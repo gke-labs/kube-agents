@@ -1198,7 +1198,9 @@ func (s *syncBuffer) String() string {
 
 // What one task leaves in the reset paths (its working directory, $HOME,
 // /tmp and the rest) is gone before the next task's harness starts, on the
-// same warm pod, and the log says the reset ran.
+// same warm pod, and the log says the reset ran. That includes a directory
+// left read-only and the fleet-audit collectors' 0700 .kubeconfigs with its
+// 0600 kubeconfig (KUBE_AGENTS_KUBECONFIG_DIR is on the scratch mount).
 func TestATasksFilesAreGoneBeforeTheNextTask(t *testing.T) {
 	url := startServer(t)
 	d := newFakeDispatcher(t, url)
@@ -1210,6 +1212,7 @@ case "$first" in
     mkdir -p %[1]s/sub && echo left > %[1]s/sub/notes.md
     echo left > %[2]s/.cache-file
     chmod 0500 %[1]s/sub
+    mkdir -m 0700 %[1]s/.kubeconfigs && (umask 077 && echo kc > %[1]s/.kubeconfigs/kubeconfig_p_c_l.yaml)
     echo '{"type":"result","subtype":"success","result":"wrote"}' ;;
   *)
     found=$(find %[1]s %[2]s -mindepth 1 | tr '\n' ' ')

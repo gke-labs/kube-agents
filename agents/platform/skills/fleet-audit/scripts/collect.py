@@ -112,7 +112,8 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
 ]
 
-KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
+# The per-cluster kubeconfig directory, `KUBECONFIG_DIR`, is set below once
+# `credential_proxy_client` is importable.
 # The shared kubeconfig directory is this uid's and closed to every other
 # uid: 0755, so only its owner (and root, which no mode binds) creates
 # entries in it. The file names are public and fixed, so a directory other
@@ -125,6 +126,11 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 # brought back to this one.
 KUBECONFIG_DIR_MODE = 0o755
 KUBECONFIG_DIR_MODE_MASK = 0o7777
+# The directory $KUBE_AGENTS_KUBECONFIG_DIR names is not shared: a profile
+# worker's scratch mount, this uid's alone and emptied after every task
+# (#7462). It is made and kept at 0700
+# (`credential_proxy_client.KUBECONFIG_OVERRIDE_DIR_MODE`); the shared
+# `$HERMES_HOME/.kubeconfigs` keeps the 0755 above.
 # A chmod the filesystem refuses (mode bits it does not carry, a read-only
 # mount) on a directory this uid owns alone -- the owner able to write and
 # search it, no other uid able to write in it (0700, say) -- keeps the
@@ -668,6 +674,10 @@ import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
 import credential_proxy_client  # noqa: E402
+# The per-cluster kubeconfig directory: `credential_proxy_client.kubeconfig_dir`,
+# the one resolver ($KUBE_AGENTS_KUBECONFIG_DIR when set, else
+# `$HERMES_HOME/.kubeconfigs`), read once at import.
+KUBECONFIG_DIR = credential_proxy_client.kubeconfig_dir()
 # The Config Connector read that the collectors share: this file's `gcp` read
 # gives the compliance stream's entries their `kcc_unready` keys through it.
 # It sits beside this file, which a caller can load by path with this
@@ -1353,6 +1363,15 @@ def prepare_kubeconfig(kc: Path) -> str | None:
     return None
 
 
+def kubeconfig_dir_mode(directory: Path) -> int:
+    """The mode `usable_kubeconfig_dir` holds `directory` at: 0700 for the
+    directory $KUBE_AGENTS_KUBECONFIG_DIR names, else `KUBECONFIG_DIR_MODE`."""
+    override = credential_proxy_client.kubeconfig_dir_override()
+    if override is not None and Path(directory) == override:
+        return credential_proxy_client.KUBECONFIG_OVERRIDE_DIR_MODE
+    return KUBECONFIG_DIR_MODE
+
+
 def usable_kubeconfig_dir(directory: Path) -> str | None:
     """`directory` at `KUBECONFIG_DIR_MODE`, owned by this uid or root: made
     fresh and chmodded (its missing ancestors keep the caller's umask);
@@ -1360,7 +1379,9 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
     mode, said on stderr, when the chmod fails and the directory is this
     uid's alone; moved aside and remade when it is another uid's, since this
     uid could not write into it. A note when none of that is possible,
-    naming the owner."""
+    naming the owner. The directory $KUBE_AGENTS_KUBECONFIG_DIR names is held
+    at `kubeconfig_dir_mode`'s 0700 instead."""
+    wanted = kubeconfig_dir_mode(directory)
     euid = os.geteuid()
     if os.path.islink(directory):
         return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory)
@@ -1400,7 +1421,7 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
             # A parent this uid cannot create in: the note, as the reporter's
             # copy of this rule and every other refusal here.
             return f"{directory} could not be made ({exc})"
-    if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+    if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != wanted:
         # Through a descriptor opened without following, so a symlink swapped
         # in between the stat and here is refused rather than chased.
         try:
@@ -1408,18 +1429,18 @@ def usable_kubeconfig_dir(directory: Path) -> str | None:
         except OSError as exc:
             return f"{directory} could not be opened as a directory ({exc})"
         try:
-            os.fchmod(opened, KUBECONFIG_DIR_MODE)
+            os.fchmod(opened, wanted)
         except OSError as exc:
             # Judged on the directory the descriptor holds, not the earlier stat.
             actual = os.fstat(opened)
             mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
             private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
             if not private:
-                return f"{directory} is at mode {oct(mode)}, not {oct(KUBECONFIG_DIR_MODE)}, and could not be changed ({exc})"
+                return f"{directory} is at mode {oct(mode)}, not {oct(wanted)}, and could not be changed ({exc})"
             # This uid's alone: closed to other uids as the rule asks, so
             # kept; refusing would read no cluster on every tick over such a
             # filesystem.
-            log(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=directory, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc))
+            log(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=directory, mode=oct(mode), wanted=oct(wanted), error=exc))
         finally:
             os.close(opened)
     return None

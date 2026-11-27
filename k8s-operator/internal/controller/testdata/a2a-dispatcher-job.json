@@ -207,6 +207,14 @@
                 "value": "/var/run/kube-agents/harness-config"
               },
               {
+                "name": "FLEET_AUDIT_SCRATCH_DIR",
+                "value": "/scratch"
+              },
+              {
+                "name": "KUBE_AGENTS_KUBECONFIG_DIR",
+                "value": "/scratch/.kubeconfigs"
+              },
+              {
                 "name": "A2A_DELEGATE_TOOL",
                 "value": "off"
               },

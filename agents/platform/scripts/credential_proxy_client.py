@@ -329,6 +329,17 @@ RELAY_FALLBACK_MIN_SECONDS = 1.0
 # one that convention spells as `${HERMES_HOME:-/opt/data}`.
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
+# The directory itself, not a home above it, when set and not empty: a profile
+# worker's root filesystem is read-only and it has no HERMES_HOME, so the
+# operator points this at its writable scratch mount (#7462). Unset or empty,
+# the directory is `$HERMES_HOME/.kubeconfigs` as above; platform pods never
+# set it. The fleet-audit collectors and fleet_upgrade_report.py resolve their
+# directory through `kubeconfig_dir` below.
+KUBECONFIG_DIR_ENV = "KUBE_AGENTS_KUBECONFIG_DIR"
+# The mode the collectors give that directory when they make it: this uid's
+# alone. The `$HERMES_HOME/.kubeconfigs` they share with other uids' hand runs
+# keeps its 0755 (collect.KUBECONFIG_DIR_MODE).
+KUBECONFIG_OVERRIDE_DIR_MODE = 0o700
 DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
 # A `get-credentials` the shim answers itself when the kube-api proxy is in
 # use (`answer_get_credentials_locally`): the broker would run gcloud only for
@@ -1067,8 +1078,18 @@ def kubectl_context_flag(argv: list[str]) -> str | None:
     return context
 
 
+def kubeconfig_dir_override() -> Path | None:
+    """`$KUBE_AGENTS_KUBECONFIG_DIR` when set and not empty, else None."""
+    override = os.environ.get(KUBECONFIG_DIR_ENV, "").strip()
+    return Path(override) if override else None
+
+
 def kubeconfig_dir() -> Path:
-    """`$HERMES_HOME/.kubeconfigs`, read at call time so the session decides."""
+    """`$KUBE_AGENTS_KUBECONFIG_DIR` when set, else `$HERMES_HOME/.kubeconfigs`,
+    read at call time so the session decides."""
+    override = kubeconfig_dir_override()
+    if override is not None:
+        return override
     home = os.environ.get("HERMES_HOME", "").strip() or DEFAULT_HERMES_HOME
     return Path(home) / KUBECONFIG_DIR_NAME
 

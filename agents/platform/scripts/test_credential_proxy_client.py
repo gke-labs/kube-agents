@@ -5440,5 +5440,32 @@ class WriteRefusalRecordTest(unittest.TestCase):
         self.assertEqual([], self.records())
 
 
+class TestKubeconfigDirOverride(unittest.TestCase):
+    """`kubeconfig_dir`: $KUBE_AGENTS_KUBECONFIG_DIR is the directory itself when set and not empty
+    (a profile worker's scratch mount, #7462); else `$HERMES_HOME/.kubeconfigs`, home /opt/data."""
+
+    CASES = (
+        ("unset", {}, Path("/opt/data/.kubeconfigs")),
+        ("empty", {"KUBE_AGENTS_KUBECONFIG_DIR": ""}, Path("/opt/data/.kubeconfigs")),
+        ("override", {"KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/.kubeconfigs"}, Path("/scratch/.kubeconfigs")),
+        ("home only", {"HERMES_HOME": "/home/h"}, Path("/home/h/.kubeconfigs")),
+        ("both", {"HERMES_HOME": "/home/h", "KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/k"}, Path("/scratch/k")),
+    )
+
+    def test_the_override_is_the_directory_and_unset_or_empty_is_hermes_home(self):
+        for name, env, want in self.CASES:
+            with self.subTest(name), patch.dict(os.environ, env, clear=True):
+                self.assertEqual(credential_proxy_client.kubeconfig_dir(), want)
+                self.assertEqual(
+                    credential_proxy_client.kubeconfig_dir_override(),
+                    want if env.get(credential_proxy_client.KUBECONFIG_DIR_ENV) else None,
+                )
+
+    def test_the_per_target_file_lands_in_the_override(self):
+        target = credential_proxy_client.parse_gke_context(GKE_CONTEXT)
+        with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/.kubeconfigs"}, clear=True):
+            self.assertEqual(credential_proxy_client.per_target_kubeconfig_path(target).parent, Path("/scratch/.kubeconfigs"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

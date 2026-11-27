@@ -127,6 +127,10 @@ var (
 		// read by the fleet-audit skill's report_status.py and the fleet
 		// scope arguments (fleet_scope_args.py)
 		"FLEET_AUDIT_REPORT_STORE", "KUBEAGENTS_SCOPE_DECLARED",
+		// read by credential_proxy_client.kubeconfig_dir and the fleet-audit
+		// collectors: the per-cluster kubeconfig directory, on a profile
+		// worker's scratch mount
+		"KUBE_AGENTS_KUBECONFIG_DIR",
 		// read by gitops_workspace.py: the commit author, the forge org, the
 		// lease and state store, and the kube context
 		"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GITHUB_ORG", "GITOPS_ORG",
