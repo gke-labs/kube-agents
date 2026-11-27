@@ -1,5 +1,6 @@
 // Command kube-proxy is the kube-agents build of k8s-api-proxy: the same server, with the
-// task credential gate as its Authorize hook when the environment configures one.
+// task credential gate as its Authorize hook when the environment configures one, and the
+// gate's workers as the callers admitted for the profile audience.
 package main
 
 import (
@@ -52,25 +53,33 @@ func main() {
 
 // options are what this binary adds to the stock server: its version, the task credential
 // gate the environment asks for, and the credential's header among the ones never
-// forwarded, gate or no gate.
+// forwarded, gate or no gate. With the gate on, the server also accepts the profile
+// audience, from exactly the ServiceAccounts the gate's identity map names: a worker the
+// proxy admits for that audience is always one the gate checks. With the gate off it
+// accepts no audience the stock server does not.
 //
 // A malformed gate configuration is an error, except when args ask only for the version or
 // the usage text: those answer whatever the environment holds. The server then gets a hook
-// that refuses every request, so if args were misread and it serves after all, it serves
-// nothing rather than serving ungated.
+// that refuses every request and no profile audience, so if args were misread and it serves
+// after all, it serves nothing rather than serving ungated.
 func options(args []string, getenv func(string) string, logger *slog.Logger) (proxyserver.Options, error) {
-	authorize, err := taskgate.FromEnv(getenv, logger)
+	opts := proxyserver.Options{
+		Version:            version,
+		ExtraCallerHeaders: taskgate.CallerHeaders(),
+	}
+	cfg, err := taskgate.LoadConfig(getenv)
 	if err != nil {
 		if !asksForVersionOrHelp(args) {
 			return proxyserver.Options{}, err
 		}
-		authorize = refuseAll
+		opts.Authorize = refuseAll
+		return opts, nil
 	}
-	return proxyserver.Options{
-		Version:            version,
-		Authorize:          authorize,
-		ExtraCallerHeaders: taskgate.CallerHeaders(),
-	}, nil
+	if cfg != nil {
+		opts.Authorize = taskgate.FromConfig(*cfg, logger)
+		opts.AudienceCallers = map[string][]string{cfg.ProfileAudience: cfg.WorkerUsernames()}
+	}
+	return opts, nil
 }
 
 // asksForVersionOrHelp reports whether args hold the version flag, set true, or a help

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
@@ -132,6 +133,16 @@ type Options struct {
 	// ExtraCallerHeaders is k8sapiproxy.Config.ExtraCallerHeaders; a name the handler
 	// refuses stops Run with the handler's error.
 	ExtraCallerHeaders []string
+	// AudienceCallers adds TokenReview audiences, each with the caller usernames admitted for
+	// it, to the ones the flags and the environment configure: a caller is admitted when its
+	// token verifies for a key and its username is in that key's list, and is held to its pod
+	// like every TokenReview caller. A key is one audience the server does not already
+	// accept: its own (--audience) and the session audience are refused, so an embedder
+	// cannot widen who those admit. An empty or padded key, one holding a comma, a key with
+	// no callers, a blank caller, and a caller already admitted for another audience stop Run,
+	// as does a non-empty map without token-review in --auth-mode. Empty leaves the server's
+	// audiences as the stock binary has them.
+	AudienceCallers map[string][]string
 }
 
 type proxyConfig struct {
@@ -375,6 +386,53 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 	return map[string][]string{aud: callers}, nil
 }
 
+// mergeAudienceCallers returns configured, the audiences the environment binds to callers
+// of their own, with the embedder's Options.AudienceCallers added. ownAudience is
+// --audience, which is bound to --allowed-callers. An embedder's audience that is already
+// configured is an error rather than a union of the two caller lists: a union would let an
+// embedder widen who the server's own audience or the session audience admits. With no
+// embedder audiences it returns configured itself.
+func mergeAudienceCallers(configured, embedder map[string][]string, ownAudience string) (map[string][]string, error) {
+	if len(embedder) == 0 {
+		return configured, nil
+	}
+	taken := make(map[string]string, len(configured)+1)
+	for _, aud := range splitList(ownAudience) {
+		taken[aud] = "--audience (or " + audienceEnv + ")"
+	}
+	for raw := range configured {
+		for _, aud := range splitList(raw) {
+			taken[aud] = sessionAudienceEnv
+		}
+	}
+	merged := make(map[string][]string, len(configured)+len(embedder))
+	for aud, callers := range configured {
+		merged[aud] = callers
+	}
+	// Sorted, so the same Options stop the binary on the same error every time.
+	for _, aud := range slices.Sorted(maps.Keys(embedder)) {
+		if aud == "" || aud != strings.TrimSpace(aud) || strings.Contains(aud, listSeparator) {
+			return nil, fmt.Errorf("Options.AudienceCallers audience %q is not one audience name: it is empty, padded with whitespace or holds a %q", aud, listSeparator)
+		}
+		if owner, ok := taken[aud]; ok {
+			return nil, fmt.Errorf("Options.AudienceCallers audience %q is already configured by %s; an embedder's audience must be one the server does not otherwise accept", aud, owner)
+		}
+		if len(embedder[aud]) == 0 {
+			return nil, fmt.Errorf("Options.AudienceCallers audience %q names no caller", aud)
+		}
+		callers := make([]string, 0, len(embedder[aud]))
+		for _, caller := range embedder[aud] {
+			caller = strings.TrimSpace(caller)
+			if caller == "" {
+				return nil, fmt.Errorf("Options.AudienceCallers audience %q has a blank caller", aud)
+			}
+			callers = append(callers, caller)
+		}
+		merged[aud] = callers
+	}
+	return merged, nil
+}
+
 func buildHandler(
 	ctx context.Context,
 	cfg proxyConfig,
@@ -414,6 +472,10 @@ func buildHandler(
 			if err != nil {
 				return nil, err
 			}
+			audienceCallers, err = mergeAudienceCallers(audienceCallers, cfg.embedder.AudienceCallers, cfg.audience)
+			if err != nil {
+				return nil, err
+			}
 			reviewer, err := tokenreview.NewAuthenticator(tokenreview.Config{
 				Kubernetes:      inCluster,
 				Audience:        cfg.audience,
@@ -440,6 +502,9 @@ func buildHandler(
 			}
 			if strings.TrimSpace(cfg.sessionAudience) != "" || strings.TrimSpace(cfg.sessionCallers) != "" {
 				return nil, errors.New("--auth-mode=none cannot be combined with " + sessionAudienceEnv + " or " + sessionCallersEnv)
+			}
+			if len(cfg.embedder.AudienceCallers) > 0 {
+				return nil, errors.New("--auth-mode=none cannot be combined with Options.AudienceCallers")
 			}
 			logger.Warn(
 				"caller authentication is disabled; isolate the listener at the network boundary",

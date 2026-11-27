@@ -13,12 +13,17 @@
 //
 // The gate is off unless the identity map is set. A caller the map does not name is never
 // asked for a credential and passes untouched.
+//
+// The map also says who the proxy admits as a worker: the binary accepts the profile
+// audience (ProfileAudienceEnv) from exactly the map's usernames (Config.WorkerUsernames),
+// so a caller admitted for that audience is always one the gate checks.
 package taskgate
 
 import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -41,6 +46,10 @@ const (
 	SigningKeysEnv = "A2A_TASK_SIGNING_PUBLIC_KEYS" // #nosec G101 -- an environment variable name
 	// MaxLifetimeEnv names the ceiling on a credential's lifetime, a Go duration.
 	MaxLifetimeEnv = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an environment variable name
+	// ProfileAudienceEnv names the audience a worker's ServiceAccount token is issued for,
+	// the one the broker gives the profile role by. Required when the identity map names a
+	// worker, and not read otherwise.
+	ProfileAudienceEnv = "CREDENTIAL_PROXY_PROFILE_AUDIENCE" // #nosec G101 -- an environment variable name
 
 	// ReasonTaskCredential is the audit reason of a worker request with no credential,
 	// more than one, or one that does not verify, does not bind to the caller, or names
@@ -110,6 +119,15 @@ type Config struct {
 	SigningKeys []string
 	// MaxLifetime is the ceiling on a credential's lifetime.
 	MaxLifetime time.Duration
+	// ProfileAudience is the audience a worker's ServiceAccount token is issued for. The
+	// hook does not read it: the binary admits WorkerUsernames for it.
+	ProfileAudience string
+}
+
+// WorkerUsernames are the ServiceAccount usernames the identity map names, sorted: the
+// callers the proxy admits for ProfileAudience. The slice is the caller's own.
+func (c Config) WorkerUsernames() []string {
+	return slices.Sorted(maps.Keys(c.Identities))
 }
 
 // CallerHeaders are the request headers the proxy must not forward: the credential's.
@@ -120,8 +138,11 @@ func CallerHeaders() []string {
 }
 
 // LoadConfig reads the gate's configuration from the environment. It returns nil when the
-// identity map is unset, blank or empty: the gate is off. A malformed map, key list or
-// lifetime is an error, for the binary to stop on.
+// identity map is unset, blank or empty: the gate is off, and no other variable is read. A
+// malformed map, key list or lifetime is an error, for the binary to stop on, and so is a
+// map that names workers with no profile audience: the proxy would admit none of them as
+// one. The broker starts in that state, since there a worker's role comes from the audience
+// and a broker without it has no workers to gate; here the map is what turns the gate on.
 func LoadConfig(getenv func(string) string) (*Config, error) {
 	identities, err := ParseIdentityMap(getenv(IdentitiesEnv))
 	if err != nil {
@@ -138,7 +159,11 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Config{Identities: identities, SigningKeys: keys, MaxLifetime: lifetime}, nil
+	audience := strings.TrimSpace(getenv(ProfileAudienceEnv))
+	if audience == "" {
+		return nil, fmt.Errorf("%s is required when %s names a worker: it is the audience the proxy admits them for", ProfileAudienceEnv, IdentitiesEnv)
+	}
+	return &Config{Identities: identities, SigningKeys: keys, MaxLifetime: lifetime, ProfileAudience: audience}, nil
 }
 
 // ParseSigningKeys reads the task-signing public key list as the broker does
@@ -183,13 +208,19 @@ func FromEnv(getenv func(string) string, logger *slog.Logger) (func(k8sapiproxy.
 	if err != nil || cfg == nil {
 		return nil, err
 	}
+	return FromConfig(*cfg, logger), nil
+}
+
+// FromConfig is the Authorize hook of a binary that starts with cfg, as LoadConfig returned
+// it: New on the wall clock, after the one warning a configuration with no signing key gets.
+func FromConfig(cfg Config, logger *slog.Logger) func(k8sapiproxy.AuthorizeAttributes) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if len(cfg.SigningKeys) == 0 {
 		logger.Warn(noKeysWarning, logKeyEnv, SigningKeysEnv)
 	}
-	return New(*cfg, logger, time.Now), nil
+	return New(cfg, logger, time.Now)
 }
 
 // New returns the Authorize hook for cfg. now is the verifier's clock.

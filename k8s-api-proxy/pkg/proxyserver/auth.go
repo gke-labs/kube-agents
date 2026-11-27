@@ -138,8 +138,9 @@ func jwtFlagsSet(cfg proxyConfig) []string {
 }
 
 // validateAuthFlags refuses flags that belong to an authenticator --auth-mode does not
-// enable: left alone they would be ignored, and the operator who set an allowlist or an
-// issuer would believe it applied. The none mode makes its own checks.
+// enable, and an embedder's Options.AudienceCallers without token-review: left alone they
+// would be ignored, and the operator who set an allowlist or an issuer would believe it
+// applied. The none mode makes its own checks.
 func validateAuthFlags(cfg proxyConfig, modes []string) error {
 	if !slices.Contains(modes, authModeJWT) {
 		if set := jwtFlagsSet(cfg); len(set) > 0 {
@@ -154,6 +155,9 @@ func validateAuthFlags(cfg proxyConfig, modes []string) error {
 	}
 	if strings.TrimSpace(cfg.sessionAudience) != "" || strings.TrimSpace(cfg.sessionCallers) != "" {
 		return fmt.Errorf("%s and %s require %q in --%s", sessionAudienceEnv, sessionCallersEnv, authModeTokenReview, authModeFlag)
+	}
+	if len(cfg.embedder.AudienceCallers) > 0 {
+		return fmt.Errorf("Options.AudienceCallers requires %q in --%s", authModeTokenReview, authModeFlag)
 	}
 	return nil
 }

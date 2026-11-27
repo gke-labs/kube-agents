@@ -2,7 +2,8 @@
 
 The binary the `kube-proxy` image runs. It is the [`k8s-api-proxy`](../k8s-api-proxy/README.md)
 server, with the same flags and environment variables, plus one thing that module cannot hold
-because it is specific to kube-agents: the task credential gate.
+because it is specific to kube-agents: the task credential gate, and with it the workers the proxy
+admits.
 
 `k8s-api-proxy/` stays generic and separately released. This module imports its server
 (`pkg/proxyserver`) and the task credential verifier (`a2a/taskcred`) through `replace` directives,
@@ -38,14 +39,30 @@ off.
 
 Only callers the identity map names. A caller the proxy admits whose username is not a key of the
 map is not asked for a credential and is handled as `k8s-api-proxy` handles it. An empty map (`{}`)
-turns the gate off, and with `--auth-mode=none` no caller has a username in the map, so the gate
-gates nobody.
+turns the gate off.
 
-The broker decides differently. It gives a caller the profile role by the audience of its token,
-and refuses a profile caller that has no map entry. Here the map alone decides, so a worker
-ServiceAccount that is allowed to call the proxy and is missing from the map reaches every cluster
-the proxy serves. Whoever renders the proxy's allowed callers must render the identity map from the
-same source.
+### Who is admitted as a worker
+
+A worker's ServiceAccount token is issued for the profile audience
+(`CREDENTIAL_PROXY_PROFILE_AUDIENCE`), the audience the broker gives the profile role by. With the
+gate on, the binary accepts that audience from exactly the usernames that are keys of the identity
+map (`proxyserver.Options.AudienceCallers`), so a caller admitted for the profile audience is always
+a caller the gate checks. A ServiceAccount with a valid profile-audience token and no map entry is
+refused at authentication with `401`, as the broker refuses it. There is no separate list of worker
+callers to keep in step with the map.
+
+The map's usernames are admitted for the profile audience only. The server refuses to start when
+one of them is also in `CREDENTIAL_PROXY_ALLOWED_CALLERS` or `CREDENTIAL_PROXY_SESSION_CALLERS`, or
+when the profile audience equals the proxy's own audience or the session audience. A worker's pod
+is held to its address like every TokenReview caller, so the proxy's ServiceAccount needs `get` on
+`pods` in each namespace a worker runs in.
+
+One caveat remains. A caller admitted through another audience, such as a ServiceAccount listed in
+the proxy's own allowed callers, is not in the map and so is not gated: it reaches every cluster the
+proxy serves. A worker ServiceAccount must be named in the map and in no other caller list.
+
+The profile audience needs `token-review` in `--auth-mode`. With the gate on, `--auth-mode=none` or
+`jwt` alone stops the binary at startup.
 
 ### When the credential is checked
 
@@ -66,18 +83,22 @@ here reaches one.
 
 ## Configuration
 
-The gate reads three environment variables, the ones the broker reads, in the same formats:
+The gate reads four environment variables, the ones the broker reads, in the same formats:
 
 | Variable                              | Value                                                                                                                                     |
 | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `CREDENTIAL_PROXY_PROFILE_IDENTITIES` | JSON object: worker ServiceAccount username (`system:serviceaccount:<namespace>:<name>`) to `{"profile": "<profile>", "tier": "<tier>"}`. |
+| `CREDENTIAL_PROXY_PROFILE_AUDIENCE`   | The audience a worker's ServiceAccount token is issued for. Required when the identity map names a worker.                                |
 | `A2A_TASK_SIGNING_PUBLIC_KEYS`        | The task-signing public keys, comma separated: one, or two during a key rotation.                                                         |
 | `A2A_TASK_CREDENTIAL_MAX_LIFETIME`    | The longest lifetime a credential may have, as a Go duration (`6h` when unset, at most `168h`).                                           |
 
 The gate is off by default: with `CREDENTIAL_PROXY_PROFILE_IDENTITIES` unset, blank or `{}`, the
-binary behaves as `k8s-api-proxy` does and reads neither of the other two. A malformed identity
-map, key list or lifetime stops the binary at startup. An identity map with no signing key starts,
-logs a warning once, and refuses every worker.
+binary behaves as `k8s-api-proxy` does and reads none of the other three, so a profile audience set
+on its own adds no audience. A malformed identity map, key list or lifetime stops the binary at
+startup, and so does an identity map that names a worker with the profile audience unset or blank:
+the proxy would admit none of the workers it is asked to gate. The broker starts in that state,
+because there the audience confers the role and a broker without it has no profile callers. An
+identity map with no signing key starts, logs a warning once, and refuses every worker.
 
 ## Refusals
 
