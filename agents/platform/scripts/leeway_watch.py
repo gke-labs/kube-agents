@@ -175,8 +175,8 @@ placement problems, on which cluster or how many, and how many are new,
 changed or still open), then names up to three of them, most severe and most
 concentrated first, each as its workload, zone, compute class or node pool
 (named as one), its cluster, leeway's suspected cause in plain words
-(`CAUSE_PHRASES`; a workload leeway marks `platform_managed` says it is
-managed by GKE, which reverts direct edits), and a share where it has one (a workload's pods or a node
+(`CAUSE_PHRASES`; a workload leeway marks `platform_managed` says the
+addon manager can undo edits to it), and a share where it has one (a workload's pods or a node
 pool's nodes in one zone; a compute class's time on its last machine choice),
 with "and N more" past that. It closes by pointing at the
 agent for fixes, and with the date its findings are next posted if still
@@ -681,13 +681,13 @@ CAUSE_PHRASES: dict[str, str] = {
     "rank-baseline": "running on lower machine choices than usual",
 }
 CAUSE_PHRASE_FALLBACK = "cause not identified"
-# A finding leeway marks platform_managed (remediation.kind, v0.1.7+) is on a
-# workload the cluster platform reconciles (addonmanager.kubernetes.io/mode:
-# Reconcile, GKE's addon manager), which reverts edits to it; saying so tells
-# the reader not to patch it. It replaces "no clear cause found" and follows a
-# cause leeway did name.
+# leeway (v0.1.7+) sets remediation.kind platform_managed where it would
+# otherwise offer a manifest patch on a workload labelled
+# addonmanager.kubernetes.io/mode: Reconcile, which the cluster's addon manager
+# can revert; saying so tells the reader not to patch it. It replaces the
+# no-cause phrase and follows a cause leeway did name.
 REMEDIATION_KIND_PLATFORM_MANAGED = "platform_managed"
-PLATFORM_MANAGED_PHRASE = "managed by GKE, which reverts direct edits"
+PLATFORM_MANAGED_PHRASE = "the addon manager can undo edits to it"
 PLATFORM_MANAGED_WITH_CAUSE = "{cause}; " + PLATFORM_MANAGED_PHRASE
 # On a zone finding the cause is about the zone itself (pkg/leeway/domain.go);
 # leeway's consolidation there only means the zone has no nodes, a guess at why.
@@ -1452,7 +1452,8 @@ def due_chat_item(item: dict[str, Any]) -> str:
     is_zone = str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE
     cause = cause_phrase(item.get(SUSPECTED_CAUSE_FIELD), zone=is_zone)
     if is_platform_managed(item):
-        known = str(item.get(SUSPECTED_CAUSE_FIELD) or DEFAULT_UNKNOWN) != DEFAULT_UNKNOWN
+        code = str(item.get(SUSPECTED_CAUSE_FIELD) or DEFAULT_UNKNOWN)
+        known = code != DEFAULT_UNKNOWN and code in CAUSE_PHRASES
         cause = PLATFORM_MANAGED_WITH_CAUSE.format(cause=cause) if known else PLATFORM_MANAGED_PHRASE
     pct = round(_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT) * PERCENT_SCALE)
     ns = str(item.get(NAMESPACE_FIELD) or "")

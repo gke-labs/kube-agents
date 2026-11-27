@@ -1642,7 +1642,7 @@ class ChatMessageTests(unittest.TestCase):
                             cluster="p1/us-central1/platform-agent-host", cause="taint_exclusion")
         self.assertNotIn(watch.CHAT_ELLIPSIS, watch.due_chat_item(gateway))
 
-    def test_a_platform_managed_workload_says_gke_reverts_edits(self) -> None:
+    def test_a_platform_managed_workload_says_its_addon_manager_can_revert_edits(self) -> None:
         # leeway v0.1.7 marks a workload GKE's addon manager reconciles as
         # remediation.kind platform_managed; "no clear cause found" would send
         # the reader to investigate a Deployment they can't change.
@@ -1653,12 +1653,19 @@ class ChatMessageTests(unittest.TestCase):
 
         self.assertEqual(
             watch.due_chat_item(managed("unknown")),
-            "kube-dns (kube-system) on prod-east: 100% of its pods in one zone; managed by GKE, which reverts direct edits",
+            "kube-dns (kube-system) on prod-east: 100% of its pods in one zone; the addon manager can undo edits to it",
         )
         self.assertEqual(
             watch.due_chat_item(managed("constraint_ignored")),
             "kube-dns (kube-system) on prod-east: 100% of its pods in one zone; "
-            "its zone spread rule is not being kept; managed by GKE, which reverts direct edits",
+            "its zone spread rule is not being kept; the addon manager can undo edits to it",
+        )
+        # A cause code with no phrase reads as no cause, so the item doesn't say
+        # "cause not identified" in front of it.
+        self.assertTrue(
+            watch.due_chat_item(managed("novel_cause_v2")).endswith(
+                "one zone; the addon manager can undo edits to it"
+            )
         )
         for other in ({"kind": "manifest_patch"}, {"kind": ""}, {}, "platform_managed", []):
             text = watch.due_chat_item(managed("unknown", other))
@@ -1670,7 +1677,7 @@ class ChatMessageTests(unittest.TestCase):
         item["remediation"] = {"kind": "platform_managed"}
         text = watch.due_chat_item(item)
         self.assertLessEqual(len(text), watch.CHAT_ITEM_MAX_CHARS)
-        self.assertTrue(text.endswith("; managed by GKE, which reverts direct edits"), text)
+        self.assertTrue(text.endswith("; the addon manager can undo edits to it"), text)
 
     def test_leeways_platform_managed_finding_reaches_the_chat_line(self) -> None:
         # From leeway's own JSON (a v0.1.7 kube-dns finding), through
@@ -1687,7 +1694,7 @@ class ChatMessageTests(unittest.TestCase):
         norm = watch.normalize_topology_finding("p1/us-east4/alert-sim", raw)
         self.assertEqual(
             watch.due_chat_item(norm),
-            "kube-dns (kube-system) on alert-sim: 100% of its pods in one zone; managed by GKE, which reverts direct edits",
+            "kube-dns (kube-system) on alert-sim: 100% of its pods in one zone; the addon manager can undo edits to it",
         )
 
     def test_a_zone_cause_on_a_workload_names_the_other_zone(self) -> None:
