@@ -182,6 +182,33 @@ def test_parts_that_carry_input_keep_it() -> None:
     assert [c["args"] for c in calls_of(fold)] == [own, READ_INPUT]
 
 
+def test_a_part_left_without_input_is_marked_and_counted() -> None:
+    """A part the executor sent with no input, and the capture didn't fill,
+    is written with empty args and :data:`inject.ENTRY_INPUT_ABSENT_FIELD`,
+    and the marker counts it (not as a loss). The scorer reads the mark per
+    tool."""
+    from kube_agents_bench import scoring
+
+    own = {"command": "ls"}
+    fold = fold_of([STRIPPED_PARTS[0], {**STRIPPED_PARTS[1], "input": own}])
+    calls = calls_of(fold)
+    assert calls[0]["args"] == {} and calls[0][inject.ENTRY_INPUT_ABSENT_FIELD] is True
+    assert calls[1]["args"] == own and inject.ENTRY_INPUT_ABSENT_FIELD not in calls[1]
+    assert marker_of(fold)["args"] == {"calls": 2, "dropped": 0, inject.ACTIVITY_INPUT_ABSENT_ARG: 1}
+    assert scoring._inject_inputless_tools(fold.trajectory) == {"Bash"}
+    assert not scoring._inject_blind([{"name": scoring.INJECT_TASK_EVENT}, *fold.trajectory])
+
+
+def test_a_filled_part_carries_no_mark() -> None:
+    fold = fold_of(STRIPPED_PARTS)
+    assert all(c.get(inject.ENTRY_INPUT_ABSENT_FIELD) for c in calls_of(fold))
+    captured = session_trajectory.parse(reply_of(CAPTURE), TASK)
+    assert captured is not None
+    fold.fill_inputs(session_trajectory.merge(fold.call_parts(), captured))
+    assert all(inject.ENTRY_INPUT_ABSENT_FIELD not in c for c in calls_of(fold))
+    assert inject.ACTIVITY_INPUT_ABSENT_ARG not in marker_of(fold)["args"]
+
+
 def test_a_new_read_of_the_trace_drops_filled_inputs() -> None:
     fold = fold_of(STRIPPED_PARTS)
     fold.fill_inputs({0: BASH_INPUT})

@@ -222,7 +222,13 @@ than one task, a pushed-report replay's, needs a clean marker per task), since g
 it could fail a call that happened or pass a safeguard over one. One exception runs the other way:
 a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
 _failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
-the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. The worker
+the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. A
+trace with no loss can still hold a call whose executor sent no input (the core-agent executor
+publishes none): the transport writes it with empty args and `input_absent: true`, and counts it on
+the marker, not as a loss. An entry with a router-scope `arguments` leaf naming that call's tool
+(`CaseSpec.trace_argument_checks`, compound or not) is set aside when the empty args could have
+changed its grade, since they match no pattern: a positive entry that failed, a `none`-wrapped one
+that passed, and one with both kinds of leaf whatever it recorded. The worker
 half is keyed on what the record carries (`_inject_workers_carried()`). The delegation wait for
 this path reads the workers' calls from the pod and puts them on the trajectory tagged with their
 profile, and the harness writes a `harness_worker_capture_gaps` entry when that read could not

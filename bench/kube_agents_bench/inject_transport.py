@@ -302,6 +302,18 @@ ACTIVITY_DROPPED_KEY = "dropped"
 ACTIVITY_CALL_ID_KEY = "callId"
 # The trajectory entry's field for the part's ``callId`` (above).
 ENTRY_CALL_ID_FIELD = "call_id"
+# The trajectory entry's mark, ``true``, for a call that arrived with no
+# ``input`` and took none from the session pod's capture
+# (:meth:`Fold.fill_inputs`). Its ``args`` are then ``{}`` because the
+# executor sent none, not because the call had none: the core-agent
+# executor publishes ``{tool, title, callId}`` and no input at all. An
+# ``arguments`` pattern over such a call reads nothing, so a check on it
+# would fail a call that matched or pass a ``none`` safeguard over one;
+# the scorer sets those checks aside instead (``scoring._inject_lane_view``,
+# which duplicates the name). A hermes call with no arguments also arrives
+# without the key (its bridge omits an empty input), so the mark names the
+# call rather than the record, and the scorer reads it per tool.
+ENTRY_INPUT_ABSENT_FIELD = "input_absent"
 ACTIVITY_STATUS_CALLED = "called"
 ACTIVITY_STATUS_TRUNCATED = "truncated"
 # The bridge caps one call's ``input`` and replaces an input over the cap
@@ -360,6 +372,10 @@ ACTIVITY_DROPPED_ARG = "dropped"
 ACTIVITY_MALFORMED_ARG = "malformed"
 ACTIVITY_INPUT_TRUNCATED_ARG = "input_truncated"
 ACTIVITY_STALE_ARG = "stale"
+# How many entries carry :data:`ENTRY_INPUT_ABSENT_FIELD`, present only when
+# non-zero. Not a loss: the trace holds every call, and only checks that
+# read a call's arguments lose anything, per call (the field above).
+ACTIVITY_INPUT_ABSENT_ARG = "input_absent"
 ACTIVITY_LOSS_ARGS = (
     ACTIVITY_DROPPED_ARG,
     ACTIVITY_MALFORMED_ARG,
@@ -988,7 +1004,8 @@ class Fold:
         with the part's own status word (``completed``, ``error``,
         ``interrupted``) or the api shape's ``called`` when the part has
         none. A part with no ``input`` takes the one the session pod's
-        capture holds for it (:meth:`fill_inputs`), or maps to empty args;
+        capture holds for it (:meth:`fill_inputs`), or maps to empty args
+        and carries :data:`ENTRY_INPUT_ABSENT_FIELD`;
         an input that is not an object is kept under the key it arrived by. The bridge's
         ``truncated`` stand-in for calls past its budget is a count and not
         a call: its ``dropped`` joins the door's ``activityDropped`` in the
@@ -1025,6 +1042,7 @@ class Fold:
         dropped = self.activity_dropped
         malformed = self.activity_malformed
         input_truncated = 0
+        input_absent = 0
         for index, part in enumerate(self.activity):
             if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
                 # The stand-in exists only because calls were dropped; a
@@ -1070,6 +1088,9 @@ class Fold:
                 "result": None,
                 "status": status if isinstance(status, str) and status else ACTIVITY_STATUS_CALLED,
             }
+            if raw_input is None:
+                entry[ENTRY_INPUT_ABSENT_FIELD] = True
+                input_absent += 1
             call_id = part.get(ACTIVITY_CALL_ID_KEY)
             if isinstance(call_id, str) and call_id:
                 entry[ENTRY_CALL_ID_FIELD] = call_id
@@ -1082,6 +1103,8 @@ class Fold:
             marker_args[ACTIVITY_MALFORMED_ARG] = malformed
         if input_truncated:
             marker_args[ACTIVITY_INPUT_TRUNCATED_ARG] = input_truncated
+        if input_absent:
+            marker_args[ACTIVITY_INPUT_ABSENT_ARG] = input_absent
         if self.activity_stale:
             marker_args[ACTIVITY_STALE_ARG] = 1
         return calls, marker_args

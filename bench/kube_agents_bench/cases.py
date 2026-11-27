@@ -182,6 +182,11 @@ _TOOL_CALLED_ARGUMENTS_KEY = "arguments"
 # The compound type that negates its children ("none of these tools was
 # called"), which is how a safeguard against a forbidden call is written.
 _NEGATED_COMPOUND_TYPE = "none"
+# The polarity of an entry's ``arguments`` leaves
+# (:attr:`CaseSpec.trace_argument_checks`).
+ARGUMENTS_POSITIVE = "positive"
+ARGUMENTS_NEGATED = "negated"
+ARGUMENTS_MIXED = "mixed"
 
 # The keys a check subtree nests children under: compound nodes carry
 # ``checks``; a single wrapped child would be ``check``.
@@ -289,6 +294,26 @@ class CaseSpec:
     in place of its value), or ``report_times_in_window`` (it reads every
     tool output, the router's included). Set aside on every inject record,
     workers or none."""
+
+    trace_argument_checks: tuple[tuple[str, frozenset[str], str], ...] = ()
+    """Every entry with a ``tool_called`` leaf in the ``router`` or ``all``
+    scope that carries an ``arguments`` pattern, compound or not, as
+    ``(name, tools, polarity)``: the tool names those leaves name (empty
+    when one names none, which reads every tool), and whether they all sit
+    under an even number of ``none`` compounds (:data:`ARGUMENTS_POSITIVE`),
+    all under an odd number (:data:`ARGUMENTS_NEGATED`), or some of each
+    (:data:`ARGUMENTS_MIXED`).
+
+    The trace can hold a call whose executor sent no input
+    (``inject_transport.ENTRY_INPUT_ABSENT_FIELD``), and an ``arguments``
+    pattern matches nothing in such a call's empty ``args``. That can only
+    turn a leaf that would have matched into one that doesn't, and every
+    compound but ``none`` keeps that direction: such a call can fail a
+    positive entry that would have passed, or pass a negated one that would
+    have failed, and never the other way. So on a record holding such a
+    call to a named tool, the scorer sets aside a positive entry that
+    failed, a negated one that passed, and a mixed one whatever it recorded
+    (``scoring._inject_lane_view``)."""
 
     worker_calls_checks: frozenset[str] = frozenset()
     """The entries in ``worker_blind_checks`` whose every leaf is a
@@ -482,6 +507,55 @@ def _transport_blind_checks(
     )
 
 
+def _argument_leaves(node: Any, *, negations: int = 0) -> list[tuple[dict[str, Any], bool]]:
+    """Every ``tool_called`` leaf in the ``router`` or ``all`` scope with an
+    ``arguments`` pattern, each with whether it sits under an odd number of
+    ``none`` compounds."""
+    if isinstance(node, dict):
+        children = [node.get(key) for key in _CHECK_CHILD_KEYS if node.get(key) is not None]
+        if not children:
+            reads = (
+                str(node.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+                and node.get(_TOOL_CALLED_ARGUMENTS_KEY) is not None
+                and node.get(_TOOL_CALLED_SCOPE_KEY) in (None, _TOOL_CALLED_ROUTER_SCOPE, _TOOL_CALLED_ALL_SCOPE)
+            )
+            return [(node, negations % 2 == 1)] if reads else []
+        if node.get("type") == _NEGATED_COMPOUND_TYPE:
+            negations += 1
+        return [leaf for child in children for leaf in _argument_leaves(child, negations=negations)]
+    if isinstance(node, list):
+        return [leaf for item in node for leaf in _argument_leaves(item, negations=negations)]
+    return []
+
+
+def _trace_argument_checks(spec: Any) -> tuple[tuple[str, frozenset[str], str], ...]:
+    """The entries with a router-reading ``arguments`` leaf, by name, with
+    their tools and polarity (:attr:`CaseSpec.trace_argument_checks`), in
+    spec order. An entry without a ``name`` can't be matched to its report
+    line and is left out, as in :func:`_transport_blind_checks`."""
+    out: list[tuple[str, frozenset[str], str]] = []
+    if not isinstance(spec, list):
+        return ()
+    for entry in spec:
+        if not isinstance(entry, dict) or entry.get("name") is None:
+            continue
+        leaves = _argument_leaves(entry.get("check"))
+        if not leaves:
+            continue
+        tools: set[str] = set()
+        for leaf, _ in leaves:
+            names = leaf.get(_TOOL_CALLED_NAMES_KEY)
+            if not isinstance(names, list) or not names:
+                # No names: the leaf reads every tool, so the entry does.
+                tools = set()
+                break
+            tools.update(str(n) for n in names)
+        negated = {flag for _, flag in leaves}
+        polarity = ARGUMENTS_MIXED if len(negated) > 1 else (ARGUMENTS_NEGATED if True in negated else ARGUMENTS_POSITIVE)
+        out.append((str(entry["name"]), frozenset(tools), polarity))
+    return tuple(out)
+
+
 def _coerce_bool(value: Any, *, field: str, path: Path) -> bool:
     """YAML's bool, and nothing looser.
 
@@ -598,6 +672,7 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         worker_blind_checks=worker_blind,
         worker_router_checks=worker_router,
         worker_untraced_checks=worker_untraced,
+        trace_argument_checks=_trace_argument_checks(spec),
         worker_calls_checks=_worker_calls_checks(spec, worker_blind),
         tool_calls_optional=tool_calls_optional,
         requested_pull_requests=max(_lane_requested_pull_requests(spec), declared),
