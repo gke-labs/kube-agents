@@ -21,24 +21,28 @@ broker (BROKER_STORE_ROOT), so a report written here is one the broker
 answers, as a scheduled run on a profile worker leaves it (#6110). The shell
 sandbox reads it only when it reads the broker store.
 
-seed: writes one run of the stream, an hour old, with one critical finding
-whose cluster and namespace carry <mark>, through `audit_report.write_report`
-as `finish` does: a ring entry and `latest`. A `latest` already there is moved
-aside first and put back by teardown. Every write lands under
-BROKER_STORE_ROOT. It refuses, writing nothing, when this container reads the
-broker store itself, when its store root is not BROKER_STORE_ROOT, when an
-earlier plant was not torn down, when the stream's ring has less than one free
-slot (a real run landing during the case must not push a real one out), and
-when the ring already holds a run at or after the planted one's time (the plant
-must be the newest run, as `latest` is).
+seed: writes one run of the stream with one critical finding whose cluster
+and namespace carry <mark>, through `audit_report.write_report` as `finish`
+does: a ring entry and `latest`. It's stamped an hour back, or just after the
+newest real run when that is newer, so the plant is the newest run, as
+`latest` is, and a real run in the last hour doesn't stop the case. When the
+ring has less than two free slots (the steady state of a busy stream), the
+oldest real entries are moved aside so the plant and one real run landing
+during the case still fit and no real run is pruned. A `latest` already there
+is moved aside too. Every write lands under BROKER_STORE_ROOT. It refuses,
+writing nothing, when this container reads the broker store itself, when its
+store root is not BROKER_STORE_ROOT (by text and by real path), when an
+earlier plant was not torn down, and when the ring holds a run not before now.
 
 teardown: finds its notes under BROKER_STORE_ROOT/<audit id>/ by <mark>, so it
 never resolves the repository again (a forge or broker hiccup at destroy time
 must not send it to another directory). For each, it removes by exact path the
-ring entry the seed wrote and `latest` while it is still the planted bytes,
-puts back a `latest` the seed moved aside (or drops it when a newer real run
-has replaced the plant), removes the directories the seed created when they
-are empty, and removes the note. A note for another mark is left alone.
+ring entry the seed wrote, puts back the ring entries it moved aside, replaces
+the planted `latest` with the one it moved aside in one move (or drops that
+one when a real run replaced or deleted the plant), removes the directories
+the seed created when they are empty, and removes the note. Paths are
+compared by real path. A note for another mark is left alone, and a note
+naming a path outside its own directory is kept after teardown.
 """
 
 import json
@@ -67,6 +71,13 @@ PLANT_LOCATION = "us-central1"
 # stream's store directory. Readers read only latest.json and runs/ there.
 PLANT_NOTE = "eval-scheduled-run-plant.json"
 LATEST_BACKUP = "eval-scheduled-run-latest.json"
+# Where the seed moves the oldest real ring entries, in the stream's store
+# directory, to make room for the plant and one real run landing during the
+# case; teardown puts them back. Readers read only latest.json and runs/.
+RING_ASIDE = "eval-scheduled-run-ring-aside"
+# How far after the newest real run the plant is stamped when that run is
+# newer than REPORT_AGE, so the plant is the newest run, as `latest` is.
+AFTER_NEWEST = timedelta(seconds=1)
 # A mark names the planted cluster, project and namespace and the finding id,
 # so it must be a DNS-1123 label of 3 to 32 characters, short enough to take
 # their suffixes.
@@ -130,8 +141,14 @@ def planted_document(audit_report, audit_id, mark):
 
 
 def publish_repo(audit_report, audit_id, repo):
-    """The repository `start` resolves for the stream: the store directory a reader asks for."""
-    return audit_report.resolve_reachable_repo(audit_id, repo or None).publish_repo
+    """The stream's repository as the install registers it: the store directory a reader asks for.
+
+    `resolve_repo_or_no_forge`, not the reachability probe `start` makes: the
+    gateway's `platform-agent` container has no broker URL, so every forge
+    probe from here fails, and the probe's fallback would plant where no
+    reader looks.
+    """
+    return audit_report.resolve_repo_or_no_forge(audit_id, repo or None)
 
 
 def under_root(path):
@@ -182,7 +199,9 @@ def refuse_unless_broker_root(audit_report):
             "store's files, so it runs in the container that holds them."
         )
     root = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or audit_report.REPORTS_DIR
-    if os.path.realpath(root) != os.path.realpath(BROKER_STORE_ROOT):
+    # By its text as well as its real path, so every path the note records is
+    # spelled from BROKER_STORE_ROOT, as teardown builds its own.
+    if os.path.normpath(root) != os.path.normpath(BROKER_STORE_ROOT) or os.path.realpath(root) != os.path.realpath(BROKER_STORE_ROOT):
         sys.exit(f"ERROR: this container's report store is {root}, not the broker store's root {BROKER_STORE_ROOT}.")
 
 
@@ -213,26 +232,37 @@ def seed(audit_report, audit_id, mark, repo, now):
     for leftover in (note_path, backup):
         if os.path.lexists(leftover):
             sys.exit(f"ERROR: an earlier plant was not torn down ({leftover} is still there); run teardown first.")
+    aside_dir = store / RING_ASIDE
+    if os.path.lexists(aside_dir):
+        sys.exit(f"ERROR: an earlier plant was not torn down ({aside_dir} is still there); run teardown first.")
     runs = store / audit_report.REPORT_RUNS_DIR
     real_runs = sorted(p.name for p in runs.glob("*.json")) if runs.is_dir() else []
-    if len(real_runs) >= audit_report.REPORT_HISTORY - 1:
-        sys.exit(
-            f"ERROR: the {audit_id} store keeps {len(real_runs)} of {audit_report.REPORT_HISTORY} runs; the planted "
-            "run and one real run landing during the case would push out a real one, which teardown cannot put back."
-        )
+    # Stamped an hour back, or just after the newest real run when that is
+    # newer: a real run of the stream in the last hour must not stop the case.
     reported = now - REPORT_AGE
-    ring_name = f"{stamp_of(audit_report, reported)}.json"
-    if real_runs and real_runs[-1] >= ring_name:
-        sys.exit(
-            f"ERROR: the {audit_id} store already holds a run at or after {ring_name} ({real_runs[-1]}); the "
-            "planted run would not be the newest."
+    if real_runs:
+        newest = datetime.strptime(real_runs[-1][: -len(".json")], audit_report.REPORT_STAMP_FORMAT).replace(
+            tzinfo=timezone.utc
         )
+        if newest >= reported:
+            reported = newest + AFTER_NEWEST
+        if reported >= now:
+            sys.exit(
+                f"ERROR: the {audit_id} store already holds a run at {real_runs[-1]}, not before now; the planted "
+                "run would not be the newest."
+            )
+    ring_name = f"{stamp_of(audit_report, reported)}.json"
+    # The oldest real entries to move aside, so the plant and one real run
+    # landing during the case still fit the ring and no real run is pruned.
+    aside = real_runs[: max(0, len(real_runs) + 2 - audit_report.REPORT_HISTORY)]
     # Built, and so checked, before anything on disk changes.
     data = planted_document(audit_report, audit_id, mark)
     # Every directory the seed is about to create, the store's missing parents
     # included and the root itself never, for teardown to remove when empty.
     root = Path(os.path.realpath(BROKER_STORE_ROOT))
     created = [str(runs)] if not runs.exists() else []
+    if aside:
+        created.append(str(aside_dir))
     parent = store
     while not parent.exists() and Path(os.path.realpath(parent)) != root:
         created.append(str(parent))
@@ -246,6 +276,7 @@ def seed(audit_report, audit_id, mark, repo, now):
         "latest": str(latest),
         "latest_sha256": None,
         "backup": None,
+        "aside": [],
         "created": created,
     }
     try:
@@ -257,6 +288,13 @@ def seed(audit_report, audit_id, mark, repo, now):
             except OSError:
                 pass
         raise
+    if aside:
+        audit_report._make_store_dirs(aside_dir)
+    for name in aside:
+        # Each named in the note before its move: teardown checks it exists.
+        note["aside"].append(name)
+        write_note(note_path, note)
+        os.replace(runs / name, aside_dir / name)
     if latest.is_file():
         # Named in the note before the move: teardown checks the backup exists.
         note["backup"] = str(backup)
@@ -314,30 +352,58 @@ def notes_for(audit_id, mark):
     return found
 
 
+def same_path(a, b):
+    """Whether two paths name the same file or directory, by their real paths."""
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def teardown_one(audit_report, note_path, note):
-    """Undo one plant from its note. Returns the paths removed."""
+    """Undo one plant from its note. Returns the paths removed.
+
+    Every path is compared by its real path with the one teardown builds from
+    the note's own directory: a note edited to name anything else removes
+    nothing, and is kept, so nothing it names is forgotten.
+    """
     store = note_path.parent
     runs = store / audit_report.REPORT_RUNS_DIR
     latest = store / audit_report.REPORT_LATEST_NAME
     backup = store / LATEST_BACKUP
+    aside_dir = store / RING_ASIDE
     removed = []
+    skipped = False
     ring = note.get("ring")
-    # Only paths under this store directory: a note edited to name anything
-    # else removes nothing.
-    if ring and Path(ring).parent == runs and os.path.lexists(ring):
-        os.unlink(ring)
-        removed.append(ring)
+    if ring:
+        if same_path(Path(ring).parent, runs) and Path(ring).name.endswith(".json"):
+            if os.path.lexists(runs / Path(ring).name):
+                os.unlink(runs / Path(ring).name)
+                removed.append(ring)
+        else:
+            skipped = True
+    for name in note.get("aside") or []:
+        held = aside_dir / Path(str(name)).name
+        if Path(str(name)).name != name or not name.endswith(".json"):
+            skipped = True
+        elif os.path.isfile(held):
+            if os.path.lexists(runs / name):
+                os.unlink(held)
+            else:
+                os.replace(held, runs / name)
     planted = note.get("latest_sha256")
     still_planted = latest.is_file() and (planted is None or sha256_of(latest) == planted)
     if planted is None and latest.is_file():
         # The seed stopped before it recorded the planted bytes: the plant is
         # `latest` only when it carries the mark.
         still_planted = note.get("mark", "") in latest.read_text(encoding="utf-8", errors="replace")
-    if still_planted:
-        os.unlink(latest)
-        removed.append(str(latest))
-    if note.get("backup") == str(backup) and os.path.isfile(backup):
-        if latest.exists() or (planted is not None and not still_planted):
+    named_backup = note.get("backup")
+    backup_is_ours = bool(named_backup) and same_path(named_backup, backup)
+    if named_backup and not backup_is_ours:
+        skipped = True
+    if backup_is_ours and os.path.isfile(backup):
+        if still_planted:
+            # One move over the plant: no moment with neither in place.
+            os.replace(backup, latest)
+            removed.append(str(latest))
+        elif latest.exists() or planted is not None:
             # A real run replaced the plant, or deleted `latest` on purpose
             # (`invalidate_report_memory`, a failed `write_report`: absent is
             # honest, stale is not). The moved-aside run is older either way.
@@ -345,10 +411,15 @@ def teardown_one(audit_report, note_path, note):
             removed.append(str(backup))
         else:
             os.replace(backup, latest)
+    elif still_planted:
+        os.unlink(latest)
+        removed.append(str(latest))
+    if skipped:
+        return removed
     note_path.unlink()
     removed.append(str(note_path))
     for directory in sorted(note.get("created") or [], key=len, reverse=True):
-        if not under_root(directory) or os.path.realpath(directory) == os.path.realpath(BROKER_STORE_ROOT):
+        if not under_root(directory) or same_path(directory, BROKER_STORE_ROOT):
             continue
         try:
             os.rmdir(directory)

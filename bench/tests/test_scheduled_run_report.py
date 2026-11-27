@@ -30,7 +30,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -172,17 +172,105 @@ def test_a_second_seed_without_teardown_refuses_and_keeps_the_real_latest(store)
     assert json.loads((stream() / "latest.json").read_text()) == {"status": "CLEAN"}
 
 
-def test_the_seed_refuses_a_ring_with_no_slot_to_spare(store):
-    # One slot short of full: the plant plus a real run landing during the
-    # case would push a real run out.
+def full_ring(count=None):
+    """A stream whose ring holds `count` real runs, a day apart, the newest two days ago."""
+    runs = stream() / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    count = audit_report.REPORT_HISTORY if count is None else count
+    names = []
+    for back in range(count, 0, -1):
+        name = (NOW - timedelta(days=back + 1)).strftime(audit_report.REPORT_STAMP_FORMAT) + ".json"
+        (runs / name).write_text('{"status": "CLEAN"}')
+        names.append(name)
+    (stream() / "latest.json").write_text('{"status": "CLEAN"}')
+    return names
+
+
+def test_a_full_ring_makes_room_and_teardown_puts_it_back(store):
+    # The steady state of a busy stream: the ring is at its cap.
+    names = full_ring()
+    before = snapshot(store)
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    ring = sorted(p.name for p in (stream() / "runs").glob("*.json"))
+    # Room for the plant and one real run landing during the case.
+    assert len(ring) == audit_report.REPORT_HISTORY - 1
+    assert sorted(p.name for p in (stream() / plant.RING_ASIDE).glob("*.json")) == names[:2]
+    assert MARK in (stream() / "runs" / ring[-1]).read_text()
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert snapshot(store) == before
+
+
+def test_a_real_run_landing_during_the_case_loses_nothing(store):
+    names = full_ring()
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    landed = (NOW + timedelta(minutes=5)).strftime(audit_report.REPORT_STAMP_FORMAT) + ".json"
+    (stream() / "runs" / landed).write_text('{"status": "OPENED"}')
+    (stream() / "latest.json").write_text('{"status": "OPENED"}')
+    plant.teardown(audit_report, AUDIT, MARK)
+    ring = sorted(p.name for p in (stream() / "runs").glob("*.json"))
+    assert ring == sorted(names + [landed])
+    assert json.loads((stream() / "latest.json").read_text()) == {"status": "OPENED"}
+    assert not (stream() / plant.RING_ASIDE).exists()
+
+
+def test_a_real_run_in_the_last_hour_moves_the_plant_after_it(store):
     runs = stream() / "runs"
     runs.mkdir(parents=True)
-    for day in range(audit_report.REPORT_HISTORY - 1):
-        (runs / f"202611{day + 1:02d}T090000.000000Z.json").write_text('{"status": "CLEAN"}')
+    recent = NOW - plant.REPORT_AGE / 2
+    (runs / f"{recent.strftime(audit_report.REPORT_STAMP_FORMAT)}.json").write_text('{"status": "CLEAN"}')
     before = snapshot(store)
-    with pytest.raises(SystemExit):
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    ring = sorted(p.name for p in runs.glob("*.json"))
+    assert ring[-1] == (recent + plant.AFTER_NEWEST).strftime(audit_report.REPORT_STAMP_FORMAT) + ".json"
+    assert MARK in (runs / ring[-1]).read_text()
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert snapshot(store) == before
+
+
+def test_the_seed_refuses_a_ring_with_a_run_not_before_now(store):
+    runs = stream() / "runs"
+    runs.mkdir(parents=True)
+    (runs / f"{NOW.strftime(audit_report.REPORT_STAMP_FORMAT)}.json").write_text('{"status": "CLEAN"}')
+    before = snapshot(store)
+    with pytest.raises(SystemExit, match="would not be the newest"):
         plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
     assert snapshot(store) == before
+
+
+def test_teardown_compares_real_paths(store, tmp_path):
+    # A note whose paths are spelled through a link to the root is the same
+    # store: teardown undoes it, rather than skipping its entries.
+    real_stream()
+    before = snapshot(store)
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    alias = tmp_path / "alias"
+    alias.symlink_to(store)
+    note_path = stream() / plant.PLANT_NOTE
+    note = json.loads(note_path.read_text())
+    for key in ("ring", "latest", "backup"):
+        note[key] = note[key].replace(str(store), str(alias))
+    note_path.write_text(json.dumps(note))
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert snapshot(store) == before
+
+
+def test_the_seed_refuses_a_root_named_through_a_link(store, tmp_path, monkeypatch):
+    alias = tmp_path / "alias"
+    alias.symlink_to(store)
+    monkeypatch.setenv("FLEET_AUDIT_REPORTS_DIR", str(alias))
+    with pytest.raises(SystemExit, match="not the broker store's root"):
+        plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    assert snapshot(store) == {}
+
+
+def test_the_repository_comes_from_the_registration_not_a_forge_probe(monkeypatch):
+    def probe(*args, **kwargs):
+        raise AssertionError("the seed probed the forge")
+
+    monkeypatch.setattr(audit_report, "resolve_reachable_repo", probe)
+    monkeypatch.setattr(audit_report, "resolve_repo_or_no_forge", lambda audit_id, repo=None: repo or GITOPS)
+    assert plant.publish_repo(audit_report, AUDIT, "") == GITOPS
+    assert plant.publish_repo(audit_report, AUDIT, "acme/other") == "acme/other"
 
 
 def test_the_seed_refuses_a_container_that_reads_the_broker_store(store, monkeypatch):
@@ -230,6 +318,8 @@ def test_teardown_ignores_a_note_naming_paths_outside_the_stream(store, tmp_path
     assert outside.read_text() == "keep"
     assert (other / "latest.json").read_text() == "keep"
     assert empty.is_dir() and store.is_dir()
+    # It named paths it skipped, so the note stays for a person to read.
+    assert (stream() / plant.PLANT_NOTE).exists()
     assert json.loads((stream() / "latest.json").read_text()) == {"status": "CLEAN"}
 
 
@@ -283,17 +373,6 @@ def test_the_script_writes_under_the_listeners_root():
     store_module = REPO / "agents" / "platform" / "scripts" / "audit_report_store.py"
     assert f'DEFAULT_REPORTS_DIR = "{plant.BROKER_STORE_ROOT}"' in store_module.read_text(encoding="utf-8")
     assert os.path.normpath(plant.BROKER_STORE_ROOT) == plant.BROKER_STORE_ROOT
-
-
-def test_the_seed_refuses_a_ring_with_a_run_newer_than_the_plant(store):
-    runs = stream() / "runs"
-    runs.mkdir(parents=True)
-    newer = (NOW - plant.REPORT_AGE / 2).strftime(audit_report.REPORT_STAMP_FORMAT)
-    (runs / f"{newer}.json").write_text('{"status": "CLEAN"}')
-    before = snapshot(store)
-    with pytest.raises(SystemExit, match="would not be the newest"):
-        plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
-    assert snapshot(store) == before
 
 
 def test_teardown_finds_the_plant_without_resolving_the_repository(store, monkeypatch):
