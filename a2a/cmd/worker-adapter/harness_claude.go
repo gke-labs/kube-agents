@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
@@ -52,6 +53,11 @@ type harnessBuilder interface {
 	// source, or "".
 	userSettings(getenv func(string) string) string
 	defaultPath() string
+	// configDir is the directory holding the harness's shipped persona, which
+	// the session check reads, or "" when it isn't known; personaCovers says
+	// which paths under it are the persona's.
+	configDir(getenv func(string) string) string
+	personaCovers(rel string) bool
 }
 
 // activeHarness is the pod's harness builder, chosen once by selectHarness
@@ -179,6 +185,12 @@ func (claudeBuilder) userSettings(getenv func(string) string) string {
 	}
 	return filepath.Join(dir, claudeUserSettingsFile)
 }
+
+func (claudeBuilder) configDir(getenv func(string) string) string { return claudeConfigDir(getenv) }
+
+// personaCovers: the persona file and skills cmd/session-persona ships in
+// Claude Code's config directory, beside the harness's own state.
+func (claudeBuilder) personaCovers(rel string) bool { return lib.SessionHomeCovers(rel) }
 
 // claudeConfigDir is Claude Code's config directory: $CLAUDE_CONFIG_DIR,
 // else ~/.claude. "" when neither is known.

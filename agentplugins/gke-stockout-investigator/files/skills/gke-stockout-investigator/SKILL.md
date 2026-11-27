@@ -213,7 +213,24 @@ _Note: The `.data.status` field in this ConfigMap is a multi-line text block. Pa
 
 **RBAC Fallback:** If this command returns `Forbidden` or is otherwise unavailable, do not fail. Fall back to analyzing pod events for `NotTriggerScaleUp` or `FailedScheduling` events, and rely on `gcloud compute regions describe` and Spot capacity advice.
 
-_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), capacity history (`gcloud beta compute advice capacity-history`), and attempt the autoscaler status check (`kubectl get configmap cluster-autoscaler-status`), and report ALL executed `gcloud` and `kubectl` diagnostic commands (including failed/denied attempts) in BOTH the chat notification (`send_notification`) and the Pull Request description.
+#### F. CapacityBuffer Readiness Check
+
+`CapacityBuffer` (`autoscaling.x-k8s.io/v1beta1`, GKE 1.35.2+, shortName `cb`; not `autoscaling.gke.io`) placeholder pods live only inside Cluster Autoscaler memory and do not show up in `kubectl get pods`. During reactive triage, check whether an existing standby buffer targeting the same `ComputeClass` was already failing before real pods went `Pending`:
+
+```bash
+kubectl get capacitybuffers.autoscaling.x-k8s.io -A
+```
+
+If any buffer targets the affected `ComputeClass` or namespace, inspect its conditions and events (`kubectl describe capacitybuffer.autoscaling.x-k8s.io <name> -n <namespace>`):
+
+- **`ReadyForProvisioning=False`**: Configuration, `PodTemplate`, or billing-model error prevented placeholder pod creation. Quote `condition.message` verbatim in the diagnosis.
+- **`LimitedByQuotas=True`**: Namespace `ResourceQuota` capped or zeroed the buffer's `status.replicas` (`status.replicas == 0` means the buffer is fully blocked). Quote `condition.message` verbatim in the diagnosis.
+- **`Provisioning=False`**: Controller failed to construct or inject placeholder pods (for example `FailedToGetPodTemplate` or `FailedToMakeFakePods`), excluding benign `reason: BufferIsEmpty` when `spec.replicas == 0` or a dynamic `scalableRef` buffer resolves to `status.replicas == 0` without `LimitedByQuotas=True`. Quote `condition.message` verbatim.
+- **Steady-state `Provisioning=True` (`reason: FakePodsInjected`) & scale-up starvation**: Upstream `v1beta1` emits `ReadyForProvisioning`, `LimitedByQuotas`, and `Provisioning` only — healthy buffers stay `Provisioning=True` with no `Ready` condition. Run `kubectl describe capacitybuffer.autoscaling.x-k8s.io <name> -n <namespace>` and inspect `NotTriggerScaleUp` / `TriggeredScaleUp` events on the `CapacityBuffer` object itself (plus `Ready=False` or `status.readyReplicas < status.replicas` past 15 minutes if emitted) to detect scale-up starvation or regional quota exhaustion on the backing `ComputeClass`. Report prior buffer failure alongside the workload's capacity constraint and remediate fallback priorities on the target `ComputeClass` in GitOps without mutating `CapacityBuffer` replicas or strategy.
+
+**Version / RBAC Fallback:** On clusters earlier than GKE 1.35.2 where the API server reports `the server doesn't have a resource type`, or if RBAC returns `Forbidden`, note that `CapacityBuffer` status was absent or unreadable and continue triage without failing.
+
+_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), capacity history (`gcloud beta compute advice capacity-history`), attempt the autoscaler status check (`kubectl get configmap cluster-autoscaler-status`), and attempt the CapacityBuffer readiness check (`kubectl get capacitybuffers.autoscaling.x-k8s.io -A`), and report ALL executed `gcloud` and `kubectl` diagnostic commands (including failed/denied attempts) in BOTH the chat notification (`send_notification`) and the Pull Request description.
 
 ### 5. Diagnose Using ComputeClass Debugging Guidelines
 
@@ -300,7 +317,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 
 **MANDATORY Summary Requirements**:
 
-- 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
+- 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml`, `kubectl get capacitybuffers.autoscaling.x-k8s.io -A`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
 - Do NOT omit the `Checks Performed` section or its code block.
 - Do NOT include any forge CLI commands in the summary or PR description. The `Checks Performed` block records diagnostics, not how the PR was opened.
 - **Terminology**: Use `"capacity constraint"` or `"scale-up failure"` in the Pull Request title, description, YAML comments, and chat notifications — do NOT call the diagnosis a `"stockout"`.
@@ -322,6 +339,7 @@ cat > "$BODY" <<'EOF'
 # Diagnostic commands executed during analysis:
 kubectl describe pod <pod_name> -n <namespace>
 kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
+kubectl get capacitybuffers.autoscaling.x-k8s.io -A
 gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=NVIDIA_L4_GPUS))"
 gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selection-machine-types="g2-standard-4,g2-standard-12" --target-distribution-shape=ANY --size=1 --region=us-central1 --format="json"
 gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-type=g2-standard-4 --types=PREEMPTION,PRICE --region=us-central1 --format="json"
@@ -363,7 +381,7 @@ The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc exp
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
 
 ````json
-send_notification(message="🛠️ GKE Capacity Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
+send_notification(message="🛠️ GKE Capacity Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\nkubectl get capacitybuffers.autoscaling.x-k8s.io -A\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
 ````
 
 After calling the tool, provide the user with the generated PR URL and a summary of your findings.

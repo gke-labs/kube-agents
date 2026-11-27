@@ -39,7 +39,7 @@ This design adds to the work below. It links that work and does not repeat its d
 | The event producers                           | The event watcher and the drift detector move to triggers, and the triage gating with its ledger moves with them. The stall-watch job, the third writer of that ledger, is a script run of the schedule track. The daily recap reads that ledger: the plan of #6572 moves it with the watcher, and the scheduling inventory gives its run form as open (O3).                                                                                                                                   | [#6528](https://github.com/gke-labs/kube-agents/issues/6528), [#6572](https://github.com/gke-labs/kube-agents/issues/6572), [#5622](https://github.com/gke-labs/kube-agents/issues/5622)                        |
 | Thread incidents and pushed reports           | A scheduled report is kept as its thread's incident, and the pushed reports are kept in session state.                                                                                                                                                                                                                                                                                                                                                                                         | [#6124](https://github.com/gke-labs/kube-agents/pull/6124), [#6889](https://github.com/gke-labs/kube-agents/pull/6889), [#6870](https://github.com/gke-labs/kube-agents/issues/6870)                            |
 | The unattended write permit                   | What lets a scheduled run make a change.                                                                                                                                                                                                                                                                                                                                                                                                                                                       | [#6672](https://github.com/gke-labs/kube-agents/issues/6672)                                                                                                                                                    |
-| The two designs beside this one               | The broker-surface design gives each other broker route and verb its row. The write-permit design gives the permit, its rendered table and its rule for a canary row. This design depends on both.                                                                                                                                                                                                                                                                                             | [#7120](https://github.com/gke-labs/kube-agents/pull/7120), [#7130](https://github.com/gke-labs/kube-agents/pull/7130)                                                                                          |
+| The two designs beside this one               | The broker-surface design gives each other broker route and verb its row. The write-permit design gives the permit, its rendered table and its rule for a canary row. This design depends on both.                                                                                                                                                                                                                                                                                             | [`profile-broker-surface.md`](profile-broker-surface.md), [`unattended-write-permit.md`](unattended-write-permit.md)                                                                                            |
 
 Three rules follow from that work. The design of the queue holds each of them:
 
@@ -251,47 +251,244 @@ rows and the options, and it asks for the owner's view.
 
 ## Questions
 
+Each question has our recommendation, or "No recommendation", below it. A recommendation is a
+proposal: the question stays open until its owner answers it. "No recommendation" means that we
+have no ground for one, and it says what is missing. The reasons use facts of the code and of the
+other designs that were read on `main` at `b9e487e8e`.
+
 For the security approver:
 
 1. Is option 1 with these verbs and this write rule the form to build for the findings queue, and
    is #5895 reopened for it, or folded into #6669?
+
+   Recommendation: build option 1 as it is written here, with the write verbs for a profile that
+   the answers to questions 3 and 6 grant. Fold the work into
+   [#6669](https://github.com/gke-labs/kube-agents/issues/6669), which then links
+   [#5895](https://github.com/gke-labs/kube-agents/issues/5895); that issue stays closed.
+
+   Reason: the data does not move, and the form is the form of the report route, which is built.
+   The plan of the closed issue differs from this design in three points: see the last paragraph
+   of "The findings queue: one design". So a reopened issue would start from a plan that is out of
+   date.
+
 2. One listener for the report store and the queue, or a second listener of the same form? Is the
    forward form acceptable, given the two facts in the table?
+
+   Recommendation: a second listener of the same form, with the forward form.
+
+   Reason: the report listener keeps its one duty and its sentence in
+   `fleet-audit-report-store.md`. The path check is the only limit of the Session KV key. It is
+   then in a process that serves the findings routes and nothing else. The forward form needs no
+   new mount in `agent-api-auth`. The costs: a second port with its own NetworkPolicy rule and
+   token check, and routes that fail while Session KV is down.
+
 3. Which write verbs may a run that no person started call? An update holds a person's decision
    (dismiss, snooze, accept) and the pull request fields. A verification can resolve a finding.
+
+   Recommendation: for a script run with no model turn, the register and the surfaced mark. The
+   row of the nudge also gets the snooze expiry. No update, no verification and no publisher's
+   record. A stream whose model turn reads a tenant's text gets a verb only by the approver's
+   decision, verb by verb. No stream row grants the update or the verification (question 6).
+
+   Reason: the register, the surfaced mark and the snooze expiry are the writes that the two
+   scripts of scheduled jobs make today (`upgrade_readiness_review.py`, `findings_nudge.py`).
+   `inventory_findings.py` registers in the ranking step of the first-run flow, which is a model
+   turn. Its verb goes with the first-boot track
+   ([#5623](https://github.com/gke-labs/kube-agents/issues/5623)) and the approver's decision.
+   Only the platform's tools call the update, the verification and the publisher's record. The
+   write of a publisher's record stays ungranted. No job writes one today: the backlog publisher
+   is not built, and the nudge keeps its state in a file. O4 keeps a register, a verification and
+   a decision out of the weekly brief's turn, because that turn reads a tenant's text. We propose
+   the same rule for each such stream.
+
 4. Is a row for each built-in schedule the right bind for a queue write, and does the operator
    render the table? One table with the write permit, or two? Is the read allowlist the report
    route's list, or a list of its own? Does a read need a schedule trigger, or a hold to the
    task's cluster?
+
+   Recommendation: a row for each built-in schedule, which the operator renders, as columns of the
+   permit's table. The read allowlist is a list of its own. A read needs no schedule trigger. A
+   task with a cluster target reads the findings of that cluster only. A task with no cluster
+   target reads each cluster. A team profile's task is held to its namespaces when the namespace
+   bound of [#7354](https://github.com/gke-labs/kube-agents/pull/7354) exists. Until then, no
+   team profile is on the read allowlist. With a yes, "Who may read" changes: it says today that a
+   read is not held to the task's target.
+
+   Reason: a stream is the schedule's own name and a task cannot choose it, so the schedule is a
+   bind that the broker can check. The write-permit design offers these columns, and its
+   conditions for a rendered table then hold for a queue row too. The columns have four costs. A
+   reader that does not know a column reads the table as empty. So a release that adds a column
+   refuses each permitted write until both readers know the column. A schedule with no permit
+   opt-in still has a row, with the queue columns and no write family. Such a row must not count
+   as "the table lists the schedule" for the mint of a permit (row 5 of that design). An install
+   without the built-in admission policy gets no table, so it gets no queue write. Row 4 of that
+   design has an open point on the trust of the profile and its images. If its answer needs
+   images by digest, a queue row needs them too, and no install pins an image by digest today.
+
+   The queue holds today what no stored report holds: each person's decision, and the findings of
+   the sweep and of the readiness review. So the report list does not say who needs the queue. A
+   person's question about the fleet is a task with no trigger, so a read cannot need one. The
+   nudge, the weekly review and the weekly brief have no cluster target and need each cluster, so
+   they keep the whole read. A task that is confined to one cluster needs only the findings of its
+   cluster. The text of a finding can come from a tenant. The list route takes a cluster filter
+   today, so the broker can set it from the task's target. The ranked list and the day's additions
+   return the whole queue. They need a filter in Session KV, or they stay with the tasks that have
+   no cluster target.
+
 5. Is a verb that names a finding id held to the findings of the row's source? That needs a check
    in Session KV. Is a register held to the findings that its source wrote? Which stream may act
    as which publisher? A surfaced mark that names a paced publisher spends the pacing budget of
    the nudge.
+
+   Recommendation: yes for a row that names a source. Its verbs with a finding id are held to that
+   source, with the check in Session KV. The row of the nudge names no source: it marks the
+   findings of each source, as it alone gets the snooze expiry. A stream acts only as the
+   publisher that its own row names. That is `nudge` for the nudge; `first_report` stays with the
+   first-run delivery and its track
+   ([#5623](https://github.com/gke-labs/kube-agents/issues/5623)). No recommendation for the
+   register: what is missing is how often a finding changes its source in a real install
+   ([#3561](https://github.com/gke-labs/kube-agents/issues/3561)).
+
+   Reason: these routes have no read by id, so the broker cannot hold a verb to a source. Without
+   the check, a row that registers one source marks the findings of each source. The nudge reads
+   the ranked list of each source and marks what it shows, so its row cannot have that hold. A
+   surfaced mark that names a paced publisher spends the day's budget that the nudge reads,
+   whichever paced publisher it names. So a stream must not name a publisher that is not its own.
+   A hold on the register changes which writer keeps a finding, and
+   we did not measure what that breaks.
+
 6. A queue write with no trigger is refused under the proposed rule. Then no profile task writes
    a person's decision. Which one: (a) the decision stays with the session and the board
    (option 3), and no stream row grants a change of a decision; or (b) a task that a person
    started writes a decision, with a hold of its own? Does a queue write of a live scheduled run
    also need the permit of [#6672](https://github.com/gke-labs/kube-agents/issues/6672)?
+
+   Recommendation: (b), for the update only, with this hold: only a task whose chain a person
+   started. The allowlist condition stays, and no stream row grants the update. The verification
+   stays ungranted until a duty needs it. A queue write of a live scheduled run needs no permit.
+
+   What (b) changes: it is a second write path beside the schedule-row rule. For the update, a
+   task needs no trigger and no stream row. With a yes, four places of this design change. They
+   are rule 3, "Who may write", the row "The platform's tools", and "What this design does not
+   add".
+
+   What (b) depends on: the task credential has no fact for "a person started the chain". A `read`
+   child of a scheduled run has no trigger too, so the broker cannot tell the two apart today.
+   (b) needs the interactive-origin fact of
+   [`scheduling-on-profiles.md`](scheduling-on-profiles.md)
+   ([#6790](https://github.com/gke-labs/kube-agents/issues/6790)) in the credential. A queue write
+   with no trigger stays refused until the broker can read that fact.
+
+   Reason: today the platform's tool writes a person's decision, and nothing in the code holds the
+   tool to a turn that a person started. With (b) the writer is a profile task through the broker,
+   not the platform's tool server. The last "Done when" line for #6669 needs only accept, snooze
+   and dismiss, and the update holds these three. (a) is the stricter rule. Its cost is a writer
+   at the front door, which does not exist and which question 10 leaves to the retirement step.
+
+   The risk of (b) is a turn that a person started and that reads a tenant's text. It can write a
+   decision that the person did not give. One such write can be large. A dismiss is sticky: a
+   later register does not open the finding again. A decision also covers the other shown rows of
+   the same item. A hold to the task's cluster needs the Session KV check of question 5.
+
+   The permit gates a change of a repository. A queue write changes a record of the install's own
+   store, as a report write does, and the stream row is its gate. With the permit as a second
+   gate, an install that gives no permit stores each report and registers no finding.
+
 7. Does [#6572](https://github.com/gke-labs/kube-agents/issues/6572) carry the daily recap and the
    stall-watch row of the ledger, or does the recap need the `events.read` endpoint of O3, and who
    builds it?
+
+   Recommendation: that issue carries the recap. A reader that runs on a profile (the recap, the
+   `get_alert_history` tool) gets the `events.read` endpoint of O3, in the form of the findings
+   read. The track that moves the first such reader builds it. That endpoint is a new read for a
+   profile and needs the approver's decision; this design still builds no events route. No
+   recommendation for the stall-watch row: the text of the issue does not name it.
+
+   Reason: [`scheduling-on-profiles.md`](scheduling-on-profiles.md) (section 3, item 4) moves the
+   two watchers of that issue in two phases. In phase 1 the daemon keeps each gate, and the ledger
+   that the daily recap reads is one of them. So phase 1 of that issue moves no reader. O3 says
+   that no job opens the database file, and the ledger has two readers.
+
 8. Does the move of the triage start carry the cap of open triage pull requests?
+
+   Recommendation: yes. The cap goes where the triage start goes, in the same change.
+
+   Reason: Session KV applies the cap at a triage start, when the install turns it on. A start
+   that moves without the cap does not hold the limit of such an install.
+
 9. Which incident rows of the inventory does the work on thread incidents cover: the tables, the
    `apply` record, the `recent` list, the `incident_context` plugin? A row that it does not cover
    needs a row here.
+
+   Recommendation: No recommendation. Which rows that work covers is a fact of that work, and what
+   is missing is the list from its owner. One fact for a row that it leaves: the
+   `send_notification` tool posts an incident to `/v1/incidents` during a run of the platform.
+   That row is a write during a run, so option 3 does not fit it.
+
 10. The rows with option 3 stay in Session KV today. What holds them after Session KV goes away
     is not in this design. Is that the retirement step, or a row for the front door now?
+
+    Recommendation: the retirement step.
+
+    Reason: nothing in the epic needs a move of data before that step. A row now would design a
+    store for the front door before the front door has a store design.
+
+The owner of the dial and post-merge code decides questions 11 to 13. Our recommendations there are
+proposals for the owner to change or decline.
 
 For the owner of the dial and post-merge code:
 
 11. Where does the dial record go: option (a) or (b)? When it moves, who checks that the presser
     is an admin? Who reports the level to the broker when the chat-role reporter in Session KV
     goes?
+
+    Recommendation: (a) for now. When Session KV goes, the component that receives the board's
+    action checks the admin list and is the one reporter.
+
+    Reason: the broker's gate applies the level to a profile's write already, so no profile duty
+    needs the record in another place. (b) needs a durable store on the broker's side, which the
+    broker does not have. The reporter stays one principal whose token no command of a model can
+    present.
+
 12. Which form for the post-merge record, (a) or (b)? The same question holds for the updates
     that the check job makes, and for the count of opened proposals. Where does the check job
     run, and who labels an auto-merge candidate? That decides if `proposal-reviews`,
     `revision-contains` and `proposal-practice-label` need a grant for a profile.
+
+    Recommendation: (a) for the record and for the count, with the records where they are. The
+    broker writes them through a broker-only listener, in the form of the findings route. We
+    propose the listener of question 2 with these routes added. That listener then serves more
+    than the findings routes, so that sentence of the reason of question 2 changes. This adds a
+    route, so it also needs the security approver. No recommendation for the updates of the check
+    job, for where that job runs and for who labels a candidate. What is missing is the owner's
+    plan for that job after the scheduler moves.
+
+    Reason: the broker serves each `proposal-create` of each caller, so the write no longer
+    depends on a plugin in the worker. A record still needs the finding id, the cluster, the
+    object and the origin in the caller's request. Only a fix of a known kind gets one. The count
+    needs an origin too, and this text does not say which origin the broker gives a profile's
+    proposal. The table names a store and a route for (a). With the listener, the listener is the
+    route and the store stays the Session KV database, so (a) needs no store on the broker's side.
+    That agrees with the recommendation for question 11. A proposal of the platform then has two
+    writers of its record, the plugin and the broker. The change names one of them.
+
 13. What carries `automerge_switch.py` and the switches when the shell sandbox goes away?
+
+    Recommendation: No recommendation. What is missing is the answer to open question 6 of the
+    broker-surface design ([`profile-broker-surface.md`](profile-broker-surface.md)). Until then
+    the verbs `proposal-close` and `branch-delete` have no grant for a profile. A move of this
+    script adds a grant, so it also needs the security approver.
+
+    Facts for the answer: an admin's dial action starts the script today (Session KV,
+    `dial_state.py`), and a pending check runs it with `--check`. The header of the script, which
+    says that nothing calls it yet, is out of date. For each repository named, one run can close
+    the pending pull request of the opposite state and delete its branch. It can then open one new
+    pull request to `.kube-agents/automation.yaml`, with `publish` and `proposal-create`. A profile
+    task reaches those two verbs only with the write permit
+    ([`unattended-write-permit.md`](unattended-write-permit.md)). The operator delivers the
+    install switches to the agent pod's managed `.env` and to a root-owned file in the shell
+    sandbox (`kubeagents_switches.py`). The broker reads its two switches from its own
+    environment. So the copy in the sandbox is the one that needs a carrier.
 
 ## Done when
 

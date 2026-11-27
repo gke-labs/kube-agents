@@ -66,6 +66,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 const (
@@ -1216,6 +1217,11 @@ func (b *Bridge) listenActivity() error {
 	b.activityLn = ln
 	b.activityDone = make(chan struct{})
 	b.activitySrv = &http.Server{
+		// net/http logs a handler panic it recovers with the panic's value,
+		// which may carry model or user text. The handler's own stages are
+		// guarded (taskguard), and anything net/http still recovers is
+		// logged here without it.
+		ErrorLog:          quietServerLog(b.cfg.Logger),
 		Handler:           mux,
 		ReadHeaderTimeout: activityReadHeaderTimeout,
 		ReadTimeout:       activityReadTimeout,
@@ -1306,8 +1312,10 @@ func (b *Bridge) closeActivity() {
 
 // handleActivity is the door. Every answer past the method check is 204:
 // hermes retries connection errors and 5xx and warns on 4xx, and a delivery
-// the door cannot use (unsigned, unmatched, unparseable) is not the sender's
-// problem to hear about per call. An entry is published on this request,
+// the door cannot use (unsigned, unmatched, unparseable, or one whose
+// routing or handling panicked: routeGuarded, takeDelivery) is not the
+// sender's problem to hear
+// about per call. An entry is published on this request,
 // under run.mu: hermes delivers from one background thread in order, so
 // the trace keeps call order, a publish costs the tool call nothing, and
 // there is no queue for finalize to race.
@@ -1329,7 +1337,14 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sig := r.Header.Get(hookSignatureHeader)
-	run, decoded, runs := b.routeDelivery(sig, body)
+	run, decoded, runs, ok := b.routeGuarded(sig, body)
+	if !ok {
+		// Routing panicked: the delivery is dropped and its candidate runs
+		// are marked (routeGuarded). Still 204, so hermes doesn't retry a
+		// panic one delivery triggers into one per retry.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if run == nil {
 		if decoded != nil {
 			b.collectCardWorkerSecrets(runs, decoded)
@@ -1337,6 +1352,27 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	b.takeDelivery(run, body, decoded)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// takeDelivery is the door's work for a delivery routed to run, under
+// taskguard.Guard: a panic anywhere in it, the decode and the tool result's
+// secret collection included, is recovered, logged and counted once, and
+// marks the run panicked (markPanicked), so it ends failed with no answer
+// (panic.go) rather than publish one whose scrub missed a value. The
+// delivery is dropped, and the sender still gets the door's 204: the run
+// is already marked, and a 5xx would only make hermes retry it.
+func (b *Bridge) takeDelivery(run *taskRun, body []byte, decoded *hookDelivery) {
+	if taskguard.Guard(b.cfg.Logger, "activity delivery", []any{"task", run.origin.TaskID}, func() {
+		b.takeDeliveryUnguarded(run, body, decoded)
+	}) != nil {
+		markPanicked(run)
+	}
+}
+
+// takeDeliveryUnguarded is takeDelivery's work.
+func (b *Bridge) takeDeliveryUnguarded(run *taskRun, body []byte, decoded *hookDelivery) {
 	var d hookDelivery
 	if decoded != nil {
 		d = *decoded
@@ -1348,7 +1384,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		// trace either way and the marker does not count it. Said in the
 		// log.
 		b.cfg.Logger.Warn("activity delivery unparseable", "task", run.origin.TaskID, "err", err)
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	// observe under run.mu: it closes the call, and a finalize slipping in
@@ -1361,10 +1396,54 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// would hold the heartbeat and a finalize behind it. A value that lands
 	// after the answer was published scrubs nothing; the answer is out.
 	if d.Event == hookPostToolCall {
-		act.secrets.CollectToolResult(d.Extra.Result)
+		b.collectToolResult(act, d.Extra.Result)
 	}
+	b.observeDelivery(run, act, d)
+}
+
+// collectToolResult reads a tool result's secret values into the task's
+// seen set, for the answer's scrub; b.collectResult when a test set it.
+func (b *Bridge) collectToolResult(act *activityState, result json.RawMessage) {
+	if b.collectResult != nil {
+		b.collectResult(act, result)
+		return
+	}
+	act.secrets.CollectToolResult(result)
+}
+
+// markPanicked marks run touched by a recovered panic, under run.mu, so a
+// finalize that takes mu after it publishes no answer. A finalize already
+// past its check has published what it had, as for a secret value that
+// lands after the answer.
+func markPanicked(run *taskRun) {
 	run.mu.Lock()
-	entry, ok, steps := act.observe(d)
+	defer run.mu.Unlock()
+	run.panicked.Store(true)
+}
+
+// observeDelivery is the door's critical section: under run.mu, released by
+// defer, it observes the delivery and publishes what it closed. A panic in
+// it is recovered here, still under run.mu, and marks the run panicked
+// before the lock is released, so a finalize that takes mu next already
+// sees the mark and publishes no answer.
+func (b *Bridge) observeDelivery(run *taskRun, act *activityState, d hookDelivery) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if taskguard.Guard(b.cfg.Logger, "activity observation", []any{"task", run.origin.TaskID}, func() {
+		b.observeDeliveryLocked(run, act, d)
+	}) != nil {
+		run.panicked.Store(true)
+	}
+}
+
+// observeDeliveryLocked observes the delivery and publishes what it
+// closed. Caller holds run.mu.
+func (b *Bridge) observeDeliveryLocked(run *taskRun, act *activityState, d hookDelivery) {
+	observe := b.observe
+	if observe == nil {
+		observe = (*activityState).observe
+	}
+	entry, ok, steps := observe(act, d)
 	b.publishSteps(run, act, steps)
 	if ok {
 		if run.state == stateRunning {
@@ -1377,8 +1456,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
 		}
 	}
-	run.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // runForSignature finds the in-flight task a delivery belongs to: the CLI
@@ -1396,15 +1473,25 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 // when the pod's shared secret signed it and it decoded (nil otherwise),
 // and the snapshot of tasks it matched against.
 func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery, []*taskRun) {
+	return b.routeDeliveryNarrowing(sig, body, nil)
+}
+
+// routeDeliveryNarrowing is routeDelivery, keeping in *cands, when cands
+// is set, the runs the delivery could still be for as routing narrows
+// them: every run in flight, then, once a pod-wide delivery's session is
+// read and some run is on it, the runs on that session. A card worker's
+// delivery is on the worker's own session, which no run holds, so it
+// narrows nothing. routeGuarded marks those runs if
+// routing panics.
+func (b *Bridge) routeDeliveryNarrowing(sig string, body []byte, cands *[]*taskRun) (*taskRun, *hookDelivery, []*taskRun) {
 	if sig == "" {
 		return nil, nil, nil
 	}
-	b.mu.Lock()
-	runs := make([]*taskRun, 0, len(b.tasks))
-	for _, r := range b.tasks {
-		runs = append(runs, r)
+	runs := b.runsInFlight()
+	if cands != nil {
+		*cands = runs
 	}
-	b.mu.Unlock()
+	b.routeStage("in-flight")
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.signed(sig, body) {
 			return r, nil, runs
@@ -1420,12 +1507,79 @@ func (b *Bridge) routeDelivery(sig string, body []byte) (*taskRun, *hookDelivery
 	if d.SessionID == "" {
 		return nil, d, runs
 	}
+	if cands != nil {
+		if on := runsOnSession(runs, d.SessionID); len(on) > 0 {
+			*cands = on
+		}
+	}
+	b.routeStage("session")
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
 			return r, d, runs
 		}
 	}
 	return matchWorkerDeliveryRun(runs, *d), d, runs
+}
+
+// routeStage calls b.routeHook, when a test set it, at a routing stage.
+func (b *Bridge) routeStage(stage string) {
+	if b.routeHook != nil {
+		b.routeHook(stage)
+	}
+}
+
+// runsInFlight is every task run the bridge holds, read under b.mu,
+// released by defer.
+func (b *Bridge) runsInFlight() []*taskRun {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	runs := make([]*taskRun, 0, len(b.tasks))
+	for _, r := range b.tasks {
+		runs = append(runs, r)
+	}
+	return runs
+}
+
+// runsOnSession is the runs of runs whose hermes session is session.
+func runsOnSession(runs []*taskRun, session string) []*taskRun {
+	var on []*taskRun
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID == session {
+			on = append(on, r)
+		}
+	}
+	return on
+}
+
+// routeGuarded is routeDelivery under taskguard.Guard. A panic in routing
+// is recovered, logged and counted, and the delivery is dropped (ok is
+// false). Which task it was for can't be known, and a dropped
+// post_tool_call can carry a secret value the answer's scrub needed, so
+// every run it could still have been for is marked panicked (fails closed:
+// each ends failed internal-panic with no answer). That is the runs on its
+// session once routing had read one that some run holds, and otherwise
+// every run in flight (a card worker's delivery, or a panic before the
+// session was read).
+// One bad delivery can so fail several concurrent tasks, deliberately: a
+// missed secret is worse than a failed task. The count marked is logged,
+// never their ids or the delivery's text.
+func (b *Bridge) routeGuarded(sig string, body []byte) (run *taskRun, decoded *hookDelivery, runs []*taskRun, ok bool) {
+	var cands []*taskRun
+	if taskguard.Guard(b.cfg.Logger, "activity routing", nil, func() {
+		run, decoded, runs = b.routeDeliveryNarrowing(sig, body, &cands)
+	}) == nil {
+		return run, decoded, runs, true
+	}
+	if len(cands) == 0 {
+		// Routing panicked before it named any candidate (or named none):
+		// an empty set would fail nothing closed, so every run in flight.
+		cands = b.runsInFlight()
+	}
+	for _, r := range cands {
+		markPanicked(r)
+	}
+	b.cfg.Logger.Error("activity routing panic: delivery dropped and its candidate runs failed closed", "marked", len(cands))
+	return nil, nil, nil, false
 }
 
 // collectCardWorkerSecrets reads the Secret values of a post_tool_call
@@ -1440,8 +1594,21 @@ func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
 	if d.Event != hookPostToolCall || d.SessionID == "" {
 		return
 	}
-	if run := cardWorkerRun(runs, *d); run != nil {
-		run.act.Load().secrets.CollectToolResult(d.Extra.Result)
+	// Matching the delivery to a run comes first, guarded on its own: no
+	// task is known yet, and a panic there leaves the delivery unused, as
+	// a delivery that matched nothing.
+	var run *taskRun
+	if taskguard.Guard(b.cfg.Logger, "card worker match", nil, func() {
+		run = cardWorkerRun(runs, *d)
+	}) != nil || run == nil {
+		return
+	}
+	// A panic in the collection marks the run, as takeDelivery does: that
+	// run's answer folds the card's report in. The record names its task.
+	if taskguard.Guard(b.cfg.Logger, "card worker delivery", []any{"task", run.origin.TaskID}, func() {
+		b.collectToolResult(run.act.Load(), d.Extra.Result)
+	}) != nil {
+		markPanicked(run)
 	}
 }
 
@@ -1464,12 +1631,25 @@ func (b *Bridge) runActivity(run *taskRun) {
 		case <-a.stop:
 			return
 		case <-tick:
-			run.mu.Lock()
-			if run.state == stateRunning && a.heartbeatUnderBudget() {
-				b.publishProgress(run, a.progressLine(time.Now()))
-			}
-			run.mu.Unlock()
+			// A panicking tick is logged and counted and skipped; the
+			// heartbeat goes on (panic.go).
+			_ = taskguard.Guard(b.cfg.Logger, "heartbeat", []any{"task", run.origin.TaskID}, func() {
+				b.heartbeatTick(run, a)
+			})
 		}
+	}
+}
+
+// heartbeatTick is one heartbeat publish, under run.mu, released by defer.
+func (b *Bridge) heartbeatTick(run *taskRun, a *activityState) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state == stateRunning && a.heartbeatUnderBudget() {
+		line := b.progressLine
+		if line == nil {
+			line = (*activityState).progressLine
+		}
+		b.publishProgress(run, line(a, time.Now()))
 	}
 }
 

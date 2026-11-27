@@ -228,7 +228,7 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //   - stop records (contract addendum 9), per profile it dispatches for:
 //     subscribe on a2a.stop.<profile>.*, and a direct get of the same
 //     subjects on DISPATCH_STOPS to catch up after a restart. The gateway is
-//     their only writer, once #4127 grants it.
+//     their only writer.
 //
 // No subscribe on a2a.tasks.> or a2a.submit.>: it reads submissions only
 // through its durables, and never a task's .in or .events.

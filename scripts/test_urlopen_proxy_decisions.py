@@ -101,6 +101,10 @@ DECISIONS = (
     # The platform profile's plugins.
     Decision("agents/platform/plugins/incident_context/__init__.py", "_post", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision("agents/platform/plugins/incident_context/__init__.py", "_get", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(
+        "agents/platform/plugins/model_identity/__init__.py", "<module>._MODEL_INFO_OPENER", BUILD_OPENER, REFUSES, REFUSE,
+        "the LiteLLM inference gateway", "an in-cluster http call that may carry the inference gateway bearer key",
+    ),
     Decision("agents/platform/plugins/pr_opened/__init__.py", "_session_kv_post", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     # The platform profile's scripts.
     Decision(SCRIPTS + "agent_common_server.py", "call_agent", URLOPEN, TAKES, REFUSE, "the platform agent Service", "an in-cluster call with the gateway key"),
@@ -108,6 +112,7 @@ DECISIONS = (
     Decision(SCRIPTS + "broker_admission.py", "<module>._OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._METADATA_OPENER", BUILD_OPENER, REFUSES, REFUSE, METADATA, "a link-local address must never go through a proxy"),
     Decision(SCRIPTS + "credential_proxy.py", "ServiceAccountAuthenticator._review", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
+    Decision(SCRIPTS + "credential_proxy.py", "PodAddressBinding._read_pod", BUILD_OPENER, REFUSES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "SlackRelay.download", BUILD_OPENER, TAKES, KEEP, "slack.com", PUBLIC_HOST),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._TEAMS_OPENER", BUILD_OPENER, TAKES, KEEP, "the Microsoft identity and Bot Framework hosts", PUBLIC_HOST),
     Decision(SCRIPTS + "dial_state.py", "<module>._BROKER_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, "an in-cluster http call with the broker token"),
@@ -173,6 +178,7 @@ AUDITED_FILES = (
     "agents/chat/scripts/memory_file_import.py",
     "agents/chat/scripts/memory_ttl_curator.py",
     "agents/platform/plugins/incident_context/__init__.py",
+    "agents/platform/plugins/model_identity/__init__.py",
     "agents/platform/plugins/pr_opened/__init__.py",
     SCRIPTS + "agent_common_server.py",
     SCRIPTS + "audit_report_store.py",

@@ -232,7 +232,7 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr, path string, counter
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume, Dispatcher: reading.Dispatcher}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume, Dispatcher: reading.Dispatcher, SlackConnected: reading.SlackConnected}
 	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
 	if slices.Contains(kinds, usageReadingTopTools) {
 		out.ToolPairs = reading.ToolPairs
@@ -295,6 +295,18 @@ func (s *stubUsageSource) setSample(addr, counter string, sample int64) {
 		reading.Samples = map[string]int64{}
 	}
 	reading.Samples[counter] = sample
+	s.readings[addr] = reading
+}
+
+func (s *stubUsageSource) setSlackConnected(addr string, connected *bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.errs, addr)
+	reading := s.readings[addr]
+	if reading.Samples == nil {
+		reading.Samples = map[string]int64{}
+	}
+	reading.SlackConnected = connected
 	s.readings[addr] = reading
 }
 
@@ -5246,5 +5258,125 @@ func TestUsagePoller_WatcherRestartDuringStartupHoldsThenRecoversOrClearsAtStrea
 	}
 	if volCond := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); volCond != nil {
 		t.Fatalf("after streak=%d DataVolumeNearlyFull = %+v, want removed", usageScrapeFailureEventStreak, volCond)
+	}
+}
+
+func TestUsagePoller_SlackConnectedTransitionsAndClearing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+	}
+	a2aLeader := usageA2AGatewayPod("agent-a2a-gateway-0", "a2a-0", usageTestA2AIP, created)
+	standbyIP := "10.0.0.41"
+	a2aStandby := usageA2AGatewayPod("agent-a2a-gateway-1", "a2a-1", standbyIP, created)
+	standbyAddr := standbyIP + ":9096"
+
+	h := newUsageHarness(t, agent, append(usageDefaultObjects(created), a2aLeader, a2aStandby)...)
+	h.stub.set(gatewayAddr(), 0, ptr.To(1.0))
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 0, ptr.To(1.0))
+	h.stub.set(a2aAddr(), 0, ptr.To(1.0))
+	h.stub.set(standbyAddr, 0, ptr.To(1.0))
+
+	// Poll 1: single 0 reading does not immediately set False (debounces startup
+	// handshake and routine Socket Mode reconnects).
+	h.stub.setSlackConnected(a2aAddr(), ptr.To(false))
+	h.stub.setSlackConnected(standbyAddr, nil)
+	h.poll(5)
+	if cond := meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType); cond != nil {
+		t.Fatalf("after 1st gauge=0 SlackConnected = %+v, want held absent until confirmed", cond)
+	}
+
+	// Poll 2: 2nd consecutive 0 reading confirms failure -> SlackConnected=False.
+	h.poll(10)
+	cond := meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != slackConnectedReasonFailed {
+		t.Fatalf("after 2nd gauge=0 SlackConnected = %+v, want False/%s", cond, slackConnectedReasonFailed)
+	}
+	// Steady-state repeat 0 poll must not issue another status patch.
+	patchesAtFalse := h.patches
+	h.poll(12)
+	if h.patches != patchesAtFalse {
+		t.Fatalf("steady repeat gauge=0 issued %d status patch(es), want 0", h.patches-patchesAtFalse)
+	}
+
+	// Poll 3: another replica reports 1 alongside 0 -> max aggregation yields True immediately.
+	h.stub.setSlackConnected(standbyAddr, ptr.To(true))
+	h.poll(15)
+	cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != slackConnectedReasonConnected {
+		t.Fatalf("after max gauge=1 SlackConnected = %+v, want True/%s", cond, slackConnectedReasonConnected)
+	}
+	// Steady-state repeat 1 poll must not issue another status patch.
+	patchesAtTrue := h.patches
+	h.poll(17)
+	if h.patches != patchesAtTrue {
+		t.Fatalf("steady repeat gauge=1 issued %d status patch(es), want 0", h.patches-patchesAtTrue)
+	}
+
+	// Poll 4: single transient 0 reading after True holds True (no Degraded flap).
+	h.stub.setSlackConnected(standbyAddr, nil)
+	h.poll(20)
+	cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("after single transient 0 SlackConnected = %+v, want held True", cond)
+	}
+
+	// Poll 5: single missed scrape (both pods omit gauge / fail) holds True and resets down streak.
+	h.stub.fail(a2aAddr(), usageScrapeKindRefused)
+	h.poll(25)
+	cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("after 1st miss SlackConnected = %+v, want held True", cond)
+	}
+
+	// Poll 6: 2nd consecutive miss removes SlackConnected.
+	h.poll(30)
+	if cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType); cond != nil {
+		t.Fatalf("after 2nd miss SlackConnected = %+v, want removed", cond)
+	}
+
+	// Polls 7-8: two consecutive 0 readings set False again.
+	h.stub.set(a2aAddr(), 0, ptr.To(1.0))
+	h.stub.setSlackConnected(a2aAddr(), ptr.To(false))
+	h.poll(35)
+	if cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType); cond != nil {
+		t.Fatalf("after 1st gauge=0 post-clear SlackConnected = %+v, want held absent", cond)
+	}
+	h.poll(40)
+	if cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType); cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("after 2nd gauge=0 again SlackConnected = %+v, want False", cond)
+	}
+
+	// Poll 9: disabling Slack removes SlackConnected immediately on the next poll.
+	cur := h.agent()
+	cur.Spec.Integration.Slack.Enabled = ptr.To(false)
+	if err := h.r.Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	h.poll(45)
+	if cond = meta.FindStatusCondition(h.agent().Status.Conditions, slackConnectedConditionType); cond != nil {
+		t.Fatalf("with Slack disabled SlackConnected = %+v, want removed", cond)
+	}
+
+	// Optimistic-lock 409 Conflict on status patch is suppressed cleanly for retry next poll.
+	conflictAgent := usageTestAgent(created)
+	conflictAgent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+	}
+	conflictClient := fake.NewClientBuilder().
+		WithScheme(h.r.Scheme).
+		WithObjects(conflictAgent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(context.Context, client.Client, string, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+				return apierrors.NewConflict(schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "platformagents"}, conflictAgent.Name, errors.New("stale resourceVersion"))
+			},
+		}).
+		Build()
+	conflictPoller := &UsageCounterPoller{r: &PlatformAgentReconciler{Client: conflictClient}}
+	if err := conflictPoller.projectSlackConnected(context.Background(), conflictAgent, ptr.To(false), true); err != nil {
+		t.Fatalf("projectSlackConnected returned error on 409 Conflict: %v, want nil", err)
 	}
 }

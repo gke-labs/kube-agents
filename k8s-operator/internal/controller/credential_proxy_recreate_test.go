@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -263,18 +264,149 @@ func TestTheBrokerRecreationGivesTheReconcileBackWhenTheDeleteHangs(t *testing.T
 	}
 }
 
-// The stateful broker is one pod, and a rollout never runs two. The broker's
-// per-task record of which profile task made which branch and proposal
-// (ProfileTaskWrites in agents/platform/scripts/credential_proxy.py, #6400) is
-// process-local, and is only right because one process serves /v1/vcs/. If
-// this ever changes, that record moves to shared state first; until then this
-// test is the tripwire, so a scale-out can't quietly let two pods disagree.
+// The stateful broker runs one active pod, and two active pods never serve
+// /v1/vcs/ at the same time. Default and fixed profiles keep Recreate without
+// standby; sizingProfile: auto in-cluster uses RollingUpdate (maxSurge=1,
+// maxUnavailable=0) holding the standby surge pod on 503 standby until the
+// outgoing pod reaches drained (in_flight=0) and transfers ProfileTaskWrites
+// (#6400) across /control/drain -> /control/activate, while off-cluster reverts
+// via disableCredentialProxyStandby to Recreate.
 func TestTheStatefulBrokerIsOnePodAndARolloutNeverOverlaps(t *testing.T) {
 	deploy := buildCredentialProxyDeployment(a2aTestAgent(), "hash")
 	if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 1 {
 		t.Fatalf("the stateful broker renders %v replicas; it must be exactly 1 while ProfileTaskWrites is process-local (#6400)", deploy.Spec.Replicas)
 	}
-	if deploy.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
-		t.Fatalf("the stateful broker rolls out with %q; it must be Recreate, so no two pods serve /v1/vcs/ at once (#6400)", deploy.Spec.Strategy.Type)
+	if deploy.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || deploy.Spec.Strategy.RollingUpdate != nil {
+		t.Fatalf("the default stateful broker strategy = %+v; expected Recreate while standby is gated to sizingProfile: auto", deploy.Spec.Strategy)
+	}
+	for _, env := range deploy.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == credentialProxyStandbyEnv || env.Name == credentialProxyControlFileEnv || env.Name == credentialProxyPeerHealthURLEnv {
+			t.Fatalf("default Recreate broker must not carry %s", env.Name)
+		}
+	}
+
+	autoAgent := a2aTestAgent()
+	if autoAgent.Spec.Deployment == nil {
+		autoAgent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	}
+	autoAgent.Spec.Deployment.SizingProfile = sizingProfileAuto
+	autoDep := buildCredentialProxyDeployment(autoAgent, "hash")
+	if autoDep.Spec.Replicas == nil || *autoDep.Spec.Replicas != 1 {
+		t.Fatalf("the auto stateful broker renders %v replicas; it must be exactly 1 while ProfileTaskWrites is process-local (#6400)", autoDep.Spec.Replicas)
+	}
+	if autoDep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType ||
+		autoDep.Spec.Strategy.RollingUpdate == nil ||
+		autoDep.Spec.Strategy.RollingUpdate.MaxSurge == nil ||
+		autoDep.Spec.Strategy.RollingUpdate.MaxSurge.IntVal != credentialProxyMaxSurge ||
+		autoDep.Spec.Strategy.RollingUpdate.MaxUnavailable == nil ||
+		autoDep.Spec.Strategy.RollingUpdate.MaxUnavailable.IntVal != credentialProxyMaxUnavailable {
+		t.Fatalf("the auto stateful broker strategy = %+v; expected active-standby RollingUpdate(maxSurge=%d, maxUnavailable=%d)",
+			autoDep.Spec.Strategy, credentialProxyMaxSurge, credentialProxyMaxUnavailable)
+	}
+	hasStandby, hasControlFile, hasPeerHealth := false, false, false
+	for _, env := range autoDep.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == credentialProxyStandbyEnv && env.Value == credentialProxyStandbyEnabledValue {
+			hasStandby = true
+		}
+		if env.Name == credentialProxyControlFileEnv && env.Value == credentialProxyControlFilePath() {
+			hasControlFile = true
+		}
+		if env.Name == credentialProxyPeerHealthURLEnv && env.Value == credentialProxyPeerHealthURL(autoAgent) {
+			hasPeerHealth = true
+		}
+	}
+	if !hasStandby || !hasControlFile || !hasPeerHealth {
+		t.Fatalf("RollingUpdate auto broker must render standby (%v), control file (%v), and peer health URL (%v)", hasStandby, hasControlFile, hasPeerHealth)
+	}
+
+	offCluster := autoDep.DeepCopy()
+	disableCredentialProxyStandby(offCluster)
+	if offCluster.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || offCluster.Spec.Strategy.RollingUpdate != nil {
+		t.Fatalf("off-cluster broker rolls out with %+v; it must be Recreate without standby (#6400)", offCluster.Spec.Strategy)
+	}
+	for _, env := range offCluster.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == credentialProxyStandbyEnv || env.Name == credentialProxyPeerHealthURLEnv || env.Name == credentialProxyControlFileEnv {
+			t.Fatalf("off-cluster Recreate broker must not carry %s", env.Name)
+		}
+	}
+	for _, mount := range offCluster.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if mount.Name == credentialProxyControlVolume {
+			t.Fatalf("off-cluster Recreate broker must not mount %s", mount.Name)
+		}
+	}
+	for _, vol := range offCluster.Spec.Template.Spec.Volumes {
+		if vol.Name == credentialProxyControlVolume {
+			t.Fatalf("off-cluster Recreate broker must not declare Secret volume %s", vol.Name)
+		}
+	}
+}
+
+// TestCredentialProxyOffClusterAutoReconcileSkipsControlSecretAndMounts exercises
+// the full reconcileCredentialProxy path when POD_NAMESPACE is unset/invalid on
+// sizingProfile: auto, proving the Deployment neither mounts an uncreated
+// control Secret nor retains CREDENTIAL_PROXY_CONTROL_FILE.
+func TestCredentialProxyOffClusterAutoReconcileSkipsControlSecretAndMounts(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "")
+	agent := brokerPodAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{SizingProfile: sizingProfileAuto}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	requeue, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned)
+	if err != nil {
+		t.Fatalf("reconcileCredentialProxy off-cluster auto failed: %v", err)
+	}
+	if requeue != 0 {
+		t.Fatalf("reconcileCredentialProxy off-cluster auto requeue = %v; want 0", requeue)
+	}
+
+	sec := &corev1.Secret{}
+	secErr := cl.Get(context.Background(), types.NamespacedName{
+		Name:      credentialProxyControlSecretName(agent),
+		Namespace: agent.Namespace,
+	}, sec)
+	if !errors.IsNotFound(secErr) {
+		t.Fatalf("control Secret Get error = %v; want IsNotFound when off-cluster", secErr)
+	}
+
+	got := &appsv1.Deployment{}
+	if err := cl.Get(context.Background(), types.NamespacedName{
+		Name:      credentialBrokerName(agent),
+		Namespace: agent.Namespace,
+	}, got); err != nil {
+		t.Fatalf("getting credential-proxy Deployment: %v", err)
+	}
+	if got.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || got.Spec.Strategy.RollingUpdate != nil {
+		t.Fatalf("off-cluster auto Deployment strategy = %+v; want Recreate", got.Spec.Strategy)
+	}
+	var c *corev1.Container
+	for i := range got.Spec.Template.Spec.Containers {
+		if got.Spec.Template.Spec.Containers[i].Name == credentialProxyContainerName {
+			c = &got.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	if c == nil {
+		t.Fatalf("container %s not found", credentialProxyContainerName)
+	}
+	for _, env := range c.Env {
+		if env.Name == credentialProxyStandbyEnv || env.Name == credentialProxyPeerHealthURLEnv || env.Name == credentialProxyControlFileEnv {
+			t.Fatalf("off-cluster auto container kept env %s", env.Name)
+		}
+	}
+	for _, mount := range c.VolumeMounts {
+		if mount.Name == credentialProxyControlVolume {
+			t.Fatalf("off-cluster auto container mounted %s for an uncreated Secret", mount.Name)
+		}
+	}
+	for _, vol := range got.Spec.Template.Spec.Volumes {
+		if vol.Name == credentialProxyControlVolume {
+			t.Fatalf("off-cluster auto Deployment declared Secret volume %s for an uncreated Secret", vol.Name)
+		}
 	}
 }

@@ -313,6 +313,8 @@ exit {manifest_status}
 
 
 MOCK_AR_REGISTRY_PREFIX = "us-docker.pkg.dev/mock-project/mock-candidates"
+# A second registry a release is published to, beside the default one.
+MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX = "us-docker.pkg.dev/mock-release-project/mock-release"
 MOCK_AR_ACCESS_TOKEN = "mock-google-access-token"
 MOCK_AR_CURL_LOG = "ar_curl.log"
 MOCK_AR_CURL_STDIN_LOG = "ar_curl_stdin.log"

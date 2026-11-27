@@ -5,10 +5,11 @@
 # no gcloud surface). See resources/ca-capacity-buffers.md → Capacity Buffers.
 #
 # Provisioning strategies (set in spec.provisioningStrategy):
-#   buffer.x-k8s.io/active-capacity   default. Buffer pods are real, low-priority
-#                                     placeholder pods that get evicted to make
-#                                     room when real workloads arrive. Requires
-#                                     GKE 1.35.2-gke.1842000+.
+#   buffer.x-k8s.io/active-capacity   default. Placeholder pods live only inside
+#                                     Cluster Autoscaler memory (`kubectl get pods`
+#                                     shows 0 Pending pods) and hold warm spare
+#                                     capacity that real workloads schedule onto
+#                                     directly. Requires GKE 1.35.2-gke.1842000+.
 #   buffer.gke.io/standby-capacity    Nodes pre-provisioned but kept idle (no
 #                                     pods running). Requires 1.35.2-gke.1842002+.
 #

@@ -64,6 +64,9 @@ type ProfileWorkerConfig struct {
 	RequirePersonaIntegrity bool
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
+	// Workdir is the harness's working directory, the workspace a
+	// core-agent grant's file tools are confined to.
+	Workdir string
 	// Relay is how the rendered persona's MCP servers reach the broker's
 	// relay (ProfileRelay, #5495). Empty drops every MCP server the persona
 	// declares, and the render says so.
@@ -88,6 +91,14 @@ type ProfileWorkerConfig struct {
 	// what a script-run task's credential is verified against (#5622).
 	// Without them no script runs.
 	TaskSigningKeys string
+	// KubeProxy is the pod's kube-proxy, when its environment names one
+	// (kubeproxy.go): the worker then stands a loopback proxy in front of it
+	// and points each task's kubectl there. Without one, nothing starts and
+	// kubectl goes to the broker as before.
+	KubeProxy KubeProxyLoopbackConfig
+	// kubeProxyTaskEndHook, when set, runs as each task's end at the
+	// loopback begins. Tests use it to see what has been reported by then.
+	kubeProxyTaskEndHook func(task string)
 	// scriptCheck replaces the image's script-file check in tests.
 	scriptCheck scriptFileCheck
 	// resetTimeout replaces resetTimeout in tests.
@@ -140,23 +151,45 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 	if pw.deadlineMargin <= 0 {
 		pw.deadlineMargin = cfg.KillGrace + defaultDeadlineMargin
 	}
+	// Before the bus: a kube-proxy the pod names but can't be reached
+	// through stops the worker before it can be offered a task.
+	kubeProxy, err := startKubeProxyLoopback(pw.KubeProxy, cfg.Logger)
+	if err != nil {
+		return err
+	}
+	if kubeProxy != nil {
+		kubeProxy.taskEndHook = pw.kubeProxyTaskEndHook
+		defer func() { _ = kubeProxy.Close() }()
+	}
 	b, closeBus, err := dialBus(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer closeBus()
 
-	w := &profileWorker{cfg: cfg, pw: pw, b: b, msgs: make(chan *nats.Msg, 16)}
+	w := &profileWorker{cfg: cfg, pw: pw, b: b, msgs: make(chan *nats.Msg, 16), kubeProxy: kubeProxy}
 	// Before anything can be offered: whatever a previous process in this
 	// container left (it died mid-task, or its reset failed) goes first.
 	if err := w.resetWorkspace("startup", ""); err != nil {
 		return err
 	}
 	if pw.PersonaDir != "" {
-		if w.persona, err = renderPersona(pw, cfg.Logger); err != nil {
+		if w.persona, w.skills, err = renderPersona(pw, cfg.Logger); err != nil {
 			return err
 		}
 		logPersonaWarnings(cfg.Logger, w.persona)
+	}
+	// core-agent takes its tool grant in each turn's envelope, from the
+	// driver: the persona's replaces the session grant the pod's driver
+	// started with, or the worker stops here. Without a persona there is no
+	// profile grant to give it.
+	if pw.Harness == persona.CoreAgent {
+		if w.persona == nil {
+			return fmt.Errorf("a core-agent profile worker needs a persona for its tool grant")
+		}
+		if w.cfg.Driver, err = coreAgentProfileDriver(w.cfg.driver(), *w.persona, pw.Workdir); err != nil {
+			return fmt.Errorf("the persona's core-agent tool grant: %w", err)
+		}
 	}
 	sub, err := b.nc.ChanSubscribe(lib.DispatchSubject(cfg.Profile, pw.Tier, cfg.PodName), w.msgs)
 	if err != nil {
@@ -190,38 +223,49 @@ type profileWorker struct {
 	ready atomic.Bool
 	// persona is the persona as rendered for the harness, or nil.
 	persona *persona.Output
+	// skills are the names of the persona's skills, for the per-tool log
+	// line's skill key (toollog.go).
+	skills []string
+	// kubeProxy is the loopback in front of the pod's kube-proxy, nil when
+	// the pod names none.
+	kubeProxy *KubeProxyLoopback
 }
 
-// renderPersona loads the profile's persona and renders it for the harness.
+// renderPersona loads the profile's persona and renders it for the harness,
+// and also returns the names of the persona's skills.
 // It runs once: the persona is the image's and doesn't change under a
 // running pod, and a persona that doesn't load stops the worker before it
 // takes a task. That includes a persona whose files don't match its
 // build-time content manifest, and, under RequirePersonaIntegrity, one with
 // no manifest. Which of verified or unverified it loaded as is logged.
-func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, error) {
+func renderPersona(pw ProfileWorkerConfig, log *slog.Logger) (*persona.Output, []string, error) {
 	// The persona loads, and its files are checked, before the harness is
 	// looked at: the check is the same for every harness, and a persona that
 	// differs from its build is refused as that, whichever driver the
 	// profile runs.
 	p, err := persona.LoadWithOptions(pw.PersonaDir, persona.Options{RequireIntegrity: pw.RequirePersonaIntegrity})
 	if err != nil {
-		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
+		return nil, nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
 	}
 	adapter, err := render.For(pw.Harness)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Logged once the persona is one this harness can use, so a refused
 	// harness doesn't follow a success line.
 	logPersonaIntegrity(log, pw.PersonaDir, p)
 	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
 	if err != nil {
-		return nil, fmt.Errorf("rendering the persona: %w", err)
+		return nil, nil, fmt.Errorf("rendering the persona: %w", err)
 	}
 	if err := render.CheckOutput(out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &out, nil
+	skills := make([]string, 0, len(p.Skills))
+	for _, s := range p.Skills {
+		skills = append(skills, s.Name)
+	}
+	return &out, skills, nil
 }
 
 // logPersonaIntegrity says whether the persona's files were checked against
@@ -592,6 +636,8 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	cfg.TaskID = h.offer.TaskID
 	// A copy: this task's additions must not land in the worker's slice.
 	cfg.HarnessEnv = append([]string(nil), w.cfg.HarnessEnv...)
+	// A profile task's tool calls go on the worker's log (toollog.go).
+	cfg.ToolLines = &ToolLines{Skills: w.skills}
 	h.done = make(chan turnOutcome, 1)
 	bus, closeTaskBus := w.b, func() {}
 	if h.taskCredential != "" {
@@ -630,6 +676,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)
+	endKubeProxy := w.beginKubeProxyTask(&cfg, h)
 	removeRefusals := w.makeWriteRefusalFile(&cfg)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
@@ -669,8 +716,10 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		// opens at the subject's start.
 		out := a.execute(ctx, h.origin, 0, plan)
 		// Cleaned up before the outcome is reported, so the final renewal,
-		// and with it the next task, never overlaps this task's token or
-		// config.
+		// and with it the next task, never overlaps this task's token,
+		// config or connections to kube-proxy. The connections go first:
+		// a watch a leftover process still holds ends here.
+		endKubeProxy()
 		removeConfig()
 		removeToken()
 		removeRefusals()
@@ -764,6 +813,28 @@ func (w *profileWorker) writeTaskToken(token string) func() {
 		return func() {}
 	}
 	return func() { _ = os.Remove(path) }
+}
+
+// beginKubeProxyTask makes h the loopback's active task, with the cluster
+// credential the confirm carried, and points the task's harness at the
+// loopback in place of the pod's kube-proxy, with the task's target cluster
+// as the context a bare kubectl reads. It returns what ends the task there.
+// Without a loopback it does nothing.
+func (w *profileWorker) beginKubeProxyTask(cfg *Config, h *held) func() {
+	if w.kubeProxy == nil {
+		return func() {}
+	}
+	env := cfg.HarnessEnv
+	if w.cfg.HarnessEnv == nil {
+		// A nil HarnessEnv means the harness inherits this process's
+		// environment; that is what the pod's kube-proxy is replaced in.
+		env = append(os.Environ(), env...)
+	}
+	// One reading of the credential: the context the harness is given is
+	// the one the loopback holds the task to.
+	target, end := w.kubeProxy.BeginTask(cfg.TaskID, h.proxyToken)
+	cfg.HarnessEnv = kubeProxyTaskEnv(env, w.kubeProxy.URL, target)
+	return end
 }
 
 // makeWriteRefusalFile makes the task's write-refusal record file empty

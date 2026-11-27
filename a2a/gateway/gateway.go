@@ -2529,6 +2529,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
 	state.ChildAddressees = chainChildAddressees(rec, taskID)
+	state.ChildCount = chainChildCount(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2628,6 +2629,30 @@ func chainChildAddressees(rec *SessionRecord, taskID string) []string {
 		out = append(out, t.Addressee)
 	}
 	return out
+}
+
+// chainChildCount is how many child tasks the delegation chain rooted at
+// taskID's root minted: every delegation, so two to the same addressee count
+// two where chainChildAddressees names it once. A child minted without an
+// addressee still counts, since it is a delegation whomever it went to. Zero
+// when the chain delegated nothing; nil only when taskID is unknown, so the
+// wire tells "none" from "unknown" as the addressees do. It counts the
+// children the record still holds: a long-lived conversation whose history
+// trim (trimHistory) dropped old child entries under a live root counts
+// fewer, which a fresh bench conversation never reaches.
+func chainChildCount(rec *SessionRecord, taskID string) *int {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == taskRoleChild && t.rootID() == root {
+			n++
+		}
+	}
+	return &n
 }
 
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.

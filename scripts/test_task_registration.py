@@ -476,6 +476,22 @@ class TestTheValidatorItself(unittest.TestCase):
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("can only pass", problems[0])
 
+    def test_a_delegated_to_check_with_only_min_children_zero_is_rejected(self):
+        """Every chain has at least zero children, so `min_children: 0` alone
+        asserts nothing; with another field set it is a real lower bound."""
+        problems = []
+        validator._check_assertions({"type": "delegated_to", "min_children": 0}, "check 'x'", problems)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("can only pass", problems[0])
+        for node in (
+            {"type": "delegated_to", "min_children": 0, "max_children": 1},
+            {"type": "delegated_to", "min_children": 1},
+            {"type": "delegated_to", "min_children": 0, "required_addressees": ["cluster"]},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
+
     def test_a_finding_scope_without_its_check_is_rejected(self):
         """The verifier's model refuses the pair after the cluster lease; this
         rule refuses it here."""
@@ -1457,6 +1473,44 @@ class TestTheRulesReject(unittest.TestCase):
             "malformed cluster placeholder",
             verification_spec=self._entry(check={"type": "report_contains", "forbidden_patterns": ["{cluster: a}: no"]}),
         )
+
+    def test_model_placeholder_is_accepted_only_in_report_contains_pattern_lists(self):
+        for key in ("forbidden_patterns", "required_patterns", "any_of_patterns"):
+            with self.subTest(valid_key=key):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]})),
+                    [],
+                )
+        for key in ("required_phrases", "forbidden_phrases", "any_of_phrases"):
+            with self.subTest(phrase_key=key):
+                problem = self._only(
+                    "which only report_contains expands",
+                    verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]}),
+                )
+                self.assertIn(repr(key), problem)
+        for bad_check in (
+            {"type": "worker_commands", "forbidden_patterns": ["{model}"]},
+            {"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-{model}"},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"assignee": "{model}"}},
+        ):
+            with self.subTest(bad_check=bad_check):
+                self._only("which only report_contains expands", verification_spec=self._entry(check=bad_check))
+        for valid_non_placeholder in (
+            {"type": "report_contains", "forbidden_patterns": [r'\{"model": "model-default"\}']},
+            {"type": "worker_commands", "required_patterns": [r"jsonpath=\{\.spec\.model\}"]},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"body": r'\{"model": "gemini"\}'}},
+        ):
+            with self.subTest(valid_non_placeholder=valid_non_placeholder):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check=valid_non_placeholder)),
+                    [],
+                )
+        for malformed in ("{ model }", "{Model}", "{model:default}"):
+            with self.subTest(malformed=malformed):
+                self._only(
+                    "malformed model placeholder",
+                    verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": [malformed]}),
+                )
 
     def test_a_slotless_overlay_role_is_rejected_in_fixture_roles(self):
         # `orphan-disks` is in the overlay with no slot, so `fixtures:` takes

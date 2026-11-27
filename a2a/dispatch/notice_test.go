@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -234,9 +235,8 @@ func refusedErr() error {
 
 // Only a latched install gives up: an unlatched one (the five-token form)
 // keeps retrying a refused terminal for as long as it takes, as it did before
-// the six-token form, and a duplicate that isn't the task's terminal gives up
-// at once whatever the bound. Only a permission refusal counts: a timeout
-// with no refusal heard is retried, latched or not.
+// the six-token form. Only a permission refusal counts: a timeout with no
+// refusal heard is retried, latched or not.
 func TestOnlyALatchedInstallGivesUpOnARefusedTerminal(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
@@ -682,5 +682,41 @@ func TestAnIDSeenOnAnUnstoredSendDoesNotSwallowTheRetry(t *testing.T) {
 	}
 	if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-seen")); n != 1 {
 		t.Fatalf("%d terminals on the six-token subject, want the real one", n)
+	}
+}
+
+// A give-up is an install fault with no other carrier (#6884): it logs one
+// Error line starting with the fixed ALERT prefix a log-based alert matches,
+// naming the profile, tier and task and the terminal-unpublished settle. The
+// prefix is pinned literally: the docs' log filter quotes it.
+func TestAGiveUpLogsTheAlertLineANamedFilterMatches(t *testing.T) {
+	var buf lockedBuffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := testDispatchConfig(6, testProfile("tse", 2))
+	cfg.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile
+	clock := time.Now()
+	d := &Dispatcher{cfg: testConfig(), src: NewStaticSource(cfg), log: base, now: func() time.Time { return clock }}
+	log := base.With("profile", "tse", "tier", "read", "kind", lib.SubmitKindTop, "task", "task-alert")
+	var r terminalRefusal
+	for range 2 {
+		d.terminalGivenUp(log, &r, refusedErr(), lib.StateFailed, ReasonLeaseExpired)
+		clock = clock.Add(time.Hour)
+	}
+	var alerts []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if msg, _ := rec["msg"].(string); strings.HasPrefix(msg, "ALERT dispatcher_terminal_unpublished") {
+			alerts = append(alerts, rec)
+		}
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("%d alert lines, want one for the give-up:\n%s", len(alerts), buf.String())
+	}
+	a := alerts[0]
+	if a["level"] != "ERROR" || a["profile"] != "tse" || a["tier"] != "read" || a["task"] != "task-alert" || a["settle"] != ReasonTerminalUnpublished {
+		t.Errorf("alert line = %v, want an Error naming the profile, tier, task and the terminal-unpublished settle", a)
 	}
 }

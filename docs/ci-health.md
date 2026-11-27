@@ -1608,7 +1608,7 @@ reads of the project-scoped roles (`startup-fail-vm`, `rotated-console-vm`, `wor
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the
-cluster role `missing-reservation-pool` (`compute.reservations.list`, in the same role), and `FLEET_READONLY_SA` makes the runner
+cluster roles `missing-reservation-pool` and `missing-reservation-autoscaled` (`compute.reservations.list`, in the same role), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
