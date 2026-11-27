@@ -244,9 +244,11 @@ func grantedTools(grants []string, server string) ([]string, bool) {
 func IsScriptPath(rel string) bool { return scriptPathRE.MatchString(rel) }
 
 // ScriptPaths are the absolute paths, under personaDir, of a rendering's
-// executable skill files: the only commands the harness's shell may run from
-// the persona, each directly by its path. A path outside personaDir's skills
-// directory, or one that isn't clean, is refused.
+// executable skill files: where a skill's scripts are. A persona that ships
+// scripts grants the shell, which runs any command, so the paths limit
+// nothing; they are what toolgrant.Policy.Scripts would take for a shell
+// limited to command prefixes. A path outside personaDir's skills directory,
+// or one that isn't clean, is refused.
 func ScriptPaths(out persona.Output, personaDir string) ([]string, error) {
 	var paths []string
 	for _, f := range out.Files {

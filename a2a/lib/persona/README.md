@@ -176,7 +176,9 @@ worker refuses `antigravity`, which has no persona adapter yet.
     grant takes the server's `include` list. The worker sends them in each
     turn's stdin envelope.
   - Tools pass through as the manifest names them, for the harness's tool
-    grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+    grant to map. `coreagent.ScriptPaths` lists the scripts' absolute paths;
+    a persona's shell runs any command, so the list tells the model where the
+    scripts are rather than limiting what the shell runs.
   - A profile worker's core-agent tool grant is read from this rendering
     (`workeradapter.PersonaToolPolicy`) and grants what the Claude Code
     rendering does: `read_file` the read tools, `shell` any command

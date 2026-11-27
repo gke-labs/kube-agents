@@ -100,15 +100,16 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 		// while the native grep and glob tools are registered. So "any
 		// command" means any command those pass. The
 		// read tools' workspace scope doesn't hold, which a shell that reads
-		// anywhere never had. The grant may not carry a file write: no
-		// persona grants one, and in this mode the path scope wouldn't
-		// confine it, so such a policy is refused rather than run.
+		// anywhere never had. The grant may not carry a file write, since no
+		// persona grants one, so such a policy is refused rather than run.
+		// (In this mode core-agent's sandbox would still hold a file write
+		// to workdir and the temp directories.)
 		if !permitted["bash"] {
 			return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command must grant the shell")
 		}
 		for name := range permitted {
 			if toolgrant.CoreAgentWrites(name) {
-				return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command may not grant %s, which that mode's path scope wouldn't confine", name)
+				return tools.BuiltinTools{}, permissions.Options{}, nil, fmt.Errorf("a policy that runs any shell command may not grant %s: no persona's shell grant carries a file write", name)
 			}
 		}
 		mode = permissions.ModeYolo
