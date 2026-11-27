@@ -3904,6 +3904,28 @@ def test_the_measured_crashloop_case_is_not_graded_never_passed(inject_run):
     assert verdict.rung is Rung.NOT_GRADED_ON_TRANSPORT and verdict.blocking is False, verdict.reason
 
 
+@pytest.mark.parametrize(("status", "outcome", "rung"), [("fail", "fail", None), ("error", "blocked", "CHECK_DID_NOT_RUN")])
+def test_an_objective_the_empty_args_cant_flip_keeps_its_fail_or_error(write_task, inject_run, status, outcome, rung):
+    """Beside an uncertain entry, only the other objectives' passes are
+    swept. The answer check failing or erroring on its own isn't the empty
+    args' doing: a fail still fails the repetition, and an error still
+    blocks at rung 2."""
+    spec = _arguments_spec(write_task)
+
+    def mutate(rec):
+        _arguments_shape([_bash(absent=True)], "fail", "pass")(rec)
+        answer = rec["verification_report"][0]
+        answer["status"], answer["success"] = status, False
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    rep = classify_rep(spec, inject_run(mutate=mutate), 1)
+    assert ANSWER_CHECK not in rep.not_applicable_checks, rep.reason
+    assert BASH_ARGS_OBJECTIVE in rep.not_applicable_checks, rep.reason
+    assert rep.outcome == outcome, rep.reason
+    if rung:
+        assert rep.rung is getattr(Rung, rung), rep.reason
+
+
 def test_a_repetition_with_no_inputless_call_grades_as_before(write_task, inject_run):
     """The same failed objective on a record whose calls all carry their
     input: nothing is set aside, and the repetition fails."""
