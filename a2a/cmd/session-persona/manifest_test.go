@@ -205,7 +205,7 @@ func TestBothLayoutsShipTheSameSkills(t *testing.T) {
 // claudeOnlyToolNames are Claude Code's tool names as the session text could
 // refer to them; none may reach the core-agent tree, whose tools are named
 // otherwise (the skills come through load_skill, the shell is the harness's).
-var claudeOnlyToolNames = regexp.MustCompile(`\b(Skill|Bash|Read|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch|Edit|Write) tool\b|\bBash\(`)
+var claudeOnlyToolNames = regexp.MustCompile(`\b(Skill|Bash|Read|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch|Edit|Write) tool\b|\bBash\b`)
 
 // The core-agent tree names core-agent's tools, and the Claude Code tree is
 // the source as it was: the persona's skill instruction is rewritten only in
