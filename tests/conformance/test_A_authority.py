@@ -499,6 +499,16 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         principal = cp.Principal(workload="system:serviceaccount:ns:profile", role=cp.CALLER_ROLE_PROFILE)
         task = type("Task", (), {"permits": frozenset()})()
         permitted = type("Task", (), {"permits": frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})})()
+        # Another permit is not the confirmed one. The verifiers also accept
+        # vcs:unattended-write (docs/designs/unattended-write-permit.md), which
+        # this gate does not read; the second name is in no verifier's list.
+        # A credential with either opens the reads and none of the writes.
+        # The suite does not import the verifier, so the first name is a
+        # literal; the source "task_credential_verifier" anchors it there.
+        other_permits = {
+            name: type("Task", (), {"permits": frozenset({name})})()
+            for name in ("vcs:unattended-write", "vcs:proposal-merge")
+        }
         writes = cp.PROFILE_PERMIT_GATED_VCS_VERBS
         self.assertEqual(frozenset({"publish", "proposal-create", "proposal-update"}), writes)
         for verb in sorted(cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE]):
@@ -507,6 +517,12 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 with_task = dataclasses.replace(principal, task=task)
                 self.assertEqual(verb in writes, cp.profile_vcs_refusal(with_task, verb) is not None)
                 self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
+                for name, other in other_permits.items():
+                    with_other = dataclasses.replace(principal, task=other)
+                    self.assertEqual(
+                        verb in writes, cp.profile_vcs_refusal(with_other, verb) is not None,
+                        f"a credential with only the permit {name}",
+                    )
         others = cp.vcs_broker.WRITE_VERBS - writes
         self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
 
