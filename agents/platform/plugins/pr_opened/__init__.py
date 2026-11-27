@@ -226,6 +226,9 @@ NO_ORIGIN = ("other", "")
 SESSION_KV_URL = "http://127.0.0.1:8699"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 LEDGER_PATH = "/v1/proposals/opened"
+#: A proxy from the environment must not get a request to the server and its
+#: key, and urllib does not leave out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 #: The ledger write waits at most this long, on loopback.
 LEDGER_TIMEOUT_SECONDS = 2.0
@@ -461,7 +464,7 @@ def _session_kv_post(path, payload, timeout_s=LEDGER_TIMEOUT_SECONDS):
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+    with _SESSION_KV_OPENER.open(request, timeout=timeout_s) as response:
         loaded = json.loads(response.read() or b"{}")
     return loaded if isinstance(loaded, dict) else {}
 

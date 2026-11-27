@@ -53,6 +53,8 @@ KNOWN_OPENER_IS_GONE = (
 )
 PROXY_VARIABLES = ("http_proxy", "https_proxy", "all_proxy")
 PROXY_VARIABLE_SUFFIX = "_proxy"
+DATABASE_PATH_VARIABLE = "SESSION_KV_DB_PATH"
+DATABASE_FILE = "session_kv.db"
 # Prints the schemes that the module's opener has a proxy for, then those of a
 # default opener of the same process, which shows that the variables reached
 # the process. A name that holds the `open` method of an opener stands for
@@ -132,10 +134,14 @@ def probe(module: str, opener: str, folder: Path) -> str:
     """
     environment = {key: value for key, value in os.environ.items() if not key.lower().endswith(PROXY_VARIABLE_SUFFIX)}
     environment.update(dict.fromkeys(PROXY_VARIABLES, PROXY))
-    done = subprocess.run(
-        [sys.executable, "-c", PROBE, module, opener],
-        cwd=folder, env=environment, capture_output=True, text=True, check=False,
-    )
+    # `session_kv_server` makes its database when it is loaded, and the default
+    # path is in the pod only.
+    with tempfile.TemporaryDirectory() as scratch:
+        environment[DATABASE_PATH_VARIABLE] = str(Path(scratch) / DATABASE_FILE)
+        done = subprocess.run(
+            [sys.executable, "-c", PROBE, module, opener],
+            cwd=folder, env=environment, capture_output=True, text=True, check=False,
+        )
     return done.stdout.strip() if done.returncode == 0 else done.stderr.strip()
 
 

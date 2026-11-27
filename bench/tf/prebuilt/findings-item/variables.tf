@@ -14,7 +14,8 @@
 
 # The deployer drops an injected variable this stack does not declare and
 # raises on a task.yaml variable it does not declare, so this file,
-# bench/tasks/findings-decision-covers-item/task.yaml and
+# bench/tasks/findings-decision-covers-item/task.yaml,
+# bench/tasks/findings-decision-reply-names-no-id/task.yaml and
 # bench/tasks/findings-decision-leaves-unnamed-open/task.yaml are matched.
 
 variable "host_cluster_name" {
@@ -51,9 +52,11 @@ variable "agent_container" {
   default     = "platform-agent"
 }
 
-# Which rows to plant: findings.json for findings-decision-covers-item, and
-# findings-unnamed.json for findings-decision-leaves-unnamed-open, which adds
-# a row no message has named (`plant_state: queued`) under its own project.
+# Which rows to plant: findings.json for findings-decision-covers-item;
+# findings-twin.json for findings-decision-reply-names-no-id, which adds a twin
+# of the gathered line under another project; and findings-unnamed.json for
+# findings-decision-leaves-unnamed-open, which adds a row no message has named
+# (`plant_state: queued`) under its own project.
 variable "findings_file" {
   type    = string
   default = "findings.json"

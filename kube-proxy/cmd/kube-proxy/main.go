@@ -1,10 +1,13 @@
 // Command kube-proxy is the kube-agents build of k8s-api-proxy: the same server, with the
-// task credential gate as its Authorize hook when the environment configures one.
+// task credential gate as its Authorize hook when the environment configures one, the
+// gate's workers as the callers admitted for the profile audience, and a limit on what each
+// of those workers may have open at once.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -25,6 +28,14 @@ const (
 	flagPrefix = "-"
 	// flagValueSeparator joins a flag to a value given in the same argument.
 	flagValueSeparator = "="
+
+	// workersNotAdmittedFormat is the startup error of a gate whose workers the server
+	// cannot admit for the profile audience. Its arguments are the profile audience's
+	// variable, the identity map's, and the server's own error.
+	workersNotAdmittedFormat = "kube-proxy: the task credential gate is on, and the server cannot admit the workers %[2]s names for the audience in %[1]s: %[3]w. " +
+		"Set %[1]s to an audience that is neither --audience nor CREDENTIAL_PROXY_SESSION_AUDIENCE, " +
+		"keep every ServiceAccount %[2]s names out of --allowed-callers and CREDENTIAL_PROXY_SESSION_CALLERS, " +
+		"and keep token-review in --auth-mode; or unset %[2]s to turn the gate off"
 )
 
 // helpFlags are the names the flag package answers with the usage text.
@@ -46,31 +57,53 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := proxyserver.Run(context.Background(), os.Args[1:], opts); err != nil {
-		log.Fatal(err)
+		log.Fatal(startupError(err, opts))
 	}
+}
+
+// startupError is the error the binary exits on for err, the server's. The server names
+// Options.AudienceCallers when it refuses the gate's workers, a field no operator set, so
+// that error is wrapped to name the two variables the audience and its callers came from
+// and what to change. Any other error is the server's own.
+func startupError(err error, opts proxyserver.Options) error {
+	var refused *proxyserver.AudienceCallersError
+	if len(opts.AudienceCallers) == 0 || !errors.As(err, &refused) {
+		return err
+	}
+	return fmt.Errorf(workersNotAdmittedFormat, taskgate.ProfileAudienceEnv, taskgate.IdentitiesEnv, err)
 }
 
 // options are what this binary adds to the stock server: its version, the task credential
 // gate the environment asks for, and the credential's header among the ones never
-// forwarded, gate or no gate.
+// forwarded, gate or no gate. With the gate on, the server also accepts the profile
+// audience, from exactly the ServiceAccounts the gate's identity map names: a worker the
+// proxy admits for that audience is always one the gate checks, and each of them is held to
+// the gate's worker limits, which no other caller gets. With the gate off it accepts no
+// audience and limits no caller the stock server does not.
 //
 // A malformed gate configuration is an error, except when args ask only for the version or
 // the usage text: those answer whatever the environment holds. The server then gets a hook
-// that refuses every request, so if args were misread and it serves after all, it serves
-// nothing rather than serving ungated.
+// that refuses every request, no profile audience and no worker limits, so if args were misread and it serves
+// after all, it serves nothing rather than serving ungated.
 func options(args []string, getenv func(string) string, logger *slog.Logger) (proxyserver.Options, error) {
-	authorize, err := taskgate.FromEnv(getenv, logger)
+	opts := proxyserver.Options{
+		Version:            version,
+		ExtraCallerHeaders: taskgate.CallerHeaders(),
+	}
+	cfg, err := taskgate.LoadConfig(getenv)
 	if err != nil {
 		if !asksForVersionOrHelp(args) {
 			return proxyserver.Options{}, err
 		}
-		authorize = refuseAll
+		opts.Authorize = refuseAll
+		return opts, nil
 	}
-	return proxyserver.Options{
-		Version:            version,
-		Authorize:          authorize,
-		ExtraCallerHeaders: taskgate.CallerHeaders(),
-	}, nil
+	if cfg != nil {
+		opts.Authorize = taskgate.FromConfig(*cfg, logger)
+		opts.AudienceCallers = map[string][]string{cfg.ProfileAudience: cfg.WorkerUsernames()}
+		opts.CallerLimits = cfg.CallerLimits()
+	}
+	return opts, nil
 }
 
 // asksForVersionOrHelp reports whether args hold the version flag, set true, or a help

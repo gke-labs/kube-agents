@@ -174,13 +174,14 @@ class TriageReplyRoundTripTest(unittest.TestCase):
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM incidents")
-        # Both ends call `urllib.request.urlopen` against 127.0.0.1:8699. In the
-        # pod that is a real socket between the gateway process and the Session
-        # KV server; here it is the same FastAPI app in-process. Patching the
-        # shared `urllib.request` module covers both callers at once — which is
-        # the point, since the whole failure was one end writing nowhere the
-        # other end reads.
-        patcher = patch.object(urllib.request, "urlopen", self._urlopen)
+        # Both ends call 127.0.0.1:8699 through an opener that refuses a proxy
+        # from the environment. In the pod that is a real socket between the
+        # gateway process and the Session KV server; here it is the same FastAPI
+        # app in-process. Patching `OpenerDirector.open` of the shared
+        # `urllib.request` module covers both callers at once — which is the
+        # point, since the whole failure was one end writing nowhere the other
+        # end reads.
+        patcher = patch.object(urllib.request.OpenerDirector, "open", self._urlopen)
         patcher.start()
         self.addCleanup(patcher.stop)
 

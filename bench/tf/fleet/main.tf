@@ -150,7 +150,7 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 }
 
 # The project-scoped fixtures (the startup-fail VM, the world-open firewall
-# rule and its VM, the peered mtu-peer-declared network, the two orphaned
+# rule and its VM, the health-check shadow rules, the peered mtu-peer-declared network, the two orphaned
 # snapshots; fixtures.json roles with cluster_slot null) are Compute Engine
 # objects, which container.viewer cannot read. The CI health bot's scan runs
 # every gcloud read as this account, so the presence probe and the state pass
@@ -1231,6 +1231,49 @@ resource "google_compute_firewall" "world_open_deny_remote" {
   deny {
     protocol = "tcp"
     ports    = ["22", "3389"]
+  }
+}
+
+
+# Defect (networking): a DENY that blocks load-balancer health checks. The
+# networking audit's §2.8 (`firewall-health-check-shadowed`) flags an enabled
+# INGRESS DENY that, at the priority of an enabled allow of the Google Cloud
+# health-check probe ranges or above, covers those ranges, that allow's target
+# and every TCP port it opens, on a network where a live instance is in that
+# target. Both rules aim at the world-open VM's tag, so no new VM is needed:
+# the VM is the live instance the check requires. tcp:80 is not a management
+# port, so §2.6's finding on that VM is unchanged, and nothing on the VM
+# listens on 80 or sits behind a load balancer, so no real probe is blocked.
+# The names lead with distinct prefixes (`hc-shadow-allow-`, `hc-shadow-deny-`)
+# so the case can grade `FirewallRule/hc-shadow-deny-`, which only the
+# finding's object carries, and `hc-shadow-allow-`, which only its excerpt
+# names. Catalogue role: health-check-shadowed.
+resource "google_compute_firewall" "hc_shadow_allow" {
+  name          = "hc-shadow-allow-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  priority      = 1000
+  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+}
+
+#trivy:ignore:AVD-GCP-0027
+resource "google_compute_firewall" "hc_shadow_deny" {
+  name          = "hc-shadow-deny-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  priority      = 900
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  deny {
+    protocol = "tcp"
+    ports    = ["80"]
   }
 }
 

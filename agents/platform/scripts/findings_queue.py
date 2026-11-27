@@ -950,7 +950,7 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
     `rolled_up`) covers the named rows of its item: every other row with the
     same `item_key` that `decided_with_item` accepts and that is in
     `CASCADE_STATES` takes the same state and `snoozed_until`. Their ids come
-    back as `item_rows_decided`. Without it, the nudge names one id for a
+    back as `item_rows_decided`. Without it, the nudge keeps one id for a
     gathered line, the user decides it, and the line stays pending. A
     `queued` row of the item, which no message has named, keeps its state:
     its id comes back as `item_rows_left_open`.

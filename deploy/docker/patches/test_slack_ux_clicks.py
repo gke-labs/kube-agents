@@ -475,6 +475,55 @@ class BoardActionTest(unittest.TestCase):
                                    ("kage_board.delete", False), ("kage.choice.0", False)):
             with self.subTest(action_id=action_id):
                 self.assertEqual(bool(runtime.BOARD_ACTION_ID_PATTERN.match(action_id)), matched)
+class BoardRequestProxyTest(unittest.TestCase):
+    """Session KV is on the pod's loopback address. With a proxy variable and no NO_PROXY
+    entry for it, urllib hands the request to the proxy."""
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        import http.server
+        import socket
+        import threading
+        import urllib.request
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - the stdlib's name
+                sent = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                seen.append((self.path, self.headers.get("Authorization"), sent))
+                answer = json.dumps({"results": [{"id": "t_1", "outcome": "done"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.object(runtime, "SESSION_KV_URL", url), \
+                mock.patch.dict(os.environ, {runtime.SESSION_KV_KEY_ENV: "k", "http_proxy": proxy, "HTTP_PROXY": proxy}), \
+                mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            results = runtime._board_request("retry", ["t_1"], "U1")
+        self.assertEqual(results, [{"id": "t_1", "outcome": "done"}])
+        self.assertEqual(
+            seen,
+            [(runtime.BOARD_ACTIONS_PATH, "Bearer k", {"action": "retry", "tasks": ["t_1"], "by": "U1"})],
+        )
+
+
 class ActionIdTest(unittest.TestCase):
     def test_choice_pattern_matches_the_presenters_choice_buttons_only(self):
         ids = [
@@ -960,6 +1009,57 @@ class RuntimeTest(unittest.TestCase):
         adapter = _Adapter()
         self._answer(adapter, body, action)
         return (entry[1] for entry in adapter.log)
+
+    def test_a_findings_nudge_button_names_the_row_of_its_own_card(self):
+        """The nudge's card on the relay path: its button's value is the label and the card's
+        first row, a line the card shows whole. So a click under an earlier card of the day
+        names that card's row, whatever a later card stored for the thread."""
+        import findings_nudge_card
+
+        card = {
+            "version": 1,
+            "text": "fallback",
+            "headline": "2 critical issues will delay or block cluster upgrades",
+            "note": "· 4 open issues covering 4 objects on 2 clusters",
+            "rows": [
+                {
+                    "severity": "critical",
+                    "text": "**kube-system/istiod** on `prod-central` — PodDisruptionBudget blocks drain",
+                    "detail": "Allow at least 1 disruption.",
+                },
+                {"severity": "critical", "text": "**gke-pool-1** on `prod-central` — Orphan Node has no backing VM"},
+            ],
+            "choices": ["Fix first issue"],
+            "replies": {"Fix first issue": "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain"},
+        }
+        blocks, _ = findings_nudge_card.blocks_from_card(card)
+        (button,) = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        self.assertEqual(button["value"], card["replies"]["Fix first issue"])
+        self.assertEqual(
+            runtime._turn("Fix first issue", button["value"], {"blocks": blocks}),
+            "Fix first issue: kube-system/istiod on prod-central — PodDisruptionBudget blocks drain",
+        )
+        # A value that named a row this card does not show would send the label alone.
+        self.assertEqual(
+            runtime._turn("Fix first issue", "Fix first issue: billing/worker on staging-east", {"blocks": blocks}),
+            "Fix first issue",
+        )
+
+    def test_a_findings_nudge_button_names_a_row_too_long_for_the_card(self):
+        """A real nudge with a title past the card's row limit: the nudge cuts the row where
+        the card shows it whole, so the click still names it and does not send the label alone."""
+        import findings_nudge
+        import findings_nudge_card
+        from test_findings_nudge import finding, plan_for
+
+        rows = [finding(id="a", title="word " * 100)]
+        bundle = findings_nudge.build_nudge(plan_for(rows), 1, False, rows=rows)
+        label = bundle.card["choices"][0]
+        blocks, _ = findings_nudge_card.blocks_from_card(bundle.card)
+        (button,) = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        turn = runtime._turn(label, button["value"], {"blocks": blocks})
+        self.assertTrue(turn.startswith(f"{label}: payments/api on prod — word word"))
+        self.assertGreater(len(turn), len(label))
 
     def test_a_session_that_never_read_the_card_is_told_which_finding(self):
         # An existing session in the thread is not re-hydrated with it, so the turn itself names the row the card shows.

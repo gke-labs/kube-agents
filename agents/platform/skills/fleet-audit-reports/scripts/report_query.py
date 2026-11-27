@@ -536,6 +536,10 @@ def _stream_row(audit_id: str, stream: dict, repo: str | None, entry: dict) -> d
         "issue_number": latest.get("issue_number"),
         "issue_url": latest.get("issue_url"),
         "runs": len(entry.get("runs") or []),
+        # The newest run-start record when it has no done mark (#6812): the
+        # run that started last did not finish, so this row is the run
+        # before it. Null for a finished run, or a stream with no records.
+        "unfinished_run": entry.get("unfinished_run"),
         "running_since": started.get("started_at"),
         "age_s": started.get("age_s"),
         # A stream-level error -- the lease, a stray directory, a sibling
@@ -564,6 +568,13 @@ def cmd_show(args: argparse.Namespace) -> dict:
         ),
         # Always a boolean, as on the other per-run subcommands.
         "latest_missing": bool(envelope.get("latest_missing")),
+        # Beside the envelope, never in it, and only on the newest run: the
+        # stream's newest run-start record when it has no done mark (#6812).
+        "unfinished_run": (
+            report_status.unfinished_run_of(root, args.stream, repo)
+            if _run_name(args.run) == report_status.LATEST_NAME
+            else None
+        ),
         "error": None,
     }
 

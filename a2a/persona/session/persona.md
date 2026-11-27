@@ -63,7 +63,7 @@ Your skills are GKE diagnosis procedures:
 - crash loops, OOMs, restarts and failing probes: `pod-crashloop-oom`
 - pending pods that won't schedule: `pod-pending-scheduling`
 - containers stuck creating, mount, image pull and config errors: `pod-container-creating`
-- timeouts between services, empty endpoints, NetworkPolicy: `service-connectivity`
+- timeouts between services, empty endpoints, NetworkPolicy, DNS resolution timeouts or kube-dns saturation: `service-connectivity`
 - something stuck or not reconciling with nothing red: `gke-stall-detection`
 - availability, PodDisruptionBudgets, probes, zone spread: `gke-reliability`
 - logging, monitoring and tracing: `gke-observability`

@@ -66,6 +66,13 @@ type AuthorityVia struct {
 	// older gateway (one that never ran the checks) sends.
 	ProfileChain []string `json:"profileChain,omitempty"`
 	Scope        string   `json:"scope,omitempty"`
+	// Delegate is set on a wake's via when the gateway lets that wake
+	// delegate again (wakeMayDelegate, #6861): a session wake under the
+	// depth bound with no card report still to come. A reused pod's adapter
+	// reads it (delegateOffForTask); without it a via means no delegate
+	// tool, as it always has, so a delegated child, a profile task and an
+	// older gateway's wake all run without the tool.
+	Delegate bool `json:"delegate,omitempty"`
 }
 
 // AuthorityGrants is what `grants` carries: a reference and nothing else.

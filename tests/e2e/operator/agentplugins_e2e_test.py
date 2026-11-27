@@ -65,7 +65,7 @@ def get_namespace() -> str:
     return os.environ.get("NAMESPACE") or os.environ.get("AGENT_NAMESPACE") or "kubeagents-system"
 
 def get_registry() -> str:
-    reg = os.environ.get("REGISTRY") or os.environ.get("CONTAINER_REGISTRY") or os.environ.get("REGISTRY_PREFIX")
+    reg = os.environ.get("REGISTRY") or os.environ.get("CONTAINER_REGISTRY")
     if reg:
         return reg
     return _get_required_env("REGISTRY")
@@ -1893,7 +1893,7 @@ def test_e2e_operator_cluster(rebuild_operator: bool = False, test_destructive_c
     Pass --rebuild-operator / --deploy-operator or REBUILD_OPERATOR=true to build and deploy the operator.
     """
     ctx = os.environ.get("KUBE_CONTEXT")
-    reg = get_registry() if (os.environ.get("REGISTRY") or os.environ.get("CONTAINER_REGISTRY") or os.environ.get("REGISTRY_PREFIX")) else ""
+    reg = get_registry() if (os.environ.get("REGISTRY") or os.environ.get("CONTAINER_REGISTRY")) else ""
     if not ctx or not reg:
         import pytest
         pytest.fail("KUBE_CONTEXT and REGISTRY environment variables must be set to validate operator plugins.")

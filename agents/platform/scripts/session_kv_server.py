@@ -41,6 +41,7 @@ import clean_merges
 import dial_state
 from fix_recipes import registry as fix_recipes_registry
 import cron_schedule
+import findings_nudge_card
 import findings_queue
 import gitops_workspace
 import kanban_board_health
@@ -189,6 +190,10 @@ app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, lifespan=_lifespa
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+# How long a read of a thread's stored report waits on a locked database.
+INCIDENT_DB_TIMEOUT_SECONDS = 5.0
+# The report stored for one chat thread.
+INCIDENT_REPORT_QUERY = "SELECT report FROM incidents WHERE chat_id = ? AND thread_id = ?"
 
 # The data volume warning. A full volume fails every kanban and session write
 # with a bare `disk I/O error` and nothing in chat says why, so this server, the
@@ -295,7 +300,7 @@ PRE_KANBAN_STATUS_COMPLETED = "completed"
 PRE_KANBAN_STATUS_FAILED = "failed"
 # Upper bound for an unclosed front-door routing turn before it is treated as
 # stale rather than permanently `in_progress`. `_start_agent_turn` uses a 300s
-# client-side `urlopen` read timeout, but the Hermes gateway turn can continue
+# client-side read timeout, but the Hermes gateway turn can continue
 # running server-side (and a single MCP call in `agents/platform/config.yaml`
 # allows up to 420s: `connect_timeout: 120` + `timeout: 300`), so 900s (15m)
 # gives slow multi-step routing turns headroom before marking them stale.
@@ -381,6 +386,10 @@ TRIAGE_RETRY_MAX_DELAY_S = 60.0
 TRIAGE_RETRY_JITTER = (0.5, 1.0)
 # The gateway's loopback address, when PLATFORM_API_URL does not name one.
 PLATFORM_API_URL_DEFAULT = "http://127.0.0.1:8642"
+# The gateway API is on the pod's loopback address by default: a proxy from the
+# environment must not get a turn's prompt, and urllib does not leave out a
+# loopback host by itself.
+_GATEWAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # A start queued longer than this still gets one attempt, then no retry, whatever
 # the budget says: the wait bounds the retries, never the first try.
 TRIAGE_QUEUE_WAIT_LIMIT_S = 1200.0
@@ -3707,7 +3716,7 @@ def _gateway_failure(exc: Exception, turn_sent: bool) -> _GatewayAttempt:
     if isinstance(reason, ConnectionRefusedError):
         return _GatewayAttempt(START_RETRY, "refused", answered=False)
     detail = "timeout" if isinstance(reason, TimeoutError) else type(reason).__name__
-    # urlopen wraps an error raised while connecting or sending the request in
+    # urllib wraps an error raised while connecting or sending the request in
     # URLError; an error while waiting for the response (a read timeout) comes
     # out unwrapped. Only the unwrapped one may hide a turn that is running.
     if turn_sent and not isinstance(exc, urllib.error.URLError):
@@ -3732,7 +3741,7 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
+        with _GATEWAY_OPENER.open(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
             return _GatewayAttempt(START_OK)
     except urllib.error.HTTPError as exc:
         # It already exists: a retry after a create that timed out and still committed.
@@ -5143,7 +5152,7 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
+        with _GATEWAY_OPENER.open(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
             if resp.status != 200:
                 logger.error(f"Gateway API chat execution failed (status {resp.status})")
             return _GatewayAttempt(START_OK)
@@ -5776,8 +5785,22 @@ def _ensure_session_row(session_id: str, profile: str, job_id: str, title: str =
         logger.error(f"Failed to create relay session row for {session_id}: {exc}")
 
 
+def _stored_incident_report(chat_id: str, thread_id: str) -> str:
+    """The text stored for a thread, or "" when it has none or the read fails."""
+    if not (chat_id and thread_id):
+        return ""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_DB_TIMEOUT_SECONDS)) as conn:
+            row = conn.execute(INCIDENT_REPORT_QUERY, (chat_id, thread_id)).fetchone()
+    except Exception as exc:
+        logger.error(f"Failed to read the stored report for thread {thread_id}: {exc}")
+        return ""
+    return str(row[0] or "") if row else ""
+
+
 def _store_incident_report(chat_id: str, thread_id: str, report: str) -> None:
-    """Persist the delivered text so a reply in this thread carries it back.
+    """Persist the delivered text so a reply in this thread carries it back
+    (for the findings nudge, the text and the finding ids it does not print).
 
     This is the half of the mechanism that makes the Chat Agent context-aware
     about something it did not investigate. `incident_context`
@@ -6281,6 +6304,24 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
         return None
 
 
+def _post_sidecar_card(
+    platform: str,
+    profile: str,
+    job_id: str,
+    card: dict,
+    card_module: Any,
+    chat_id: str,
+    thread_id: str,
+    deadline: float,
+) -> AuditPost | None:
+    """Post a sidecar cron card through the gateway or Slack relay; None to fall back to text."""
+    routed = chat_notify.routes(platform)
+    if not (routed or slack_blocks_post.configured()):
+        return None
+    built = card_module.chat_from_card(card) if routed else card_module.blocks_from_card(card)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
 def _post_board_health_card(
     platform: str, profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
@@ -6289,11 +6330,25 @@ def _post_board_health_card(
     Block Kit through the Slack relay, or a chat message through the gateway
     where it holds Slack, with the outcomes of :func:`_post_audit_card`.
     """
-    routed = chat_notify.routes(platform)
-    if not (routed or slack_blocks_post.configured()):
+    return _post_sidecar_card(platform, profile, job_id, card, board_health_card, chat_id, thread_id, deadline)
+
+
+def _load_findings_nudge_card(report: str, job_id: str) -> dict | None:
+    """Load the findings-nudge sidecar matching ``report``, or None when absent or stale."""
+    if job_id != findings_nudge_card.JOB_ID:
         return None
-    built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
-    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
+    try:
+        return findings_nudge_card.load(gitops_workspace.agent_home(), report)
+    except Exception as exc:  # noqa: BLE001 - the report still posts, as text
+        logger.warning(f"Relay for {job_id}: findings-nudge card unreadable, posting text: {exc!r}")
+        return None
+
+
+def _post_findings_nudge_card(
+    platform: str, profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Post the findings-nudge card; where it landed, or None to post the report as text."""
+    return _post_sidecar_card(platform, profile, job_id, card, findings_nudge_card, chat_id, thread_id, deadline)
 
 
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -6781,6 +6836,7 @@ def relay_cron_report(
     # Legs whose Block Kit post landed with no ts to thread under: delivered,
     # with nothing to register.
     unthreaded: list[str] = []
+    nudge = None if truncation_notice else _load_findings_nudge_card(report, job_id)
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
         try:
@@ -6801,6 +6857,10 @@ def relay_cron_report(
             # where it does not post, the report goes out as written.
             posted = _post_board_health_card(
                 platform, profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+            )
+        elif nudge is not None and _card_platform(platform, leg_chat_id):
+            posted = _post_findings_nudge_card(
+                platform, profile, job_id, nudge, leg_chat_id, leg_thread_id, blocks_deadline
             )
         elif headline and not truncation_notice:
             posted = _post_audit_blocks(
@@ -6901,11 +6961,24 @@ def relay_cron_report(
     # `_store_incident_report` is INSERT OR REPLACE on `(chat_id, thread_id)`,
     # so writing those rows would overwrite each channel's stored context with a
     # report it never received and drop the one still on its screen.
+    #
+    # The findings nudge prints no id, and a day's nudges share the thread and
+    # its one row. So its newest context keeps the items of the nudges before
+    # it, read back from the row of each leg: replacing the row would leave a
+    # reply or a click under an earlier card with the newest card's items.
     registered = _lookup_platform_threads(session_id)
     for platform in threads:
         entry = registered.get(platform)
-        if entry:
-            _store_incident_report(entry[0], entry[1], message)
+        if not entry:
+            continue
+        stored_report = message
+        if job_id == findings_nudge_card.JOB_ID:
+            # Also with no card to hand (a truncated report, a card file missing or
+            # refused): its text alone must not erase the earlier cards' items.
+            stored_report = findings_nudge_card.thread_context_with_earlier(
+                nudge, message, _stored_incident_report(entry[0], entry[1])
+            )
+        _store_incident_report(entry[0], entry[1], stored_report)
 
     logger.info(
         f"Relayed {profile}/{job_id} report to {', '.join(threads)} "

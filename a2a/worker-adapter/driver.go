@@ -100,7 +100,10 @@ const (
 	// whether the harness reported the result as an error (Event.Failed)
 	// and the tool's name (Event.Tool), each where the driver sets it, for
 	// the per-tool log line (toollog.go). It reads the write-refusal record
-	// on the event (refusal.go), never the result itself.
+	// on the event (refusal.go). Its Event.ToolResult, when the harness
+	// reported content, is the result as the answer's scrub reads it: the
+	// adapter feeds it into the task's seen-values set (answerscrub.Seen) and
+	// never publishes it.
 	EventToolResult
 	// EventResult ends a turn: Event.Text is the deliverable, Event.Failed
 	// and Event.Token whether it failed and the reason token, and
@@ -141,6 +144,12 @@ type Event struct {
 	// only when the task's persona has a skill of that name.
 	SkillCall bool
 	Skill     string
+
+	// ToolResult is a tool result's content as answerscrub.Seen's
+	// CollectToolResult reads it: a JSON string, or a JSON list of strings
+	// for a result made of several text pieces. Empty for a result with no
+	// content.
+	ToolResult json.RawMessage
 
 	// Failed is a turn the harness reported as failed, or a tool result it
 	// reported as an error (EventToolResult). Token is the reason

@@ -1453,7 +1453,7 @@ The operator renders the block as `scope.json` in the agent's config ConfigMap, 
 
 ### What a reconcile run records
 
-Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume:
+Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume (read by `fleet_scope_targets.py` and by `agent-api-auth`'s `GET /api/scope` endpoint for the web console):
 
 | Entry             | What it holds                                                                                                                                                                                                                                                      |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -1663,7 +1663,7 @@ Enables external integrations. Only the enabled ones need to be present.
 - **`repositories[].baseBranch`** — on a `gitops` or `managed` entry, the branch every pull request (a merge request on GitLab) onto that repository must target; absent means the repository's own default branch. [`spec.integration.repositories[].baseBranch`](#specintegrationrepositoriesbasebranch) says what the credential broker does with it and the spellings the schema accepts.
 - **`github`** — deprecated alias for one forge with `provider: github`: `org` is its `namespace` and `gitRepo`, when set, is one `gitops` repository on it; the two resolve identically. Set `forges`/`repositories` or `github`, not both; a resource setting both is refused by a CEL rule on the CRD and by the webhook.
 
-  This is still the spelling `install.sh` and the `full-install` Terraform composition write for a github.com install (a GitLab, Bitbucket or GitHub Enterprise Server install writes `forges`/`repositories`; see [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/)). The Helm chart renders one GitHub forge with no `credentialsRef`, no `caBundleRef`, no host other than a spelling of github.com, and at most one repository, the `gitops` one, with no namespace of its own, this way whichever values key set it, because `helm upgrade` does not update CRDs and an older CRD would prune `forges`.
+  This is still the spelling `install.sh` and the `full-install` Terraform composition write for a github.com install (a GitLab, Bitbucket or GitHub Enterprise Server install writes `forges`/`repositories`; see [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/)). The Helm chart renders one GitHub forge with no `credentialsRef`, no `caBundleRef`, no host other than a spelling of github.com, and at most one repository, the `gitops` one, with no namespace of its own, this way whichever values key set it, because `helm upgrade` does not update CRDs and an older CRD would prune `forges`. To register more repositories on such an install, see [Adding repositories to a github.com install](#adding-repositories-to-a-githubcom-install).
 
   It does so only where the forge declares a namespace or the repository, and the repository is one the operator would accept for GitHub: `name`, `owner/name`, or an `http(s)://`, `ssh://` or `git://` URL, a schemeless host or an scp remote on `github.com`, `www.github.com` or `ssh.github.com`, with no port, naming `owner/name`. A repository the operator would refuse renders as the lists, so the refusal names the entry that was written. A repository that sets `baseBranch` renders as the lists too, since the alias has no place for it.
 
@@ -1800,6 +1800,50 @@ Any other, an empty string, a JSON `null` or a value that is not a string (a num
 The credential broker's repository gate reads every typed entry, keyed by its `type`, host and path, so an entry counts only for the forge whose provider it names.
 
 Each same-organization `context_repos` entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's `snapshot` read, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). On a `gitlab` forge, a private context repository is readable the same way when the forge's Secret holds `read-token` — see [Private context repositories](/kube-agents/install/gitlab/#private-context-repositories). Nothing that writes consults the key: a context repository stays refused by every version-control verb but `capabilities` and `snapshot`.
+
+### Adding repositories to a github.com install
+
+An install that `install.sh` made for github.com has the deprecated `github` block: the installer writes `org` and `gitRepo` from `GITOPS_ORG` and `GITOPS_REPO`. To register more repositories, move to `forges` and `repositories`, and clear the `github` block in the same change. If the lists are added and the block still has a value, the chart stops the upgrade with this message:
+
+```text
+set platformAgent.integration.forges and repositories, or platformAgent.integration.github, not both
+```
+
+Set `org` and `gitRepo` to empty strings beside the two lists. The chart then renders the lists and no `github` key:
+
+```yaml
+platformAgent:
+  integration:
+    github:
+      org: ""
+      gitRepo: ""
+    forges:
+      - name: github
+        provider: github
+        namespace: my-org
+    repositories:
+      - forge: github
+        repository: infra
+        role: gitops
+      - forge: github
+        repository: app-one
+        role: managed
+      - forge: github
+        repository: runbooks
+        role: context
+```
+
+The list must hold the GitOps repository with `role: gitops`. The lists do not take it from the block that you cleared.
+
+On an install made with `install.sh`, the installer writes the `github` block itself, so put these keys in the `TF_VAR_extra_helm_values` line in `install.env`, which a full-mode `install.sh` or `upgrade.sh` run applies. `install.env` holds one such line, so if it already has a `platformAgent` key, put `integration={...}` inside that key ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) says how the line works):
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={integration={github={org="",gitRepo=""},forges=[{name="github",provider="github",namespace="my-org"}],repositories=[{forge="github",repository="infra",role="gitops"},{forge="github",repository="app-one",role="managed"},{forge="github",repository="runbooks",role="context"}]}}}'
+```
+
+On a bare Helm install, set the block in your values file. If a file of your own sets `github`, you can remove those keys there instead of emptying them.
+
+Every repository in the list must be in one GitHub organization, the one where the GitHub App is installed: see [Single-organization scoping boundary](/kube-agents/deploy/token-minter/#single-organization-scoping-boundary). The operator skips a repository in another organization when it writes the token minter policies, so the agent gets no token for it.
 
 ### `spec.integration.repositories[].baseBranch`
 
@@ -2019,7 +2063,7 @@ fail when it writes a condition type that has no row there:
 | `ShellSandboxPinned` | While `spec.harness.experimental.shellSandbox.image` names an image other than the one the operator would run without it | `status: True`, `Reason: ImageDiffersFromOperator`. The message names both images. A pin survives operator and agent upgrades, and a sandbox older than the agent fails every `kubectl` call at the credential proxy with a policy refusal. Not `Degraded`; `Ready` is unaffected, since a pin to a mirror or a test build can be deliberate. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that parks `Degraded` on `ShellSandboxKeysMissing` or `A2AProvisionFailed`. Clear the field, or set it to the operator's image, to clear it. |
 | `A2AMCPServer` | While the operator runs the MCP server (on by default; `operator.mcpServer.enabled`) and a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control | `status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included. |
 | `ScopeResolved` | While `spec.scope` declares a folder, organization, Shared VPC host or Metrics Scope | A Job named `<agent>-scope-publisher-<suffix>` (shortened for long names) resolves those members into the `<agent>-resolved-scope` ConfigMap 15 minutes after each start, or at once for a new membership when no run is active. `True`, `Resolved`: a lookup answered within twice the sum of 15 minutes and 5 minutes per started 100 of `maxProjects` (40 minutes at the default). `False` reasons: `Missing`, no readable result yet. `Stale`, no lookup answered within that bound. `HashMismatch`, the result predates the membership. `TooLarge`, the members did not fit. `Error`, read the Job's log. `UnownedServiceAccount`, somebody else owns `<agent>-scope-publisher`; delete it; it clears within 15 minutes. `ScopeRoleNotConferred`, the install has no `kube-agents-a2a-gateway-pod` admission policy from the chart, which the broker's scope role needs. `Ready` is unaffected. |
-| `BuiltinSchedules` | While something about the built-in AgentSchedules needs saying | `status: False`, one of `OverrideUnknown`, `OverrideRefused`, `ReplacedUnownedSchedule` or `WritesForbidden`. `OverrideUnknown`: an entry in `spec.schedules.overrides` names no built-in schedule, and is ignored; overrides key on the rendered name, so a canary's entry is `<name>-canary`. `OverrideRefused`: an override sets `suspend: false` on a run-now-only schedule such as `onboarding`, which would put it on its nominal cron; only `suspend: true` is taken there. `WritesForbidden`: a write the renderer needs was refused with a 403; the message names the verb, the schedule and the API's reason. If RBAC refused it, as an operator image ahead of its RBAC sees, apply the chart's RBAC: the writes are on the operator's namespaced Role in the install namespace. `ReplacedUnownedSchedule`: an AgentSchedule sat on a reserved built-in name without the operator's marks, and was deleted to be created again as the built-in (an Event says so too). Built-in names are reserved; don't create a schedule under one. Fix the override, or let the replacement finish, to clear it. |
+| `BuiltinSchedules` | While something about the built-in AgentSchedules needs saying. `OverrideUnknown` is written only while the operator runs AgentSchedules | `status: False`, one of `OverrideUnknown`, `OverrideRefused`, `ReplacedUnownedSchedule` or `WritesForbidden`. `OverrideUnknown`: an entry in `spec.schedules.overrides` names no built-in schedule and no job in the Platform Agent's cron roster, and is ignored; overrides key on the rendered name, so a canary's entry is `<name>-canary`. `OverrideRefused`: an override sets `suspend: false` on a run-now-only schedule such as `onboarding`, which would put it on its nominal cron; only `suspend: true` is taken there. `WritesForbidden`: a write the renderer needs was refused with a 403; the message names the verb, the schedule and the API's reason. If RBAC refused it, as an operator image ahead of its RBAC sees, apply the chart's RBAC: the writes are on the operator's namespaced Role in the install namespace. `ReplacedUnownedSchedule`: an AgentSchedule sat on a reserved built-in name without the operator's marks, and was deleted to be created again as the built-in (an Event says so too). Built-in names are reserved; don't create a schedule under one. Fix the override, or let the replacement finish, to clear it. |
 | `VolumesDropped` | Only after a pass that rendered the Pod template around a `hostPath` on `spec.deployment.extraVolumes` or `.sidecarVolumes`, or a volume or mount that would hand a container the credential proxy's watcher token | `status: True`, `Reason: HostPathVolumeDropped` or `WatcherTokenVolumeDropped`. The render leaves the named `hostPath` or watcher-token entries and every mount naming them out of the Pod template the operator applies, and the message lists them by field and index. Not `Degraded`: the Pod runs without them. [What `VolumesDropped` reports](#what-volumesdropped-reports) says which passes write it and which leave it as it stands. Remove the entries to clear it. |
 | `ReplicasLimited` | Only while `spec.deployment.availability.replicas` is above 1, after a pass that rendered the gateway | `status: True`, `Reason: HighAvailabilityNotSupported`. The operator runs the gateway as a single replica, whatever the field asks for; the message names the requested count and why a second replica does not start. Not `Degraded`: the single replica runs. Written on whichever status the pass ends on, on the same terms as `VolumesDropped`: a refusal that returns before the render neither writes nor clears it. Set the field to 1, or remove it, to clear it. |
 | `CredentialProxyExecReady` | Only while `credentialProxy.exec.replicas` is above 0 and the agent's name is accepted for the tier | `status: True`, `Reason: AllReplicasReady` when every exec-tier replica is Ready. `status: False` otherwise: `Reason: Unschedulable` when the scheduler cannot place a replica, with the pod's name and the scheduler's message (often `Insufficient cpu`); `Reason: ReplicasUnavailable` for any other shortfall. The message counts the Ready replicas against the field. Re-read every 30 s while short; a failed read leaves it as it stands. Not `Degraded`: a caller that cannot reach the tier falls back to the stateful broker. Each replica needs a node with 2 free CPU. Removed when the field is 0 or unset, or when the name is refused (`InvalidCredentialProxyExec`). A park that returns before the broker is reconciled (`ReservedServiceAccountName`, `ForbiddenVolumeMount`, `ShellSandboxCannotBeDisabled`, `RuntimeClassNotFound`, `UniverseDomainMismatch`) leaves it as it stands, count included, until the park clears. |

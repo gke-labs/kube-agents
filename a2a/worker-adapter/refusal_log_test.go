@@ -99,11 +99,12 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 }
 
 // TestACoreAgentToolCallsActivityCarriesItsCallID: end to end, a core-agent
-// tool call's activity entry carries the harness's call id as callId,
-// beside the input and never in it, so it joins a refused-call record; the
-// input is passed as it was. So does a Claude Code tool call's, whose id the
-// driver reads from the tool_use block. A call with no id gets no callId key
-// at all.
+// tool call's activity entry carries the harness's call id as callId beside
+// the tool and its scrubbed title, so it joins a refused-call record; the
+// call's arguments are not published (no input key, and the title stops at
+// the subcommand). So does a Claude Code tool call's, whose id the driver
+// reads from the tool_use block. A call with no id, or with an id outside
+// activityCallID's alphabet, gets no callId key at all.
 func TestACoreAgentToolCallsActivityCarriesItsCallID(t *testing.T) {
 	for _, c := range []struct {
 		name, script string
@@ -113,18 +114,23 @@ func TestACoreAgentToolCallsActivityCarriesItsCallID(t *testing.T) {
 		{"core-agent", `
 read first || exit 1
 echo '{"type":"init","session":"s1","model":"m"}'
-echo '{"type":"tool_call","id":"adk-42","tool":"bash","input":{"command":"kubectl get pods"}}'
+echo '{"type":"tool_call","id":"adk-42","tool":"bash","input":{"command":"kubectl get pods --token=ARG-SECRET-MARKER"}}'
 echo '{"type":"tool_result","id":"adk-42","tool":"bash","text":"ok"}'
 echo '{"type":"result","text":"done"}'
 `, NewCoreAgentDriver(coreagentwire.Policy{}, nil), "adk-42"},
 		{"claude-code", `
 read first || exit 1
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"kubectl get pods"}}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"kubectl get pods --token=ARG-SECRET-MARKER"}}]}}'
 echo '{"type":"result","subtype":"success","result":"done"}'
 `, nil, "toolu_1"},
 		{"no-id", `
 read first || exit 1
-echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"kubectl get pods"}}]}}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"kubectl get pods --token=ARG-SECRET-MARKER"}}]}}'
+echo '{"type":"result","subtype":"success","result":"done"}'
+`, nil, ""},
+		{"off-shape-id", `
+read first || exit 1
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu 1/../x","name":"Bash","input":{"command":"kubectl get pods --token=ARG-SECRET-MARKER"}}]}}'
 echo '{"type":"result","subtype":"success","result":"done"}'
 `, nil, ""},
 	} {
@@ -151,9 +157,15 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 			if err := json.Unmarshal(a.Parts[0].Data, &entry); err != nil {
 				t.Fatal(err)
 			}
-			var input map[string]any
-			if err := json.Unmarshal(entry["input"], &input); err != nil || len(input) != 1 || input["command"] != "kubectl get pods" {
-				t.Errorf("input %s, want exactly the call's arguments", entry["input"])
+			if strings.Contains(string(a.Parts[0].Data), "ARG-SECRET-MARKER") {
+				t.Errorf("the entry %s carries a value from the call's arguments", a.Parts[0].Data)
+			}
+			if raw, has := entry["input"]; has {
+				t.Errorf("the entry carries input %s, want none", raw)
+			}
+			var title string
+			if err := json.Unmarshal(entry["title"], &title); err != nil || title == "" || strings.Contains(title, "pods") {
+				t.Errorf("title %s, want a non-empty title without the call's arguments", entry["title"])
 			}
 			raw, has := entry["callId"]
 			if c.wantCallID == "" {

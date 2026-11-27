@@ -173,7 +173,8 @@ class EvalTest(unittest.TestCase):
 
 class ImagesTest(unittest.TestCase):
     def test_every_first_party_image_an_install_pulls_is_checked(self):
-        repos = cli.image_repositories()
+        with mock.patch.dict(cli.os.environ, {cli.REGISTRY_PREFIX_ENV: ""}):
+            repos = cli.image_repositories()
         # The chart's five tags, and the bus images the operator renders at its own tag.
         for name in ("platform-agent", "k8s-operator", "a2a-gateway", "a2a-worker", "hermes-bridge", "web-console"):
             self.assertIn(f"gke-labs/kube-agents/{name}", repos)
@@ -184,6 +185,128 @@ class ImagesTest(unittest.TestCase):
             self.assertFalse(cli.image_published("abc"))
         with mock.patch.object(cli, "manifest_exists", return_value=True):
             self.assertTrue(cli.image_published("abc"))
+
+
+AR_PREFIX = "us-docker.pkg.dev/some-project/some-repository"
+
+
+class RegistryPrefixTest(unittest.TestCase):
+    """REGISTRY_PREFIX names where a commit's images are looked up and installed from."""
+
+    def _manifest_request(self, prefix_env, token):
+        """The manifest request manifest_exists sends, with the token source stubbed."""
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(request)
+            return mock.MagicMock()
+
+        with mock.patch.dict(cli.os.environ, prefix_env), \
+                mock.patch.object(cli, "registry_token", return_value=token) as token_for, \
+                mock.patch.object(cli.urllib.request, "urlopen", side_effect=urlopen):
+            self.assertTrue(cli.manifest_exists(cli.image_repositories()[0], "abc"))
+        return sent[0], token_for.call_args.args
+
+    def test_unset_it_is_the_public_default(self):
+        with mock.patch.dict(cli.os.environ, {cli.REGISTRY_PREFIX_ENV: ""}):
+            self.assertEqual(cli.registry_prefix(), cli.DEFAULT_REGISTRY_PREFIX)
+
+    def test_each_image_keeps_its_name_under_the_prefix(self):
+        with mock.patch.dict(cli.os.environ, {cli.REGISTRY_PREFIX_ENV: AR_PREFIX + "/"}):
+            repos = cli.image_repositories()
+        self.assertIn("some-project/some-repository/platform-agent", repos)
+        self.assertTrue(all(r.startswith("some-project/some-repository/") for r in repos))
+
+    def test_the_manifest_is_asked_of_the_prefixes_host_with_its_token(self):
+        request, token_args = self._manifest_request({cli.REGISTRY_PREFIX_ENV: AR_PREFIX}, "google-token")
+        self.assertTrue(request.full_url.startswith("https://us-docker.pkg.dev/v2/some-project/some-repository/"))
+        self.assertTrue(request.full_url.endswith("/manifests/abc"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer google-token")
+        self.assertEqual(token_args[0], "us-docker.pkg.dev")
+        request, token_args = self._manifest_request({cli.REGISTRY_PREFIX_ENV: ""}, "anonymous-token")
+        self.assertTrue(request.full_url.startswith("https://ghcr.io/v2/gke-labs/kube-agents/"))
+        self.assertEqual(token_args[0], "ghcr.io")
+
+    def test_artifact_registry_takes_the_callers_google_token_and_ghcr_an_anonymous_one(self):
+        self.addCleanup(cli.google_access_token.cache_clear)
+        cli.google_access_token.cache_clear()
+        with mock.patch.object(cli.kube, "run", return_value="google-token\n") as run, \
+                mock.patch.object(cli.urllib.request, "urlopen") as urlopen:
+            self.assertEqual(cli.registry_token("us-docker.pkg.dev", "p/r/platform-agent"), "google-token")
+            self.assertEqual(cli.registry_token("us-docker.pkg.dev", "p/r/k8s-operator"), "google-token")
+        self.assertEqual(run.call_args.args[0], cli.ACCESS_TOKEN_COMMAND)
+        self.assertIsNotNone(run.call_args.kwargs["timeout"])
+        self.assertEqual(run.call_count, 1, "the token is asked for once a run, not once an image")
+        urlopen.assert_not_called()
+
+    def test_a_token_blip_is_retried_and_a_failure_carries_gclouds_message(self):
+        """The token goes through the runner every other gcloud call uses."""
+        self.addCleanup(cli.google_access_token.cache_clear)
+        cli.google_access_token.cache_clear()
+        blip = mock.Mock(returncode=1, stdout="", stderr="ERROR: There was a problem refreshing your current auth tokens")
+        token = mock.Mock(returncode=0, stdout="google-token\n", stderr="")
+        with mock.patch.object(cli.kube.subprocess, "run", side_effect=[blip, token]) as run, \
+                mock.patch.object(cli.kube.time, "sleep"):
+            self.assertEqual(cli.google_access_token(), "google-token")
+        self.assertEqual(run.call_count, 2)
+        cli.google_access_token.cache_clear()
+        denied = mock.Mock(returncode=1, stdout="", stderr="ERROR: (gcloud.auth.print-access-token) no active account")
+        with mock.patch.object(cli.kube.subprocess, "run", return_value=denied):
+            with self.assertRaises(cli.kube.CommandError) as failure:
+                cli.google_access_token()
+        self.assertIn("no active account", str(failure.exception))
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"token": "anonymous-token"}'
+        with mock.patch.object(cli.subprocess, "run") as run, \
+                mock.patch.object(cli.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.assertEqual(cli.registry_token("ghcr.io", "gke-labs/kube-agents/platform-agent"), "anonymous-token")
+        run.assert_not_called()
+        self.assertIn("https://ghcr.io/token?", urlopen.call_args.args[0])
+
+    def test_the_google_token_goes_to_no_host_that_only_resembles_artifact_registry(self):
+        """A host that is neither Artifact Registry nor GHCR is refused, with no request made."""
+        for host in ("us-docker.pkg.dev.example.com", "evil.example/us-docker.pkg.dev", "docker.pkg.dev",
+                     "registry.example.com"):
+            with self.subTest(host=host), \
+                    mock.patch.object(cli.subprocess, "run") as run, \
+                    mock.patch.object(cli.urllib.request, "urlopen") as urlopen:
+                with self.assertRaises(SystemExit) as refused:
+                    cli.registry_token(host, "p/r/platform-agent")
+                self.assertIn(host, str(refused.exception))
+                run.assert_not_called()
+                urlopen.assert_not_called()
+
+    def test_the_default_prefix_and_the_host_pattern_are_the_ones_the_installer_and_release_scripts_use(self):
+        defaults = (REPO / "install.defaults.env").read_text()
+        self.assertIn(f'DEFAULT_REGISTRY_PREFIX="{cli.DEFAULT_REGISTRY_PREFIX}"', defaults)
+        common = (REPO / "scripts" / "release" / "common.sh").read_text()
+        self.assertIn(f"AR_REGISTRY_HOST_PATTERN='{cli.ARTIFACT_REGISTRY_HOST.pattern}'", common)
+        self.assertTrue(cli.DEFAULT_REGISTRY_PREFIX.startswith(cli.GHCR_HOST + "/"))
+
+    def _helm_upgrade_argv(self, prefix_env):
+        seen = []
+
+        def run(argv, **kwargs):
+            if argv[0] == "helm":
+                seen.append(argv)
+            return mock.Mock(returncode=0, stderr="", stdout=b"")
+
+        with mock.patch.dict(cli.os.environ, prefix_env), \
+                mock.patch.object(cli.kube, "gcloud"), mock.patch.object(cli.kube, "run", return_value="{}"), \
+                mock.patch.object(cli, "check_host"), mock.patch.object(cli, "host_lease"), \
+                mock.patch.object(cli.subprocess, "run", side_effect=run):
+            self.assertEqual(cli.cmd_install(args(sha="abc", host_cluster="h", host_location="z", namespace="ns")), 0)
+        (argv,) = seen
+        return argv
+
+    def test_the_install_pulls_from_the_prefix_the_commit_was_looked_up_in(self):
+        argv = self._helm_upgrade_argv({cli.REGISTRY_PREFIX_ENV: AR_PREFIX})
+        self.assertIn(f"--set-string={cli.IMAGE_REGISTRY_KEY}={AR_PREFIX}", argv)
+
+    def test_the_default_resets_a_registry_the_release_kept(self):
+        """--reset-then-reuse-values keeps the release's values, another run's registry among them."""
+        argv = self._helm_upgrade_argv({cli.REGISTRY_PREFIX_ENV: ""})
+        self.assertIn(f"--set-string={cli.IMAGE_REGISTRY_KEY}=", argv)
 
 
 class EvalCaseIsolationTest(unittest.TestCase):

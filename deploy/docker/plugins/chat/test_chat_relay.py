@@ -13,10 +13,15 @@ import asyncio
 import json
 import os
 import shutil
+import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 import adapter as mod
@@ -705,6 +710,109 @@ class TestStandaloneSend(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(mod.relay_url(), mod.DEFAULT_RELAY_URL)
         self.assertTrue(mod.DEFAULT_RELAY_URL.startswith("http://127.0.0.1:8699/"))
+
+
+class TestRelayRefusesProxy(unittest.TestCase):
+    """The relay route is on the pod's loopback address and the request carries
+    the Session KV key, so the call takes no proxy from the environment."""
+
+    PROXY = "http://egress.invalid:3128"
+    # Prints the http proxy of the module's opener, then that of a default opener
+    # of the same process, which shows that the variable reached the process.
+    PROBE = (
+        "import urllib.request\n"
+        "import adapter\n"
+        "def http_proxies(opener):\n"
+        "    return [h.proxies.get('http') for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]\n"
+        "print(http_proxies(adapter._SESSION_KV_OPENER), http_proxies(urllib.request.build_opener()))\n"
+    )
+
+    def test_the_opener_takes_no_proxy_when_the_module_is_loaded_under_a_proxy_variable(self):
+        # The opener is built when the module is imported, and a pod that has a
+        # proxy variable has it at that time. So the module is loaded in a new
+        # process with `http_proxy` set.
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.lower() not in ("no_proxy", "http_proxy")
+        }
+        environment["http_proxy"] = self.PROXY
+        done = subprocess.run(
+            [sys.executable, "-c", self.PROBE],
+            cwd=Path(__file__).resolve().parent,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(f"[] [{self.PROXY!r}]", done.stdout.strip())
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_relay(self):
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with RecordingRelay() as relay:
+            with patch.dict(
+                os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}
+            ), patch.object(urllib.request, "_opener", None):
+                for name in ("no_proxy", "NO_PROXY"):
+                    os.environ.pop(name, None)
+                self.assertEqual(mod._post(relay.url, {"report": "r"}, "k"), (None, {}))
+        self.assertEqual(
+            [(sent["path"], sent["authorization"]) for sent in relay.requests],
+            [("/v1/cron-reports", "Bearer k")],
+        )
+
+
+class TestRelayRefusesRedirect(unittest.TestCase):
+    """The request carries the Session KV key. urllib sends a POST again as a GET
+    for a 301, 302 or 303 answer, with the same `Authorization` header."""
+
+    def _serve(self, handler) -> str:
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/v1/cron-reports"
+
+    def test_a_redirect_answer_is_a_failure_and_the_key_goes_nowhere_else(self):
+        seen_elsewhere = []
+
+        class Elsewhere(BaseHTTPRequestHandler):
+            def _answer(self):
+                seen_elsewhere.append((self.command, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815 - the stdlib's names
+
+            def log_message(self, *args):
+                pass
+
+        elsewhere = self._serve(Elsewhere)
+        for status in (301, 302, 303):
+            with self.subTest(status=status):
+
+                class Redirect(BaseHTTPRequestHandler):
+                    def do_POST(self):  # noqa: N802 - the stdlib's name
+                        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                        self.send_response(status)
+                        self.send_header("Location", elsewhere)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+
+                    def log_message(self, *args):
+                        pass
+
+                answer = mod._post(self._serve(Redirect), {"report": "r"}, "k")
+                self.assertEqual(seen_elsewhere, [])
+                self.assertEqual(answer, (f"chat relay answered HTTP {status}", {}))
 
 
 class TestSiblingDeliveryTargets(unittest.TestCase):
