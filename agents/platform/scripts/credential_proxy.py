@@ -7905,14 +7905,14 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
                 if not config_path.is_file():
                     continue
-                identity = cls._parse_cluster_identity(config_path, yaml)
+                identity = cls._parse_cluster_identity(config_path, yaml, profiles_dir=profiles_dir)
                 if not identity:
                     continue
                 is_ready = (
                     (entry / AGENT_API_PROFILE_SCAFFOLD_FILE).is_file()
                     and (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file()
                 )
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 LOGGER.debug("could not inspect profile %s: %s", entry, exc)
                 continue
             entries.append(
@@ -7927,21 +7927,35 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return entries
 
     @staticmethod
-    def _parse_cluster_identity(config_path: Path, yaml_mod: Any) -> dict[str, str] | None:
+    def _parse_cluster_identity(
+        config_path: Path,
+        yaml_mod: Any,
+        *,
+        profiles_dir: Path | None = None,
+    ) -> dict[str, str] | None:
         if yaml_mod is None:
             return None
+        base = os.path.normpath(str(profiles_dir if profiles_dir is not None else config_path.parent))
+        candidate = os.path.normpath(str(config_path))
+        if not candidate.startswith(base + os.sep):
+            return None
         try:
-            stat_res = config_path.stat()
+            real_base = os.path.realpath(base)
+            real_candidate = os.path.realpath(candidate)
+            if not real_candidate.startswith(real_base + os.sep):
+                return None
+            stat_res = os.stat(real_candidate)
         except OSError:
             return None
-        cache_key = (str(config_path), stat_res.st_mtime_ns, stat_res.st_size)
+        cache_key = (real_candidate, stat_res.st_mtime_ns, stat_res.st_size)
         with _PROFILE_IDENTITY_CACHE_LOCK:
             if cache_key in _PROFILE_IDENTITY_CACHE:
                 cached = _PROFILE_IDENTITY_CACHE[cache_key]
                 return dict(cached) if cached is not None else None
         try:
-            text = config_path.read_text(encoding="utf-8")
-        except OSError:
+            with open(real_candidate, encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, ValueError):
             return None
         result: dict[str, str] | None = None
         loader = getattr(yaml_mod, "CSafeLoader", yaml_mod.SafeLoader)

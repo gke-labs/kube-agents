@@ -1306,6 +1306,48 @@ class AgentAPIProxyTest(unittest.TestCase):
             self.assertEqual({"project": "proj-cache", "cluster": "c1-updated", "location": "europe-west1"}, third)
             self.assertEqual(2, spy_load.call_count)
 
+    def test_scope_route_skips_non_utf8_and_symlink_escape_profile_configs(self):
+        root = Path(self.workspace_dir.name)
+        profiles_dir = root / "profiles"
+
+        good_dir = profiles_dir / "cluster-proj-good-us-central1"
+        good_dir.mkdir(parents=True)
+        (good_dir / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-good\n  cluster: good\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (good_dir / "profile.yaml").write_text("name: good\n", encoding="utf-8")
+        (good_dir / "USER.md").write_text("# user\n", encoding="utf-8")
+
+        # Invalid UTF-8 bytes must be skipped rather than crashing GET /api/scope.
+        bad_utf8_dir = profiles_dir / "cluster-proj-bad-utf8-us-central1"
+        bad_utf8_dir.mkdir(parents=True)
+        (bad_utf8_dir / "config.yaml").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+        # Symlink escaping profiles_dir must be ignored by containment guard.
+        outside_file = root / "outside-config.yaml"
+        outside_file.write_text(
+            "cluster_identity:\n  project: proj-outside\n  cluster: leaked\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        escape_dir = profiles_dir / "cluster-proj-escape-us-east1"
+        escape_dir.mkdir(parents=True)
+        (escape_dir / "config.yaml").symlink_to(outside_file)
+
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(200, response.status)
+                data = json.loads(response.read())
+
+        self.assertEqual(
+            ["cluster-proj-good-us-central1"],
+            [p["profile"] for p in data["profile_identities"]],
+        )
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):
