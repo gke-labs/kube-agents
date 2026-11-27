@@ -1845,6 +1845,8 @@ On a bare Helm install, set the block in your values file. If a file of your own
 
 Every repository in the list must be in one GitHub organization, the one where the GitHub App is installed: see [Single-organization scoping boundary](/kube-agents/deploy/token-minter/#single-organization-scoping-boundary). The operator skips a repository in another organization when it writes the token minter policies, so the agent gets no token for it.
 
+The operator only adds list entries to the `<agent>-gitops-state` ConfigMap: to remove a repository, remove it from the list, apply that change, and only then remove its entry from the `managed_repos` or `context_repos` key, or the operator adds it again.
+
 ### `spec.integration.repositories[].baseBranch`
 
 A `context` entry may not set `baseBranch`: the CRD refuses one, because a context repository is never written and its branch pin is the `ref` in the `<agent>-gitops-state` ConfigMap. The deprecated `github` alias has no place for a base, so pinning one takes `forges`/`repositories`.
