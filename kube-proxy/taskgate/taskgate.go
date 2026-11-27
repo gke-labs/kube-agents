@@ -6,7 +6,8 @@
 // The credential broker holds a worker's kubectl to the same rule
 // (agents/platform/scripts/credential_proxy.py, ProfileTaskGate, and task_credential.py's
 // parse_identity_map and bind), and this package is that rule in Go, read from the same
-// three environment variables in the same formats. It differs from the broker in one
+// four environment variables in the same formats. Three configure the gate; the fourth,
+// the profile audience, admits rather than gates. It differs from the broker in one
 // place on purpose: a worker that presents no credential is refused here, where the
 // broker admits it to commands that reach no cluster. Every request at the kube-proxy
 // reaches a cluster.

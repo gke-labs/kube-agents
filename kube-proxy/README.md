@@ -62,7 +62,9 @@ the proxy's own allowed callers, is not in the map and so is not gated: it reach
 proxy serves. A worker ServiceAccount must be named in the map and in no other caller list.
 
 The profile audience needs `token-review` in `--auth-mode`. With the gate on, `--auth-mode=none` or
-`jwt` alone stops the binary at startup.
+`jwt` alone stops the binary at startup. Each of these startup errors names
+`CREDENTIAL_PROXY_PROFILE_AUDIENCE` and `CREDENTIAL_PROXY_PROFILE_IDENTITIES` and says what to
+change.
 
 ### When the credential is checked
 

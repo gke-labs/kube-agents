@@ -315,7 +315,12 @@ and not a union of the two caller lists, so an embedder cannot widen who `--audi
 `CREDENTIAL_PROXY_SESSION_AUDIENCE` admits. These are startup errors too: an audience name that is
 empty, padded with whitespace or holds a comma; an audience with no caller, or with a blank one; a
 caller that another audience already admits; and a non-empty map when `--auth-mode` does not include
-`token-review`. An empty map changes nothing.
+`token-review`. Each is an `*AudienceCallersError`, so an embedder that fills the map from settings
+of its own can find it with `errors.As` and name those settings. An empty map changes nothing.
+
+`proxyserver.NewHandler` returns the handler `Run` would serve for the same arguments and options,
+with the flags registered on a `flag.FlagSet` the caller passes and nothing started. It is for a
+program that serves the handler itself and for an embedder's tests of its `Options`.
 
 Everything else is the binary's: the same flags, environment variables and
 defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
@@ -459,6 +464,6 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
 `AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
-`AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.Options` and `pkg/mtlsauth` may change in any release. The version moves with every
+`AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.NewHandler`, `proxyserver.Options`, `proxyserver.AudienceCallersError` and `pkg/mtlsauth` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

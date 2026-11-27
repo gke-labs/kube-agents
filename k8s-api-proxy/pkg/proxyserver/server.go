@@ -140,8 +140,8 @@ type Options struct {
 	// accept: its own (--audience) and the session audience are refused, so an embedder
 	// cannot widen who those admit. An empty or padded key, one holding a comma, a key with
 	// no callers, a blank caller, and a caller already admitted for another audience stop Run,
-	// as does a non-empty map without token-review in --auth-mode. Empty leaves the server's
-	// audiences as the stock binary has them.
+	// as does a non-empty map without token-review in --auth-mode, each with an
+	// *AudienceCallersError. Empty leaves the server's audiences as the stock binary has them.
 	AudienceCallers map[string][]string
 }
 
@@ -386,23 +386,49 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 	return map[string][]string{aud: callers}, nil
 }
 
+// AudienceCallersError is the error Run and NewHandler return when the server cannot apply
+// the embedder's Options.AudienceCallers: an entry is malformed, collides with an audience
+// or a caller the flags and the environment already configure, or --auth-mode has no
+// token-review. An embedder that fills the option from settings of its own finds it with
+// errors.As and names those settings to its operator.
+type AudienceCallersError struct {
+	// Reason is the error's text.
+	Reason string
+}
+
+func (e *AudienceCallersError) Error() string { return e.Reason }
+
+func audienceCallersErrorf(format string, args ...any) error {
+	return &AudienceCallersError{Reason: fmt.Sprintf(format, args...)}
+}
+
 // mergeAudienceCallers returns configured, the audiences the environment binds to callers
 // of their own, with the embedder's Options.AudienceCallers added. ownAudience is
-// --audience, which is bound to --allowed-callers. An embedder's audience that is already
-// configured is an error rather than a union of the two caller lists: a union would let an
-// embedder widen who the server's own audience or the session audience admits. With no
-// embedder audiences it returns configured itself.
-func mergeAudienceCallers(configured, embedder map[string][]string, ownAudience string) (map[string][]string, error) {
+// --audience, which is bound to ownCallers, --allowed-callers. An embedder's audience that
+// is already configured is an error rather than a union of the two caller lists: a union
+// would let an embedder widen who the server's own audience or the session audience
+// admits. A caller another audience admits is an error too, as it is in pkg/tokenreview.
+// Every error is an *AudienceCallersError. With no embedder audiences it returns configured
+// itself.
+func mergeAudienceCallers(configured, embedder map[string][]string, ownAudience string, ownCallers []string) (map[string][]string, error) {
 	if len(embedder) == 0 {
 		return configured, nil
 	}
+	// taken and admitted name the setting that already holds an audience or a caller.
 	taken := make(map[string]string, len(configured)+1)
+	admitted := make(map[string]string, len(ownCallers))
 	for _, aud := range splitList(ownAudience) {
 		taken[aud] = "--audience (or " + audienceEnv + ")"
 	}
-	for raw := range configured {
+	for _, caller := range ownCallers {
+		admitted[strings.TrimSpace(caller)] = "--allowed-callers (or " + allowedCallersEnv + ")"
+	}
+	for raw, callers := range configured {
 		for _, aud := range splitList(raw) {
 			taken[aud] = sessionAudienceEnv
+		}
+		for _, caller := range callers {
+			admitted[strings.TrimSpace(caller)] = sessionCallersEnv
 		}
 	}
 	merged := make(map[string][]string, len(configured)+len(embedder))
@@ -412,21 +438,27 @@ func mergeAudienceCallers(configured, embedder map[string][]string, ownAudience 
 	// Sorted, so the same Options stop the binary on the same error every time.
 	for _, aud := range slices.Sorted(maps.Keys(embedder)) {
 		if aud == "" || aud != strings.TrimSpace(aud) || strings.Contains(aud, listSeparator) {
-			return nil, fmt.Errorf("Options.AudienceCallers audience %q is not one audience name: it is empty, padded with whitespace or holds a %q", aud, listSeparator)
+			return nil, audienceCallersErrorf("Options.AudienceCallers audience %q is not one audience name: it is empty, padded with whitespace or holds a %q", aud, listSeparator)
 		}
 		if owner, ok := taken[aud]; ok {
-			return nil, fmt.Errorf("Options.AudienceCallers audience %q is already configured by %s; an embedder's audience must be one the server does not otherwise accept", aud, owner)
+			return nil, audienceCallersErrorf("Options.AudienceCallers audience %q is already configured by %s; an embedder's audience must be one the server does not otherwise accept", aud, owner)
 		}
 		if len(embedder[aud]) == 0 {
-			return nil, fmt.Errorf("Options.AudienceCallers audience %q names no caller", aud)
+			return nil, audienceCallersErrorf("Options.AudienceCallers audience %q names no caller", aud)
 		}
 		callers := make([]string, 0, len(embedder[aud]))
 		for _, caller := range embedder[aud] {
 			caller = strings.TrimSpace(caller)
 			if caller == "" {
-				return nil, fmt.Errorf("Options.AudienceCallers audience %q has a blank caller", aud)
+				return nil, audienceCallersErrorf("Options.AudienceCallers audience %q has a blank caller", aud)
+			}
+			if owner, ok := admitted[caller]; ok {
+				return nil, audienceCallersErrorf("Options.AudienceCallers audience %q admits caller %q, which %s already admits; a caller is admitted for one audience", aud, caller, owner)
 			}
 			callers = append(callers, caller)
+		}
+		for _, caller := range callers {
+			admitted[caller] = "Options.AudienceCallers audience " + strconv.Quote(aud)
 		}
 		merged[aud] = callers
 	}
@@ -472,7 +504,7 @@ func buildHandler(
 			if err != nil {
 				return nil, err
 			}
-			audienceCallers, err = mergeAudienceCallers(audienceCallers, cfg.embedder.AudienceCallers, cfg.audience)
+			audienceCallers, err = mergeAudienceCallers(audienceCallers, cfg.embedder.AudienceCallers, cfg.audience, callers)
 			if err != nil {
 				return nil, err
 			}
@@ -504,7 +536,7 @@ func buildHandler(
 				return nil, errors.New("--auth-mode=none cannot be combined with " + sessionAudienceEnv + " or " + sessionCallersEnv)
 			}
 			if len(cfg.embedder.AudienceCallers) > 0 {
-				return nil, errors.New("--auth-mode=none cannot be combined with Options.AudienceCallers")
+				return nil, audienceCallersErrorf("--auth-mode=none cannot be combined with Options.AudienceCallers")
 			}
 			logger.Warn(
 				"caller authentication is disabled; isolate the listener at the network boundary",
@@ -670,6 +702,23 @@ func assemble(fs *flag.FlagSet, args []string, opts Options) (cfg proxyConfig, m
 		return proxyConfig{}, "", false, fmt.Errorf("invalid mode: %w", err)
 	}
 	return cfg, mode, false, nil
+}
+
+// NewHandler is the handler Run would serve for args and opts: the same flags, registered
+// on fs, the same environment and the same startup checks, with nothing started and no
+// listener. It is for a program that serves the handler itself, and for an embedder's
+// tests of the Options it passes. Its audit records go to standard output, as Run's do.
+// Args that ask for the version are an error: they ask for no handler.
+func NewHandler(ctx context.Context, fs *flag.FlagSet, args []string, opts Options) (http.Handler, error) {
+	cfg, mode, versionOnly, err := assemble(fs, args, opts)
+	if err != nil {
+		return nil, err
+	}
+	if versionOnly {
+		return nil, errors.New("--version asks for no handler")
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	return buildHandler(ctx, cfg, mode, logger, k8sapiproxy.NewMetrics(), nil)
 }
 
 // Run is the whole of the server binary's main: it parses args (os.Args[1:]) into

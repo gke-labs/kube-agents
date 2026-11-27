@@ -3,6 +3,7 @@ package proxyserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -227,13 +228,18 @@ func TestOptionsAudienceCallersFailStartup(t *testing.T) {
 		{
 			name:    "a caller the server's own audience admits",
 			callers: map[string][]string{testEmbedderAudience: {testReviewCaller}},
-			want:    "cannot be bound to both",
+			want:    "which --allowed-callers (or " + allowedCallersEnv + ") already admits",
 		},
 		{
 			name:    "a caller the session audience admits",
 			env:     map[string]string{sessionAudienceEnv: testSessionAudience, sessionCallersEnv: testSessionCaller},
 			callers: map[string][]string{testEmbedderAudience: {testSessionCaller}},
-			want:    "cannot be bound to both",
+			want:    "which " + sessionCallersEnv + " already admits",
+		},
+		{
+			name:    "a caller in two of its audiences",
+			callers: map[string][]string{testEmbedderAudience: listed, "z-" + testEmbedderAudience: {" " + testEmbedderCaller}},
+			want:    `which Options.AudienceCallers audience "` + testEmbedderAudience + `" already admits`,
 		},
 		{name: "auth mode none", args: noneArgs, callers: map[string][]string{testEmbedderAudience: listed}, want: "--auth-mode=none cannot be combined with Options.AudienceCallers"},
 		{name: "auth mode jwt alone", args: jwtArgs, callers: map[string][]string{testEmbedderAudience: listed}, want: `Options.AudienceCallers requires "token-review"`},
@@ -258,7 +264,35 @@ func TestOptionsAudienceCallersFailStartup(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("buildHandler with AudienceCallers %v: err = %v, want one containing %q", tc.callers, err, tc.want)
 			}
+			var refused *AudienceCallersError
+			if !errors.As(err, &refused) {
+				t.Errorf("err = %v (%T), want an *AudienceCallersError for the embedder to find", err, err)
+			}
+			// NewHandler is the same path, from the flags on.
+			if _, viaNewHandler := NewHandler(context.Background(), testFlagSet(), args, Options{AudienceCallers: tc.callers}); viaNewHandler == nil || err == nil || viaNewHandler.Error() != err.Error() {
+				t.Errorf("NewHandler: err = %v, want buildHandler's %v", viaNewHandler, err)
+			}
 		})
+	}
+}
+
+// NewHandler builds the handler Run serves, and has none for args that ask for the version.
+func TestNewHandler(t *testing.T) {
+	clearProxyEnv(t)
+	up := newHeaderUpstream(t)
+	args := []string{"--auth-mode=none", "--listen-addr=127.0.0.1:18443", "--upstream-url=" + up.srv.URL}
+	h, err := NewHandler(context.Background(), testFlagSet(), args, Options{})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	if rec := getPods(h, testCallerToken); rec.Code != http.StatusOK {
+		t.Errorf("code = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if h, err := NewHandler(context.Background(), testFlagSet(), append(args, "--version"), Options{}); err == nil || h != nil {
+		t.Errorf("NewHandler(--version) = %v, %v; want an error and no handler", h, err)
+	}
+	if h, err := NewHandler(context.Background(), testFlagSet(), []string{"--no-such-flag"}, Options{}); err == nil || h != nil {
+		t.Errorf("NewHandler(--no-such-flag) = %v, %v; want the parse error", h, err)
 	}
 }
 
@@ -267,11 +301,11 @@ func TestOptionsAudienceCallersFailStartup(t *testing.T) {
 func TestOptionsAudienceCallersUnsetChangeNothing(t *testing.T) {
 	session := map[string][]string{testSessionAudience: {testSessionCaller}}
 	for name, embedder := range map[string]map[string][]string{"nil": nil, "empty": {}} {
-		got, err := mergeAudienceCallers(nil, embedder, testReviewAudience)
+		got, err := mergeAudienceCallers(nil, embedder, testReviewAudience, []string{testReviewCaller})
 		if err != nil || got != nil {
 			t.Errorf("%s map, no session audience: merged = %v, %v; want nil, as before", name, got, err)
 		}
-		got, err = mergeAudienceCallers(session, embedder, testReviewAudience)
+		got, err = mergeAudienceCallers(session, embedder, testReviewAudience, []string{testReviewCaller})
 		if err != nil || len(got) != 1 || !slices.Equal(got[testSessionAudience], session[testSessionAudience]) {
 			t.Errorf("%s map: merged = %v, %v; want the session audience alone", name, got, err)
 		}
@@ -279,7 +313,7 @@ func TestOptionsAudienceCallersUnsetChangeNothing(t *testing.T) {
 
 	// The embedder's map is not the one handed on, and its lists are not changed.
 	embedder := map[string][]string{testEmbedderAudience: {" " + testEmbedderCaller}}
-	got, err := mergeAudienceCallers(session, embedder, testReviewAudience)
+	got, err := mergeAudienceCallers(session, embedder, testReviewAudience, []string{testReviewCaller})
 	if err != nil {
 		t.Fatalf("mergeAudienceCallers: %v", err)
 	}

@@ -157,7 +157,7 @@ func validateAuthFlags(cfg proxyConfig, modes []string) error {
 		return fmt.Errorf("%s and %s require %q in --%s", sessionAudienceEnv, sessionCallersEnv, authModeTokenReview, authModeFlag)
 	}
 	if len(cfg.embedder.AudienceCallers) > 0 {
-		return fmt.Errorf("Options.AudienceCallers requires %q in --%s", authModeTokenReview, authModeFlag)
+		return audienceCallersErrorf("Options.AudienceCallers requires %q in --%s", authModeTokenReview, authModeFlag)
 	}
 	return nil
 }

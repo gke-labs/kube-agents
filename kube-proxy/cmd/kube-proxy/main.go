@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -26,6 +27,14 @@ const (
 	flagPrefix = "-"
 	// flagValueSeparator joins a flag to a value given in the same argument.
 	flagValueSeparator = "="
+
+	// workersNotAdmittedFormat is the startup error of a gate whose workers the server
+	// cannot admit for the profile audience. Its arguments are the profile audience's
+	// variable, the identity map's, and the server's own error.
+	workersNotAdmittedFormat = "kube-proxy: the task credential gate is on, and the server cannot admit the workers %[2]s names for the audience in %[1]s: %[3]w. " +
+		"Set %[1]s to an audience that is neither --audience nor CREDENTIAL_PROXY_SESSION_AUDIENCE, " +
+		"keep every ServiceAccount %[2]s names out of --allowed-callers and CREDENTIAL_PROXY_SESSION_CALLERS, " +
+		"and keep token-review in --auth-mode; or unset %[2]s to turn the gate off"
 )
 
 // helpFlags are the names the flag package answers with the usage text.
@@ -47,8 +56,20 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := proxyserver.Run(context.Background(), os.Args[1:], opts); err != nil {
-		log.Fatal(err)
+		log.Fatal(startupError(err, opts))
 	}
+}
+
+// startupError is the error the binary exits on for err, the server's. The server names
+// Options.AudienceCallers when it refuses the gate's workers, a field no operator set, so
+// that error is wrapped to name the two variables the audience and its callers came from
+// and what to change. Any other error is the server's own.
+func startupError(err error, opts proxyserver.Options) error {
+	var refused *proxyserver.AudienceCallersError
+	if len(opts.AudienceCallers) == 0 || !errors.As(err, &refused) {
+		return err
+	}
+	return fmt.Errorf(workersNotAdmittedFormat, taskgate.ProfileAudienceEnv, taskgate.IdentitiesEnv, err)
 }
 
 // options are what this binary adds to the stock server: its version, the task credential
