@@ -7,7 +7,12 @@
 // (persona.IntegrityManifestFile) over CLAUDE.md and skills/, which the
 // session worker checks the shipped tree against at start.
 //
-//	session-persona -skills agents/cluster/skills -persona a2a/persona/session/persona.md -out /out/claude
+//	session-persona -skills agents/cluster/skills -persona a2a/persona/session/persona.md -out /out/claude [-core-agent-out /out/core-agent-session]
+//
+// With -core-agent-out it also writes the same persona and skills in the
+// core-agent harness's layout (coreagent.InstructionsFile and
+// coreagent.SkillsDir, with its own content manifest), which the worker
+// image ships read-only for a core-agent session pod.
 //
 // Of each skill, only SKILL.md is shipped. The skills' scripts and assets are not: the
 // session pod has no shell beyond the cluster view's kubectl and gcloud, and
@@ -22,9 +27,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
 )
 
 const (
@@ -68,6 +75,7 @@ func main() {
 	skills := flag.String("skills", "", "the cluster agent's skills directory (agents/cluster/skills)")
 	persona := flag.String("persona", "", "the session persona source (a2a/persona/session/persona.md)")
 	out := flag.String("out", "", "the directory to write CLAUDE.md and skills/ into")
+	coreAgentOut := flag.String("core-agent-out", "", "also write the persona and skills in the core-agent harness's layout into this directory")
 	flag.Parse()
 	if *skills == "" || *persona == "" || *out == "" {
 		flag.Usage()
@@ -77,12 +85,62 @@ func main() {
 		fmt.Fprintln(os.Stderr, "session-persona:", err)
 		os.Exit(1)
 	}
+	if *coreAgentOut != "" {
+		if err := buildLayout(*skills, *persona, *coreAgentOut, coreAgentLayout); err != nil {
+			fmt.Fprintln(os.Stderr, "session-persona:", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// layout names a harness's persona file and skills directory under the
+// tree's root.
+type layout struct {
+	personaFile, skillsDir string
+	// toolNames rewrites the source's tool references (written for Claude
+	// Code) to this harness's names, in the persona and every skill. Empty
+	// for Claude Code, whose tree is the source as it is.
+	toolNames []toolRename
+}
+
+// toolRename is one tool reference and this harness's name for it. The
+// pattern matches across the source's hard line wraps.
+type toolRename struct {
+	from *regexp.Regexp
+	to   string
+}
+
+var (
+	// claudeLayout is Claude Code's config directory: CLAUDE.md and skills/.
+	claudeLayout = layout{personaFile: personaFile, skillsDir: skillsDir}
+	// coreAgentLayout is a core-agent rendering: instructions.md and skills/,
+	// the names coreagent.Snapshot and coreagent.VerifyRendering accept.
+	coreAgentLayout = layout{
+		personaFile: coreagent.InstructionsFile,
+		skillsDir:   coreagent.SkillsDir,
+		// core-agent surfaces skills through list_skills, load_skill and
+		// load_skill_resource (toolgrant.CoreAgentSkillTools).
+		toolNames: []toolRename{{regexp.MustCompile(`with\s+the\s+Skill\s+tool`), "with `load_skill`"}},
+	}
+)
+
+// rename applies the layout's tool-name rewrites to text.
+func (l layout) rename(text []byte) []byte {
+	for _, r := range l.toolNames {
+		text = r.from.ReplaceAll(text, []byte(r.to))
+	}
+	return text
 }
 
 // build writes the persona and every session skill under out, then the
 // tree's content manifest (personafmt.IntegrityManifestFile), which the worker
 // checks the shipped tree against at start.
 func build(skillsSrc, personaSrc, out string) error {
+	return buildLayout(skillsSrc, personaSrc, out, claudeLayout)
+}
+
+// buildLayout is build with the file names l gives.
+func buildLayout(skillsSrc, personaSrc, out string, l layout) error {
 	written := map[string][]byte{}
 	persona, err := os.ReadFile(personaSrc) // #nosec G304 -- the -persona flag of a build-time tool
 	if err != nil {
@@ -91,10 +149,11 @@ func build(skillsSrc, personaSrc, out string) error {
 	if err := mkdirOut(out); err != nil {
 		return err
 	}
-	if err := writeFile(filepath.Join(out, personaFile), persona); err != nil {
+	persona = l.rename(persona)
+	if err := writeFile(filepath.Join(out, l.personaFile), persona); err != nil {
 		return err
 	}
-	written[personaFile] = persona
+	written[l.personaFile] = persona
 	for _, name := range sessionSkills {
 		src, err := os.ReadFile(filepath.Join(skillsSrc, name, skillFile)) // #nosec G304 -- the -skills flag of a build-time tool
 		if err != nil {
@@ -104,8 +163,9 @@ func build(skillsSrc, personaSrc, out string) error {
 		if err != nil {
 			return err
 		}
-		dir := filepath.Join(out, skillsDir, name)
-		if err := mkdir(filepath.Join(out, skillsDir)); err != nil {
+		adapted = l.rename(adapted)
+		dir := filepath.Join(out, l.skillsDir, name)
+		if err := mkdir(filepath.Join(out, l.skillsDir)); err != nil {
 			return err
 		}
 		if err := mkdir(dir); err != nil {
@@ -114,7 +174,7 @@ func build(skillsSrc, personaSrc, out string) error {
 		if err := writeFile(filepath.Join(dir, skillFile), adapted); err != nil {
 			return err
 		}
-		written[path.Join(skillsDir, name, skillFile)] = adapted
+		written[path.Join(l.skillsDir, name, skillFile)] = adapted
 	}
 	return writeFile(filepath.Join(out, personafmt.IntegrityManifestFile), personafmt.FormatIntegrityManifest(written))
 }

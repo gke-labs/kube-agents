@@ -93,6 +93,20 @@ the worker, and a missing manifest is logged as unverified. The harness's own
 state in that directory is not checked (see
 [Content manifest](../lib/persona/README.md#content-manifest)).
 
+The same tool also writes the persona and skills in the core-agent harness's
+layout (`instructions.md` and `skills/`, with their own manifest; tool
+references written for Claude Code become core-agent's, so "the Skill tool"
+reads `load_skill`), and the
+Dockerfile copies that tree to `/usr/share/kube-agents/persona/session`,
+owned by root with every write bit cleared. A session pod running the
+core-agent harness reads it there (`--persona-dir`) and always requires it,
+so a missing, writable or changed tree fails the turn. A core-agent profile
+pod never reads it: its persona is the operator's rendering at
+`/var/lib/agent-persona`, so a profile pod whose rendering is missing fails
+rather than run with the session's persona. Running the worker outside the image with
+`A2A_HARNESS=core-agent` and no profile flag therefore fails every turn
+unless that directory holds a sealed tree.
+
 Editing a skill in `sessionSkills` now also feeds the worker image: its build
 fails if the skill's frontmatter stops parsing, its `name` stops matching its
 directory, or its description is empty or over 1024 characters.

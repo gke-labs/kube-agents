@@ -17,6 +17,10 @@ import (
 // test can see what run() does in each mode without a bus.
 const runChildEnv = "WORKER_ADAPTER_TEST_RUN_CHILD"
 
+// runChildSessionPersonaEnv points the child's core-agent session persona at
+// a tree the test wrote.
+const runChildSessionPersonaEnv = "A2A_TEST_SESSION_PERSONA_DIR"
+
 // sessionHomeFailure is the start-up check's error, as run() logs it.
 const sessionHomeFailure = "the session's shipped persona and skills"
 
@@ -25,6 +29,10 @@ func TestRunChild(t *testing.T) {
 		t.Skip("helper for the wiring tests below")
 	}
 	os.Args = append([]string{os.Args[0]}, strings.Fields(os.Getenv(runChildEnv+"_ARGS"))...)
+	// A test can put the core-agent session tree somewhere it wrote one.
+	if dir := os.Getenv(runChildSessionPersonaEnv); dir != "" {
+		coreAgentSessionPersonaDir = dir
+	}
 	os.Exit(run())
 }
 
