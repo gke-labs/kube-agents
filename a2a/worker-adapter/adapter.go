@@ -2747,17 +2747,25 @@ func chunkString(s string, size int) []string {
 }
 
 // activityTitle is a tool call's title for the activity artifact, with none
-// of its arguments: a shell command's program and subcommand, a file tool's
-// file name, otherwise the tool's name. It goes through the scrub's shape
-// rules here, and the caller scrubs it again with the task's seen values, so
-// a seen value that looks like a bare word is redacted too.
+// of its arguments: a shell command's program and subcommand, a single-file
+// tool's file name, otherwise the tool's name. Claude Code's tools and
+// core-agent's get the same rules under their own names (Bash and bash, Read
+// and read_file); a tool whose argument is a pattern or a list, such as
+// Glob, Grep, glob or grep, keeps its name alone. It goes through the
+// scrub's shape rules here, and the caller scrubs it again with the task's
+// seen values, so a seen value that looks like a bare word is redacted too.
 func activityTitle(tool string, input json.RawMessage) string {
 	var args map[string]any
 	_ = json.Unmarshal(input, &args)
 	str := func(k string) string { v, _ := args[k].(string); return strings.TrimSpace(v) }
 	title := tool
+	file := func(path string) {
+		if path != "" {
+			title = tool + " " + filepath.Base(path)
+		}
+	}
 	switch tool {
-	case "Bash":
+	case "Bash", "bash":
 		if bin, sub := leadingCommand(str("command")); bin != "" {
 			title = strings.TrimSpace(tool + " " + bin + " " + sub)
 		}
@@ -2766,9 +2774,10 @@ func activityTitle(tool string, input json.RawMessage) string {
 		if path == "" {
 			path = str("notebook_path")
 		}
-		if path != "" {
-			title = tool + " " + filepath.Base(path)
-		}
+		file(path)
+	case "read_file", "write_file", "edit_file", "view_file_outline", "stat":
+		// core-agent's single-file tools, which name their file "path".
+		file(str("path"))
 	}
 	return answerscrub.ScrubInline(title)
 }

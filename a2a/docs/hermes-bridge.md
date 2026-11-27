@@ -963,8 +963,12 @@ the record; hermes reads the URL from its config), and a delivery belongs to whi
 task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. Unsigned or
 unmatched deliveries are answered 204 and dropped.
 
-What goes on the bus, one `data` part per invocation at `post_tool_call`, a superset of the
-worker adapter's `{"tool","title"}` so one fold reads both executors:
+What goes on the bus, one `data` part per invocation at `post_tool_call`. It shares the
+worker adapter's `tool` and `callId` keys, so one fold reads both executors, but it carries the
+call's `input` where the worker adapter's `{"tool","title","callId"}` entry carries a `title`
+and no input. The worker adapter's `title` is the tool's name with its subject and none of its
+arguments (a shell command's program and verb, a single-file tool's file name), under Claude
+Code's tool names and core-agent's alike:
 
 ```json
 {
