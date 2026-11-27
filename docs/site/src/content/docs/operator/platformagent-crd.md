@@ -1453,7 +1453,7 @@ The operator renders the block as `scope.json` in the agent's config ConfigMap, 
 
 ### What a reconcile run records
 
-Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume:
+Each reconcile run (other than `--dry-run`) writes what it resolved to `fleet_scope.json` beside the profiles on the data volume (read by `fleet_scope_targets.py` and by `agent-api-auth`'s `GET /api/scope` endpoint for the web console):
 
 | Entry             | What it holds                                                                                                                                                                                                                                                      |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
