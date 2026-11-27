@@ -1219,6 +1219,46 @@
         flex-shrink: 0;
         user-select: none;
       }
+      .model-note {
+        margin: 8px 16px 0;
+        padding: 8px 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        background: var(--green-bg);
+        color: var(--text-primary);
+        font-size: 12.5px;
+      }
+      .model-note.failed {
+        background: var(--red-bg);
+      }
+      .model-note-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .model-note-reason {
+        margin-top: 4px;
+        color: var(--text-secondary);
+        font-size: 11.5px;
+        overflow-wrap: anywhere;
+      }
+      .model-note-lead {
+        margin-top: 8px;
+        font-weight: 600;
+      }
+      .model-note-yaml {
+        margin: 4px 0 6px;
+        padding: 8px;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-color);
+        border-radius: 4px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        line-height: 1.4;
+        overflow: auto;
+        max-height: 160px;
+      }
       .header-model-select,
       .header-reasoning-select {
         background: transparent;
@@ -2368,6 +2408,27 @@
             </button>
           </div>
         </header>
+
+        <div class="model-note" id="model-note" role="status" hidden>
+          <div class="model-note-head">
+            <div>
+              <div id="model-note-text"></div>
+              <div
+                class="model-note-reason"
+                id="model-note-reason"
+                hidden
+              ></div>
+            </div>
+            <button type="button" class="btn-msg-act" id="model-note-close">
+              Dismiss
+            </button>
+          </div>
+          <div class="model-note-lead" id="model-note-lead"></div>
+          <pre class="model-note-yaml" id="model-note-yaml"></pre>
+          <button type="button" class="btn-msg-act" id="model-note-copy">
+            Copy Helm values
+          </button>
+        </div>
 
         <section class="insights" aria-label="Agent metrics">
           <div
@@ -8464,7 +8525,7 @@
         // Update wrapper tooltip
         const wrap = $("header-model-wrap");
         if (wrap) {
-          wrap.title = `Preferred Model: ${activeModel} (${activeProvider})\nTarget: ${activeTarget}${data.reasoning_level ? "\nReasoning: " + data.reasoning_level : ""}\nClick dropdown to record preferred model on PlatformAgent and generate Helm values.`;
+          wrap.title = `Preferred model: ${activeModel} (${activeProvider})\nModel in use: ${data.model_in_use || "unknown"}\nTarget: ${activeTarget}${data.reasoning_level ? "\nReasoning: " + data.reasoning_level : ""}\nPick a model to test it through the inference gateway and record it as preferred. Only a Helm change switches the model in use.`;
         }
 
         // Group models by provider
@@ -8540,6 +8601,78 @@
               : `Reasoning Level: active model (${activeModel}) does not support reasoning configuration.`;
           }
         }
+        renderPreferredModelNote(data);
+      }
+
+      // The note under the header: what a pick in the model selector did,
+      // and the Helm values that switch the model in use. dismissedModelNote
+      // is the preferred model whose note the user closed; pickedModel is
+      // the model last picked in this page; failedModelNote is true while a
+      // failed pick's note shows, so a re-read of the models leaves it up.
+      let dismissedModelNote = "";
+      let pickedModel = "";
+      let failedModelNote = false;
+
+      function showModelNote(failed, text, reason, lead, yaml) {
+        $("model-note").classList.toggle("failed", failed);
+        $("model-note-text").textContent = text;
+        const reasonEl = $("model-note-reason");
+        reasonEl.textContent = reason || "";
+        reasonEl.hidden = !reason;
+        $("model-note-lead").textContent = lead;
+        $("model-note-yaml").textContent = yaml;
+        $("model-note-copy").textContent = "Copy Helm values";
+        $("model-note").hidden = false;
+      }
+
+      // A preferred model that is not the model in use: show the Helm
+      // values that switch to it, and for a pick made in this page whether
+      // it passed the gateway test.
+      function renderPreferredModelNote(data) {
+        if (failedModelNote) return;
+        const preferred = data.active_model || "";
+        const inUse = data.model_in_use || "";
+        if (
+          !preferred ||
+          !inUse ||
+          preferred === inUse ||
+          !(data.helm_values_yaml || "").includes(
+            `modelDefaultName: ${preferred}\n`,
+          ) ||
+          preferred === dismissedModelNote
+        ) {
+          $("model-note").hidden = true;
+          return;
+        }
+        const opt = (data.models || []).find(
+          (m) => m.id === preferred || m.model_target === data.active_target,
+        );
+        let recorded = `${preferred} is recorded as the preferred model.`;
+        if (preferred === pickedModel) {
+          recorded =
+            opt && opt.verified
+              ? `${preferred} answered a test request through the inference gateway and is recorded as the preferred model.`
+              : `${preferred} is recorded as the preferred model. It was not tested: this console has no inference gateway to ask.`;
+        }
+        showModelNote(
+          false,
+          `${recorded} The agent still runs on ${inUse}.`,
+          "",
+          `To switch the agent to ${preferred}, apply these Helm values:`,
+          data.helm_values_yaml,
+        );
+      }
+
+      // A pick the gateway did not answer for: nothing was recorded.
+      function showModelTestFailedNote(data) {
+        failedModelNote = true;
+        showModelNote(
+          true,
+          `${data.model} did not answer a test request through the inference gateway, so nothing was recorded. Check the model name and that your project can use it.`,
+          `Gateway's answer for ${data.target}: ${data.reason}.`,
+          `After that, switch the agent to ${data.model} with these Helm values:`,
+          data.helm_values_yaml,
+        );
       }
 
       async function switchReasoningLevel(level) {
@@ -8624,9 +8757,20 @@
           if (!resp.ok) {
             const errDetail =
               (data && (data.detail || data.error)) || `HTTP ${resp.status}`;
-            alert(`Failed to switch model: ${errDetail}`);
+            if (
+              data &&
+              data.error === "model_test_failed" &&
+              data.helm_values_yaml
+            ) {
+              showModelTestFailedNote(data);
+            } else {
+              alert(`Failed to switch model: ${errDetail}`);
+            }
             if (lastModels && select) select.value = lastModels.active_model;
           } else if (data) {
+            dismissedModelNote = "";
+            failedModelNote = false;
+            pickedModel = data.active_model || "";
             lastModels = data;
             renderModelDropdown(data);
             fetchInsights();
@@ -10930,6 +11074,22 @@
       $("header-reasoning-select").addEventListener("change", (e) =>
         switchReasoningLevel(e.target.value),
       );
+      $("model-note-close").addEventListener("click", () => {
+        if (failedModelNote) {
+          failedModelNote = false;
+          $("model-note").hidden = true;
+          if (lastModels) renderPreferredModelNote(lastModels);
+          return;
+        }
+        dismissedModelNote = (lastModels && lastModels.active_model) || "";
+        $("model-note").hidden = true;
+      });
+      $("model-note-copy").addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText($("model-note-yaml").textContent);
+          $("model-note-copy").textContent = "Copied";
+        } catch (e) {}
+      });
       const tileModel = $("tile-model");
       if (tileModel) {
         tileModel.addEventListener("click", () =>
