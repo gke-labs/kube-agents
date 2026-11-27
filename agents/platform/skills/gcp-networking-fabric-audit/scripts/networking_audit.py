@@ -215,8 +215,9 @@ DNS_CACHE_CHECK_SLUG = "missing-nodelocal-dnscache"
 # What the DNS cache check calls its read in a limitation.
 DNS_CACHE_READ = "Cluster add-ons"
 DNS_CACHE_EXCERPT = "addonsConfig.dnsCacheConfig.enabled is not true on a Standard cluster"
-# `networkConfig.dnsConfig.clusterDns` on a cluster that uses Cloud DNS for GKE: its
-# Pods resolve at the metadata address, so no lookup crosses kube-dns or conntrack.
+# `networkConfig.dnsConfig.clusterDns` on a cluster that uses Cloud DNS for GKE: once
+# its nodes are re-created, its Pods resolve at the metadata address, so no lookup
+# crosses kube-dns or conntrack.
 CLOUD_DNS_PROVIDER = "CLOUD_DNS"
 # A project with the Kubernetes Engine API off holds no cluster to read.
 DNS_CACHE_NO_GKE_REASON = "the Kubernetes Engine API is not enabled in this project, so it holds no cluster"
@@ -1312,7 +1313,7 @@ def check_nodelocal_dnscache(clusters: list) -> tuple[list[dict], list[str]]:
     """SOP 2.7: one hit per Standard cluster whose NodeLocal DNSCache add-on is
     not on, and the clusters whose listing carries no add-ons to decide from.
     Autopilot always runs the cache, and a cluster on Cloud DNS for GKE sends
-    no lookup to kube-dns, so neither is read."""
+    no lookup to kube-dns once its nodes are re-created, so neither is read."""
     hits: list[dict] = []
     undecided: list[str] = []
     for cluster in clusters or []:

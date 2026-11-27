@@ -25,6 +25,13 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
+const (
+	serverReadyTimeout = 30 * time.Second
+	jetStreamOpTimeout = 15 * time.Second
+	pollUntilTimeout   = 30 * time.Second
+	pollUntilInterval  = 20 * time.Millisecond
+)
+
 // ---- harness ----------------------------------------------------------
 
 func startServer(t *testing.T) *natsserver.Server {
@@ -42,7 +49,7 @@ func startServer(t *testing.T) *natsserver.Server {
 		t.Fatalf("NewServer: %v", err)
 	}
 	go s.Start()
-	if !s.ReadyForConnections(10 * time.Second) {
+	if !s.ReadyForConnections(serverReadyTimeout) {
 		t.Fatal("nats-server not ready")
 	}
 	t.Cleanup(s.Shutdown)
@@ -70,7 +77,7 @@ func provision(t *testing.T, url string) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), jetStreamOpTimeout)
 	defer cancel()
 	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:      lib.TasksStream,
@@ -132,12 +139,12 @@ func deleteTasksStream(t *testing.T, url string) {
 		t.Fatalf("jetstream: %v", err)
 	}
 	waitFor(t, "the relay durable to bind", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), jetStreamOpTimeout)
 		defer cancel()
 		_, err := js.Consumer(ctx, lib.TasksStream, relayDurable)
 		return err == nil
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), jetStreamOpTimeout)
 	defer cancel()
 	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
 		t.Fatalf("delete TASKS: %v", err)
@@ -230,8 +237,11 @@ type fakeAdapter struct {
 	verified []string
 	// feedbacks records every PostMessage's feedback mark, when it has one,
 	// and markedTexts the text each marked post carried.
-	feedbacks   []string
-	markedTexts []string
+	feedbacks []string
+	// editFeedbacks records every EditMessage's feedback mark, when it has
+	// one: a whole answer taken on the task's line.
+	editFeedbacks []string
+	markedTexts   []string
 	// takesTerminals makes PostTerminal record the terminal in terminals, as
 	// the console adapter publishes a terminal frame; without it the fake
 	// answers errNoTerminalFrames, as a chat backend would.
@@ -387,6 +397,9 @@ func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) 
 	a.setLaidOutLocked(messageID, m.Chat != nil)
 	if m.Stop != "" {
 		a.stopLines = append(a.stopLines, fakePost{conversation, messageID, m.Text})
+	}
+	if m.Feedback != "" {
+		a.editFeedbacks = append(a.editFeedbacks, m.Feedback)
 	}
 	a.mu.Unlock()
 	return nil
@@ -569,18 +582,19 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 		t.Fatalf("New: %v", err)
 	}
 	go func() { _ = g.Run(ctx) }()
+	waitFor(t, "the relay to bind", g.relayBound.Load)
 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
 
-// pollUntil retries cond for up to ten seconds and reports whether it held.
+// pollUntil retries cond for up to pollUntilTimeout and reports whether it held.
 func pollUntil(cond func() bool) bool {
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(pollUntilTimeout)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return true
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(pollUntilInterval)
 	}
 	return false
 }
@@ -1216,8 +1230,9 @@ func TestTasklessActiveTaskInsideGraceStillSteers(t *testing.T) {
 }
 
 // TestTasklessHealPersistsAcrossCapRefusal: the release is written when the
-// heal fires, not at the end of the turn — a Delegate refused at the session
-// cap returns before the end-of-turn write, and the conversation must not be
+// heal fires, not at the end of the turn — a Delegate parked at the session
+// cap returns before the end-of-turn write, as a refused one does, and the
+// conversation must not be
 // told it is released while the record still says otherwise.
 func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
@@ -1227,14 +1242,7 @@ func TestTasklessHealPersistsAcrossCapRefusal(t *testing.T) {
 
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
 		AuthorID: "1001", MessageID: "t-3", Text: "Delegate: write a haiku about otters"}
-	waitFor(t, "cap refusal posted", func() bool {
-		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "cap 1") {
-				return true
-			}
-		}
-		return false
-	})
+	waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 	rec, err := r.g.reg.Get(context.Background(), conv)
 	if err != nil || rec == nil {
 		t.Fatal(err)
@@ -1380,6 +1388,18 @@ type fakeSpawner struct {
 	// started is each pod's start time for PodStarted; startedErr fails it.
 	started    map[string]time.Time
 	startedErr error
+	// warm is what WarmPods lists; warmSpawns records SpawnWarm's names,
+	// each added to warm as a pod not yet Ready; warmSpawnErr fails
+	// SpawnWarm and warmErr fails WarmPods.
+	warm         []warmPod
+	warmSpawns   []string
+	warmSpawnErr error
+	warmErr      error
+	// liveSpawns makes each spawn count in live, as the pod it creates
+	// would in the cluster, and maxLive the most live has been since; the
+	// session-cap line's tests free a slot by lowering live.
+	liveSpawns bool
+	maxLive    int
 }
 
 func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
@@ -1454,6 +1474,10 @@ func (s *fakeSpawner) Spawn(_ context.Context, rec *SessionRecord, taskID, _ str
 		return "", s.spawnErr
 	}
 	s.spawns = append(s.spawns, fakeSpawn{Session: rec.BusSession, TaskID: taskID, OriginSeq: originSeq})
+	if s.liveSpawns {
+		s.live++
+		s.maxLive = max(s.maxLive, s.live)
+	}
 	return rec.BusSession, nil
 }
 
@@ -1586,6 +1610,7 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	}
 	ran := make(chan struct{})
 	go func() { _ = g.Run(ctx); close(ran) }()
+	waitFor(t, "the relay to bind", g.relayBound.Load)
 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel, ran: ran}, spawn
 }
@@ -2380,8 +2405,8 @@ func TestSessionCommandOnSessionDefaultChangesNothing(t *testing.T) {
 	}
 }
 
-// TestSessionCommandWithTextHonoursTheCap: a refused first turn leaves no
-// half-written record - the cap post is the only reply.
+// TestSessionCommandWithTextHonoursTheCap: a first turn parked at the cap
+// leaves no half-written record - the queued notice is the only reply.
 func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
 	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	spawn.mu.Lock()
@@ -2389,7 +2414,7 @@ func TestSessionCommandWithTextHonoursTheCap(t *testing.T) {
 	spawn.mu.Unlock()
 	conv := "discord:g1/thread-s8"
 	sessionRigTurn(r, conv, "s-170", "/session first task")
-	waitFor(t, "cap refusal", postedContaining(r, "not started: 1 session worker is already running (cap 1)"))
+	waitFor(t, "the turn queued at the cap", postedContaining(r, "**queued**"))
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("spawned %d past the cap", got)
 	}
@@ -2787,6 +2812,10 @@ func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
 		{slackBackend, "slack:dm/D1", false},
 		{slackBackend, "not-a-key", false},
 		{discordBackend, "discord:g1/thread-s1", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2;messageid=1794603936403", true},
+		{teamsBackend, "teams:a:1UxxASmI", false},
+		{teamsBackend, "teams:19:abc@thread.tacv2", false},
+		{teamsBackend, "teams:19:group@thread.v2", false},
 	} {
 		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
 			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)

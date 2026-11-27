@@ -1,0 +1,125 @@
+# WHAT THIS GRADES: today's platform agent on the ask of
+# cluster-profile-confirmed-pdb-pull-request, with today's authority. The two
+# cases are a pair (hack/eval/permit-pairs.txt, docs/designs/permit-pairs.md):
+# this one is side A, the profile case is side B. Side B addresses the ask to
+# the `cluster` AgentProfile, which writes under a permit minted for one
+# confirmed task. This case sends the same ask on the install's default route,
+# so the platform agent does the work: a pull request on the job's GitOps
+# repository that adds a PodDisruptionBudget for the planted checkout-gateway
+# Deployment (role no-pdb-workload), and the cluster unchanged.
+#
+# THE SAME ASK AND THE SAME CHECKS, held by `make bench-case-check` (the rule
+# is in docs/designs/permit-pairs.md): the prompt is side B's text after its
+# [bench:profile ...] directive, behind one sentence that names the
+# directive's target in words. Change one side and the other in the same pull
+# request, or remove the pair's line.
+#
+# NOT pdb-remediation-pr: that case lets the agent find the cluster, names the
+# submit-suggestion skill, and grades a linked pull request by its reply. This
+# one names the target and the repository, and grades the pull request's paths
+# and content, as side B does.
+#
+# TRANSPORT: the default route, no directive and no structured confirm. The
+# pair compare (scripts/eval_front_door_ab.py --pairs) refuses this side from
+# a run whose front-door.txt is not the platform route, where the default
+# session would take the ask.
+#
+# Isolation class: read-only on the cluster; one write to the eval GitOps
+# repository. pull_request_opened makes the lane run it in its second phase,
+# after the repository reset, and allow it the one pull request it names.
+id: platform-agent-pdb-pull-request
+name: The platform agent opens the PodDisruptionBudget pull request that the cluster profile's pair case asks for
+prompt: >-
+  The target of this task: project {{FLEET_CLUSTER_PROJECT:no-pdb-workload}},
+  location {{FLEET_CLUSTER_LOCATION:no-pdb-workload}},
+  cluster {{FLEET_CLUSTER_NAME:no-pdb-workload}}.
+  The checkout-gateway Deployment in the seeded-reliability namespace on this
+  cluster runs two replicas, and no PodDisruptionBudget bounds its voluntary
+  disruption, so a node drain can take both down. Check that on the cluster,
+  then open a pull request on the managed GitOps repository
+  {{BENCH_GITOPS_REPO}} that adds a policy/v1 PodDisruptionBudget for it in
+  its own file beside the Deployment's manifest, selecting its pods by the
+  labels they carry on the cluster and keeping at least one replica up.
+  Change nothing else in the repository, and don't change the cluster. Reply
+  with the pull request's URL.
+expected_output: >-
+  The platform agent confirms from live reads that checkout-gateway runs two
+  replicas with no PodDisruptionBudget in seeded-reliability, opens a pull
+  request on the named repository that adds one file beside the Deployment's
+  manifest, a policy/v1 PodDisruptionBudget in seeded-reliability selecting
+  app=checkout-gateway with minAvailable 1 or maxUnavailable 1, and links it
+  by URL. Nothing is applied to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a pull request written through the
+# version-control verbs.
+domain: source-control
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: Fuxiao-Gao
+
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  # assert, not the converge default: the reply is fixed once the run ends,
+  # so polling a failed check would only wait out the timeout.
+  - name: the-platform-agent-opened-the-budget-pull-request
+    role: objective
+    mode: assert
+    check:
+      # Resolves the URL the reply names and requires a head commit pushed
+      # during this run, so a quoted leftover fails.
+      type: pull_request_opened
+      # gke-agentic/<project>-infra on every pool project. A dev install
+      # writing to a repository elsewhere needs this cleared locally.
+      owner: gke-agentic
+      # The diff is the budget file and nothing else: every changed path is
+      # in the namespace's directory, and the Deployment's own declaration is
+      # not one of them. The globs cover the pool's clusters/seeded-a/ and a
+      # dev fleet's clusters/<prefix>-seeded-a/.
+      changed_paths_only:
+        - clusters/*seeded-a/seeded-reliability/*.yaml
+      unchanged_paths:
+        - clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml
+      # What it adds is a working budget for the planted workload: a
+      # PodDisruptionBudget that selects checkout-gateway's pods (the
+      # fixture's label) and lets one of its two replicas drain, in the
+      # workload's namespace.
+      content:
+        - paths: ["clusters/*seeded-a/seeded-reliability/*.yaml"]
+          kind: PodDisruptionBudget
+          op: admits_disruption
+          replicas: 2
+          pod_labels: { app: checkout-gateway }
+        - paths: ["clusters/*seeded-a/seeded-reliability/*.yaml"]
+          kind: PodDisruptionBudget
+          field: metadata.namespace
+          op: contains
+          value: seeded-reliability
+  # Cluster-state safeguards, side B's: the fleet came out the way it went in.
+  - name: nothing-was-applied-directly
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  # Pathless `absent` over the namespace's budgets: any PDB appearing there
+  # fails it.
+  - name: no-budget-was-created-during-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

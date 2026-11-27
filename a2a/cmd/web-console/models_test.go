@@ -224,3 +224,53 @@ func TestModelsTestEndpoint(t *testing.T) {
 		t.Errorf("expected verified=false, got %v", failResp["verified"])
 	}
 }
+
+// The model probe calls the inference gateway keyless: the agent API key is the
+// agent's own, not a gateway credential. Both requests are covered: the first
+// try, and the alias fallback testModel sends when the target is not mapped in
+// the gateway.
+func TestModelsTestSendsTheGatewayNoAgentKey(t *testing.T) {
+	var models, auths []string
+	fakeGateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		model, _ := req["model"].(string)
+		models = append(models, model)
+		auths = append(auths, r.Header.Get("Authorization"))
+		if model == "working-model" || model == "alias-model" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer fakeGateway.Close()
+
+	s := newServer(config{LiteLLMURL: fakeGateway.URL, APIServerKey: "agent-api-key-not-for-the-gateway"})
+	for _, body := range []string{
+		`{"model":"working-model"}`,
+		`{"model":"failing-model"}`,
+		// An unmapped target: the probe retries under the model's own id.
+		`{"model":"alias-model","model_target":"unmapped/target"}`,
+	} {
+		rec := httptest.NewRecorder()
+		s.handleModelsTest(rec, httptest.NewRequest(http.MethodPost, "/api/models/test", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code %d: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	sawFallback := false
+	for i, model := range models {
+		if model == "alias-model" && i > 0 && models[i-1] == "unmapped/target" {
+			sawFallback = true
+		}
+	}
+	if !sawFallback {
+		t.Fatalf("the alias fallback request never reached the gateway; models seen: %v", models)
+	}
+	for i, a := range auths {
+		if a != "" {
+			t.Errorf("gateway request %d (%s) carried Authorization %q; want none", i, models[i], a)
+		}
+	}
+}

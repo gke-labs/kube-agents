@@ -10,8 +10,9 @@
 #
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
-# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `world-open-ingress`,
-# `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot` are
+# on a cluster at all (`orphan-disks`, `startup-fail-vm`, `rotated-console-vm`,
+# `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and
+# `orphan-snapshot` are
 # project-scoped, so they have no cluster slot). fixtures.json carries all but
 # `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
 # probes in the project with gcloud; `orphan-disks` is in this file alone. A
@@ -32,7 +33,8 @@
 #
 # `available_from_day` is days after the stack is applied, and it is the SOP's
 # own age gate rather than a provisioning delay: recreating a fixture restarts
-# its clock, because creationTimestamp is server-set and immutable. The clock
+# its clock, because creationTimestamp is server-set and immutable (and so is
+# the status.completionTime of a finished Job). The clock
 # runs per project, so a fleet-wide assertion holds only from the most recently
 # applied project's date.
 
@@ -41,13 +43,13 @@
 slots:
   - slot: a
     suffix: a
-    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the pool that names a missing reservation
+    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the two pools that name a missing reservation
   - slot: b
     suffix: b
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures over that pool
+    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -133,6 +135,61 @@ fixtures:
       declares. The names are literals in the stack, the same on every
       project. No multi-day age gate.
 
+  - role: generated-name-job-family
+    slot: a
+    available_from_day: 7
+    objects:
+      - job/reindex-8daede4e-4620-426c-9e07-58f5f0505f39
+      - job/reindex-1657c63c-8745-4ba0-a6a9-1d4365c43041
+      - job/reindex-55fe5b6f-82b7-4fef-bfe3-877e9e5200b2
+    namespace: seeded-family
+    defect: >-
+      Three finished Jobs named reindex-<uuid>, the shape a spawner leaves,
+      with one common app.kubernetes.io/part-of label, no owner reference
+      and no ttlSecondsAfterFinished, so each one stays after it ran. The
+      waste audit's terminal-pods check files a finished Job once its
+      status.completionTime is 7 days old, so the role is not ready, rather
+      than drifted, until then. The names are literals in the stack, the
+      same on every project.
+
+  - role: long-name-replaced-pod
+    slot: a
+    available_from_day: 1
+    objects:
+      - deployment/settlement-batch-reconciliation-exporter-for-partner-feeds
+      - configmap/long-name-pod-cycle
+      - serviceaccount/long-name-pod-cycle
+      - role/long-name-pod-cycle
+      - rolebinding/long-name-pod-cycle
+    namespace: seeded-long-name
+    defect: >-
+      One Deployment whose name has 58 characters, so Kubernetes cuts the
+      names of its pods: the name and 5 generated characters, with no hash
+      between them. Its one pod is idle until 18:00 UTC, then uses its CPU
+      limit and holds 64Mi for 11 minutes, then deletes itself through the
+      API with a Role that can delete pods in this namespace only. The live
+      pod is then idle, and the pod of the day before is a replaced pod with
+      a peak above the bar of the waste audit's overrequest check. The first
+      replaced pod exists one day after the plant. The Deployment has no
+      verdict from 18:00 to about 19:11 UTC.
+
+  - role: cpu-burst-and-flat
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/cpu-flat
+      - deployment/cpu-burst
+      - configmap/cpu-cycle
+    namespace: seeded-cpu-cycle
+    defect: >-
+      Two Deployments whose real CPU use is in the manifest. cpu-flat uses
+      the CPU all the time, held by its limit at its 100m request: the
+      control. cpu-burst uses the CPU for 45 seconds at the start of each 10
+      minutes, held by its limit at its 200m request: in a bucket of 300
+      seconds the burst reads as 15% of the request, under the bar of the
+      waste audit's overrequest check, and in a bucket of 60 seconds as 37%
+      or more. No multi-day age gate: the check reads a pod after one hour.
+
   - role: guaranteed-qos-workload
     slot: a
     available_from_day: 0
@@ -212,6 +269,25 @@ fixtures:
       node it would add, so the pool can never grow. The stack plants no
       reservation: the missing one is the defect. Zero nodes cost nothing.
 
+  - role: missing-reservation-autoscaled
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/dev-reserved-pool
+      - deployment/reserved-batch
+    namespace: seeded-reservation
+    defect: >-
+      A single-zone pool that autoscales from 0 to 1 node, held behind the
+      taint seeded-role=missing-reservation-autoscaled, that consumes the
+      reservation that missing-reservation-pool names (SPECIFIC_RESERVATION),
+      which exists in no zone of the project; and a Deployment (one replica)
+      whose pod only that pool can hold. The autoscaler asks for a node, GKE
+      refuses it, and the pod stays Pending with the pool at zero nodes: the
+      autoscaler's visibility log repeats scale.up.error.reservation.not.found.
+      `dev` in the pool's name makes it non-production for the stockout
+      audit, so the reservation check (3.10) does not name it. Zero nodes
+      cost nothing.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0
@@ -255,6 +331,20 @@ fixtures:
       exits 1 on every boot. The guest agent prints the failure line once
       per boot, and the serial buffer rotates it out within about three
       weeks, so each reconcile resets the VM to print it again.
+
+  - role: rotated-console-vm
+    slot: null # Project-scoped, in var.zone; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - instance/serial-flood-<prefix>
+    defect: >-
+      A standalone e2-micro, serial-flood-<prefix>, whose startup script
+      fails at boot and whose systemd timer then writes about 2 MiB of
+      counted filler lines to serial port 1, two minutes after boot and
+      every 24 hours after. The 1 MiB serial buffer keeps only the filler,
+      so the boot's failure lines rotate out minutes after boot. The
+      reconcile does not reset this VM: the rotated console is its healthy
+      state, and the VM's own daily pass renews it.
 
   - role: world-open-ingress
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
@@ -355,10 +445,10 @@ fixtures:
     objects:
       - cluster/self
     defect: >-
-      Slot c's default pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota
-      false, where every other pool in the fleet runs a 20 GB disk and no
-      kubelet block, planted ahead of the boot-disk and kubelet-config drift
-      facets, which the drift SOP does not read yet. Day 1 as for drift-outlier,
+      Slot c's default pool on a 50 GB boot disk with kubeletConfig.podPidsLimit
+      4096, where every other pool in the fleet runs a 20 GB disk and no
+      kubelet block. The drift SOP's boot-disk facet reads the disk and its
+      kubelet-config facet reads the kubelet block. Day 1 as for drift-outlier,
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
@@ -401,8 +491,11 @@ fixtures:
     defect: >-
       A Deployment targeted through the nodeSelector with a hand-written
       toleration for the class taint that names key, value and effect and no
-      operator. The pool it targets carries no taint, so the pod runs; the
-      toleration's shape is the fixture.
+      operator. GKE adds its own toleration with operator Equal to a Pod
+      that selects a class, and a live test ran this shape on a tainted class
+      pool, hand-made and GKE-created (Standard 1.35.8, Autopilot 1.36.4;
+      older versions not tested): no defect, and no case reads the role. The
+      pool it targets carries no taint, so the pod runs.
 
   - role: no-ephemeral-limit-workload
     slot: c
@@ -411,7 +504,7 @@ fixtures:
       - deployment/batch-worker-a
     namespace: seeded-compute-class
     defect: >-
-      The same batch-worker-a Deployment, read for a second defect: its
+      The same batch-worker-a Deployment, read for its defect: its
       container sets no ephemeral-storage request or limit, so its writable
       layer and logs can fill the node's boot disk until the kubelet evicts
       pods under DiskPressure. GKE Standard admission adds none, where
@@ -426,9 +519,10 @@ fixtures:
     defect: >-
       Slot c's default-pool labelled cloud.google.com/compute-class=general-ccc
       with no matching NoSchedule taint, so the scheduler fills it with
-      untargeted pods before the pre-filter drops them. The label is also what
-      leaves the cluster with no untainted pool without a class label, which
-      the obtainability audit's 3.24 needs before it files anything.
+      untargeted pods before the pre-filter (GKE 1.35.6 and later) drops them.
+      The label is also what leaves the cluster with no untainted pool without
+      a class label, which the obtainability audit's 3.24 needs before it
+      files anything.
 
   - role: manual-pools-compute-class
     slot: c
@@ -440,6 +534,22 @@ fixtures:
       rules across the nodepools rule default-pool backs and two machine
       families no pool backs, so a stockout on the first rule leaves pods with
       no fallback GKE can create.
+
+  - role: missing-reservation-compute-class
+    slot: c
+    available_from_day: 0
+    objects:
+      - computeclass/reserved-ccc
+    defect: >-
+      ComputeClass reserved-ccc, whose first rule asks for one named
+      reservation (affinity Specific, seeded-absent-reservation) that no
+      reservation of the project carries, and whose second rule is a machine
+      type that GKE can create. Node pool auto-creation is on and no workload
+      selects the class, so GKE makes no node pool for it. One NoSchedule
+      taint (dedicated=reserved-ccc) keeps the class out of the
+      general-purpose classes that the obtainability audit counts. GKE marks
+      the class misconfigured with the reason ReservationNotFound, and the
+      stockout audit files that status.
 
   - role: no-nodelocal-dnscache
     slot: c
@@ -677,6 +787,15 @@ fixtures:
     defect: >-
       cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
 
+  - role: state-sync-controller
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/state-sync-controller
+    namespace: seeded-shapes
+    defect: >-
+      state-sync-controller Deployment (one replica) in seeded-shapes whose container startup argument passes --kube-api-qps=-1 to an inert sleep process, planting a controller with a negative client QPS (client-side rate limit disabled) for control-plane-configmap-lease-write-storm without generating API server write load
+
   - role: scaled-zero-gateway
     slot: a
     available_from_day: 0
@@ -708,8 +827,10 @@ fixtures:
       - statefulset/zone-bound-store
     namespace: seeded-topology
     defect: >-
-      One replica on a zonal standard-rwo claim, so the pod cannot change zone
-      without leaving its data. The fix is a migration, not an edit.
+      Two replicas whose claims use seeded-zonal-pd, a class whose
+      allowedTopologies names only the first zone, so both bind there and
+      neither pod can change zone without leaving its data. The fix is a
+      migration, not an edit.
 
   - role: zonal-skew-capacity
     slot: d
@@ -719,6 +840,25 @@ fixtures:
       - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
-      Four replicas at 120m CPU against two e2-small nodes, so those that do
-      not fit stay Pending on insufficient CPU. Its distribution looks like
+      Four replicas at 500m CPU against the first zone's e2-small, which
+      first-zone-sponge keeps below one replica's worth of free CPU, and the
+      second zone's e2-standard-2, so every replica that runs is in the second
+      zone and the rest stay Pending on insufficient CPU. Its distribution looks like
       the scheduling case; only the Pending pods' events say otherwise.
+
+  - role: unaccepted-gateway-class
+    slot: a
+    available_from_day: 0
+    objects:
+      - gatewayclass/seeded-unaccepted-gw
+      - gateway/seeded-unaccepted-gateway
+      - httproute/seeded-unaccepted-route
+      - gatewayclass/seeded-envoy
+    namespace: seeded-shapes
+    defect: >-
+      Cluster-scoped GatewayClass seeded-unaccepted-gw referencing
+      example.com/unsupported-controller so no controller accepts it, with
+      Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route
+      in seeded-shapes bound to it (zero Pods or Services provisioned).
+      GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as
+      the accepted-class negative control on the same cluster.

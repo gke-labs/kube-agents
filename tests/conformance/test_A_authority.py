@@ -23,6 +23,7 @@ import io
 import json
 import types
 import re
+import tempfile
 import textwrap
 import unittest
 from unittest import mock
@@ -498,6 +499,16 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         principal = cp.Principal(workload="system:serviceaccount:ns:profile", role=cp.CALLER_ROLE_PROFILE)
         task = type("Task", (), {"permits": frozenset()})()
         permitted = type("Task", (), {"permits": frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})})()
+        # Another permit is not the confirmed one. The verifiers also accept
+        # vcs:unattended-write (docs/designs/unattended-write-permit.md), which
+        # this gate does not read; the second name is in no verifier's list.
+        # A credential with either opens the reads and none of the writes.
+        # The suite does not import the verifier, so the first name is a
+        # literal; the source "task_credential_verifier" anchors it there.
+        other_permits = {
+            name: type("Task", (), {"permits": frozenset({name})})()
+            for name in ("vcs:unattended-write", "vcs:proposal-merge")
+        }
         writes = cp.PROFILE_PERMIT_GATED_VCS_VERBS
         self.assertEqual(frozenset({"publish", "proposal-create", "proposal-update"}), writes)
         for verb in sorted(cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE]):
@@ -506,8 +517,223 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 with_task = dataclasses.replace(principal, task=task)
                 self.assertEqual(verb in writes, cp.profile_vcs_refusal(with_task, verb) is not None)
                 self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
+                for name, other in other_permits.items():
+                    with_other = dataclasses.replace(principal, task=other)
+                    self.assertEqual(
+                        verb in writes, cp.profile_vcs_refusal(with_other, verb) is not None,
+                        f"a credential with only the permit {name}",
+                    )
         others = cp.vcs_broker.WRITE_VERBS - writes
         self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
+
+    def test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other(self) -> None:
+        # The row above holds the writes. This one holds the whole set: a read
+        # added to it (proposal-reviews, for one) is a grant to every profile
+        # of the install, and it turns this row red rather than none.
+        cp = h.credential_proxy
+        profile = cp.CALLER_ROLE_PROFILE
+        reached = frozenset(
+            {
+                "clone", "proposal-view", "proposal-list", "proposal-commits", "branch-view", "identity",
+                "issue-list", "issue-view", "publish", "proposal-create", "proposal-update",
+            }
+        )
+        self.assertEqual(reached, cp.ROLE_VCS_VERBS[profile])
+        for verb in sorted(cp.vcs_broker.VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.assertEqual(verb in reached, cp.vcs_verb_permitted(profile, verb))
+        self.assertFalse(cp.vcs_verb_permitted(profile, "Proposal-View"), "a spelling that is no verb")
+
+    def test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller(self) -> None:
+        # The route row reads ROUTE_ROLES. This one drives the handler's own
+        # authentication step, so a handler that stops asking the table, or
+        # stops binding a profile caller's task credential, is red.
+        cp = h.credential_proxy
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        def authenticated(path: str, credential: str | None = None, gate: object = None) -> tuple[object, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.authenticator = types.SimpleNamespace(authenticate=lambda headers: principal)
+            handler.headers = email.message.Message()
+            if credential is not None:
+                handler.headers[cp.TASK_CREDENTIAL_HEADER] = credential
+            handler.command, handler.path, handler.profile_gate = "POST", path, gate
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            return handler._authenticated(), replies
+
+        for path in ("/v1/exec", "/v1/vcs/clone", h.mcp_policy.MCP_RELAY_PREFIX + "developer_knowledge"):
+            with self.subTest(reached=path):
+                admitted, replies = authenticated(path)
+                self.assertIs(principal, admitted, replies)
+        for path in (
+            "/v1/forge/refresh", "/v1/github/refresh", "/v1/feedback/submit", cp.ADMISSION_PATH,
+            cp.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/projects/p/timeSeries", cp.DIAL_PATH, "/v1/chat/api",
+        ):
+            with self.subTest(refused=path):
+                admitted, replies = authenticated(path)
+                self.assertIsNone(admitted)
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", replies[0][1]["code"])
+        # A credential the gate refuses is refused whole, not dropped; one it
+        # binds is the principal the routes see. The same holds for a broker
+        # that verifies none.
+        bound = dataclasses.replace(principal, task=types.SimpleNamespace(report_only=False))
+
+        def refuse(caller: object, token: object) -> object:
+            raise cp.TaskCredentialRefused("the signature does not verify")
+
+        for case, gate in (
+            ("a gate that refuses", types.SimpleNamespace(admit=refuse)),
+            ("a broker with no gate", None),
+        ):
+            with self.subTest(case=case):
+                admitted, replies = authenticated("/v1/exec", credential="not-a-credential", gate=gate)
+                self.assertIsNone(admitted)
+                self.assertEqual((403, cp.RULE_TASK_CREDENTIAL), (replies[0][0], replies[0][1]["rule"]))
+        admitted, replies = authenticated(
+            "/v1/exec", credential="a-credential", gate=types.SimpleNamespace(admit=lambda caller, token: bound)
+        )
+        self.assertIs(bound, admitted, replies)
+
+    def test_A3_only_the_chat_role_reports_the_dial(self) -> None:
+        # The handler row holds that the role table refuses a profile caller on
+        # the dial route. This row names the dial. The table gives the route to
+        # the chat role alone. The route's own handler refuses each other
+        # caller, also one with no role, which the table admits on every route.
+        # A refused report stores no level: a dial that a profile task or the
+        # shell could move is no dial.
+        cp = h.credential_proxy
+        broker = cp.vcs_broker
+        chat = cp.CALLER_ROLE_CHAT
+        self.assertIn((cp.DIAL_PATH, (chat,)), cp.ROUTE_ROLES)
+
+        def principal_of(role: str) -> object:
+            return cp.Principal(workload="w", uid="u", role=role, pod="p", pod_uid="u")
+
+        def authenticated(role: str) -> tuple[object, list]:
+            principal = principal_of(role)
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.authenticator = types.SimpleNamespace(authenticate=lambda headers: principal)
+            handler.headers = email.message.Message()
+            handler.command, handler.path, handler.profile_gate = "POST", cp.DIAL_PATH, None
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            return handler._authenticated(), replies
+
+        def reported(principal: object, level: str) -> tuple[int, dict]:
+            body = json.dumps({"level": level}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile, handler.path = io.BytesIO(body), cp.DIAL_PATH
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._handle_dial_post(principal)
+            return replies[0]
+
+        for role in cp.CALLER_ROLES:
+            with self.subTest(table=role):
+                admitted, replies = authenticated(role)
+                if role == chat:
+                    self.assertIsNotNone(admitted, replies)
+                    continue
+                self.assertIsNone(admitted)
+                self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (replies[0][0], replies[0][1]["code"]), replies)
+
+        # The handler's own check, with the dial on and its stored level in a
+        # folder of this test. The chat role's report is the control.
+        with contextlib.ExitStack() as stack:
+            stored = f"{stack.enter_context(tempfile.TemporaryDirectory())}/dial-level"
+            stack.enter_context(mock.patch.dict("os.environ", {broker.DIAL_ENV: "on", broker.WRITE_MODE_ENV: ""}))
+            stack.enter_context(mock.patch.object(broker, "DIAL_STATE_FILE", stored))
+            stack.enter_context(mock.patch.object(broker, "_dial_level", None))
+            stack.enter_context(mock.patch.object(broker, "_dial_reported", False))
+            status, answer = reported(principal_of(chat), broker.DIAL_PROPOSE)
+            self.assertEqual((200, broker.DIAL_PROPOSE), (status, answer.get("level")), answer)
+            others = [role for role in cp.CALLER_ROLES if role != chat]
+            self.assertIn(cp.CALLER_ROLE_PROFILE, others)
+            callers = [(role, principal_of(role)) for role in others]
+            callers += [("a caller with no role", principal_of("")), ("no principal", None)]
+            for case, principal in callers:
+                with self.subTest(handler=case), self.assertLogs(cp.LOGGER, level="WARNING"):
+                    status, answer = reported(principal, broker.DIAL_AUTOMERGE)
+                    self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, answer.get("code")), answer)
+                    self.assertEqual(broker.DIAL_PROPOSE, broker.dial_level())
+                    with open(stored, encoding="utf-8") as level:
+                        self.assertEqual(broker.DIAL_PROPOSE, level.read().strip())
+
+    def test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body(self) -> None:
+        # The permit row calls profile_vcs_refusal. This one drives the
+        # dispatch, so a dispatch that stops asking the verb set or the permit
+        # is red. No forge is behind the handler: a refusal is the only answer
+        # these requests may get.
+        cp = h.credential_proxy
+        bare = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+        unpermitted = dataclasses.replace(bare, task=types.SimpleNamespace(task="task-1", permits=frozenset()))
+        permitted = dataclasses.replace(
+            bare, task=types.SimpleNamespace(task="task-1", permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        )
+
+        def dispatch(principal: object, verb: str) -> tuple[int, dict]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs = principal, None
+            handler.headers = email.message.Message()
+            handler.rfile = io.BytesIO(b"")
+            handler.max_request_bytes = 1 << 20
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            # The install's write mode is another refusal, ahead of the permit's.
+            with mock.patch.dict("os.environ", {cp.vcs_broker.WRITE_MODE_ENV: "", cp.vcs_broker.DIAL_ENV: ""}):
+                handler._dispatch_vcs_post(verb)
+            return replies[0]
+
+        for verb in ("branch-delete", "issue-create", "proposal-comment", "snapshot", "capabilities"):
+            with self.subTest(outside_the_set=verb):
+                status, answer = dispatch(permitted, verb)
+                self.assertEqual((403, cp.RULE_CALLER_VCS_VERB), (status, answer.get("rule")), answer)
+        for principal, verb, case in (
+            (bare, "clone", "a read with no task credential"),
+            (bare, "publish", "a write with no task credential"),
+            (unpermitted, "publish", "a write on a credential with no permit"),
+            (unpermitted, "proposal-create", "a write on a credential with no permit"),
+        ):
+            with self.subTest(case=case, verb=verb):
+                status, answer = dispatch(principal, verb)
+                self.assertEqual((403, cp.RULE_CALLER_VCS_PERMIT), (status, answer.get("rule")), answer)
+                self.assertEqual(cp.CALLER_PERMIT_REQUIRED_CODE, answer.get("code"))
+
+    def test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role(self) -> None:
+        # Both tables are checked when the broker module loads. Each case is
+        # an edit that reads as policy: most widen the profile role, and two
+        # are a typo that a table must not accept as a verb or a role. The
+        # shipped tables pass.
+        cp = h.credential_proxy
+        profile = cp.CALLER_ROLE_PROFILE
+        table = dict(cp.ROLE_VCS_VERBS)
+        gated, owned = cp.PROFILE_PERMIT_GATED_VCS_VERBS, cp.PROFILE_OWNERSHIP_GATED_VCS_VERBS
+        cp._validate_role_vcs_verbs(table, gated, owned)
+
+        def widened(verb: str) -> dict:
+            return {**table, profile: table[profile] | {verb}}
+
+        for case, verbs, permit_set, owned_set in (
+            ("a write with no permit gate", widened("issue-create"), gated, owned | {"issue-create"}),
+            ("a write with no ownership bar", widened("issue-create"), gated | {"issue-create"}, owned),
+            ("a read of a repository nobody registered", widened("snapshot"), gated, owned),
+            ("a verb the managed list does not gate", widened("capabilities"), gated, owned),
+            ("a verb that is no verb", widened("proposal-vew"), gated, owned),
+        ):
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    cp._validate_role_vcs_verbs(verbs, permit_set, owned_set)
+        with self.assertRaisesRegex(TypeError, "must be a frozenset"):
+            cp._validate_role_vcs_verbs({**table, profile: "publish"}, gated, owned)
+
+        cp._validate_route_roles(cp.ROUTE_ROLES)
+        with self.assertRaisesRegex(TypeError, "must be a tuple"):
+            cp._validate_route_roles(cp.ROUTE_ROLES + (("/v1/new/", profile),))
+        with self.assertRaisesRegex(ValueError, "is not a caller role"):
+            cp._validate_route_roles(cp.ROUTE_ROLES + (("/v1/new/", ("profil",)),))
 
     def test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals(self) -> None:
         # #3993, #6247: the permit says a requester asked for a change, not
@@ -1280,8 +1506,124 @@ class A3TheA2ADoorsGoogleClassAssertsOnlyAVerifiedEmail(unittest.TestCase):
         body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
         self.assertRegex(
             body,
-            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend \{\s*return func",
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aGoogleBackend[^{]*\{\s*return func",
             "the Google class's roster falls through to principalMapFor, whose default is the chat map",
+        )
+
+
+class A3TheA2ADoorsEntraClassAssertsOnlyAVerifiedObjectID(unittest.TestCase):
+    """A3 on the A2A door's Microsoft Entra class, the Google class's
+    conditions read against a token the door checks itself.
+
+    A bearer shaped like a JWT is checked against the tenant's published
+    signing keys, with the algorithm pinned before any key is read; its
+    issuer and tenant must be the install's and its audience the install's
+    application; the object id is the principal, admitted only if it is on
+    the door's own Entra allowlist, at the door before it holds any state
+    and again in the gateway; the class's prefix is one no eval caller can
+    spell; and its roster never resolves through the chat map.
+    """
+
+    def test_A3_an_entra_token_is_checked_against_the_tenants_keys_with_the_algorithm_pinned(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "verify")
+        self.assertRegex(
+            body,
+            r'if header\.Alg != a2aEntraAlgorithm \{\s*return id, fmt\.Errorf\("%w',
+            "a token naming another signing algorithm is no longer refused",
+        )
+        self.assertLess(
+            body.index("header.Alg != a2aEntraAlgorithm"),
+            body.index("v.key(ctx, header.Kid)"),
+            "the algorithm is no longer pinned before a key is read",
+        )
+        self.assertIn("rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature)", body)
+        self.assertLess(
+            body.index("rsa.VerifyPKCS1v15"),
+            body.index("v.identity(claims)"),
+            "the claims are read before the signature is verified",
+        )
+        self.assertEqual(
+            re.search(r'\ba2aEntraAlgorithm\s*=\s*"([^"]*)"', h.text("a2a_door_entra")).group(1),
+            "RS256",
+            "the pinned algorithm is no longer RS256",
+        )
+
+    def test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "identity")
+        self.assertRegex(
+            body,
+            r"if !issued \|\| !strings\.EqualFold\(claims\.Tid, v\.tenantID\) \{\s*return id, fmt\.Errorf",
+            "a token of another tenant is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r"if !audience \{\s*return id, fmt\.Errorf",
+            "a token issued for another application is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'"%w: it has expired"',
+            "an expired token is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if strings\.TrimSpace\(claims\.Scp\) == "" \{\s*return id, fmt\.Errorf',
+            "a token that grants no delegated scope (an ID token) is no longer refused",
+        )
+
+    def test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "verify")
+        self.assertRegex(
+            body,
+            r"if !entraTokenShaped\(token\) \{\s*return id, fmt\.Errorf",
+            "a bearer not shaped like a JWT is no longer refused before anything is read",
+        )
+        self.assertLess(
+            body.index("entraTokenShaped(token)"),
+            body.index("v.key("),
+            "the shape check no longer runs before the key lookup",
+        )
+
+    def test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra_identity"), "resolveA2AEntraPrincipal")
+        self.assertIn("strings.CutPrefix(authorID, a2aEntraCallerPrefix)", body)
+        self.assertRegex(
+            body,
+            r'if !ok \|\| objectID == "" \{\s*return ""',
+            "an id without the class's prefix is no longer refused",
+        )
+        self.assertRegex(
+            body,
+            r'if !g\.a2aEntraAllowed\[strings\.ToLower\(objectID\)\] \{\s*return ""',
+            "an object id off the door's Entra allowlist is no longer refused",
+        )
+
+    def test_A3_the_door_refuses_an_entra_account_off_the_allowlist_before_holding_state(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_entra"), "identifyEntra")
+        self.assertRegex(
+            body,
+            r"if err == nil && !d\.entraAllowed\[strings\.ToLower\(id\.objectID\)\] \{[^}]*return \"\", false",
+            "the door no longer refuses a verified Entra account off its allowlist before it creates state for it",
+        )
+
+    def test_A3_no_eval_caller_can_spell_an_entra_caller(self) -> None:
+        found = re.search(r'\ba2aEntraCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_entra"))
+        self.assertIsNotNone(found, "a2aEntraCallerPrefix is no longer a string constant in a2adoor_entra.go")
+        prefix = found.group(1)
+        self.assertTrue(
+            prefix.startswith(":"),
+            f"a2aEntraCallerPrefix is {prefix!r}: without the leading colon an eval caller "
+            "naming a context that carries the object id spells an Entra caller's conversation key",
+        )
+        google = re.search(r'\ba2aGoogleCallerPrefix\s*=\s*"([^"]*)"', h.text("a2a_door_google")).group(1)
+        self.assertNotEqual(prefix, google, "the two verified classes share a caller prefix")
+
+    def test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_roster"), "rosterResolver")
+        self.assertRegex(
+            body,
+            r"if backend == consoleBackend[^{]*\|\| backend == a2aEntraBackend[^{]*\{\s*return func",
+            "the Entra class's roster falls through to principalMapFor, whose default is the chat map",
         )
 
 
@@ -2014,6 +2356,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
+    NOTIFY_TEAMS_PROBE = "chat.notify.teams"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
@@ -2021,7 +2364,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         """The chat.notify route: only the agent asks, only the gateway answers.
 
         The gateway posts what arrives on `chat.notify.gchat` (or, on a
-        Slack-armed gateway, `chat.notify.slack`) to the home channel as the
+        Slack-armed gateway, `chat.notify.slack`; on a Teams-armed one,
+        `chat.notify.teams`) to the home channel as the
         install's bot, and what arrives on `chat.notify.console` into a console
         conversation, so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer
@@ -2034,6 +2378,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         for probe, want in (
             (self.NOTIFY_PROBE, ["agent"]),
             (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_TEAMS_PROBE, ["agent"]),
             (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
             (self.NOTIFY_REPLY_PROBE, ["gateway"]),
         ):
@@ -2797,11 +3142,25 @@ class A3TheA2AChatRoleIsTheA2AGatewaysAlone(unittest.TestCase):
             "the operator renders the a2a-chat binding under a name the broker does not read: "
             "the binding is dropped and the audience alone decides",
         )
+        # Every audience render carries the binding beside it: the Chat-armed
+        # block and the Teams-only block each render the pair, so a binding
+        # found somewhere in the file does not show the block that lost it.
         render = h.text("manifests_go")
-        self.assertRegex(
+        audiences = re.findall(
+            r"Name:\s*credentialProxyA2AChatAudienceEnvVar,\s*Value:\s*credentialProxyA2AChatAudience",
             render,
-            r"Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
-            "the broker env no longer names the A2A gateway's ServiceAccount as the a2a-chat caller",
+        )
+        paired_bindings = re.findall(
+            r"Name:\s*credentialProxyA2AChatAudienceEnvVar,\s*Value:\s*credentialProxyA2AChatAudience\}\s*,\s*"
+            r"corev1\.EnvVar\{Name:\s*credentialProxyA2AChatCallersEnvVar,\s*Value:\s*a2aGatewayBrokerCaller\(agent\)",
+            render,
+        )
+        self.assertGreaterEqual(len(audiences), 1, "the broker env no longer arms the a2a-chat audience")
+        self.assertEqual(
+            len(paired_bindings),
+            len(audiences),
+            "every a2a-chat audience render in the broker env must bind "
+            "credentialProxyA2AChatCallersEnvVar to a2aGatewayBrokerCaller(agent)",
         )
 
     def test_A3_the_exec_tier_keeps_the_a2a_chat_binding(self) -> None:

@@ -2,7 +2,11 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,9 +22,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
+
+// triggerScriptNamesPath is the script-name case list a2a/lib's trigger test
+// and the AgentProfile CRD's spec.scripts test read too.
+const triggerScriptNamesPath = "../../../a2a/lib/testdata/trigger-script-names.json"
 
 // fakeScheduleGateway is the gateway as the reconciler sees it: the same
 // idempotency key returns the same task, as the gateway's KV record does.
@@ -30,6 +39,8 @@ type fakeScheduleGateway struct {
 	tasks   map[string]string
 	sends   []string
 	origins []string
+	// subs are the submissions as the bus submitter would send them.
+	subs []triggerSubmitWire
 	// onSubmit, when set, runs at each submission, before it is answered.
 	onSubmit func(ScheduleSubmission)
 }
@@ -42,6 +53,9 @@ func (g *fakeScheduleGateway) Submit(_ context.Context, sub ScheduleSubmission) 
 	defer g.mu.Unlock()
 	g.sends = append(g.sends, sub.IdempotencyKey)
 	g.origins = append(g.origins, sub.Origin)
+	if sub.Schedule != nil {
+		g.subs = append(g.subs, triggerSubmitFor(sub))
+	}
 	if g.err != nil {
 		return "", g.err
 	}
@@ -72,11 +86,25 @@ func (t *fakeScheduleTracker) State(context.Context, *agentv1alpha1.AgentSchedul
 	return t.state, nil
 }
 
+// fakeScheduleStopper is the gateway's stop: it records the tasks it was
+// asked to stop and answers result, or err.
+type fakeScheduleStopper struct {
+	result string
+	err    error
+	stops  []string
+}
+
+func (s *fakeScheduleStopper) Stop(_ context.Context, _ *agentv1alpha1.AgentSchedule, taskID string) (string, error) {
+	s.stops = append(s.stops, taskID)
+	return s.result, s.err
+}
+
 type scheduleFixture struct {
 	r       *AgentScheduleReconciler
 	c       client.Client
 	gw      *fakeScheduleGateway
 	tracker *fakeScheduleTracker
+	stopper *fakeScheduleStopper
 	clock   time.Time
 	key     types.NamespacedName
 }
@@ -134,8 +162,12 @@ func newScheduleFixtureWith(t *testing.T, mutate func(*agentv1alpha1.AgentSchedu
 	c := fake.NewClientBuilder().WithScheme(setupScheme()).
 		WithObjects(objs...).WithStatusSubresource(&agentv1alpha1.AgentSchedule{}).Build()
 	f := &scheduleFixture{c: c, gw: &fakeScheduleGateway{}, tracker: &fakeScheduleTracker{state: ScheduleTaskState{Found: true}},
-		key: client.ObjectKeyFromObject(sched)}
-	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Now: func() time.Time { return f.clock }}
+		stopper: &fakeScheduleStopper{result: triggerStopStopped}, key: client.ObjectKeyFromObject(sched)}
+	// The fixture's schedule is one the PlatformAgent renders, so a labelled,
+	// controlled one runs as built-in.
+	builtin := sched.Name
+	f.r = &AgentScheduleReconciler{Client: c, Scheme: c.Scheme(), Submitter: f.gw, Tracker: f.tracker, Stopper: f.stopper, Now: func() time.Time { return f.clock },
+		BuiltinNames: func(*agentv1alpha1.PlatformAgent) []string { return []string{builtin} }}
 	return f
 }
 
@@ -156,6 +188,25 @@ func (f *scheduleFixture) get(t *testing.T) *agentv1alpha1.AgentSchedule {
 		t.Fatal(err)
 	}
 	return &s
+}
+
+// listScripts sets the fixture profile's spec.scripts to names, the
+// allowlist a script schedule's script must be on.
+func (f *scheduleFixture) listScripts(t *testing.T, names ...string) {
+	t.Helper()
+	var p agentv1alpha1.AgentProfile
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.key.Namespace, Name: "fleet-audit"}, &p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Scripts = nil
+	for _, n := range names {
+		p.Spec.Scripts = append(p.Spec.Scripts, agentv1alpha1.AgentProfileScript{
+			Name: n, Path: agentv1alpha1.AgentProfileScriptRoot + n + ".py", TimeoutSeconds: 300,
+		})
+	}
+	if err := f.c.Update(context.Background(), &p); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func hourAt(h, m int) time.Time { return time.Date(2026, 11, 11, h, m, 0, 0, time.UTC) }
@@ -356,6 +407,54 @@ func TestAgentScheduleRecordsATerminal(t *testing.T) {
 	}
 }
 
+// A terminal's reason is recorded on the run and as the last reason; a reason
+// off the CRD's shape is dropped rather than failing the status write; a Lost
+// run carries none.
+func TestAgentScheduleRecordsARunsReason(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(1, 20), Reason: "deadline-exceeded"}
+	f.at(t, hourAt(1, 21))
+	s := f.get(t)
+	if s.Status.LastReason != "deadline-exceeded" || len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Reason != "deadline-exceeded" {
+		t.Fatalf("status = %+v; want the run and the last reason deadline-exceeded", s.Status)
+	}
+	// The next run is Lost: the last reason is cleared, not carried over.
+	f.tracker.state = ScheduleTaskState{Found: true}
+	f.at(t, hourAt(2, 0))
+	f.tracker.state = ScheduleTaskState{Found: false}
+	f.at(t, hourAt(3, 0))
+	s = f.get(t)
+	if s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeLost || s.Status.LastReason != "" {
+		t.Fatalf("status = %+v; want a Lost run with no reason", s.Status)
+	}
+	// A reason off the CRD's shape is dropped (knownReason). The fixture's
+	// client doesn't validate the CRD pattern; TestRunReasonShapeIsTheCRDsPattern
+	// pins that knownReason is that pattern.
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: hourAt(3, 20), Reason: "not a token; with detail"}
+	f.at(t, hourAt(3, 21))
+	s = f.get(t)
+	if s.Status.LastOutcome != agentv1alpha1.AgentScheduleOutcomeFailed || s.Status.LastReason != "" || s.Status.RecentRuns[0].Reason != "" {
+		t.Fatalf("status = %+v; want an off-shape reason dropped", s.Status)
+	}
+}
+
+func TestKnownReason(t *testing.T) {
+	for in, want := range map[string]string{
+		"write-refused":          "write-refused",
+		"error_during_execution": "error_during_execution",
+		"":                       "",
+		"has space":              "",
+		"reason: x":              "",
+		strings.Repeat("a", 65):  "",
+	} {
+		if got := knownReason(in); got != want {
+			t.Errorf("knownReason(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // run-now starts a run with its own key and leaves the cadence alone; a
 // second token while that run is live adopts it.
 func TestAgentScheduleRunNowStartsOrAdoptsARun(t *testing.T) {
@@ -379,6 +478,160 @@ func TestAgentScheduleRunNowStartsOrAdoptsARun(t *testing.T) {
 	f.at(t, hourAt(0, 55))
 	if s = f.get(t); len(f.gw.sends) != 1 || s.Status.LastHandledRunNow != "t2" || s.Status.ActiveTaskID != "task-1" {
 		t.Fatalf("a run-now during a live run started a second one: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+}
+
+// annotate sets the schedule's stop token.
+func (f *scheduleFixture) annotateStop(t *testing.T, token string) {
+	t.Helper()
+	s := f.get(t)
+	if s.Annotations == nil {
+		s.Annotations = map[string]string{}
+	}
+	s.Annotations[agentv1alpha1.AgentScheduleStopAnnotation] = token
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A new stop token ends the run in flight through the gateway, once (#6052):
+// the token is recorded as handled, the same token again stops nothing, and
+// the run's canceled terminal lands as Cancelled.
+func TestAgentScheduleAStopTokenEndsTheRunInFlightOnce(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	active := f.get(t).Status.ActiveTaskID
+	if active == "" {
+		t.Fatal("no run in flight")
+	}
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 2))
+	s := f.get(t)
+	if len(f.stopper.stops) != 1 || f.stopper.stops[0] != active || s.Status.LastHandledStop != "s1" {
+		t.Fatalf("stops = %v, lastHandledStop = %q", f.stopper.stops, s.Status.LastHandledStop)
+	}
+	f.at(t, hourAt(1, 3))
+	if len(f.stopper.stops) != 1 {
+		t.Fatalf("a handled token stopped again: %v", f.stopper.stops)
+	}
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: scheduleOutcomeFor(a2aStateCanceled), CompletedAt: hourAt(1, 4)}
+	f.at(t, hourAt(1, 5))
+	s = f.get(t)
+	if s.Status.ActiveTaskID != "" || len(s.Status.RecentRuns) != 1 || s.Status.RecentRuns[0].Outcome != agentv1alpha1.AgentScheduleOutcomeCancelled {
+		t.Fatalf("after the canceled terminal: %+v", s.Status)
+	}
+}
+
+// With nothing running, a stop token is handled at once and asks the gateway
+// nothing. A claim still in flight isn't dropped (the gateway may already have
+// taken it): the token waits until the claim resolves into a run, which the
+// next pass stops.
+func TestAgentScheduleAStopWaitsForAClaimInFlight(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.annotateStop(t, "s0")
+	f.at(t, hourAt(0, 45))
+	if s := f.get(t); s.Status.LastHandledStop != "s0" || len(f.stopper.stops) != 0 {
+		t.Fatalf("with nothing running: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+	f.gw.err = fmt.Errorf("dial: %w", ErrScheduleGatewayUnavailable)
+	f.at(t, hourAt(1, 0))
+	if f.get(t).Status.PendingSlot == nil {
+		t.Fatal("no claim held")
+	}
+	f.annotateStop(t, "s1")
+	f.gw.err = nil
+	f.at(t, hourAt(1, 1))
+	s := f.get(t)
+	if s.Status.ActiveTaskID == "" || s.Status.LastHandledStop != "s0" || len(f.stopper.stops) != 0 {
+		t.Fatalf("the claim in flight: status = %+v, stops = %v", s.Status, f.stopper.stops)
+	}
+	f.at(t, hourAt(1, 2))
+	s = f.get(t)
+	if s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 1 || f.stopper.stops[0] != s.Status.ActiveTaskID {
+		t.Fatalf("the run the claim became: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+}
+
+// A run-now asked for after a stop isn't an adoption of the run being
+// stopped: it waits for that run to settle, then starts a new one.
+func TestAgentScheduleARunNowAfterAStopStartsANewRun(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	first := f.get(t).Status.ActiveTaskID
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	s := f.get(t)
+	s.Annotations[agentv1alpha1.AgentScheduleRunNowAnnotation] = "r1"
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(1, 2))
+	if s = f.get(t); s.Status.LastHandledRunNow != "" || len(f.gw.sends) != 1 {
+		t.Fatalf("the run-now adopted the stopping run: lastHandledRunNow = %q, sends = %v", s.Status.LastHandledRunNow, f.gw.sends)
+	}
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: scheduleOutcomeFor(a2aStateCanceled), CompletedAt: hourAt(1, 3)}
+	f.at(t, hourAt(1, 4))
+	s = f.get(t)
+	if s.Status.LastHandledRunNow != "r1" || len(f.gw.sends) != 2 || s.Status.ActiveTaskID == first || s.Status.StoppedTaskID != "" {
+		t.Fatalf("after the stopped run settled: status = %+v, sends = %v", s.Status, f.gw.sends)
+	}
+}
+
+// A stop the gateway refuses for good is handled, not retried.
+func TestAgentScheduleARefusedStopIsNotRetried(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.stopper.err = fmt.Errorf("%w (invalid): the run predates the record of its trigger", errTriggerStopRefused)
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 1 {
+		t.Fatalf("lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+}
+
+// An API server serving a CRD from before lastHandledStop prunes it. The
+// stop isn't sent then: a token that can't be recorded would read as new on
+// every pass and stop every later run.
+func TestAgentScheduleAStopIsNotSentWhenTheTokenCantBeRecorded(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if s, ok := obj.(*agentv1alpha1.AgentSchedule); ok {
+				s.Status.LastHandledStop, s.Status.StoppedTaskID = "", ""
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	f.at(t, hourAt(1, 2))
+	if len(f.stopper.stops) != 0 {
+		t.Fatalf("a stop was sent with its token pruned: %v", f.stopper.stops)
+	}
+}
+
+// A gateway that doesn't answer the stop (an older one, say) leaves the token
+// unhandled and comes back soon; the next pass that's answered handles it.
+func TestAgentScheduleAnUnansweredStopIsTriedAgain(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	f.annotateStop(t, "s1")
+	res := f.at(t, hourAt(1, 1))
+	if s := f.get(t); s.Status.LastHandledStop != "" || res.RequeueAfter > agentScheduleRetry {
+		t.Fatalf("an unanswered stop: lastHandledStop = %q, requeue = %s", s.Status.LastHandledStop, res.RequeueAfter)
+	}
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 2 {
+		t.Fatalf("the retry: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
 	}
 }
 
@@ -513,12 +766,15 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 		name       string
 		controlled bool
 		label      string
+		rendered   bool
 		builtin    bool
+		reason     string
 	}{
-		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, false},
-		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, false},
-		{"controlled, unlabelled", true, "", false},
-		{"controlled by the install, labelled builtin", true, agentv1alpha1.AgentScheduleOriginBuiltin, true},
+		{"labelled builtin, not controlled", false, agentv1alpha1.AgentScheduleOriginBuiltin, true, false, agentScheduleReasonBuiltinNotFromOperator},
+		{"controlled, labelled user", true, agentv1alpha1.AgentScheduleOriginUser, true, false, agentScheduleReasonUserDeferred},
+		{"controlled, unlabelled", true, "", true, false, agentScheduleReasonUserDeferred},
+		{"controlled and labelled builtin, not a schedule the install renders", true, agentv1alpha1.AgentScheduleOriginBuiltin, false, false, agentScheduleReasonBuiltinNotFromOperator},
+		{"controlled by the install, labelled builtin, rendered", true, agentv1alpha1.AgentScheduleOriginBuiltin, true, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
@@ -531,6 +787,9 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 					s.OwnerReferences = nil
 				}
 			})
+			if !tc.rendered {
+				f.r.BuiltinNames = func(*agentv1alpha1.PlatformAgent) []string { return nil }
+			}
 			f.at(t, hourAt(0, 45))
 			f.at(t, hourAt(1, 0))
 			if tc.builtin {
@@ -544,10 +803,240 @@ func TestAgentScheduleOriginNeedsTheControllerAndTheLabel(t *testing.T) {
 			}
 			got := f.get(t)
 			cond := meta.FindStatusCondition(got.Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
-			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != agentScheduleReasonUserDeferred {
-				t.Fatalf("Accepted = %+v, want False/%s", cond, agentScheduleReasonUserDeferred)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != tc.reason {
+				t.Fatalf("Accepted = %+v, want False/%s", cond, tc.reason)
 			}
 		})
+	}
+}
+
+// The operator renders no built-in schedules yet, so with the rendered set
+// every builtin-labelled schedule reads BuiltinNotFromOperator and fires
+// nothing, however it was written.
+func TestAgentScheduleNoScheduleIsBuiltinUntilTheOperatorRendersOne(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.r.BuiltinNames = nil
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
+		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
+	}
+}
+
+// A built-in schedule's script reaches the gateway on the run's trigger.
+func TestAgentScheduleABuiltinScriptIsForwarded(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+		s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
+	})
+	f.listScripts(t, "stall-watch")
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	if len(f.gw.subs) != 1 {
+		t.Fatalf("submitted %d runs, want 1", len(f.gw.subs))
+	}
+	if sub := f.gw.subs[0]; sub.Skills != nil || sub.MaxTurns != 0 {
+		t.Errorf("a script run's submission carries skills %v and maxTurns %d", sub.Skills, sub.MaxTurns)
+	}
+	got := f.gw.subs[0].Trigger
+	if got != (triggerClaimWire{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "stall-watch"}) {
+		t.Fatalf("trigger = %+v, want the script on the built-in trigger", got)
+	}
+	c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("Accepted = %+v", c)
+	}
+}
+
+// Only a built-in schedule may name a script: any other one that does reads
+// Accepted=False, InvalidSchedule, whatever else would have held it back,
+// and nothing is submitted. So does one naming both a prompt and a script,
+// or neither, which the CRD refuses but a stored object might carry.
+func TestAgentScheduleAScriptOffABuiltinIsNotAccepted(t *testing.T) {
+	script := func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt, s.Spec.Script = "", "stall-watch" }
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.AgentSchedule)
+		notIn  bool
+	}{
+		{"a user schedule", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Labels[agentv1alpha1.AgentScheduleOriginLabel] = agentv1alpha1.AgentScheduleOriginUser
+			s.OwnerReferences = nil
+		}, false},
+		{"labelled builtin, not controlled", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.OwnerReferences = nil
+		}, false},
+		{"controlled and labelled, not one the install renders", script, true},
+		{"a prompt and a script", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Script = "stall-watch" }, false},
+		{"neither", func(s *agentv1alpha1.AgentSchedule) { s.Spec.Prompt = "" }, false},
+		// The fake client stores what the CRD's CEL rule would refuse: a
+		// script beside skills or maxTurns, on a built-in schedule whose
+		// profile lists the script.
+		{"a script with skills", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Spec.Skills = []string{"fleet-audit"}
+		}, false},
+		{"a script with maxTurns", func(s *agentv1alpha1.AgentSchedule) {
+			script(s)
+			s.Spec.MaxTurns = ptr.To[int32](5)
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newScheduleFixture(t, tc.mutate)
+			f.listScripts(t, "stall-watch")
+			if tc.notIn {
+				f.r.BuiltinNames = func(*agentv1alpha1.PlatformAgent) []string { return nil }
+			}
+			f.at(t, hourAt(0, 45))
+			f.at(t, hourAt(1, 0))
+			if len(f.gw.sends) != 0 {
+				t.Fatalf("submitted %v", f.gw.sends)
+			}
+			c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+			if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonInvalidSchedule {
+				t.Fatalf("Accepted = %+v, want False/%s", c, agentScheduleReasonInvalidSchedule)
+			}
+		})
+	}
+}
+
+// A built-in schedule's script must be on its profile's spec.scripts: one the
+// profile doesn't list reads Accepted=False, ProfileScriptUnknown, and
+// nothing is submitted.
+func TestAgentScheduleAScriptTheProfileDoesNotListIsNotAccepted(t *testing.T) {
+	for _, listed := range [][]string{nil, {"other-script"}} {
+		f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+			s.Spec.Prompt, s.Spec.Script = "", "stall-watch"
+		})
+		if listed != nil {
+			f.listScripts(t, listed...)
+		}
+		f.at(t, hourAt(0, 45))
+		f.at(t, hourAt(1, 0))
+		if len(f.gw.sends) != 0 {
+			t.Fatalf("listed %v: submitted %v", listed, f.gw.sends)
+		}
+		c := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != agentScheduleReasonProfileScriptUnknown ||
+			!strings.Contains(c.Message, `"stall-watch"`) {
+			t.Fatalf("listed %v: Accepted = %+v, want False/%s naming the script", listed, c, agentScheduleReasonProfileScriptUnknown)
+		}
+	}
+}
+
+// A built-in schedule with no script sends what it sent before spec.script
+// existed, byte for byte: the operator's prompt-run fixture, which predates
+// the field, with only the reconciler's own slot key and schedule.
+func TestAgentScheduleAPromptRunIsUnchanged(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	if len(f.gw.subs) != 1 {
+		t.Fatalf("submitted %d runs, want 1", len(f.gw.subs))
+	}
+	got, err := json.Marshal(f.gw.subs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(`{"trigger":{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"},`+
+		`"idempotencyKey":"schedule/kubeagents-system/compliance-audit/%d",`+
+		`"schedule":{"namespace":"kubeagents-system","name":"compliance-audit"},"profile":"fleet-audit",`+
+		`"prompt":"Run the compliance audit.","activeDeadlineSeconds":3600,`+
+		`"delivery":{"mode":"chat","jobKey":"compliance-audit"}}`, hourAt(1, 0).Unix())
+	if string(got) != want {
+		t.Fatalf("submission =\n%s\nwant\n%s", got, want)
+	}
+}
+
+// TestAgentScheduleScriptNamesEnvtest holds spec.script to the names
+// lib.ValidateTrigger takes, on the one case list a2a/lib's
+// TestValidateTriggerScriptNamesMatchTheCRD reads, and holds prompt and
+// script to exactly one.
+func TestAgentScheduleScriptNamesEnvtest(t *testing.T) {
+	raw, err := os.ReadFile(triggerScriptNamesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names struct {
+		Accepted []string `json:"accepted"`
+		Refused  []string `json:"refused"`
+	}
+	if err := json.Unmarshal(raw, &names); err != nil {
+		t.Fatal(err)
+	}
+	if len(names.Accepted) == 0 || len(names.Refused) == 0 {
+		t.Fatalf("the case list is empty: %+v", names)
+	}
+	cl, _ := startEnvtest(t)
+	ctx := context.Background()
+	if err := cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kubeagents-system"}}); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	mk := func(prompt, script string) *agentv1alpha1.AgentSchedule {
+		n++
+		return &agentv1alpha1.AgentSchedule{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("s-%d", n), Namespace: "kubeagents-system"},
+			Spec: agentv1alpha1.AgentScheduleSpec{
+				Schedule: "20 6 * * *", ProfileRef: agentv1alpha1.AgentScheduleProfileRef{Name: "helpers"},
+				Prompt: prompt, Script: script,
+			},
+		}
+	}
+	for _, name := range names.Accepted {
+		s := mk("", name)
+		if err := cl.Create(ctx, s); err != nil {
+			t.Errorf("script %q refused: %v", name, err)
+			continue
+		}
+		var back agentv1alpha1.AgentSchedule
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(s), &back); err != nil || back.Spec.Script != name {
+			t.Errorf("script %q read back as %q (%v)", name, back.Spec.Script, err)
+		}
+	}
+	for _, name := range names.Refused {
+		if err := cl.Create(ctx, mk("", name)); err == nil || !apierrors.IsInvalid(err) {
+			t.Errorf("script %q: create = %v, want refused as invalid", name, err)
+		}
+	}
+	if err := cl.Create(ctx, mk("Run the audit.", "stall-watch")); err == nil || !apierrors.IsInvalid(err) ||
+		!strings.Contains(err.Error(), "exactly one of spec.prompt and spec.script") {
+		t.Errorf("a prompt and a script: create = %v, want the CEL rule's refusal", err)
+	}
+	if err := cl.Create(ctx, mk("", "")); err == nil || !apierrors.IsInvalid(err) ||
+		!strings.Contains(err.Error(), "exactly one of spec.prompt and spec.script") {
+		t.Errorf("neither: create = %v, want the CEL rule's refusal", err)
+	}
+	// skills and maxTurns shape a model run: beside a script they are
+	// refused, and on a prompt run (an object as it was before script
+	// existed) they still validate.
+	turns := int32(5)
+	withSkills := mk("", "stall-watch")
+	withSkills.Spec.Skills = []string{"fleet-audit"}
+	withTurns := mk("", "stall-watch")
+	withTurns.Spec.MaxTurns = &turns
+	for what, s := range map[string]*agentv1alpha1.AgentSchedule{"skills": withSkills, "maxTurns": withTurns} {
+		if err := cl.Create(ctx, s); err == nil || !apierrors.IsInvalid(err) ||
+			!strings.Contains(err.Error(), "a script run takes neither") {
+			t.Errorf("a script with %s: create = %v, want the CEL rule's refusal", what, err)
+		}
+	}
+	promptRun := mk("Run the audit.", "")
+	promptRun.Spec.Skills = []string{"fleet-audit"}
+	promptRun.Spec.MaxTurns = &turns
+	if err := cl.Create(ctx, promptRun); err != nil {
+		t.Errorf("a prompt run with skills and maxTurns: create = %v, want accepted", err)
+	}
+	// An empty script sent explicitly is refused too, not read as absent.
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": agentv1alpha1.GroupVersion.String(), "kind": "AgentSchedule",
+		"metadata": map[string]any{"name": "empty-script", "namespace": "kubeagents-system"},
+		"spec":     map[string]any{"schedule": "0 * * * *", "profileRef": map[string]any{"name": "helpers"}, "prompt": "no-op", "script": ""},
+	}}
+	if err := cl.Create(ctx, u); err == nil || !apierrors.IsInvalid(err) {
+		t.Errorf("an explicit empty script: create = %v, want refused as invalid", err)
 	}
 }
 
@@ -848,4 +1337,154 @@ func TestAgentScheduleRecordsHowARunsReportWasDelivered(t *testing.T) {
 			t.Fatalf("a delivery was asked after past the window: %+v", s.Status.RecentRuns[0])
 		}
 	})
+}
+
+// A stop whose answer never made it into status (the stop failed and the
+// pass's last status write failed too, or the operator died meanwhile) is
+// sent again on the next pass: the token is recorded only once the gateway
+// has answered, never before.
+func TestAgentScheduleAStopLostBeforeItsAnswerIsSentAgain(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	inner := f.r.Client
+	writes := 0
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes++
+			if writes > 1 {
+				return errors.New("the API server is unavailable")
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	f.annotateStop(t, "s1")
+	f.clock = hourAt(1, 1)
+	_, _ = f.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: f.key})
+	if s := f.get(t); s.Status.LastHandledStop == "s1" {
+		t.Fatal("the token was persisted as handled before the gateway answered")
+	}
+	f.r.Client = inner
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 2))
+	if s := f.get(t); s.Status.LastHandledStop != "s1" || len(f.stopper.stops) != 2 {
+		t.Fatalf("the lost stop: lastHandledStop = %q, stops = %v", s.Status.LastHandledStop, f.stopper.stops)
+	}
+}
+
+// While a stop is retried after a transient failure, the run being stopped
+// stays recorded (as a claimed slot does): a run-now set meanwhile isn't an
+// adoption of it and starts a new run once it has ended, and a retry pass that
+// changes nothing writes nothing.
+func TestAgentScheduleARetriedStopKeepsTheRunItStops(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	active := f.get(t).Status.ActiveTaskID
+	f.stopper.err = fmt.Errorf("no answer: %w", ErrScheduleGatewayUnavailable)
+	s := f.get(t)
+	s.Annotations = map[string]string{
+		agentv1alpha1.AgentScheduleStopAnnotation:   "s1",
+		agentv1alpha1.AgentScheduleRunNowAnnotation: "r1",
+	}
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(1, 1))
+	s = f.get(t)
+	if s.Status.StoppedTaskID != active || s.Status.LastHandledRunNow != "" || s.Status.LastHandledStop != "" {
+		t.Fatalf("after a failed stop: stoppedTaskID = %q, lastHandledRunNow = %q, lastHandledStop = %q",
+			s.Status.StoppedTaskID, s.Status.LastHandledRunNow, s.Status.LastHandledStop)
+	}
+	inner := f.r.Client
+	writes := 0
+	f.r.Client = interceptor.NewClient(f.c.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			writes++
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	})
+	f.at(t, hourAt(1, 2))
+	if writes != 0 {
+		t.Fatalf("a retry pass that changed nothing wrote status %d times", writes)
+	}
+	f.r.Client = inner
+	f.stopper.err = nil
+	f.at(t, hourAt(1, 3))
+	f.tracker.state = ScheduleTaskState{Found: true, Terminal: true, Outcome: scheduleOutcomeFor(a2aStateCanceled), CompletedAt: hourAt(1, 4)}
+	f.at(t, hourAt(1, 5))
+	s = f.get(t)
+	if s.Status.LastHandledStop != "s1" || s.Status.LastHandledRunNow != "r1" || s.Status.ActiveTaskID == active || len(f.gw.sends) != 2 {
+		t.Fatalf("after the stop and the run's end: status = %+v, sends = %v", s.Status, f.gw.sends)
+	}
+}
+
+// A stop the gateway refuses for good clears the run being stopped, so a
+// run-now afterwards adopts the run still going, as it would with no stop.
+func TestAgentScheduleARefusedStopClearsTheRunItStops(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	f.stopper.err = fmt.Errorf("%w (invalid): the run predates the record of its trigger", errTriggerStopRefused)
+	f.annotateStop(t, "s1")
+	f.at(t, hourAt(1, 1))
+	if s := f.get(t); s.Status.StoppedTaskID != "" || s.Status.LastHandledStop != "s1" {
+		t.Fatalf("after a refused stop: stoppedTaskID = %q, lastHandledStop = %q", s.Status.StoppedTaskID, s.Status.LastHandledStop)
+	}
+}
+
+// A controller reference of another kind that carries the PlatformAgent's uid
+// doesn't make a schedule built-in: metav1.IsControlledBy matches uids alone,
+// so the reconciler checks the kind too.
+func TestAgentScheduleAControllerOfAnotherKindIsNotThePlatformAgent(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) {
+		s.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "v1", Kind: "ConfigMap", Name: "not-an-agent", UID: "agent-uid", Controller: ptr.To(true),
+		}}
+	})
+	f.at(t, hourAt(0, 45))
+	f.at(t, hourAt(1, 0))
+	cond := meta.FindStatusCondition(f.get(t).Status.Conditions, agentv1alpha1.AgentScheduleConditionAccepted)
+	if len(f.gw.sends) != 0 || cond == nil || cond.Reason != agentScheduleReasonBuiltinNotFromOperator {
+		t.Fatalf("sends = %v, Accepted = %+v", f.gw.sends, cond)
+	}
+}
+
+// TestRunReasonShapeIsTheCRDsPattern: the reconciler drops what the CRD would
+// refuse, so its shape and the generated CRD's pattern for both reason
+// fields are the same expression.
+func TestRunReasonShapeIsTheCRDsPattern(t *testing.T) {
+	crd, err := os.ReadFile(filepath.Join("..", "..", "config", "crd", "bases", "kubeagents.x-k8s.io_agentschedules.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "pattern: " + runReasonShape.String()
+	if n := strings.Count(string(crd), want); n < 2 {
+		t.Fatalf("the CRD has %d %q lines, want one each for reason and lastReason", n, want)
+	}
+}
+
+// run-now runs a suspended schedule. A run-now-only built-in (the onboarding
+// row, builtinSchedule.RunNowOnly) renders suspended on a nominal schedule
+// and relies on this: the reconciler handles a run-now token before it skips
+// a suspended slot. Reordering those two turns onboarding off with nothing to
+// show for it, so this pins the order.
+func TestARunNowRunsASuspendedSchedule(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Suspend = true })
+	f.at(t, hourAt(0, 45))
+	s := f.get(t)
+	s.Annotations = map[string]string{agentv1alpha1.AgentScheduleRunNowAnnotation: "once"}
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 50))
+	if s = f.get(t); len(f.gw.sends) != 1 || s.Status.LastHandledRunNow != "once" {
+		t.Fatalf("a run-now on a suspended schedule ran nothing: sends = %v, status = %+v", f.gw.sends, s.Status)
+	}
+	// Its slots stay skipped.
+	f.at(t, hourAt(2, 0))
+	if s = f.get(t); s.Status.SkipCounts.Suspended == 0 {
+		t.Fatalf("a suspended schedule's slot wasn't skipped: %+v", s.Status)
+	}
 }

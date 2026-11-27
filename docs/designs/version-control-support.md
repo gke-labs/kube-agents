@@ -919,7 +919,7 @@ proposal, which no caller-supplied field can prove.
 
 The broker checks what the create kept with the token, never a repository or
 number the caller sends. The claim answers 200 with `{url, number, title}` when
-the forge confirms the proposal: open, at that url, authored by this
+the forge confirms the proposal: open or already merged, at that url, authored by this
 credential, and created inside the window. It answers 404 `CLAIM_UNKNOWN` for a
 token that is unknown, already burned or expired, or whose `url` does not
 match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, 502
@@ -948,6 +948,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                                      |
 | `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                                            |
 | `proposal-reviews`                   | `{repository, number, limit?}`                                       | `{reviews, count, truncated}` (library callers only)                                     |
+| `proposal-closer`                    | `{repository, number}`                                               | `{actor, bot}` (library callers only)                                                    |
 | `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                                         |
 | `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                                |
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                                 |
@@ -983,11 +984,11 @@ thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
 The rows down to `issue-create` except `snapshot`, `proposal-claim` and `proposal-practice-label`, and the two branch rows, are the
-version-control skill's. `snapshot`, `proposal-claim`, `revision-contains`, `proposal-reviews` and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
+version-control skill's. `snapshot`, `proposal-claim`, `revision-contains`, `proposal-reviews`, `proposal-closer`, and `proposal-practice-label` are the library verbs (`LIBRARY_VERBS` in
 `providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
 (`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
 which presents the token from a proposal record line. `revision-contains` is for the
-post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-reviews`, every submitted review with its state, is for the post-merge check too: a change request makes a merged fix not clean. `proposal-practice-label` is served to fleet-audit's
+post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. `proposal-reviews`, every submitted review with its state, is for the post-merge check too: a change request makes a merged fix not clean. `proposal-closer` returns who closed an unmerged proposal for the Decision Memory sweep's closer authority check. `proposal-practice-label` is served to fleet-audit's
 `audit_report.py` after it opens a disruption-budget fix: the broker judges the proposal from its own reads
 and adds or removes the reserved `kube-agents:would-auto-merge` or `kube-agents:auto-merge` label
 ([automation rules](../site/src/content/docs/reference/automation-rules.md) says when), and every other

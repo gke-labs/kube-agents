@@ -1,6 +1,6 @@
 // Command curator is the Go OKF Curator and Dreamer daemon and CLI for kube-agents.
 // It subscribes to NATS JetStream (a2a.topics.shared.annotations on TOPICS-JOURNAL
-// and _INBOX.agent.curator.outcomes), synthesizes and updates Operational Knowledge
+// and a2a.topics.agent.platform.curator-outcomes), synthesizes and updates Operational Knowledge
 // Framework (OKF) records (DEC-* and LES-*), indexes them verbatim into Hindsight
 // (kube-agents-decisions) with in-place status transitions, graduates multi-cluster
 // recurrences into fleet-wide decisions, and broadcasts the active digest to
@@ -27,18 +27,29 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/memory"
+	"github.com/nats-io/nats.go"
 )
 
 const (
-	defaultCLIStoreDir      = "/opt/data/memory/knowledge-store"
-	defaultManagedReposPath = "/etc/gitops/managed_repos"
-	defaultRecurrenceFloor  = 2
-	cliOpTimeout            = 30 * time.Second
-	indexOpTimeout          = 60 * time.Second
-	overseerTimeout         = 15 * time.Second
-	maxCheckFileBytes       = 4 << 20
-	statusReadHeaderTimeout = 5 * time.Second
-	exitCodeBlocked         = 2
+	defaultCLIStoreDir           = "/opt/data/memory/knowledge-store"
+	defaultAgentHomeDir          = "/opt/data"
+	defaultManagedReposPath      = "/etc/gitops/managed_repos"
+	hindsightConfigSubdir        = "hindsight"
+	hindsightConfigFilename      = "config.json"
+	hindsightConfigEndpointField = "api_url"
+	hindsightConfigFallbackField = "url"
+	envDecisionHindsightURL      = "DECISION_MEMORY_HINDSIGHT_URL"
+	envHindsightAPIURL           = "HINDSIGHT_API_URL"
+	envPlatformAgentHome         = "PLATFORM_AGENT_HOME"
+	flagNameRepoID               = "repo-id"
+	flagNameGuardSeverity        = "guard-severity"
+	defaultRecurrenceFloor       = 2
+	cliOpTimeout                 = 30 * time.Second
+	indexOpTimeout               = 60 * time.Second
+	overseerTimeout              = 15 * time.Second
+	maxCheckFileBytes            = 4 << 20
+	statusReadHeaderTimeout      = 5 * time.Second
+	exitCodeBlocked              = 2
 )
 
 const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator and Dreamer for kube-agents
@@ -163,37 +174,7 @@ func connectNATS(ctx context.Context, name string, log *slog.Logger) (*lib.Clien
 }
 
 func extractRepoSlug(u string) string {
-	s := strings.TrimRight(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(u), ".git")), "/")
-	for _, scheme := range []string{"https://", "http://", "ssh://"} {
-		s = strings.TrimPrefix(s, scheme)
-	}
-	if at := strings.Index(s, "@"); at >= 0 {
-		s = s[at+1:]
-	}
-	// Convert SCP-style host:owner/repo to host/owner/repo without clobbering host:port/owner/repo.
-	if colon := strings.Index(s, ":"); colon >= 0 {
-		slash := strings.Index(s, "/")
-		if slash < 0 || colon < slash {
-			portPart := s[colon+1:]
-			if slash > colon {
-				portPart = s[colon+1 : slash]
-			}
-			isPort := portPart != ""
-			for _, ch := range portPart {
-				if ch < '0' || ch > '9' {
-					isPort = false
-					break
-				}
-			}
-			if !isPort {
-				s = s[:colon] + "/" + s[colon+1:]
-			}
-		}
-	}
-	if slash := strings.Index(s, "/"); slash > 0 && strings.Contains(s[:slash], ".") {
-		return strings.Trim(s[slash+1:], "/")
-	}
-	return strings.Trim(s, "/")
+	return memory.ExtractRepoSlug(u)
 }
 
 func defaultRepoID() string {
@@ -243,10 +224,28 @@ func defaultRepoDir() string {
 }
 
 func defaultHindsightURL() string {
-	if v := os.Getenv("DECISION_MEMORY_HINDSIGHT_URL"); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envDecisionHindsightURL)); v != "" {
 		return v
 	}
-	return os.Getenv("HINDSIGHT_API_URL")
+	if v := strings.TrimSpace(os.Getenv(envHindsightAPIURL)); v != "" {
+		return v
+	}
+	agentHome := strings.TrimRight(strings.TrimSpace(os.Getenv(envPlatformAgentHome)), "/")
+	if agentHome == "" {
+		agentHome = defaultAgentHomeDir
+	}
+	cfgPath := filepath.Join(filepath.Clean(agentHome), hindsightConfigSubdir, hindsightConfigFilename)
+	if raw, err := readFileViaDirRoot(cfgPath); err == nil && strings.TrimSpace(string(raw)) != "" {
+		var parsed map[string]any
+		if json.Unmarshal(raw, &parsed) == nil {
+			for _, field := range []string{hindsightConfigEndpointField, hindsightConfigFallbackField} {
+				if u, ok := parsed[field].(string); ok && strings.TrimSpace(u) != "" {
+					return strings.TrimSpace(u)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func runDaemon(args []string) error {
@@ -262,49 +261,12 @@ func runDaemonContext(ctx context.Context, args []string) error {
 	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	threshold := fs.Int("recurrence-threshold", defaultRecurrenceFloor, "clusters required to graduate a lesson to a fleet-wide decision")
-	statusListen := fs.String("status-listen", strings.TrimSpace(os.Getenv("CURATOR_STATUS_LISTEN")), "optional HTTP address serving /healthz and /readyz (for example, :8080)")
+	statusListen := fs.String("status-listen", strings.TrimSpace(os.Getenv("CURATOR_STATUS_LISTEN")), "optional HTTP address serving /healthz, /readyz, and /metrics (for example, :8080)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	var ready atomic.Bool
-	var statusSrv *http.Server
-	if *statusListen != "" {
-		ln, lnErr := net.Listen("tcp", *statusListen)
-		if lnErr != nil {
-			return fmt.Errorf("listen status %s: %w", *statusListen, lnErr)
-		}
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok\n"))
-		})
-		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-			if !ready.Load() {
-				http.Error(w, "not ready", http.StatusServiceUnavailable)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ready\n"))
-		})
-		statusSrv = &http.Server{
-			Handler:           mux,
-			ReadHeaderTimeout: statusReadHeaderTimeout,
-		}
-		go func() {
-			if sErr := statusSrv.Serve(ln); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
-				log.Error("curator status server failed", "err", sErr)
-			}
-		}()
-		defer func() {
-			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = statusSrv.Shutdown(shCtx)
-			_ = statusSrv.Close()
-		}()
-	}
 
 	client, err := connectNATS(ctx, "daemon", log)
 	if err != nil {
@@ -334,6 +296,45 @@ func runDaemonContext(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	var ready atomic.Bool
+	var statusSrv *http.Server
+	if *statusListen != "" {
+		ln, lnErr := net.Listen("tcp", *statusListen)
+		if lnErr != nil {
+			return fmt.Errorf("listen status %s: %w", *statusListen, lnErr)
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+			if !ready.Load() {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready\n"))
+		})
+		mux.Handle("/metrics", cur.MetricsHandler())
+		statusSrv = &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: statusReadHeaderTimeout,
+		}
+		go func() {
+			if sErr := statusSrv.Serve(ln); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
+				log.Error("curator status server failed", "err", sErr)
+			}
+		}()
+		defer func() {
+			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = statusSrv.Shutdown(shCtx)
+			_ = statusSrv.Close()
+		}()
+	}
+
 	if err := cur.Start(ctx); err != nil {
 		return err
 	}
@@ -368,10 +369,12 @@ func runEmit(args []string) error {
 	rule := fs.String("rule", "", "guard rule text")
 	pr := fs.String("pr", "", "pull request reference")
 	remediationPR := fs.String("remediation-pr", "", "operational remediation pull request reference")
+	commitSHA := fs.String("commit", "", "commit SHA associated with the proposal or outcome")
 	knowledgePR := fs.Bool("knowledge-pr", false, "true when the merged PR is the knowledge/ proposal PR itself")
 	reason := fs.String("reason", "", "reviewer or persistence reason")
 	initialProposal := fs.String("initial-proposal", "", "superseded initial agent proposal when modified before merge")
 	soakWindow := fs.String("soak-window", "", "post-merge soak window (for example, 10m, 24h, or 7d)")
+	outcome := fs.String("outcome", "", "evidence outcome marker (for example, backfill)")
 	pathsCSV := fs.String("paths", "", "comma-separated governed file globs")
 	guardFile := fs.String("guard-file", "", "guard expect file glob")
 	guardPath := fs.String("guard-path", "", "guard expect YAML path")
@@ -382,6 +385,12 @@ func runEmit(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	guardSeverityExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == flagNameGuardSeverity {
+			guardSeverityExplicit = true
+		}
+	})
 
 	var ev memory.OutcomeEvent
 	if *jsonSpec != "" {
@@ -396,6 +405,15 @@ func runEmit(args []string) error {
 		if err := json.Unmarshal(raw, &ev); err != nil {
 			return fmt.Errorf("parse --json: %w", err)
 		}
+		if strings.TrimSpace(*outcome) != "" && ev.Outcome == "" {
+			ev.Outcome = strings.TrimSpace(*outcome)
+		}
+		if strings.TrimSpace(*commitSHA) != "" && ev.Commit == "" {
+			ev.Commit = strings.TrimSpace(*commitSHA)
+		}
+		if guardSeverityExplicit {
+			ev.GuardSeverity = strings.TrimSpace(*guardSeverity)
+		}
 	} else {
 		var paths []string
 		for _, p := range strings.Split(*pathsCSV, ",") {
@@ -406,6 +424,7 @@ func runEmit(args []string) error {
 		ev = memory.OutcomeEvent{
 			Schema:          memory.OutcomeSchema,
 			Kind:            memory.OutcomeKind(*kind),
+			Outcome:         strings.TrimSpace(*outcome),
 			RecordID:        *recordID,
 			RecordType:      memory.RecordType(*recordType),
 			Repo:            *repo,
@@ -417,10 +436,14 @@ func runEmit(args []string) error {
 			Rule:            *rule,
 			PullRequest:     *pr,
 			RemediationPR:   *remediationPR,
+			Commit:          strings.TrimSpace(*commitSHA),
 			KnowledgePR:     *knowledgePR,
 			ReviewerReason:  *reason,
 			InitialProposal: *initialProposal,
 			SoakWindow:      *soakWindow,
+		}
+		if guardSeverityExplicit {
+			ev.GuardSeverity = strings.TrimSpace(*guardSeverity)
 		}
 		if len(paths) > 0 || *cluster != "" || *checkID != "" {
 			ev.Scope = &memory.RecordScope{Paths: paths}
@@ -488,11 +511,22 @@ func runEmit(args []string) error {
 }
 
 func runPending(args []string) error {
+	defaultRepo := defaultRepoID()
 	fs := flag.NewFlagSet("curator pending", flag.ContinueOnError)
 	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory (used as local fallback)")
-	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
+	repoID := fs.String(flagNameRepoID, defaultRepo, "canonical repository identifier")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	repoIDExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == flagNameRepoID {
+			repoIDExplicit = true
+		}
+	})
+	wantRepo := ""
+	if repoIDExplicit {
+		wantRepo = strings.TrimSpace(*repoID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cliOpTimeout)
 	defer cancel()
@@ -504,6 +538,7 @@ func runPending(args []string) error {
 			if resp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
 				Schema: memory.MemoryQuerySchema,
 				Action: "pending",
+				Repo:   wantRepo,
 			}); qErr == nil {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
@@ -522,9 +557,19 @@ func runPending(args []string) error {
 	digest := memory.BuildBlueprintDigest(*repoID, records, "local-pending", nil)
 	var pending []memory.BlueprintRecordDigest
 	for _, r := range digest.Records {
-		if r.Status == memory.StatusProposed {
-			pending = append(pending, r)
+		if r.Status != memory.StatusProposed {
+			continue
 		}
+		if wantRepo != "" {
+			effRepo := strings.TrimSpace(r.Repo)
+			if effRepo == "" {
+				effRepo = strings.TrimSpace(defaultRepo)
+			}
+			if effRepo != "" && !memory.SameRepoSlug(effRepo, wantRepo) {
+				continue
+			}
+		}
+		pending = append(pending, r)
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -678,55 +723,133 @@ func runIndex(args []string) error {
 	fs := flag.NewFlagSet("curator index", flag.ContinueOnError)
 	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory")
 	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
+	role := fs.String("role", memory.RoleManaged, "repository role: managed|context")
 	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *hsURL == "" {
-		records, err := memory.LoadRecords(*repoDir)
-		if err != nil {
-			return err
-		}
-		var localIDs []string
-		for _, r := range records {
-			if len(memory.ValidateRecord(r)) == 0 {
-				localIDs = append(localIDs, r.Meta.ID)
-			}
-		}
-		if extRecords, err := memory.LoadExternalDocRecords(*repoDir); err == nil {
-			for _, r := range extRecords {
-				localIDs = append(localIDs, r.Meta.ID)
-			}
-		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(map[string]any{
-			"backend":  "okf-local",
-			"repo":     *repoID,
-			"upserted": localIDs,
-			"deleted":  []string{},
-		})
+	normRole := strings.ToLower(strings.TrimSpace(*role))
+	if normRole == "" {
+		normRole = memory.RoleManaged
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), indexOpTimeout)
-	defer cancel()
-	hs := memory.NewHindsightClient(*hsURL, *bank)
-	upserted, deleted, err := memory.SyncRecordsToHindsight(ctx, hs, *repoID, *repoDir)
+	if normRole != memory.RoleManaged && normRole != memory.RoleContext {
+		return fmt.Errorf("invalid --role %q: must be managed or context", *role)
+	}
+
+	records, err := memory.LoadRecords(*repoDir)
 	if err != nil {
 		return err
 	}
-	if deleted == nil {
-		deleted = []string{}
+	var allRecords []memory.Record
+	for _, r := range records {
+		if normRole == memory.RoleManaged {
+			if len(memory.ValidateRecord(r)) == 0 {
+				allRecords = append(allRecords, r)
+			}
+		} else if strings.TrimSpace(r.Meta.ID) != "" && strings.TrimSpace(r.Meta.Title) != "" {
+			allRecords = append(allRecords, r)
+		}
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(map[string]any{
-		"backend":  "hindsight",
-		"bank":     *bank,
-		"repo":     *repoID,
-		"upserted": upserted,
-		"deleted":  deleted,
-	})
+	extRecords, _ := memory.LoadSingleRepoExternalDocRecords(*repoDir)
+	allRecords = append(allRecords, extRecords...)
+	normalized := memory.NormalizeRepoRecords(*repoID, normRole, allRecords)
+
+	writeReceipt := func(backend, bankID, revision string, upserted, deleted []string) error {
+		if upserted == nil {
+			upserted = []string{}
+		}
+		if deleted == nil {
+			deleted = []string{}
+		}
+		out := map[string]any{
+			"backend":  backend,
+			"repo":     *repoID,
+			"repo_id":  *repoID,
+			"role":     normRole,
+			"indexed":  len(upserted),
+			"upserted": upserted,
+			"deleted":  deleted,
+			"revision": revision,
+		}
+		if bankID != "" {
+			out["bank"] = bankID
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+
+	opCtx, cancel := context.WithTimeout(context.Background(), indexOpTimeout)
+	defer cancel()
+
+	if os.Getenv("NATS_URL") != "" {
+		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		client, cErr := connectNATS(opCtx, "index", log)
+		if cErr == nil {
+			defer client.Close()
+			var resp memory.MemoryQueryResponse
+			var nErr error
+			if normRole == memory.RoleManaged {
+				resp, nErr = memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
+					Schema: memory.MemoryQuerySchema,
+					Action: "index",
+					Bank:   *bank,
+					Repo:   *repoID,
+					Role:   memory.RoleManaged,
+				})
+				if nErr != nil && strings.Contains(nErr.Error(), memory.ErrBrokerNotConfigured) {
+					resp, nErr = memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
+						Schema:    memory.MemoryQuerySchema,
+						Action:    "index",
+						Bank:      *bank,
+						Repo:      *repoID,
+						Role:      memory.RoleManaged,
+						FromLocal: true,
+						Records:   normalized,
+					})
+				}
+			} else {
+				resp, nErr = memory.IndexViaNATS(opCtx, client, memory.MemoryQueryRequest{
+					Schema:    memory.MemoryQuerySchema,
+					Action:    "index",
+					Bank:      *bank,
+					Repo:      *repoID,
+					Role:      normRole,
+					FromLocal: true,
+					Records:   normalized,
+				})
+			}
+			if nErr == nil {
+				backend := resp.Backend
+				if backend == "" {
+					backend = "curator"
+				}
+				return writeReceipt(backend, *bank, resp.Revision, resp.Upserted, resp.Deleted)
+			}
+			canFallback := errors.Is(nErr, nats.ErrNoResponders) || errors.Is(nErr, nats.ErrMaxPayload)
+			if !canFallback || *hsURL == "" {
+				return nErr
+			}
+		} else if *hsURL == "" {
+			return cErr
+		}
+	}
+
+	if *hsURL != "" {
+		hs := memory.NewHindsightClient(*hsURL, *bank)
+		upserted, deleted, syncErr := memory.SyncRecordListToHindsight(opCtx, hs, *repoID, normalized)
+		if syncErr != nil {
+			return syncErr
+		}
+		return writeReceipt("hindsight", *bank, "", upserted, deleted)
+	}
+
+	localIDs := make([]string, 0, len(normalized))
+	for _, r := range normalized {
+		localIDs = append(localIDs, r.Meta.ID)
+	}
+	return writeReceipt("okf-local", "", "", localIDs, []string{})
 }
 
 func runDream(args []string) error {
@@ -828,6 +951,7 @@ func runRecall(args []string) error {
 				MaxResults: *maxResults,
 			})
 			if qErr == nil {
+				resp.Results = memory.FrameRecallResultsForRepo(resp.Results, *repoID, nil, nil)
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
 				return enc.Encode(resp)
@@ -860,20 +984,39 @@ func runRecall(args []string) error {
 	byDocID := map[string]memory.Record{}
 	if localRecs, lErr := memory.LoadRecords(*repoDir); lErr == nil {
 		for _, r := range localRecs {
-			byID[r.Meta.ID] = r
-			byDocID[r.DocumentID(*repoID)] = r
+			if strings.TrimSpace(r.Meta.Repo) == "" && strings.TrimSpace(*repoID) != "" {
+				r.Meta.Repo = strings.TrimSpace(*repoID)
+			}
+			recRepo := strings.TrimSpace(r.Meta.Repo)
+			if recRepo == "" {
+				recRepo = strings.TrimSpace(*repoID)
+			}
+			if recRepo == "" || *repoID == "" || memory.SameRepoSlug(recRepo, *repoID) {
+				byID[r.Meta.ID] = r
+			}
+			byDocID[r.DocumentID(recRepo)] = r
 		}
 	}
 	if extRecs, eErr := memory.LoadExternalDocRecords(*repoDir); eErr == nil {
 		for _, r := range extRecs {
-			byID[r.Meta.ID] = r
-			byDocID[r.DocumentID(*repoID)] = r
+			if strings.TrimSpace(r.Meta.Repo) == "" && strings.TrimSpace(*repoID) != "" {
+				r.Meta.Repo = strings.TrimSpace(*repoID)
+			}
+			recRepo := strings.TrimSpace(r.Meta.Repo)
+			if recRepo == "" {
+				recRepo = strings.TrimSpace(*repoID)
+			}
+			if recRepo == "" || *repoID == "" || memory.SameRepoSlug(recRepo, *repoID) {
+				byID[r.Meta.ID] = r
+			}
+			byDocID[r.DocumentID(recRepo)] = r
 		}
 	}
-	results = memory.FilterRecallResults(results, byID, byDocID, *clusterFilter, *pathFilter)
+	results = memory.FilterRecallResultsForRepo(results, *repoID, byID, byDocID, *clusterFilter, *pathFilter)
 	if *maxResults > 0 && len(results) > *maxResults {
 		results = results[:*maxResults]
 	}
+	results = memory.FrameRecallResultsForRepo(results, *repoID, byID, byDocID)
 	if results == nil {
 		results = []memory.HindsightRecallResult{}
 	}

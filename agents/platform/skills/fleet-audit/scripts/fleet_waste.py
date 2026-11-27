@@ -303,6 +303,36 @@ REPLACED_POD_PATTERNS = {
     "StatefulSet": r"^{name}-[0-9]+$",
     "ReplicaSet": rf"^{{name}}-{K8S_GENERATED_CHARS}{{{{5}}}}$",
 }
+# The patterns above are the names of a controller with a short name. Kubernetes
+# cuts a generated name at 63 characters: the generator keeps at most 58 of the
+# base it is given -- `<replicaset>-`, which for a Deployment's pod is
+# `<deployment>-<hash>-` -- and appends its five with no separator. With a
+# ten-character hash, a Deployment named in 47 characters loses the hyphen
+# before the suffix, one of 48 ends `-55c6d97c65q5rw`, and from 57 no character
+# of the hash is left. No pattern above matches such a name, so the controller
+# was sized on its live pods alone, which is the defect the patterns exist to
+# prevent. `_cut_pod_pattern` builds the cut form.
+K8S_GENERATED_NAME_MAX = 63
+K8S_GENERATED_SUFFIX_CHARS = 5
+K8S_GENERATED_BASE_MAX = K8S_GENERATED_NAME_MAX - K8S_GENERATED_SUFFIX_CHARS
+# A pod-template-hash is the decimal form of a 32-bit number, re-encoded one
+# character for one from the alphabet above: ten characters at most, and only
+# the ten the digits map to. A name with room for more than a whole hash before
+# the cut has no cut form, which is what keeps `web` from claiming every
+# 63-character name that starts `web-`.
+POD_TEMPLATE_HASH_CHARS = "[4-9bcdf]"
+POD_TEMPLATE_HASH_MAX_CHARS = 10
+# How much of the hash a cut name must keep to tell this controller's pods from
+# a sibling's. `<name>-worker`, named in 58 characters or more, leaves pods that
+# start `<name>-w`. With one or two characters of hash to match, the start of a
+# tail such as `db` or `cache` passes for them; four characters of a ten-letter
+# alphabet with no vowel in it are no word. A tail that does start with four of
+# them (`c5d9`) still passes: nothing in a name tells it from a hash.
+CUT_NAME_HASH_MIN_CHARS = 4
+# The kinds in `REPLACED_POD_PATTERNS` whose pods the generator names, and
+# whether a pod-template-hash sits between the controller's name and the pod's
+# suffix.
+CUT_NAME_KINDS = {"Deployment": True, "ReplicaSet": False}
 # Alignment happens twice. The primary period buckets each container's raw
 # points before they are summed across the containers of a pod -- it has to
 # be short enough that a spike stays a spike, since a wide bucket averages
@@ -726,6 +756,60 @@ _HELM_NAMESPACE_ANNOTATION = "meta.helm.sh/release-namespace"
 _ARGOCD_TRACKING_ANNOTATION = "argocd.argoproj.io/tracking-id"
 _MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 _HELM_MANAGED_BY = "helm"
+# A family: the Deployments a spawner creates as `<stem>-<uuid>`, one for each
+# run. No file declares a member under its own name, and the name is gone when
+# the spawner replaces the member, so a finding on a member moves each week.
+# The sizing checks judge the family as one controller, `Deployment/<stem>`.
+#
+# The name is the only evidence. One chart release, one `part-of` value and one
+# operator resource each hold many different Deployments with fixed names, so
+# an owner reference or a label cannot say that two Deployments share a
+# template. The canonical UUID form can. It does not say that the name is
+# short-lived, though: a Deployment for each tenant can carry the tenant's id
+# and be declared in Git. So a Deployment that the repository declares, or
+# that a chart release or an Argo CD Application holds, is no member.
+GENERATED_FAMILY_KIND = "Deployment"
+UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# Each UUID segment at the end is cut, so the stem of `run-<uuid>-<uuid>` is `run`.
+GENERATED_NAME_RE = re.compile(rf"^(?P<stem>.+?)(?:-{UUID_PATTERN})+$")
+# One member is a family: a spawner that keeps one instance alive has a new
+# name each run, which is the case where the finding's identity moves most.
+GENERATED_FAMILY_MIN_MEMBERS = 1
+# What is left of a UUID that the cut at `K8S_GENERATED_NAME_MAX` characters ended in.
+UUID_PREFIX_PATTERN = (
+    "(?:[0-9a-f]{8}-(?:[0-9a-f]{4}-(?:[0-9a-f]{4}-(?:[0-9a-f]{4}-[0-9a-f]{0,12}|[0-9a-f]{0,4})|[0-9a-f]{0,4})|[0-9a-f]{0,4})|[0-9a-f]{0,8})"
+)
+# The pods of a member, live or gone, as `REPLACED_POD_PATTERNS` names a
+# Deployment's; `%(stem)s` is the escaped stem. The first form is a name that
+# was not cut. The second is a name of the full length: the cut fell after
+# the UUIDs or in the hash, or, for a stem of 22 characters or more, in a UUID.
+# One whole UUID is the most that fits before either cut: a second one can only be a part.
+#
+# What a name cannot say. A gone pod of another workload named `<stem>-<uuid>-...` can have a
+# member's form: where the cut removed the hash (a Deployment `<stem>-<uuid>-worker`, a Job
+# `<stem>-<uuid>`, with a long stem), and, at any stem length, a Job whose suffix is a run of
+# generated characters (`<stem>-<uuid>-svc`), as the note on hook Jobs above says of `api-db`.
+# The pattern takes such a pod. 3.1 and 3.12 read it only beside the family's own measured pods,
+# never as the one witness, so it can raise a peak and it changes the window's text ("pods it has
+# replaced"). 3.11 raises a request, so for a family it does not read a gone pod at all. And a
+# stem of 58 characters or more is itself cut: the pattern does not find such a family's gone pods.
+FAMILY_POD_PATTERN = (
+    rf"^(?:%(stem)s-{UUID_PATTERN}-{K8S_GENERATED_CHARS}+-{K8S_GENERATED_CHARS}{{5}}"
+    rf"|(?=.{{{K8S_GENERATED_NAME_MAX}}}$)%(stem)s"
+    rf"(?:-{UUID_PATTERN}(?:-{K8S_GENERATED_CHARS}*)?|(?:-{UUID_PATTERN})?-{UUID_PREFIX_PATTERN})"
+    rf"{K8S_GENERATED_CHARS}{{5}})$"
+)
+# Labels that say where a family's template is, when each member with a
+# Deployment object in the dump carries the same value. They go into the
+# excerpt and never decide the family.
+FAMILY_POINTER_LABELS = (_MANAGED_BY_LABEL, "app.kubernetes.io/part-of", "helm.sh/chart")
+# Said in a family's excerpt when the run read no repository declaration: a week with no index
+# and a week with one can then name one Deployment in two ways. It is not a `limitations` line:
+# those are coverage gaps and hold the stream at `partial`, and no check failed to run here.
+FAMILY_NO_INDEX_SENTENCE = (
+    " This run read no repository declaration, so a member that the repository declares is in this family too,"
+    " not under its own name."
+)
 SECONDS_PER_DAY = 86400.0
 HOURS_PER_DAY = 24
 BACKUP_ANNOTATION_PREFIXES = ("velero.io/", "gke.io/backup-")
@@ -2884,6 +2968,152 @@ def _declares_cpu_or_memory(requests: list[dict]) -> bool:
     return False
 
 
+def _generated_families(context: dict) -> dict[tuple[str, str], dict]:
+    """`(namespace, Deployment name) -> family`, for each member of a family.
+
+    A family is the Deployments of one namespace named `<stem>-<uuid>` with
+    one stem. Its `owner` and `labels` are what each member with a Deployment
+    object in the dump carries alike: they tell a reader where the template
+    is, and take no part in the grouping. `unread` counts the other members.
+
+    A live Deployment that has the stem's own name keeps that name, and the
+    members then stay single: two findings may not share one identity.
+
+    A Deployment with a name that lasts is no member, whatever its form: one
+    that the repository declares (`declared_deployments`, which
+    `collect_cluster` fills from the declaration index), or one that carries
+    a Helm release annotation or an Argo CD tracking annotation. It keeps its
+    own name, and with it the file that a fix goes to. The other Deployments
+    of its stem then stay single too: a family's pod pattern would take the
+    pods that such a Deployment has replaced, and nothing tells them apart.
+    """
+    declared = context.get("declared_deployments") or ()
+    # False only where `collect_cluster` said that the run had no declaration; a context with no word on it says nothing.
+    no_index = context.get("declarations_read") is False
+    live: dict[str, dict[str, dict]] = {}
+    for deployment in context.get("deployments") or []:
+        meta = deployment.get("metadata") or {}
+        live.setdefault(meta.get("namespace", ""), {})[meta.get("name", "")] = meta
+    # A dump with no Deployment objects still names them, through their pods.
+    for pod in context.get("pods") or []:
+        meta = pod.get("metadata") or {}
+        kind, name = _sizing_owner(meta)
+        if kind == GENERATED_FAMILY_KIND:
+            live.setdefault(meta.get("namespace", ""), {}).setdefault(name, {})
+    families: dict[tuple[str, str], dict] = {}
+    for ns, deployments in live.items():
+        stems: dict[str, list[str]] = {}
+        lasting: set[str] = set()
+        for name, meta in deployments.items():
+            match = GENERATED_NAME_RE.match(name)
+            if not match or match.group("stem") in deployments:
+                continue
+            if (ns, name) in declared or release_of(meta):
+                lasting.add(match.group("stem"))
+                continue
+            stems.setdefault(match.group("stem"), []).append(name)
+        for stem, members in stems.items():
+            if stem in lasting or len(members) < GENERATED_FAMILY_MIN_MEMBERS:
+                continue
+            # A member that only a pod names has no metadata here: it says nothing
+            # on what the members carry, so it does not hide what the others share.
+            metas = [deployments[member] for member in members if deployments[member]]
+            owners = {_owner_key(meta.get("ownerReferences") or []) for meta in metas}
+            owner = next(iter(owners)) if len(owners) == 1 else None
+            labels = []
+            for label in FAMILY_POINTER_LABELS:
+                values = {str((meta.get("labels") or {}).get(label) or "") for meta in metas}
+                if len(values) == 1 and "" not in values:
+                    labels.append(f"{label}: {values.pop()}")
+            family = {
+                "stem": stem,
+                "members": sorted(members),
+                # An owner with a generated name of its own does not last
+                # either, and names no place to look.
+                "owner": f"{owner[0]}/{owner[1]}" if owner and not GENERATED_NAME_RE.match(owner[1]) else "",
+                "labels": labels,
+                "unread": len(members) - len(metas),
+                "no_index": no_index,
+            }
+            for member in members:
+                families[(ns, member)] = family
+    return families
+
+
+def _family_owner(families: dict, ns: str, kind: str, name: str) -> tuple[str, dict | None]:
+    """The name the sizing checks file this owner under, and its family if it has one."""
+    family = families.get((ns, name)) if kind == GENERATED_FAMILY_KIND else None
+    return (family["stem"] if family else name), family
+
+
+def _request_spread(pods: list[dict]) -> str:
+    """The range of the per-pod requests where the pods do not all declare the same, else ``""``."""
+    parts = []
+    for label, parse, unit, scale in (("cpu", parse_cpu_cores, "m", MILLICORES_PER_CORE), ("memory", parse_mem_mib, "Mi", 1)):
+        totals = {
+            round(sum(parse(str(req.get(label, "0"))) or 0 for req in pod["requests"]) * scale)
+            for pod in pods
+            if "requests" in pod
+        }
+        if len(totals) > 1:
+            parts.append(f"{label} {min(totals)}{unit} to {max(totals)}{unit}")
+    return ", ".join(parts)
+
+
+def _memory_differs(pods: list[dict]) -> bool:
+    """Whether the pods do not all declare the same memory request and limit on each container."""
+    return len({
+        tuple(parse_mem_mib(str(resources.get("memory", "0"))) or 0 for resources in pod["requests"] + pod["limits"])
+        for pod in pods
+    }) > 1
+
+
+def _family_sentence(entry: dict, name: str, *, uncounted: int = 0) -> str:
+    """What a family finding says after its figures, or ``""`` for any other owner.
+
+    The excerpt is the one text that reaches the ledger unchanged, so this is
+    where a reader learns that the `object` is a family and that the fix is at
+    the template. A member that declares other requests stays in the family,
+    as a pod of an earlier revision stays in its Deployment: the figures take
+    the hottest pod of any member, so the target starves none of them.
+    (3.11, which raises, files such a family only when its members agree.)
+
+    The count is the members whose pods are this finding's replicas. The sized
+    checks and 3.12 split a family by pod, as they split a Deployment in
+    the middle of a rollout, and each says how many members it speaks for.
+    `uncounted` is the live pods of other members, or pods too young to be a
+    replica, that `_with_uncounted_member_pods` read into the peak; the text
+    says so, because the window and the count beside the peak are the entry's.
+    """
+    family = entry.get("family")
+    if not family:
+        return ""
+    count = len(entry["members"])
+    text = (
+        f" `{GENERATED_FAMILY_KIND}/{name}` is not an object in the cluster: it stands for {count} generated-name "
+        f"{GENERATED_FAMILY_KIND}{'s' if count != 1 else ''} `{name}-<uuid>`, judged as one controller."
+        # Before the optional sentences: a cut of a very long excerpt then removes one of those, not this.
+        " A member's name does not last, so change the template that creates the members, not a member."
+    )
+    carried = []
+    if family["owner"]:
+        carried.append(f"is owned by `{family['owner']}`")
+    if family["labels"]:
+        carried.append("carries " + " and ".join(f"`{label}`" for label in family["labels"]))
+    if carried:
+        # The sentence speaks only for the members that the dump holds as a Deployment.
+        who = "Each member whose Deployment this audit read" if family["unread"] else "Each member"
+        text += f" {who} {' and '.join(carried)}."
+    spread = _request_spread(entry["pods"])
+    if spread:
+        text += f" The members declare different requests ({spread} per pod), and the figures above take the hottest pod of any member."
+    if uncounted:
+        text += f" The peak also reads {uncounted} live pod{'s' if uncounted != 1 else ''} of its members that this finding does not count as a replica."
+    if family["no_index"]:
+        text += FAMILY_NO_INDEX_SENTENCE
+    return text
+
+
 def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]:
     """Pods whose declared request is a sizing decision somebody here can change.
 
@@ -2901,6 +3131,7 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
     which owns the request's absence and defers its value to here.
     """
     by_owner: dict[tuple, dict] = {}
+    families = _generated_families(context)
     for pod in context["pods"]:
         meta, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
         ns, name = meta.get("namespace", ""), meta.get("name", "")
@@ -2933,14 +3164,19 @@ def _eligible_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict
         # namespaces' requests and usage into its numbers. No collision exists
         # on the sixteen-cluster fleet today; this keeps one from being
         # silently wrong later.
-        kind, owner_name = _sizing_owner(meta)
-        entry = by_owner.setdefault((ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None, "labels": {}})
+        kind, member = _sizing_owner(meta)
+        # A member of a `<stem>-<uuid>` family is filed under the stem.
+        owner_name, family = _family_owner(families, ns, kind, member)
+        entry = by_owner.setdefault(
+            (ns, kind, owner_name), {"ns": ns, "pods": [], "oldest_h": None, "labels": {}, "family": family, "members": set()}
+        )
+        entry["members"].add(member)
         # Plain init containers take no part in the sizing sums above, but
         # kubelet counts them for QoS: an init container without limits makes
         # the pod Burstable. `_is_guaranteed` reads them.
         init_requests = [(c.get("resources") or {}).get("requests") or {} for c in init_containers]
         init_limits = [(c.get("resources") or {}).get("limits") or {} for c in init_containers]
-        entry["pods"].append({"ns": ns, "name": name, "containers": [str(c.get("name") or "") for c in containers], "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits, "sidecars": sidecars})
+        entry["pods"].append({"ns": ns, "name": name, "containers": [str(c.get("name") or "") for c in containers], "requests": requests, "limits": limits, "init_requests": init_requests, "init_limits": init_limits, "sidecars": sidecars, "age_h": None if age is None else age * HOURS_PER_DAY})
         # For `check_idle_workload`'s Service join. Replicas of one controller
         # share the selector labels by construction, so the first pod's set
         # answers for the controller; a later pod merges in rather than
@@ -3070,8 +3306,46 @@ def _live_pod_owners(context: dict) -> dict[tuple[str, str], tuple[str, str]]:
     return owners
 
 
+def _cut_pod_pattern(kind: str, name: str) -> tuple[re.Pattern, bool] | None:
+    """This controller's pod names that Kubernetes cut at 63 characters, and whether they are its own alone.
+
+    None for a kind the generator does not name and for a name too short to be
+    cut. Otherwise the pattern, by how much of the base `<name>-<hash>-`
+    (`<name>-` for a bare ReplicaSet) fits in its 58 characters:
+
+    - `<name>-` fits: the name, its hyphen, as much of the hash as fits (none
+      of it, where `<name>-` fills the 58), then the five. Deployment only, and
+      only when the room is no more than a hash can fill.
+    - `<name>-` runs past the 58: the first 58 characters of it, then the five.
+
+    The flag is whether `CUT_NAME_HASH_MIN_CHARS` of the hash are left. Short of
+    that, another controller whose name starts the same way leaves pods of the
+    same shape -- every `<name>-<tail>` Deployment, Job or DaemonSet once no
+    hash is left -- and nothing in a gone pod's name says whose it was.
+    `_observed_pod_keys` decides what a name like that may count for.
+    """
+    hashed = CUT_NAME_KINDS.get(kind)
+    if hashed is None:
+        return None
+    head = f"{name}-"
+    hash_room = K8S_GENERATED_BASE_MAX - len(head)
+    suffix = f"{K8S_GENERATED_CHARS}{{{K8S_GENERATED_SUFFIX_CHARS}}}"
+    if hash_room < 0:
+        return re.compile(rf"^{re.escape(head[:K8S_GENERATED_BASE_MAX])}{suffix}$"), False
+    if not hashed or hash_room > POD_TEMPLATE_HASH_MAX_CHARS:
+        return None
+    pattern = re.compile(rf"^{re.escape(head)}{POD_TEMPLATE_HASH_CHARS}{{{hash_room}}}{suffix}$")
+    return pattern, hash_room >= CUT_NAME_HASH_MIN_CHARS
+
+
+def _measured_on_every_dimension(series: Any, keys: list[tuple[str, str]]) -> bool:
+    """Whether these pods, between them, have a figure on every dimension the read reports."""
+    values = [value if isinstance(value, tuple) else (value,) for value in map(series.get, keys) if value is not None]
+    return bool(values) and all(any(value[index] is not None for value in values) for index in range(len(values[0])))
+
+
 def _observed_pod_keys(
-    entry: dict, kind: str, name: str, metric_keys: Any, live_owners: dict
+    entry: dict, kind: str, name: str, metric_keys: Any, live_owners: dict, *, shared_names: bool = False
 ) -> tuple[list[tuple[str, str]], int]:
     """Every pod of this controller the metric read saw, live or since replaced.
 
@@ -3093,6 +3367,21 @@ def _observed_pod_keys(
     that the sizing checks skipped is live, not replaced. And a controller kind absent
     from `REPLACED_POD_PATTERNS` is not widened at all, because a bare `Pod` and
     the kinds this does not model name their pods by rules this does not know.
+
+    A cut name that another controller's pod can also carry is read for each
+    controller it fits, on two conditions. The caller asks for it
+    (`shared_names`), which is for a check where a higher figure withholds a
+    proposal or makes it smaller, never one where it makes the finding or
+    enlarges a number the finding writes. And this controller's live pods are
+    measured on every dimension, so the borrowed figure can raise what the
+    controller measured and never stand in for it. Such a pod sits in `keys`
+    and not in `replaced_count`: whose it was is not known, so it may not
+    widen the window the excerpt claims.
+
+    That paragraph is for a single controller. A family (`entry["family"]`)
+    reads its gone pods by `FAMILY_POD_PATTERN`, whose own rules are stated at
+    its definition: a name that fits is in `keys` and in `replaced_count`,
+    whatever `shared_names` says.
     """
     live = [(pod["ns"], pod["name"]) for pod in entry["pods"]]
     template = REPLACED_POD_PATTERNS.get(kind)
@@ -3100,19 +3389,61 @@ def _observed_pod_keys(
         return live, 0
     ns = entry["ns"]
     seen = set(live)
-    pattern = re.compile(template.format(name=re.escape(name)))
-    extra = [
-        key
-        for key in metric_keys
-        if key not in seen
-        and key[0] == ns
-        and pattern.match(key[1])
+    family = entry.get("family")
+    # A family's pods carry a member's UUID before the two generated segments,
+    # and a member that is gone left its series under such a name.
+    pattern = re.compile(FAMILY_POD_PATTERN % {"stem": re.escape(name)} if family else template.format(name=re.escape(name)))
+    # A family reads its gone pods with `FAMILY_POD_PATTERN` and takes no cut
+    # form by the stem's name: that form is for the pods of a Deployment named
+    # as the stem. The limits of a family's pattern are stated at its definition.
+    cut_pattern, own_alone = (None, False) if family else (_cut_pod_pattern(kind, name) or (None, False))
+    borrow = cut_pattern is not None and not own_alone and shared_names and _measured_on_every_dimension(metric_keys, live)
+    own, shared = [], []
+    for key in metric_keys:
         # A pod still in the dump is not replaced, whoever owns it: another
         # controller's, or this one's that the sizing checks skipped (under an
         # hour old, terminating, Pending).
-        and key not in live_owners
+        if key in seen or key[0] != ns or key in live_owners:
+            continue
+        if pattern.match(key[1]) or (own_alone and cut_pattern.match(key[1])):
+            own.append(key)
+        elif borrow and cut_pattern.match(key[1]):
+            shared.append(key)
+    return live + sorted(own) + sorted(shared), len(own)
+
+
+def _with_uncounted_member_pods(
+    peaks: tuple[float, float], entry: dict, usage_peaks: dict, live_owners: dict, replicas: int
+) -> tuple[tuple[float, float], int]:
+    """A family's peaks, raised to cover the live pods of its members that the
+    entry does not hold, and how many of those pods reported.
+
+    Such a pod is under an hour old, Pending, in deletion, or of a member that
+    declares no request. It is no replica of the entry and is not counted as
+    replaced, but a target for the template that the members share must cover
+    it: a spawner's members are young by design, and each one was read as soon
+    as it was gone. For 3.1 and 3.12 only, where a higher peak is the safe
+    direction; 3.11 reads a mean, where a pod's first minutes would raise a request.
+
+    It takes peaks that are measured already. A family whose own pods did not
+    report stays unmeasured: a young pod's few minutes must not be the one
+    witness that calls a week idle.
+    """
+    family = entry.get("family")
+    if not family:
+        return peaks, 0
+    held = {(pod["ns"], pod["name"]) for pod in entry["pods"]}
+    members = {(GENERATED_FAMILY_KIND, member) for member in family["members"]}
+    keys = [
+        key
+        for key, owner in live_owners.items()
+        if key[0] == entry["ns"] and owner in members and key not in held and key in usage_peaks
     ]
-    return live + sorted(extra), len(extra)
+    raised = []
+    for index, peak in enumerate(peaks):
+        other = _per_replica(keys, usage_peaks, index)
+        raised.append(peak if other is None else max(peak, other * replicas))
+    return (raised[0], raised[1]), len(keys)
 
 
 def _per_replica(keys: list[tuple[str, str]], series: dict, index: int | None = None) -> float | None:
@@ -3372,7 +3703,9 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
 
     hits = []
     for (_ns, kind, name), entry in by_owner.items():
-        if (entry["ns"], kind, name) in hpa_targets:
+        # An HPA on one member of a family is an HPA on the template they share.
+        scaled = entry["family"]["members"] if entry["family"] else [name]
+        if any((entry["ns"], kind, target) in hpa_targets for target in scaled):
             continue
         if _requests_are_the_namespace_default(entry, lr_defaults.get(entry["ns"], {})):
             continue
@@ -3387,7 +3720,12 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         replicas = len(entry["pods"])
         guaranteed = _is_guaranteed(entry)
 
-        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners, shared_names=True)
+        # A family's gone pods are found by name, and such a name can be another workload's. A pod
+        # like that must not be the one witness: the family's own pods (`keys` starts with them)
+        # are measured first.
+        if entry["family"] and _measured_peaks(keys[:replicas], usage_peaks, replicas) is None:
+            continue
         # Same guard `check_underrequest` carries, and this is the direction in
         # which getting it wrong is worse. A controller none of whose pods
         # reported would read as zero on both dimensions, which is not "idle"
@@ -3402,7 +3740,7 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
         peaks = _measured_peaks(keys, usage_peaks, replicas)
         if peaks is None:
             continue
-        peak_cpu, peak_mem = peaks
+        (peak_cpu, peak_mem), uncounted = _with_uncounted_member_pods(peaks, entry, usage_peaks, live_owners, replicas)
         # The one case this check yields to §3.13. A `Guaranteed` controller
         # idle on every dimension gets a stand-down there rather than the
         # `manual` note here, because the note is all this check can offer it
@@ -3594,8 +3932,9 @@ def check_overrequest(context: dict, usage_peaks: dict, *, now: datetime, autopi
             {
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
-                "excerpt": excerpt,
+                "excerpt": excerpt + _family_sentence(entry, name, uncounted=uncounted),
                 "severity": severity,
+                "_family": bool(entry["family"]),
                 "_guaranteed": guaranteed,
                 "_autopilot_bumped": bumped,
             }
@@ -3878,7 +4217,8 @@ def check_idle_workload(
         if (entry["ns"], kind, name) in hpa_targets:
             continue
         # A controller the dump does not carry -- anything but a Deployment or
-        # a StatefulSet -- has no age to test, and this check does not guess one
+        # a StatefulSet, and a family's stem, which names no Deployment -- has
+        # no age to test, and this check does not guess one
         # from its pods. Skipping is the safe direction: the cost of staying
         # quiet is another month of a 50m reservation, and the cost of being
         # wrong is a recommendation to delete something.
@@ -3894,7 +4234,7 @@ def check_idle_workload(
             continue
         replicas = len(entry["pods"])
 
-        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners, shared_names=True)
         # Same guard as §3.1, and it matters more here. Zero is the most idle a
         # workload can read, and an unmeasured controller would read as zero on
         # both dimensions -- so without this, a metrics agent down on one node
@@ -4134,9 +4474,22 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         # a sidecar's `memory: "0"` sets nothing against its own usage either.
         if any(not (parse_mem_mib(str(req.get("memory") or "")) or 0) > 0 for pod in entry["pods"] for req in pod["requests"]):
             continue
+        # A family whose members declare different memory requests or limits
+        # has no one request to hold the hottest pod's mean against. Held
+        # against the sum, a large member under its own request reads as an
+        # overage for the family, and the smallest member's limit reads as
+        # the ceiling. Quiet is the safe direction for a check that raises.
+        if entry["family"] and _memory_differs(entry["pods"]):
+            continue
 
         replicas = len(entry["pods"])
         keys, replaced = _observed_pod_keys(entry, kind, name, memory_means, live_owners)
+        # A family's gone pods are found by name alone. A name cut at 63 characters can be another
+        # workload's, and a member that ran for ten minutes left a mean of ten minutes: neither is
+        # a sustained level of this family. This check raises a request, so for a family it reads
+        # the settled live pods only.
+        if entry["family"]:
+            keys, replaced = [(pod["ns"], pod["name"]) for pod in entry["pods"]], 0
         # `max` over the pods, per `_per_replica`, and the mean wants it as much
         # as the peak does: the question is whether *a* replica sustains more
         # than the request it was given, and the worst one answers it. A pod
@@ -4166,6 +4519,18 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
         _, measured_over = _measured_over(
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
         )
+        # A family's members are of different ages as a rule, and the mean is the hottest pod's. The
+        # window is then that pod's age: the oldest member's pod says nothing about how long this
+        # level lasted.
+        if entry["family"]:
+            hottest = max(entry["pods"], key=lambda pod: memory_means.get((pod["ns"], pod["name"])) or 0.0)
+            hottest_h = hottest.get("age_h")
+            if hottest_h is not None and round(hottest_h) < USAGE_WINDOW_HOURS:
+                cycle = ", under a full daily cycle" if round(hottest_h) < SHORT_OBSERVATION_HOURS else ""
+                measured_over = (
+                    f"over the trailing {round(hottest_h)}h (Cloud Monitoring: the read covers {USAGE_WINDOW_HOURS}h, "
+                    f"and the pod with this mean started {round(hottest_h)}h ago{cycle})"
+                )
         # `critical` is reserved for the case that is already failing rather
         # than merely mis-scheduled: sustained usage within 10% of the ceiling
         # is an OOMKill waiting for one more request. Everything else is
@@ -4267,8 +4632,9 @@ def check_underrequest(context: dict, usage_peaks: dict, memory_means: dict, *, 
             {
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
-                "excerpt": excerpt,
+                "excerpt": excerpt + _family_sentence(entry, name),
                 "severity": severity,
+                "_family": bool(entry["family"]),
             }
         )
     return hits
@@ -4282,6 +4648,7 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
     value is 3.1/3.11's question) or unsized (and its value is 3.12's).
     """
     by_owner: dict[tuple, dict] = {}
+    families = _generated_families(context)
     for pod in context["pods"]:
         meta, spec, status = pod.get("metadata", {}), pod.get("spec", {}), pod.get("status", {})
         ns, name = meta.get("namespace", ""), meta.get("name", "")
@@ -4307,11 +4674,13 @@ def _unsized_pods_by_owner(context: dict, *, now: datetime) -> dict[tuple, dict]
         requests = [(c.get("resources") or {}).get("requests") or {} for c in containers]
         if _declares_cpu_or_memory(requests):
             continue  # sized: 3.1 and 3.11 own it
-        kind, owner_name = _sizing_owner(meta)
+        kind, member = _sizing_owner(meta)
+        owner_name, family = _family_owner(families, ns, kind, member)
         entry = by_owner.setdefault(
             (ns, kind, owner_name),
-            {"ns": ns, "pods": [], "containers": [], "oldest_h": None},
+            {"ns": ns, "pods": [], "containers": [], "oldest_h": None, "family": family, "members": set()},
         )
+        entry["members"].add(member)
         entry["pods"].append({"ns": ns, "name": name})
         for container in containers:
             if container.get("name") and container["name"] not in entry["containers"]:
@@ -4356,6 +4725,9 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         # workload outgrows by tonight. On 2026-09-06 every Argo CD component
         # on the hub was sized off a 6h window for exactly that reason.
         keys, replaced = _observed_pod_keys(entry, kind, name, usage_peaks, live_owners)
+        # As in §3.1: a gone pod that only the name gave is never a family's one witness.
+        if entry["family"] and _measured_peaks(keys[:replicas], usage_peaks, replicas) is None:
+            continue
         # The whole finding is the measurement, so an unmeasured controller has
         # nothing to say. Reporting it anyway would recommend requesting zero,
         # which is the state being complained about -- and so would a
@@ -4363,7 +4735,7 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
         peaks = _measured_peaks(keys, usage_peaks, replicas)
         if peaks is None:
             continue
-        peak_cpu, peak_mem = peaks
+        (peak_cpu, peak_mem), uncounted = _with_uncounted_member_pods(peaks, entry, usage_peaks, live_owners, replicas)
 
         _, measured_over = _measured_over(
             entry["oldest_h"], replaced=replaced, controller_h=_controller_hours(context, kind, entry["ns"], name, now), kind=kind
@@ -4439,8 +4811,9 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             {
                 "namespace": entry["ns"],
                 "object": f"{kind}/{name}",
-                "excerpt": excerpt,
+                "excerpt": excerpt + _family_sentence(entry, name, uncounted=uncounted),
                 "severity": severity,
+                "_family": bool(entry["family"]),
                 "_autopilot_bumped": autopilot,
             }
         )
@@ -4478,6 +4851,11 @@ def _emit(
         "impact": IMPACT[slug],
         "needs_triage": None,
     }
+    # A family's `object` is in no cluster and in no repository. A file that
+    # declares a Deployment with the stem's name declares something else, and
+    # a `declaration` here would send the fix to it.
+    if hit.get("_family"):
+        return candidate
     if declarations:
         found = declaration_for(declarations, cluster, candidate["namespace"], candidate["object"])
         if found:
@@ -4629,6 +5007,12 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
     dump_record = _record(paged_command_text(dump_kinds, kubeconfig=kubeconfig), result)
     context = build_context(parsed)
+    # For `_generated_families`: a Deployment that this cluster's tree declares keeps its own name.
+    context["declared_deployments"] = {
+        (key[2], key[3]) for key in declarations or () if key[0] == name and key[1] == GENERATED_FAMILY_KIND
+    }
+    # Whether the grouping had any declaration to hold a `<stem>-<uuid>` name against; a family's excerpt says when it had none.
+    context["declarations_read"] = bool(declarations)
     fleet_facts = _fleet_facts(context)
     release_index = _releases_by_object(parsed, releases, name)
 

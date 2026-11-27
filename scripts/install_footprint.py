@@ -119,10 +119,10 @@ A2A_WORKLOADS = (
     ("a2aGateway", "A2A gateway", "Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false`"),
     ("a2aConsole", "Console", "Standing"),
     ("a2aDispatcher", "Profile dispatcher", "Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it"),
+    ("a2aMcp", "MCP server", "Standing, unless `operator.mcpServer.enabled` is `false`, when the quota check still counts it"),
     ("a2aProvision", "Bus provisioning Job", "At install, again whenever its spec changes, and about daily"),
 )
 FLAGGED_LABELS = {
-    "mcp": "MCP server",
     "curator": "OKF memory curator",
 }
 FLAGGED_WHEN = {

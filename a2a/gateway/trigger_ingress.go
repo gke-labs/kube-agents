@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,14 +32,22 @@ import (
 // the trigger's own conversation, publishes the submission on the profile's
 // unattended intake, and answers with the task's id or a refusal.
 //
+// An event source (#6572) submits the same way, with a trigger named
+// <source>/<kind> and no schedule, and only for a kind the install admits
+// (TriggerEventKinds, empty by default). Each run has its own conversation,
+// trigger:<key>, and each kind its own rate bucket.
+//
 // Only a source the callout grants publish on the subject can reach it: the
 // operator, as the schedule source, while A2A_AGENT_SCHEDULES is on (#5617).
+// No event source has that grant yet.
 
 const (
 	// triggerSubmitWildcard is every source's submission subject.
 	triggerSubmitWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerSubmitSubjectSuffix
 	// triggerStatusWildcard is every source's status query subject.
 	triggerStatusWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerStatusSubjectSuffix
+	// triggerStopWildcard is every source's stop subject.
+	triggerStopWildcard = lib.TriggerSubmitSubjectPrefix + "*" + lib.TriggerStopSubjectSuffix
 	// triggerConversationPrefix opens a trigger's own conversation key:
 	// trigger:<source>/<namespace>/<name>.
 	triggerConversationPrefix = "trigger:"
@@ -54,6 +63,12 @@ const (
 	// none: twelve an hour, so a schedule every five minutes runs every
 	// time (#5635).
 	DefaultTriggerRatePerHour = 12
+	// DefaultTriggerEventRatePerHour is each admitted event kind's cap when
+	// the config sets none (#6572): above the largest daily alert quota the
+	// session store applies to one kind before it asks for a triage, so one
+	// day's alerts pass in a burst and a runaway source is held to the cap
+	// on each kind the install admits.
+	DefaultTriggerEventRatePerHour = 30
 	// triggerLimiterMax bounds the limiter's map: past it, a full bucket
 	// (one that would admit at once anyway) is dropped first.
 	triggerLimiterMax = 4096
@@ -68,6 +83,7 @@ const (
 // submission subject, retrying a failed subscribe as the directory does, for
 // as long as the term's ctx lives.
 func (g *Gateway) startTriggerIngress(ctx context.Context) {
+	g.startTriggerStop(ctx)
 	denied := make(chan struct{}, 1)
 	remove := g.client.OnAsyncError(func(err error) {
 		if isTriggerSubscriptionRefusal(err) {
@@ -160,7 +176,71 @@ func isTriggerSubscriptionRefusal(err error) bool {
 	}
 	text := err.Error()
 	return (errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(text, "Permissions Violation")) &&
-		strings.Contains(text, "Subscription to \"a2a.trigger.")
+		strings.Contains(text, "Subscription to \"a2a.trigger.") && !strings.Contains(text, "Subscription to \""+triggerStopWildcard+"\"")
+}
+
+// isTriggerStopSubscriptionRefusal reports whether err is the server refusing
+// the stop subscription, which is retried on its own.
+func isTriggerStopSubscriptionRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return (errors.Is(err, nats.ErrPermissionViolation) || strings.Contains(text, "Permissions Violation")) &&
+		strings.Contains(text, "Subscription to \""+triggerStopWildcard+"\"")
+}
+
+// startTriggerStop subscribes the elected gateway to every source's stop
+// subject (#6052), on its own retry loop: the stop grant is newer than the
+// submit and status ones, so a bus that hasn't loaded it yet refuses this
+// subscription alone, and submissions and status queries carry on meanwhile.
+func (g *Gateway) startTriggerStop(ctx context.Context) {
+	denied := make(chan struct{}, 1)
+	remove := g.client.OnAsyncError(func(err error) {
+		if isTriggerStopSubscriptionRefusal(err) {
+			select {
+			case denied <- struct{}{}:
+			default:
+			}
+		}
+	})
+	go func() {
+		defer remove()
+		for {
+			select {
+			case <-denied:
+			default:
+			}
+			sub, err := g.client.SubscribeCore(triggerStopWildcard, func(m *nats.Msg) {
+				source, err := lib.ParseTriggerStopSubject(m.Subject)
+				if err != nil || !lib.ValidTriggerReplySubject(source, m.Reply) {
+					g.log.Info("trigger stop dropped: no reply subject in the source's namespace", "subject", m.Subject)
+					return
+				}
+				if data, err := json.Marshal(g.handleTriggerStop(ctx, m.Subject, m.Data)); err == nil {
+					if err := m.Respond(data); err != nil {
+						g.log.Warn("trigger stop reply failed", "subject", m.Subject, "err", err)
+					}
+				}
+			})
+			if err == nil {
+				select {
+				case <-ctx.Done():
+					sub.Stop()
+					return
+				case <-denied:
+					sub.Stop()
+					err = errTriggerSubscriptionRefused
+				}
+			}
+			g.log.Warn("trigger stop subscription failed; retrying", "err", err, "in", triggerIngressRetry)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(triggerIngressRetry):
+			}
+		}
+	}()
 }
 
 // triggerRefused is a refusal reply, logged with the trigger it was for.
@@ -187,15 +267,28 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if err := lib.ValidateTriggerSubmit(source, s); err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, err.Error())
 	}
-	// A trigger's identity is schedule/<name>, with no namespace in it: the
-	// grant, the report stream it binds and the rate cap all key on it. A
-	// built-in schedule lives in the install's own namespace (one
+	// A schedule's trigger identity is schedule/<name>, with no namespace in
+	// it: the grant, the report stream it binds and the rate cap all key on
+	// it. A built-in schedule lives in the install's own namespace (one
 	// PlatformAgent per cluster, which owns them), so a schedule anywhere
-	// else is refused, and two namespaces never share a trigger.
-	if g.cfg.Namespace == "" || s.Schedule.Namespace != g.cfg.Namespace {
+	// else is refused, and two namespaces never share a trigger. An event
+	// trigger names no schedule; it must be a kind the install admits.
+	event := source != lib.TriggerSourceSchedule
+	switch {
+	case event && !slices.Contains(g.cfg.TriggerEventKinds, s.Trigger.Name):
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "event trigger "+s.Trigger.Name+" is not one this install admits")
+	case !event && (g.cfg.Namespace == "" || s.Schedule.Namespace != g.cfg.Namespace):
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "schedule "+s.Schedule.Namespace+"/"+s.Schedule.Name+" is not in the install's namespace")
 	}
 	key := triggerConversationKey(source, s.Schedule)
+	bucket := key
+	if event {
+		// An event run is its own conversation, so its delivery and
+		// active task are its own and its key is answered for as long as
+		// the record lives; its kind is its rate bucket.
+		key = triggerConversationPrefix + s.IdempotencyKey
+		bucket = triggerConversationPrefix + s.Trigger.Name
+	}
 	// One submission at a time per trigger, and the relay's batches for its
 	// tasks wait on the same lock (relayBatch): the record read here is the
 	// one written back, and a fast executor's terminal finds its TaskRef.
@@ -239,7 +332,7 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, err.Error())
 	}
 	if route.Profile != s.Profile {
-		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the schedule's target routes to profile "+route.Profile+", not "+s.Profile)
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the submission's target routes to profile "+route.Profile+", not "+s.Profile)
 	}
 
 	// A run recorded but not yet published (its publish failed, or the
@@ -251,15 +344,15 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.publishTriggerRun(ctx, rec, s, route, *run)
 	}
 
-	limiter := g.triggerLimiter()
-	if !limiter.allow(key, time.Now()) {
+	limiter := g.triggerLimiterFor(event)
+	if !limiter.allow(bucket, time.Now()) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedRateLimited, "the trigger is over its rate cap")
 	}
 	// Every failure from here until the run is recorded hands the token back:
 	// the attempt count, not the rate budget, is what bounds the retries of
 	// one key (#5923), and it is kept in the record.
 	refuse := func(reason, detail string) lib.TriggerSubmitReply {
-		limiter.refund(key, time.Now())
+		limiter.refund(bucket, time.Now())
 		return g.triggerRefused(s.Trigger.Name, reason, detail)
 	}
 	if rec == nil {
@@ -351,17 +444,23 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 	if trigger == nil {
 		trigger = &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream, Script: s.Trigger.Script}
 	}
-	authority := Authority{
-		Requester: AuthorityRequester{
-			Principal:  g.ps.Hash("trigger:" + s.Trigger.Name),
-			Backend:    triggerRequesterBackend,
-			Subject:    s.Trigger.Name,
-			VerifiedBy: triggerRequesterVerifiedBy,
-		},
-		Audience: AuthorityAudience{Conversation: rec.Key, Kind: triggerAudienceKind},
-		Trigger:  trigger,
+	authority := g.triggerAuthority(rec, s.Trigger.Name, trigger)
+	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
+	now := time.Now()
+	// The run's entry on the record, written below. A run of a profile whose
+	// card says it delegates carries the profiles the delegation would
+	// accept from this entry and the width (profileTargetsParts, #6789), as
+	// a profile task started from a turn does; any other run is submitted
+	// as it was.
+	entry := TaskRef{
+		ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
+		Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
+		RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
+		// Its scope, recorded as a profile task's is: the scope its
+		// children are held to when it fans out (#6744).
+		Scope: string(route.Scope),
 	}
-	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route, false)
+	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route, false, g.profileTargetsParts(rec, entry, taskID)...)
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the task's message could not be built")
 	}
@@ -377,18 +476,12 @@ func (g *Gateway) publishTriggerRun(ctx context.Context, rec *SessionRecord, s l
 
 	// Registered where the relay looks before the publish, as startTask
 	// does, so the executor's first event finds its conversation.
-	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
 	prevActive, prevTasks := rec.ActiveTask, rec.Tasks
-	now := time.Now()
 	rec.Delivery = &s.Delivery
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: run.CorrelationID, Ask: truncateRunes(s.Prompt, askCap),
 		SubmittedAt: now, Capability: run.Capability}
 	if !rec.hasTask(taskID) {
-		rec.Tasks = append(append([]TaskRef(nil), rec.Tasks...), TaskRef{
-			ID: taskID, Addressee: route.Profile, CorrelationID: run.CorrelationID, Capability: run.Capability,
-			Requester: &requester, Attribution: authority.Attribution(), StartedAt: now.UTC(),
-			RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
-		})
+		rec.Tasks = append(append([]TaskRef(nil), rec.Tasks...), entry)
 		if len(rec.Tasks) > taskHistoryCap {
 			rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 		}
@@ -490,7 +583,132 @@ func (g *Gateway) handleTriggerStatus(ctx context.Context, subject string, data 
 	if err != nil || task == nil || task.State == "" {
 		return lib.TriggerStatusReply{Found: true, State: lib.StateSubmitted}
 	}
-	return lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	reply := lib.TriggerStatusReply{Found: true, State: task.State, Terminal: task.Final}
+	// A completed run has no reason to record: only a run that ended
+	// otherwise (failed, rejected, canceled) carries one.
+	if task.Final && task.State != lib.StateCompleted && task.FinalMessage != nil {
+		reply.Reason = runReasonToken(joinTextParts(task.FinalMessage.Parts))
+	}
+	return reply
+}
+
+// triggerAuthority is the authority a trigger's task rides: the trigger as
+// requester, its own conversation as audience, and the trigger the grant was
+// minted with. The run's cancel rides the same.
+func (g *Gateway) triggerAuthority(rec *SessionRecord, triggerName string, trigger *capability.Trigger) Authority {
+	return Authority{
+		Requester: AuthorityRequester{
+			Principal:  g.ps.Hash("trigger:" + triggerName),
+			Backend:    triggerRequesterBackend,
+			Subject:    triggerName,
+			VerifiedBy: triggerRequesterVerifiedBy,
+		},
+		Audience: AuthorityAudience{Conversation: rec.Key, Kind: triggerAudienceKind},
+		Trigger:  trigger,
+	}
+}
+
+// handleTriggerStop ends one of a schedule's tasks (#6052), for a task this
+// gateway recorded on that schedule's trigger record and no other, so a
+// source stops only the tasks it started. It writes the task's cancel on its
+// .in subject and its dispatcher stop record: a run still starting has its
+// Job removed, and a running one is canceled. A task already ended, or one
+// already stopped, writes nothing again.
+func (g *Gateway) handleTriggerStop(ctx context.Context, subject string, data []byte) lib.TriggerStopReply {
+	refuse := func(reason, detail string) lib.TriggerStopReply {
+		return lib.TriggerStopReply{Refused: &lib.TriggerRefusal{Reason: reason, Detail: detail}}
+	}
+	source, err := lib.ParseTriggerStopSubject(subject)
+	if err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	var q lib.TriggerStop
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, "the stop is not well-formed")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return refuse(lib.TriggerRefusedInvalid, "the stop has data after its object")
+	}
+	if err := lib.ValidateTriggerStop(source, q); err != nil {
+		return refuse(lib.TriggerRefusedInvalid, err.Error())
+	}
+	if g.cfg.Namespace == "" || q.Schedule.Namespace != g.cfg.Namespace {
+		return refuse(lib.TriggerRefusedInvalid, "schedule "+q.Schedule.Namespace+"/"+q.Schedule.Name+" is not in the install's namespace")
+	}
+	key := triggerConversationKey(source, q.Schedule)
+	// Under the trigger's lock, as a submission and the relay's batches are:
+	// the cancel mark written back is on the record they read.
+	lock := g.lockSession(key)
+	lock.Lock()
+	defer lock.Unlock()
+	rec, err := g.reg.Get(ctx, key)
+	if err != nil {
+		return refuse(lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
+	}
+	var run *TriggerRun
+	if rec != nil {
+		for i := range rec.TriggerRuns {
+			if rec.TriggerRuns[i].Task == q.TaskID {
+				run = &rec.TriggerRuns[i]
+			}
+		}
+	}
+	// Only a published run has a task to stop: a source learns a task id
+	// from the answer to a submission that reached the bus.
+	if run == nil || !run.Published {
+		return lib.TriggerStopReply{Result: lib.TriggerStopUnknownRun}
+	}
+	ref, held := rec.TaskRefFor(q.TaskID)
+	if !held {
+		return lib.TriggerStopReply{Result: lib.TriggerStopUnknownRun}
+	}
+	if task, err := g.replayForTerminal(ctx, ref.Addressee, q.TaskID); err == nil && task != nil && task.Final {
+		return lib.TriggerStopReply{Result: lib.TriggerStopAlreadyFinal}
+	}
+	if ref.Canceled {
+		return lib.TriggerStopReply{Result: lib.TriggerStopStopped}
+	}
+	if run.Trigger == nil {
+		// A run recorded before its trigger was kept: the cancel's authority
+		// has to equal the grant's trigger, which this record can't say.
+		return refuse(lib.TriggerRefusedInvalid, "the run predates the record of its trigger; it ends at its deadline")
+	}
+	correlation := ref.CorrelationID
+	if correlation == "" {
+		correlation = run.CorrelationID
+	}
+	authority := g.triggerAuthority(rec, run.Trigger.Name, run.Trigger)
+	env, err := lib.NewCancelEnvelope(gatewayParty, q.TaskID, rec.ContextID, correlation,
+		lib.WithTo(lib.Party{Session: ref.Addressee}),
+		lib.WithAuthority(authority.Render(run.Capability)))
+	if err != nil {
+		g.log.Error("trigger stop envelope build failed", "taskId", q.TaskID, "err", err)
+		return refuse(lib.TriggerRefusedInvalid, "the cancel could not be built")
+	}
+	// The stop record first: the dispatcher reads that, not the cancel, for
+	// a submission it still holds queued or a Job still starting, so it is
+	// the half the stop exists for. Either publish failing is refused
+	// unavailable with nothing marked, so the operator asks again and both
+	// are sent again (the record is one per subject, and a second cancel for
+	// the same task is answered as the first).
+	if ref.Tier != "" {
+		if err := g.client.PublishDispatchStop(ctx, ref.Addressee, ref.ID); err != nil {
+			g.log.Error("trigger stop record publish failed", "taskId", q.TaskID, "profile", ref.Addressee, "err", err)
+			return refuse(lib.TriggerRefusedUnavailable, "the stop record could not be published")
+		}
+	}
+	if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, q.TaskID), env); err != nil {
+		g.log.Error("trigger stop cancel publish failed", "taskId", q.TaskID, "err", err)
+		return refuse(lib.TriggerRefusedUnavailable, "the cancel could not be published")
+	}
+	rec.MarkCanceled(q.TaskID)
+	if err := g.reg.Put(ctx, rec); err != nil {
+		g.log.Error("trigger stop record write failed", "conversation", rec.Key, "taskId", q.TaskID, "err", err)
+	}
+	g.log.Info("trigger task stopped", "conversation", rec.Key, "taskId", q.TaskID, "profile", ref.Addressee)
+	return lib.TriggerStopReply{Result: lib.TriggerStopStopped}
 }
 
 // triggerConversationKey is a trigger's own conversation:
@@ -705,6 +923,22 @@ func (g *Gateway) triggerLimiter() *triggerRateLimiter {
 		g.triggerLimits = newTriggerRateLimiter(rate)
 	})
 	return g.triggerLimits
+}
+
+// triggerLimiterFor is the schedules' limiter, or for an event source the
+// event kinds', made on first use.
+func (g *Gateway) triggerLimiterFor(event bool) *triggerRateLimiter {
+	if !event {
+		return g.triggerLimiter()
+	}
+	g.triggerEventLimiterOnce.Do(func() {
+		rate := g.cfg.TriggerEventRatePerHour
+		if rate <= 0 {
+			rate = DefaultTriggerEventRatePerHour
+		}
+		g.triggerEventLimits = newTriggerRateLimiter(rate)
+	})
+	return g.triggerEventLimits
 }
 
 // triggerRateLimiter is a token bucket per trigger name: perHour tokens,

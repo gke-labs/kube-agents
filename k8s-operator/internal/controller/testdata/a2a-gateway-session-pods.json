@@ -104,6 +104,9 @@
             {
               "name": "A2A_CAPABILITY_REQUIRED",
               "value": "true"
+            },
+            {
+              "name": "A2A_HARNESS_UNISOLATED"
             }
           ],
           "resources": {
@@ -291,6 +294,9 @@
             {
               "name": "NATS_CA_FILE",
               "value": "/etc/a2a/nats-ca/ca.crt"
+            },
+            {
+              "name": "A2A_HARNESS_UNISOLATED"
             }
           ],
           "resources": {
@@ -471,6 +477,9 @@
             {
               "name": "A2A_SESSION_REUSE",
               "value": "true"
+            },
+            {
+              "name": "A2A_HARNESS_UNISOLATED"
             }
           ],
           "resources": {
@@ -670,6 +679,9 @@
               "value": "true"
             },
             {
+              "name": "A2A_HARNESS_UNISOLATED"
+            },
+            {
               "name": "CREDENTIAL_PROXY_URL",
               "value": "http://pa-credential-proxy.a2a-pod-policy.svc.cluster.local:8765"
             },
@@ -692,6 +704,10 @@
             {
               "name": "KUBE_PROXY_HOST_CONTEXT",
               "value": "in-cluster"
+            },
+            {
+              "name": "KUBEAGENTS_KUBECTL_COST_TIER",
+              "value": "default"
             },
             {
               "name": "KUBE_PROXY_CA_FILE",
@@ -751,6 +767,369 @@
       ],
       "restartPolicy": "Never",
       "activeDeadlineSeconds": 1500,
+      "serviceAccountName": "pa-a2a-session",
+      "automountServiceAccountToken": false,
+      "securityContext": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
+      }
+    },
+    "status": {}
+  },
+  {
+    "kind": "Pod",
+    "apiVersion": "v1",
+    "metadata": {
+      "name": "harness",
+      "namespace": "a2a-pod-policy",
+      "labels": {
+        "app.kubernetes.io/component": "a2a-session",
+        "app.kubernetes.io/part-of": "a2a-next"
+      },
+      "annotations": {
+        "a2a.kubeagents.dev/addressee": "harness",
+        "a2a.kubeagents.dev/bus-transport": "01ba4719c80b6fe9",
+        "a2a.kubeagents.dev/context-id": "ctx",
+        "a2a.kubeagents.dev/correlation-id": "",
+        "a2a.kubeagents.dev/rehydration-primer": "",
+        "a2a.kubeagents.dev/session-key": "fixture:harness",
+        "a2a.kubeagents.dev/task-id": "task-1"
+      }
+    },
+    "spec": {
+      "volumes": [
+        {
+          "name": "scratch",
+          "emptyDir": {
+            "sizeLimit": "1Gi"
+          }
+        },
+        {
+          "name": "rehydration-primer",
+          "downwardAPI": {
+            "items": [
+              {
+                "path": "primer",
+                "fieldRef": {
+                  "fieldPath": "metadata.annotations['a2a.kubeagents.dev/rehydration-primer']"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "bus-token",
+          "projected": {
+            "sources": [
+              {
+                "serviceAccountToken": {
+                  "audience": "a2a-bus",
+                  "expirationSeconds": 3600,
+                  "path": "token"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "containers": [
+        {
+          "name": "worker",
+          "image": "worker",
+          "env": [
+            {
+              "name": "TASK_ID",
+              "value": "task-1"
+            },
+            {
+              "name": "PROFILE"
+            },
+            {
+              "name": "NATS_URL"
+            },
+            {
+              "name": "A2A_SESSION",
+              "value": "harness"
+            },
+            {
+              "name": "A2A_PRIMER_FILE",
+              "value": "/etc/a2a-primer/primer"
+            },
+            {
+              "name": "A2A_DELEGATE_TOOL",
+              "value": "on"
+            },
+            {
+              "name": "A2A_POD_NAME",
+              "valueFrom": {
+                "fieldRef": {
+                  "fieldPath": "metadata.name"
+                }
+              }
+            },
+            {
+              "name": "A2A_TASK_DEADLINE_SECONDS",
+              "value": "900"
+            },
+            {
+              "name": "A2A_ORIGIN_SEQ",
+              "value": "1"
+            },
+            {
+              "name": "A2A_AUTHORITY_SCOPE"
+            },
+            {
+              "name": "A2A_CAPABILITY_REQUIRED",
+              "value": "true"
+            },
+            {
+              "name": "A2A_HARNESS",
+              "value": "claude-code"
+            },
+            {
+              "name": "A2A_HARNESS_UNISOLATED"
+            }
+          ],
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "1088Mi",
+              "memory": "2Gi"
+            },
+            "requests": {
+              "cpu": "150m",
+              "ephemeral-storage": "1088Mi",
+              "memory": "320Mi"
+            }
+          },
+          "volumeMounts": [
+            {
+              "name": "scratch",
+              "mountPath": "/scratch"
+            },
+            {
+              "name": "bus-token",
+              "readOnly": true,
+              "mountPath": "/var/run/secrets/a2a-bus"
+            },
+            {
+              "name": "rehydration-primer",
+              "readOnly": true,
+              "mountPath": "/etc/a2a-primer"
+            }
+          ],
+          "securityContext": {
+            "capabilities": {
+              "drop": [
+                "ALL"
+              ]
+            },
+            "allowPrivilegeEscalation": false,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          }
+        }
+      ],
+      "restartPolicy": "Never",
+      "activeDeadlineSeconds": 1500,
+      "serviceAccountName": "pa-a2a-session",
+      "automountServiceAccountToken": false,
+      "securityContext": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
+      }
+    },
+    "status": {}
+  },
+  {
+    "kind": "Pod",
+    "apiVersion": "v1",
+    "metadata": {
+      "name": "warm",
+      "namespace": "a2a-pod-policy",
+      "labels": {
+        "app.kubernetes.io/component": "a2a-session",
+        "app.kubernetes.io/part-of": "a2a-next"
+      },
+      "annotations": {
+        "a2a.kubeagents.dev/addressee": "warm",
+        "a2a.kubeagents.dev/bus-transport": "01ba4719c80b6fe9",
+        "a2a.kubeagents.dev/session-reuse": "true",
+        "a2a.kubeagents.dev/warm": "true",
+        "a2a.kubeagents.dev/warm-shape": "19068ae9ba6578c5"
+      }
+    },
+    "spec": {
+      "volumes": [
+        {
+          "name": "scratch",
+          "emptyDir": {
+            "sizeLimit": "1Gi"
+          }
+        },
+        {
+          "name": "rehydration-primer",
+          "downwardAPI": {
+            "items": [
+              {
+                "path": "primer",
+                "fieldRef": {
+                  "fieldPath": "metadata.annotations['a2a.kubeagents.dev/rehydration-primer']"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "bus-token",
+          "projected": {
+            "sources": [
+              {
+                "serviceAccountToken": {
+                  "audience": "a2a-bus",
+                  "expirationSeconds": 3600,
+                  "path": "token"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "containers": [
+        {
+          "name": "worker",
+          "image": "worker",
+          "env": [
+            {
+              "name": "PROFILE",
+              "value": "chat"
+            },
+            {
+              "name": "NATS_URL"
+            },
+            {
+              "name": "A2A_SESSION",
+              "value": "warm"
+            },
+            {
+              "name": "A2A_PRIMER_FILE",
+              "value": "/etc/a2a-primer/primer"
+            },
+            {
+              "name": "A2A_DELEGATE_TOOL",
+              "value": "on"
+            },
+            {
+              "name": "A2A_POD_NAME",
+              "valueFrom": {
+                "fieldRef": {
+                  "fieldPath": "metadata.name"
+                }
+              }
+            },
+            {
+              "name": "A2A_TASK_DEADLINE_SECONDS",
+              "value": "900"
+            },
+            {
+              "name": "A2A_AUTHORITY_SCOPE"
+            },
+            {
+              "name": "A2A_CAPABILITY_REQUIRED",
+              "value": "true"
+            },
+            {
+              "name": "A2A_SESSION_REUSE",
+              "value": "true"
+            },
+            {
+              "name": "A2A_HARNESS_UNISOLATED"
+            },
+            {
+              "name": "A2A_SESSION_WARM",
+              "value": "true"
+            },
+            {
+              "name": "A2A_SESSION_WARM_IDLE_SECONDS",
+              "value": "1800"
+            }
+          ],
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "1088Mi",
+              "memory": "2Gi"
+            },
+            "requests": {
+              "cpu": "150m",
+              "ephemeral-storage": "1088Mi",
+              "memory": "320Mi"
+            }
+          },
+          "volumeMounts": [
+            {
+              "name": "scratch",
+              "mountPath": "/scratch"
+            },
+            {
+              "name": "bus-token",
+              "readOnly": true,
+              "mountPath": "/var/run/secrets/a2a-bus"
+            },
+            {
+              "name": "rehydration-primer",
+              "readOnly": true,
+              "mountPath": "/etc/a2a-primer"
+            }
+          ],
+          "readinessProbe": {
+            "exec": {
+              "command": [
+                "/usr/local/bin/worker-adapter",
+                "warm-ready"
+              ]
+            },
+            "timeoutSeconds": 25,
+            "periodSeconds": 15
+          },
+          "securityContext": {
+            "capabilities": {
+              "drop": [
+                "ALL"
+              ]
+            },
+            "allowPrivilegeEscalation": false,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          }
+        }
+      ],
+      "restartPolicy": "Never",
+      "activeDeadlineSeconds": 16200,
       "serviceAccountName": "pa-a2a-session",
       "automountServiceAccountToken": false,
       "securityContext": {

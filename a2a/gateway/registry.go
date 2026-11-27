@@ -63,12 +63,13 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
-	// LineClosed marks a live message a Google Chat stop closed, a Stop
-	// press or a typed stop (chat_stop_press.go): it reads "cancel sent"
-	// with no Stop control, and the relay leaves it so until the terminal
-	// edit (updateRollingLine, showBusy). False for every other stop: one
-	// typed on another backend, or on Google Chat on a task with no line
-	// or when the armed card stop answers it (cardStopWanted); such a line
+	// LineClosed marks a live message a stop closed on a backend whose
+	// Stop button is on the line (Google Chat, Teams), a Stop press or a
+	// typed stop (chat_stop_press.go): it reads "cancel sent" with no Stop
+	// control, and the relay leaves it so until the terminal edit
+	// (updateRollingLine, showBusy). False for every other stop: one typed
+	// on another backend, or on such a backend on a task with no line or
+	// when the armed card stop answers it (cardStopWanted); such a line
 	// keeps moving until the terminal.
 	LineClosed bool `json:"lineClosed,omitempty"`
 	// Capability pins this task's root entry in the `cap` bucket: the key
@@ -79,8 +80,8 @@ type ActiveTask struct {
 	Capability *capability.Ref `json:"capability,omitempty"`
 	// Detached means the user said stop but no terminal event has arrived
 	// (the executor may be dead and platform tasks have no janitor yet, W3
-	// retarget). A detached task no longer serializes the session; its events,
-	// if they ever arrive, still relay.
+	// retarget). A detached task no longer serializes the session, and
+	// nothing it writes afterwards reaches the room (applyCanceledEvent).
 	Detached bool `json:"detached,omitempty"`
 	// NoFirstEventNoticeAt is when the reap scan told the conversation that
 	// this task had produced nothing past FirstEventGrace. Zero until then.
@@ -88,6 +89,11 @@ type ActiveTask struct {
 	// task across gateway restarts; it goes with ActiveTask when the task is
 	// released or ends.
 	NoFirstEventNoticeAt time.Time `json:"noFirstEventNoticeAt,omitempty"`
+	// WaitingNoticeAt is when the waiting notice was first shown on this
+	// child's line (noticeChildWaiting, #7015), and WaitingNoticeOthers the
+	// count it last showed, so the line is edited only when that changes.
+	WaitingNoticeAt     time.Time `json:"waitingNoticeAt,omitzero"`
+	WaitingNoticeOthers int       `json:"waitingNoticeOthers,omitempty"`
 	// LineNote suffixes every render of the rolling line (taskStart.LineNote);
 	// on the record so a gateway restart keeps rendering it.
 	LineNote string `json:"lineNote,omitempty"`
@@ -115,11 +121,27 @@ type SessionRecord struct {
 	// which the design of record counts from the last user message; zero on
 	// records written before the field existed.
 	LastUserMessage time.Time `json:"lastUserMessage,omitzero"`
+	// SteeredSession is the BusSession a human last steered a running task
+	// on: a follow-up sent before the answer, which goes to the running task
+	// rather than starting one, so it adds no TaskRef. singleTurnDM reads it
+	// as a second turn for that pod (#2371). Empty on records written before
+	// the field existed, and on a conversation never steered.
+	SteeredSession string `json:"steeredSession,omitempty"`
 	// PodReuse marks PodName as a pod spawned to serve every turn of the
 	// conversation (Config.SessionReuse at spawn). Only such a pod is
 	// handed a later task, and only such a pod's running task is held to
 	// the reap scan's overdue bound; a one-task pod has its own deadline.
 	PodReuse bool `json:"podReuse,omitempty"`
+	// PodClaimedAt is when PodName was claimed from the warm pool, zero for
+	// a pod spawned for the conversation. A warm pod was started before its
+	// claim, so its reuse window counts from here, ending when a fresh
+	// spawn's would (reuseLivePod). An older gateway ignores it.
+	PodClaimedAt time.Time `json:"podClaimedAt,omitzero"`
+	// warmClaim is the warm pod this turn claimed as the conversation's
+	// next incarnation (claimOrMint), for ensureSessionPod to record in
+	// place of a spawn. The turn's own: never stored, since the record's
+	// PodName and the claim index are what persist.
+	warmClaim string
 	// LastTaskActivity is when a task last started or, from an executor's
 	// terminal, ended in this session. It is what the Slack adapter's
 	// session-thread rule bounds on (Gateway.hasSession), separately from
@@ -350,7 +372,7 @@ type TaskRef struct {
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// Tier is the tier a task addressed to an AgentProfile runs at; empty
 	// for a task addressed to platform or a session. A profile task's child
-	// runs at its tier, and the child's end reaches it as a childResult on
+	// runs at its tier (at read below an unattended task, #6744), and the child's end reaches it as a childResult on
 	// its .in rather than as a wake (deliverChildResult).
 	Tier string `json:"tier,omitempty"`
 	// Scope is a profile task's scope, recorded at mint: its target's
@@ -366,6 +388,11 @@ type TaskRef struct {
 	// profile task waiting open. Carried rather than walked, because the
 	// bounded history can evict an ancestor and a walk would then miss it.
 	ProfileChain []string `json:"profileChain,omitempty"`
+	// Scheduled marks a profile task below a scheduled run (#6744): a child
+	// of an unattended task, or of one marked. Carried down the chain at
+	// mint, like ProfileChain, so a grandchild's profile is held to the
+	// same card check as a child's even though both run at read.
+	Scheduled bool `json:"scheduled,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -383,12 +410,29 @@ type TaskRef struct {
 	// False on entries written before it existed.
 	ChangeRequested bool `json:"changeRequested,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
-	// set only after the publish succeeded, so a true here means the cancel
-	// is on the stream. It is what lets a supervisor path reached long
+	// for the task holding the conversation, set only after the publish
+	// succeeded. It is what lets a supervisor path reached long
 	// after ActiveTask moved on (Sweep, routinely) tell "finishing a cancel
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
+	// Two writers set it whether or not the cancel went out: a withdrawn
+	// batch child (withdrawBatch) and a task the tree-wide stop reached
+	// (stopTree), so its writes are dropped either way; CancelUnsent says
+	// which. Either way the task counts as running until it ends.
 	Canceled bool `json:"canceled,omitempty"`
+	// CancelUnsent marks a task the gateway marked Canceled whose cancel
+	// never reached the bus (a withdrawn batch child, a task the tree-wide
+	// stop reached). Its writes are dropped as any canceled task's are, and
+	// a later stop (stopTree), or the next turn's heal (healStoppedTasks),
+	// re-sends its cancel, which clears the mark, as its terminal does. The
+	// history cap never evicts it (trimHistory).
+	CancelUnsent bool `json:"cancelUnsent,omitempty"`
+	// StopPending marks a task the tree-wide stop canceled (stopTree), or
+	// whose re-sent cancel went out, whose
+	// terminal the relay hasn't delivered: relayTerminal clears it, and the
+	// heal ends a task still marked once its terminal is on the stream or it
+	// has produced nothing past FirstEventGrace (healStoppedTasks).
+	StopPending bool `json:"stopPending,omitempty"`
 	// QuietCancel marks a cancel that answers for itself (cancelTaskVoiced):
 	// Slack's Stop button with one reply of its own, Google Chat's button
 	// and typed stop on the task's line (chat_stop_press.go), so the relay
@@ -399,6 +443,13 @@ type TaskRef struct {
 	// from the stream), so a queued or redelivered relayTerminal does not
 	// double-count in task_terminals_total.
 	TerminalObserved bool `json:"terminalObserved,omitempty"`
+	// endedUnread marks, for one heal pass and never in the store (it is
+	// unexported, so JSON skips it), a profile parent whose own terminal the
+	// heal found on its stream before handling it (healActiveTask): its
+	// batch's ends are booked but none is sent to it (profileParentListens).
+	// TerminalObserved isn't used for that, since its delivery path reads
+	// the mark as "observed earlier".
+	endedUnread bool
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -434,6 +485,11 @@ type TaskRef struct {
 	// parent's line is kept here to close on the parent's terminal. A batch
 	// child, which never takes ActiveTask, keeps its own line here too.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// Lineless marks a task started with no rolling line at all: its
+	// backend shows task status itself (startTaskWith). A canceled one has
+	// no line to close at 🛑, so its terminal posts its one "🛑 canceled"
+	// (relayTerminal). Entries written before it read false, as before.
+	Lineless bool `json:"lineless,omitempty"`
 	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
 	// with its line because the child never holds the active task, whose
 	// LineNote the single-child path reads.
@@ -526,13 +582,100 @@ type TaskRef struct {
 	BatchIndex int       `json:"batchIndex,omitempty"`
 	Target     string    `json:"target,omitempty"`
 	BatchEnd   *BatchEnd `json:"batchEnd,omitempty"`
+	// BatchRound is, on a profile parent's child (single or batch), the
+	// delegation round whose request minted it, from 1; 0 is read as 1 and
+	// is all a record holds while DelegationRoundsMax is one. Its ends carry
+	// it (lib.ChildResult.Round), and batchChildren reads a parent's current
+	// round's children by it.
+	BatchRound int `json:"batchRound,omitempty"`
+	// DelegationRound is, on a profile parent, the round of the latest
+	// delegate request the gateway handled for it, from 1: every request
+	// that passes the round checks uses one, minted or refused
+	// (handleDelegateRequest). 0 on a task that hasn't delegated, and on a
+	// record written before rounds, whose count roundsUsed reads from the
+	// request's marks instead. A refusal for having used every round stores
+	// nothing, so repeated asks past the cap don't grow it.
+	//
+	// Children, BatchSize, DelegationEnd and the fan-out spot check mean the
+	// current round; a new round moves Children to EarlierChildren and
+	// clears the rest (startDelegationRound), so every batch path reads one
+	// round. EarlierChildren holds the finished rounds' children, at most
+	// DelegationRoundsMax x DelegationWidthMax ids, for the stop walks
+	// (taskChildren). While the cap is one, no record gets either field
+	// past its first request, so a rollback to a gateway before rounds
+	// loses nothing.
+	DelegationRound int      `json:"delegationRound,omitempty"`
+	EarlierChildren []string `json:"earlierChildren,omitempty"`
+}
+
+// roundOf is a round as the record holds it: 0 (unset) is round one.
+func roundOf(r int) int {
+	if r < 1 {
+		return 1
+	}
+	return r
+}
+
+// roundsUsed is how many delegation rounds a profile parent has used. The
+// stored count when there is one (DelegationRound); otherwise, on a record
+// written before rounds, one once its request ended (DelegationEnd) or minted
+// its child or whole batch, and none before. A batch cut short and being
+// finished is still its round.
+func roundsUsed(parent TaskRef) int {
+	if parent.DelegationRound > 0 {
+		return parent.DelegationRound
+	}
+	if parent.DelegationEnd != "" || (len(parent.Children) > 0 && parent.batchComplete()) {
+		return 1
+	}
+	return 0
+}
+
+// currentRoundOf is the delegation round a parent on the record is in: its
+// DelegationRound, read as one when unset or when the parent isn't on the
+// record.
+func currentRoundOf(rec *SessionRecord, parentID string) int {
+	if parent, ok := rec.TaskRefFor(parentID); ok {
+		return roundOf(parent.DelegationRound)
+	}
+	return 1
+}
+
+// taskChildren is every child a task has minted, every round's: the stop
+// walks reach a finished round's children too.
+func (ref TaskRef) taskChildren() []string {
+	if len(ref.EarlierChildren) == 0 {
+		return ref.Children
+	}
+	return append(slices.Clone(ref.EarlierChildren), ref.Children...)
+}
+
+// startDelegationRound begins a profile parent's next delegation round:
+// round is the round number it now holds. The finished round's children move
+// to EarlierChildren, and the round-scoped fields (BatchSize, DelegationEnd)
+// clear, so the batch paths read the new round alone.
+func (rec *SessionRecord) startDelegationRound(taskID string, round int) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID != taskID {
+			continue
+		}
+		t := &rec.Tasks[i]
+		t.EarlierChildren = append(t.EarlierChildren, t.Children...)
+		t.Children, t.BatchSize, t.DelegationEnd = nil, 0, ""
+		t.DelegationRound = round
+		return
+	}
 }
 
 // BatchEnd is how a fan-out child ended, kept on its entry until the wake
 // that carries every sibling's (batchChildEnded). Text is the child's result
 // for completed, its question for input-required, and its reason otherwise,
 // already cut to the child's share of the wake (batchShare) and marked when
-// cut, so the record holds at most one wake's worth across the batch.
+// cut, so the record holds at most one wake's worth across the batch. Text
+// is a content copy: it is cleared once the wake is on the bus (wakeBatch),
+// or at AskTTL from the child's start for a wake that hasn't run
+// (boundAskCopyAt), since the record outlives the stream copy; the rest of
+// the end stays for the batch's accounting.
 // Stopped is a child the gateway had sent a cancel to before it ended, which
 // does not wake the session on its own. Unposted is a result the room was
 // not shown whole (the heal found it), and Cards a child that handed work to
@@ -544,6 +687,11 @@ type BatchEnd struct {
 	Stopped  bool           `json:"stopped,omitempty"`
 	Unposted bool           `json:"unposted,omitempty"`
 	Cards    bool           `json:"cards,omitempty"`
+	// Unsent marks a profile parent's batch child whose end couldn't be
+	// published to the parent: Text is kept, and the heal sends it again
+	// (healProfileBatch) and clears this, or the ask bound drops the end
+	// with its text past AskTTL (TaskRef.clearBatchText).
+	Unsent bool `json:"unsent,omitempty"`
 }
 
 // fanOut reports a turn whose request was a batch of two or more children.
@@ -554,9 +702,12 @@ func (ref TaskRef) fanOut() bool {
 // batchChildren is the record's entries for the children of a fan-out
 // parent, in the order they are on the record.
 func (rec *SessionRecord) batchChildren(parentID string) []TaskRef {
+	// The parent's current round only: an earlier round's children are
+	// that round's, ended before this one began.
+	round := currentRoundOf(rec, parentID)
 	var out []TaskRef
 	for _, ref := range rec.Tasks {
-		if ref.Role == taskRoleChild && ref.ParentTaskID == parentID && ref.BatchIndex > 0 {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == parentID && ref.BatchIndex > 0 && roundOf(ref.BatchRound) == round {
 			out = append(out, ref)
 		}
 	}
@@ -589,6 +740,27 @@ func (rec *SessionRecord) fanOutPending(taskID string) bool {
 	return ok && ref.fanOut() && ref.DelegationEnd == "" && rec.batchLeft(ref) > 0
 }
 
+// endedBatchEntries is the recorded end of each entry of taskID's batch whose
+// child has ended, read before a withdrawal drops those children from the
+// record: an end already sent gets nothing more, and an end recorded Unsent
+// is sent as recorded (endWithdrawnProfileBatch).
+func (rec *SessionRecord) endedBatchEntries(taskID string) map[int]TaskRef {
+	ended := map[int]TaskRef{}
+	for _, k := range rec.batchChildren(taskID) {
+		if k.BatchEnd != nil {
+			ended[k.BatchIndex] = k
+		}
+	}
+	return ended
+}
+
+// profileTask reports a task addressed to an AgentProfile, which waits open
+// for its children rather than being woken (it has a tier).
+func (rec *SessionRecord) profileTask(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && ref.Tier != ""
+}
+
 // batchComplete reports a turn whose batch has every planned child on the
 // record: true for any turn that did not ask for a batch of two or more.
 func (ref TaskRef) batchComplete() bool {
@@ -602,6 +774,30 @@ func (rec *SessionRecord) setBatchEnd(taskID string, end *BatchEnd) {
 			rec.Tasks[i].BatchEnd = end
 		}
 	}
+}
+
+// clearBatchText clears the result text from every ended child of the
+// fan-out parent parentID, keeping the rest of each end (BatchEnd).
+func (rec *SessionRecord) clearBatchText(parentID string) {
+	for i := range rec.Tasks {
+		ref := &rec.Tasks[i]
+		if ref.ParentTaskID == parentID && ref.BatchEnd != nil && ref.BatchEnd.Text != "" {
+			ref.clearBatchText()
+		}
+	}
+}
+
+// clearBatchText clears the entry's result text, on a copy of its end, so
+// an end shared with a caller's TaskRef is left as it was.
+func (ref *TaskRef) clearBatchText() {
+	end := *ref.BatchEnd
+	end.Text = ""
+	// An end not sent yet is dropped with its text: past AskTTL it can't be
+	// sent any more (the same bound clears the parent's attribution, which a
+	// send needs), and a resend of what is left would read as a result. The
+	// parent's own deadline bounds its wait, as for an end a restart drops.
+	end.Unsent = false
+	ref.BatchEnd = &end
 }
 
 // markCardsPending marks a console chain's root (CardsPending).
@@ -630,8 +826,10 @@ func (rec *SessionRecord) takeCardsPending(rootID string) bool {
 // not, while a child it counts (batchLeft) has yet to end: its parent, the
 // chain's root and every child, ended or not, since the wake reads each
 // child's end and the root carries the chain's mark. Nor the active task's
-// entry. A history whose live nodes alone pass the cap keeps them all; a
-// batch holds at most lib.DelegateBatchMax children, so that is bounded.
+// entry, nor a stopped task not yet seen to end (CancelUnsent, or Canceled
+// with StopPending), which may still run. A history whose live nodes alone
+// pass the cap keeps them all; a batch holds at most lib.DelegateBatchMax
+// children, so that is bounded.
 func (rec *SessionRecord) trimHistory() {
 	over := len(rec.Tasks) - taskHistoryCap
 	if over <= 0 {
@@ -642,6 +840,11 @@ func (rec *SessionRecord) trimHistory() {
 		live[rec.ActiveTask.TaskID] = true
 	}
 	for _, ref := range rec.Tasks {
+		// A stopped task not yet seen to end may still run: its cancel to
+		// re-send (CancelUnsent), or its end to heal (StopPending).
+		if ref.CancelUnsent || (ref.Canceled && ref.StopPending) {
+			live[ref.ID] = true
+		}
 		// Not fanOutPending: a withdrawn batch (DelegationEnd) whose kept
 		// child still runs is live too, since that child's end is the
 		// chain's (batchLeft counts it).
@@ -768,8 +971,8 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 }
 
 // markQuietCancel records that taskID's cancel answers for itself: a Stop
-// button on Slack or Google Chat, or a stop typed on Google Chat
-// (TaskRef.QuietCancel).
+// button on Slack, Google Chat or Teams, or a stop typed on Google Chat or
+// Teams (TaskRef.QuietCancel).
 func (rec *SessionRecord) markQuietCancel(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
@@ -785,6 +988,16 @@ func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].TerminalObserved = true
+			return
+		}
+	}
+}
+
+// setEndedUnread sets the task entry's endedUnread mark (TaskRef).
+func (rec *SessionRecord) setEndedUnread(taskID string, ended bool) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].endedUnread = ended
 			return
 		}
 	}
@@ -845,14 +1058,20 @@ func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
 // chainLast follows a delegation chain from the turn that started it to its
 // last task: down each turn's last child to the wake that child started, until
 // a turn that did not delegate (the wake that ends the chain) or a child no
-// wake followed. false when root did not delegate, or a link has fallen off
-// the history cap.
+// wake followed. false when root did not delegate, is a profile task (its
+// own end, as observedAs has it), or a link has fallen off the history cap.
 //
 // A fan-out turn's children share one wake, started by whichever ended last,
 // so its step is that wake; with none yet, the child carrying the chain's
 // end (observeChainEnd) when the chain ended without one, or else a child
 // still running.
 func (rec *SessionRecord) chainLast(root TaskRef) (TaskRef, bool) {
+	// A profile task is the end of its own chain, children or not
+	// (observedAs): it waits open for them and ends after them, so its own
+	// stream is the chain's end, and nothing below it wakes it.
+	if root.Tier != "" {
+		return TaskRef{}, false
+	}
 	cur := root
 	for steps := 0; len(cur.Children) > 0 && steps <= taskHistoryCap; steps++ {
 		if cur.fanOut() {
@@ -1410,6 +1629,100 @@ func (r *Registry) SessionForTask(ctx context.Context, taskID string) (string, e
 		return "", err
 	}
 	return string(entry.Value()), nil
+}
+
+// warmClaimPrefix keys the warm pod claim index: warm.<pod> holds the session
+// key of the conversation that claimed that warm pod. Pod names are dot-free
+// DNS-1123 labels, so the key is one token past the prefix.
+const warmClaimPrefix = "warm."
+
+func warmClaimKey(pod string) string { return warmClaimPrefix + pod }
+
+// ClaimWarmPod records that the conversation sessionKey has claimed the warm
+// pod pod (warm_pool.go). It stands in for the conversation annotations a
+// spawned pod carries and a warm pod can't be given (the gateway holds no
+// patch on pods): the cap count, the cap eviction and both sweeps read the
+// pod's conversation from here. A create, so a pod is claimed once: a second
+// claim of the same pod fails with jetstream.ErrKeyExists. Fenced by the
+// claiming session's record, as IndexTask is.
+func (r *Registry) ClaimWarmPod(ctx context.Context, pod, sessionKey string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	if mine := r.epoch.Load(); mine != 0 {
+		if _, err := r.fencedRecord(ctx, kv, sessionKey, mine); err != nil {
+			return err
+		}
+	}
+	if _, err := kv.Create(ctx, warmClaimKey(pod), []byte(sessionKey)); err != nil {
+		return fmt.Errorf("warm claim %s: %w", pod, err)
+	}
+	return nil
+}
+
+// WarmClaims is the claim index: warm pod name to the session key that
+// claimed it.
+func (r *Registry) WarmClaims(ctx context.Context) (map[string]string, error) {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lister, err := kv.ListKeysFiltered(ctx, warmClaimPrefix+">")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lister.Stop() }()
+	var keys []string
+	for key := range lister.Keys() {
+		keys = append(keys, key)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	claims := make(map[string]string, len(keys))
+	for _, key := range keys {
+		entry, err := kv.Get(ctx, key)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		claims[strings.TrimPrefix(key, warmClaimPrefix)] = string(entry.Value())
+	}
+	return claims, nil
+}
+
+// StillLeading reports whether this gateway's term is still the newest: no
+// later term has begun on the counter. At term 0 (no election) it always is.
+// A read that fails is not leading: the caller is about to delete, and a
+// delete a deposed leader should not make waits for the next pass.
+func (r *Registry) StillLeading(ctx context.Context) bool {
+	mine := r.epoch.Load()
+	if mine == 0 {
+		return ctx.Err() == nil
+	}
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return false
+	}
+	term, _, err := readTerm(ctx, kv)
+	return err == nil && term <= mine
+}
+
+// DropWarmClaim removes a claim whose pod is gone (the pool's pass). Not
+// fenced: a claim names a pod, and once the pod no longer exists the entry
+// says nothing anyone can act on, whoever removes it.
+func (r *Registry) DropWarmClaim(ctx context.Context, pod string) error {
+	kv, err := r.kv(ctx)
+	if err != nil {
+		return err
+	}
+	if err := kv.Delete(ctx, warmClaimKey(pod)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("warm claim %s: %w", pod, err)
+	}
+	return nil
 }
 
 // SessionCallback is invoked for each session record in a scan.

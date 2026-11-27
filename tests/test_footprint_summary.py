@@ -156,8 +156,8 @@ class FootprintSummaryTest(unittest.TestCase):
         self._assert_summary_matches(notes, req)
         # The stock install's figures, the ones the prerequisites page quotes, in the
         # words the notes use, so a wording change is a deliberate one here too.
-        self.assertIn("CPU requests:        4.436 cores", notes)
-        self.assertIn("Memory requests:     14.77 GiB", notes)
+        self.assertIn("CPU requests:        4.536 cores", notes)
+        self.assertIn("Memory requests:     14.89 GiB", notes)
         self.assertIn("Persistent storage:  228 GiB over 7 claims", notes)
         self.assertIn("$0.0445/vCPU-hour", notes)
         self.assertIn("$0.0049225/GiB-hour", notes)
@@ -198,6 +198,10 @@ class FootprintSummaryTest(unittest.TestCase):
         notes, req = self._render(["platformAgent.harness.tuning.maxSessions=4"])
         self.assertEqual(req["sessionRequestsCpu"], 4 * 150)
         self.assertIn("At the cap of 4 they request 0.600 cores and 1.25 GiB over 4 pods", notes)
+        # On the session route the default warm pod holds one session pod's requests beside them.
+        notes, req = self._render(["platformAgent.harness.tuning.maxSessions=4",
+                                   "platformAgent.harness.tuning.defaultRoute=session"])
+        self.assertIn("At the cap of 4, with 1 warm, they request 0.750 cores and 1.56 GiB over 5 pods", notes)
 
     def test_an_install_with_no_session_pods_prints_no_session_line(self) -> None:
         notes, req = self._render(["platformAgent.enabled=false", "hindsight.enabled=true"])

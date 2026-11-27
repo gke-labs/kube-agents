@@ -31,6 +31,10 @@ What it grades is the hermes-bridge's read of that row before the turn
 a report the relay or the notifier pushed reaches the bridge with no link to
 the report, and the bridge attaches the stored report ahead of the user's
 words, as the Hermes gateway's ``incident_context`` hook did before the bus.
+On a live install the gateway relays a card's report it posted into the
+thread ahead of the row (``a2a/docs/hermes-bridge.md``); the row is the
+fallback, and the one reached here, since nothing posts into an inject
+conversation.
 A case asks about a detail only the report carries; an agent that has the
 report answers it, and one that does not cannot.
 
@@ -244,7 +248,7 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     the reply's buckets with the opening's added in, bucket by bucket and
     into the nested ones, as the card-wake merge sums two turns (an inject
     record's tokens are the chain's usage as the door reported it, null
-    where it reported none, and a null bucket adds nothing).
+    where the harness holds none, and a null bucket adds nothing).
     """
     from kube_agents_bench import worker_trajectory  # devops_bench-bound, like the import below
     from kube_agents_bench.card_wake import _add_tokens  # devops_bench-bound; imported where a result exists

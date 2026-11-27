@@ -152,8 +152,8 @@ CHECK_CODEBASE_MAPPING = "codebase_mapping"
 CHECK_PROJECT_AND_APIS = "project_and_apis"
 CHECK_IAM = "iam"
 CHECK_ARTIFACT_REGISTRY = "artifact_registry"
-# The one read outside the project: this project's build identities' reader
-# grant on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT. Its own
+# The reads outside the project: this project's build identities' reader
+# grants on PROW_READ_REPOSITORIES in WARM_CACHE_REPOSITORY_PROJECT. Its own
 # check so that a caller holding nothing there -- every caller but the Prow
 # runner -- gets an unread check rather than an IAM check with a warning.
 CHECK_WARM_CACHE = "warm_cache"
@@ -174,6 +174,7 @@ CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 # The eval nightlies' Gemini Developer API key, its secret and the secret's
 # grants (scripts/provision_ci_pool_gemini_key.sh), read as metadata and IAM.
 CHECK_GEMINI_KEY = "gemini_api_key"
+CHECK_POST_MERGE_SYNC = "post_merge_sync"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
 # the minter GSA's signing right and its Workload Identity binding, read with
@@ -197,6 +198,7 @@ CHECK_IDS = (
     CHECK_GITLAB_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_GEMINI_KEY,
+    CHECK_POST_MERGE_SYNC,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
 )
@@ -208,7 +210,11 @@ CHECK_IDS = (
 # is onboarded after provisioning (docs/ci-pool-projects.md 5.6, 8), so a
 # default run during provisioning would fail or go unverified over a project
 # nobody has created yet.
-DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c not in (CHECK_TOKEN_MINTER_KMS, CHECK_GITLAB_WORKLOAD_MANIFEST))
+# The post-merge sync's check is opt-in (`--checks post_merge_sync`) until the
+# fleet stack lists the pool's projects in post_merge_sync_projects: before
+# then nothing reads its secret or syncs its seeds, so a default run must not
+# fail a project that has not had the step yet.
+DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c not in (CHECK_TOKEN_MINTER_KMS, CHECK_GITLAB_WORKLOAD_MANIFEST, CHECK_POST_MERGE_SYNC))
 # The console name each check reports under, for a result written on its
 # behalf before it ran (a deadline that passed, a blocked toolchain).
 CHECK_DISPLAY_NAMES = {
@@ -227,6 +233,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GITLAB_WORKLOAD_MANIFEST: "GitLab Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_GEMINI_KEY: "Gemini Developer API Key",
+    CHECK_POST_MERGE_SYNC: "Post-merge Sync Deploy Key & Seeds",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
 }
@@ -234,7 +241,7 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST, CHECK_POST_MERGE_SYNC})
 # The GitLab lane's twin of the workload check reads gitlab.com over HTTPS
 # with a token (GITLAB_VERIFY_TOKEN, else the pool's ledger token from Secret
 # Manager), no `gh` and no project-level `gcloud` read, so it sits in neither
@@ -248,7 +255,9 @@ GITLAB_CHECKS = frozenset({CHECK_GITLAB_WORKLOAD_MANIFEST})
 # every check but the mapping, which reads the checkout and the remote ref,
 # the default-branch read, and the GitHub checks in GITHUB_CHECKS, whose reads
 # are all `gh`.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS - GITLAB_CHECKS
+# The post-merge sync check reads both: the secret over gcloud, the seeded
+# files over gh.
+GCP_CHECKS = (frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS - GITLAB_CHECKS) | {CHECK_POST_MERGE_SYNC}
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks that need a credential the health bot must not hold
@@ -256,7 +265,7 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAUL
 # gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
-# read is in another project the bot holds nothing on. The Gemini key check
+# reads are in another project the bot holds nothing on. The Gemini key check
 # is in: securityReviewer carries its reads (GCLOUD_SURFACE_READ_ROLES). The
 # GitOps default-branch read is in: one metadata call the job makes with whatever GitHub credential it
 # carries (GITOPS_READ_TOKEN_ENV), and records as not checked when it carries
@@ -308,9 +317,20 @@ REPAIR_MINTER_ROTATION = "import the version the chart pins, or bump githubMinte
 # The one version state `kms keys versions enable` takes; a scheduled or done
 # destruction and a failed or pending import need the rotation repair.
 KMS_VERSION_DISABLED = "DISABLED"
-# hack/ci-deploy.sh's warm cache image lives in the Prow project's `us` repository.
+# Where the repositories of PROW_READ_REPOSITORIES are: the Prow project, at `us`.
 WARM_CACHE_REPOSITORY_PROJECT = "kube-agents-prow"
 WARM_CACHE_REPOSITORY_LOCATION = "us"
+# The repositories there a pool project's Cloud Build and Compute SAs read, each
+# with what it holds (for the messages) and the finding-id segment its missing
+# grants report under: the warm cache, and the repository for per-commit
+# candidate images. scripts/provision_ci_pool_project.sh grants reader on both
+# (its PROW_READ_REPOSITORIES, held equal by scripts/test_verify_ci_pool_project.py).
+WARM_CACHE_REPOSITORY = "kube-agents"
+CANDIDATE_IMAGES_REPOSITORY = "kube-agents-candidates"
+PROW_READ_REPOSITORIES = (
+    (WARM_CACHE_REPOSITORY, "the warm cache image", "reader"),
+    (CANDIDATE_IMAGES_REPOSITORY, "the per-commit candidate images", "candidates-reader"),
+)
 
 # The summary hack/fleet-kubeconfigs.sh prints to stderr on its way out. It is
 # the only place the counts appear, and the script exits 0 whether it wrote
@@ -339,7 +359,8 @@ _FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
 # carried into this check's advice rather than read as an unread role.
 FLEET_STATE_UNASSERTED_MARK = "was not asserted"
 # The fourth count: a role that is not yet ready is planted and in shape, and
-# its audit's age gate (the orphaned-snapshot roles' 91 days) has not passed;
+# its audit's age gate (the orphaned-snapshot roles' 91 days, the finished-Job
+# family's 7) has not passed;
 # it fails nothing here.
 _FLEET_STATE_SUMMARY = re.compile(
     r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
@@ -402,6 +423,9 @@ REQUIRED_APIS = {
     # project's RolloutSequences through the GKE Hub API; the composition
     # enables it for the same reason.
     "gkehub.googleapis.com",
+    # The seeded fleet's Config Sync on seeded-a (bench/tf/fleet/config-sync.tf),
+    # a fleet feature that needs the Config Management API.
+    "anthosconfigmanagement.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
     # The eval nightlies' Gemini Developer API key (check_gemini_api_key): the
@@ -526,6 +550,14 @@ FORGE_FINDINGS = frozenset(
 # position as the pieces: nothing on the public lanes resolves eval.internal.
 FINDING_DNS_API = "apis/dns.googleapis.com"
 LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS | {FINDING_DNS_API}
+# The seeded fleet's Config Sync (bench/tf/fleet/config-sync.tf) needs these on
+# a project listed in post_merge_sync_projects, and only the reconcile reads
+# them: a leased run uses neither the Config Management API nor the
+# reconciler's gkehub grant, so a project missing them is not the pool's
+# reason for a red, and the health bot's pool-drift advice must not say it is.
+FINDING_CONFIG_MANAGEMENT_API = "apis/anthosconfigmanagement.googleapis.com"
+FINDING_FLEET_RECONCILER_GKEHUB = "iam/fleet-reconciler/missing/roles/gkehub.editor"
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | {FINDING_CONFIG_MANAGEMENT_API, FINDING_FLEET_RECONCILER_GKEHUB}
 
 # ─── The eval nightlies' Gemini Developer API key ────────────────────────────
 # scripts/provision_ci_pool_gemini_key.sh mints the key and keeps its string as
@@ -542,6 +574,17 @@ GEMINI_KEY_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
 GEMINI_KEY_ERR_EXCERPT = 200
 # The state of a secret version the nightly's `versions access latest` reads.
 GEMINI_KEY_VERSION_ENABLED = "ENABLED"
+# The post-merge sync's repository side (scripts/provision_ci_pool_post_merge_sync.sh,
+# docs/ci-pool-projects.md 5.13): the deploy key's secret, the fleet
+# reconciler's accessor grant on it, and the two files Config Sync syncs into
+# seeded-post-merge. A test pins these to the script.
+POST_MERGE_SYNC_SCRIPT = "scripts/provision_ci_pool_post_merge_sync.sh"
+POST_MERGE_SYNC_SECRET = "kube-agents-eval-gitops-deploy-key"
+POST_MERGE_SYNC_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
+POST_MERGE_SYNC_SEEDED_PATHS = (
+    "clusters/seeded-a/seeded-post-merge/order-ledger.yaml",
+    "clusters/seeded-a/seeded-post-merge/order-ledger-pdb.yaml",
+)
 # Client restrictions on an API key: a key that carries any of them accepts
 # calls only from that browser, server address or app, so the agent pod's
 # calls are refused.
@@ -978,7 +1021,7 @@ CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow
 # (scripts/eval_dashboard/pool_state.py, which runs POOL_STATE_CHECKS as the
 # bot). Together they cover every read those checks make, and none writes;
 # securityReviewer alone lacks projects.get and the three describes (role
-# definitions read 2026-09-25). The one cross-project read is CHECK_WARM_CACHE,
+# definitions read 2026-09-25). The cross-project reads are CHECK_WARM_CACHE's,
 # which the scan does not run. Granted by bench/tf/fleet
 # (`pool_state_readers`), kept equal by test, checked below.
 POOL_STATE_READER_ROLES = {
@@ -1104,6 +1147,9 @@ FLEET_RECONCILER_ROLES = {
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
+    # gkehub.editor: the stack registers seeded-a to the fleet and turns on Config
+    # Sync for it (config-sync.tf): gkehub.memberships.* and gkehub.features.*.
+    "roles/gkehub.editor",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
     "roles/resourcemanager.projectIamAdmin",
@@ -2180,72 +2226,76 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
 
 
 def check_warm_cache_readers(project_id: str, project_number: str) -> CheckResult:
-    """Verify this project's Cloud Build and Compute SAs hold reader on the warm cache repository in WARM_CACHE_REPOSITORY_PROJECT."""
+    """Verify this project's Cloud Build and Compute SAs hold reader on each of PROW_READ_REPOSITORIES in WARM_CACHE_REPOSITORY_PROJECT."""
     details: List[str] = []
     warnings: List[str] = []
     findings: List[Finding] = []
     passed = True
-    prow_checked = False
-    # The warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE to lives in the
-    # `us` multi-region repository of kube-agents-prow, not in us-central1.
-    rc, out, err = run_cmd([
-        "gcloud", "artifacts", "repositories", "get-iam-policy",
-        "kube-agents",
-        f"--project={WARM_CACHE_REPOSITORY_PROJECT}",
-        f"--location={WARM_CACHE_REPOSITORY_LOCATION}",
-        "--format=json",
-    ])
-    if rc != 0:
-        # A cross-project read. The pool project can be perfectly configured
-        # while the caller simply holds nothing on kube-agents-prow, which is
-        # the common case for anyone who is not the Prow service account.
-        if not _record_unreadable(
-            err,
-            f"Failed reading IAM policy for kube-agents-prow repository: {err.strip()}",
-            "Could not read the IAM policy on kube-agents-prow's kube-agents repository, so this "
-            "project's Cloud Build and Compute SAs were not checked for reader on the warm cache image",
-            details,
-            warnings,
-        ):
-            passed = False
-    else:
-        prow_checked = True
+    repositories_read = 0
+    cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
+    compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
+    # Both live in the `us` multi-region location of kube-agents-prow, not in
+    # us-central1: the warm cache image hack/ci-deploy.sh defaults CACHE_IMAGE
+    # to, and the candidate images.
+    for repository, holds, finding_segment in PROW_READ_REPOSITORIES:
+        rc, out, err = run_cmd([
+            "gcloud", "artifacts", "repositories", "get-iam-policy",
+            repository,
+            f"--project={WARM_CACHE_REPOSITORY_PROJECT}",
+            f"--location={WARM_CACHE_REPOSITORY_LOCATION}",
+            "--format=json",
+        ])
+        if rc != 0:
+            # A cross-project read. The pool project can be perfectly configured
+            # while the caller simply holds nothing on kube-agents-prow, which is
+            # the common case for anyone who is not the Prow service account.
+            if not _record_unreadable(
+                err,
+                f"Failed reading IAM policy for kube-agents-prow repository {repository}: {err.strip()}",
+                f"Could not read the IAM policy on kube-agents-prow's {repository} repository, so this "
+                f"project's Cloud Build and Compute SAs were not checked for reader on {holds}",
+                details,
+                warnings,
+            ):
+                passed = False
+            continue
+        repositories_read += 1
         try:
             policy = _load_json(out)
-            cb_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
-            compute_sa = f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"
             readers = set()
             for b in policy.get("bindings", []):
                 if b.get("role") == "roles/artifactregistry.reader":
                     readers.update(b.get("members", []))
-            warm_cache_grant = (
-                f"gcloud artifacts repositories add-iam-policy-binding kube-agents --project={WARM_CACHE_REPOSITORY_PROJECT} "
+            grant = (
+                f"gcloud artifacts repositories add-iam-policy-binding {repository} --project={WARM_CACHE_REPOSITORY_PROJECT} "
                 f'--location={WARM_CACHE_REPOSITORY_LOCATION} --member="{{member}}" --role=roles/artifactregistry.reader'
             )
             if cb_sa not in readers:
                 passed = False
                 _drift(
-                    details, findings, "warm_cache/reader/cloudbuild",
-                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
-                    warm_cache_grant.format(member=cb_sa),
+                    details, findings, f"warm_cache/{finding_segment}/cloudbuild",
+                    f"Cloud Build SA ({cb_sa}) missing roles/artifactregistry.reader on kube-agents-prow's {repository} repository",
+                    grant.format(member=cb_sa),
                 )
             if compute_sa not in readers:
                 passed = False
                 _drift(
-                    details, findings, "warm_cache/reader/compute",
-                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow",
-                    warm_cache_grant.format(member=compute_sa),
+                    details, findings, f"warm_cache/{finding_segment}/compute",
+                    f"Compute SA ({compute_sa}) missing roles/artifactregistry.reader on kube-agents-prow's {repository} repository",
+                    grant.format(member=compute_sa),
                 )
         except Exception as exc:
             passed = False
-            details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
+            details.append(f"Failed parsing kube-agents-prow AR policy for {repository}: {exc}")
 
     if not passed:
-        message = "Warm cache reader grants missing"
-    elif not prow_checked:
-        message = "Not checked: the warm cache repository's policy could not be read"
+        message = "Warm cache or candidate image reader grants missing"
+    elif repositories_read == 0:
+        message = "Not checked: the Prow project's repository policies could not be read"
+    elif repositories_read < len(PROW_READ_REPOSITORIES):
+        message = "Reader held on the repository whose policy was read; the other could not be read"
     else:
-        message = "Cloud Build and Compute SAs hold reader on the warm cache repository"
+        message = "Cloud Build and Compute SAs hold reader on the warm cache and candidate image repositories"
     return CheckResult(
         "Warm Cache Readers",
         passed,
@@ -2253,7 +2303,7 @@ def check_warm_cache_readers(project_id: str, project_number: str) -> CheckResul
         details=details,
         warnings=warnings,
         findings=findings,
-        read=prow_checked,
+        read=repositories_read > 0,
     )
 
 
@@ -4668,6 +4718,99 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
     return CheckResult(name, passed, message, details, warnings, findings, read=True)
 
 
+def check_post_merge_sync(project_id: str) -> CheckResult:
+    """The post-merge sync's repository side: an enabled latest version of the
+    deploy key's secret, the fleet reconciler's accessor grant on it, and the
+    order-ledger declaration and budget in the GitOps repository. Metadata and
+    presence only: no read returns the key or a file's body. A read that is
+    refused or times out leaves its part unverified, as check_gemini_api_key
+    does, and a check that read some parts and not others passes with warnings.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_POST_MERGE_SYNC]
+    repair = f"{POST_MERGE_SYNC_SCRIPT} {project_id}"
+    secret = POST_MERGE_SYNC_SECRET
+    details: List[str] = []
+    warnings: List[str] = []
+    problems: List[str] = []
+    read_any = False
+
+    def gcloud_json(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
+        """(parsed JSON, read): None with read True when the resource is absent."""
+        nonlocal read_any
+        rc, out, err = run_cmd(cmd)
+        if rc != 0:
+            # The absent line is not recorded here: the caller's problem says it once.
+            if _record_unreadable(err, "", f"Could not read {what} in {project_id}", [], warnings):
+                return None, False
+            read_any = True
+            return None, True
+        try:
+            parsed = json.loads(out or "null")
+        except ValueError as exc:
+            warnings.append(Unread(f"Could not read {what} in {project_id}: gcloud printed no JSON ({exc})"))
+            return None, False
+        read_any = True
+        return parsed, True
+
+    versions, versions_read = gcloud_json(
+        ["gcloud", "secrets", "versions", "list", secret, f"--project={project_id}", "--limit=1", "--format=json"],
+        f"the latest version of secret {secret}",
+    )
+    secret_exists = versions_read and versions is not None
+    if versions_read:
+        latest = (versions or [{}])[0].get("state", "") if versions is not None else ""
+        if latest == GEMINI_KEY_VERSION_ENABLED:
+            details.append(f"✓ Secret {secret} has an enabled latest version")
+        else:
+            problems.append(f"secret {secret} has no enabled latest version ({latest or 'absent'})")
+    # As check_gemini_api_key: the grant is read when the secret exists or its
+    # versions could not be read, and a policy that does not come back is unread.
+    if secret_exists or not versions_read:
+        policy, policy_read = gcloud_json(
+            ["gcloud", "secrets", "get-iam-policy", secret, f"--project={project_id}", "--format=json"],
+            f"the IAM policy of secret {secret}",
+        )
+        if policy_read and policy is None:
+            warnings.append(Unread(f"Could not read the IAM policy of secret {secret} in {project_id}, so the reconciler's grant is unverified"))
+        elif policy_read:
+            held = {
+                member
+                for binding in (policy or {}).get("bindings", [])
+                if binding.get("role") == POST_MERGE_SYNC_ACCESSOR_ROLE
+                for member in binding.get("members", [])
+            }
+            if FLEET_RECONCILER_MEMBER in held:
+                details.append(f"✓ the fleet reconciler holds {POST_MERGE_SYNC_ACCESSOR_ROLE} on {secret}")
+            else:
+                problems.append(f"the fleet reconciler lacks {POST_MERGE_SYNC_ACCESSOR_ROLE} on secret {secret}")
+    repo_slug = _gitops_repo_slug(project_id)
+    for path in POST_MERGE_SYNC_SEEDED_PATHS:
+        state, out = _gitops_path_state(repo_slug, path)
+        if state == GITHUB_PATH_PRESENT:
+            read_any = True
+            details.append(f"✓ {repo_slug} carries {path}")
+        elif state == GITHUB_PATH_ABSENT:
+            # gh answers 404 for an absent file and for a repository the token
+            # cannot see; both readings are named, as the sibling checks do.
+            read_any = True
+            problems.append(
+                f"{repo_slug} has no {path}, or this token cannot read the repository "
+                "(gh answers 404 to both; the github_repo_and_app check says which)"
+            )
+        elif state == GITHUB_PATH_FAILED:
+            read_any = True
+            problems.append(f"could not read {path} in {repo_slug}: {out}")
+        else:
+            warnings.append(Unread(f"Not checked: {path} in {repo_slug} could not be read: {out}"))
+    if problems:
+        details.extend(problems)
+        return CheckResult(name, False, f"{'; '.join(problems)} (run {repair})", details, warnings, read=read_any)
+    if not read_any:
+        return CheckResult(name, True, "Not checked", details, warnings, read=False)
+    message = "Partly unverified" if warnings else "Deploy key secret, reconciler grant, declaration and budget in place"
+    return CheckResult(name, True, message, details, warnings, read=True)
+
+
 def _probe_github_app_identity(
     project_id: str, location: str, version: str, app_id: int, timeout: int = 15
 ) -> Tuple[str, str]:
@@ -5249,6 +5392,7 @@ def run_checks(
     run(CHECK_GITLAB_WORKLOAD_MANIFEST, lambda: check_gitlab_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     run(CHECK_GEMINI_KEY, lambda: check_gemini_api_key(project_id))
+    run(CHECK_POST_MERGE_SYNC, lambda: check_post_merge_sync(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
     elif CHECK_TOKEN_MINTER_KMS in wanted:

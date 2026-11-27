@@ -7,11 +7,13 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import ast
 import base64
 import errno
 import hashlib
 import importlib
 import inspect
+import contextlib
 import io
 import json
 import time
@@ -24,7 +26,8 @@ import textwrap
 import types
 import unittest
 from contextlib import contextmanager, redirect_stderr
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import argparse
 from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -4938,6 +4941,585 @@ class TestIngressGatewayHealthcheckMismatch(unittest.TestCase):
         )
 
 
+def cluster_node(name, pool="default-pool", taints=None, labels=None):
+    doc = {
+        "kind": "Node",
+        "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": pool, **(labels or {})}},
+        "spec": {},
+    }
+    if taints:
+        doc["spec"]["taints"] = taints
+    return doc
+
+
+def node_agent(
+    name="cni-shaped-agent",
+    ns="seeded-shapes",
+    *,
+    host_network=True,
+    host_paths=("/etc/cni/net.d",),
+    tolerations=None,
+    node_selector=None,
+    affinity=None,
+    labels=None,
+    annotations=None,
+    status=None,
+    capabilities=(),
+):
+    spec = {"containers": [{"name": "agent", "image": "registry.k8s.io/pause:3.10"}]}
+    if capabilities:
+        spec["containers"][0]["securityContext"] = {"capabilities": {"drop": ["ALL"], "add": list(capabilities)}}
+    if host_network:
+        spec["hostNetwork"] = True
+    if host_paths:
+        spec["volumes"] = [{"name": f"host-{i}", "hostPath": {"path": p}} for i, p in enumerate(host_paths)]
+    if tolerations is not None:
+        spec["tolerations"] = tolerations
+    if node_selector is not None:
+        spec["nodeSelector"] = node_selector
+    if affinity is not None:
+        spec["affinity"] = affinity
+    doc = {
+        "kind": "DaemonSet",
+        "metadata": {"namespace": ns, "name": name, "labels": labels or {}, "annotations": annotations or {}},
+        "spec": {"template": {"spec": spec}},
+    }
+    if status is not None:
+        doc["status"] = status
+    return doc
+
+
+# What GKE's documented ip-masq-agent manifest adds to its container.
+IP_MASQ_CAPABILITIES = ("NET_ADMIN", "NET_RAW")
+
+
+class TestNetworkDaemonsetMissingToleration(unittest.TestCase):
+    """§3.27 (`network-daemonset-missing-ccc-toleration`). A DaemonSet on the
+    node's network, or mounting a network plug-in directory, against the taints
+    of every node pool that has a node."""
+
+    IDLE = {"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}
+    PINNED = {"key": "seeded-role", "value": "pinned-inference", "effect": "NoSchedule"}
+
+    def fleet_nodes(self):
+        return [
+            cluster_node("default-1"),
+            cluster_node("default-2"),
+            cluster_node("default-3"),
+            cluster_node("idle-1", pool="idle-batch-pool", taints=[self.IDLE]),
+            cluster_node("pinned-1", pool="pinned-inference-pool", taints=[self.PINNED]),
+        ]
+
+    def hits(self, *items, nodes=None):
+        nodes = self.fleet_nodes() if nodes is None else nodes
+        return collect.check_network_daemonset_missing_toleration(context_of(dump_of(*items, *nodes)))
+
+    def test_the_fleet_shape_names_both_uncovered_pools_on_one_finding(self):
+        agent = node_agent(status={"desiredNumberScheduled": 3, "numberReady": 3})
+        hits = self.hits(agent)
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual((hit["namespace"], hit["object"]), ("seeded-shapes", "DaemonSet/cni-shaped-agent"))
+        self.assertEqual(
+            hit["excerpt"],
+            "DaemonSet (checked here because of: mounts /etc/cni/net.d from the node) "
+            "cannot be placed on 2 of the cluster's 5 nodes. "
+            "It reports 3 of 3 pods ready, which counts only the nodes it can be placed on. "
+            "It has no toleration for seeded-role=idle-batch:NoSchedule (node pool idle-batch-pool, 1 node); "
+            "seeded-role=pinned-inference:NoSchedule (node pool pinned-inference-pool, 1 node).",
+        )
+
+    def test_the_documented_ip_masq_agent_without_its_tolerations_is_flagged_in_kube_system(self):
+        # GKE's manifest: kube-system, hostNetwork, a ConfigMap volume and no host mount.
+        agent = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        hits = self.hits(agent)
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("kube-system", "DaemonSet/ip-masq-agent")])
+        self.assertIn("(checked here because of: hostNetwork: true with NET_ADMIN, NET_RAW)", hits[0]["excerpt"])
+
+    def test_kube_system_is_the_one_system_namespace_read(self):
+        """GKE's documented manifest is applied to `kube-system` by the owner.
+        The other system namespaces hold objects that are not the owner's to
+        edit, whether or not they carry the add-on label."""
+        for ns in ("gke-managed-system", "gmp-system", "gke-gmp-system", "config-management-system", "istio-system"):
+            with self.subTest(namespace=ns):
+                self.assertEqual(self.hits(node_agent("collector", ns)), [])
+        self.assertEqual(len(self.hits(node_agent("ip-masq-agent", "kube-system", capabilities=IP_MASQ_CAPABILITIES))), 1)
+
+    def test_the_host_network_alone_does_not_make_a_node_networking_agent(self):
+        """Log, metrics and security agents use the host network to reach the
+        node's ports. Without a network capability or a plug-in mount they are
+        not this check's subject, in any namespace and whatever the taint."""
+        gpu = {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+        evict = {"key": "dedicated", "value": "batch", "effect": "NoExecute"}
+        nodes = [cluster_node("n1"), cluster_node("g1", pool="gpu-pool", taints=[gpu]), cluster_node("e1", pool="evict-pool", taints=[evict])]
+        privileged = node_agent("security-agent", "security", host_paths=())
+        privileged["spec"]["template"]["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        for agent in (
+            node_agent("filebeat", "kube-system", host_paths=()),
+            node_agent("node-exporter", "monitoring", host_paths=(), tolerations=[{"effect": "NoSchedule", "operator": "Exists"}]),
+            node_agent("otel-agent", "observability", host_paths=(), capabilities=("SYS_PTRACE",)),
+            privileged,
+        ):
+            with self.subTest(agent=agent["metadata"]["name"]):
+                self.assertEqual(self.hits(agent, nodes=nodes), [])
+
+    def test_the_host_network_with_a_network_capability_is_flagged(self):
+        for capabilities in (("NET_ADMIN",), ("NET_RAW",), ("NET_ADMIN", "NET_RAW"), ("SYS_TIME", "NET_ADMIN")):
+            with self.subTest(capabilities=capabilities):
+                hits = self.hits(node_agent("snat-agent", "kube-system", host_paths=(), capabilities=capabilities))
+                self.assertEqual(len(hits), 1)
+                named = ", ".join(c for c in ("NET_ADMIN", "NET_RAW") if c in capabilities)
+                self.assertIn(f"(checked here because of: hostNetwork: true with {named})", hits[0]["excerpt"])
+        # The capability on an init container counts: it sets the rules before the agent starts.
+        agent = node_agent("snat-agent", "kube-system", host_paths=())
+        agent["spec"]["template"]["spec"]["initContainers"] = [
+            {"name": "rules", "securityContext": {"capabilities": {"add": ["NET_ADMIN"]}}}
+        ]
+        self.assertEqual(len(self.hits(agent)), 1)
+        # The capability without the host network is not the mark.
+        self.assertEqual(self.hits(node_agent("in-pod", "apps", host_network=False, host_paths=(), capabilities=("NET_ADMIN",))), [])
+
+    def test_a_network_plugin_mount_without_host_network_is_flagged(self):
+        for path in ("/etc/cni/net.d", "/opt/cni/bin", "/home/kubernetes/bin", "/etc/cni/net.d/"):
+            with self.subTest(path=path):
+                hits = self.hits(node_agent(host_network=False, host_paths=(path,)))
+                self.assertEqual(len(hits), 1)
+                self.assertIn(f"mounts {path} from the node", hits[0]["excerpt"])
+                self.assertNotIn("hostNetwork", hits[0]["excerpt"])
+
+    def test_a_compute_class_taint_is_named_as_any_other_taint(self):
+        taint = {"key": "cloud.google.com/compute-class", "value": "batch", "effect": "NoSchedule"}
+        hits = self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2", pool="batch-pool", taints=[taint])])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("cloud.google.com/compute-class=batch:NoSchedule (node pool batch-pool, 1 node)", hits[0]["excerpt"])
+
+    def test_a_no_execute_taint_and_a_valueless_taint_are_flagged(self):
+        nodes = [
+            cluster_node("n1", pool="evict-pool", taints=[{"key": "dedicated", "effect": "NoExecute"}]),
+            cluster_node("n2", pool="evict-pool", taints=[{"key": "dedicated", "effect": "NoExecute"}]),
+        ]
+        hits = self.hits(node_agent(), nodes=nodes)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("dedicated:NoExecute (node pool evict-pool, 2 nodes)", hits[0]["excerpt"])
+        self.assertIn("cannot be placed on 2 of the cluster's 2 nodes", hits[0]["excerpt"])
+
+    def test_a_partly_tolerating_agent_names_only_the_pool_it_misses(self):
+        tolerations = [{"key": "seeded-role", "operator": "Equal", "value": "idle-batch", "effect": "NoSchedule"}]
+        hits = self.hits(node_agent(tolerations=tolerations))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool pinned-inference-pool, 1 node)", hits[0]["excerpt"])
+        self.assertNotIn("idle-batch-pool", hits[0]["excerpt"])
+        self.assertIn("cannot be placed on 1 of the cluster's 5 nodes", hits[0]["excerpt"])
+
+    def test_a_blanket_or_matching_toleration_is_clean(self):
+        clean = [
+            [{"operator": "Exists"}],
+            [{"effect": "NoSchedule", "operator": "Exists"}, {"effect": "NoExecute", "operator": "Exists"}],
+            [{"key": "seeded-role", "operator": "Exists"}],
+            [
+                {"key": "seeded-role", "operator": "Equal", "value": "idle-batch", "effect": "NoSchedule"},
+                {"key": "seeded-role", "operator": "Equal", "value": "pinned-inference", "effect": "NoSchedule"},
+            ],
+        ]
+        for tolerations in clean:
+            with self.subTest(tolerations=tolerations):
+                self.assertEqual(self.hits(node_agent(tolerations=tolerations)), [])
+
+    def test_a_cluster_with_no_tainted_node_is_clean(self):
+        self.assertEqual(self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2")]), [])
+
+    def test_a_tainted_pool_with_no_node_cannot_appear(self):
+        # The pool exists in GKE but holds no Node object: nothing to cover.
+        self.assertEqual(self.hits(node_agent(), nodes=self.fleet_nodes()[:3]), [])
+
+    def test_a_daemonset_that_is_no_node_networking_agent_is_clean(self):
+        for host_paths in (
+            (),
+            ("/var/log",),
+            ("/etc/cni-backup",),
+            ("/etc/cni",),
+            ("/etc/cni/net.d-old",),
+            ("/opt/cni/binaries",),
+            ("/home/kubernetes/bin/nvidia",),
+        ):
+            with self.subTest(host_paths=host_paths):
+                self.assertEqual(self.hits(node_agent(host_network=False, host_paths=host_paths)), [])
+
+    def test_a_deployment_on_the_host_network_is_clean(self):
+        dep = deployment("host-net-api", ns="seeded-shapes")
+        dep["spec"]["template"]["spec"]["hostNetwork"] = True
+        dep["spec"]["template"]["spec"]["containers"][0]["securityContext"] = {"capabilities": {"add": list(IP_MASQ_CAPABILITIES)}}
+        self.assertEqual(self.hits(dep), [])
+
+    def test_a_pool_the_agents_own_selector_excludes_is_clean(self):
+        selector = {"cloud.google.com/gke-nodepool": "default-pool"}
+        self.assertEqual(self.hits(node_agent(node_selector=selector)), [])
+        affinity = {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "cloud.google.com/gke-nodepool",
+                                    "operator": "NotIn",
+                                    "values": ["idle-batch-pool", "pinned-inference-pool"],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+        self.assertEqual(self.hits(node_agent(affinity=affinity)), [])
+
+    def test_a_selector_on_a_node_label_reads_the_nodes_own_labels(self):
+        nodes = [
+            cluster_node("n1", labels={"sandbox.gke.io/runtime": "gvisor"}),
+            cluster_node("n2", pool="idle-batch-pool", taints=[self.IDLE]),
+        ]
+        selector = {"sandbox.gke.io/runtime": "gvisor"}
+        self.assertEqual(self.hits(node_agent(node_selector=selector), nodes=nodes), [])
+        nodes[1]["metadata"]["labels"]["sandbox.gke.io/runtime"] = "gvisor"
+        self.assertEqual(len(self.hits(node_agent(node_selector=selector), nodes=nodes)), 1)
+
+    def affinity_of(self, *terms):
+        return {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": list(terms)}}}
+
+    def test_a_node_name_field_in_the_affinity_decides_which_nodes_count(self):
+        only_idle = self.affinity_of({"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["idle-1"]}]})
+        hits = self.hits(node_agent(affinity=only_idle))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool idle-batch-pool, 1 node)", hits[0]["excerpt"])
+        self.assertNotIn("pinned-inference-pool", hits[0]["excerpt"])
+        not_tainted = self.affinity_of(
+            {"matchFields": [{"key": "metadata.name", "operator": "NotIn", "values": ["idle-1", "pinned-1"]}]}
+        )
+        self.assertEqual(self.hits(node_agent(affinity=not_tainted)), [])
+
+    def test_a_numeric_affinity_operator_is_decided_from_the_label(self):
+        nodes = [
+            cluster_node("old-1", pool="old-pool", taints=[self.IDLE], labels={"example.com/generation": "2"}),
+            cluster_node("new-1", pool="new-pool", taints=[self.PINNED], labels={"example.com/generation": "5"}),
+            cluster_node("plain-1", pool="plain-pool", taints=[self.IDLE]),
+        ]
+        newer = self.affinity_of({"matchExpressions": [{"key": "example.com/generation", "operator": "Gt", "values": ["3"]}]})
+        hits = self.hits(node_agent(affinity=newer), nodes=nodes)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool new-pool, 1 node)", hits[0]["excerpt"])
+        self.assertIn("cannot be placed on 1 of the cluster's 3 nodes", hits[0]["excerpt"])
+        older = self.affinity_of({"matchExpressions": [{"key": "example.com/generation", "operator": "Lt", "values": ["3"]}]})
+        self.assertIn("(node pool old-pool, 1 node)", self.hits(node_agent(affinity=older), nodes=nodes)[0]["excerpt"])
+
+    def test_each_affinity_operator_reads_a_present_and_an_absent_label(self):
+        """Per operator: which of three tainted nodes the affinity admits, where
+        one node carries the label with the wanted value, one with another
+        value, and one does not carry it at all."""
+        nodes = [
+            cluster_node("gpu-1", pool="gpu-pool", taints=[self.IDLE], labels={"example.com/tier": "7"}),
+            cluster_node("cpu-1", pool="cpu-pool", taints=[self.IDLE], labels={"example.com/tier": "2"}),
+            cluster_node("bare-1", pool="bare-pool", taints=[self.IDLE]),
+        ]
+        admitted = {
+            ("In", ("7",)): {"gpu-pool"},
+            ("NotIn", ("7",)): {"cpu-pool", "bare-pool"},
+            ("Exists", ()): {"gpu-pool", "cpu-pool"},
+            ("DoesNotExist", ()): {"bare-pool"},
+            ("Gt", ("5",)): {"gpu-pool"},
+            ("Lt", ("5",)): {"cpu-pool"},
+            ("In", ("",)): set(),
+            ("Gt", ("x",)): set(),
+        }
+        for (operator, values), pools in admitted.items():
+            with self.subTest(operator=operator, values=values):
+                expression = {"key": "example.com/tier", "operator": operator}
+                if values:
+                    expression["values"] = list(values)
+                hits = self.hits(node_agent(affinity=self.affinity_of({"matchExpressions": [expression]})), nodes=nodes)
+                named = set(re.findall(r"node pools? ([a-z, -]+?), \d+ node", hits[0]["excerpt"])[0].split(", ")) if hits else set()
+                self.assertEqual(named, pools)
+
+    def test_affinity_terms_are_alternatives_when_the_first_one_fails(self):
+        # The first term names a pool that does not exist; the second admits the tainted pool.
+        either = self.affinity_of(
+            {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["no-such-pool"]}]},
+            {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["idle-batch-pool"]}]},
+        )
+        hits = self.hits(node_agent(affinity=either))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("(node pool idle-batch-pool, 1 node)", hits[0]["excerpt"])
+        # Within one term every expression must hold.
+        both = self.affinity_of(
+            {
+                "matchExpressions": [
+                    {"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["idle-batch-pool"]},
+                    {"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["pinned-inference-pool"]},
+                ]
+            }
+        )
+        self.assertEqual(self.hits(node_agent(affinity=both)), [])
+
+    def test_the_marks_are_read_as_the_api_writes_them(self):
+        # GKE's binary directory with a trailing slash is still that directory.
+        hits = self.hits(node_agent(host_network=False, host_paths=("/home/kubernetes/bin/",)))
+        self.assertEqual(len(hits), 1)
+        # Two volumes of one path are one mark.
+        twice = self.hits(node_agent(host_network=False, host_paths=("/etc/cni/net.d", "/etc/cni/net.d")))
+        self.assertEqual(twice[0]["excerpt"].count("mounts /etc/cni/net.d from the node"), 1)
+        # `hostNetwork` is a boolean; a string is not the host network.
+        agent = node_agent(host_network=False, host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        agent["spec"]["template"]["spec"]["hostNetwork"] = "true"
+        self.assertEqual(self.hits(agent), [])
+
+    def test_a_long_list_of_plugin_mounts_is_cut_and_counted(self):
+        paths = tuple(f"/etc/cni/net.d/conf-{i}" for i in range(collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED + 3))
+        excerpt = self.hits(node_agent(host_paths=paths))[0]["excerpt"]
+        self.assertIn(f"mounts /etc/cni/net.d/conf-{collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED - 1} from the node; 3 more plug-in mounts) cannot be placed on", excerpt)
+        self.assertNotIn(f"conf-{collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED} ", excerpt)
+        one_more = self.hits(node_agent(host_paths=paths[: collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED + 1]))[0]["excerpt"]
+        self.assertIn("; 1 more plug-in mount) cannot be placed on", one_more)
+        self.assertEqual(collect.NETWORK_DAEMONSET_MAX_MOUNTS_NAMED, 4)
+
+    def test_a_status_taint_of_the_autoscaler_is_a_finding(self):
+        # Unlike its start-up prefix, the status prefix marks a node that "should not be used to run pods for the time being".
+        taint = {"key": "status-taint.cluster-autoscaler.kubernetes.io/hold", "effect": "NoSchedule"}
+        self.assertEqual(len(self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2", pool="held", taints=[taint])])), 1)
+
+    def test_ten_node_pools_are_named_per_taint(self):
+        self.assertEqual(collect.NETWORK_DAEMONSET_MAX_POOLS_NAMED, 10)
+
+    def test_affinity_terms_are_alternatives_and_an_empty_or_unknown_one_admits_no_node(self):
+        for terms in ([{}], [{"matchExpressions": [{"key": "seeded-role", "operator": "Near", "values": ["x"]}]}]):
+            with self.subTest(terms=terms):
+                self.assertEqual(self.hits(node_agent(affinity=self.affinity_of(*terms))), [])
+        either = self.affinity_of(
+            {},
+            {"matchExpressions": [{"key": "cloud.google.com/gke-nodepool", "operator": "In", "values": ["pinned-inference-pool"]}]},
+        )
+        hits = self.hits(node_agent(affinity=either))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("cannot be placed on 1 of the cluster's 5 nodes", hits[0]["excerpt"])
+
+    def test_taints_the_daemonset_controller_tolerates_by_itself_are_ignored(self):
+        own = [
+            {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"},
+            {"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"},
+            {"key": "node.kubernetes.io/network-unavailable", "effect": "NoSchedule"},
+            {"key": "ToBeDeletedByClusterAutoscaler", "effect": "NoSchedule"},
+            {"key": "node.kubernetes.io/out-of-service", "effect": "NoExecute"},
+            {"key": "node.cloudprovider.kubernetes.io/shutdown", "effect": "NoSchedule"},
+            # Start-up taints a node sheds once it is ready.
+            {"key": "node.cilium.io/agent-not-ready", "value": "true", "effect": "NoExecute"},
+            {"key": "startup-taint.cluster-autoscaler.kubernetes.io/driver", "effect": "NoSchedule"},
+            {"key": "ignore-taint.cluster-autoscaler.kubernetes.io/driver", "effect": "NoSchedule"},
+        ]
+        nodes = [cluster_node("n1"), cluster_node("n2", taints=own)]
+        self.assertEqual(self.hits(node_agent(), nodes=nodes), [])
+
+    def test_a_node_tainted_for_another_platform_is_none_of_the_agents_nodes(self):
+        """GKE taints Windows Server and Arm nodes to keep software built for
+        another platform off them. An agent that does not tolerate that taint
+        is not reported there, whatever else the node carries: the toleration
+        would start an image the node cannot run."""
+        dedicated = {"key": "dedicated", "value": "batch", "effect": "NoSchedule"}
+        platforms = {
+            "windows-pool": {"key": "node.kubernetes.io/os", "value": "windows", "effect": "NoSchedule"},
+            "arm-pool": {"key": "kubernetes.io/arch", "value": "arm64", "effect": "NoSchedule"},
+        }
+        for pool, platform in platforms.items():
+            with self.subTest(pool=pool):
+                nodes = [cluster_node("plain-1"), cluster_node("other-1", pool=pool, taints=[platform, dedicated])]
+                self.assertEqual(self.hits(node_agent(), nodes=nodes), [])
+                # An agent built for that platform says so with the toleration;
+                # the pool's other taint then counts as on any pool.
+                built_for_it = [{"key": platform["key"], "operator": "Exists"}]
+                hits = self.hits(node_agent(tolerations=built_for_it), nodes=nodes)
+                self.assertEqual(len(hits), 1)
+                self.assertIn(f"dedicated=batch:NoSchedule (node pool {pool}, 1 node)", hits[0]["excerpt"])
+
+    def test_a_gpu_or_dedicated_pool_taint_is_a_finding(self):
+        # Taints that keep ordinary workloads off a pool, not node agents.
+        for taint in (
+            {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"},
+            {"key": "sandbox.gke.io/runtime", "value": "gvisor", "effect": "NoSchedule"},
+            {"key": "dedicated", "value": "payments", "effect": "NoSchedule"},
+        ):
+            with self.subTest(taint=taint["key"]):
+                nodes = [cluster_node("plain-1"), cluster_node("special-1", pool="special-pool", taints=[taint])]
+                self.assertEqual(len(self.hits(node_agent(), nodes=nodes)), 1)
+
+    def test_a_prefer_no_schedule_taint_is_ignored(self):
+        nodes = [cluster_node("n1", pool="soft-pool", taints=[{"key": "soft", "effect": "PreferNoSchedule"}])]
+        self.assertEqual(self.hits(node_agent(), nodes=nodes), [])
+
+    def test_gke_managed_and_opted_out_agents_are_skipped(self):
+        skipped = [
+            node_agent("netd", "kube-system", labels={"addonmanager.kubernetes.io/mode": "Reconcile"}),
+            node_agent(labels={"kubeagents.x-k8s.io/reliability-audit": "exempt"}),
+            node_agent(annotations={"kubeagents.x-k8s.io/reliability-audit": "exempt"}),
+            node_agent("anetd", "kube-system", annotations={"components.gke.io/component-name": "advanceddatapath"}),
+        ]
+        for agent in skipped:
+            with self.subTest(agent=agent["metadata"]):
+                self.assertEqual(self.hits(agent), [])
+
+    def test_the_excerpt_omits_the_ready_count_when_status_is_absent(self):
+        hits = self.hits(node_agent())
+        self.assertIn("cannot be placed on 2 of the cluster's 5 nodes. It has no toleration for ", hits[0]["excerpt"])
+        self.assertNotIn("pods ready", hits[0]["excerpt"])
+
+    def test_every_taint_is_named_however_many_pools_carry_it(self):
+        """The fix is one toleration per taint, so no taint may fall off the end
+        of a long pool list: the pools of one taint are cut and counted, the
+        taints are not."""
+        cap = collect.NETWORK_DAEMONSET_MAX_POOLS_NAMED
+        batch = {"key": "cloud.google.com/compute-class", "value": "batch", "effect": "NoSchedule"}
+        gpu = {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+        nodes = [cluster_node(f"n{i}", pool=f"nap-{i:02d}", taints=[batch]) for i in range(cap + 3)]
+        nodes.append(cluster_node("g1", pool="zz-gpu", taints=[gpu]))
+        hits = self.hits(node_agent(), nodes=nodes)
+        self.assertEqual(len(hits), 1)
+        excerpt = hits[0]["excerpt"]
+        self.assertIn(f"nap-{cap - 1:02d} and 3 more, {cap + 3} nodes); nvidia.com/gpu=present:NoSchedule (node pool zz-gpu, 1 node).", excerpt)
+        self.assertNotIn(f"nap-{cap:02d}", excerpt)
+        self.assertEqual(excerpt.count("cloud.google.com/compute-class=batch:NoSchedule"), 1)
+        self.assertIn(f"cannot be placed on {cap + 4} of the cluster's {cap + 4} nodes.", excerpt)
+
+    def test_a_node_with_two_untolerated_taints_is_one_node_under_each_taint(self):
+        both = [self.IDLE, {"key": "dedicated", "value": "batch", "effect": "NoExecute"}]
+        hits = self.hits(node_agent(), nodes=[cluster_node("n1"), cluster_node("n2", pool="batch-pool", taints=both)])
+        self.assertIn(
+            "cannot be placed on 1 of the cluster's 2 nodes. "
+            "It has no toleration for dedicated=batch:NoExecute (node pool batch-pool, 1 node); "
+            "seeded-role=idle-batch:NoSchedule (node pool batch-pool, 1 node).",
+            hits[0]["excerpt"],
+        )
+
+    def test_the_counts_come_before_a_long_list_of_taints(self):
+        # The report cuts a long excerpt at its end; what it cuts must be taints, not the counts.
+        taints = [{"key": f"team-{i:02d}", "value": "x" * 60, "effect": "NoSchedule"} for i in range(25)]
+        nodes = [cluster_node("n0")] + [cluster_node(f"n{i + 1}", pool=f"pool-{i:02d}", taints=[taint]) for i, taint in enumerate(taints)]
+        excerpt = self.hits(node_agent(status={"desiredNumberScheduled": 1, "numberReady": 1}), nodes=nodes)[0]["excerpt"]
+        self.assertGreater(len(excerpt), audit_report.MAX_EXCERPT_CHARS)
+        self.assertLess(excerpt.index("pods ready"), excerpt.index("team-00"))
+        self.assertLess(excerpt.index("cannot be placed on 25 of the cluster's 26 nodes"), excerpt.index("team-00"))
+
+    def test_a_node_with_no_node_pool_label_is_named_as_such(self):
+        bare = cluster_node("bare-1", taints=[self.IDLE])
+        del bare["metadata"]["labels"]["cloud.google.com/gke-nodepool"]
+        hits = self.hits(node_agent(), nodes=[cluster_node("n1"), bare, cluster_node("idle-1", pool="idle-batch-pool", taints=[self.IDLE])])
+        self.assertEqual(len(hits), 1)
+        self.assertIn(
+            "seeded-role=idle-batch:NoSchedule (node pool idle-batch-pool and nodes with no node pool label, 2 nodes).",
+            hits[0]["excerpt"],
+        )
+        only_bare = self.hits(node_agent(), nodes=[bare])
+        self.assertIn("seeded-role=idle-batch:NoSchedule (nodes with no node pool label, 1 node).", only_bare[0]["excerpt"])
+
+    def test_the_finding_carries_what_reconciles_the_agent(self):
+        agent = node_agent(labels={"app.kubernetes.io/managed-by": "Helm"}, annotations={"meta.helm.sh/release-name": "cni"})
+        hit = self.hits(agent)[0]
+        self.assertEqual(hit["reconciler"], collect.reconciler_of(agent["metadata"]))
+        self.assertIsNotNone(hit["reconciler"])
+        # And the release that renders it, which is what finds the values file for the fix.
+        self.assertEqual(hit["release"], collect.release_of(agent["metadata"]))
+        self.assertIsNotNone(hit["release"])
+
+    def test_it_is_rostered_as_a_major_cluster_check(self):
+        spec = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "network-daemonset-missing-ccc-toleration")
+        self.assertEqual((spec.kind, spec.severity, spec.autopilot_severity), ("cluster", "major", None))
+        self.assertEqual(len(spec.run(context_of(dump_of(node_agent(), *self.fleet_nodes())))), 1)
+        self.assertNotIn("SNAT", spec.impact)
+
+    def test_the_plugin_directories_match_the_upgrade_readiness_table(self):
+        """`collect.py` ships standalone, so it copies the three directories of
+        `CNI_HOST_PATHS` in fleet-upgrade-verification's table; this holds the
+        copy to it."""
+        table = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts" / "upgrade_shape_tables.py"
+        declared = next(
+            ast.literal_eval(node.value)
+            for node in ast.parse(table.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "CNI_HOST_PATHS" for target in node.targets)
+        )
+        self.assertEqual(tuple(declared), (*collect.CNI_HOST_DIRECTORIES, collect.GKE_CNI_BINARY_DIRECTORY))
+
+    def test_collect_cluster_files_it_from_the_dump_alone_where_only_system_workloads_exist(self):
+        """The whole path, on a cluster whose only workload is the documented
+        agent in kube-system: no workload survives S1, so the workload checks
+        are inapplicable, and this check still runs, files the finding at
+        `major`, and records the dump as its command with no read of its own."""
+        agent = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:3] == ["kubectl", "get", "computeclasses"] or (
+                argv[:2] == ["kubectl", "get"] and argv[2] in collect.INGRESS_GATEWAY_CRD_RESOURCES
+            ):
+                return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "x"', 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(agent, *self.fleet_nodes())), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        slug = "network-daemonset-missing-ccc-toleration"
+        cluster = {"name": "c", "project": "acme", "location": "us-central1", "autopilot": False}
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path("acme", "c", "us-central1")
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        found = [c for c in result["candidates"] if c["check"] == slug]
+        self.assertEqual([(c["namespace"], c["object"], c["severity"]) for c in found], [("kube-system", "DaemonSet/ip-masq-agent", "major")])
+        self.assertEqual(found[0]["impact"], collect.IMPACT_NETWORK_DAEMONSET_MISSING_TOLERATION)
+        command = next(c["command"] for c in result["commands"] if c["check"] == slug)
+        self.assertEqual(command, collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig))
+        inapplicable = {e["check"] for e in result.get("checks_not_applicable", [])}
+        self.assertIn("no-requests", inapplicable)
+        self.assertNotIn(slug, inapplicable)
+        self.assertFalse([argv for argv in calls if "node-pools" in argv])
+
+        # Autopilot: S1 binds, so GKE's own kube-system is not read. With no
+        # workload in scope the check examined the same empty set as the
+        # workload checks, and says so with them.
+        cluster["autopilot"] = True
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertEqual([c for c in result["candidates"] if c["check"] == slug], [])
+        self.assertNotIn(slug, {c["check"] for c in result["commands"]})
+        reasons = {e["check"]: e["reason"] for e in result["checks_not_applicable"]}
+        self.assertEqual(reasons[slug], reasons["no-requests"])
+        self.assertNotIn(slug, {e["check"] for e in result.get("checks_unevaluated", [])})
+
+        # Autopilot with a workload in scope: the check ran, as on any cluster.
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(
+                cluster,
+                "obtainability-audit",
+                collect.OBTAINABILITY_CHECKS,
+                run=lambda argv, **kwargs: (
+                    Run(argv, 0, json.dumps(dump_of(agent, deployment("api"), *self.fleet_nodes())), "", 0.01)
+                    if argv[:2] == ["kubectl", "get"] and argv[2] not in collect.INGRESS_GATEWAY_CRD_RESOURCES and argv[2] != "computeclasses"
+                    else run(argv, **kwargs)
+                ),
+            )
+        self.assertIn(slug, {c["check"] for c in result["commands"]})
+        self.assertNotIn(slug, {e["check"] for e in result.get("checks_not_applicable", [])})
+
+    def test_on_autopilot_a_host_network_daemonset_in_a_user_namespace_is_still_filed(self):
+        """An allowlist can admit a host-network workload to an Autopilot
+        cluster. That one is its owner's, so it is read; the system namespaces,
+        which hold GKE's own agents there, are not."""
+        partner = node_agent("partner-agent", "monitoring")
+        gke_own = node_agent("ip-masq-agent", "kube-system", host_paths=(), capabilities=IP_MASQ_CAPABILITIES)
+        dump = dump_of(partner, gke_own, *self.fleet_nodes())
+        hits = collect.check_network_daemonset_missing_toleration(context_of(dump, autopilot=True))
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("monitoring", "DaemonSet/partner-agent")])
+        both = collect.check_network_daemonset_missing_toleration(context_of(dump, autopilot=False))
+        self.assertEqual({h["namespace"] for h in both}, {"monitoring", "kube-system"})
+
+
 def fake_run(replies, calls):
     def run(argv, **kwargs):
         calls.append(argv)
@@ -5060,6 +5642,544 @@ class TestDumpStateGate(unittest.TestCase):
         self.assertIn("credential proxy output truncated", result.stderr)
 
 
+# The pods of the two planted image-pull Deployments, as a 1.35 Autopilot host returned them
+# (testdata/image_pull_failing/pods.json says how): two pods that name no pull secret, then two that name one.
+IMAGE_PULL_PODS = Path(__file__).resolve().parent / "testdata" / "image_pull_failing" / "pods.json"
+PULL_NODE_IDENTITY_WORKLOAD = "streamed-image-service"
+PULL_NODE_IDENTITY_NAMESPACE = "seeded-streaming"
+PULL_NODE_IDENTITY_IMAGE = "us-east4-docker.pkg.dev/bench-no-such-streaming-registry-project/apps/streamed-image-service:2.3.0"
+PULL_NAMED_WORKLOAD = "private-image-worker"
+PULL_NAMED_NAMESPACE = "seeded-registry"
+PULL_NAMED_IMAGE = "us-east4-docker.pkg.dev/private-registry-project/apps/private-image-worker:1.4.2"
+PULL_REF_NAME = "private-reg-creds"
+# The later of the two node-identity pods' start times, and of the two pull-secret pods'.
+PULL_NODE_IDENTITY_STARTS = ("2026-11-19T00:01:27Z", "2026-11-19T00:01:22Z")
+PULL_NAMED_STARTS = ("2026-11-19T00:01:35Z", "2026-11-19T00:01:32Z")
+PULL_MIN_SECONDS = 600
+PULL_INIT_SECONDS = 1200
+# A claim only a Secret read could back, or the kubelet's own text: neither belongs in the evidence.
+PULL_EVIDENCE_NEVER_SAYS = ("expired", "dockerconfigjson", "oauth token", "https://", "was used", "pulled through")
+PULL_WAITING_PODS_PATH = "/api/v1/pods?"
+# Six Deployments and the pods the collector's own read returned for them on a Standard cluster
+# (testdata/image_pull_failing/standard_read.json says how), read past the minimum age.
+IMAGE_PULL_STANDARD_READ = Path(__file__).resolve().parent / "testdata" / "image_pull_failing" / "standard_read.json"
+PULL_STANDARD_NAMESPACE = "pull-audit-std-read"
+PULL_NODE_IDENTITY_NOTE = "the pods name no pull secret, so the pull runs as the node service account"
+PULL_UNNAMED_NOTE = "the pods name no pull secret"
+# What each Deployment's excerpt says after the container line: the stated reason, the availability, the pull path.
+PULL_STANDARD_EXPECTED = {
+    "image-not-found": ("the image was not found", "0 of 1", PULL_UNNAMED_NOTE),
+    "registry-not-reached": ("the registry's host name did not resolve", "0 of 1", PULL_UNNAMED_NOTE),
+    "refused-node-identity": ("the registry refused the pull (403 Forbidden)", "0 of 1", PULL_NODE_IDENTITY_NOTE),
+    "refused-pull-secret": ("the registry refused the pull (401 Unauthorized, 403 Forbidden)", "0 of 1", "the pods name pull secret `private-reg-creds`"),
+    "init-then-refused": ("the registry refused the pull (403 Forbidden)", "0 of 1", PULL_NODE_IDENTITY_NOTE),
+    "surge-stuck": ("the registry refused the pull (403 Forbidden)", "2 of 3", PULL_NODE_IDENTITY_NOTE),
+}
+# When the init container of `init-then-refused` finished, two minutes after its pod started.
+PULL_STANDARD_INIT_DONE = "2026-11-20T19:09:12Z"
+PULL_WAITING_SELECTOR = "fieldSelector=status.phase%3DPending%2Cspec.nodeName%21%3D"
+
+
+def pull_epoch(stamp):
+    return collect._rfc3339(stamp)
+
+
+def pull_stamp(epoch):
+    return collect.datetime.datetime.fromtimestamp(epoch, collect.datetime.timezone.utc).strftime(collect.TIMESTAMP_FORMAT)
+
+
+def pull_pods(first=0, count=2):
+    """`count` of the fixture's pods from index `first`: 0 for the pods that name no pull secret, 2 for the ones that name one."""
+    return json.loads(IMAGE_PULL_PODS.read_text(encoding="utf-8"))["items"][first : first + count]
+
+
+def pull_workload(name=PULL_NODE_IDENTITY_WORKLOAD, ns=PULL_NODE_IDENTITY_NAMESPACE, kind="Deployment", counted=2, available=0):
+    """The raw workload a dump holds: a selector on `app`, and a status that counts `counted` pods and `available` of them available."""
+    doc = deployment(name, ns=ns)
+    doc["kind"] = kind
+    doc["spec"]["selector"] = {"matchLabels": {"app": name}}
+    doc["status"] = (
+        {"desiredNumberScheduled": counted, "numberAvailable": available}
+        if kind == "DaemonSet"
+        else {"replicas": counted, "availableReplicas": available}
+    )
+    return doc
+
+
+def pull_waiting(pod, message, reason="ImagePullBackOff"):
+    pod["status"]["containerStatuses"][0]["state"] = {"waiting": {"reason": reason, "message": message}}
+    return pod
+
+
+class TestImagePullFailing(unittest.TestCase):
+    """3.28: a workload with a pod that has failed to pull its image for ten minutes or more is
+    named once, with what the pod's status states and no diagnosis of its own."""
+
+    def hit(self, pods, raw=None, read_at=None, after=PULL_MIN_SECONDS, others=()):
+        """The check's answer for `raw` over `pods`, read `after` seconds past the latest start time among the fixture's pods."""
+        raw = raw or pull_workload()
+        raws = [raw, *others]
+        workloads = collect.normalize_workloads(dump_of(*raws))
+        if read_at is None:
+            read_at = max(pull_epoch(p["status"]["startTime"]) for p in pods) + after
+        context = {
+            "pull_waiting_pods": [collect.pull_waiting_pod_record(p) for p in pods],
+            "pod_availability": collect.workloads_short_of_pods(raws, workloads),
+            "pull_waiting_read_at": read_at,
+        }
+        workload = next(w for w in workloads if w["name"] == raw["metadata"]["name"])
+        return collect.check_image_pull_failing(workload, context)
+
+    def test_the_planted_pods_are_one_finding_on_their_deployment(self):
+        hit = self.hit(pull_pods())
+        self.assertEqual(hit["object"], f"Deployment/{PULL_NODE_IDENTITY_WORKLOAD}")
+        self.assertEqual(
+            hit["excerpt"],
+            f"At this audit's read: app: 2 pods could not pull {PULL_NODE_IDENTITY_IMAGE}, waiting since "
+            f"{min(PULL_NODE_IDENTITY_STARTS)}; the kubelet's stated reason: the registry refused the pull (403 Forbidden); "
+            "0 of 2 pods of the workload are available; "
+            "the pods name no pull secret, so the pull runs as the node service account",
+        )
+
+    def test_the_pod_that_names_a_pull_secret_is_named_with_its_secret_and_both_answers(self):
+        # With a pull secret the kubelet tries the secret's credential and then the node's: two statuses.
+        raw = pull_workload(PULL_NAMED_WORKLOAD, PULL_NAMED_NAMESPACE)
+        excerpt = self.hit(pull_pods(first=2), raw=raw)["excerpt"]
+        self.assertIn(f"app: 2 pods could not pull {PULL_NAMED_IMAGE}, waiting since {min(PULL_NAMED_STARTS)}", excerpt)
+        self.assertIn("the registry refused the pull (401 Unauthorized, 403 Forbidden)", excerpt)
+        self.assertTrue(excerpt.endswith(f"the pods name pull secret `{PULL_REF_NAME}`"), excerpt)
+
+    def test_a_wait_is_named_at_ten_minutes_and_not_a_second_before(self):
+        older = min(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        self.assertIsNone(self.hit(pull_pods(), read_at=older + PULL_MIN_SECONDS - 1))
+        self.assertIsNotNone(self.hit(pull_pods(), read_at=older + PULL_MIN_SECONDS))
+        self.assertEqual(collect.IMAGE_PULL_FAILING_MIN_SECONDS, PULL_MIN_SECONDS)
+
+    def test_only_the_pods_past_the_minimum_are_counted(self):
+        # One pod is five seconds older than the other: at ten minutes past the older one, one pod counts.
+        older = min(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        self.assertIn("app: 1 pod could not pull", self.hit(pull_pods(), read_at=older + PULL_MIN_SECONDS)["excerpt"])
+
+    def test_the_wait_runs_from_the_end_of_the_init_containers_and_not_from_the_pods_start(self):
+        # A pod that spent twenty minutes in an init container has waited on its main image since
+        # the Initialized condition turned True, which is what the evidence says and what the minimum counts from.
+        pod = pull_pods(count=1)[0]
+        started = pull_epoch(pod["status"]["startTime"])
+        initialized = started + PULL_INIT_SECONDS
+        for condition in pod["status"]["conditions"]:
+            if condition["type"] == "Initialized":
+                condition["lastTransitionTime"] = pull_stamp(initialized)
+        self.assertIsNone(self.hit([pod], read_at=initialized + PULL_MIN_SECONDS - 1))
+        hit = self.hit([pod], read_at=initialized + PULL_MIN_SECONDS)
+        self.assertIn(f"waiting since {pull_stamp(initialized)}", hit["excerpt"])
+
+    def test_an_init_container_that_cannot_pull_waits_from_the_init_container_before_it(self):
+        pod = pull_pods(count=1)[0]
+        started = pull_epoch(pod["status"]["startTime"])
+        first_done = started + PULL_INIT_SECONDS
+        waiting = pod["status"].pop("containerStatuses")[0]
+        waiting["name"] = "fetch"
+        pod["status"]["initContainerStatuses"] = [
+            {"name": "warm-up", "state": {"terminated": {"exitCode": 0, "finishedAt": pull_stamp(first_done)}}},
+            waiting,
+        ]
+        pod["status"]["conditions"] = [c for c in pod["status"]["conditions"] if c["type"] != "Initialized"]
+        pod["spec"]["initContainers"] = [{"name": "warm-up", "image": "gcr.io/acme/warm:1.0"}, {"name": "fetch", "image": PULL_NODE_IDENTITY_IMAGE}]
+        pod["spec"]["containers"] = [{"name": "app", "image": "gcr.io/acme/app:1.0"}]
+        self.assertIsNone(self.hit([pod], read_at=first_done + PULL_MIN_SECONDS - 1))
+        hit = self.hit([pod], read_at=first_done + PULL_MIN_SECONDS)
+        self.assertIn(f"fetch: 1 pod could not pull {PULL_NODE_IDENTITY_IMAGE}, waiting since {pull_stamp(first_done)}", hit["excerpt"])
+
+    def test_a_pod_with_no_start_time_is_not_judged(self):
+        pod = pull_pods(count=1)[0]
+        self.assertIsNotNone(self.hit([pod]))
+        read_at = pull_epoch(pod["status"].pop("startTime")) + PULL_MIN_SECONDS
+        self.assertIsNone(self.hit([pod], read_at=read_at))
+
+    def test_either_waiting_reason_is_a_failed_pull_and_a_pod_that_is_pulling_is_not(self):
+        for reason, named in (("ErrImagePull", True), ("ImagePullBackOff", True), ("ContainerCreating", False)):
+            with self.subTest(reason=reason):
+                pod = pull_pods(count=1)[0]
+                pod["status"]["containerStatuses"][0]["state"]["waiting"]["reason"] = reason
+                self.assertEqual(self.hit([pod]) is not None, named)
+
+    def test_a_terminating_pod_is_not_read(self):
+        pod = pull_pods(count=1)[0]
+        self.assertIsNotNone(self.hit([pod]))
+        pod["metadata"]["deletionTimestamp"] = "2026-11-19T00:30:00Z"
+        self.assertIsNone(self.hit([pod], read_at=pull_epoch(pod["status"]["startTime"]) + PULL_MIN_SECONDS))
+
+    def test_a_workload_whose_pods_are_all_available_is_not_judged(self):
+        """The gate: a workload the dump shows whole gets no finding whatever the pod list
+        holds, and the same pods under a status that is one pod short are named."""
+        self.assertIsNone(self.hit(pull_pods(), raw=pull_workload(counted=2, available=2)))
+        self.assertIsNotNone(self.hit(pull_pods(), raw=pull_workload(counted=2, available=1)))
+
+    def test_a_rollout_with_one_stuck_surge_pod_is_named_and_says_the_old_pods_serve(self):
+        # Three old replicas available and one surge pod that cannot pull: the status counts four pods.
+        hit = self.hit(pull_pods(count=1), raw=pull_workload(counted=4, available=3))
+        self.assertIn("app: 1 pod could not pull", hit["excerpt"])
+        self.assertIn("3 of 4 pods of the workload are available", hit["excerpt"])
+
+    def test_a_daemonset_rollout_with_a_stuck_surge_pod_opens_the_gate(self):
+        """A DaemonSet counts a node available from its old pod, so a surge pod that cannot pull
+        lowers neither the desired nor the available count; the count of pods on the current
+        template is what shows the rollout is not finished."""
+
+        def short(updated):
+            raw = pull_workload(kind="DaemonSet", counted=3, available=3)
+            if updated is not None:
+                raw["status"]["updatedNumberScheduled"] = updated
+            return collect.workloads_short_of_pods([raw], collect.normalize_workloads(dump_of(raw)))
+
+        self.assertEqual(short(1), {("DaemonSet", PULL_NODE_IDENTITY_NAMESPACE, PULL_NODE_IDENTITY_WORKLOAD): (3, 3)})
+        self.assertEqual(short(3), {})
+        self.assertEqual(short(None), {})
+        pod = pull_pods(count=1)[0]
+        pod["metadata"]["ownerReferences"] = [{"kind": "DaemonSet", "name": PULL_NODE_IDENTITY_WORKLOAD, "controller": True}]
+        raw = pull_workload(kind="DaemonSet", counted=3, available=3)
+        raw["status"]["updatedNumberScheduled"] = 1
+        self.assertIn("3 of 3 pods of the workload are available", self.hit([pod], raw=raw)["excerpt"])
+
+    def test_a_container_that_ran_and_cannot_pull_again_waits_from_the_end_of_its_last_run(self):
+        # An init container ran for an hour, exited, and its image cannot be pulled again: it has
+        # waited since it exited, not since the pod started an hour before.
+        pod = pull_pods(count=1)[0]
+        ran_until = pull_epoch(pod["status"]["startTime"]) + 3600
+        pod["status"]["containerStatuses"][0]["lastState"] = {"terminated": {"exitCode": 1, "finishedAt": pull_stamp(ran_until)}}
+        self.assertIsNone(self.hit([pod], read_at=ran_until + PULL_MIN_SECONDS - 1))
+        self.assertIn(f"waiting since {pull_stamp(ran_until)}", self.hit([pod], read_at=ran_until + PULL_MIN_SECONDS)["excerpt"])
+
+    def test_the_wait_does_not_start_before_the_pods_sandbox_is_up(self):
+        pod = pull_pods(count=1)[0]
+        sandbox_up = pull_epoch(pod["status"]["startTime"]) + PULL_INIT_SECONDS
+        pod["status"]["conditions"].append(
+            {"type": "PodReadyToStartContainers", "status": "True", "lastTransitionTime": pull_stamp(sandbox_up)}
+        )
+        self.assertIsNone(self.hit([pod], read_at=sandbox_up + PULL_MIN_SECONDS - 1))
+        self.assertIsNotNone(self.hit([pod], read_at=sandbox_up + PULL_MIN_SECONDS))
+
+    def test_the_availability_of_each_kind_is_read_from_its_own_status(self):
+        for kind in ("Deployment", "StatefulSet", "DaemonSet"):
+            with self.subTest(kind=kind):
+                self.assertEqual(collect.pod_availability(pull_workload(kind=kind, counted=3, available=1)), (3, 1))
+        self.assertEqual(collect.pod_availability({"kind": "Deployment"}), (0, 0))
+        self.assertEqual(collect.pod_availability({"kind": "Deployment", "status": {"replicas": 2}}), (2, 0))
+
+    def test_the_other_workload_kinds_are_named_by_their_own_name(self):
+        for kind in ("StatefulSet", "DaemonSet"):
+            with self.subTest(kind=kind):
+                pod = pull_pods(count=1)[0]
+                pod["metadata"]["ownerReferences"] = [{"kind": kind, "name": PULL_NODE_IDENTITY_WORKLOAD, "controller": True}]
+                self.assertEqual(self.hit([pod], raw=pull_workload(kind=kind))["object"], f"{kind}/{PULL_NODE_IDENTITY_WORKLOAD}")
+
+    def test_a_pod_is_counted_for_its_own_workload_only(self):
+        """Labels and owner both: a pod with the workload's labels under another owner is not its
+        pod, and neither is a pod of a ReplicaSet that only shares the name's prefix."""
+        stray = pull_pods(count=1)[0]
+        stray["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "other-5c8d7", "controller": True}]
+        self.assertIsNone(self.hit([stray], read_at=pull_epoch(stray["status"]["startTime"]) + PULL_MIN_SECONDS))
+        relabelled = pull_pods(count=1)[0]
+        relabelled["metadata"]["labels"]["app"] = "other"
+        self.assertIsNone(self.hit([relabelled], read_at=pull_epoch(relabelled["status"]["startTime"]) + PULL_MIN_SECONDS))
+        longer = pull_workload(f"{PULL_NODE_IDENTITY_WORKLOAD}-79dd67676b")
+        longer["spec"]["selector"] = {"matchLabels": {"app": PULL_NODE_IDENTITY_WORKLOAD}}
+        self.assertIsNone(self.hit(pull_pods(), raw=longer))
+        self.assertIsNotNone(self.hit(pull_pods(), others=[longer]))
+
+    def test_an_excluded_workload_is_not_judged(self):
+        system = pull_workload(ns="kube-system")
+        self.assertEqual(collect.workloads_short_of_pods([system], collect.normalize_workloads(dump_of(system))), {})
+        judged = pull_workload()
+        self.assertEqual(
+            collect.workloads_short_of_pods([judged], collect.normalize_workloads(dump_of(judged))),
+            {("Deployment", PULL_NODE_IDENTITY_NAMESPACE, PULL_NODE_IDENTITY_WORKLOAD): (2, 0)},
+        )
+
+    def test_the_pull_secrets_are_read_from_the_pods_spec_in_its_order(self):
+        # The ServiceAccount admission plugin copies an account's pull secrets onto the pod, so the pod is what is read.
+        pod = pull_pods(count=1)[0]
+        pod["spec"]["imagePullSecrets"] = [{"name": "second-creds"}, {"name": PULL_REF_NAME}]
+        self.assertTrue(self.hit([pod])["excerpt"].endswith(f"the pods name pull secrets `second-creds`, `{PULL_REF_NAME}`"))
+
+    def test_pods_that_disagree_on_the_pull_secret_get_one_clause_each(self):
+        # A rolling update that added the secret: both generations wait on the same pull.
+        bare, named = pull_pods()
+        named["spec"]["imagePullSecrets"] = [{"name": PULL_REF_NAME}]
+        self.assertTrue(
+            self.hit([bare, named])["excerpt"].endswith(
+                "of the waiting pods, 1 name no pull secret, so their pull runs as the node service account; "
+                f"1 name pull secret `{PULL_REF_NAME}`"
+            )
+        )
+
+    def test_the_stated_reason_is_one_of_a_closed_set(self):
+        image = PULL_NODE_IDENTITY_IMAGE
+        host = image.partition("/")[0]
+        refused = f'failed to pull image "{image}": unexpected status from GET request to https://{host}/v2/token?scope=x: 403 Forbidden'
+        not_found = f'failed to resolve reference "{image}": {image}: not found'
+        unresolved = f'failed to do request: Head "https://{host}/v2/x": dial tcp: lookup {host} on 10.0.0.2:53: no such host'
+        cases = (
+            (refused, "the registry refused the pull (403 Forbidden)"),
+            (not_found, "the image was not found"),
+            (unresolved, "the registry's host name did not resolve"),
+            (f"dial tcp: lookup {host}: no such host", "the registry's host name did not resolve"),
+            # Attempts within one message that state different things give each, whatever their order.
+            (f"[{refused}, {not_found}]", "the image was not found; the registry refused the pull (403 Forbidden)"),
+            (f"[{not_found}, {refused}]", "the image was not found; the registry refused the pull (403 Forbidden)"),
+            # A status from another host is a proxy's, a mirror's or a token service's: not read as the registry's.
+            (refused.replace(f"https://{host}/", "https://mirror.example.com/"), ""),
+            (
+                'failed to pull image "docker.io/acme/app:1": failed to authorize: failed to fetch oauth token: '
+                "unexpected status from GET request to https://auth.docker.io/token?scope=x: 401 Unauthorized",
+                "",
+            ),
+            # The same words about something else than the resolved reference or the image's host state nothing.
+            (f'failed to pull image "{image}": no match for platform in manifest sha256:0a1b: not found', ""),
+            (f'failed to pull image "{image}": dial tcp: lookup mirror.example.com on 10.0.0.2:53: no such host', ""),
+            (f"[lookup {host} on 10.0.0.2:53: i/o timeout, lookup auth.example.com on 10.0.0.2:53: no such host]", ""),
+            # Wording that is said of more than one fault states nothing.
+            (f'failed to pull image "{image}": dial tcp 10.0.0.1:443: connect: connection refused', ""),
+            (f'failed to pull image "{image}": dial tcp 10.0.0.1:443: i/o timeout', ""),
+            (f'failed to pull and unpack image "{image}": failed to copy: context deadline exceeded', ""),
+            (f'failed to pull image "{image}": tls: failed to verify certificate: x509: certificate signed by unknown authority', ""),
+            (f'failed to pull image "{image}": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://{host}/v2/token: 503 Service Unavailable', ""),
+            (f'failed to pull image "{image}": pull access denied', ""),
+            (f'Back-off pulling image "{image}"', ""),
+        )
+        for message, reason in cases:
+            with self.subTest(message=message):
+                self.assertEqual(collect.stated_pull_failure([message], image), reason)
+
+    def test_a_reference_the_runtime_spells_differently_and_a_host_with_a_port_are_still_read(self):
+        # The runtime resolves `gcr.io/acme/app` as `gcr.io/acme/app:latest`, and the resolver names a host without its port.
+        self.assertEqual(
+            collect.stated_pull_failure(
+                ['failed to resolve reference "gcr.io/acme/app:latest": gcr.io/acme/app:latest: not found'], "gcr.io/acme/app"
+            ),
+            "the image was not found",
+        )
+        self.assertEqual(
+            collect.stated_pull_failure(["dial tcp: lookup reg.internal on 10.0.0.2:53: no such host"], "reg.internal:5000/a:1"),
+            "the registry's host name did not resolve",
+        )
+
+    def test_a_pull_that_states_no_reason_is_still_named_and_says_so(self):
+        pods = [pull_waiting(pod, f'Back-off pulling image "{PULL_NODE_IDENTITY_IMAGE}"') for pod in pull_pods()]
+        self.assertIn("the kubelet's message states no reason this check reads", self.hit(pods)["excerpt"])
+
+    def test_a_reason_one_pod_states_is_read_for_the_workload(self):
+        # A back-off message that carries no cause says nothing; another pod of the workload may still state it.
+        stated, silent = pull_pods()
+        pull_waiting(silent, f'Back-off pulling image "{PULL_NODE_IDENTITY_IMAGE}"')
+        excerpt = self.hit([stated, silent])["excerpt"]
+        self.assertIn("app: 2 pods could not pull", excerpt)
+        self.assertIn("the registry refused the pull (403 Forbidden)", excerpt)
+
+    def test_the_excerpt_quotes_no_kubelet_text_and_survives_redaction(self):
+        import audit_report
+
+        for first, name, ns in ((0, PULL_NODE_IDENTITY_WORKLOAD, PULL_NODE_IDENTITY_NAMESPACE), (2, PULL_NAMED_WORKLOAD, PULL_NAMED_NAMESPACE)):
+            with self.subTest(workload=name):
+                excerpt = self.hit(pull_pods(first=first), raw=pull_workload(name, ns))["excerpt"]
+                for words in PULL_EVIDENCE_NEVER_SAYS:
+                    self.assertNotIn(words, excerpt.lower())
+                self.assertEqual(audit_report.redact_secrets(excerpt), excerpt)
+
+
+class TestImagePullFailingOnAStandardRead(unittest.TestCase):
+    """The check over a live read of a Standard cluster: each cause of a failed pull, the init
+    container's clock and the stuck surge pod, as the API server returned them."""
+
+    def hits(self, read_at=None):
+        read = json.loads(IMAGE_PULL_STANDARD_READ.read_text(encoding="utf-8"))
+        workloads = collect.normalize_workloads(dump_of(*read["deployments"]))
+        context = {
+            "pull_waiting_pods": [collect.pull_waiting_pod_record(pod) for pod in read["pods"]],
+            "pod_availability": collect.workloads_short_of_pods(read["deployments"], workloads),
+            "pull_waiting_read_at": read_at if read_at is not None else pull_epoch(read["read_at"]),
+        }
+        return {w["name"]: collect.check_image_pull_failing(w, context) for w in workloads}
+
+    def test_every_planted_workload_is_named_with_its_stated_reason(self):
+        hits = self.hits()
+        self.assertEqual(set(hits), set(PULL_STANDARD_EXPECTED))
+        for name, (reason, available, path) in PULL_STANDARD_EXPECTED.items():
+            with self.subTest(workload=name):
+                self.assertEqual(hits[name]["object"], f"Deployment/{name}")
+                excerpt = hits[name]["excerpt"]
+                self.assertIn("app: 1 pod could not pull", excerpt)
+                self.assertIn(f"; the kubelet's stated reason: {reason}; {available} pods of the workload are available; ", excerpt)
+                self.assertTrue(excerpt.endswith(f"; {path}"), excerpt)
+
+    def test_the_init_containers_two_minutes_do_not_count_toward_the_minimum(self):
+        # Every pod started within five seconds; the one that ran an init container first has
+        # waited on its image two minutes less, and is named two minutes later than the rest.
+        done = pull_epoch(PULL_STANDARD_INIT_DONE)
+        early = self.hits(read_at=done + PULL_MIN_SECONDS - 1)
+        self.assertIsNone(early["init-then-refused"])
+        self.assertIsNotNone(early["refused-node-identity"])
+        self.assertIn(f"waiting since {PULL_STANDARD_INIT_DONE}", self.hits(read_at=done + PULL_MIN_SECONDS)["init-then-refused"]["excerpt"])
+
+    def test_a_pull_from_another_registry_with_no_pull_secret_is_not_said_to_run_as_the_node(self):
+        hits = self.hits()
+        self.assertNotIn("node service account", hits["image-not-found"]["excerpt"])
+        self.assertIn("node service account", hits["refused-node-identity"]["excerpt"])
+
+    def test_no_excerpt_quotes_the_kubelet_or_changes_under_redaction(self):
+        import audit_report
+
+        for name, hit in self.hits().items():
+            with self.subTest(workload=name):
+                for words in PULL_EVIDENCE_NEVER_SAYS:
+                    self.assertNotIn(words, hit["excerpt"].lower())
+                self.assertEqual(audit_report.redact_secrets(hit["excerpt"]), hit["excerpt"])
+
+
+class TestImagePullFailingCollection(unittest.TestCase):
+    """The read behind 3.28: none while every workload is available, one narrowed and paged read
+    when one is not, and a failed read that costs this check alone."""
+
+    CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+    SLUG = "image-pull-failing"
+
+    def collect(self, raws, pods=(), pod_reply=None, cluster=None, now=None, patch_clock=True):
+        """One collection over `raws` as the dump's workloads, through the real paged read (the
+        fake answers each `--raw` page itself). Returns the cluster's entry, the pod reads
+        issued, and the kubeconfig the reads ran under."""
+        pod_calls = []
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                if argv[3].startswith(PULL_WAITING_PODS_PATH):
+                    pod_calls.append(argv[3])
+                    return pod_reply(argv) if pod_reply else Run(argv, 0, json.dumps(dump_of(*pods)), "", 0.02)
+                kind_path = argv[3].partition("?")[0].rpartition("/")[2]
+                items = [raw for raw in raws if f"{raw['kind'].lower()}s" == kind_path]
+                return Run(argv, 0, json.dumps(dump_of(*items)), "", 0.02)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "x"', 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        cluster = cluster or self.CLUSTER
+        read_at = now if now is not None else max((pull_epoch(p["status"]["startTime"]) for p in pods), default=0.0) + PULL_MIN_SECONDS
+        clock = patch.object(collect.time, "time", return_value=read_at) if patch_clock else contextlib.nullcontext()
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(collect, "KUBECONFIG_DIR", Path(tmp)),
+            patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump),
+            clock,
+        ):
+            result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path(cluster["project"], cluster["name"], cluster["location"])
+        return result, pod_calls, kubeconfig
+
+    def command(self, result):
+        return next((c["command"] for c in result["commands"] if c["check"] == self.SLUG), None)
+
+    def candidates(self, result):
+        return [c for c in result["candidates"] if c["check"] == self.SLUG]
+
+    def test_a_cluster_whose_workloads_are_all_available_reads_no_pods(self):
+        result, pod_calls, kubeconfig = self.collect([pull_workload(counted=2, available=2)], pods=pull_pods())
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertEqual(pod_calls, [])
+        self.assertEqual(self.candidates(result), [])
+        self.assertEqual(self.command(result), collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig))
+
+    def test_a_workload_short_of_pods_is_one_narrowed_paged_read_and_a_candidate(self):
+        import audit_report
+
+        result, pod_calls, kubeconfig = self.collect([pull_workload()], pods=pull_pods())
+        self.assertEqual(len(pod_calls), 1, pod_calls)
+        self.assertIn(PULL_WAITING_SELECTOR, pod_calls[0])
+        self.assertIn("limit=500", pod_calls[0])
+        (found,) = self.candidates(result)
+        self.assertEqual(
+            (found["object"], found["namespace"], found["severity"], found["needs_triage"]),
+            (f"Deployment/{PULL_NODE_IDENTITY_WORKLOAD}", PULL_NODE_IDENTITY_NAMESPACE, "major", "image-pull"),
+        )
+        self.assertIn("could not pull", found["excerpt"])
+        dump = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        pod_read = collect.paged_command_text(("pods",), query=collect.PULL_WAITING_PODS_QUERY, kubeconfig=kubeconfig)
+        self.assertEqual(self.command(result), f"{dump}; {pod_read}")
+        self.assertLessEqual(len(self.command(result)), audit_report.MAX_COMMAND_CHARS)
+        self.assertIn(found["needs_triage"], audit_report.NO_SWEEP_TRIAGE)
+
+    def test_the_collector_takes_the_time_of_its_own_read(self):
+        # The same pods one second short of the minimum at the collector's clock are not a candidate.
+        latest = max(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        early, _, _ = self.collect([pull_workload()], pods=pull_pods(), now=min(pull_epoch(s) for s in PULL_NODE_IDENTITY_STARTS) + PULL_MIN_SECONDS - 1)
+        self.assertEqual(self.candidates(early), [])
+        late, _, _ = self.collect([pull_workload()], pods=pull_pods(), now=latest + PULL_MIN_SECONDS)
+        self.assertEqual(len(self.candidates(late)), 1)
+
+    def test_autopilot_runs_the_check_at_the_same_severity(self):
+        cluster = {**self.CLUSTER, "autopilot": True}
+        result, pod_calls, _ = self.collect([pull_workload()], pods=pull_pods(), cluster=cluster)
+        self.assertEqual(len(pod_calls), 1)
+        self.assertEqual([c["severity"] for c in self.candidates(result)], ["major"])
+
+    def test_a_failed_pod_read_leaves_this_check_alone_not_evaluated(self):
+        refused = lambda argv: Run(argv, 1, "", "Error from server (Forbidden): pods is forbidden", 0.01)  # noqa: E731
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            result, _, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=refused)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}
+        self.assertEqual(set(unevaluated), {self.SLUG})
+        # The reason reaches the run's report, so it is plain words: the exit code and
+        # the stderr go to the collector's log and stay out of it.
+        self.assertEqual(
+            unevaluated[self.SLUG],
+            f"{collect.UNDETERMINED_PREFIX} the pods that have a node and have not started could not be read, "
+            "so a failing image pull could not be established. This check cleared nothing on this cluster.",
+        )
+        self.assertIn("pods is forbidden", logged.getvalue())
+        self.assertIsNone(self.command(result))
+        self.assertEqual(self.candidates(result), [])
+        self.assertIn("no-pdb", {c["check"] for c in result["commands"]})
+
+    def test_a_read_past_its_page_ceiling_is_not_evaluated_and_stops_there(self):
+        pages = {"n": 0}
+
+        def endless(argv):
+            pages["n"] += 1
+            page = {"items": pull_pods(), "metadata": {"continue": f"t{pages['n']}"}}
+            return Run(argv, 0, json.dumps(page), "", 0.01)
+
+        result, pod_calls, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=endless)
+        self.assertEqual(len(pod_calls), collect.PULL_WAITING_PODS_MAX_PAGES)
+        unevaluated = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}
+        self.assertIn("are more than the 2000 this check reads on one cluster", unevaluated[self.SLUG])
+        self.assertEqual(self.candidates(result), [])
+
+    def test_a_pod_read_that_times_out_says_so_in_plain_words(self):
+        timed_out = lambda argv: Run(argv, collect.TIMEOUT_RC, "", "timed out after 60s", 60.0)  # noqa: E731
+        result, _, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=timed_out)
+        reason = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}[self.SLUG]
+        self.assertIn("could not be read in time", reason)
+        self.assertNotIn(str(collect.TIMEOUT_RC), reason)
+
+    def test_the_time_is_taken_before_the_pods_are_read(self):
+        """A slow read must not age the pods it returns: the clock is one second short of the
+        minimum until the read is issued and far past it afterwards, and nothing is named."""
+        latest = max(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        oldest = min(pull_epoch(stamp) for stamp in PULL_NODE_IDENTITY_STARTS)
+        clock = {"now": oldest + PULL_MIN_SECONDS - 1}
+
+        def slow_read(argv):
+            clock["now"] = latest + 10 * PULL_MIN_SECONDS
+            return Run(argv, 0, json.dumps(dump_of(*pull_pods())), "", 0.02)
+
+        with patch.object(collect.time, "time", side_effect=lambda: clock["now"]):
+            result, pod_calls, _ = self.collect([pull_workload()], pods=pull_pods(), pod_reply=slow_read, patch_clock=False)
+        self.assertEqual(len(pod_calls), 1)
+        self.assertEqual(self.candidates(result), [])
+
+
 class TestCollectCluster(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
@@ -5160,7 +6280,8 @@ class TestCollectCluster(unittest.TestCase):
         # true of a cluster whose *workload* set is empty. 3.12, 3.15, 3.16 and
         # 3.17 in particular are only ever reachable this way -- neither a
         # CronJob nor a Service is a workload, so a cluster that holds nothing
-        # else still owes all four an answer.
+        # else still owes all four an answer. 3.27 reads DaemonSets in the
+        # system namespaces too, which S1 keeps out of the workload set.
         cluster_slugs = {s.slug for s in collect.OBTAINABILITY_CHECKS if s.kind != "workload"} - anchored
         self.assertEqual(
             cluster_slugs,
@@ -5171,6 +6292,7 @@ class TestCollectCluster(unittest.TestCase):
                 "service-selects-nothing",
                 "service-port-unresolved",
                 "ingress-gateway-healthcheck-mismatch",
+                "network-daemonset-missing-ccc-toleration",
             },
         )
         self.assertFalse(cluster_slugs & set(na))
@@ -5973,14 +7095,32 @@ def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDat
     return doc
 
 
+# What Config Sync v1.25.2 wrote on a live RootSync whose reconciler Deployment
+# passed its progress deadline (testdata/configsync/rootsync_stalled.json).
+CONFIGSYNC_STALLED_MESSAGE = "Deployment (config-management-system/root-reconciler) Failed: Progress deadline exceeded"
+CONFIGSYNC_TESTDATA = Path(__file__).resolve().parent / "testdata" / "configsync"
+
+
+def configsync_live(name):
+    """A cut copy of an object, or a list of pods, that a live Config Sync
+    v1.25.2 produced (one Standard cluster, the open-source release manifest).
+    A sync object keeps its name, namespace, generation, labels, spec and
+    status. A pod keeps its name, namespace, labels, owners, phase and, for
+    each container, the name, the ready and started flags, the restart count
+    and both states without the container id. Every kept field is as read."""
+    return json.loads((CONFIGSYNC_TESTDATA / name).read_text())
+
+
 def configsync_object(kind, name, ns="config-management-system", stalled="False", syncing_refs=(), syncing_message="Sync Completed",
-                      reconciling="False", stage_errors=None):
+                      reconciling="False", stage_errors=None, reconciling_since=None, reconciling_reason="Deployment",
+                      reconciling_message="Reconciler deployment was created"):
     """A Config Sync RootSync or RepoSync as `kubectl get <kind> -A -o json` returns it.
 
     `stalled=None` omits every condition, which is what a just-applied object
     carries. `syncing_refs` are the `errorSourceRefs` of the `Syncing`
     condition; `stage_errors` is `{"source": [{"code": ..., "errorMessage": ...}]}`
-    and lands under `status.<stage>.errors`.
+    and lands under `status.<stage>.errors`. `reconciling_since` is the
+    `Reconciling` condition's `lastTransitionTime`.
     """
     doc = {"kind": kind, "metadata": {"namespace": ns, "name": name}, "status": {}}
     if stalled is None:
@@ -5989,13 +7129,58 @@ def configsync_object(kind, name, ns="config-management-system", stalled="False"
     if syncing_refs:
         syncing["errorSourceRefs"] = list(syncing_refs)
     doc["status"]["conditions"] = [
-        {"type": "Reconciling", "status": reconciling, "reason": "Deployment", "message": "Reconciler deployment was created"},
-        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": "Reconciler deployment failed" if stalled == "True" else ""},
+        {
+            "type": "Reconciling", "status": reconciling, "reason": reconciling_reason, "message": reconciling_message,
+            **({"lastTransitionTime": reconciling_since} if reconciling_since else {}),
+        },
+        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": CONFIGSYNC_STALLED_MESSAGE if stalled == "True" else ""},
         syncing,
     ]
     for stage, errors in (stage_errors or {}).items():
         doc["status"][stage] = {"errors": errors, "errorSummary": {"totalCount": len(errors)}}
     return doc
+
+
+def configsync_reconciler_pod(kind, name, ns="config-management-system", restarts=0, killed=None, killed_at=None, running=True,
+                              pod="root-reconciler-7f99b9c746-h4dhh", container="reconciler", state_only=False):
+    """A reconciler pod as the compliance stream's workload dump returns it,
+    cut to what §2.17 reads.
+
+    The labels and the shape of the container statuses are the ones Config
+    Sync v1.25.2 wrote on a live cluster (testdata/configsync/reconciler_pods_loop.json).
+    `killed` is the reason of the last termination of `container` and
+    `killed_at` its `finishedAt`; `running` False puts that termination in
+    `state` (the container is down right now) as well as in `lastState`, and
+    `state_only` leaves `lastState` empty (the first kill after a clean start).
+    """
+    terminated = {"terminated": {"exitCode": 137, "reason": killed, "finishedAt": killed_at}} if killed else {}
+    statuses = {
+        each: {"name": each, "ready": True, "restartCount": 0, "state": {"running": {}}, "lastState": {}}
+        for each in ("git-sync", "otel-agent", "reconciler")
+    }
+    hit = statuses[container]
+    hit.update({"ready": running, "restartCount": restarts})
+    if running:
+        hit.update({"state": {"running": {"startedAt": killed_at or "2026-11-20T23:37:40Z"}}, "lastState": terminated})
+    else:
+        hit.update({"state": terminated, "lastState": {} if state_only else terminated})
+    return {
+        "kind": "Pod",
+        "metadata": {
+            "namespace": "config-management-system",
+            "name": pod,
+            "labels": {
+                "app": "reconciler",
+                "configsync.gke.io/managed-by": "reconciler-manager",
+                "configsync.gke.io/sync-kind": kind,
+                "configsync.gke.io/sync-name": name,
+                "configsync.gke.io/sync-namespace": ns,
+            },
+            "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": pod.rsplit("-", 1)[0], "controller": True}],
+        },
+        "spec": {"containers": [{"name": each, "image": f"gcr.io/config-management-release/{each}:v1.25.2"} for each in statuses]},
+        "status": {"phase": "Running", "containerStatuses": list(statuses.values())},
+    }
 
 
 def service_entry(name, ns, hosts, export_to=None, addresses=(), ports=((443, "TLS"),), resolution="DNS", endpoints=()):
@@ -8682,8 +9867,244 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         "\"Err\":\"fatal: could not read Username for 'https://github.com': terminal prompts disabled\"}"
     )
 
-    def run_on(self, *objects):
-        return collect.check_configsync_reconciler_stalled({"configsync_objects": list(objects)})
+    # What Config Sync v1.25.2 wrote on a live cluster for a reconciler whose
+    # Deployment has no available replica.
+    DEPLOYMENT_DOWN = "Deployment (config-management-system/root-reconciler) InProgress: Available: 0/1"
+    # A moment inside the live out-of-memory loop: nine restarts, the last kill ten seconds ago.
+    NOW = datetime(2026, 11, 21, 0, 2, 0, tzinfo=timezone.utc)
+    LAST_KILL = "2026-11-21T00:01:50Z"
+
+    def run_on(self, *objects, pods=(), now=None):
+        return collect.check_configsync_reconciler_stalled(
+            {"configsync_objects": list(objects), "configsync_reconciler_pods": list(pods)}, now=now or self.NOW
+        )
+
+    def ago(self, seconds):
+        return (self.NOW - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_a_reconciler_killed_for_memory_in_a_loop_is_named_from_its_pod(self):
+        """The live loop at a moment when the sync object reads healthy: each
+        restart makes the Deployment available, `Reconciling` goes False, and
+        the object says nothing until the next kill. The pod says it always."""
+        healthy_looking = configsync_object("RootSync", "root-sync")
+        pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL)
+        self.assertEqual(self.run_on(healthy_looking), [])
+        hits = self.run_on(healthy_looking, pods=[pod])
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("config-management-system", "RootSync/root-sync")])
+        self.assertEqual(
+            hits[0]["excerpt"],
+            "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed "
+            "for memory (OOMKilled) and has restarted more than once (pod root-reconciler-7f99b9c746-h4dhh)",
+        )
+        # Nothing Config Sync reported: the excerpt must not put the words in its mouth.
+        self.assertNotIn("Config Sync reports", hits[0]["excerpt"])
+
+    def test_the_excerpt_does_not_change_while_the_loop_goes_on(self):
+        """The ledger compares the excerpt byte for byte between two runs. A
+        restart count or a kill time in it would make the finding read as
+        changed on every run."""
+        healthy_looking = configsync_object("RootSync", "root-sync")
+        earlier = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.ago(300))
+        later = configsync_reconciler_pod("RootSync", "root-sync", restarts=40, killed="OOMKilled", killed_at=self.LAST_KILL)
+        self.assertEqual(self.run_on(healthy_looking, pods=[earlier]), self.run_on(healthy_looking, pods=[later]))
+
+    def test_the_first_kills_are_read_from_the_container_state_alone(self):
+        """Down right now, and nothing in `lastState` yet."""
+        pod = configsync_reconciler_pod(
+            "RootSync", "root-sync", restarts=2, killed="OOMKilled", killed_at=self.LAST_KILL, running=False, state_only=True
+        )
+        self.assertEqual(len(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod])), 1)
+
+    def test_an_ended_pod_beside_its_replacement_is_not_this_finding(self):
+        """A killed pod can stay listed in phase Failed while a new pod of the
+        same reconciler runs. Only a live pod is the reconciler."""
+        ended = configsync_reconciler_pod(
+            "RootSync", "root-sync", restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL, running=False, pod="root-reconciler-7f99b9c746-old00"
+        )
+        replacement = configsync_reconciler_pod("RootSync", "root-sync", pod="root-reconciler-7f99b9c746-new00")
+        for phase in ("Failed", "Succeeded"):
+            with self.subTest(phase=phase):
+                ended["status"]["phase"] = phase
+                self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync"), pods=[ended, replacement]), [])
+        ended["status"]["phase"] = "Running"
+        self.assertEqual(len(self.run_on(configsync_object("RootSync", "root-sync"), pods=[ended, replacement])), 1)
+
+    def test_another_container_of_the_pod_in_a_loop_is_not_this_finding(self):
+        """Only the container that applies the repository is read: whether the
+        repository is still applied while a sibling is killed was not tested."""
+        for container in ("otel-agent", "git-sync"):
+            with self.subTest(container=container):
+                pod = configsync_reconciler_pod(
+                    "RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL, container=container
+                )
+                self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod]), [])
+
+    def test_a_pod_names_one_sync_object_by_all_three_labels(self):
+        """Sync objects can share a name (two kinds, or two namespaces) and a
+        namespace (two names, or two kinds). A killed reconciler names only
+        the object that all three of its labels name."""
+        objects = [
+            configsync_object("RootSync", "sync"),
+            configsync_object("RootSync", "other"),
+            configsync_object("RepoSync", "sync"),
+            configsync_object("RepoSync", "sync", ns="team-a"),
+            configsync_object("RepoSync", "sync", ns="team-b"),
+        ]
+        for kind, name, ns in (
+            ("RootSync", "sync", "config-management-system"),
+            ("RootSync", "other", "config-management-system"),
+            ("RepoSync", "sync", "config-management-system"),
+            ("RepoSync", "sync", "team-a"),
+            ("RepoSync", "sync", "team-b"),
+        ):
+            with self.subTest(kind=kind, name=name, ns=ns):
+                pod = configsync_reconciler_pod(kind, name, ns=ns, restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL)
+                hits = self.run_on(*objects, pods=[pod])
+                self.assertEqual([(h["namespace"], h["object"]) for h in hits], [(ns, f"{kind}/{name}")])
+
+    def test_the_window_for_a_recent_kill_is_three_times_the_back_off_cap(self):
+        """A crash loop's back-off tops out at five minutes, so the last kill
+        of a container that dies at its start is inside 15."""
+        self.assertEqual(collect.CONFIGSYNC_OOM_RECENT_SECONDS, 3 * 5 * 60)
+        self.assertEqual(collect.CONFIGSYNC_OOM_MIN_RESTARTS, 2)
+
+    def test_the_loop_is_named_while_the_container_is_down_and_while_it_is_up(self):
+        for running in (True, False):
+            with self.subTest(running=running):
+                pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL, running=running)
+                self.assertEqual(len(self.run_on(configsync_object("RootSync", "root-sync"), pods=[pod])), 1)
+
+    def test_a_namespace_reconciler_in_a_loop_names_its_reposync_and_no_other_object(self):
+        root = configsync_object("RootSync", "root-sync")
+        team = configsync_object("RepoSync", "repo-sync", ns="gamestore")
+        pod = configsync_reconciler_pod("RepoSync", "repo-sync", ns="gamestore", restarts=4, killed="OOMKilled", killed_at=self.LAST_KILL,
+                                        pod="ns-reconciler-gamestore-d488c59db-h8k46")
+        hits = self.run_on(root, team, pods=[pod])
+        self.assertEqual([(h["namespace"], h["object"]) for h in hits], [("gamestore", "RepoSync/repo-sync")])
+
+    def test_one_old_kill_is_history_not_a_loop(self):
+        healthy = configsync_object("RootSync", "root-sync")
+        for label, pod in (
+            ("a first kill", configsync_reconciler_pod("RootSync", "root-sync", restarts=1, killed="OOMKilled", killed_at=self.LAST_KILL)),
+            ("a loop that ended", configsync_reconciler_pod(
+                "RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.ago(collect.CONFIGSYNC_OOM_RECENT_SECONDS + 1))),
+            ("another cause", configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="Error", killed_at=self.LAST_KILL)),
+            ("never killed", configsync_reconciler_pod("RootSync", "root-sync")),
+            ("a kill with no time", configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled")),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self.run_on(healthy, pods=[pod]), [])
+
+    def test_a_reconciler_that_never_came_up_is_named_after_the_wait(self):
+        """The live object of a reconciler starved from its start: the same
+        `Reconciling` for the whole test, and no `Stalled` at any read."""
+        def starved(age):
+            return configsync_object(
+                "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(age), reconciling_message=self.DEPLOYMENT_DOWN
+            )
+        hits = self.run_on(starved(698))  # 11 minutes 38 seconds, the length of the live test
+        self.assertEqual(len(hits), 1)
+        # The time and not the age: the excerpt must read the same on the next run.
+        self.assertEqual(
+            hits[0]["excerpt"],
+            f"RootSync/root-sync is not applying its repository: its reconciler has not come up since {self.ago(698)} "
+            f"(Deployment: {self.DEPLOYMENT_DOWN})",
+        )
+        self.assertEqual(len(self.run_on(starved(collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS))), 1)
+
+    def test_a_healthy_start_is_not_a_finding(self):
+        """A healthy start held this state for 12 and 14 seconds on a live
+        cluster. The wait is the ten minutes after which Config Sync says
+        `Stalled` itself for a Deployment that made no progress."""
+        for age in (14, collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS - 1):
+            with self.subTest(age=age):
+                starting = configsync_object(
+                    "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(age), reconciling_message=self.DEPLOYMENT_DOWN
+                )
+                self.assertEqual(self.run_on(starting), [])
+        self.assertEqual(collect.CONFIGSYNC_DEPLOYMENT_WAIT_SECONDS, 10 * 60)
+
+    def test_reconciling_for_another_reason_is_not_a_finding_however_old(self):
+        syncing = configsync_object(
+            "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(86400), reconciling_reason="Sync", reconciling_message="Syncing"
+        )
+        self.assertEqual(self.run_on(syncing), [])
+
+    def test_a_reconciling_condition_that_is_false_is_not_a_finding_however_old(self):
+        settled = configsync_object(
+            "RootSync", "root-sync", reconciling="False", reconciling_since=self.ago(86400), reconciling_message=self.DEPLOYMENT_DOWN
+        )
+        self.assertEqual(self.run_on(settled), [])
+
+    def test_a_reconciling_condition_with_no_time_is_not_a_finding(self):
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True", reconciling_message=self.DEPLOYMENT_DOWN)), [])
+
+    def test_the_live_objects_of_each_reconciler_state(self):
+        """The objects a live Config Sync wrote, read at the moment each was
+        saved. The loop's pod list was saved at 00:02:33Z; its two sync objects
+        are the same loop at 23:50:45Z (between two kills) and at 00:01:13Z
+        (the reconciler down)."""
+        def at(text):
+            return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+        loop_pods = configsync_live("reconciler_pods_loop.json")["items"]
+        saved_pods_at = at("2026-11-21T00:02:33Z")
+        for label, name, pods, now, expected in (
+            ("stalled", "rootsync_stalled.json", [], at("2026-11-20T21:20:00Z"),
+             f"Config Sync reports RootSync/root-sync is not applying its repository: Deployment: {CONFIGSYNC_STALLED_MESSAGE}"),
+            ("starved from its start", "rootsync_reconciler_starved.json", [], at("2026-11-20T21:07:11Z"),
+             "RootSync/root-sync is not applying its repository: its reconciler has not come up since 2026-11-20T20:56:06Z "
+             f"(Deployment: {self.DEPLOYMENT_DOWN})"),
+            ("the loop between two kills, the object alone", "rootsync_loop_between_kills.json", [], at("2026-11-20T23:50:45Z"), None),
+            ("the loop with the reconciler down, the object alone", "rootsync_loop_reconciler_down.json", [], at("2026-11-21T00:01:13Z"), None),
+            ("the loop between two kills, with its pods", "rootsync_loop_between_kills.json", loop_pods, saved_pods_at,
+             "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed "
+             "for memory (OOMKilled) and has restarted more than once (pod root-reconciler-7f99b9c746-h4dhh)"),
+            ("the loop with the reconciler down, with its pods", "rootsync_loop_reconciler_down.json", loop_pods, saved_pods_at,
+             "RootSync/root-sync is not applying its repository: its reconciler container `reconciler` was killed "
+             "for memory (OOMKilled) and has restarted more than once (pod root-reconciler-7f99b9c746-h4dhh)"),
+            ("healthy", "rootsync_healthy.json", [], at("2026-11-20T23:34:00Z"), None),
+            # The saved list also holds a healthy namespace reconciler: no finding for a healthy object beside it.
+            ("healthy, beside another object's killed reconciler", "rootsync_healthy.json",
+             [pod for pod in loop_pods if pod["metadata"]["labels"]["configsync.gke.io/sync-kind"] == "RepoSync"], saved_pods_at, None),
+        ):
+            with self.subTest(label):
+                hits = self.run_on(configsync_live(name), pods=pods, now=now)
+                self.assertEqual([h["excerpt"] for h in hits], [expected] if expected else [])
+
+    def test_the_kill_for_memory_leads_when_both_reconciler_rules_apply(self):
+        """A reconciler killed from its first start: the object is old enough
+        for the age rule and the pod shows the kills. The excerpt names the
+        kill, which is a cause, and not the age."""
+        starved = configsync_object(
+            "RootSync", "root-sync", reconciling="True", reconciling_since=self.ago(698), reconciling_message=self.DEPLOYMENT_DOWN
+        )
+        pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=7, killed="OOMKilled", killed_at=self.LAST_KILL, running=False)
+        (hit,) = self.run_on(starved, pods=[pod])
+        self.assertIn("was killed for memory (OOMKilled)", hit["excerpt"])
+        self.assertNotIn("has not come up since", hit["excerpt"])
+
+    def test_a_render_in_flight_does_not_hide_a_reconciler_that_is_down(self):
+        """Only transient errors on the object is not Config Sync's verdict.
+        The reconciler's own state is still read."""
+        def rendering(**kw):
+            return configsync_object(
+                "RootSync", "root-sync", syncing_refs=["status.rendering.errors"],
+                stage_errors={"rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}]}, **kw
+            )
+        self.assertEqual(self.run_on(rendering()), [])
+        pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL)
+        (hit,) = self.run_on(rendering(), pods=[pod])
+        self.assertIn("was killed for memory (OOMKilled)", hit["excerpt"])
+        (hit,) = self.run_on(rendering(reconciling="True", reconciling_since=self.ago(3600), reconciling_message=self.DEPLOYMENT_DOWN))
+        self.assertIn("has not come up since", hit["excerpt"])
+
+    def test_config_syncs_own_verdict_leads_when_it_gave_one(self):
+        stalled = configsync_object("RootSync", "root-sync", stalled="True")
+        pod = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=self.LAST_KILL)
+        (hit,) = self.run_on(stalled, pods=[pod])
+        self.assertIn("Config Sync reports RootSync/root-sync is not applying its repository: Deployment:", hit["excerpt"])
+        self.assertNotIn("OOMKilled", hit["excerpt"])
 
     def test_healthy_objects_report_nothing(self):
         self.assertEqual(
@@ -8695,8 +10116,8 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", stalled=None)), [])
 
     def test_reconciling_alone_is_not_a_finding(self):
-        """The state of every first sync; a large repository holds it for a
-        long time, and no threshold this check could pick is defensible."""
+        """The state of every first sync. Only the wait for the reconciler's
+        Deployment is read, and only after it has lasted (below)."""
         self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True")), [])
 
     def test_stalled_is_one_critical_naming_the_object(self):
@@ -8704,7 +10125,7 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["object"], "RootSync/root-sync")
         self.assertEqual(hits[0]["namespace"], "config-management-system")
-        self.assertIn("Deployment: Reconciler deployment failed", hits[0]["excerpt"])
+        self.assertIn(f"Deployment: {CONFIGSYNC_STALLED_MESSAGE}", hits[0]["excerpt"])
         self.assertNotIn("severity", hits[0])  # the CheckSpec's `critical` stands
 
     def test_syncing_errors_name_the_stage_and_its_first_error(self):
@@ -8917,8 +10338,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, endpointslice_run=None, serviceentry_items=None):
-        workload_items = [self.benign_pod()] if workload_items is None else workload_items
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, endpointslice_run=None, serviceentry_items=None, configsync_pod_items=(), project_describe_runs=None):
+        # §2.17's reconciler pods are pods of the workload dump like any other.
+        workload_items = ([self.benign_pod()] if workload_items is None else list(workload_items)) + list(configsync_pod_items)
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
         self.issued = []
@@ -8999,6 +10421,12 @@ class TestComplianceCollectCluster(unittest.TestCase):
                 if target.get("autopilot"):
                     return Run(argv, 1, "", self.AUTOPILOT_NODE_POOLS_ERROR, 0.1)
                 return Run(argv, 0, json.dumps(list(node_pools)), "", 0.1)
+            if argv[:3] == ["gcloud", "projects", "describe"] and project_describe_runs is not None:
+                if callable(project_describe_runs):
+                    return project_describe_runs(argv, **kwargs)
+                described = project_describe_runs.get(argv[3])
+                if described is not None:
+                    return described
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
@@ -9014,7 +10442,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 17)
+        self.assertEqual(len(result["commands"]), 18)
 
     def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
         """The real paging, not the module's adapter: the workload, RBAC,
@@ -9241,7 +10669,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 17)
+        self.assertEqual(len(command_slugs), 18)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -9560,14 +10988,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Twenty checks minus the three Autopilot rules out and the three no
-        cluster without Config Connector, Config Sync or Istio can run is fourteen,
+        Twenty-one checks minus the three Autopilot rules out and the three no
+        cluster without Config Connector, Config Sync or Istio can run is fifteen,
         each with a command behind it, and the six dispositioned rather than silently
         absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 14)
+        self.assertEqual(len(command_slugs), 15)
         self.assertEqual(len(na_slugs), 6)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
@@ -13506,7 +14934,7 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertNotIn("webhook-backend-unreachable", command_slugs)
         self.assertIn("webhook-ca-bundle-expired", command_slugs)
-        self.assertEqual(len(command_slugs), 16)
+        self.assertEqual(len(command_slugs), 17)
         self.assertNotIn("webhook-backend-unreachable", {c["check"] for c in result["candidates"]})
 
     def test_a_planted_expired_ca_bundle_webhook_runs_when_endpointslices_fail(self):
@@ -13539,7 +14967,7 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         self.assertNotIn("webhook-ca-bundle-expired", unevaluated)
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertNotIn("webhook-backend-unreachable", command_slugs)
-        self.assertEqual(len(command_slugs), 16)
+        self.assertEqual(len(command_slugs), 17)
         candidates = [c for c in result["candidates"] if c["check"] == "webhook-ca-bundle-expired"]
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["object"], "ValidatingWebhookConfiguration/bench-expiring-webhook-ca")
@@ -13632,6 +15060,45 @@ class TestAdversarialReviewFixes(unittest.TestCase):
     def test_an_unparseable_config_sync_read_is_undetermined(self):
         result = self.compliance(configsync_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
         self.assertIn("could not read", self.configsync_reason(result))
+
+    # §2.17 and a reconciler killed for memory: its sync object reads healthy
+    # between two kills, and its pod is in the workload dump the stream makes.
+    def test_an_out_of_memory_reconciler_is_a_candidate_from_the_workload_dump_and_the_dump_is_recorded(self):
+        last_kill = (datetime.now(timezone.utc) - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = self.compliance(
+            configsync_items=[configsync_object("RootSync", "root-sync")],
+            configsync_pod_items=[configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=last_kill)],
+        )
+        self.assertIsNone(self.configsync_reason(result))
+        candidate = next(c for c in result["candidates"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertEqual((candidate["object"], candidate["severity"]), ("RootSync/root-sync", "critical"))
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        # The two sync reads, then the dump the pod came from: what a reader runs to see it.
+        dump = next(c for c in result["commands"] if c["check"] == "privileged-container")
+        self.assertIn("kubectl get rootsyncs.configsync.gke.io -A -o json; ", command["command"])
+        self.assertTrue(command["command"].endswith("; " + dump["command"]), command["command"])
+        # An owned pod: no other check files the reconciler pod itself.
+        self.assertEqual([c["check"] for c in result["candidates"] if "reconciler" in c["object"]], [])
+
+    def test_the_check_makes_no_pod_read_of_its_own_and_records_a_command_only_where_a_sync_object_exists(self):
+        for label, kw in (("no Config Sync", {}), ("served and empty", {"configsync_items": []}), ("one object", {"configsync_items": [configsync_object("RootSync", "root-sync")]})):
+            with self.subTest(label):
+                tester = TestComplianceCollectCluster()
+                result = tester.run_with(**kw)
+                self.assertEqual([argv for argv in tester.issued if argv[:3] == ["kubectl", "get", "pods"]], [])
+                commands = [c["command"] for c in result["commands"] if c["check"] == "configsync-reconciler-stalled"]
+                self.assertEqual(len(commands), 1 if kw.get("configsync_items") else 0)
+                for command in commands:
+                    self.assertIn(collect.COMPLIANCE_DUMP_KINDS.split(",")[-1], command.rsplit("; ", 1)[-1])
+
+    def test_only_reconciler_pods_of_the_config_sync_namespace_are_kept(self):
+        """The sync labels on a pod of another namespace name nothing: Config
+        Sync runs every reconciler in its own namespace."""
+        last_kill = (datetime.now(timezone.utc) - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elsewhere = configsync_reconciler_pod("RootSync", "root-sync", restarts=9, killed="OOMKilled", killed_at=last_kill)
+        elsewhere["metadata"]["namespace"] = "team-a"
+        result = self.compliance(configsync_items=[configsync_object("RootSync", "root-sync")], configsync_pod_items=[elsewhere])
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["candidates"]})
 
     # Any ccnp failure read as "no cluster-wide policies".
     def test_a_forbidden_ccnp_read_leaves_netpol_missing_unevaluated(self):
@@ -14204,6 +15671,15 @@ class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
             audit_report.validate_check_command(mm_text, "clusters[0]", "ingress-gateway-healthcheck-mismatch"),
         )
         self.assertEqual(mm_text, audit_report.trim_command(mm_text))
+        # §2.17 where a sync object exists: both sync reads, then the workload dump its pods came from.
+        compliance_dump = collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig)
+        sync_reads = [
+            f"KUBECONFIG={kubeconfig} {collect.shlex.join(['kubectl', 'get', kind, '-A', '-o', 'json'])}" for kind in collect.CONFIGSYNC_SYNC_KINDS
+        ]
+        sync_text = "; ".join([*sync_reads, compliance_dump])
+        self.assertLessEqual(len(sync_text), audit_report.MAX_COMMAND_CHARS, len(sync_text))
+        self.assertEqual(sync_text, audit_report.validate_check_command(sync_text, "clusters[0]", "configsync-reconciler-stalled"))
+        self.assertEqual(sync_text, audit_report.trim_command(sync_text))
 
 
 class TestNodePoolsFromTheDiscoveryListing(unittest.TestCase):
@@ -15128,6 +16604,524 @@ class TestWebhookCaBundleExpired(unittest.TestCase):
         self.assertEqual(spec.severity, "critical")
         self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-ca-bundle-expired"], ("webhooks",))
 
+WI_TEST_WORKLOAD_POOL = "acme.svc.id.goog"
+WI_PLANTED_NS = "seeded-identity"
+WI_PLANTED_SA = "kms-signer-sa"
+WI_PLANTED_PROJECT = "kube-agents-bench-no-such-fixture-project"
+WI_PLANTED_GSA = f"kms-signer@{WI_PLANTED_PROJECT}.iam.gserviceaccount.com"
+WI_READABLE_PROJECT = "acme"
+WI_READABLE_GSA = f"app-reader@{WI_READABLE_PROJECT}.iam.gserviceaccount.com"
+WI_CENTRAL_PROJECT = "central-iam-prod"
+WI_COMPUTE_DEFAULT_PROJECT = "123456789012"
+WI_COMPUTE_DEFAULT_GSA = f"{WI_COMPUTE_DEFAULT_PROJECT}-compute@developer.gserviceaccount.com"
+WI_APPSPOT_PROJECT = "acme-appengine"
+WI_APPSPOT_GSA = f"{WI_APPSPOT_PROJECT}@appspot.gserviceaccount.com"
+
+
+def wi_serviceaccount(
+    name: str = WI_PLANTED_SA,
+    *,
+    ns: str = WI_PLANTED_NS,
+    gsa: str | None = WI_PLANTED_GSA,
+    labels: dict | None = None,
+    annotations: dict | None = None,
+) -> dict:
+    merged_annotations = dict(annotations or {})
+    if gsa is not None:
+        merged_annotations[collect.WI_GSA_ANNOTATION] = gsa
+    return {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": dict(labels or {}),
+            "annotations": merged_annotations,
+        },
+    }
+
+
+class TestWiGsaIamBindingMissing(unittest.TestCase):
+    """§2.21 `wi-gsa-iam-binding-unverifiable` (arm A: unreadable target project)."""
+
+    def compliance(self, **kw) -> dict:
+        helper = TestComplianceCollectCluster()
+        result = helper.run_with(**kw)
+        self.issued = helper.issued
+        return result
+
+    def test_planted_unreadable_overlong_project_emits_minor_serviceaccount_candidate(self):
+        planted = wi_serviceaccount(
+            labels={"managed-by": "kube-agents-bench", "app.kubernetes.io/managed-by": "Helm", "meta.helm.sh/release-name": "signer"},
+            annotations={"meta.helm.sh/release-name": "signer", "meta.helm.sh/release-namespace": WI_PLANTED_NS},
+        )
+        result = self.compliance(
+            sa_items=[planted],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_PLANTED_PROJECT: Run(
+                    ["gcloud", "projects", "describe", WI_PLANTED_PROJECT],
+                    1,
+                    "",
+                    "ERROR: (gcloud.projects.describe) Bad Request: Request contains an invalid argument.",
+                    0.05,
+                ),
+            },
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(len(candidates), 1)
+        hit = candidates[0]
+        self.assertEqual(hit["namespace"], WI_PLANTED_NS)
+        self.assertEqual(hit["object"], f"ServiceAccount/{WI_PLANTED_SA}")
+        self.assertEqual(hit["severity"], "minor")
+        self.assertTrue(hit.get("impact_authoritative"))
+        self.assertIn("cannot vouch", hit["impact"])
+        self.assertNotIn("broken", hit["impact"].lower())
+        self.assertNotIn("missing", hit["impact"].lower())
+        self.assertNotIn("broken", hit["excerpt"].lower())
+        self.assertNotIn("no such", hit["excerpt"].lower())
+        self.assertIn(WI_PLANTED_GSA, hit["excerpt"])
+        self.assertIn(f"serviceAccount:{WI_TEST_WORKLOAD_POOL}[{WI_PLANTED_NS}/{WI_PLANTED_SA}]", hit["excerpt"])
+        self.assertIn(collect.WI_IAM_ROLE, hit["excerpt"])
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertIn("/api/v1/serviceaccounts", command)
+        self.assertIn(f"gcloud projects describe {WI_PLANTED_PROJECT}", command)
+        self.assertIn("/api/v1/serviceaccounts", hit["command"])
+        self.assertIn(f"gcloud projects describe {WI_PLANTED_PROJECT}", hit["command"])
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_readable_project_is_not_flagged(self):
+        result = self.compliance(
+            sa_items=[wi_serviceaccount(gsa=WI_READABLE_GSA)],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_READABLE_PROJECT: Run(["gcloud", "projects", "describe", WI_READABLE_PROJECT], 0, "111222333\n", "", 0.03),
+            },
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(candidates, [])
+
+    def test_workload_identity_off_skips_project_describes_and_emits_nothing(self):
+        result = self.compliance(
+            sa_items=[wi_serviceaccount()],
+            describe={"workloadIdentityConfig": {}},
+            project_describe_runs=lambda argv, **kw: (_ for _ in ()).throw(AssertionError(f"unexpected project describe: {argv}")),
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(candidates, [])
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertIn("gcloud container clusters describe", command)
+        self.assertNotIn("/api/v1/serviceaccounts", command)
+
+    def test_compute_and_appspot_default_gsas_resolve_target_projects(self):
+        result = self.compliance(
+            sa_items=[
+                wi_serviceaccount("compute-sa", gsa=WI_COMPUTE_DEFAULT_GSA),
+                wi_serviceaccount("appspot-sa", gsa=WI_APPSPOT_GSA),
+            ],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_COMPUTE_DEFAULT_PROJECT: Run(["x"], 1, "", "PERMISSION_DENIED", 0.02),
+                WI_APPSPOT_PROJECT: Run(["x"], 1, "", "PERMISSION_DENIED", 0.02),
+            },
+        )
+        objects = [c["object"] for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(objects, ["ServiceAccount/appspot-sa", "ServiceAccount/compute-sa"])
+
+    def test_suppressions_and_google_service_agents_issue_no_project_describe(self):
+        result = self.compliance(
+            sa_items=[
+                wi_serviceaccount("sys-sa", ns="kube-system", gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("gke-sa", ns="gke-managed-cim", gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("addon-sa", labels={"addonmanager.kubernetes.io/mode": "Reconcile"}, gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("comp-sa", annotations={"components.gke.io/component-name": "gke-mcs"}, gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("plain-sa", gsa=None),
+                wi_serviceaccount("bad-sa", gsa="not-an-email"),
+                wi_serviceaccount("agent-sa", gsa="service-123@gcp-sa-gkehub.iam.gserviceaccount.com"),
+                wi_serviceaccount("robot-sa", gsa="service-123@container-engine-robot.iam.gserviceaccount.com"),
+                wi_serviceaccount("cloudsvc-sa", gsa="123@cloudservices.gserviceaccount.com"),
+            ],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs=lambda argv, **kw: (_ for _ in ()).throw(AssertionError(f"unexpected project describe: {argv}")),
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(candidates, [])
+
+    def test_project_describe_is_deduplicated_within_and_across_clusters(self):
+        describes: list[str] = []
+        cache = collect._WiProjectDescribeCache()
+        for cluster_name in ("cluster-a", "cluster-b"):
+            helper = TestComplianceCollectCluster()
+            target = {**helper.CLUSTER, "name": cluster_name, "target": f"acme/us-central1/{cluster_name}"}
+
+            def make_run(target_cluster):
+                def run(argv, **kw):
+                    if argv[:3] == ["gcloud", "projects", "describe"]:
+                        describes.append(argv[3])
+                        return Run(argv, 1, "", "PERMISSION_DENIED", 0.02)
+                    if "get-credentials" in argv:
+                        return Run(argv, 0, "", "", 0.01)
+                    if argv[:2] == ["kubectl", "api-resources"]:
+                        return serve_kcc(argv, None)
+                    if argv[:2] == ["kubectl", "get"]:
+                        kinds = argv[2]
+                        if kinds == "sa":
+                            return Run(
+                                argv,
+                                0,
+                                json.dumps(
+                                    dump_of(
+                                        wi_serviceaccount("sa-one", gsa=f"one@{WI_CENTRAL_PROJECT}.iam.gserviceaccount.com"),
+                                        wi_serviceaccount("sa-two", gsa=f"two@{WI_CENTRAL_PROJECT}.iam.gserviceaccount.com"),
+                                    )
+                                ),
+                                "",
+                                0.02,
+                            )
+                        if kinds in ("ccnp", *collect.CONFIGSYNC_SYNC_KINDS, *collect.AUTOPILOT_ALLOWLIST_KINDS):
+                            return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds}"', 0.01)
+                        return Run(argv, 0, json.dumps(dump_of()), "", 0.02)
+                    if argv[:3] == ["gcloud", "container", "clusters"]:
+                        return Run(
+                            argv,
+                            0,
+                            json.dumps(
+                                {
+                                    "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                                    "privateClusterConfig": {"enablePrivateEndpoint": True},
+                                }
+                            ),
+                            "",
+                            0.02,
+                        )
+                    if argv[:3] == ["gcloud", "container", "node-pools"]:
+                        return Run(argv, 0, "[]", "", 0.02)
+                    return Run(argv, 0, "", "", 0.01)
+
+                return run
+
+            with TemporaryDirectory() as tmp:
+                with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+                    entry = collect.collect_cluster(
+                        target,
+                        "compliance-audit",
+                        collect.COMPLIANCE_CHECKS,
+                        run=make_run(target),
+                        wi_project_cache=cache,
+                    )
+            hits = [c["object"] for c in entry["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+            self.assertEqual(hits, ["ServiceAccount/sa-one", "ServiceAccount/sa-two"])
+        self.assertEqual(describes, [WI_CENTRAL_PROJECT])
+
+    def test_timed_out_project_describe_marks_check_unevaluated_not_clean_or_flagged(self):
+        result = self.compliance(
+            sa_items=[wi_serviceaccount()],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_PLANTED_PROJECT: Run(["gcloud", "projects", "describe", WI_PLANTED_PROJECT], collect.TIMEOUT_RC, "", "", 60.0),
+            },
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG])
+        self.assertIn(WI_PLANTED_PROJECT, unevaluated[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG])
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertNotIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, command_slugs)
+        self.assertEqual(len(command_slugs), 17)
+        self.assertNotIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, {c["check"] for c in result["candidates"]})
+
+    def test_broker_transient_and_consumer_disabled_failures_mark_unevaluated_without_caching(self):
+        cases = (
+            ("broker-busy", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "credential proxy throttled: gave up after 1 attempt (HTTP 503): CREDENTIAL_PROXY_BUSY", 0.1)),
+            ("policy-cap", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 77, "", "BROKER_SESSION_BUDGET_EXCEEDED", 0.05)),
+            ("spawn-error", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], -1, "", "FileNotFoundError: gcloud", 0.01)),
+            ("empty-stderr", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "", 0.05)),
+            ("rate-limited", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "ERROR: RESOURCE_EXHAUSTED: Quota exceeded (HTTP 429)", 0.1)),
+            ("upstream-503", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "ERROR: UNAVAILABLE: backend unavailable (HTTP 503)", 0.1)),
+            ("auth-refresh", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "ERROR: problem refreshing your current auth tokens: invalid_grant", 0.1)),
+            (
+                "consumer-disabled",
+                Run(
+                    ["gcloud", "projects", "describe", WI_CENTRAL_PROJECT],
+                    1,
+                    "",
+                    "ERROR: PERMISSION_DENIED: Cloud Resource Manager API has not been used in project 123456 before or it is disabled (SERVICE_DISABLED)",
+                    0.1,
+                ),
+            ),
+            (
+                "quota-project-denied",
+                Run(
+                    ["gcloud", "projects", "describe", WI_CENTRAL_PROJECT],
+                    1,
+                    "",
+                    f"ERROR: (gcloud.projects.describe) [caller] does not have permission to access projects instance [{WI_CENTRAL_PROJECT}] (or it may not exist): Caller does not have required permission to use project quota-proj. Grant the caller the roles/serviceusage.serviceUsageConsumer role (USER_PROJECT_DENIED)",
+                    0.1,
+                ),
+            ),
+            (
+                "insufficient-scopes",
+                Run(
+                    ["gcloud", "projects", "describe", WI_CENTRAL_PROJECT],
+                    1,
+                    "",
+                    f"ERROR: (gcloud.projects.describe) [caller] does not have permission to access projects instance [{WI_CENTRAL_PROJECT}] (or it may not exist): Request had insufficient authentication scopes. (ACCESS_TOKEN_SCOPE_INSUFFICIENT)",
+                    0.1,
+                ),
+            ),
+        )
+        for label, failed_run in cases:
+            with self.subTest(case=label):
+                cache = collect._WiProjectDescribeCache()
+                calls = 0
+
+                def flaky_then_readable(argv, _failed=failed_run):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return _failed
+                    return Run(argv, 0, "99887766\n", "", 0.02)
+
+                _, first_run = cache.describe(WI_CENTRAL_PROJECT, run=flaky_then_readable)
+                self.assertEqual(collect._classify_wi_project_describe(first_run), collect.WI_PROJECT_UNREAD)
+                self.assertEqual(cache._results, {})
+
+                result = self.compliance(
+                    sa_items=[wi_serviceaccount(gsa=f"reader@{WI_CENTRAL_PROJECT}.iam.gserviceaccount.com")],
+                    describe={
+                        "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                        "privateClusterConfig": {"enablePrivateEndpoint": True},
+                    },
+                    project_describe_runs={WI_CENTRAL_PROJECT: failed_run},
+                )
+                unevaluated = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}
+                self.assertIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, unevaluated)
+                self.assertIn("Undetermined:", unevaluated[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG])
+                self.assertNotIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, {c["check"] for c in result["commands"]})
+                self.assertEqual([c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG], [])
+
+                _, recovered_run = cache.describe(WI_CENTRAL_PROJECT, run=flaky_then_readable)
+                self.assertEqual(recovered_run.rc, 0)
+                self.assertEqual(calls, 2)
+                self.assertIn(WI_CENTRAL_PROJECT, cache._results)
+
+    def test_many_projects_stay_under_max_command_chars_and_keep_per_candidate_commands(self):
+        projects = [f"acme-external-tenant-{idx:02d}" for idx in range(35)]
+        overlong_project = "a" * (collect.WI_MAX_PROJECT_ID_CHARS + 1)
+        sa_items = [
+            wi_serviceaccount(f"sa-{idx:02d}", gsa=f"svc@{proj}.iam.gserviceaccount.com")
+            for idx, proj in enumerate(projects)
+        ] + [
+            wi_serviceaccount("overlong-sa", gsa=f"svc@{overlong_project}.iam.gserviceaccount.com"),
+        ]
+        project_runs = {
+            proj: Run(
+                ["gcloud", "projects", "describe", proj],
+                1,
+                "",
+                f"ERROR: (gcloud.projects.describe) caller does not have permission to access [{proj}] (or it may not exist): PERMISSION_DENIED",
+                0.02,
+            )
+            for proj in projects
+        }
+        result = self.compliance(
+            sa_items=sa_items,
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs=project_runs,
+        )
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertLessEqual(len(command), audit_report.MAX_COMMAND_CHARS)
+        self.assertEqual(
+            command,
+            audit_report.validate_check_command(command, "clusters[0]", collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG),
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(len(candidates), 35)
+        last = candidates[-1]
+        self.assertEqual(last["object"], "ServiceAccount/sa-34")
+        self.assertIn(f"gcloud projects describe {projects[-1]}", last["command"])
+        self.assertLessEqual(len(last["command"]), audit_report.MAX_COMMAND_CHARS)
+
+        drafted = audit_report.draft_findings({"audit": "compliance-audit", "clusters": [result]}, "compliance-audit")
+        adopted_finding = next(f for f in drafted["findings"] if f["object"] == "ServiceAccount/sa-34")
+        self.assertEqual(adopted_finding["evidence"]["command"], last["command"])
+
+    def test_concurrent_cache_waiter_recovers_when_owner_raises(self):
+        cache = collect._WiProjectDescribeCache()
+        entered = collect.threading.Event()
+        release = collect.threading.Event()
+        calls = 0
+
+        def owner_raises_then_waiter_succeeds(argv):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                release.wait(timeout=5.0)
+                raise RuntimeError("injected owner crash")
+            return Run(argv, 0, "12345\n", "", 0.01)
+
+        errors: list[BaseException] = []
+        waiter_results: list[Run] = []
+
+        def run_owner():
+            try:
+                cache.describe(WI_CENTRAL_PROJECT, run=owner_raises_then_waiter_succeeds)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def run_waiter():
+            _, res = cache.describe(WI_CENTRAL_PROJECT, run=owner_raises_then_waiter_succeeds)
+            waiter_results.append(res)
+
+        t1 = collect.threading.Thread(target=run_owner)
+        t2 = collect.threading.Thread(target=run_waiter)
+        t1.start()
+        self.assertTrue(entered.wait(timeout=5.0))
+        t2.start()
+        deadline = collect.time.monotonic() + 5.0
+        while collect.time.monotonic() < deadline:
+            frame = sys._current_frames().get(t2.ident)
+            in_wait = False
+            while frame is not None:
+                if frame.f_code.co_name == "wait":
+                    in_wait = True
+                    break
+                frame = frame.f_back
+            if in_wait:
+                break
+            collect.time.sleep(0.001)
+        self.assertTrue(in_wait)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertEqual(len(waiter_results), 1)
+        self.assertEqual(waiter_results[0].rc, 0)
+        self.assertEqual(calls, 2)
+
+    def test_check_is_on_the_compliance_roster_as_a_minor_cluster_check(self):
+        spec = next(c for c in collect.COMPLIANCE_CHECKS if c.slug == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG)
+        self.assertEqual(spec.kind, "cluster")
+        self.assertEqual(spec.severity, "minor")
+        self.assertEqual(
+            collect._COMPLIANCE_CHECK_SOURCES[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG],
+            ("serviceaccounts", "describe", "projects"),
+        )
+
+
+
+class TestOnlyCluster(unittest.TestCase):
+    """`--cluster <location>/<name>` (#5623): one cluster of --project, the rest
+    dropped before any read; and with no flag, the manifest is today's."""
+
+    LISTING = json.dumps(
+        [
+            {"name": "c1", "location": "us-central1", "status": "RUNNING"},
+            {"name": "c2", "location": "us-east1", "status": "RUNNING"},
+            {"name": "c3", "location": "us-west1", "status": "PROVISIONING"},
+        ]
+    )
+    GOLDEN = Path(__file__).resolve().parent / "testdata" / "no_cluster_flag"
+
+    def setUp(self):
+        self.addCleanup(setattr, collect, "only_cluster", None)
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.calls = []
+
+    def run_fake(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+            return collect.Run(argv, 0, self.LISTING, "", 0.05)
+        if "get-credentials" in argv:
+            return collect.Run(argv, 0, "", "", 0.05)
+        if argv[:2] == ["kubectl", "get"]:
+            return collect.Run(argv, 0, json.dumps({"apiVersion": "v1", "kind": "List", "items": [], "metadata": {}}), "", 0.05)
+        return collect.Run(argv, 0, "", "", 0.01)
+
+    def manifest(self, audit):
+        kubeconfigs = Path(self.tmp.name)
+        # The real paged read, which the platform job runs: this module swaps in
+        # a shared double for its other tests (setUpModule).
+        with patch.object(collect, "KUBECONFIG_DIR", kubeconfigs), patch.object(
+            collect, "paged_dump", _PAGED_DUMP.temp_original
+        ):
+            m = collect.collect_fleet(audit, "acme", run=self.run_fake, max_workers=1)
+        # The fields that differ between any two runs of the same code: the
+        # collector's own digest, and the clock.
+        m["checks_revision"] = "<checks_revision>"
+        m["started_at"] = "<started_at>"
+        m["finished_at"] = "<finished_at>"
+        return json.dumps(m, indent=2, sort_keys=True).replace(str(kubeconfigs), "<kubeconfig_dir>") + "\n"
+
+    def test_with_no_flag_the_manifest_is_byte_identical_to_main_before_the_flag(self):
+        # testdata/no_cluster_flag holds each manifest as the collector made it
+        # before --cluster existed, on this fixture. The platform agent's own
+        # audit runs with no flag, so it must not change by a byte.
+        for audit in ("obtainability-audit", "compliance-audit"):
+            with self.subTest(audit=audit):
+                self.assertEqual(self.manifest(audit), (self.GOLDEN / f"{audit}.json").read_text())
+
+    def test_the_flag_reads_only_its_cluster_and_records_the_others_as_not_read(self):
+        collect.only_cluster = ("us-east1", "c2")
+        clusters, not_running, error = collect.enumerate_clusters("acme", run=self.run_fake)
+        self.assertEqual([c["target"] for c in clusters], ["acme/us-east1/c2"])
+        self.assertIsNone(error)
+        # c1 and c3 aren't read here, and the manifest says so: never a fix.
+        self.assertEqual(sorted(e["name"] for e in not_running), ["acme/us-central1/c1", "acme/us-west1/c3"])
+        self.assertTrue(all(e["outcome"] == collect.OUTCOME_UNREACHABLE for e in not_running))
+        self.assertTrue(any("--cluster" in e["error"] for e in not_running))
+
+    def test_a_cluster_the_project_doesnt_list_is_refused_and_nothing_is_read(self):
+        for wanted in (("us-east1", "nope"), ("europe-west1", "c2")):
+            with self.subTest(wanted=wanted):
+                collect.only_cluster = wanted
+                self.calls.clear()
+                with patch.object(collect, "KUBECONFIG_DIR", Path(self.tmp.name)):
+                    m = collect.collect_fleet("compliance-audit", "acme", run=self.run_fake, max_workers=1)
+                self.assertIn("--cluster", m.get("error") or "")
+                self.assertFalse(any("get-credentials" in c or c[:2] == ["kubectl", "get"] for c in self.calls), self.calls)
+
+    def test_a_cluster_the_scope_excludes_is_refused_too(self):
+        collect.declared_scope.set("acme", None, "acme/us-east1/c2")
+        self.addCleanup(collect.declared_scope.set, None, None)
+        collect.only_cluster = ("us-east1", "c2")
+        with mock.patch("sys.stderr"):
+            clusters, _, error = collect.enumerate_clusters("acme", run=self.run_fake)
+        self.assertEqual(clusters, [])
+        self.assertIn("--cluster", error)
+
+    def test_the_flag_is_shape_checked_and_needs_a_project(self):
+        for bad in ("c2", "us-east1/", "/c2", "US-EAST1/c2", "us-east1/C2", "us-east1/c2/x", "us-east1/" + "a" * 41):
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    collect.cluster_arg(bad)
+        self.assertEqual(collect.cluster_arg("us-east1/c2"), ("us-east1", "c2"))
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--cluster", "us-east1/c2"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

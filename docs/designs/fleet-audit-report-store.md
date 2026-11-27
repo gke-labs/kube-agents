@@ -62,7 +62,9 @@ repository's store. With no public body to check it against, the next no-forge r
 `current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
 that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
 envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
-counted as resolved, as the ledger holds it. Over a gap, so is a previous id on a target the run did
+counted as resolved, as the ledger holds it; so is a previous id on an object a target's note
+names (`noted_objects`) — the collector read it but could not see the result, so the run did not
+see the finding go away. Over a gap, so is a previous id on a target the run did
 not check ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 
 Two runs have a repository setting but take the no-forge path, and they store marked envelopes. A run
@@ -113,7 +115,8 @@ in the run record, read as `finish` begins, else the in-flight note's, else null
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
 dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
-run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
+run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), the ids of
+its noted objects (`scheduled_noted_ids`), and the
 ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
 The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an
 on-demand run copies them from the record before it. A run that `precheck` closed from the stored
@@ -228,6 +231,57 @@ every install.
 The broker serves the same seven routes under `/v1/audit-reports` and relays each to the listener with its own token, read fresh from `AUDIT_REPORT_STORE_TOKEN_FILE` on every call; the listener's status and body come back, its 401 or 403 (the broker's own store credential refused, which the broker's log says) as a 502. The broker decides who may read and write, which the listener doesn't: a profile task whose profile is in `CREDENTIAL_PROXY_REPORT_PROFILES` reads, and writes only its own builtin schedule's stream, to the repository `finish` publishes to (or `no_forge%2Flocal` when that rule yields none); the platform agent's shell reads every stream and writes that key or any repository `managed_repos` registers; the A2A gateway's relay, under the `a2a-reports` role its own `kubeagents-credential-proxy-a2a-reports` audience confers to the gateway's ServiceAccount alone, reads one finished report of any audit on that publish key alone, as `GET /v1/audit-reports/{audit_id}/publish/latest` or `.../publish/runs/{ts}`, and writes nothing (#5618): the gateway can't compute the publish key, so it sends the reserved word `publish`, which the broker replaces with the publish key before relaying and refuses any real key from it, and which no real key can equal, since each holds a `%2F`; the shell's or a profile's `publish` isn't resolved; the role may read any audit's report on the publish key, so the gateway's relay decides which conversation sees which report; every other caller is refused ([`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4). It caps a body at the listener's 1 MiB, answers 503 with no store configured, answers 504 when the listener doesn't answer whole within 15 seconds, and logs the method, path, caller and status of each request, never a token or a body. One known window: the broker reads `managed_repos` through its 30-second managed-repository cache and `gitops_repo` fresh, so for up to that long after a ConfigMap edit a write can be checked against a key neither the old nor the new state alone gives. The key is still one a state registers, or `no_forge%2Flocal`. The exec tier doesn't serve these routes.
 
 Each stored run records who wrote it. On a `PUT .../runs/{ts}` the broker sets `X-Report-Writer` from the caller it verified: `shell` for the shell, and `builtin-schedule:<audit_id>:<task_id>` for a profile task, the task id being the verified task credential's `task` claim. It strips any `X-Report-Writer` a caller sends, in any case and on every route, and sets that header on nothing else. The listener refuses a run `PUT` with a malformed writer or a builtin writer for another audit (400). A run `PUT` with no writer at all comes from a broker older than this change (the broker and the listener roll independently); it's written with no sidecar, and any old sidecar is dropped, so it reads back unstamped. Otherwise the listener keeps the value beside the envelope as `runs/<ts>.writer`, a small JSON object holding the writer and the SHA-256 of the exact envelope bytes, written inside the same lock with the same fd-relative, no-symlink, atomic discipline and 0644 mode, and pruned with its envelope. `PUT latest` copies the matched run's sidecar to `latest.writer`: the bytes are identical, so the hash is too. `DELETE latest` drops `latest.writer` with it, under the same lock. `GET latest` and `GET runs/{ts}` read the envelope and its sidecar under the store's lock and answer the stored writer as `X-Report-Writer` only when the sidecar's hash is that of the bytes returned, and the broker passes that one header on to the shell, a profile worker or the `a2a-reports` reader, and none of the listener's other headers. So a sidecar never vouches for another envelope. There's no header when the hash doesn't match (a write that landed between the two reads, or an envelope a listener without sidecars rewrote after a rollback), or when there's no readable sidecar: an envelope written before this change, one `finish` wrote to the file store directly, or a sidecar that's a symlink or not a regular file, which is never followed and doesn't fail the envelope's read. The run index and the stream list don't include sidecars, and an envelope's bytes are never changed. A seeded envelope comes in through the shell, so it's stamped `shell`. The A2A gateway's relay (#6133) trusts a report only when the writer is `builtin-schedule:<audit_id>:<task_id>` naming its own task. The stamp records what the broker verified. It doesn't defend against the `platform-agent` container, which writes this volume as the same user and could write a sidecar as easily as an envelope.
+
+The fleet-audit scripts use that broker store when `FLEET_AUDIT_REPORT_STORE` is `broker`, and the
+file store above otherwise, as before the switch existed. No install sets it yet: the operator change
+that renders `broker` on the shell sandbox's `shell` container and on every profile worker, never on
+the gateway's `platform-agent` container (whose shell writes the file store on the volume the
+listener serves), is a separate change (#6110), which also moves the evaluation cases that plant
+into the sandbox's local store. `audit_report.py`,
+`report_status.py` and `report_query.py` read and write the same names (`latest.json` and the ring's
+`<stamp>.json`) by the key `report_store_key` gives, which a test holds equal to the scripts' own.
+The client is `report_status.py`'s, standard library only, so the status view can still stream it
+into a pod. It sends each request to `CREDENTIAL_PROXY_URL` with the bearer from `CREDENTIAL_PROXY_TOKEN_FILE`, read
+fresh per call, and the task credential from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` when there is one,
+under `credential_proxy_client`'s rule. Each script logs one line on stderr naming the store and
+why (`report store: broker <url> (FLEET_AUDIT_REPORT_STORE=broker)`), and never a token;
+`audit_report.py` stays silent with the switch unset, so `finish`'s output is unchanged there.
+Everything in §2 holds through it: the ring entry is written first and `latest` as its byte copy,
+the listener prunes, `finish` drops `latest` before each ledger rewrite and after a failed write,
+and the readers flag a missing `latest` or a newer ring entry. A 404 is a missing file only when its body is the listener's `{"error": "not found"}`, which the
+broker relays whole. Any other 404 (the broker's own `not_found`, as a broker that predates the
+routes answers every one, or the listener's `no such route`), a 3xx, a 502, 503 or 504, or no answer
+is a store that cannot be used now, which a write logs as a warning without
+changing the exit code and a read treats as unreadable, so a run over it has a lost memory rather
+than a first run. That includes a ring whose listing fails, or whose entries all fail to read, behind a
+missing or marked `latest`. The in-flight notes and the precheck digest stay in the pod's scratch directory.
+
+The sandbox's own file store holds every run from before the switch, and the broker store starts
+empty. So the first time a script touches a stream through the broker (a read, or a write) while the
+pod's local root holds it with no `.seeded-to-broker` marker, the script copies it in. It holds an
+flock on the local stream directory throughout, and looks for the marker again once it has it, so two
+seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. Each attempt
+copies every local ring entry the broker's ring lacks, oldest first, whatever other runs the broker
+holds: a profile worker's, or this shell's own `finish`, that wrote the stream before the seed began
+or while it copied. The one exception is an entry the listener would prune at once: with the broker's
+ring already at its 14 entries, a local entry older than its oldest is skipped and counted as done.
+Then `latest.json` goes, only when it is a byte copy of the newest local entry and, checked just
+before the write, the broker's newest ring entry is that same run and it has no `latest`: a run that
+landed through the broker (a profile worker takes no local lock) keeps its own, so a seed never rolls
+`latest` back. Then the script leaves the marker so the copy never repeats, and logs one line for the
+stream. The marker is left exactly when every local entry is on the broker or skipped as above,
+including when nothing needed copying. A stream the broker refuses to take (a 403: a repository the
+install does not register) is skipped and logged with no marker, so a later registration can still
+seed it, and so is a stream whose run write it answers 409 (the store path, not the entry: a symlink, a
+full directory). An entry it refuses alone (a 400 or 413) is skipped and the rest still copy. A store
+that cannot be used now fails the read or write that started the seed, as an outage, and the next
+touch in the same process seeds again, so a run never reads a stream half copied as a first run. Any
+other failure (another refusal, a local file that cannot be read) is logged, leaves no marker, and
+lets the read or write go on; the next process's seed copies what is still missing and marks the
+stream, whatever the broker was written in between. A `PUT` of a stamp the listener already holds
+rewrites it, so the copy is idempotent. It never deletes or changes a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
+worker has no local store, so nothing is seeded there. The known limit: the copied envelopes are as
+trustworthy as today's file store, which the agent can write; the seed is not attested.
 
 The store is written as 0755 directories and 0644 files whatever the writer's umask, and a `finish`
 run as root, which is what a hand-run over `kubectl exec` is, gives each directory and file it
@@ -349,6 +403,18 @@ human or an external tool recovers a run's id set with no pod access. The identi
 remediation pull request bodies keeps both its write and its read, because reconciliation has to
 work from the live pull request list, which humans change between runs.
 
+### Shadow streams
+
+A shadow run (`start` and `finish` with `--store-only`, #5623) is a canary beside the job it may
+replace. It writes its report to the store and nothing else: no ledger, no forge or git write, no
+remediation and no chat. Its envelopes go to a stream of their own, so two runs of one audit never
+move each other's baseline: the triggering schedule's name when the worker exports it
+(`PROFILE_TRIGGER_STREAM`), or `<audit>-shadow` for a run started by hand. They are stored under the
+install's own store key, which is the one key the broker lets a profile write to, and the stream is
+the trigger's stream, as the broker also requires. A shadow envelope carries `shadow: true`, the
+stream, and `shadow_summary`, the summary a live run would have posted. The store is a shadow run's
+only output, so a write that fails fails the run.
+
 ## 5. Liveness
 
 Whether a run is in flight comes from the lease `start` takes — the in-flight note
@@ -393,6 +459,14 @@ directory, so one the stream stopped publishing to keeps its last row, unflagged
 deletes `<audit-id>/<owner>/<name>/` from the store. `report_status.py` therefore imports nothing outside the standard
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
+
+A shadow run's stream (#5623) holds a canary's results, not a live audit's. `report_status.project`
+leaves it out and counts it as `shadow_hidden`, so the board snapshot and the status view never show
+it, and `report_query.py` leaves it out of `streams` and refuses a question about one of its runs,
+unless `--include-shadow` asks for it. That flag is for the canary's comparison and its eval, never
+for an answer to a person. A stream is a shadow run's when its newest envelope carries `shadow: true`,
+which is enough because a shadow run never writes to a live audit's stream. The broker's raw routes
+don't filter; a reader that goes around these two must check the key itself.
 
 ## 7. Rejected alternatives
 

@@ -24,13 +24,11 @@ const (
 	ruleDelegationBusy          = "delegation.busy"
 	ruleDelegationDepth         = "delegation.depth"
 	ruleDelegationWidth         = "delegation.width"
-	// ruleDelegationProfileBatch ignores a batch from a profile task, which
-	// waits open for one child result and has no way yet to take several.
-	ruleDelegationProfileBatch = "delegation.profile-batch"
-	ruleDelegationNoRequester  = "delegation.no-requester"
-	ruleDelegationStale        = "delegation.stale"
-	ruleDelegationMalformed    = "delegation.malformed"
-	ruleDelegationDoorUnlisted = "delegation.door-unlisted"
+	ruleDelegationRounds        = "delegation.rounds"
+	ruleDelegationNoRequester   = "delegation.no-requester"
+	ruleDelegationStale         = "delegation.stale"
+	ruleDelegationMalformed     = "delegation.malformed"
+	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
 	// ruleDelegationChildSteer refuses a steer into a delegated child from
 	// an author the target's list refuses (gke-labs#2531 item 5).
 	ruleDelegationChildSteer = "delegation.child-steer"
@@ -48,14 +46,26 @@ const (
 	// ruleDelegationParentChainMismatch refuses when an ancestor the record
 	// still holds contradicts the parent's carried chain.
 	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
-	// ruleDelegationUnattendedParent refuses a child of an unattended task:
-	// the child's grant would not carry the parent's trigger binding.
-	ruleDelegationUnattendedParent = "delegation.unattended-parent"
+	// ruleDelegationProfileNotDelegating refuses a task of a profile whose
+	// card doesn't say it delegates (AgentProfile spec.delegates, #6789).
+	ruleDelegationProfileNotDelegating = "delegation.profile-not-delegating"
+	// ruleDelegationUnattendedChild refuses a scheduled run's child whose
+	// profile's card doesn't list the unattended tier: its owner hasn't
+	// agreed to runs nobody is watching, even read-only ones (#6744).
+	ruleDelegationUnattendedChild = "delegation.unattended-child"
 )
 
 // reasonWakeNotStarted is the reason token on a delegation chain's root
 // terminal when the child ended and no wake could run (observeChildEnd).
 const reasonWakeNotStarted = "wake-not-started"
+
+// terminalLogChainEnd is the source on the "task terminal" line for a chain
+// that ended failed with reasonWakeNotStarted (observeChainEnd). The end is
+// the gateway's word about the chain, not the executor's about the root's own
+// work, so the root's second line doesn't read as a duplicate of its first.
+// Only the log carries it: the observers and the counter are told the child's
+// source (ChainEnd.Source).
+const terminalLogChainEnd TerminalSource = "gateway-chain-end"
 
 // reasonDelegationRefused and reasonDelegationNotStarted are the reason
 // tokens on the root terminal an observer is told for a session turn that
@@ -75,7 +85,6 @@ const (
 	whyRequestMalformed = "the request was malformed"
 	whyNoChild          = "the request minted no child"
 	whyRequestUnread    = "the delegate request could not be read from the stream"
-	whyProfileBatch     = "a profile task can't hand out a batch yet"
 	// whyBatchPlanUnwritten: the batch's plan could not be written to the
 	// record before its first child, so none was minted (mintBatch).
 	whyBatchPlanUnwritten = "the batch could not be recorded before its tasks were started"
@@ -166,11 +175,19 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// handed to an observer as the answer (handOffEnd). Written now, under
 	// the session lock the caller holds, as startTaskWith writes a mint:
 	// left to the relay's end-of-batch write, a failed write would lose it.
+	// startRound, once set below, begins the request's delegation round
+	// for a profile parent, whose request uses a round whether it mints or
+	// is refused: it is called where the request is decided (noChild, the
+	// mints), so a request ignored without a decision uses none. It returns
+	// the round as the parent's ends and refusals carry it.
+	startRound := func() int { return 0 }
 	noChild := func(reason string) {
+		round := startRound()
 		rec.markDelegationEnd(taskID, reason)
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
 		}
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, wireRound(round), false)
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
@@ -178,7 +195,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	refuse := func(rule, notice string, extra ...any) {
 		log.Warn("delegation refused", append(append([]any{"rule", rule}, audit...), extra...)...)
 		g.deferNotice(taskID, notice)
-		noChild("reason: " + reasonDelegationRefused + " - " + notice)
+		noChild(refusedEnd(notice))
 	}
 
 	// Only the task the gateway started, from the incarnation that owns it
@@ -196,6 +213,35 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		ignore(ruleDelegationStale, "busSession", rec.BusSession)
 		return
 	}
+	// refuseRounds refuses a profile parent's request made once the task
+	// has used its delegation rounds (DelegationRoundsMax): every request
+	// the gateway handled for it used one, minted or refused. The parent
+	// waits open, so it is told, tagged with the round the request would
+	// have been (lib.DelegationRefusal.Round), which is past the round it
+	// waits on, so it ends nothing. Nothing is minted or recorded, and the
+	// room is not told: the earlier request's mark and children stand, and
+	// a DelegationEnd written here would hold back its children's ends
+	// (profileBatchChildEnded).
+	refuseRounds := func(notice string, extra ...any) {
+		used := roundsUsed(parent)
+		log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationRounds, "roundsUsed", used, "roundsMax", g.cfg.DelegationRoundsMax}, audit...), extra...)...)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+fmt.Sprintf(noticeDelegationRounds, used, plural(used))+notice), used+1, true)
+	}
+	// A profile parent stays open after its request, so it can ask again
+	// after one that ended (DelegationEnd: refused, not started, or a batch
+	// withdrawn, with or without children kept). It has had its answer, and
+	// was told it (#4860), or had each entry ended (endWithdrawnProfileBatch).
+	// That request again, a redelivery or a second ask, is its one, too:
+	// minting it would send none of its ends, since the parent's mark holds
+	// them back (profileBatchChildEnded), and a batch minted beside one a
+	// withdrawal kept would mix with it. It mints nothing and records
+	// nothing; the parent is told, tagged so it ends nothing. That request
+	// used the task's round, so this is the delegation.rounds refusal at
+	// the one round there is today.
+	if profileParent && parent.DelegationEnd != "" && roundsUsed(parent) >= g.cfg.DelegationRoundsMax {
+		refuseRounds("", "delegationEnd", parent.DelegationEnd)
+		return
+	}
 	// A request is accepted once per task, whether it asked for one child
 	// or a batch: a parent with any child has had its request. Checked
 	// before the active task, so a repeat from the parent logs as what it
@@ -211,16 +257,73 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	resuming, minting := false, false
 	if len(parent.Children) > 0 {
 		if parent.batchComplete() || parent.DelegationEnd != "" {
-			ignore(ruleDelegationBusy, "child", parent.Children[len(parent.Children)-1])
-			return
+			last := parent.Children[len(parent.Children)-1]
+			// A profile parent waits open on the children its request
+			// minted: one past its rounds is refused to it, and ends
+			// nothing. A request with rounds left while those children
+			// run is no new round, and stays the busy ignore below.
+			if profileParent && roundsUsed(parent) >= g.cfg.DelegationRoundsMax {
+				// Told its children will still report back only while one
+				// of them has an end to send.
+				notice := ""
+				if profileChildrenRunning(rec, parent, last) {
+					notice = noticeDelegationRoundsChildren
+				}
+				refuseRounds(notice, "child", last)
+				return
+			}
+			// Rounds left: the next round waits for this one to settle,
+			// every child's end recorded (a batch) or the child ended and
+			// the conversation back with the parent (a single child). A
+			// request before that is no new round.
+			if !profileParent || !g.roundSettled(ctx, rec, parent, last) {
+				ignore(ruleDelegationBusy, "child", last)
+				return
+			}
+		} else {
+			resuming = true
 		}
-		resuming = true
+	}
+	if resuming {
 		defer func() {
 			if !minting {
 				g.withdrawCutShortBatch(ctx, rec, taskID, log)
 			}
 		}()
 		log.Info("finishing a batch cut short", "minted", len(parent.Children), "tasks", parent.BatchSize)
+	}
+	// A profile parent's request that gets past the round checks uses a
+	// round, minted or refused: the parent's next one, or, for a batch cut
+	// short and being finished, the round it was started in. Begun where
+	// the request is decided (startRound's callers), not here.
+	if profileParent {
+		used, started := roundsUsed(parent), 0
+		// A plan written with no child minted yet (the gateway stopped
+		// before the first) is the same request's round, as a batch cut
+		// short is: the plan stands, and mintBatch rewrites it.
+		planOnly := parent.BatchSize > 0 && len(parent.Children) == 0 && parent.DelegationEnd == ""
+		startRound = func() int {
+			if resuming || planOnly {
+				return roundOf(parent.DelegationRound)
+			}
+			if started == 0 {
+				started = used + 1
+				rec.startDelegationRound(taskID, started)
+			}
+			return started
+		}
+	}
+	// Only a profile whose card says it delegates (spec.delegates): the
+	// worker's tool is the profile admin's opt-in, and this is where it
+	// holds, not the tool's absence on the worker (#6789). After the resume
+	// block, so a batch cut short whose profile has since lost it is still
+	// withdrawn (the deferred withdrawCutShortBatch); before every check
+	// whose notice could name another task.
+	if profileParent {
+		if !g.profileDelegates(parent.Addressee) {
+			refuse(ruleDelegationProfileNotDelegating, noticeDelegationRefusedFor+fmt.Sprintf(noticeProfileDoesNotDelegate, parent.Addressee))
+			return
+		}
 	}
 	if active := rec.ActiveTask; active == nil || active.TaskID != taskID {
 		ignore(ruleDelegationStale)
@@ -235,13 +338,6 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	if rec.ActiveTask.Detached || parent.Canceled {
 		ignore(ruleDelegationStale, "stopped", true)
 		noChild(notStartedEnd(whyTurnStopped))
-		return
-	}
-	// A profile task waits open for its child's result, and nothing yet
-	// lets it take several, so a batch from one is not served.
-	if parsed && req.IsBatch() && profileParent {
-		ignore(ruleDelegationProfileBatch, "tasks", len(req.Tasks))
-		noChild(notStartedEnd(whyProfileBatch))
 		return
 	}
 	// A batch wider than this gateway's setting is refused whole, naming
@@ -267,7 +363,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 
 	// One live child per conversation, whichever turn asked
-	// for it: a stop detaches a child without ending it.
+	// for it: a stop detaches a child without ending it, so a stopped child
+	// counts until its terminal, or the heal, ends it.
 	// A batch being finished has its own children live.
 	if live := g.liveChild(ctx, rec); live != "" && !resuming {
 		refuse(ruleDelegationBusy, fmt.Sprintf("⚠️ delegation refused: a delegated task is still running (task %s)", live), "child", live)
@@ -288,97 +385,16 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			return
 		}
 	}
-	// Each child the request asks for meets the same checks, all of them
-	// before any is minted, so one entry that fails refuses the request with
-	// nothing minted. check refuses (with the notice a single child would
-	// get) and reports false, or reports the entry's route: nil for
-	// platform.
+	// Each child the request asks for meets the same checks
+	// (delegateEntryCheck), all of them before any is minted, so one entry
+	// that fails refuses the request with nothing minted. check refuses
+	// (with the notice a single child would get) and reports false, or
+	// reports the entry's route: nil for platform.
 	check := func(e lib.DelegateTask) (*profileRoute, bool) {
-		// Anything but platform is an AgentProfile: resolved, its target checked
-		// against the scope, and minted at the parent's tier, which for a
-		// session parent is its requester's (profileRouteFor).
-		var route *profileRoute
-		var err error
-		addressee := strings.TrimSpace(e.Addressee)
-		// A profile task delegates only to another profile: a platform child is
-		// minted at the install's tier and scope, wider than the parent's.
-		if profileParent && addressee == targetPlatform {
-			refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
+		route, no := g.delegateEntryCheck(rec, parent, profileParent, e, true)
+		if no != nil {
+			refuse(no.rule, no.notice, no.extra...)
 			return nil, false
-		}
-		if addressee == targetPlatform && len(e.Parameters) > 0 {
-			// Only a profile route carries parameters; platform's would be dropped.
-			refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
-			return nil, false
-		}
-		if addressee != targetPlatform {
-			tier := capability.Tier(parent.Tier)
-			if !profileParent {
-				authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
-				if tier, err = g.tierFor(authors, unknown); err != nil {
-					refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
-					return nil, false
-				}
-			}
-			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
-				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
-				return nil, false
-			}
-			if profileParent {
-				if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
-					refuse(rule, noticeDelegationRefusedFor+notice, "child", route.Profile)
-					return nil, false
-				}
-			}
-		}
-		// The lists are the target's: the profile the address resolved to, so a
-		// list on a pinned profile can't be stepped round by addressing another.
-		target := addressee
-		if route != nil {
-			target = route.Profile
-		}
-		// The A2A door's callers delegate only under a list of their own,
-		// which nothing renders yet (gke-labs#2478): an absent list there is
-		// nobody, where on a chat backend it is everyone the ingress admits.
-		if g.doorUnlisted(target, parent.Requester.Backend) {
-			refuse(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
-			return nil, false
-		}
-		if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
-			refuse(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
-			return nil, false
-		}
-		// Anyone in the room can steer the turn, so everyone who did is checked
-		// as the requester is: otherwise an off-list human steers the session
-		// into delegating under the requester's name.
-		if parent.SteerAuthorsOverflow {
-			refuse(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
-			return nil, false
-		}
-		for _, a := range parent.SteerAuthors {
-			if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
-				refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
-				return nil, false
-			}
-		}
-		// And everyone whose text reached this incarnation, on any turn: the
-		// pod keeps what it was told, so an off-list human's earlier turn can
-		// leave the instruction a later on-list turn delegates on. The check
-		// above pinned the parent to rec.BusSession, so the set is the parent's
-		// incarnation's.
-		sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
-		if profileParent {
-			sessionAuthors, sessionUnknown = nil, false
-		}
-		if sessionUnknown {
-			refuse(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
-			return nil, false
-		}
-		for _, a := range sessionAuthors {
-			if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
-				refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
-				return nil, false
-			}
 		}
 		return route, true
 	}
@@ -395,9 +411,13 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		// What the dispatcher re-checks the child against (#5686).
 		authority.Via.ProfileChain, authority.Via.Scope = parent.ProfileChain, parent.Scope
 	}
+	if profileParent {
+		startRound()
+		parent, _ = rec.TaskRefFor(taskID)
+	}
 	if len(routes) > 1 {
 		minting = true
-		g.mintBatch(ctx, rec, taskID, parent, req.Tasks, routes, authority, noChild, log)
+		g.mintBatch(ctx, rec, taskID, parent, profileParent, req.Tasks, routes, authority, noChild, log)
 		return
 	}
 	route := routes[0]
@@ -428,6 +448,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		LineNote:             lineNote,
 		Route:                route,
 		ProfileChain:         childProfileChain(parent, profileParent),
+		BatchRound:           mintRound(parent, profileParent),
+		Scheduled:            profileParent && parent.belowSchedule(),
 		SteerAuthors:         parent.SteerAuthors,
 		SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 		RootTaskID:           parent.rootID(),
@@ -454,6 +476,142 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
 }
 
+// entryRefusal is why delegateEntryCheck refused an entry: the rule and the
+// notice handleDelegateRequest refuses with, and the audit line's extras.
+type entryRefusal struct {
+	rule, notice string
+	extra        []any
+}
+
+func refuseEntry(rule, notice string, extra ...any) *entryRefusal {
+	return &entryRefusal{rule: rule, notice: notice, extra: extra}
+}
+
+// delegateEntryCheck is whether parent may start a child for one entry of
+// its delegate request: the entry's route (nil for platform), or why not. It
+// is the one statement of the per-child rules, read by the delegation as it
+// arrives (handleDelegateRequest) and by the list a delegating profile
+// parent's submission carries (profileDelegateTargets), so the list offers
+// nothing the delegation refuses. scopeChecked false leaves out only the
+// install-scope check of a target the entry names (profileRouteWith), for
+// the list's probe of a profile whose cluster is the asker's to choose; the
+// delegation always passes true.
+func (g *Gateway) delegateEntryCheck(rec *SessionRecord, parent TaskRef, profileParent bool, e lib.DelegateTask, scopeChecked bool) (*profileRoute, *entryRefusal) {
+	// Anything but platform is an AgentProfile: resolved, its target checked
+	// against the scope, and minted at the parent's tier (read when the
+	// parent is unattended, #6744), which for a session parent is its
+	// requester's (profileRouteFor).
+	var route *profileRoute
+	var err error
+	addressee := strings.TrimSpace(e.Addressee)
+	// A profile task delegates only to another profile: a platform child is
+	// minted at the install's tier and scope, wider than the parent's.
+	if profileParent && addressee == targetPlatform {
+		return nil, refuseEntry(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
+	}
+	if addressee == targetPlatform && len(e.Parameters) > 0 {
+		// Only a profile route carries parameters; platform's would be dropped.
+		return nil, refuseEntry(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
+	}
+	if addressee != targetPlatform {
+		tier := capability.Tier(parent.Tier)
+		if profileParent && tier == capability.TierUnattended {
+			// A child of an unattended task (#6744) is minted at the read
+			// tier, as a fresh root on the parent's scope (the chain checks
+			// below hold it there), and carries no trigger: an unattended
+			// grant is bound to its trigger, and only the parent writes
+			// under it. A child can read for its parent, never write.
+			tier = capability.TierRead
+		}
+		if !profileParent {
+			authors, unknown, _ := delegateAuthors(rec, *parent.Requester)
+			if tier, err = g.tierFor(authors, unknown); err != nil {
+				return nil, refuseEntry(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+			}
+		}
+		if route, err = g.profileRouteWith(addressee, e.Parameters, tier, lib.SubmitKindChild, scopeChecked); err != nil {
+			return nil, refuseEntry(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+		}
+		if profileParent && parent.belowSchedule() {
+			// The child runs at read, but for a schedule, with nobody
+			// watching: only a profile whose card lists unattended takes
+			// it, as only such a profile takes the trigger itself. So
+			// does a grandchild: the mark rides the chain.
+			if card, ok := g.profiles.lookup(route.Profile); !ok || !cardAllowsTier(card, capability.TierUnattended) {
+				return nil, refuseEntry(ruleDelegationUnattendedChild, noticeDelegationRefusedFor+fmt.Sprintf(noticeUnattendedChild, route.Profile), "child", route.Profile)
+			}
+			// And a profile pinned to the child's target must list it
+			// too, as a trigger submitted there directly is held to
+			// (profileRouteFor's checkPinnedTiers at unattended).
+			// resolveProfile already succeeded for this address above.
+			_, target, rerr := resolveProfile(g.profiles, addressee, e.Parameters)
+			if rerr == nil {
+				rerr = g.checkPinnedTiers(route.Profile, target, capability.TierUnattended)
+			}
+			if rerr != nil {
+				return nil, refuseEntry(ruleDelegationUnattendedChild, refusalNotice(noticeDelegationRefusedFor, rerr), "child", route.Profile)
+			}
+		}
+		if profileParent {
+			if rule, notice := g.profileChildRefusal(rec, parent, route); rule != "" {
+				return nil, refuseEntry(rule, noticeDelegationRefusedFor+notice, "child", route.Profile)
+			}
+		}
+	}
+	// The lists are the target's: the profile the address resolved to, so a
+	// list on a pinned profile can't be stepped round by addressing another.
+	target := addressee
+	if route != nil {
+		target = route.Profile
+	}
+	// The A2A door's callers delegate only under a list of their own,
+	// which nothing renders yet (gke-labs#2478): an absent list there is
+	// nobody, where on a chat backend it is everyone the ingress admits.
+	if g.doorUnlisted(target, parent.Requester.Backend) {
+		return nil, refuseEntry(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
+	}
+	if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
+		return nil, refuseEntry(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
+	}
+	// Anyone in the room can steer the turn, so everyone who did is checked
+	// as the requester is: otherwise an off-list human steers the session
+	// into delegating under the requester's name.
+	if parent.SteerAuthorsOverflow {
+		return nil, refuseEntry(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
+	}
+	for _, a := range parent.SteerAuthors {
+		if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
+			return nil, refuseEntry(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
+		}
+	}
+	// And everyone whose text reached this incarnation, on any turn: the
+	// pod keeps what it was told, so an off-list human's earlier turn can
+	// leave the instruction a later on-list turn delegates on. The caller
+	// pinned a session parent to rec.BusSession, so the set is the parent's
+	// incarnation's.
+	sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
+	if profileParent {
+		sessionAuthors, sessionUnknown = nil, false
+	}
+	if sessionUnknown {
+		return nil, refuseEntry(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
+	}
+	for _, a := range sessionAuthors {
+		if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
+			return nil, refuseEntry(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
+		}
+	}
+	return route, nil
+}
+
+// profileDelegates reports whether profile's card says its tasks may
+// delegate (AgentProfile spec.delegates, #6789): the delegation's check of a
+// profile parent, and whether its submission carries a delegateTargets part.
+func (g *Gateway) profileDelegates(profile string) bool {
+	card, ok := g.profiles.lookup(profile)
+	return ok && card.Delegates
+}
+
 // noticeBatchChildWithdrawn closes the line of a batch child that reached
 // the bus when a later one in its batch did not: the batch is withdrawn whole.
 // reasonBatchWithdrawn is the reason token on the terminal audit line of a
@@ -474,7 +632,7 @@ const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delega
 // a cancel and dropped, and the parent records that its request minted no
 // child, so the record is as it was before the request. A child whose cancel
 // couldn't be published stays on the record, canceled, linked and indexed.
-func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, tasks []lib.DelegateTask,
+func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, profileParent bool, tasks []lib.DelegateTask,
 	routes []*profileRoute, authority Authority, noChild func(string), log *slog.Logger) {
 	correlationID := rec.ActiveTask.CorrelationID
 	// The plan goes on the parent before any child is published, in its own
@@ -512,29 +670,42 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			addressee, lineNote = routes[i].Profile, fmt.Sprintf(delegatedProfileLineNote, routes[i].Profile)
 		}
 		childID, ok := g.startTaskWith(ctx, rec, taskStart{
-			Text:                 e.Text,
-			Requester:            *parent.Requester,
-			Authority:            authority,
-			CorrelationID:        correlationID,
-			Role:                 taskRoleChild,
-			ParentTaskID:         taskID,
-			Depth:                parent.Depth + 1,
-			LineNote:             lineNote,
-			Route:                routes[i],
+			Text:          e.Text,
+			Requester:     *parent.Requester,
+			Authority:     authority,
+			CorrelationID: correlationID,
+			Role:          taskRoleChild,
+			ParentTaskID:  taskID,
+			Depth:         parent.Depth + 1,
+			LineNote:      lineNote,
+			Route:         routes[i],
+			ProfileChain:  childProfileChain(parent, profileParent),
+			BatchRound:    mintRound(parent, profileParent),
+			// Below a scheduled run, as a single child is: the mark is what
+			// holds this child's own delegation to the unattended card check.
+			Scheduled:            profileParent && parent.belowSchedule(),
 			SteerAuthors:         parent.SteerAuthors,
 			SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
 			RootTaskID:           parent.rootID(),
-			LinkParent:           true,
-			Addressee:            addressee,
-			KeepActive:           true,
-			BatchIndex:           i + 1,
-			Target:               batchTarget(batchParams(e, routes[i])),
+			// The parent's entry, as for a single child: a child can't
+			// raise it.
+			ChangeRequested: parent.ChangeRequested,
+			LinkParent:      true,
+			Addressee:       addressee,
+			KeepActive:      true,
+			BatchIndex:      i + 1,
+			Target:          batchTarget(batchParams(e, routes[i])),
 		})
 		if !ok {
 			// The parent records that its request ran nothing, whether or
 			// not a child whose cancel failed stays on the record: a
 			// withdrawn batch wakes nothing (batchChildEnded).
+			// The entries' ends go out before noChild writes the record,
+			// which marks the batch withdrawn: after that write nothing
+			// would send them.
+			ended := rec.endedBatchEntries(taskID)
 			g.withdrawBatch(ctx, rec, taskID, minted, authority)
+			g.endWithdrawnProfileBatch(ctx, rec, taskID, len(tasks), whyChildOffBus, ended)
 			noChild(notStartedEnd(whyChildOffBus))
 			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
 			return
@@ -566,18 +737,20 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 		g.publishDispatchStop(ctx, ref)
 		if !g.publishBatchCancel(ctx, rec, ref, authority, batchCancelWithdrawn) {
 			rec.MarkCanceled(id)
+			rec.setCancelUnsent(id, true)
 			kept[id] = true
 			continue
 		}
 		if ref.StatusMsgID != "" {
-			g.editLine(rec.Key, ref.StatusMsgID, noticeBatchChildWithdrawn, "")
+			g.editLine(rec.Key, ref.StatusMsgID, withLineNote(noticeBatchChildWithdrawn, ref.LineNote), "")
 		}
 		g.logTaskTerminal(rec, ref.Addressee, id, lib.StateCanceled, TerminalFromGateway,
 			"reason: "+reasonBatchWithdrawn+" - "+noticeBatchChildWithdrawn)
 	}
+	round := currentRoundOf(rec, taskID)
 	keep := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {
-		if ref.Role == taskRoleChild && ref.ParentTaskID == taskID && !kept[ref.ID] {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == taskID && roundOf(ref.BatchRound) == round && !kept[ref.ID] {
 			g.retireTaskRoute(ctx, ref.ID)
 			continue
 		}
@@ -635,8 +808,10 @@ func (g *Gateway) withdrawCutShortBatch(ctx context.Context, rec *SessionRecord,
 	if authority.Via == nil {
 		authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
 	}
+	ended := rec.endedBatchEntries(taskID)
 	kept := g.withdrawBatch(ctx, rec, taskID, parent.Children, authority)
 	rec.markDelegationEnd(taskID, notStartedEnd(whyBatchCutShort))
+	g.endWithdrawnProfileBatch(ctx, rec, taskID, parent.BatchSize, whyBatchCutShort, ended)
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed after a cut-short batch was withdrawn", "conversation", rec.Key, "err", err)
 	}
@@ -771,9 +946,10 @@ func (g *Gateway) sessionTurn(ref TaskRef) bool {
 // held to the same rule: its callers are verified people, but they reach the
 // door through a program, and bnaylor decided (2026-10-07) that a door
 // caller delegates only under a list of its own, whichever class verified
-// them.
+// them. The Entra class (a2aEntraBackend, a2adoor_entra.go) is the same
+// case.
 func (g *Gateway) doorUnlisted(target, backend string) bool {
-	return (backend == a2aBackend || backend == a2aGoogleBackend) && g.targetAllowed[target][backend] == nil
+	return (backend == a2aBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend) && g.targetAllowed[target][backend] == nil
 }
 
 // authorRefusal is the rule a steer author or incarnation-set member refuses
@@ -925,7 +1101,7 @@ func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
 // a wake used to loop to the depth bound with nothing answered.
 const (
 	wakeReplyGuide     = "The user has already seen what came back above. Reply in a few sentences with what it means for their question, without repeating it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
-	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
+	wakeReplyGuideFull = "The person asking hasn't seen what came back above; they see only your reply. Give them the complete answer to their question from it, in the format their question asked for if it gave one. If it failed, or says more is still running or will follow later, say so plainly. You can't delegate on this turn."
 )
 
 // wakeReplyGuideMax is the longer of the two guides, which the result
@@ -1061,6 +1237,8 @@ func breakBacktickRuns(body string, n int) string {
 // refused request can be asked again, a second live child cannot be undone.
 func (g *Gateway) liveChild(ctx context.Context, rec *SessionRecord) string {
 	for _, ref := range rec.Tasks {
+		// A stopped child counts until it has ended: a cancel, sent or
+		// not, doesn't stop a task that is still working.
 		if ref.Role != taskRoleChild {
 			continue
 		}
@@ -1092,9 +1270,12 @@ func setParentLine(rec *SessionRecord, taskID, statusMsgID string) {
 // the failed one, and so is every link it holds. A batch that fails partway
 // is withdrawBatch's.
 func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, taskID string) {
+	// The current round's children only: an earlier round's stay on the
+	// record (EarlierChildren), routes and all.
+	round := currentRoundOf(rec, taskID)
 	kept := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {
-		if ref.Role != taskRoleChild || ref.ParentTaskID != taskID {
+		if ref.Role != taskRoleChild || ref.ParentTaskID != taskID || roundOf(ref.BatchRound) != round {
 			kept = append(kept, ref)
 			continue
 		}
@@ -1306,6 +1487,12 @@ func (g *Gateway) observeChainEnd(rec *SessionRecord, child TaskRef, stopped boo
 		}
 	}
 	g.observeTaskTerminal(rec, child.rootID(), end.State, end.Source, end.Reason)
+	// The root's own line says how its turn ended; this one says the chain
+	// it started failed, as the observers were just told, so the log and
+	// the read route agree. A stopped chain logs no chain-end line.
+	if !stopped {
+		g.logTaskTerminal(rec, rec.AddresseeFor(child.rootID()), child.rootID(), end.State, terminalLogChainEnd, end.Reason)
+	}
 	// The chain ends at the child, so its mark settles here, as the chain's
 	// end the observers were just told (terminalMark leaves a child's
 	// terminal to this or to the wake).
@@ -1328,8 +1515,145 @@ func wakeToDoor(parent *TaskRef) bool {
 		return false
 	}
 	switch parent.Requester.Backend {
-	case injectBackend, a2aBackend, a2aGoogleBackend:
+	case injectBackend, a2aBackend, a2aGoogleBackend, a2aEntraBackend:
 		return true
 	}
 	return false
+}
+
+// refusedEnd is the DelegationEnd reason of a request refused with notice.
+func refusedEnd(notice string) string {
+	return "reason: " + reasonDelegationRefused + " - " + notice
+}
+
+// tellProfileParentNoChild sends a profile parent the refusal its delegate
+// request ended in (#4860), on its .in, so it stops waiting for a child that
+// will never exist. A session parent's turn has already ended on the hand-off
+// and needs nothing; nor does a batch whose plan was written, whose entries
+// each get their own end (endWithdrawnProfileBatch), nor a parent a stop
+// cancelled or that has ended (profileParentListens).
+//
+// round is the 1-based round the refused request would have been, 0 or 1
+// for the first. One past the first is a request made after one that minted
+// its child or whole batch, or ended (DelegationEnd): the parent's wait is on
+// those children, or is already over, so the refusal goes out tagged with its
+// round (lib.DelegationRefusal.Round) and ends nothing. Only such a parent
+// gets one: one with no earlier request is a first refusal, and a batch cut
+// short and being finished has its entries' ends coming instead.
+func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, round int, overCap bool) {
+	parent, ok := rec.TaskRefFor(taskID)
+	if !ok || parent.Tier == "" || session != parent.Addressee {
+		return
+	}
+	if round <= 1 {
+		round = 0
+	}
+	// A refusal for having used every round (overCap) is past the round the
+	// parent waits on; any other is the request's own round, whose batch
+	// plan, once written, gets its per-entry ends instead. Not read off the
+	// round number: from round two on, a request's own refusal is past one
+	// too.
+	repeat := overCap
+	if repeat {
+		if parent.DelegationEnd == "" && (len(parent.Children) == 0 || !parent.batchComplete()) {
+			return
+		}
+	} else if parent.BatchSize > 0 || len(parent.Children) > 0 {
+		return
+	}
+	if !g.profileParentListens(ctx, &parent, "") {
+		return
+	}
+	text := delegationRefusalText(reason)
+	if err := g.publishDelegationRefusal(ctx, rec, parent, text, round); err != nil {
+		g.log.Error("delegation refusal not delivered to its parent", "parent", parent.ID, "round", max(round, 1), "err", err)
+		return
+	}
+	g.log.Info("delegation refusal delivered to its parent", "parent", parent.ID, "round", max(round, 1))
+}
+
+// delegationRefusalText is the parent's line for a DelegationEnd reason:
+// a refusal's own notice, or what didn't start and why.
+func delegationRefusalText(reason string) string {
+	if notice, ok := strings.CutPrefix(reason, "reason: "+reasonDelegationRefused+" - "); ok {
+		return notice
+	}
+	if why, ok := strings.CutPrefix(reason, "reason: "+reasonDelegationNotStarted+" - "); ok {
+		return noticeDelegationNotStarted + why
+	}
+	return reason
+}
+
+// publishDelegationRefusal publishes a lib.DelegationRefusal on the parent's
+// .in, under the parent's own capability, as publishChildResult does.
+func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionRecord, parent TaskRef, text string, round int) error {
+	if len(text) > lib.ChildResultTextCap {
+		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
+	}
+	part, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text, Round: round})
+	if err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+	payload, err := messagePayloadParts([]lib.Part{part}, parent.ID, rec.ContextID)
+	if err != nil {
+		return fmt.Errorf("payload: %w", err)
+	}
+	authority, err := AuthorityFromAttribution(parent.Attribution)
+	if err != nil {
+		return fmt.Errorf("authority: %w", err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, parent.ID, rec.ContextID, parent.CorrelationID, payload,
+		lib.WithTo(lib.Party{Session: parent.Addressee}),
+		lib.WithAuthority(authority.Render(parent.Capability)))
+	if err != nil {
+		return fmt.Errorf("envelope: %w", err)
+	}
+	if err := g.client.Publish(ctx, lib.TaskInSubject(parent.Addressee, parent.ID), env); err != nil {
+		return fmt.Errorf("publish: %w", err)
+	}
+	return nil
+}
+
+// roundSettled reports whether a profile parent's current round is over, so
+// its next request may start the next one: no child still to end
+// (profileChildrenRunning), no end still to send it (Unsent, which only the
+// current round's heal resends), and no child of the round still routed (a
+// batch child that asked is ended on the record but runs until its cancel
+// lands, and liveChild would refuse the next request for it). A lookup that
+// fails counts the child as running.
+func (g *Gateway) roundSettled(ctx context.Context, rec *SessionRecord, parent TaskRef, last string) bool {
+	if profileChildrenRunning(rec, parent, last) {
+		return false
+	}
+	for _, id := range parent.Children {
+		k, ok := rec.TaskRefFor(id)
+		if ok && k.BatchEnd != nil && k.BatchEnd.Unsent {
+			return false
+		}
+		if key, err := g.lookupTaskSession(ctx, id); err != nil || key != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// mintRound is the round a profile parent's child is minted in, as the child
+// records it (TaskRef.BatchRound): 0 for round one, so a record is what it
+// was before rounds while DelegationRoundsMax is one.
+func mintRound(parent TaskRef, profileParent bool) int {
+	if !profileParent || parent.DelegationRound <= 1 {
+		return 0
+	}
+	return parent.DelegationRound
+}
+
+// profileChildrenRunning reports whether a profile parent's minted children
+// still have an end to send it: for a batch, a planned child with no end
+// (batchLeft); for a single child, while that child holds the conversation,
+// which deliverChildResult hands back to the parent at the child's end.
+func profileChildrenRunning(rec *SessionRecord, parent TaskRef, child string) bool {
+	if parent.fanOut() {
+		return rec.batchLeft(parent) > 0
+	}
+	return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child
 }

@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -116,6 +118,34 @@ func TestAScriptFileIsCheckedBeforeItRuns(t *testing.T) {
 	for _, p := range []string{lib.ScriptRoot + "../../bin/sh", "/bin/sh", lib.ScriptRoot + "a//b", lib.ScriptRoot + "a;id"} {
 		if _, err := (scriptFileCheck{}).resolve(p); err == nil || !strings.Contains(err.Error(), "not a script path") {
 			t.Errorf("%q: %v; want it refused as not a script path", p, err)
+		}
+	}
+}
+
+// A script file with the setuid or setgid bit is refused, and the same file without either
+// resolves.
+func TestAScriptFileThatIsSetuidOrSetgidIsRefused(t *testing.T) {
+	root, check := scriptRoot(t)
+	for name, bit := range map[string]os.FileMode{"setuid": os.ModeSetuid, "setgid": os.ModeSetgid} {
+		p := filepath.Join(root, name+".sh")
+		writeScript(t, p, "#!/bin/sh\necho ok\n", 0o755)
+		if got, err := check.resolve(lib.ScriptRoot + name + ".sh"); err != nil || got != p {
+			t.Fatalf("%s: without the bit: %q, %v; want it resolved", name, got, err)
+		}
+		if err := os.Chmod(p, 0o755|bit); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode()&bit == 0 {
+			// A setgid bit for a group the test's user isn't in is cleared by the kernel.
+			t.Logf("%s: the file system cleared the bit (%v), so this case can't be checked here", name, fi.Mode())
+			continue
+		}
+		if got, err := check.resolve(lib.ScriptRoot + name + ".sh"); err == nil || !strings.Contains(err.Error(), "setuid or setgid") {
+			t.Errorf("%s: resolved to %q, %v; want it refused as setuid or setgid", name, got, err)
 		}
 	}
 }
@@ -273,11 +303,38 @@ func TestAScriptsOutputIsCappedAndItsEndReported(t *testing.T) {
 	start := time.Now()
 	r := run("slow.sh", "(sleep 3; touch "+marker+") &\nsleep 30\n", 300*time.Millisecond)
 	if !r.timedOut || time.Since(start) > 10*time.Second {
-		t.Fatalf("timedOut %v after %s; want a timeout at its bound", r.timedOut, time.Since(start))
+		t.Fatalf("timedOut %v (exit %d, startErr %v) after %s; want a timeout at its bound", r.timedOut, r.exitCode, r.startErr, time.Since(start))
 	}
 	time.Sleep(4 * time.Second)
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("the script's child outlived its timeout: the process group wasn't killed")
+	}
+}
+
+// A script's timeout starts after its process launches, so a sub-millisecond bound still reports a
+// timeout with exit -1 rather than a pre-launch failure, and a script that fails to start reports
+// exit -1 (and stopped when the worker's context has already ended) rather than exit 0.
+func TestAScriptsTimeoutStartsAfterLaunchAndAStartFailureIsNeverExitZero(t *testing.T) {
+	root, _ := scriptRoot(t)
+	p := filepath.Join(root, "slow.sh")
+	writeScript(t, p, "#!/bin/sh\nsleep 30\n", 0o755)
+	for i := range 10 {
+		r := execScript(context.Background(), &scriptRun{name: "slow", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: 100 * time.Microsecond}, scriptSignals{})
+		if !r.timedOut || r.exitCode != -1 || r.startErr != nil {
+			t.Fatalf("run %d: timedOut %v exit %d startErr %v; want timedOut with exit -1", i, r.timedOut, r.exitCode, r.startErr)
+		}
+	}
+
+	missing := execScript(context.Background(), &scriptRun{name: "missing", path: filepath.Join(root, "nope.sh"), env: []string{"PATH=/usr/bin:/bin"}, timeout: time.Second}, scriptSignals{})
+	if missing.startErr == nil || missing.exitCode != -1 || missing.timedOut || missing.stopped {
+		t.Errorf("missing script: exit %d startErr %v timedOut %v stopped %v; want startErr with exit -1", missing.exitCode, missing.startErr, missing.timedOut, missing.stopped)
+	}
+
+	stoppedCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	stopped := execScript(stoppedCtx, &scriptRun{name: "stopped", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: time.Second}, scriptSignals{})
+	if !stopped.stopped || stopped.exitCode != -1 || stopped.startErr != nil || stopped.timedOut {
+		t.Errorf("stopped context: stopped %v exit %d startErr %v timedOut %v; want stopped with exit -1", stopped.stopped, stopped.exitCode, stopped.startErr, stopped.timedOut)
 	}
 }
 
@@ -590,7 +647,8 @@ func TestAScriptThatExitsZeroWithAChildHoldingItsOutputIsNotATimeout(t *testing.
 
 // The directories on the path the confirm names are checked as well as the resolved file's: a
 // symlinked directory, or a group-writable one, on the named path is refused even when the file
-// it leads to passes every check.
+// it leads to passes every check, and a world-writable directory on the resolved path is refused
+// even when the named path's directories pass.
 func TestAScriptsNamedPathsDirectoriesAreCheckedToo(t *testing.T) {
 	root, check := scriptRoot(t)
 	good := filepath.Join(root, "helpers", "watch.sh")
@@ -619,12 +677,73 @@ func TestAScriptsNamedPathsDirectoriesAreCheckedToo(t *testing.T) {
 	if got, err := check.resolve(lib.ScriptRoot + "tidy/watch.sh"); err != nil || got != good {
 		t.Fatalf("a symlinked file in a sound directory: %q, %v; want the target", got, err)
 	}
+	// A named path whose own directories pass, through a symlinked file whose target lies in a
+	// world-writable directory: only the resolved file's chain is unsound.
+	loose := filepath.Join(root, "loose", "watch.sh")
+	writeScript(t, loose, "#!/bin/sh\necho ok\n", 0o755)
+	if err := os.Chmod(filepath.Dir(loose), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(loose, filepath.Join(tidy, "loose.sh")); err != nil {
+		t.Fatal(err)
+	}
 	for name, p := range map[string]string{
-		"a symlinked directory on the named path":      lib.ScriptRoot + "linked/watch.sh",
-		"a group-writable directory on the named path": lib.ScriptRoot + "open/watch.sh",
+		"a symlinked directory on the named path":              lib.ScriptRoot + "linked/watch.sh",
+		"a group-writable directory on the named path":         lib.ScriptRoot + "open/watch.sh",
+		"a world-writable directory on the resolved path only": lib.ScriptRoot + "tidy/loose.sh",
 	} {
 		if got, err := check.resolve(p); err == nil {
 			t.Errorf("%s: resolved to %q; want a refusal", name, got)
+		}
+	}
+}
+
+// A script file may be one symlink straight to its file, absolute or relative, and no more: a link
+// to a link (whose own directory the other checks don't reach) or a link through a symlinked
+// directory is refused.
+func TestAScriptsSymlinkMustLeadStraightToItsFile(t *testing.T) {
+	root, check := scriptRoot(t)
+	good := filepath.Join(root, "helpers", "watch.sh")
+	writeScript(t, good, "#!/bin/sh\necho ok\n", 0o755)
+	tidy := filepath.Join(root, "tidy")
+	if err := os.Mkdir(tidy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	openDir := filepath.Join(root, "open")
+	if err := os.Mkdir(openDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(openDir, 0o777); err != nil { // past the umask
+		t.Fatal(err)
+	}
+	links := map[string]string{
+		"tidy/abs.sh":     good,
+		"tidy/rel.sh":     "../helpers/watch.sh",
+		"open/hop.sh":     good,
+		"tidy/in.sh":      filepath.Join(openDir, "hop.sh"),
+		"tidy/hop.sh":     good,
+		"tidy/chain.sh":   "hop.sh",
+		"linkdir":         "helpers",
+		"tidy/viadir.sh":  "../linkdir/watch.sh",
+		"tidy/selfdir.sh": "../tidy/../helpers/watch.sh",
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"tidy/abs.sh", "tidy/rel.sh", "tidy/selfdir.sh"} {
+		if got, err := check.resolve(lib.ScriptRoot + name); err != nil || got != good {
+			t.Errorf("one link straight to the file (%s -> %s): %q, %v; want the target", name, links[name], got, err)
+		}
+	}
+	for name, why := range map[string]string{
+		"tidy/in.sh":     "a link to a link in a world-writable directory",
+		"tidy/chain.sh":  "a link to a link in a sound directory",
+		"tidy/viadir.sh": "a link through a symlinked directory",
+	} {
+		if got, err := check.resolve(lib.ScriptRoot + name); err == nil || !strings.Contains(err.Error(), "one link to its file") {
+			t.Errorf("%s (%s): %q, %v; want it refused as more than one link", why, name, got, err)
 		}
 	}
 }
@@ -778,4 +897,272 @@ func boundOf(sr *scriptRun) any {
 		return nil
 	}
 	return sr.timeout
+}
+
+// statSession reads the session field after the command name's last ")", whatever the name holds,
+// and sessionMembers lists the live processes in one session from a /proc-shaped tree, skipping
+// zombies, other sessions, entries that aren't pids and stat lines it can't read.
+func TestASessionsMembersAreReadFromProcStat(t *testing.T) {
+	for line, want := range map[string]struct {
+		sid      int
+		live, ok bool
+	}{
+		"412 (sleep) S 400 412 412 0 -1 4194560": {412, true, true},
+		"413 (a) b) (c) R 412 413 412 0 -1":      {412, true, true},
+		"414 (sh) Z 412 412 412 0 -1":            {412, false, true},
+		"415 (x y) S 1 415 9 0":                  {9, true, true},
+		"416 sleep S 1 2 3":                      {0, false, false},
+		"417 (sleep) S 1 2":                      {0, false, false},
+		"418 (sleep) S 1 2 three":                {0, false, false},
+
+		// Read from the first ")", this name's fields would be "Z 1 2) S", which don't parse.
+		"419 (a) Z 1 2) S 400 419 77 0": {77, true, true},
+	} {
+		sid, live, ok := statSession(line)
+		if sid != want.sid || live != want.live || ok != want.ok {
+			t.Errorf("%q: sid %d live %v ok %v; want %d %v %v", line, sid, live, ok, want.sid, want.live, want.ok)
+		}
+	}
+
+	proc := t.TempDir()
+	for name, stat := range map[string]string{
+		"412":  "412 (sh) S 400 412 412 0 -1\n",
+		"413":  "413 (perl) S 412 413 412 0 -1\n",
+		"414":  "414 (sleep) Z 412 412 412 0 -1\n",
+		"415":  "415 (other) S 1 415 415 0 -1\n",
+		"416":  "garbage\n",
+		"self": "412 (sh) S 400 412 412 0 -1\n",
+	} {
+		if err := os.Mkdir(filepath.Join(proc, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(proc, name, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(proc, "417"), 0o755); err != nil { // exited: no stat
+		t.Fatal(err)
+	}
+	got := sessionMembers(proc, 412)
+	slices.Sort(got)
+	if !slices.Equal(got, []int{412, 413}) {
+		t.Errorf("members of session 412: %v; want [412 413]", got)
+	}
+	if got := sessionMembers(filepath.Join(proc, "missing"), 412); got != nil {
+		t.Errorf("no proc tree: %v; want nothing", got)
+	}
+}
+
+// killSessionSelfEnv tells a re-run of this test binary to be the process killSession must spare.
+const killSessionSelfEnv = "WORKER_ADAPTER_TEST_KILL_SESSION_SELF"
+
+// killSessionSweptMarker is what the child prints once its sweep returns.
+const killSessionSweptMarker = "kill-session-swept"
+
+// killSession never signals the worker, even when procRoot lists it in the target session. The
+// sweep runs in a child copy of the test binary, so a sweep that kills itself fails the test
+// rather than ending the run.
+func TestKillSessionSparesTheWorkerListedInTheSession(t *testing.T) {
+	const sid = 4242
+	if proc := os.Getenv(killSessionSelfEnv); proc != "" {
+		self := fmt.Sprint(os.Getpid())
+		if err := os.Mkdir(filepath.Join(proc, self), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stat := fmt.Sprintf("%s (worker) S 1 %d %d 0 -1\n", self, sid, sid)
+		if err := os.WriteFile(filepath.Join(proc, self, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(sessionMembers(proc, sid), os.Getpid()) {
+			t.Fatalf("the worker is not a member of session %d, so the sweep would test nothing", sid)
+		}
+		killSession(proc, sid)
+		fmt.Println(killSessionSweptMarker)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$") // #nosec G204 -- the test binary itself
+	cmd.Env = append(os.Environ(), killSessionSelfEnv+"="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the child failed (signal: killed means the sweep killed the worker): %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), killSessionSweptMarker) {
+		t.Fatalf("the child never swept the session:\n%s", out)
+	}
+}
+
+// getsid is the session id of pid.
+func getsid(t *testing.T, pid int) int {
+	t.Helper()
+	sid, _, errno := syscall.RawSyscall(syscall.SYS_GETSID, uintptr(pid), 0, 0)
+	if errno != 0 {
+		t.Fatalf("getsid(%d): %v", pid, errno)
+	}
+	return int(sid)
+}
+
+// waitForPID is the pid written to file once it holds one.
+func waitForPID(t *testing.T, file string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(file); err == nil {
+			var pid int
+			if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no pid in %s", file)
+	return 0
+}
+
+// waitGone fails unless pid has exited (or is a zombie, which runs nothing) within bound.
+func waitGone(t *testing.T, pid int, bound time.Duration, what string) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+			if _, live, ok := statSession(string(b)); ok && !live {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s (pid %d) is still running", what, pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A script runs as the leader of a session of its own: its session id is its pid, not the
+// worker's session.
+func TestAScriptRunsInASessionOfItsOwn(t *testing.T) {
+	root, _ := scriptRoot(t)
+	pidFile := filepath.Join(root, "pid")
+	p := filepath.Join(root, "sid.sh")
+	writeScript(t, p, "#!/bin/sh\necho $$ > "+pidFile+"\nsleep 30\n", 0o755)
+	done := make(chan scriptResult, 1)
+	go func() {
+		done <- execScript(context.Background(), &scriptRun{name: "sid", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: 20 * time.Second}, scriptSignals{})
+	}()
+	pid := waitForPID(t, pidFile)
+	got := getsid(t, pid)
+	mine := getsid(t, os.Getpid())
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	<-done
+	if got != pid || got == mine {
+		t.Errorf("the script's session is %d (its pid %d, the worker's session %d); want its own pid", got, pid, mine)
+	}
+}
+
+// On Linux, a process the script started in a process group of its own, but still in the
+// script's session, is killed at the script's bound by the session sweep: the group kill alone
+// misses it. Skipped where there is no /proc.
+func TestAScriptsBoundKillsItsWholeSession(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the session sweep reads /proc, which only Linux has")
+	}
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is needed to start a process in a process group of its own")
+	}
+	root, _ := scriptRoot(t)
+	pidFile := filepath.Join(root, "child")
+	p := filepath.Join(root, "group.sh")
+	writeScript(t, p, "#!/bin/sh\nperl -e 'setpgrp(0, 0); open(my $f, \">\", $ARGV[0]) or die; print $f $$; close($f); exec \"sleep\", \"300\"' "+pidFile+" >/dev/null 2>&1 &\nsleep 300\n", 0o755)
+	done := make(chan scriptResult, 1)
+	go func() {
+		done <- execScript(context.Background(), &scriptRun{name: "group", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: 3 * time.Second}, scriptSignals{})
+	}()
+	child := waitForPID(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+	if pgid, err := syscall.Getpgid(child); err != nil || pgid != child {
+		t.Fatalf("the child's group is %d (%v); want its own, %d", pgid, err, child)
+	}
+	res := <-done
+	if !res.timedOut {
+		t.Errorf("timedOut %v exit %d; want the bound to end it", res.timedOut, res.exitCode)
+	}
+	waitGone(t, child, 2*time.Second, "a child in its own process group but the script's session")
+}
+
+// A process the script started in a session of its own leaves the script's group and session, so
+// neither kill reaches it. As the worker container's pid 1 the worker also kills every other
+// process in the pid namespace, at the bound and after the script exits, and then reaps. A test
+// can't be pid 1, and kill(-1) from here would reach every process the user owns, so the
+// namespace-wide kill is stood in for by one that kills the child the script recorded: what this
+// shows is that such a child survives the group and session kills, and that the namespace-wide
+// kill runs, and the reap after the script's own Wait, only when the worker is pid 1.
+func TestAScriptsKillAsInitReachesAChildInASessionOfItsOwn(t *testing.T) {
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is needed to start a process in a session of its own")
+	}
+	for _, tc := range []struct {
+		name   string
+		body   string
+		bound  time.Duration
+		asInit bool
+	}{
+		{"bound, not init", "sleep 300\n", 2 * time.Second, false},
+		{"bound, init", "sleep 300\n", 2 * time.Second, true},
+		{"exit, not init", "exit 0\n", 20 * time.Second, false},
+		{"exit, init", "exit 0\n", 20 * time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, _ := scriptRoot(t)
+			pidFile, scriptPIDFile := filepath.Join(root, "child"), filepath.Join(root, "script")
+			p := filepath.Join(root, "detach.sh")
+			writeScript(t, p, "#!/bin/sh\necho $$ > "+scriptPIDFile+"\n"+
+				"perl -MPOSIX -e 'POSIX::setsid(); open(my $f, \">\", $ARGV[0]) or die; print $f $$; close($f); exec \"sleep\", \"300\"' "+pidFile+" >/dev/null 2>&1 &\n"+
+				"while [ ! -s "+pidFile+" ]; do sleep 0.05; done\n"+tc.body, 0o755)
+			var killed, reaped int
+			var scriptGoneAtReap bool
+			prevPID, prevKill, prevReap := adapterPID, killEveryoneButMe, reapKilledChildren
+			t.Cleanup(func() { adapterPID, killEveryoneButMe, reapKilledChildren = prevPID, prevKill, prevReap })
+			if tc.asInit {
+				adapterPID = func() int { return containerInitPID }
+			}
+			killEveryoneButMe = func() {
+				killed++
+				if b, err := os.ReadFile(pidFile); err == nil {
+					var pid int
+					if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); err == nil && pid > 0 {
+						_ = syscall.Kill(pid, syscall.SIGKILL)
+					}
+				}
+			}
+			reapKilledChildren = func(time.Duration) {
+				reaped++
+				// Wait has reaped the script by now: its pid is gone.
+				var pid int
+				if b, err := os.ReadFile(scriptPIDFile); err == nil {
+					_, _ = fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid)
+				}
+				scriptGoneAtReap = pid > 0 && syscall.Kill(pid, 0) != nil
+			}
+			res := execScript(context.Background(), &scriptRun{name: "detach", path: p, env: []string{"PATH=/usr/bin:/bin"}, timeout: tc.bound}, scriptSignals{})
+			child := waitForPID(t, pidFile)
+			t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+			if res.startErr != nil {
+				t.Fatal(res.startErr)
+			}
+			if tc.asInit {
+				waitGone(t, child, 2*time.Second, "a child in a session of its own")
+				if killed == 0 || reaped != 1 || !scriptGoneAtReap {
+					t.Errorf("as init: namespace kills %d, reaps %d, script reaped first %v; want at least one kill, one reap after the script's Wait", killed, reaped, scriptGoneAtReap)
+				}
+				return
+			}
+			if killed != 0 || reaped != 0 {
+				t.Errorf("not init: namespace kills %d, reaps %d; want none", killed, reaped)
+			}
+			if syscall.Kill(child, 0) != nil {
+				t.Error("not init, the child in a session of its own is gone; the group and session kills shouldn't reach it, so this test no longer shows what the namespace-wide kill adds")
+			}
+		})
+	}
 }

@@ -152,6 +152,16 @@ MUTATIONS: list[Mutation] = [
         "persona rule to keep it from opening an unrequested pull request",
     ),
     Mutation(
+        "A3-profile-write-under-any-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in getattr(task, "permits", ()):\n',
+         '    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and not getattr(task, "permits", ()):\n'),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "read any permit on the task credential as the write permit, since the "
+        "dispatcher mints only one -- while the verifiers accept a second name "
+        "that this gate does not read",
+    ),
+    Mutation(
         "A3-profile-vcs-without-credential",
         "agents/platform/scripts/credential_proxy.py",
         ('    if task is None:\n        return "a profile caller needs a task credential for version control"\n',
@@ -187,6 +197,168 @@ MUTATIONS: list[Mutation] = [
         "test_A3_a_permitted_profile_write_reaches_only_its_own_tasks_work",
         "let a confirmed task write on any open proposal the install owns, since "
         "the permit says a change was asked for -- though not which one",
+    ),
+    Mutation(
+        "A3-profile-reads-another-verb",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            "issue-view",\n            "publish",\n',
+         '            "issue-view",\n            "proposal-reviews",\n            "publish",\n'),
+        "test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other",
+        "give every profile one more read of a managed repository's proposals, "
+        "since a read writes nothing and the managed list still bounds it",
+    ),
+    Mutation(
+        "A3-profile-verb-set-unread",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    return narrowed is None or verb in narrowed\n',
+         '    return True\n'),
+        "test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other",
+        "drop the per-role verb narrowing as redundant with the role table, "
+        "which already says who reaches /v1/vcs/",
+    ),
+    Mutation(
+        "A3-handler-skips-the-role-table",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not self._role_permits(self.principal):\n            return None\n',
+         '        if False:\n            return None\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "stop asking the role table on every request, since each handler "
+        "checks its own caller anyway -- only the ones that were written to do",
+    ),
+    Mutation(
+        "A3-role-table-admits-any-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not needed or not principal.role or principal.role in needed:\n            return True\n',
+         '        if True:\n            return True\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "treat a role the table does not list for a route as the no-role "
+        "principal behind the socket, which reaches everything",
+    ),
+    Mutation(
+        "A3-handler-skips-the-task-gate",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):\n',
+         '        if False:\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "let a profile request through with whatever credential it sent, "
+        "leaving each route to notice that no task was bound",
+    ),
+    Mutation(
+        "A3-vcs-dispatch-skips-the-verb-set",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not vcs_verb_permitted(role, verb):\n',
+         '        if False:\n'),
+        "test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body",
+        "let the route table decide which verbs exist and drop the per-role "
+        "check ahead of it, so a profile reaches every verb the shell does",
+    ),
+    Mutation(
+        "A3-vcs-dispatch-skips-the-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            refusal = profile_vcs_refusal(principal, verb)\n',
+         '            refusal = None\n'),
+        "test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body",
+        "leave the task credential and its permit to the ownership bar "
+        "further down, which a read never reaches",
+    ),
+    Mutation(
+        "A3-profile-write-needs-no-permit-gate",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if ungated:\n        raise ValueError(\n',
+         '    if False:\n        raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "allow a profile write verb that the permit set does not name, "
+        "so a new write can ship before its gate is argued",
+    ),
+    Mutation(
+        "A3-profile-write-needs-no-ownership-bar",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if unowned:\n        raise ValueError(\n',
+         '    if False:\n        raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "allow a permit-gated profile write that the ownership set does not "
+        "name, on the argument that the permit is enough",
+    ),
+    Mutation(
+        "A3-profile-reads-unmanaged-repositories",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if unlisted:\n            raise ValueError(\n',
+         '        if False:\n            raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "let snapshot or capabilities into the profile and MCP verb sets, "
+        "since both are reads",
+    ),
+    Mutation(
+        "A3-route-roles-as-a-string",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not isinstance(roles, tuple):\n            raise TypeError(\n',
+         '        if False:\n            raise TypeError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a bare role string in ROUTE_ROLES, which a membership test "
+        "reads as a substring test",
+    ),
+    Mutation(
+        "A3-task-gate-refusal-admits",
+        "agents/platform/scripts/credential_proxy.py",
+        ('                    "message": f"The task credential was refused: {exc}.",\n                },\n            )\n            return False\n',
+         '                    "message": f"The task credential was refused: {exc}.",\n                },\n            )\n            return True\n'),
+        "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
+        "answer a refused task credential and carry on with the request as a "
+        "caller with no task, so a stale credential degrades instead of failing",
+    ),
+    Mutation(
+        "A3-profile-reports-the-dial",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (DIAL_PATH, (CALLER_ROLE_CHAT,)),\n',
+         '    (DIAL_PATH, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "let a profile task report the dial's level, so a scheduled run that "
+        "watches the dial can also set it",
+    ),
+    Mutation(
+        "A3-shell-reports-the-dial",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (DIAL_PATH, (CALLER_ROLE_CHAT,)),\n',
+         '    (DIAL_PATH, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "let the shell report the dial's level too, so a helper script can "
+        "set it when the gateway's own report is late",
+    ),
+    Mutation(
+        "A3-dial-handler-asks-no-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if getattr(principal, "role", "") != CALLER_ROLE_CHAT:\n',
+         '        if False:\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "drop the dial handler's own role check as a copy of the role table, "
+        "which admits a caller with no role on every route",
+    ),
+    Mutation(
+        "A3-role-verbs-as-a-string",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if not isinstance(verbs, frozenset):\n            raise TypeError(\n',
+         '        if False:\n            raise TypeError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a bare verb string as a role's verb set, which a membership "
+        "test reads as a substring test",
+    ),
+    Mutation(
+        "A3-role-verbs-unknown-verb",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if unknown:\n            raise ValueError(\n',
+         '        if False:\n            raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a verb the route table does not serve in a role's verb set, "
+        "so a typo reads as policy",
+    ),
+    Mutation(
+        "A3-route-roles-unknown-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('            if role not in CALLER_ROLES:\n                raise ValueError(\n',
+         '            if False:\n                raise ValueError(\n'),
+        "test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role",
+        "accept a role name that no caller holds in ROUTE_ROLES, so a typo "
+        "closes a route to everyone without a red test",
     ),
     Mutation(
         "A3-report-credential-any-route",
@@ -824,6 +996,20 @@ MUTATIONS: list[Mutation] = [
         "and a values file decides whether the role reaches tiers",
     ),
     Mutation(
+        "C1-web-console-holds-the-gateway-master-key",
+        "charts/kube-agents/templates/web-console.yaml",
+        ("            - name: RELEASE_CHECK\n",
+         "            - name: LITELLM_MASTER_KEY\n"
+         "              valueFrom:\n"
+         "                secretKeyRef:\n"
+         "                  name: litellm-master-key\n"
+         "                  key: LITELLM_MASTER_KEY\n"
+         "            - name: RELEASE_CHECK\n"),
+        "test_C1_the_gateway_master_key_reaches_only_the_gateway_container",
+        "hand the web console the gateway's master key so its /model/info call "
+        "keeps working once the gateway checks keys",
+    ),
+    Mutation(
         "A4-web-console-reads-tiers",
         "charts/kube-agents/templates/web-console.yaml",
         ('    resources: ["nodes", "namespaces", "pods"]\n    verbs: ["list"]',
@@ -899,6 +1085,15 @@ MUTATIONS: list[Mutation] = [
         "test_B1_kubectl_write_verbs_are_refused",
         "add delete to the read allowlist -- the single-line change an "
         "operator makes to unblock a skill",
+    ),
+    Mutation(
+        "B1-write-refusal-mark-any-read-only-refusal",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            and command_policy.kubectl_verb_is_mutating(decision.verb_tuple),\n", "            ,\n"),
+        "test_B1_the_broker_marks_only_a_refused_write_as_one",
+        "mark every read-only refusal a write refusal, the shorter rule: a "
+        "profile task then stops at a refused read spelling and reports a "
+        "write it never attempted",
     ),
     Mutation(
         "B1-image-gate",
@@ -1847,6 +2042,26 @@ Mutation(
         "which are commercial hosts, are relayed",
     ),
     Mutation(
+        "C2-universe-domain-metadata-check",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if reported != configured:\n",
+         "    if False and reported != configured:\n"),
+        "test_C2_the_broker_does_not_start_on_a_universe_domain_the_metadata_server_contradicts",
+        "trust the universe domain the environment names again, so a value "
+        "the host's metadata server contradicts starts the broker and its "
+        "credential goes to that domain's hosts",
+    ),
+    Mutation(
+        "C2-universe-domain-metadata-recheck",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        elif reported != configured:\n",
+         "        elif False and reported != configured:\n"),
+        "test_C2_a_broker_that_started_unchecked_stops_on_a_universe_domain_the_metadata_server_later_contradicts",
+        "let a broker that started with no answer from the metadata server "
+        "keep the environment's value when the later answer contradicts it, "
+        "so its credential goes on to that domain's hosts",
+    ),
+    Mutation(
         "C3-policy-reads-a-file",
         "agents/platform/scripts/command_policy.py",
         ('    for token in argv[1:]:\n        name, _, _ = token.partition("=")\n        if name == "--kuberc":',
@@ -2617,10 +2832,93 @@ Mutation(
     Mutation(
         "A3-a2a-google-roster-chat-map",
         "a2a/gateway/gateway.go",
-        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
-         "\tif backend == consoleBackend {"),
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
+         "\tif backend == consoleBackend || backend == a2aEntraBackend {"),
         "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
         "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
+        "A3-a2a-entra-alg-unpinned",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif header.Alg != a2aEntraAlgorithm {", "\tif false {"),
+        "test_A3_an_entra_token_is_checked_against_the_tenants_keys_with_the_algorithm_pinned",
+        "let the token name its own algorithm, so a forger who writes alg none "
+        "or an HMAC alg keyed with the public key is checked the way they ask",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-tenant",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !issued || !strings.EqualFold(claims.Tid, v.tenantID) {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token from any tenant whose key happens to be in the set, so "
+        "an account outside the install's directory signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-token-any-application",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !audience {", "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "accept a token the tenant issued for some other application, so a "
+        "token a person granted another app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-entra-id-token-admitted",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\tif strings.TrimSpace(claims.Scp) == "" {', "\tif false {"),
+        "test_A3_an_entra_token_is_bound_to_the_tenant_and_the_application",
+        "admit a token that grants no delegated scope, so an ID token lifted "
+        "from a browser or a client log signs its subject in",
+    ),
+    Mutation(
+        "A3-a2a-entra-any-bearer-parsed",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif !entraTokenShaped(token) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_jwt_never_reaches_the_tenants_keys",
+        "decode every non-static bearer as a JWT, so junk bearers and a "
+        "mistyped door token cost a parse and a key lookup each",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || objectID == "" {', '\tif objectID == "" {'),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "resolve an id that did not come through the door's Entra check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-entra-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aEntraAllowed[strings.ToLower(objectID)] {", "\tif false {"),
+        "test_A3_the_entra_class_admits_only_a_prefixed_allowlisted_object_id",
+        "admit every Entra-verified object id, so anyone in the tenant who can "
+        "mint a token for the install's application signs in",
+    ),
+    Mutation(
+        "A3-a2a-entra-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_entra.go",
+        ("\tif err == nil && !d.entraAllowed[strings.ToLower(id.objectID)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_entra_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any account of the tenant "
+        "creates door conversations and submissions that evict a listed "
+        "person's",
+    ),
+    Mutation(
+        "A3-a2a-entra-prefix-spellable",
+        "a2a/gateway/a2adoor_entra.go",
+        ('\ta2aEntraCallerPrefix = ":entra:"', '\ta2aEntraCallerPrefix = "entra:"'),
+        "test_A3_no_eval_caller_can_spell_an_entra_caller",
+        "drop the leading colon, so an eval caller \"entra\" naming the context "
+        "\"<oid>:<ctx>\" spells a person's conversation key with the static token",
+    ),
+    Mutation(
+        "A3-a2a-entra-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend || backend == a2aEntraBackend {",
+         "\tif backend == consoleBackend || backend == a2aGoogleBackend {"),
+        "test_A3_the_entra_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Entra class's roster through principalMapFor, whose default "
         "is the chat map, so a door caller's id resolves as a chat identity",
     ),
     Mutation(
@@ -2834,7 +3132,7 @@ Mutation(
     ),
     Mutation(
         "C1-session-audience-env-renamed-in-kube-proxy",
-        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        "k8s-api-proxy/pkg/proxyserver/server.go",
         ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
          'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
         "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
@@ -3311,8 +3609,8 @@ Mutation(
     Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aNotifyReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole, a2aNotifyReplySubjects)\n"),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the notify reply namespace, the symmetric-"
         "looking grant (it already reads there). The agent can then forge the "
@@ -3332,8 +3630,8 @@ Mutation(
     Mutation(
         "A3-agent-answers-the-board",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",
-         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole, a2aBoardReplySubjects)\n"),
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectTeams, a2aNotifySubjectConsole, a2aBoardReplySubjects)\n"),
         "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
         "give the agent publish on the board reply namespace, so the agent "
         "container can answer the gateway's board request itself. What it "

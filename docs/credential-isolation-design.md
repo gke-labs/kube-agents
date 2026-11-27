@@ -132,7 +132,11 @@ are rejected. Two names go to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false`, and `KUBEAGENTS_KUBECTL_COST_TIER`, the column of the
 kubectl cost table the shell's admission charges, which the operator passes only as a short
-lowercase word, before either reaches that Pod. The three
+lowercase word, before either reaches that Pod. The tier also goes, normalised the same way, to
+the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
+kubectl runs the same admission, and to the credential broker (stateful and exec tiers), whose
+kubectl admission charges profile workers' cluster-wide reads from the same table; it is reserved
+there, so `spec.deployment.env` cannot pass a raw value through. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -175,8 +179,9 @@ in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. Se
 
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
 every caller of its credentialed listener with a `TokenReview` over an audience-bound
-projected token (the metrics-only listener, [Architecture](#architecture), serves counters
-and authenticates nobody), and
+projected token (on port 8766, [Architecture](#architecture), `/metrics` serves counters
+unauthenticated while `/control/*` requires bearer auth against `<name>-credential-proxy-control`
+under `sizingProfile: auto` in-cluster and returns `404` otherwise), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds
@@ -234,21 +239,22 @@ credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. The runtime opens up
 to two TCP listeners of its own. The health-only one, closed unless
 `CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers
-`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765, with
-a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
+`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765,
+returning the same active/standby/draining status as that route (`200 {"status":"ok"}` while active or holding endpoints during active-standby handoff before `SIGTERM`, `503 {"status":"standby"}` in warm standby, `503 {"status":"draining"}` on exec drain or shutdown) under the same sixteen-connection cap and
 ten-second deadline as the metrics listener, so that a probe an operator
 points at the broker directly reads it as alive while the credentialed
 listener is at its thread cap; the operator's readiness probe reads `/healthz`
 through Envoy's health listener on 8768 instead (below), and the broker's
-NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The second listener on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
 set by the operator) serves Prometheus series whose label values are
-static enums and closed vocabularies, holds no route, credential or policy,
+static enums and closed vocabularies on `/metrics` (unauthenticated) plus, under
+`sizingProfile: auto` in-cluster, bearer-authenticated active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`, authenticated against `CREDENTIAL_PROXY_CONTROL_FILE`; `404` otherwise), holds no workload route or upstream credential,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
 process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
 namespace, where the managed-Prometheus collector runs, and to the operator's own
-pods, which read the counters into the `PlatformAgent`'s `status.usage`
+pods, which read the counters into the `PlatformAgent`'s `status.usage` and `status.sizing` and coordinate broker handoffs
 ([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica, a shape the operator does not render today.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
@@ -257,12 +263,12 @@ caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-pr
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
 broker's watcher routes), `kubeagents-credential-proxy-a2a-reports` for the A2A gateway's
-audit-report reader on every install and, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
-for the A2A gateway) as a bearer header, and the
+audit-report reader on every install, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
+for the A2A gateway, and, when the Teams inbound receiver is enabled, `kubeagents-credential-proxy-teams-inbound`
+for that receiver, which reaches one route by one method) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's on every
-install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
-pods' (bound to the audience `kubeagents-credential-proxy-session`; see
+install (bound to the `kubeagents-credential-proxy-a2a-reports` and `-a2a-chat` audiences), the Teams inbound receiver's while it runs (bound to `kubeagents-credential-proxy-teams-inbound` through `CREDENTIAL_PROXY_TEAMS_INBOUND_CALLERS`), and, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), the session pods' (bound to the audience `kubeagents-credential-proxy-session`; see
 [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and,
 with an `AgentProfile` bound, each profile tier's (bound to the audience
 `kubeagents-credential-proxy-profile`; see
@@ -272,19 +278,31 @@ allowlist itself keeps other workloads out rather than telling those callers apa
 crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
+Each request is also held to the Pod its token was issued to. The `TokenReview` names that
+Pod and its UID; the runtime reads the Pod (a `Role` named `<agent>-credential-proxy-pod-read`
+grants `get` on pods in the agent's namespace and the profile namespace) and refuses the
+request with the same 401 unless the connection's peer address is one of the Pod's
+`status.podIPs`. Envoy passes that address to the runtime in `X-Kube-Agents-Peer-Address`,
+set on every listener from the downstream connection itself and overwriting any value a
+caller sends, and the runtime believes it only on a Unix-socket connection whose kernel-reported
+peer is that Envoy process. A token used from anywhere but its own Pod is refused, and so is
+`kubectl port-forward` to the broker Pod or its Service: the kubelet connects from inside
+the broker Pod, so the peer is loopback, which is no caller's address. To call the broker by
+hand, do it from a Pod whose token it is, for example `kubectl exec` into the shell sandbox
+or a profile worker and run the command there.
+
 Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
 the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
-The credentialed listener sends every path through the `credential_runtime` cluster, and
-every open cluster watch holds one of that cluster's connections, so a probe through it is
-refused with the watches' 503 once the fleet reaches the cluster's connection ceiling, and
-three refusals remove the Pod from the Service. That ceiling is declared rather than
+The credentialed listener sends every credentialed path through the `credential_runtime` cluster, and
+every open cluster watch holds one of that cluster's connections, so routing general traffic there would starve probes with 503s once the fleet reaches the cluster's connection ceiling, and
+three readiness refusals would remove the Pod from the Service. That ceiling is declared rather than
 inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
 requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
 backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
 refuses first, and the runtime's thread cap is derived from the same thresholds at startup
-(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. The health listener routes `/healthz` alone to a `credential_health` cluster
+(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. Both the dedicated health listener (all requests) and exact `/healthz` on `:8765` route to the `credential_health` cluster
 on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
-no watch can mark the Pod unready; any other path on it is a 404. The Service and the
+no watch can starve readiness or warm-standby peer health probes; any other path on `:8768` is a 404. The Service and the
 NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
 `start-services.sh` rebinds both listeners off loopback together, to the address the operator
 passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one
@@ -416,9 +434,9 @@ including:
 - background processes or commands that outlive the request;
 - commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
-  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
-  as fit the child memory budget it derives from its container's memory limit (four at
-  the operator's defaults); a request waits up to 60 seconds for admission and is then
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (`8` on fixed/default profiles; `8` small, `12` `medium`, `16` `fleet` under `sizingProfile: auto`), and within that only as many
+  as fit the child memory budget it derives from its container's memory limit (ten at
+  the operator's 2Gi small default, so the slot cap of eight binds); a request waits up to 60 seconds for admission and is then
   refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
   cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
   caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
@@ -519,7 +537,13 @@ settings cannot be edited by anything holding the volume:
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
-  and a list that compares whole tokens matches nothing; and
+  and a list that compares whole tokens matches nothing;
+- a push stays in the repository the command names. A repository's own
+  configuration can make a plain `git push` also push inside each submodule,
+  to that submodule's own remote, and the check on the pushed branch reads only
+  the repository the command names. The setting is pinned to `no`, which is
+  git's default, and the flag that asks for the same on the command line is
+  refused; and
 - both editors git launches — the message editor and the rebase sequence editor
   — are set to a command that does nothing and fails. They are set through the
   environment for the same reason as the transport allowlist: those two
@@ -831,8 +855,8 @@ argv, and a profile task's call go to the broker as above. The read carries the
 `X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
 cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
 `get-credentials`, which refuses that cluster itself. The header only narrows:
-without it the read is unchanged, so other control-plane reads of an excluded
-cluster stay allowed.
+without it the read is unchanged, so the reconcile's existence check of an
+excluded cluster stays allowed.
 
 Consequences:
 
@@ -914,7 +938,10 @@ Consequences:
   back and lands it at
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
-  cluster from later commands.
+  cluster from later commands. It writes the file and the pin only when its
+  caller owns `.kubeconfigs`; another caller gets neither, and is told to name
+  a file of its own
+  ([`kube-proxy.md`](designs/kube-proxy.md#4-sandbox-kubectl-and-kubeconfig-setup)).
 - A `kubectl` read that names no cluster that way and comes back empty or with
   a server NotFound says where it looked. For `get`, `describe`, `events`,
   `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr
@@ -947,8 +974,8 @@ Consequences:
   cut on stderr alone keeps the command's exit code, and the marker says stdout
   is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
-  flight at once (8; the operator sets it, as it sets the output cap, and
-  reserves the name). A slot is held from admission until the response is on
+  flight at once (`8` on fixed/default profiles, stepping `8` small, `12` `medium`, and `16` `fleet` under `spec.deployment.sizingProfile: auto`; the operator sets it, as it sets the output cap, and
+  reserves the name; the fixed-`2Gi` exec tier stays at 8). A slot is held from admission until the response is on
   the wire, because everything a request costs lives that long: a child
   process plus about six times the output cap of transient copies in the
   broker (the captured streams, their decoded text, the JSON body and its
@@ -960,19 +987,19 @@ Consequences:
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
   absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy.
   At the operator's
-  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits ten
+  defaults (a 2Gi limit on `small`, raised from 1Gi when the kanban slot default rose to six) that admits ten
   requests at once, whatever executable fills them; the slot cap of eight is the upper
-  bound. The container's limit moves through the CR,
+  bound on `small` and fixed profiles (`8` slots); under `sizingProfile: auto`, `4Gi` `medium` admits `22` (held to `12`, leaving `1792 MiB` headroom) and `8Gi` `fleet` admits `45` (held to `16`, leaving `5184 MiB` headroom). The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
-  defaults per key; raising it raises the admitted count. The caps stay the
-  operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
+  defaults per key; raising it raises the budget ceiling. The slot cap still follows
+  `spec.deployment.sizingProfile` alone, because an explicit `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` override is reserved by the operator. A limit under which the budget would admit fewer than two
   requests at once (544 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
   it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
-  above the floor, so that the budget engages there too, admitting ten, held to eight by
-  the slot cap; the floor remains for a CR override that sets a smaller request.
+  above the floor, so that the budget engages there too, admitting ten on `small`, held to eight by
+  the tier's slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.

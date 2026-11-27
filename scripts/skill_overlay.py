@@ -19,7 +19,9 @@ Subcommands:
   refresh <skill>            record edits to the generated skill as a patch
   generate <skill>           rebuild the generated skill from the upstream copy and overlay
   check [<skill>...]         verify copies against their locks and generated skills against
-                             copy + overlay, offline; fail on an unfilled Eval-Case: header
+                             copy + overlay, offline; fail on a missing or unfilled Eval-Case: header,
+                             or one that names no eval case folder; fail on a Retire-When: header
+                             that has none of its three forms, and on an Upstream-Issue: line
   status                     list skills upstream has moved past, and upstream skills not mirrored
   verify-upstream            compare each copy with google/skills at its locked commit
 
@@ -98,6 +100,24 @@ WHY_PREFIX = "Why:"
 # fills the line in.
 EVAL_CASE_PREFIX = "Eval-Case:"
 HEADER_PLACEHOLDER = "TODO"
+# What an Eval-Case: value may hold: `none (<reason>)`, or ids that are folders with a task file here.
+EVAL_TASKS_ROOT = REPO_ROOT / "bench" / "tasks"
+EVAL_TASK_FILE = "task.yaml"
+EVAL_CASE_NONE_RE = re.compile(r"none \(.*\S.*\)")
+EVAL_CASE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+EVAL_CASE_SEPARATOR = ","
+# The header line that says what retires the patch. It occurs one time, and its first word says if
+# google/skills must carry the fix: only `upstream` (or `upstream's`) says yes.
+RETIRE_WHEN_PREFIX = "Retire-When:"
+RETIRE_WHEN_NEVER = "never;"
+RETIRE_WHEN_CHANGE_WORDS = ("local", "upstream", "upstream's")
+RETIRE_WHEN_FORMS = (
+    "`never; <reason>` (specific to this repository; the patch stays), "
+    "`local <change>` (a change in this repository retires the patch), or "
+    "`upstream <change>` (general; google/skills must carry the fix)"
+)
+# The header line that said the same as Retire-When: before. A patch must not have it.
+UPSTREAM_ISSUE_PREFIX = "Upstream-Issue:"
 STATE_FILE = "sync-state.json"
 SERIES_BRANCH = "patches"
 BASE_TAG = "base"
@@ -118,8 +138,7 @@ PATCH_HEADER_TEMPLATE = (
     "Why: TODO, say why this repository needs the change\n"
     "Local-Issue: TODO\n"
     f"{EVAL_CASE_PREFIX} {HEADER_PLACEHOLDER}\n"
-    "Upstream-Issue: none\n"
-    "Retire-When: TODO\n"
+    f"{RETIRE_WHEN_PREFIX} {HEADER_PLACEHOLDER}\n"
     "\n"
 )
 DEFAULT_SUBJECT = "TODO describe the change"
@@ -338,13 +357,47 @@ def patch_why(path):
 
 
 def eval_case_unfilled(path):
-    """True when any Eval-Case: line of the patch header is empty or still the placeholder.
-
-    A patch with no such line passes: patches written before the line existed carry none.
-    """
+    """True when the patch header has no Eval-Case: line, or one that is empty or the placeholder."""
     values = [line[len(EVAL_CASE_PREFIX):].strip()
               for line in patch_header(read_exact(path)).splitlines() if line.startswith(EVAL_CASE_PREFIX)]
-    return any(not value or value.startswith(HEADER_PLACEHOLDER) for value in values)
+    return not values or any(not value or value.startswith(HEADER_PLACEHOLDER) for value in values)
+
+
+def eval_case_unknown_ids(path):
+    """The ids in the patch's Eval-Case: line(s) that name no case folder. `none (<reason>)` names none."""
+    unknown = []
+    for line in patch_header(read_exact(path)).splitlines():
+        if not line.startswith(EVAL_CASE_PREFIX):
+            continue
+        value = line[len(EVAL_CASE_PREFIX):].strip()
+        if EVAL_CASE_NONE_RE.fullmatch(value):
+            continue
+        for case_id in (part.strip() for part in value.split(EVAL_CASE_SEPARATOR)):
+            known = EVAL_CASE_ID_RE.fullmatch(case_id) and (EVAL_TASKS_ROOT / case_id / EVAL_TASK_FILE).is_file()
+            if not known:
+                unknown.append(case_id)
+    return unknown
+
+
+def retire_when_problem(path):
+    """What is wrong with the patch's Retire-When: line, in a few words. None when it has one of the three forms."""
+    values = [line[len(RETIRE_WHEN_PREFIX):].strip()
+              for line in patch_header(read_exact(path)).splitlines() if line.startswith(RETIRE_WHEN_PREFIX)]
+    if len(values) != 1:
+        return f"{len(values)} lines" if values else "no line"
+    words = values[0].split(None, 1)
+    if not words:
+        return "an empty line"
+    first, has_text = words[0], len(words) > 1
+    if first == RETIRE_WHEN_NEVER:
+        return None if has_text else f"`{RETIRE_WHEN_NEVER}` with no reason"
+    if first in RETIRE_WHEN_CHANGE_WORDS:
+        return None if has_text else f"`{first}` with no change after it"
+    return f"the first word is `{first}`"
+
+
+def has_upstream_issue_line(path):
+    return any(line.startswith(UPSTREAM_ISSUE_PREFIX) for line in patch_header(read_exact(path)).splitlines())
 
 
 def separator_for(text):
@@ -623,12 +676,39 @@ def cmd_check(skills):
                     + f"\nIf you edited the skill, run `make skills-refresh SKILL={skill}`. If you "
                     f"edited a patch or {APPEND_NAME}, run `make skills-generate SKILL={skill}`."
                 )
+            # The header failures of a skill are reported together, so one run names them all.
+            header_failures = []
             unfilled = [p.name for p in patches(skill) if eval_case_unfilled(p)]
             if unfilled:
-                raise OverlayError(
-                    f"{skill}: fill in the {EVAL_CASE_PREFIX} header of {', '.join(unfilled)}: the eval "
-                    f"case id(s) from the pull request's Live validation, or `none (<reason>)`."
+                header_failures.append(
+                    f"{skill}: fill in the {EVAL_CASE_PREFIX} header of {', '.join(unfilled)} (add the line "
+                    f"after Local-Issue: when the patch has none): the eval case id(s) from the pull "
+                    f"request's Live validation, or `none (<reason>)`."
                 )
+            unknown = [f"{p.name}: {', '.join(repr(i) for i in ids)}"
+                       for p in patches(skill) if p.name not in unfilled
+                       for ids in [eval_case_unknown_ids(p)] if ids]
+            if unknown:
+                header_failures.append(
+                    f"{skill}: the {EVAL_CASE_PREFIX} header names no case folder in {rel(EVAL_TASKS_ROOT)} for "
+                    f"{'; '.join(unknown)}. Name the folder of an eval case, or write `none (<reason>)`."
+                )
+            retire = [f"{p.name}: {problem}"
+                      for p in patches(skill) for problem in [retire_when_problem(p)] if problem]
+            if retire:
+                header_failures.append(
+                    f"{skill}: the {RETIRE_WHEN_PREFIX} header has none of its three forms in:\n  "
+                    + "\n  ".join(retire)
+                    + f"\nWrite one {RETIRE_WHEN_PREFIX} line in the header of each patch: {RETIRE_WHEN_FORMS}."
+                )
+            old_line = [p.name for p in patches(skill) if has_upstream_issue_line(p)]
+            if old_line:
+                header_failures.append(
+                    f"{skill}: delete the {UPSTREAM_ISSUE_PREFIX} line of {', '.join(old_line)}; "
+                    f"the {RETIRE_WHEN_PREFIX} line decides."
+                )
+            if header_failures:
+                raise OverlayError("\n".join(header_failures))
         except OverlayError as e:
             failures.append(str(e))
     for msg in failures:
@@ -762,7 +842,8 @@ def refresh_into_overlay(skill, repo, tmp, target, message):
     header = PATCH_HEADER_TEMPLATE.format(subject=message or DEFAULT_SUBJECT)
     diff = git_diff_text(["show", "--format=", "--no-color", "--binary", "HEAD"], cwd=repo)
     write_exact(overlay_dir(skill) / name, header + strip_index_lines(diff))
-    print(f"wrote {rel(overlay_dir(skill) / name)}; fill in its Why: and {EVAL_CASE_PREFIX} headers")
+    print(f"wrote {rel(overlay_dir(skill) / name)}; fill in its Why:, {EVAL_CASE_PREFIX} and "
+          f"{RETIRE_WHEN_PREFIX} headers")
     return edited
 
 

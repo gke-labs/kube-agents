@@ -25,6 +25,22 @@ import (
 // a2a/lib's contract test (TestTheOperatorsTriggerSubmissionIsALibTriggerSubmit).
 const triggerSubmitFixturePath = "../../../a2a/lib/testdata/rendered-trigger-submit.json"
 
+// triggerSubmitScriptFixturePath is the same for a built-in schedule's
+// script run.
+const triggerSubmitScriptFixturePath = "../../../a2a/lib/testdata/rendered-trigger-submit-script.json"
+
+// scriptSubmission is submitterSubmission's schedule turned into a script
+// run: a script in place of its prompt, and no skills or maxTurns, which
+// shape a model run (the CRD refuses them beside a script).
+func scriptSubmission() ScheduleSubmission {
+	sub := submitterSubmission()
+	sub.Schedule.Spec.Prompt = ""
+	sub.Schedule.Spec.Script = "compliance-audit"
+	sub.Schedule.Spec.Skills = nil
+	sub.Schedule.Spec.MaxTurns = nil
+	return sub
+}
+
 func submitterSchedule() *agentv1alpha1.AgentSchedule {
 	return &agentv1alpha1.AgentSchedule{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "kubeagents-system", Name: "compliance-audit"},
@@ -60,6 +76,59 @@ func TestTheTriggerSubmitFixtureIsWhatTheOperatorSends(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, triggerSubmitFixturePath, string(body)+"\n")
+}
+
+// TestTheScriptTriggerSubmitFixtureIsWhatTheOperatorSends is the fixture
+// for a built-in schedule's script run, which a2a/lib decodes and validates
+// as it does the prompt run's.
+func TestTheScriptTriggerSubmitFixtureIsWhatTheOperatorSends(t *testing.T) {
+	body, err := json.MarshalIndent(triggerSubmitFor(scriptSubmission()), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, triggerSubmitScriptFixturePath, string(body)+"\n")
+}
+
+// A built-in schedule's script rides on its trigger, beside its stream, with
+// a task text the gateway requires and no model reads. A user schedule's
+// submission never carries one, even if one reached it.
+func TestAScriptRunsSubmissionCarriesItsScriptOnTheTrigger(t *testing.T) {
+	w := triggerSubmitFor(scriptSubmission())
+	if w.Trigger != (triggerClaimWire{Name: "schedule/compliance-audit", Origin: "builtin", Stream: "compliance-audit", Script: "compliance-audit"}) {
+		t.Errorf("trigger = %+v, want the script beside the stream", w.Trigger)
+	}
+	if w.Prompt != "Scheduled script run: compliance-audit (no model turn)." {
+		t.Errorf("task text = %q", w.Prompt)
+	}
+	// A schedule stored without the CRD's rule may still carry skills and
+	// maxTurns beside its script: they stay off the wire.
+	stray := scriptSubmission()
+	stray.Schedule.Spec.Skills = []string{"fleet-audit"}
+	stray.Schedule.Spec.MaxTurns = ptr.To[int32](250)
+	body, err := json.Marshal(triggerSubmitFor(stray))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"skills"`) || strings.Contains(string(body), `"maxTurns"`) {
+		t.Errorf("a script run's submission carries skills or maxTurns: %s", body)
+	}
+	user := scriptSubmission()
+	user.Origin = agentv1alpha1.AgentScheduleOriginUser
+	if got := triggerSubmitFor(user); got.Trigger.Script != "" || got.Prompt != "" {
+		t.Errorf("a user schedule's submission carries script %q and task text %q", got.Trigger.Script, got.Prompt)
+	}
+}
+
+// With no script, the submission is what it was before spec.script existed,
+// byte for byte: the script field is omitted, not sent empty.
+func TestAPromptRunsSubmissionHasNoScriptField(t *testing.T) {
+	body, err := json.Marshal(triggerSubmitFor(submitterSubmission()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"script"`) {
+		t.Errorf("a prompt run's submission names a script field: %s", body)
+	}
 }
 
 func TestAScheduleRunsSubmissionCarriesItsTriggerAndDefaults(t *testing.T) {
@@ -169,6 +238,9 @@ func TestTheTrackerReadsARunsEndFromTheGateway(t *testing.T) {
 		{"gone", triggerStatusReplyWire{Found: false}, ScheduleTaskState{Found: false}},
 		{"delivered", triggerStatusReplyWire{Found: true, State: "completed", Terminal: true, Delivery: "posted"},
 			ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeSucceeded, CompletedAt: time.Unix(1763100500, 0), Delivery: "posted"}},
+		{"failed with a reason", triggerStatusReplyWire{Found: true, State: "failed", Terminal: true, Reason: "deadline-exceeded"},
+			ScheduleTaskState{Found: true, Terminal: true, Outcome: agentv1alpha1.AgentScheduleOutcomeFailed, CompletedAt: time.Unix(1763100500, 0), Reason: "deadline-exceeded"}},
+		{"a reason before the end is not read", triggerStatusReplyWire{Found: true, State: "working", Reason: "deadline-exceeded"}, ScheduleTaskState{Found: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var asked triggerStatusWire
@@ -220,7 +292,7 @@ func TestTheTriggerGrantsFollowTheScheduleSwitch(t *testing.T) {
 	}
 	t.Setenv(AgentSchedulesEnvVar, "true")
 	id, _ = operatorIdentity()
-	for _, want := range []string{triggerSubmitSubject, triggerStatusSubject} {
+	for _, want := range []string{triggerSubmitSubject, triggerStatusSubject, triggerStopSubject} {
 		if !slices.Contains(id.publish, want) {
 			t.Errorf("operator publish lacks %q", want)
 		}
@@ -229,7 +301,7 @@ func TestTheTriggerGrantsFollowTheScheduleSwitch(t *testing.T) {
 		t.Errorf("operator subscribe lacks %q", triggerReplyPrefix+">")
 	}
 	gw := gatewayIdentity(a2aTestAgent(), "kubeagents-system")
-	for _, want := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status"} {
+	for _, want := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop"} {
 		if !slices.Contains(gw.subscribe, want) {
 			t.Errorf("gateway subscribe lacks %q", want)
 		}
@@ -286,14 +358,17 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 	t.Cleanup(gateway.Close)
 	answer := func(m *nats.Msg) {
 		var data []byte
-		if m.Subject == triggerSubmitSubject {
+		switch m.Subject {
+		case triggerSubmitSubject:
 			data, _ = json.Marshal(triggerSubmitReplyWire{TaskID: "task-1"})
-		} else {
+		case triggerStopSubject:
+			data, _ = json.Marshal(triggerStopReplyWire{Result: triggerStopStopped})
+		default:
 			data, _ = json.Marshal(triggerStatusReplyWire{Found: true, State: "working"})
 		}
 		_ = m.Respond(data)
 	}
-	for _, subject := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status"} {
+	for _, subject := range []string{"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop"} {
 		if _, err := gateway.Subscribe(subject, answer); err != nil {
 			t.Fatal(err)
 		}
@@ -313,8 +388,12 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 	if st, err := sub.State(context.Background(), submitterSchedule(), "task-1"); err != nil || !st.Found {
 		t.Fatalf("status under the rendered grants: %+v, %v", st, err)
 	}
+	if res, err := sub.Stop(context.Background(), submitterSchedule(), "task-1"); err != nil || res != triggerStopStopped {
+		t.Fatalf("stop under the rendered grants: %q, %v", res, err)
+	}
 
 	_ = operator.Publish("a2a.trigger.drift-detector.submit", []byte("{}"))
+	_ = operator.Publish("a2a.trigger.drift-detector.stop", []byte("{}"))
 	if _, err := operator.SubscribeSync("a2a.trigger.reply.drift-detector.>"); err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +403,7 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 		mu.Lock()
 		n := len(violations)
 		mu.Unlock()
-		if n >= 2 {
+		if n >= 3 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -332,7 +411,7 @@ func TestTheSubmitterWorksUnderTheRenderedGrants(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	joined := strings.Join(violations, "\n")
-	for _, s := range []string{"a2a.trigger.drift-detector.submit", "a2a.trigger.reply.drift-detector.>"} {
+	for _, s := range []string{"a2a.trigger.drift-detector.submit", "a2a.trigger.drift-detector.stop", "a2a.trigger.reply.drift-detector.>"} {
 		if !strings.Contains(joined, s) {
 			t.Errorf("the operator was not refused on %q; got:\n%s", s, joined)
 		}

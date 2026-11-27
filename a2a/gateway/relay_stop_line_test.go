@@ -573,6 +573,64 @@ func TestAChatTypedStopWithNoLineKeepsItsPosts(t *testing.T) {
 	}
 }
 
+// A task with no line at all (a backend that shows task status itself) ends
+// a stop in one of two ways. A cancel that answers for itself (quiet, as the
+// Slack Stop button's is) posts nothing at the canceled terminal; a voiced
+// cancel posts "cancel sent", and the terminal posts the one "🛑 canceled".
+// The two cases differ only in the quiet flag, so the quiet mark alone
+// decides the terminal's post.
+func TestAQuietCancelOnALinelessTaskPostsNothingAtItsTerminal(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		quiet bool
+		want  []string
+	}{
+		{name: "quiet", quiet: true, want: nil},
+		{name: "voiced", quiet: false, want: []string{cancelSentNotice, terminalNotice(lib.StateCanceled, "")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
+				return statusShowingAdapter{a}
+			})
+			ctx := context.Background()
+			conv := "discord:g1/t-lineless-cancel-" + tc.name
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "do the thing"}
+			origin := r.awaitTask(t, "platform")
+			waitForRecord(t, r, conv, "the lineless task holding the conversation", func(rec *SessionRecord) bool {
+				ref, ok := rec.TaskRefFor(origin.TaskID)
+				return ok && ref.Lineless && rec.ActiveTask != nil && rec.ActiveTask.TaskID == origin.TaskID
+			})
+			// The cancel as a stop handler makes it: under the session's
+			// lock, on the record, which is then written.
+			putRecord(t, r, conv, func(rec *SessionRecord) {
+				if !r.g.cancelTaskVoiced(ctx, rec, Authority{}, tc.quiet) {
+					t.Fatal("the cancel was not sent")
+				}
+			})
+			if ref := refOf(t, r, conv, origin.TaskID); !ref.Canceled || !ref.Lineless || ref.QuietCancel != tc.quiet {
+				t.Fatalf("the canceled task's entry = %+v; want canceled, lineless, quiet = %v", ref, tc.quiet)
+			}
+			if err := r.execFor(t, origin, "platform").PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+				t.Fatal(err)
+			}
+			// The relay posts the terminal's notice, if any, before it lets
+			// go of the conversation, so once the record holds no task the
+			// terminal's posts are all on record.
+			waitForRecord(t, r, conv, "the terminal to release the conversation", func(rec *SessionRecord) bool {
+				return rec.ActiveTask == nil
+			})
+			if got := r.adapter.postTextsFor(conv); !slices.Equal(got, tc.want) {
+				t.Fatalf("posts = %q, want %q", got, tc.want)
+			}
+			if edits := r.adapter.editTexts(); len(edits) != 0 {
+				t.Errorf("edits = %q; want none without a line", edits)
+			}
+		})
+	}
+}
+
 // With the card stop armed, a stop typed on Google Chat keeps the typed
 // stop's path: the "cancel sent" post, the cards stopped, their replies,
 // and the line left to the relay.
@@ -602,10 +660,10 @@ func TestAChatTypedStopWithTheCardStopArmedKeepsItsPosts(t *testing.T) {
 	}
 }
 
-// A stop typed on Discord keeps today's replies, line or no line: the
-// "cancel sent" post, the line moving on with no Stop, and the relay's
-// "canceled" notice beside the terminal edit. Discord draws no button, and
-// the posts are its contract.
+// A stop typed on Discord keeps its reply, line or no line: the "cancel
+// sent" post and the terminal edit. Discord draws no button, and the post is
+// its contract. The relay's "canceled" notice is gone: nothing a stopped
+// task writes reaches the room.
 func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 	t.Parallel()
 	r := startRig(t)
@@ -628,13 +686,13 @@ func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the canceled notice", func() bool {
-		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "canceled") })
-	})
 	waitFor(t, "the terminal edit", func() bool {
 		texts := r.adapter.editTexts()
 		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "canceled")
 	})
+	if slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "canceled") }) {
+		t.Fatalf("a stopped task's terminal posted a notice: %q", r.adapter.postTexts())
+	}
 	for _, e := range r.adapter.editTexts() {
 		if strings.Contains(e, "cancel sent") {
 			t.Errorf("a Discord typed stop edited the line to %q", e)

@@ -45,9 +45,9 @@ starts it. The values, as many as the runtime can tell apart:
 
 | Origin      | The work                                                                                                                                                                                                                                                                                                   |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `chat`      | a person's message on a chat platform: the A2A bridge's sessions for Google Chat, Slack and Discord, and the Hermes gateway's platform sessions (Teams)                                                                                                                                                    |
+| `chat`      | a person's message on a chat platform: the A2A bridge's sessions for Google Chat, Slack, Teams (under the operator's Teams backend switch) and Discord, and the Hermes gateway's platform sessions under `today` (Google Chat, Slack, Teams)                                                               |
 | `console`   | the operator-facing consoles: sessions whose id the web console minted (`web-console-*`) or the admin console's chat page minted (`portal_*`), both read as a convention by the in-pod reader until the agent-API door writes a record, the A2A gateway's `console` backend, and cards the dashboard files |
-| `api`       | a caller on the agent API or an A2A door (`a2a`, `a2a-google`, `inject`): another agent or a script, not a person on a chat platform                                                                                                                                                                       |
+| `api`       | a caller on the agent API or an A2A door (`a2a`, `a2a-google`, `a2a-entra`, `inject`): another agent or a script, not a person on a chat platform                                                                                                                                                          |
 | `event`     | the event watcher's triage: a `k8s-evt-*` session the Session KV server opens for a cluster event, decided by the first injected payload (`k8s-event`, `k8s-event-followup` and `controller-stall` are all `event`)                                                                                        |
 | `drift`     | the drift detector: a `k8s-evt-*` session whose first injected payload carries `kind: gitops-drift`, and the cards the drift backlog files                                                                                                                                                                 |
 | `audit`     | a scheduled fleet audit: a scheduler-started run of a job shipped in the image's `agents/platform/cron/jobs.json` whose `skills` list names `fleet-audit`                                                                                                                                                  |
@@ -61,7 +61,7 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   once over its loopback API: by the Session KV server itself for the `k8s-evt-*` sessions it creates (it writes their
   `platform: k8s-watcher` today), at the first inject since the create call carries no body,
   `event` or `drift` from the payload's kind; a watcher in shared mode injects into a session the operator named and the server never created, so that session has no record and its work resolves as `other`, which is accepted since nothing in the repository sets that mode; by the hermes-bridge for every `a2a-*` session, before its first turn (the bridge opens a
-  session through the first turn's header), from the backend (`chat` for `gchat`, `slack` and
+  session through the first turn's header), from the backend (`chat` for `gchat`, `slack`, `teams` and
   `discord`, `console` for `console`, `api` for the doors), a write beside the route record; by the `session_store` plugin for the Hermes
   platform sessions it already records (`chat`). The record carries the chat platform beside the origin under its own key,
   `origin_platform`, since `platform` is already a `session_store` key that the Session KV server
@@ -125,7 +125,7 @@ The agent pod already verifies every pull request a kanban worker opens: `vcs_cl
 one `kube-agents.event` line to stderr when the broker answers with a new proposal, the
 `pr_opened` hook sees that line in the worker's terminal output before the model does, checks it
 with the forge (the broker serves the pull request at that url, on a repository the install
-manages, open, created within the last fifteen minutes, authored by the broker's own account),
+manages, open or already merged, created within the last fifteen minutes, authored by the broker's own account),
 and only then records a `pr_opened` event on the card. That check is the trust anchor this
 design reuses: a line the model could type is not a proposal until the forge confirms the agent
 opened it.
@@ -174,7 +174,7 @@ origin). Under the experimental platform-profile front door a chat turn does run
 terminal; its session record then resolves it, `chat` with its platform. A Prometheus reader can split chat by platform; the status does not. The hook is enabled on every profile that has the terminal.
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
-background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
+background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose broker answer the client refused as nested too deep, which writes no record line; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
 instead of `vcs_client.call`. Three windows in the mechanism lose a count too. A claim that
 succeeds and a ledger write that then fails loses that proposal's count, since the token is
 spent. A broker restart between the mint and the claim loses the claims in flight, since the

@@ -207,8 +207,8 @@ been fed the bytes of the failed one. A GitHub release download in either Docker
 retrying for at least four minutes, which is `--retry 8`: GitHub's release-asset CDN can fail one
 runner for minutes while it serves others, and curl's doubling backoff waits 255 seconds over eight
 retries but 31 over five. The test reads that wait from the flags, where `--retry-max-time` can only
-shorten it, and runs the tirith download, a wget loop, against stubs; a release URL fetched any other
-way, such as another wget loop, an `ADD` or a piped curl, fails it.
+shorten it; a release URL fetched any other way, such as a wget loop, an `ADD` or a piped curl,
+fails it.
 
 `docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
 from the network run once more, after a pause, when the first attempt fails. The in-image gate
@@ -473,7 +473,8 @@ posting every Medium as a thread and sets no round budget of its own — the sto
 - **Green is settled.** A `success` `AI Review` entry the bot wrote for a review of this pull
   request — `No findings`, `No findings above low severity`, and `Found N issues, none holding` are
   all green — ends the bot's part. After it, no author `/review` in any form (`all`, `fresh`, or
-  any argument), and no draft-to-ready or close-and-reopen to buy one. Answer each open 🟠 Medium
+  any argument), and no draft-to-ready or close-and-reopen to buy one (a reopen that `/retest`
+  advised, to replace runs GitHub lost, is not buying one). Answer each open 🟠 Medium
   by reply; push a fix only for a defect you would have fixed unasked, and say so in the thread;
   otherwise reply with the reason or a filed follow-up. The human reviewer the green summons rules
   on the rest. Settled ends, and one further `/review` is owed, only when a human review requests
@@ -672,6 +673,18 @@ check, or a reason the comment does not name, a write user can re-add it with th
 comment if the push does not work. To keep a pull request out past its next push, add a hold
 (`/hold`).
 
+**Do not push to a pull request that is in the queue.** The queue merges the commit it built when
+the pull request entered it. GitHub does not remove the pull request from the queue on a later
+push, and the sweep removes it only when the push costs it a label or gains it a hold, and the
+sweep runs before the merge. Otherwise the pushed commits do not reach `main`, although GitHub
+shows the pushed commit as the merged head. After each merge, the `dropped-push` job in
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml) runs `scripts/merge_queue_dropped_push.py`,
+which repeats the queue's merge with the final head. When the result differs from what merged, it
+posts one comment, which names the missing commits when it can find them; open a new pull request
+for them. A late push that only merges `main` into the branch loses nothing and gets no comment.
+A merge the script cannot decide, such as a final head that conflicts with `main`, gets no comment
+either, and the job's log says why. The script's docstring is the reference.
+
 The two labels are the two people:
 
 - **`lgtm` is the reviewer's.** A GitHub "Approve" review sets it, and so does `/lgtm` in a comment
@@ -716,7 +729,9 @@ only `lgtm`, so the draw is the whole pool at equal weight; any other change sti
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
 `approved` is per file, so it takes as many of them as it needs to cover every file: first one for
 the file with the fewest approvers, then one more for whatever that person cannot approve, from
-the default reviewers when nobody the glob matched can approve it. A change
+the default reviewers when nobody the glob matched can approve it. Both draws pass over a
+reviewer who is away while someone on the roster who is here can do the same job
+([who owns an open pull request](#who-owns-an-open-pull-request)). A change
 to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
 unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
@@ -888,7 +903,15 @@ of the queue, so it is re-run once no run of its workflow on the pull request is
 re-run. A run still `queued` an hour after it started, which is what a run GitHub lost during an
 Actions incident looks like, is cancelled (force-cancelled if a cancel does not take) and re-run
 whole; when a newer run of its workflow on the pull request carries its checks, it is cancelled
-and not re-run. That clears the checks without the push that would restart the smoke test. GitHub's own re-run button needs Write access, which most
+and not re-run. That clears the checks without the push that would restart the smoke test. A run
+GitHub lost before queueing it refuses every cancel ("has not been queued yet"), so it can be
+neither cancelled nor re-run: the command stops on that answer, and when the run is still the
+newest of its workflow it comments on the pull request that closing and reopening it starts fresh
+runs, and the `Retest Actions Checks` run goes red unless something else was re-run. A reopen keeps
+the approvals and needs no push, but it re-runs every check that runs on a reopen, the smoke test
+included (on a head it has already passed, it has reported green again within a minute), and starts
+a fresh automated review. A workflow that runs only on a label event gets no new run from a
+reopen; removing and re-adding its label starts one. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
@@ -1040,6 +1063,27 @@ triage sweep applies the wider rule and messages whoever owns each pull request,
 one they share; it runs outside this repository (`triage/` in the internal `gke-labs/kube-agents-bot`,
 with the reasoning in its `docs/designs/2026-11-17-triage-shared-ownership.md`), so the rule above
 is all this page can state about it.
+
+The script passes over a reviewer who is away, on the check-run path and on `/request-review`. The
+`REVIEWERS_AWAY` repository secret holds a JSON list of who is away and until when, and those people
+leave the draw. A change that needs only `lgtm`, with everyone it routes to away, draws from the
+default reviewers who are here. Where nobody here on the roster can approve a file, or nobody on it
+is here at all, the script asks the person back soonest, at random among those back the same day,
+in place of nobody; a file someone here can approve still gets that person. A request already
+made stays with its reviewer. A maintainer sets the list, and each set replaces all of it. Keep the
+value on one line: GitHub masks a secret in the log one line at a time.
+
+```bash
+# `back` is the first day the person reviews again; `from` is optional. Dates are UTC.
+gh secret set REVIEWERS_AWAY --repo gke-labs/kube-agents \
+  --body '[{"login":"<login>","from":"2026-12-21","back":"2027-01-05"}]'
+# Nobody away: delete it. A list that is empty or does not parse also reads as nobody away.
+gh secret delete REVIEWERS_AWAY --repo gke-labs/kube-agents
+```
+
+GitHub does not show a secret back, so keep the list you set. The run log names logins
+and never a date. The hand-off comment says so when the reviewer it names was asked while away, also
+with no date.
 
 ```bash
 # Whose move is it: draft, conflicts, verdict, and who is on the hook now.

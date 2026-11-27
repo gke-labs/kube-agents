@@ -1148,15 +1148,20 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "bus-migration"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
-	// After the same-namespace pods, one namespace-crossing peer: every pod
-	// in the profile namespace (#3655). That namespace's own fence keeps
-	// its pods to the bus, LiteLLM and DNS, and the bus grants do the rest.
-	if len(rule.From) != len(wantPeers)+1 {
-		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+1, len(rule.From), rule.From)
+	// After the unconditional same-namespace pods, one namespace-crossing peer
+	// (every pod in the profile namespace, #3655, whose own fence keeps its
+	// pods to the bus, LiteLLM and DNS while the bus grants do the rest) and
+	// the MCP server's pod, rendered by default unless A2A_MCP_DOOR=false.
+	if len(rule.From) != len(wantPeers)+2 {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+2, len(rule.From), rule.From)
 	}
 	if profile := rule.From[len(wantPeers)]; profile.PodSelector != nil || profile.IPBlock != nil || profile.NamespaceSelector == nil ||
 		!reflect.DeepEqual(profile.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: "test-ns-profiles", "app.kubernetes.io/component": "profiles"}) {
-		t.Errorf("the last 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
+		t.Errorf("profile-namespace 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
+	}
+	if mcp := rule.From[len(wantPeers)+1]; mcp.IPBlock != nil || mcp.NamespaceSelector != nil || mcp.PodSelector == nil ||
+		!reflect.DeepEqual(mcp.PodSelector.MatchLabels, map[string]string{"app": "test-agent-a2a-mcp"}) {
+		t.Errorf("MCP 4222 peer = %+v, want app=test-agent-a2a-mcp in the same namespace", mcp)
 	}
 	for i, want := range wantPeers {
 		peer := rule.From[i]
@@ -1348,10 +1353,11 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 }
 
-// TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag: the spawner widens
-// the session pod only when the operator says so, and it needs the broker
-// URL to do it.
-func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
+// TestGatewayIsToldAboutTheClusterViewUnderTheFlagOnThePlatformRoute: on the
+// platform route the spawner widens the session pod only when the operator's
+// flag says so, and it needs the broker URL to do it. (On the session route
+// the view is on by default: TestTheSessionRouteRendersTheClusterViewWithNoFlag.)
+func TestGatewayIsToldAboutTheClusterViewUnderTheFlagOnThePlatformRoute(t *testing.T) {
 	agent := a2aTestAgent()
 	envOf := func() map[string]corev1.EnvVar {
 		env := map[string]corev1.EnvVar{}
@@ -1362,7 +1368,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT", "A2A_KUBE_PROXY_MODE"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1383,6 +1389,61 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
 		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
+	}
+	// The mode the gateway passes session pods is the one kube-proxy runs:
+	// their kubectl wrapper treats a failed write as refused only under a
+	// read-only mode.
+	var proxyMode string
+	for _, e := range buildKubeProxyDeployment(agent, "", true, "tls-hash").Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "KUBE_PROXY_MODE" {
+			proxyMode = e.Value
+		}
+	}
+	if proxyMode == "" || on["A2A_KUBE_PROXY_MODE"].Value != proxyMode {
+		t.Errorf("A2A_KUBE_PROXY_MODE = %+v, kube-proxy's KUBE_PROXY_MODE = %q; want them equal", on["A2A_KUBE_PROXY_MODE"], proxyMode)
+	}
+}
+
+// TestGatewayGetsTheKubectlCostTierNormalised: the session pods' kubectl
+// admission charges the same tier as the shell sandbox's, so the gateway
+// gets spec.deployment.env's tier normalised as the sandbox does, and only
+// under the cluster view, the only pods that run the admission.
+func TestGatewayGetsTheKubectlCostTierNormalised(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aKubectlCostTierEnv {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	withTier := func(env ...corev1.EnvVar) *agentv1alpha1.PlatformAgent {
+		agent := a2aTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: env}
+		return agent
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	if _, ok := read(a2aTestAgent()); ok {
+		t.Errorf("%s rendered with no spec.deployment.env entry; unset means the default tier", a2aKubectlCostTierEnv)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: value})); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", a2aKubectlCostTierEnv, got, ok, value, want)
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: value})); ok {
+			t.Errorf("%s = %q reached the gateway for the CR value %q; only a plain tier name may", a2aKubectlCostTierEnv, got, value)
+		}
+	}
+	fromSecret := withTier(corev1.EnvVar{Name: envKubectlCostTier,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}})
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the gateway: only a literal value may", envKubectlCostTier)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got, ok := read(withTier(corev1.EnvVar{Name: envKubectlCostTier, Value: "fleet"})); ok {
+		t.Errorf("%s = %q rendered with the cluster view off", a2aKubectlCostTierEnv, got)
 	}
 }
 
@@ -1635,18 +1696,16 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	agent.Spec.Harness.Tuning.BusReplicas = nil
 
-	// The MCP server is one more standing pod, only while its flag is on (#3869).
-	without := pods.Value()
-	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
-		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
+	// The MCP server and the profile dispatcher are on by default (counted
+	// above), each one fewer when switched off.
+	withBoth := pods.Value()
+	t.Setenv(a2aMCPDoorEnvVar, "false")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != withBoth-1 {
+		t.Fatalf("tuned quota with the MCP server off = %d, want %d (one fewer than with it)", pods.Value(), withBoth-1)
 	}
-
-	// And the profile dispatcher, on by default (counted above), one fewer
-	// switched off.
 	t.Setenv(a2aProfileDispatcherEnvVar, "false")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without {
-		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), without)
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != withBoth-2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), withBoth-2)
 	}
 }
 
@@ -1773,6 +1832,35 @@ func TestGatewayDeploymentRendersMaxSessions(t *testing.T) {
 	}
 }
 
+// The session idle times reach the gateway only when set (#2371): unset, the
+// gateway keeps its defaults and the rendered Deployment is unchanged.
+func TestGatewayDeploymentRendersTheSessionIdleTimesWhenSet(t *testing.T) {
+	envOf := func(dep *appsv1.Deployment) map[string]string {
+		got := map[string]string{}
+		for _, env := range dep.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "A2A_IDLE_TTL" || env.Name == "A2A_DM_IDLE_TTL" {
+				got[env.Name] = env.Value
+			}
+		}
+		return got
+	}
+	agent := a2aTestAgent()
+	agent.Spec.Harness = nil
+	if got := envOf(buildA2AGatewayDeployment(agent)); len(got) != 0 {
+		t.Fatalf("no harness: rendered %v, want neither", got)
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{}}
+	if got := envOf(buildA2AGatewayDeployment(agent)); len(got) != 0 {
+		t.Fatalf("unset: rendered %v, want neither", got)
+	}
+	idle, dm := int32(45), int32(3)
+	agent.Spec.Harness.Tuning.SessionIdleMinutes, agent.Spec.Harness.Tuning.DMSessionIdleMinutes = &idle, &dm
+	got := envOf(buildA2AGatewayDeployment(agent))
+	if got["A2A_IDLE_TTL"] != "45m" || got["A2A_DM_IDLE_TTL"] != "3m" {
+		t.Fatalf("set: rendered %v, want A2A_IDLE_TTL=45m and A2A_DM_IDLE_TTL=3m", got)
+	}
+}
+
 // Reconcile renders the session quota with the stack it bounds.
 func TestA2ASessionQuotaIsRendered(t *testing.T) {
 	scheme := setupScheme()
@@ -1874,6 +1962,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 		{"mcp", "buildA2AMCPDeployment", mcp.Spec.Template.Spec},
 		{"curator", "buildA2ACuratorDeployment", curator.Spec.Template.Spec},
+		{"teams-inbound", "buildA2ATeamsInboundDeployment", buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent)).Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1948,6 +2037,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 	curator := buildA2ACuratorDeployment(agent)
+	teamsInbound := buildA2ATeamsInboundDeployment(withTeamsInboundOn(agent))
 
 	cases := []struct {
 		render    string
@@ -2020,6 +2110,11 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// the same reasoning: it reads its token and credential files by
 		// absolute path and writes nothing.
 		{render: "mcp", builder: "buildA2AMCPDeployment", container: "mcp", spec: mcp.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The Teams inbound receiver, on the same distroless static nonroot
+		// base and UID 1000: it reads its token by absolute path and writes
+		// nothing, so traversable is enough; the render sets WorkingDir "/".
+		{render: "teams-inbound", builder: "buildA2ATeamsInboundDeployment", container: teamsInboundContainer, spec: teamsInbound.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 		// The OKF memory curator runs from the console image too, writing only
 		// to its mounted /var/lib/curator emptyDir by absolute path.
@@ -3575,7 +3670,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 		"a2a.topics.shared.annotations",
 	}
 	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
-	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console", "_INBOX."+a2aAgentBusUser+".>")
+	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "chat.notify.teams", "chat.notify.console", "_INBOX."+a2aAgentBusUser+".>")
 	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
 		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
 	}
@@ -3705,11 +3800,11 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks.p.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.teams", "chat.notify.console",
 		"chat.board.reply.gateway.>",
 		// Attested trigger ingress (#5617): every source's submissions and
 		// status queries, read only.
-		"a2a.trigger.*.submit", "a2a.trigger.*.status",
+		"a2a.trigger.*.submit", "a2a.trigger.*.status", "a2a.trigger.*.stop",
 		"_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -4814,6 +4909,7 @@ const (
 const (
 	notifyRequest        = "chat.notify.gchat"
 	notifyRequestSlack   = "chat.notify.slack"
+	notifyRequestTeams   = "chat.notify.teams"
 	notifyRequestConsole = "chat.notify.console"
 	notifyReply          = "chat.notify.reply.agent.>"
 )
@@ -4826,7 +4922,7 @@ const (
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestTeams, notifyRequestConsole, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -4863,6 +4959,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{consoleOutbound, true},
 		{notifyRequest, true},
 		{notifyRequestSlack, true},
+		{notifyRequestTeams, true},
 		{notifyRequestConsole, true},
 		{notifyReply, true},
 		{"a2a.task.>", true},
@@ -6474,10 +6571,12 @@ func notifyDoorViolations(ids []a2aIdentity) []string {
 	}{
 		{"publish", notifyRequest, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"publish", notifyRequestSlack, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", notifyRequestTeams, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"publish", notifyRequestConsole, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestSlack, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequestTeams, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestConsole, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
 	}
@@ -6526,10 +6625,12 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	for _, want := range []struct{ user, verb, pattern string }{
 		{a2aAgentBusUser, "publish", notifyRequest},
 		{a2aAgentBusUser, "publish", notifyRequestSlack},
+		{a2aAgentBusUser, "publish", notifyRequestTeams},
 		{a2aAgentBusUser, "publish", notifyRequestConsole},
 		{a2aAgentBusUser, "subscribe", notifyReply},
 		{"gateway", "subscribe", notifyRequest},
 		{"gateway", "subscribe", notifyRequestSlack},
+		{"gateway", "subscribe", notifyRequestTeams},
 		{"gateway", "subscribe", notifyRequestConsole},
 		{"gateway", "publish", notifyReply},
 	} {
@@ -6864,16 +6965,27 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
 		}
 	})
-	t.Run("the MCP door", func(t *testing.T) {
-		t.Setenv(a2aMCPDoorEnvVar, "true")
+	t.Run("the MCP door switched off", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "false")
+		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
+			t.Fatalf("standing pods with the MCP door off = %d, want %d", got, base-1)
+		}
+	})
+	t.Run("the curator", func(t *testing.T) {
+		t.Setenv(a2aCuratorEnvVar, "true")
 		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
-			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+			t.Fatalf("standing pods with the curator = %d, want %d", got, base+1)
 		}
 	})
 	t.Run("the dispatcher switched off", func(t *testing.T) {
 		t.Setenv(a2aProfileDispatcherEnvVar, "false")
 		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
 			t.Fatalf("standing pods with the dispatcher off = %d, want %d", got, base-1)
+		}
+	})
+	t.Run("the Teams inbound receiver", func(t *testing.T) {
+		if got := a2aStandingPods(teamsInboundTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the Teams inbound receiver = %d, want %d", got, base+1)
 		}
 	})
 }
@@ -7430,4 +7542,117 @@ func quotedLines(block string) []string {
 		}
 	}
 	return out
+}
+
+// sessionRouteAgent is a2aTestAgent on the session route with a stored cap,
+// so resolveA2ADefaultRoute says session when sessionCap is above 0 and
+// platform (no room for a session) when it is 0.
+func sessionRouteAgent(sessionCap int) *agentv1alpha1.PlatformAgent {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{DefaultRoute: ptr.To(agentv1alpha1.DefaultRouteSession)}}
+	agent.Status.EffectiveSessionCap = ptr.To(sessionCap)
+	return agent
+}
+
+// The session route's cluster view is on by default (#6538, 2026-11-20;
+// #6987): with the operator's flag unset it follows the resolved route,
+// fallbacks included, and the flag overrides it either way until the view is
+// replaced (#6483). Any other value of the flag is off, so a typo never
+// widens the fence.
+func TestTheSessionClusterViewFollowsTheRouteAndTheFlagOverridesIt(t *testing.T) {
+	agents := map[string]*agentv1alpha1.PlatformAgent{
+		"platform":                    a2aTestAgent(),
+		"session":                     sessionRouteAgent(4),
+		"session falling to platform": sessionRouteAgent(0),
+		"session held by a pruned CRD": func() *agentv1alpha1.PlatformAgent {
+			a := sessionRouteAgent(4)
+			a.Status.EffectiveSessionCap = nil
+			apimeta.SetStatusCondition(&a.Status.Conditions, metav1.Condition{Type: sessionCapFittedConditionType, Status: metav1.ConditionTrue, Reason: sessionCapPrunedReason})
+			return a
+		}(),
+	}
+	for _, tc := range []struct {
+		flag, route string
+		want        bool
+	}{
+		{"", "platform", false},
+		{"", "session", true},
+		{"", "session falling to platform", false},
+		{"", "session held by a pruned CRD", false},
+		{"true", "platform", true},
+		{"true", "session", true},
+		{"true", "session falling to platform", true},
+		{"false", "platform", false},
+		{"false", "session", false},
+		{"yes", "session", false},
+		{"TRUE", "platform", false},
+	} {
+		t.Run(tc.flag+"/"+tc.route, func(t *testing.T) {
+			t.Setenv(a2aSessionClusterViewEnvVar, tc.flag)
+			if got := a2aSessionClusterViewEnabled(agents[tc.route]); got != tc.want {
+				t.Errorf("a2aSessionClusterViewEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// On the session route with no flag set, the gateway is handed the whole
+// cluster view, as it is with the flag "true": the switch and the addresses
+// the spawner gives a session pod. On the platform route it is handed none.
+func TestTheSessionRouteRendersTheClusterViewWithNoFlag(t *testing.T) {
+	envOf := func(agent *agentv1alpha1.PlatformAgent) map[string]corev1.EnvVar {
+		env := map[string]corev1.EnvVar{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e
+		}
+		return env
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	agent := sessionRouteAgent(4)
+	on := envOf(agent)
+	if on["A2A_SESSION_CLUSTER_VIEW"].Value != "true" {
+		t.Errorf("A2A_SESSION_CLUSTER_VIEW = %+v on the session route with no flag, want true", on["A2A_SESSION_CLUSTER_VIEW"])
+	}
+	for name, want := range map[string]string{
+		"A2A_CREDENTIAL_PROXY_URL":    credentialProxyBaseURL(agent),
+		"A2A_KUBE_PROXY_URL":          kubeProxyURL(agent),
+		"A2A_KUBE_PROXY_CA_CONFIGMAP": kubeProxyCABundleName(agent),
+	} {
+		if on[name].Value != want {
+			t.Errorf("%s = %+v on the session route with no flag, want %s", name, on[name], want)
+		}
+	}
+	off := envOf(a2aTestAgent())
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_KUBE_PROXY_URL"} {
+		if _, ok := off[name]; ok {
+			t.Errorf("%s rendered on the platform route with no flag", name)
+		}
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "false")
+	if _, ok := envOf(agent)["A2A_SESSION_CLUSTER_VIEW"]; ok {
+		t.Error("the cluster view rendered on the session route with the flag \"false\"")
+	}
+}
+
+// TestTheSessionCapResolvesBeforeAnythingRendersFromTheRoute: the session
+// pods' cluster view reads the resolved route, so the pass resolves the
+// session cap before kube-proxy and the broker render, not only before the
+// workload and the gateway. Otherwise one pass could render the view on the
+// broker from the stored status and off on the gateway from this pass's
+// reading (#6987).
+func TestTheSessionCapResolvesBeforeAnythingRendersFromTheRoute(t *testing.T) {
+	src, err := os.ReadFile("platformagent_controller.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	resolve := strings.Index(text, "r.resolveA2ASessionCap(ctx, renderAgent, instance)")
+	if resolve < 0 || strings.Count(text, "r.resolveA2ASessionCap(ctx, renderAgent, instance)") != 1 {
+		t.Fatal("the reconcile resolves the session cap other than once")
+	}
+	for _, render := range []string{"r.reconcileKubeProxy(ctx, renderAgent", "r.reconcileCredentialProxy(ctx, renderAgent", "r.reconcileWorkload(ctx, renderAgent"} {
+		if at := strings.Index(text, render); at < 0 || at < resolve {
+			t.Errorf("%s renders before the session cap is resolved", render)
+		}
+	}
 }

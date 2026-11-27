@@ -79,9 +79,10 @@ from typing import Any, Callable, Mapping
 import yaml
 
 import automation_rules
-import automerge_checks
+import automerge_edit
 import automerge_eligibility
 import okf_guard
+from fix_recipes import registry as fix_recipes_registry
 from providers import (
     CliTransport,
     HttpTransport,
@@ -147,6 +148,10 @@ _INCOMING = "refs/vcs/incoming"
 DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
 DECISION_MEMORY_CHECK_FAILED = "DECISION_MEMORY_CHECK_FAILED"
 DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_MEMORY_VERDICT_ALLOW = "allow"
+DECISION_MEMORY_VERDICT_WARN = "warn"
+DECISION_MEMORY_VERDICT_BLOCK = "block"
+DECISION_MEMORY_VERDICT_ERROR = "error"
 DECISION_OVERRIDE_PREFIX = "decision-override:"
 FORBIDDEN_LABEL = "FORBIDDEN_LABEL"
 DM_MAX_GUARD_FILE_BYTES = 4 << 20  # 4 MiB ceiling per inspected text/YAML file
@@ -187,6 +192,13 @@ OPEN_PROPOSAL_STATE = "open"
 CLAIM_WINDOW_SECONDS = 900
 CLAIM_CLOCK_SKEW_SECONDS = 60
 CLAIM_TITLE_MAX = 300
+# The states `proposal-claim` accepts. Merged as well as open: a repository
+# whose own workflow merges the fix seconds after it opens (the
+# `kube-agents:auto-merge` label) can merge it before the hook presents the
+# token, and a refused claim writes no post-merge record, so the one fix the
+# check exists to guard went unverified (#6947). Closed without a merge stays
+# refused.
+CLAIM_STATES = frozenset({OPEN_PROPOSAL_STATE, MERGED_PROPOSAL_STATE})
 # The forge failures `proposal-claim` asks again once: the two refusals the
 # provider layer reads as the forge's own trouble (`providers/errors.py`), the
 # set the agent side's `forge.TRANSIENT_CODES` retries reads on. The claim
@@ -892,8 +904,12 @@ class VcsBroker:
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
         cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
         automerge_switch: Callable[[], str] | None = None,
+        on_decision_memory_check: Callable[[str], None] | None = None,
+        allowed_commit_emails: Callable[[str, str], frozenset[str]] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        self.on_decision_memory_check = on_decision_memory_check
+        self._allowed_commit_emails = allowed_commit_emails
         # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
         # or kubectl read the broker runs on its own behalf, through the same
         # executor and cluster selection a caller's read takes. Only
@@ -1902,12 +1918,17 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            if self._allowed_commit_emails is not None:
+                self._require_install_commit_identities(
+                    git, root, bound, remote_target, existing_head
+                )
             policy_branch = (
                 self._pinned_base(bound.forge, bound.repo)
                 or self._default_branch_of_remote(git, root, self._tls_refusal)
             )
             policy_branch = _short_ref(policy_branch) if policy_branch else ""
             if not policy_branch:
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                 raise WorkspaceError(
                     f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                     status=502,
@@ -1926,6 +1947,7 @@ class VcsBroker:
                 )
                 policy_base_rev = (rev_base.stdout or "").strip() if rev_base.returncode == 0 else ""
                 if not policy_base_rev:
+                    self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                     raise WorkspaceError(
                         f"could not resolve base branch for Decision Memory guard on {bound.repo}",
                         status=502,
@@ -1947,6 +1969,63 @@ class VcsBroker:
         if dm_markdown:
             result["decisionMemoryMarkdown"] = dm_markdown
         return bound.stamp(result)
+
+    def _require_install_commit_identities(
+        self,
+        git: Callable,
+        root: Path,
+        bound: Binding,
+        remote_target: str,
+        existing_head: str,
+    ) -> None:
+        """Refuse any newly pushed commit whose author or committer email is not the install's."""
+        bases = [remote_target] + ([existing_head] if existing_head else [])
+        commits_res = git(
+            root,
+            "log",
+            "--format=%ae%x00%ce",
+            _INCOMING,
+            "--not",
+            *bases,
+            check=False,
+        )
+        if commits_res.returncode != 0:
+            detail = (commits_res.stderr or commits_res.stdout or "git log failed").strip()
+            raise WorkspaceError(
+                f"could not verify commit identities before pushing: {detail}",
+                status=403,
+                code="FORBIDDEN_COMMIT_IDENTITY",
+            )
+        try:
+            viewer = self._viewer(bound)
+        except Exception:  # noqa: BLE001 — best-effort viewer lookup for app noreply address
+            viewer = ""
+        host = bound.forge.hosts[0] if bound.forge.hosts else ""
+        allowed = {
+            str(addr).strip().casefold()
+            for addr in self._allowed_commit_emails(host, viewer)
+            if str(addr).strip()
+        }
+        for line in (commits_res.stdout or "").splitlines():
+            if "\x00" not in line:
+                continue
+            ae, ce = line.split("\x00", 1)
+            author_email = ae.strip().casefold()
+            committer_email = ce.strip().casefold()
+            if (
+                not author_email
+                or author_email not in allowed
+                or not committer_email
+                or committer_email not in allowed
+            ):
+                bad = sorted(
+                    {addr or "<empty>" for addr in (author_email, committer_email) if not addr or addr not in allowed}
+                )
+                raise WorkspaceError(
+                    f"bundle contains commit identity {', '.join(bad)} outside install commit addresses",
+                    status=403,
+                    code="FORBIDDEN_COMMIT_IDENTITY",
+                )
 
     @staticmethod
     def _extract_revision_paths_to_dir(
@@ -2022,6 +2101,10 @@ class VcsBroker:
                 tar_path.unlink(missing_ok=True)
         return extracted
 
+    def _record_decision_memory_check(self, verdict: str) -> None:
+        if self.on_decision_memory_check is not None:
+            self.on_decision_memory_check(verdict)
+
     def _check_decision_memory_on_publish(
         self,
         git: Callable,
@@ -2042,6 +2125,7 @@ class VcsBroker:
             "knowledge", ".kube-agents/intent.yaml", check=False,
         )
         if getattr(tree_ls, "truncated", False):
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: base tree listing was truncated",
                 status=409,
@@ -2065,6 +2149,7 @@ class VcsBroker:
             root, "diff-tree", "-r", "--no-renames", "--name-status", "-z", diff_base, tip, check=False,
         )
         if diff_ns.returncode != 0 or getattr(diff_ns, "truncated", False):
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
             raise WorkspaceError(
                 "Decision Memory guard check failed against base branch: diff-tree failed or was truncated",
                 status=409,
@@ -2082,6 +2167,7 @@ class VcsBroker:
                 changed_paths.append((status, tokens[idx + 1]))
                 idx += 2
         if not changed_paths:
+            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ALLOW)
             return ""
 
         check_dir = self._scratch("dmcheck")
@@ -2117,6 +2203,7 @@ class VcsBroker:
                             policy_base_rev, "--", safe_prefix, check=False,
                         )
                         if getattr(extra_ls, "truncated", False):
+                            self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                             raise WorkspaceError(
                                 "Decision Memory guard check failed against base branch: extra path listing was truncated",
                                 status=409,
@@ -2164,6 +2251,7 @@ class VcsBroker:
                     k_root, changed_map, oversize_files=oversize_files
                 )
             except ValueError as exc:
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_ERROR)
                 raise WorkspaceError(
                     f"Decision Memory guard check failed against base branch: {exc}",
                     status=409,
@@ -2172,6 +2260,7 @@ class VcsBroker:
 
             markdown = str(out.get("markdown") or "") if out.get("findings") else ""
             if out.get("verdict") == "block":
+                self._record_decision_memory_check(DECISION_MEMORY_VERDICT_BLOCK)
                 msg = (
                     "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
                     f"{markdown}\n\n"
@@ -2185,6 +2274,9 @@ class VcsBroker:
                     code=DECISION_MEMORY_BLOCKED,
                     detail=markdown,
                 )
+            self._record_decision_memory_check(
+                DECISION_MEMORY_VERDICT_WARN if markdown else DECISION_MEMORY_VERDICT_ALLOW
+            )
             return markdown
         finally:
             self._discard_scratch(check_dir)
@@ -2992,8 +3084,9 @@ class VcsBroker:
         a `proposal-create` answer, and with that answer's url, number and
         repository in `payload` in place of anything the caller sent: the
         token is what proves the call, this is what proves the proposal. The
-        forge must answer `proposal-view` for the number with the same url, an
-        open state, a creation time inside CLAIM_WINDOW_SECONDS, and as author
+        forge must answer `proposal-view` for the number with the same url, a
+        state in CLAIM_STATES (open, or merged already), a creation time inside
+        CLAIM_WINDOW_SECONDS, and as author
         the account this credential acts as. Anything else the forge answers
         is a 409; the answer is the forge's, never the caller's. A forge that
         must name its account and cannot raises IdentityUnknown, whose code
@@ -3022,14 +3115,14 @@ class VcsBroker:
             and isinstance(url, str)
             and view.get("url") == url
             and view.get("number") == number
-            and view.get("state") == OPEN_PROPOSAL_STATE
+            and view.get("state") in CLAIM_STATES
             and age is not None
             and -CLAIM_CLOCK_SKEW_SECONDS <= age <= CLAIM_WINDOW_SECONDS
             and _login_key(str(view.get("author") or "")) == _login_key(viewer)
         ):
             raise WorkspaceError(
                 "The forge does not say this install opened that proposal in the "
-                "last few minutes: it is not open, not this credential's, not the "
+                "last few minutes: it is not open or merged, not this credential's, not the "
                 "one the claim was minted for, or older than the claim window.",
                 status=409,
                 code="CLAIM_NOT_CONFIRMED",
@@ -3080,6 +3173,11 @@ class VcsBroker:
         # for the post-merge check's change-request read. A library verb: no
         # `vcs.py` command runs it.
         return self._forge_verb("proposal-reviews", payload)
+
+    def proposal_closer(self, payload):
+        # Who closed an unmerged proposal, for the Decision Memory sweep's
+        # closer authority check. A library verb: no `vcs.py` command runs it.
+        return self._forge_verb("proposal-closer", payload)
 
     def proposal_acknowledge(self, payload):
         return self._forge_verb("proposal-acknowledge", payload)
@@ -3145,13 +3243,17 @@ class VcsBroker:
         - `KUBEAGENTS_AUTOMERGE` is `practice` or `on` in this process;
         - the proposal is open and this credential's own;
         - its diff adds one file and changes nothing else, and that file is,
-          byte for byte, the PodDisruptionBudget the fleet audit generates
-          (`automerge_eligibility.parse_budget`);
+          byte for byte, what the `no-pdb` recipe's generator writes for the
+          inputs it names (`automerge_eligibility.verify_added_manifest`);
+        - the file is also, byte for byte, what the generator writes from the
+          workload's live selector, read here
+          (`automerge_eligibility.regenerates_from`);
         - the rules file on the proposal's target branch allows the `no-pdb`
           fix in the environment the cluster's own labels declare
           (`automation_rules`);
         - the three safety checks pass on the broker's own read of the
-          workload's namespace (`automerge_checks.judge`).
+          workload's namespace (the `no-pdb` recipe's `checks.py`, through
+          `fix_recipes.registry.checks_module`).
 
         Off, it reads nothing and answers so. A failed read is a reason not to
         label, never an error, except a forge read of the proposal itself.
@@ -3253,17 +3355,22 @@ class VcsBroker:
             return "the proposal is not open"
         if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
             return "the proposal is not this credential's own"
-        added = automerge_eligibility.added_file_from_diff(diff)
-        budget = automerge_eligibility.parse_budget(added[1]) if added else None
-        if budget is None:
+        if automerge_edit.modified_file_from_diff(diff) is not None:
+            return self._edit_manifest_refusal(bound, payload, proposal, diff)
+        fix = automerge_eligibility.verify_added_manifest(automerge_eligibility.FIX_TYPE, diff, check_path=False)
+        if fix is None:
             return "the proposal does not add exactly one file that is the audit's generated PodDisruptionBudget"
-        if not automerge_eligibility.path_fits(added[0], budget):
-            return f"{added[0]} is not where the budget for {budget.cluster} goes"
-        target = _gke_cluster(budget.cluster)
-        if target is None or not _KUBERNETES_NAME.fullmatch(budget.namespace):
-            return f"the budget names no cluster or namespace this broker reads ({budget.cluster!r}, {budget.namespace!r})"
+        cluster, namespace = fix.candidate["cluster"], fix.candidate["namespace"]
+        if not automerge_eligibility.path_fits(fix.path, fix.name, cluster):
+            return f"{fix.path} is not where the budget for {cluster} goes"
+        target = _gke_cluster(cluster)
+        if target is None or not _KUBERNETES_NAME.fullmatch(namespace):
+            return f"the budget names no cluster or namespace this broker reads ({cluster!r}, {namespace!r})"
         if self._cluster_read is None:
             return "this broker has no cluster reader"
+        recipe_checks = fix_recipes_registry.checks_module(automerge_eligibility.FIX_TYPE)
+        if recipe_checks is None:
+            return f"the {automerge_eligibility.FIX_TYPE} recipe has no safety checks"
         # The rules on the repository's own base, never on a target branch a
         # caller could have published with a rules file of its own.
         base = self._practice_base(bound)
@@ -3281,7 +3388,7 @@ class VcsBroker:
         # Fixed words to the caller, who wrote the cluster's name: what the
         # read said would tell it which clusters exist. The log keeps it.
         if code != 0:
-            LOGGER.info("practice label: cluster labels not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            LOGGER.info("practice label: cluster labels not read cluster=%s exit=%s: %s", cluster, code, err[:400])
             return "the cluster's labels could not be read"
         try:
             labels = (json.loads(out or "{}") or {}).get("resourceLabels") or {}
@@ -3290,10 +3397,10 @@ class VcsBroker:
         environment = automation_rules.cluster_environment(labels)
         decision = automation_rules.decide(rules, automerge_eligibility.FIX_TYPE, environment)
         if not decision.allowed:
-            LOGGER.info("practice label: rules refuse cluster=%s: %s", budget.cluster, decision.reason)
+            LOGGER.info("practice label: rules refuse cluster=%s: %s", cluster, decision.reason)
             return f"{automation_rules.RULES_FILE} does not allow this fix in this cluster's environment"
         code, out, err = self._cluster_read(
-            ["kubectl", "get", automerge_checks.READ_KINDS, "-n", budget.namespace, "-o", "json"],
+            ["kubectl", "get", recipe_checks.read_kinds, "-n", namespace, "-o", "json"],
             f"gke_{project}_{location}_{name}",
         )
         try:
@@ -3301,11 +3408,101 @@ class VcsBroker:
         except json.JSONDecodeError:
             dump = None
         if not isinstance(dump, dict) or not isinstance(dump.get("items"), list):
-            LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", budget.cluster, code, err[:400])
+            LOGGER.info("practice label: namespace not read cluster=%s exit=%s: %s", cluster, code, err[:400])
             return "the workload's namespace could not be read"
-        checks += automerge_checks.judge(dump, budget.object, budget.namespace, budget.name, budget.selector)
+        kind, _, workload_name = fix.candidate["object"].partition("/")
+        workload = next(
+            (
+                item for item in dump["items"]
+                if isinstance(item, dict) and item.get("kind") == kind
+                and (item.get("metadata") or {}).get("name") == workload_name
+                and (item.get("metadata") or {}).get("namespace") == namespace
+            ),
+            None,
+        )
+        # The file's selector is only what the file says. Regenerate from the
+        # workload's live selector, which this broker read itself: the file
+        # must be those bytes too. A missing workload is judged below.
+        if workload is not None and not automerge_eligibility.regenerates_from(
+            fix, {"pod_selector": (workload.get("spec") or {}).get("selector")}
+        ):
+            return "the added file is not, byte for byte, what the recipe generates from the workload's live selector"
+        checks += recipe_checks.checks(fix, dump)
         failed = [check["name"] for check in checks if not check["passed"]]
         return f"safety checks failed: {', '.join(failed)}" if failed else None
+
+    def _edit_manifest_refusal(
+        self, bound: Binding, payload: dict[str, Any], proposal: dict[str, Any], diff: Any
+    ) -> str:
+        """Why a proposal that edits one existing file is not labelled.
+
+        Verified with the edit-manifest verb (`automerge_edit`), for each
+        recipe that opts in with `verify: edit-manifest`, against the file as
+        this broker reads it on the repository's own base and at the
+        proposal's own revision (the snapshot's commit must be the proposal's
+        `sourceRevision`). A verified edit is
+        still not labelled: the cluster behind a manifest's path is not yet
+        resolved to the project and location the rules and the safety checks
+        read, so the answer names the verified recipe and stops there.
+        """
+        recipes = [r for r in fix_recipes_registry.recipes() if r.verify == "edit-manifest"]
+        if not recipes:
+            return "the proposal edits an existing file, and no fix recipe verifies edits"
+        path = automerge_edit.modified_file_from_diff(diff)[0]
+        if automerge_edit.cluster_of(path) is None:
+            return f"{path} is not a manifest inside a cluster's own tree"
+        base = self._practice_base(bound)
+        if not base or proposal.get("target") != base:
+            return f"the proposal does not target the repository's base branch ({base or 'unknown'})"
+        text, why, _ = self._base_file(payload, base, path)
+        if text is None:
+            return f"{path} on {base} could not be read as the edit's base ({why})"
+        # The head, read here too, at the proposal's own revision: the verb
+        # requires the diff applied to the base to be exactly this file.
+        source, revision = str(proposal.get("source") or ""), str(proposal.get("sourceRevision") or "")
+        if not source or not revision:
+            return "the proposal names no source branch and revision to read its head at"
+        head, why, read_at = self._base_file(payload, source, path)
+        if head is None:
+            return f"{path} on {source} could not be read as the edit's head ({why})"
+        if read_at != revision:
+            return "the proposal's branch moved while its head was read"
+        verified, refusals = [], []
+        for recipe in recipes:
+            try:
+                fix = fix_recipes_registry.generator(recipe.kind)
+                verified.append(automerge_edit.verify_edited_manifest(recipe, fix, diff, path, text, head))
+            except (automerge_edit.EditRefused, fix_recipes_registry.RecipeError) as exc:
+                refusals.append(f"{recipe.kind}: {exc}")
+        if len(verified) != 1:
+            LOGGER.info("practice label: edit not verified path=%s: %s", path, "; ".join(refusals) or "several recipes")
+            return "the proposal's edit is not exactly one recipe's declared edit"
+        edit = verified[0]
+        LOGGER.info("practice label: edit verified kind=%s path=%s changes=%s", edit.kind, path, edit.changes)
+        return f"the edit is the {edit.kind} recipe's, but edited manifests are not labelled yet"
+
+    def _base_file(self, payload: dict[str, Any], ref: str, path: str) -> tuple[str | None, str, str]:
+        """`(text, "", revision)` for `path` on `ref`, or `(None, why, "")`: one
+        regular, non-executable file of at most `automerge_edit.MAX_FILE_BYTES`
+        UTF-8 bytes. `revision` is the commit the snapshot read."""
+        try:
+            snap = self.snapshot({"repository": payload.get("repository"), "ref": ref, "paths": [path]})
+            with tarfile.open(fileobj=io.BytesIO(base64.b64decode(snap["archiveBase64"]))) as tar:
+                members = [m for m in tar.getmembers() if not m.isdir()]
+                if len(members) != 1 or not members[0].isreg() or members[0].name != path:
+                    return None, "not one regular file", ""
+                if members[0].mode & 0o111:
+                    return None, "executable", ""
+                raw = tar.extractfile(members[0]).read(automerge_edit.MAX_FILE_BYTES + 1)
+        except (WorkspaceError, subprocess.CalledProcessError, OSError, tarfile.TarError, KeyError, ValueError) as exc:
+            # A clone that failed (a deleted branch, a fork's head) is a refusal too.
+            return None, f"not read ({type(exc).__name__})", ""
+        if len(raw) > automerge_edit.MAX_FILE_BYTES:
+            return None, f"larger than {automerge_edit.MAX_FILE_BYTES} bytes", ""
+        try:
+            return raw.decode("utf-8"), "", str(snap.get("revision") or "")
+        except UnicodeDecodeError:
+            return None, "not UTF-8", ""
 
     def _practice_base(self, bound: Binding) -> str:
         """The branch a labelled proposal must target: the repository's pinned
@@ -3605,6 +3802,7 @@ VCS_VERBS = frozenset(
         "proposal-close",
         "proposal-commits",
         "proposal-reviews",
+        "proposal-closer",
         "proposal-acknowledge",
         "proposal-claim",
         "issue-update",
@@ -3643,6 +3841,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
         "proposal-reviews": broker.proposal_reviews,
+        "proposal-closer": broker.proposal_closer,
         "proposal-acknowledge": broker.proposal_acknowledge,
         "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,

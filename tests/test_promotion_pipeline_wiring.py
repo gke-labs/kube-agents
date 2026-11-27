@@ -610,6 +610,14 @@ class PromotionPipelineWiringTest(unittest.TestCase):
             f"gchat must run before agent-plugin in optional_suites, got: {optional_suites!r}",
         )
 
+    def test_the_rollback_leg_forwards_platform_agent_sizing_profile(self):
+        steps = self.jobs[_ROLLBACK_LEG_JOB]["steps"]
+        run_step = next(step for step in steps if "rollback_environment.sh" in str(step.get("run", "")))
+        self.assertEqual(
+            run_step["env"].get("PLATFORM_AGENT_SIZING_PROFILE"),
+            "${{ vars.PLATFORM_AGENT_SIZING_PROFILE }}",
+        )
+
 
 class ConcurrencyGroupTest(unittest.TestCase):
     def test_no_workflow_hardcodes_the_rc_environment_lock(self):
@@ -775,7 +783,7 @@ class AutopushDeployWiringTest(unittest.TestCase):
         steps = resolve["steps"]
         self.assertTrue(
             any("verify_candidate_images.sh" in step.get("run", "") for step in steps),
-            "resolve-candidate must verify candidate images in GHCR",
+            "resolve-candidate must verify candidate images in the environment's registry",
         )
 
     def test_autopush_deploy_workflow_dispatch_defaults_lease_policy_to_fail(self):
@@ -800,6 +808,81 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(deploy["with"]["mode"], "apply")
         self.assertIn("needs.resolve-candidate.outputs.commit_sha", deploy["with"]["image_tag"])
         self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
+
+
+class AutopushImageCheckLoginTest(unittest.TestCase):
+    """The autopush image check logs in to Google only for an Artifact Registry prefix.
+
+    `resolve-candidate` checks that the commit's images exist before anything
+    deploys. On GHCR that needs no login. When the environment's
+    REGISTRY_PREFIX names an Artifact Registry repository the check has to
+    ask as the environment's deploy identity, so the job may mint a token and
+    logs in first; with the variable unset, as it is today, both steps are
+    skipped and the job is what it was.
+    """
+
+    _CONDITION = "contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')"
+
+    def setUp(self):
+        self.job = _doc(_WORKFLOWS / "autopush-deploy.yml")["jobs"]["resolve-candidate"]
+        self.steps = self.job["steps"]
+
+    def _index(self, predicate):
+        hits = [i for i, step in enumerate(self.steps) if predicate(step)]
+        self.assertEqual(len(hits), 1, hits)
+        return hits[0]
+
+    def test_the_login_is_the_environments_own_and_comes_before_the_check(self):
+        auth = self._index(lambda s: str(s.get("uses", "")).startswith("google-github-actions/auth@"))
+        gcloud = self._index(lambda s: str(s.get("uses", "")).startswith("google-github-actions/setup-gcloud@"))
+        check = self._index(lambda s: s.get("run") == "./scripts/release/verify_candidate_images.sh")
+        self.assertLess(auth, gcloud)
+        self.assertLess(gcloud, check)
+        self.assertEqual(
+            self.steps[auth]["with"],
+            {
+                "workload_identity_provider": "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}",
+                "service_account": "${{ vars.GCP_SERVICE_ACCOUNT }}",
+            },
+        )
+        self.assertEqual(self.job["environment"], "autopush")
+        self.assertEqual(self.job["permissions"], {"contents": "read", "id-token": "write"})
+
+    def test_both_login_steps_are_skipped_unless_the_prefix_is_artifact_registry(self):
+        for step in self.steps:
+            uses = str(step.get("uses", ""))
+            if uses.startswith("google-github-actions/"):
+                with self.subTest(step=step.get("name")):
+                    self.assertEqual(step.get("if"), self._CONDITION)
+
+    def test_the_workflows_condition_agrees_with_the_scripts_rule(self):
+        """Two rules decide "is this Artifact Registry": the workflow's
+        substring, which gates the login, and common.sh's host pattern, which
+        gates the API probe. For the prefixes an environment can hold they
+        have to say the same thing, or the probe runs with no login (or a
+        login is taken for a registry that never uses it)."""
+        needle = re.fullmatch(r"contains\(vars\.REGISTRY_PREFIX, '([^']+)'\)", self._CONDITION).group(1)
+        common = (_REPO_ROOT / "scripts" / "release" / "common.sh").read_text()
+        pattern = re.search(r"^readonly AR_REGISTRY_HOST_PATTERN='([^']+)'$", common, re.M).group(1)
+        for prefix, is_artifact_registry in (
+            ("us-docker.pkg.dev/a-project/a-repository", True),
+            ("us-central1-docker.pkg.dev/a-project/a-repository", True),
+            ("europe-west4-docker.pkg.dev/a-project/a-repository/nested", True),
+            ("ghcr.io/gke-labs/kube-agents", False),
+            ("quay.io/an-org/a-repository", False),
+            ("docker.pkg.dev.example.com/a/b", False),
+            ("", False),
+        ):
+            with self.subTest(prefix=prefix):
+                host = prefix.split("/", 1)[0]
+                self.assertEqual(bool(re.search(pattern, host)), is_artifact_registry)
+                self.assertEqual(needle in prefix, is_artifact_registry)
+
+    def test_the_check_reads_the_environments_prefix_and_is_never_skipped(self):
+        check = self.steps[self._index(lambda s: s.get("run") == "./scripts/release/verify_candidate_images.sh")]
+        self.assertEqual(check["env"]["REGISTRY_PREFIX"], "${{ vars.REGISTRY_PREFIX }}")
+        self.assertNotIn("if", check)
+        self.assertNotIn("continue-on-error", check)
 
 
 class DockerPublishGhcrWiringTest(unittest.TestCase):

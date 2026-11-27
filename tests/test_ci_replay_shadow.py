@@ -28,6 +28,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _lift_shell import lift_constant, lift_function  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
+# The smoke build's Docker Hub mirror, as cloudbuild-ci.yaml declares it (#7033).
+_DOCKER_HUB_MIRROR = yaml.safe_load((_ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml").read_text())["substitutions"][
+    "_DOCKER_HUB_MIRROR"
+]
 _CI_ENV = _ROOT / "hack" / "ci-env.sh"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CI_EVAL = _ROOT / "hack" / "ci-eval-pr.sh"
@@ -366,6 +370,17 @@ class RecordModeResolveTest(unittest.TestCase):
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("no gcloud on PATH", err)
 
+    def test_a_session_front_door_nightly_never_records(self):
+        """The replay lanes replay the platform front door's recordings; a run
+        through the default session (EVAL_FRONT_DOOR=session, #6539) stays in
+        shadow even as the recorder, and asking it to record is refused."""
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session")
+        self.assertEqual((values["rc"], values["mode"], values["cache"]), ("0", "shadow", ""))
+        self.assertIn("EVAL_FRONT_DOOR=session runs never record", err)
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_FRONT_DOOR="session", EVAL_REPLAY_RECORD="true")
+        self.assertEqual(values["rc"], "1")
+        self.assertIn("never records into the shared replay cache", err)
+
     def test_a_presubmit_never_records_whoever_it_runs_as(self):
         values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]), ("0", "presubmit", "shadow", ""))
@@ -566,7 +581,8 @@ class CloudBuildStepTest(unittest.TestCase):
         self.calls = pathlib.Path(self.tmp, "calls")
 
     def _run(self, uri):
-        script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri)
+        # $_DOCKER_HUB_MIRROR takes its declared default, as Cloud Build fills an unset substitution.
+        script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri).replace("$_DOCKER_HUB_MIRROR", _DOCKER_HUB_MIRROR)
         env = {"PATH": f"{self.tmp}:/usr/bin:/bin", "DOCKER_CALLS": str(self.calls)}
         return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
@@ -580,7 +596,8 @@ class CloudBuildStepTest(unittest.TestCase):
         proc = self._run(uri)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), [
-            f"build --platform linux/amd64 -t {uri} -f hack/replay-proxy/Dockerfile .",
+            f"build --platform linux/amd64 -t {uri} -f hack/replay-proxy/Dockerfile"
+            f" --build-arg PYTHON_IMAGE={_DOCKER_HUB_MIRROR}/library/python .",
             f"push {uri}",
         ])
 

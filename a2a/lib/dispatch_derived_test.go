@@ -42,67 +42,6 @@ func TestTheDurablesAreDerivedFromTheTiers(t *testing.T) {
 	}
 }
 
-// For one release the dispatcher reads both shapes: an entry with no
-// durables, and one that still lists them. A listed set must be exactly the
-// derived one; a mismatch refuses the config rather than either side
-// being silently preferred.
-func TestListedDurablesMustEqualTheDerivedOnes(t *testing.T) {
-	without := validDispatchConfig()
-	without.Profiles = append([]DispatchProfile(nil), without.Profiles...)
-	without.Profiles[0].Durables = nil
-	if err := without.Validate(); err != nil {
-		t.Errorf("a live profile with no listed durables: %v", err)
-	}
-	if err := validDispatchConfig().Validate(); err != nil {
-		t.Errorf("a profile listing exactly the derived durables: %v", err)
-	}
-	for name, edit := range map[string]func(*DispatchProfile){
-		"one missing": func(p *DispatchProfile) { p.Durables = p.Durables[:1] },
-		"one extra": func(p *DispatchProfile) {
-			p.Durables = append(p.Durables, DispatchDurable{Tier: "unattended", Kind: SubmitKindTop, Name: ProfileDurableName(p.Name, "unattended", SubmitKindTop)})
-		},
-		"a draining profile listing one": func(p *DispatchProfile) {
-			p.DrainingUntil = time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
-		},
-	} {
-		c := validDispatchConfig()
-		c.Profiles = append([]DispatchProfile(nil), c.Profiles...)
-		edit(&c.Profiles[0])
-		if err := c.Validate(); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
-	}
-	draining := validDispatchConfig()
-	draining.Profiles = append([]DispatchProfile(nil), draining.Profiles...)
-	draining.Profiles[0].Durables = nil
-	draining.Profiles[0].DrainingUntil = time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
-	if err := draining.Validate(); err != nil {
-		t.Errorf("a draining profile with no durables: %v", err)
-	}
-}
-
-// A Job template reference may carry only its hash: the name is the
-// profile's own param's, which the dispatcher refuses to look past anyway.
-func TestAJobTemplateRefMayCarryOnlyItsHash(t *testing.T) {
-	c := validDispatchConfig()
-	c.Profiles = append([]DispatchProfile(nil), c.Profiles...)
-	c.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{Hash: "abc123"}
-	if err := c.Validate(); err != nil {
-		t.Fatalf("a hash-only ref: %v", err)
-	}
-	if got := c.Profiles[0].JobTemplateRef.NameFor("tse"); got != DispatchJobTemplateName("tse") {
-		t.Errorf("a hash-only ref names %q; want %q", got, DispatchJobTemplateName("tse"))
-	}
-	named := &DispatchJobTemplateRef{Name: "kube-agents-dispatch-job-profile-tse", Hash: "abc123"}
-	if got := named.NameFor("tse"); got != named.Name {
-		t.Errorf("a named ref names %q; want %q", got, named.Name)
-	}
-	c.Profiles[0].JobTemplateRef = &DispatchJobTemplateRef{}
-	if err := c.Validate(); err == nil {
-		t.Error("a ref with no hash was accepted")
-	}
-}
-
 // The durables the operator creates (its fixture, written by the operator's
 // TestTheDispatchDurablesFixture) are the ones this package derives: the
 // operator can't import lib, so this is what holds the two derivations equal.

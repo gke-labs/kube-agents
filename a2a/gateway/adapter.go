@@ -99,8 +99,8 @@ type InboundMessage struct {
 	// message of its own: MessageID then names the click (the audit chain's
 	// join), not a message anything can be drawn on. A chain a click starts
 	// carries its mark on the conversation's previous ask instead (mark.go).
-	// False for a typed message, and for every backend but Slack and Google
-	// Chat.
+	// False for a typed message, and for every backend but Slack, Google
+	// Chat and Teams.
 	Click bool
 	// Answer marks a typed message that answers a question the conversation
 	// has open (one the adapter laid out with choices). Like a click, it
@@ -135,6 +135,15 @@ type InboundMessage struct {
 	// name, so nothing is addressed to a name that is not a user's; empty
 	// on a typed message, and on every backend but Google Chat.
 	Viewer string
+
+	// capRetry is set by the gateway, never an adapter: the id of one try
+	// of a session-cap waiter (session_cap_queue.go), the parked turn
+	// re-delivered to try for a slot again. Zero on every message a backend
+	// delivers. capReplay marks any message the line delivers again, the
+	// parked turn and the follow-ups behind it, which were counted as
+	// inbound when they first arrived.
+	capRetry  uint64
+	capReplay bool
 }
 
 // IntentCancel stops the conversation's running
@@ -306,6 +315,37 @@ type LineAnswerer interface {
 	AnswersOnLine(conversation string) bool
 }
 
+// WholeLineAnswerer is a LineAnswerer that takes a completed task's whole
+// answer on the task's live message when it fits one piece (PieceSizer):
+// the line becomes the answer, in place of a post under a bare mark. Teams
+// implements it: it draws no reaction, so without it every direct answer
+// sits under a card holding ✅ alone. An answer past the piece size posts
+// as on any backend, and the line ends as lineDoneMark. An edit raises no
+// notification where a post does; a backend takes that trade knowingly.
+type WholeLineAnswerer interface {
+	AnswersWholeOnLine(conversation string) bool
+}
+
+// PieceSizer names the most bytes one post or edit to conversation carries
+// A backend that does not implement it takes discordChunk, Discord's cap,
+// which every other backend fits under; one whose cap is far above it
+// (Teams, 28 KiB an activity) says so, and a table that fits one card is not
+// cut into two. The relay splits posts at it (Gateway.post) and truncates
+// line edits to it; the notifier splits home and conversation posts at it.
+type PieceSizer interface {
+	PieceSize(conversation string) int
+}
+
+// pieceSizeOf is the backend's PieceSize for conversation, or discordChunk.
+func pieceSizeOf(a any, conversation string) int {
+	if sizer, ok := a.(PieceSizer); ok {
+		if n := sizer.PieceSize(conversation); n > 0 {
+			return n
+		}
+	}
+	return discordChunk
+}
+
 // OutMessage is one post or edit as a value: the text, and the chat message
 // that lays the same content out (spec-a2a-payloads.md, "Chat messages").
 type OutMessage struct {
@@ -343,8 +383,9 @@ type OutMessage struct {
 // ErrTextOnly is a backend's answer to a message value with a chat message
 // when it renders none: Discord, the inject door, the console and the A2A
 // door. The gateway posts the text instead, so every one of them posts
-// exactly what it posted before chat messages existed. Slack and Google
-// Chat render one (slack_chat.go, gchat_chat.go).
+// exactly what it posted before chat messages existed. Slack, Google Chat
+// and Teams render one (slack_chat.go, gchat_chat.go, teams_chat.go); Teams
+// with its cards turned off answers as these do.
 var ErrTextOnly = errors.New("this backend posts text only")
 
 // ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
@@ -735,6 +776,12 @@ type ConversationState struct {
 	// record, so it costs no stream read. Only the inject door's read
 	// route carries it, for a harness grading which agent a turn chose.
 	ChildAddressees []string
+	// ChildCount is how many child tasks the chain minted under TaskID's
+	// root (chainChildCount): every delegation, so it counts the repeats
+	// ChildAddressees names once. Zero when the chain delegated nothing,
+	// nil when the task is unknown. Read from the record, and carried only
+	// by the inject door's read route, like ChildAddressees.
+	ChildCount *int
 }
 
 // chainUsageKey marks a probe's context as asking for

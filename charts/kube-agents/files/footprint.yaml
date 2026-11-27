@@ -219,6 +219,23 @@ operatorRendered:
     ephemeralStorageBytesLimit: 67108864
     pods: 1
     surges: false
+  a2aMcp:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+      ephemeral-storage: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+      ephemeral-storage: 64Mi
+    cpuMillisRequest: 100
+    cpuMillisLimit: 500
+    memoryBytesRequest: 134217728
+    memoryBytesLimit: 268435456
+    ephemeralStorageBytesRequest: 67108864
+    ephemeralStorageBytesLimit: 67108864
+    pods: 1
+    surges: false
   a2aProvision:
     requests:
       cpu: 50m
@@ -279,3 +296,19 @@ operatorRenderedPerReplica:
     ephemeralStorageBytesLimit: 1140850688
     pods: 1
     maxSessionsDefault: 10
+  teamsInboundReceiver:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+      ephemeral-storage: "0"
+    limits:
+      cpu: 200m
+      memory: 128Mi
+      ephemeral-storage: "0"
+    cpuMillisRequest: 50
+    cpuMillisLimit: 200
+    memoryBytesRequest: 67108864
+    memoryBytesLimit: 134217728
+    ephemeralStorageBytesRequest: 0
+    ephemeralStorageBytesLimit: 0
+    pods: 1

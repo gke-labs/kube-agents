@@ -3,6 +3,7 @@
 import atexit
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -157,6 +158,51 @@ atexit.register(shutil.rmtree, _INSTALLER_REPORT_DIR, ignore_errors=True)
 #: of the report files.
 UNINSTALL_LOCK_FILE_ENV = "KUBE_AGENTS_UNINSTALL_LOCK_FILE"
 UNINSTALL_LOCK_FILE_NAME = "kube-agents-uninstall.lock"
+
+
+# For the token renewers in hack/ci-eval-pr.sh (test_ci_eval_ledger_mint,
+# test_ci_eval_gitops_write_token). How long the stalled renewal write holds, and how long after the stop the test
+# looks again: longer than the stall, so a write the stop left running has landed.
+RENEWAL_WRITE_STALL_SECONDS = 0.5
+RENEWAL_AFTER_STALL_SECONDS = 1.0
+# The renewer's umask, made to hold while STALL exists: its renewal write is then
+# under way (STALLED says so) for as long as the test needs to stop it there.
+STALLED_RENEWAL_WRITE = """\
+umask() {
+  if [ -e "${STALL}" ]; then
+    : > "${STALLED}"
+    command sleep "${WRITE_STALL_SECONDS}"
+  fi
+  builtin umask "$@"
+}
+"""
+
+# A renewer tick long enough to tell a stop that ends the nap from one that waits
+# it out or leaves it running, and the bound the whole run must finish inside:
+# a nap left behind holds the run's output open until the tick ends.
+RENEWAL_NAP_TICK_SECONDS = 20
+RENEWAL_NAP_STOP_BOUND_SECONDS = 10
+# How long the test waits before it stops, so the renewer is in its nap.
+RENEWAL_NAP_SETTLE_SECONDS = 0.5
+# Static checks for bash 5.2 signal-unsafe constructs inside a TERM-trapped renewer
+# subshell and its callees: command/process substitutions and loop jumps.
+RENEWAL_SUBSTITUTION_RE = re.compile(r"\$\((?!\()|`|<\(|>\(")
+RENEWAL_UNCLOSED_ARITHMETIC_RE = re.compile(r"\$\(\((?!.*\)\))")
+RENEWAL_LOOP_JUMP_RE = re.compile(r"\b(?:continue|break)\b")
+
+
+def find_renewal_trap_offenders(scopes):
+    """Returns a list of bash 5.2 signal-unsafe constructs in (scope, text) pairs."""
+    offenders = []
+    for scope, text in scopes:
+        for number, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if RENEWAL_SUBSTITUTION_RE.search(line) or RENEWAL_UNCLOSED_ARITHMETIC_RE.search(line):
+                offenders.append(f"{scope}:{number} (substitution): {line.strip()}")
+            if RENEWAL_LOOP_JUMP_RE.search(line):
+                offenders.append(f"{scope}:{number} (loop jump): {line.strip()}")
+    return offenders
 
 
 def installer_report_env():

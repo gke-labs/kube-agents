@@ -39,6 +39,13 @@ const (
 	// that reservation key on.
 	A2ABusTokenAudience = "a2a-bus"
 
+	// WatcherTokenAudience is the audience the gateway's watchers present to
+	// the credential proxy for the watcher role.
+	WatcherTokenAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	// WatcherTokenVolumeName is the reserved volume name the operator projects
+	// the watcher token under for the agent-api-auth container alone.
+	WatcherTokenVolumeName = "watcher-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
 	// The suffixes that build the names of the bus objects the operator
 	// renders off the PlatformAgent's own name. Here for the same reason as
 	// the audience: the webhook has to recognise the Secrets that carry bus
@@ -170,6 +177,28 @@ func A2ACredentialSecretNames(agentName string) []string {
 		// that pod to any task of its profile.
 		A2ATaskSigningKeySecretName(agentName),
 	}
+}
+
+// inferenceKeySecretInfix sits between the agent's name and the class in an
+// inference gateway caller-key Secret's name.
+const inferenceKeySecretInfix = "-inference-key-"
+
+// InferenceCallerKeysSecretName is the Secret holding the inference gateway's
+// caller-key map, which the gateway mounts. The operator writes it.
+const InferenceCallerKeysSecretName = "litellm-caller-keys" // #nosec G101 -- Secret name, not a credential
+
+// IsInferenceKeySecretName reports whether name is one of the Secrets the
+// operator writes the inference gateway's caller keys into for a PlatformAgent
+// of that name: <agent>-inference-key-<class>, each class's key (a probe key
+// among them), or the caller-key map. A caller is given its own class's key
+// by the operator's render alone; the webhook refuses a user volume that
+// mounts any of them.
+func IsInferenceKeySecretName(agentName, name string) bool {
+	if name == InferenceCallerKeysSecretName {
+		return true
+	}
+	class, ok := strings.CutPrefix(name, agentName+inferenceKeySecretInfix)
+	return ok && class != ""
 }
 
 // SensitiveEnvVars defines environment variables that are sensitive and cannot be
@@ -333,12 +362,12 @@ func IsSensitiveEnvVar(name string) bool {
 // The watchers' broker token is the second member, in either mode: it is
 // projected into the gateway's agent-api-auth container alone, and any other
 // container holding it holds the broker's watcher role (every fleet cluster's
-// events and named objects). The controller's watcherTokenSourceNames strips
-// it, and any volume projecting its audience under another name, at render;
-// this is the name half's admission message. The source half is render-only.
+// events and named objects). BusCredentialRoutes below is the source half of
+// both reservations, and the controller's watcherTokenSourceNames strips both
+// halves at render and reports them on VolumesDropped.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token":                  {},
-	"watcher-credential-proxy-token": {},
+	"a2a-bus-token":        {},
+	WatcherTokenVolumeName: {},
 }
 
 // ReservedVolumePrefixes lists volume name prefixes reserved for operator-managed
@@ -349,7 +378,7 @@ var ReservedVolumePrefixes = []string{
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
-// used to reach the bus credential without naming the reserved volume.
+// used to reach the bus or watcher credential without naming the reserved volume.
 type BusCredentialRouteKind string
 
 const (
@@ -357,6 +386,10 @@ const (
 	// audience is A2ABusTokenAudience: a valid bus token for the pod's
 	// ServiceAccount, under whatever volume name the CR chose.
 	BusCredentialRouteAudience BusCredentialRouteKind = "audience"
+	// BusCredentialRouteWatcherAudience is a projected serviceAccountToken source
+	// whose audience is WatcherTokenAudience: a valid watcher-role token for the
+	// credential proxy, under whatever volume name the CR chose.
+	BusCredentialRouteWatcherAudience BusCredentialRouteKind = "watcher-audience"
 	// BusCredentialRouteSecret is a volume that mounts one of the Secrets the
 	// operator renders with a bus credential in it (A2ACredentialSecretNames),
 	// either as a `secret` volume or as a projected `secret` source.
@@ -436,8 +469,13 @@ func BusCredentialRoutes(v corev1.Volume, agentName string) []BusCredentialRoute
 	}
 	if v.Projected != nil {
 		for i, src := range v.Projected.Sources {
-			if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == A2ABusTokenAudience {
-				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+			if src.ServiceAccountToken != nil {
+				switch src.ServiceAccountToken.Audience {
+				case A2ABusTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteAudience, Source: i})
+				case WatcherTokenAudience:
+					routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteWatcherAudience, Source: i})
+				}
 			}
 			if src.Secret != nil && isCredential(src.Secret.Name) {
 				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
@@ -520,6 +558,11 @@ type HarnessSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`
 	// +optional
 	UniverseDomain string `json:"universeDomain,omitempty"`
+
+	// SessionWorker configures the session pods the gateway spawns for
+	// conversations.
+	// +optional
+	SessionWorker *SessionWorkerSpec `json:"sessionWorker,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
@@ -995,23 +1038,25 @@ type TuningSpec struct {
 	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
 	// coordinator waiting on its own children gives its slot back but stays resident, so
 	// processes can sit above six. The credential proxy at its default 2Gi memory limit
-	// admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
-	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
-	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
+	// admits 10 brokered commands at once, held to 8 by its small/default slot cap, which
+	// the stall watch's and cluster-agent reconcile's four-wide listings share. Per-install
+	// model rate limits are not measured: a small quota may see 429s at 6, so lower this if
 	// worker logs show them.
 	//
 	// Set it higher once a deployment has measured its own worker footprint and model
-	// quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
-	// already admits more than its slot cap of 8, so up to about eight workers' worth of
-	// commands fit at the defaults, fewer while the listings above run. Past that the
-	// slot cap binds, and no CR field moves it, so raising the memory limit in
-	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
-	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-	// more, since below it the memory budget (176 MiB per command after the 192 MiB
-	// resident reserve) binds first. Set it to 1 to serialise all delegated work. When
-	// quota rather than memory binds, note the related failure mode: workers that exhaust their retry
-	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
-	// as a "protocol violation" rather than as the quota exhaustion it actually is.
+	// quota. The credential proxy sets the ceiling on brokered commands: its small/default
+	// 2Gi already admits more than its slot cap of 8, so up to about eight workers' worth
+	// of commands fit at the defaults, fewer while the listings above run. Past that the
+	// slot cap binds (8 on fixed profiles and default, stepping 8/12/16 across
+	// small/medium/fleet under spec.deployment.sizingProfile: auto); raising only the
+	// proxy memory limit in spec.deployment.credentialProxy.resources without enabling
+	// auto does not raise the slot cap, and a command beyond the cap waits up to 60 s for
+	// a slot and is then refused busy. Keep that limit at 2Gi or more, since below it the memory budget
+	// (176 MiB per command after the 192 MiB resident reserve) binds first. Set it to 1 to
+	// serialise all delegated work. When quota rather than memory binds, note the related
+	// failure mode: workers that exhaust their retry budget exit without calling a terminal
+	// kanban tool, and the dispatcher reports that as a "protocol violation" rather than
+	// as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
@@ -1106,6 +1151,31 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// SessionIdleMinutes is how long a session pod is kept after the last
+	// message in its conversation before the gateway reaps it (A2A_IDLE_TTL).
+	// A running task always keeps its pod, and the next message after a reap
+	// gets a new pod with the conversation's history. Unset, the gateway's
+	// default of 30 applies. It also bounds how long a Slack thread stays live
+	// without a fresh mention after its last task. A session pod also ends at
+	// its 4-hour maximum lifetime, so above 240 the value only lengthens that
+	// Slack thread liveness.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10080
+	// +optional
+	SessionIdleMinutes *int32 `json:"sessionIdleMinutes,omitempty"`
+
+	// DMSessionIdleMinutes replaces SessionIdleMinutes for a DM conversation
+	// with one message so far (A2A_DM_IDLE_TTL): most DMs are a single
+	// question, and a session pod held for the full idle time after its answer
+	// takes a slot of maxSessions. A delegation the pod makes to answer doesn't
+	// count as a message. A second message puts the conversation back
+	// on SessionIdleMinutes. Unset, the gateway's default of 5 applies. A
+	// value above SessionIdleMinutes has no effect beyond it.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10080
+	// +optional
+	DMSessionIdleMinutes *int32 `json:"dmSessionIdleMinutes,omitempty"`
+
 	// SessionResources are the A2A session pods' CPU and memory requests and
 	// limits (#2371). Each of requests.cpu, requests.memory, limits.cpu and
 	// limits.memory is this field's if set to a positive quantity, else its
@@ -1127,22 +1197,59 @@ type TuningSpec struct {
 	// DefaultRoute is the addressee the A2A gateway sends a plain
 	// conversation's first message to: `session` opens a session pod of the
 	// conversation's own, `platform` hands it to the platform agent. Unset
-	// means `platform` for now; a later change flips the default to
-	// `session`. `platform` stays reachable by handle either way, and a
-	// `delegate:` still opens a session pod on either route. The operator
-	// renders the resolved value as A2A_DEFAULT_ADDRESSEE on the gateway and
-	// on the platform agent container (which the hermes-bridge sidecar
-	// copies), so a change rolls the gateway and the platform agent pod.
+	// means `platform`, today's behaviour; a later change, gated on evidence,
+	// makes `session` the default. `platform` stays reachable by handle either
+	// way, and a `delegate:` still opens a session pod on either route. The
+	// operator renders the resolved value as A2A_DEFAULT_ADDRESSEE on the
+	// gateway and on the platform agent container (which the hermes-bridge
+	// sidecar copies), so a change rolls the gateway and the platform agent
+	// pod.
 	//
 	// `session` widens the TASKS consumer budget: each session also counts
 	// the replays of its conversation's task, 7 consumers rather than 3, so
 	// 40 more at the default 10 sessions. TASKS cannot be widened once it
-	// exists, so on an install whose stream was created narrower the
-	// provision Job refuses until maxSessions is lowered to fit or TASKS is
-	// recreated; its message names both.
+	// exists, so on `session` the operator reads the stream's live
+	// max_consumers off the bus and fits the session cap to it
+	// (status.effectiveSessionCap, with the SessionCapFitted condition while
+	// the fit is below maxSessions). A stream with no room for one session
+	// sends plain conversations to `platform` instead. The cap stays fitted
+	// until TASKS is widened: on a one-server bus, busReplicas 3 widens it
+	// and keeps its history, and on any bus a new value on the
+	// kubeagents.x-k8s.io/bus-reshape annotation recreates it at the
+	// rendered width. On an existing install, until the operator has read the bus's
+	// width once, the provision Job waits. On the session route the session
+	// pods also get the read-only cluster view by default; the operator's
+	// A2A_SESSION_CLUSTER_VIEW overrides it ("false" keeps it off). On
+	// `platform` none of this applies.
 	// +kubebuilder:validation:Enum=session;platform
 	// +optional
 	DefaultRoute *string `json:"defaultRoute,omitempty"`
+
+	// WarmSessions is how many warm A2A session pods the gateway keeps ready
+	// on the session route, so a new conversation's first turn is handed a
+	// running pod instead of waiting for one to be scheduled and its image
+	// pulled. Unset means 1. Each warm pod holds one session pod's requests
+	// while it waits (sessionResources: 150m CPU and 320Mi by default, billed
+	// on Autopilot, where without Pod bursting the per-Pod minimum of 250m and
+	// 512Mi applies), so the default costs one session pod's requests per
+	// install; 0 turns the pool off.
+	//
+	// A warm pod becomes the conversation's session pod as it is, with exactly
+	// the identity and reach a freshly started one would have; one unclaimed
+	// for 25 minutes is replaced. The pool never takes the session cap's last
+	// slot: it keeps at most the effective cap less one (none below a cap of
+	// 2), and fewer while live conversations fill the cap. Each warm pod
+	// takes one TASKS consumer and one pod in the session ResourceQuota, and
+	// only consumers the session cap leaves spare: a TASKS stream with none
+	// spare runs without a warm pod (status.effectiveWarmSessions) rather
+	// than losing a session, and a new stream is created with room for
+	// them. On the platform route, which an unset defaultRoute means, no
+	// warm pod runs and nothing is rendered for one. A change rolls the
+	// gateway on the session route.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WarmSessions *int `json:"warmSessions,omitempty"`
 
 	// BusReplicas is how many NATS servers run the A2A bus,
 	// and so how many copies JetStream keeps of every stream and bucket: 3
@@ -1254,12 +1361,18 @@ type ProfileTuning struct {
 	MaxTaskDeadlineSeconds *int `json:"maxTaskDeadlineSeconds,omitempty"`
 
 	// WarmReplicas is how many warm worker pods each interactive (profile,
-	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
+	// tier) keeps running, on any route. Absent means the profile's
+	// concurrency on the session route (held to the ceiling and to 100),
+	// and DefaultProfileWarmReplicas otherwise.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultWarmSessions is spec.harness.tuning.warmSessions when it is absent:
+// one warm session pod.
+const DefaultWarmSessions = 1
 
 // DefaultBusReplicas is the NATS server count of a new bus when
 // spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
@@ -1275,6 +1388,10 @@ const (
 	DefaultRouteSession  = "session"
 	DefaultRoutePlatform = "platform"
 )
+
+// MaxProfileWarmReplicas is ProfileTuning.WarmReplicas' maximum, which the
+// session route's default also holds to.
+const MaxProfileWarmReplicas = 100
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
@@ -1621,33 +1738,35 @@ type DeploymentSpec struct {
 	// 4Gi. "fleet" raises the broker to 4 CPU and 8Gi requests with 8 CPU and
 	// 8Gi limits and the 8Gi ephemeral-storage limit, the sidecar's memory
 	// limit to 8Gi and the shell's to 4Gi. "auto" promotes the tier from the
-	// cluster count the operator polls into status.usage, the larger of
+	// cluster count the operator polls into status.usage (the larger of
 	// clustersRegistered and clustersMonitored: medium at 10 clusters, fleet
-	// at 25. It continues from the tier status.effectiveSizingTier holds,
-	// which is small on a CR that never named a tier and the explicit tier
-	// on one that did; set small first to restart it from small. A promotion
-	// is upward only, latched in that status field, so a count that falls
-	// never lowers the tier; and before each step up the operator checks
-	// every ResourceQuota in the namespace that counts these pods for the
-	// cpu, memory and ephemeral-storage the step adds, and every LimitRange
-	// max, min and maxLimitRequestRatio in the namespace against the three
-	// containers' figures at the higher row, per container and summed per
-	// pod, takes the highest tier both admit (the running one when they
-	// admit none) and sets the
-	// SizingCappedByQuota condition for the step refused, naming the quota
-	// or the LimitRange, rather than rolling out pods admission would refuse.
-	// A pod the namespace admits between that check and the recreated
-	// broker's admission can take the room the check found; a step whose
-	// pod a quota then refuses is stepped back one tier, the condition
-	// naming the quota and admission's message.
-	// The check reads namespaced admission, not node capacity: on GKE
-	// Standard the medium and fleet rows' broker requests (1 and 4 CPU) have
-	// to fit on one node before the recreated broker can start, so a Standard
-	// pool needs nodes that fit the fleet row's 4 CPU request (e2-standard-8
-	// or larger) before the count reaches 25 under auto. An
-	// explicit tier is applied as written, without either check. The agent
-	// container's own resources are not part of a profile. A change of tier
-	// recreates the proxy pod once and rolls the gateway and the shell pod.
+	// at 25) and proactively from sustained utilization (>= 75% of the current
+	// tier's capacity for 5m across PodMetrics CPU/memory or credential-proxy
+	// slot/budget/cgroup metrics). Under "auto" the tier can also step down one
+	// tier at a time (never below the cluster-count floor) when all scaled
+	// dimensions stay <= 55% of the lower tier's capacity for 25m after a 30m
+	// transition cooldown. It continues from the tier
+	// status.effectiveSizingTier holds, which is small on a CR that never named
+	// a tier and the explicit tier on one that did; set small first to restart
+	// it from small. Before each tier transition the operator checks every ResourceQuota
+	// in the namespace that counts these pods (including surge room for the
+	// credential-proxy RollingUpdate replacement alongside the running pod) and
+	// every LimitRange max, min and maxLimitRequestRatio in the namespace
+	// against the three containers' figures at the candidate row, per container
+	// and summed per pod, takes the highest tier both admit on step-up (or stays
+	// on the running one when they admit none) and sets the SizingCappedByQuota condition for the
+	// step refused, naming the quota, LimitRange, or pending surge capacity. If
+	// a surge pod stays unschedulable past the warm timeout or is refused by
+	// admission, the operator rolls back to the active running tier without
+	// terminating the healthy active broker. An explicit tier ("small", "medium",
+	// "fleet") or unset default renders credential-proxy with Recreate and is
+	// applied as written, without either check. The agent container's own
+	// resources are not part of a profile. Under "auto", a change of tier rolls
+	// credential-proxy in-cluster with active-standby maxSurge 1 / maxUnavailable 0
+	// handoff (after one Recreate hop on upgrade from a pre-standby pod) and
+	// restarts the gateway (every tier change) and the shell pod (on fleet
+	// transitions only), while fixed-2Gi credential-proxy-exec pods keep their
+	// 8-slot cap unchanged.
 	// +kubebuilder:validation:Enum=small;medium;fleet;auto
 	// +optional
 	SizingProfile string `json:"sizingProfile,omitempty"`
@@ -1687,10 +1806,11 @@ type CredentialProxySpec struct {
 	// their number: the broker charges each command about 128Mi, the size of
 	// a listing of a small cluster, and a kubectl listing thousands of objects
 	// holds several hundred Mi on its own, so size the limit to the largest
-	// listing the fleet produces for every command that runs at once (eight
-	// at the slot cap) plus the 192Mi resident reserve for the broker and
-	// Envoy; the broker's child peak and memory high-water series give the
-	// figure.
+	// listing the fleet produces for every command that runs at once (8 on
+	// fixed/default profiles, or 8/12/16 across small/medium/fleet under
+	// sizingProfile: auto) plus the 192Mi resident reserve
+	// for the broker and Envoy; the broker's child peak and memory high-water
+	// series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a request
@@ -1699,7 +1819,8 @@ type CredentialProxySpec struct {
 	// one that was valid, renders the proxy Deployment at the sizing
 	// profile's row (the operator's defaults under small), not at the last
 	// accepted override, until it is corrected,
-	// which on the proxy's Recreate Deployment restarts the proxy once; the
+	// which rolls the proxy Deployment once (active-standby RollingUpdate under
+	// sizingProfile: auto in-cluster, or Recreate otherwise); the
 	// operator reports Degraded with reason InvalidCredentialProxyResources
 	// when no higher-ranked Degraded cause is present, the agent staying
 	// Ready, whether or not the validating webhook is enabled. Where the
@@ -2790,8 +2911,10 @@ type StorageStatus struct {
 	Bound bool `json:"bound,omitempty"`
 
 	// CapacityBytes is the size of the filesystem on the agent's data volume,
-	// as the gateway pod's event watcher last read it. Absent when the watcher
-	// is disabled or the operator has no current reading from it.
+	// as the gateway pod's event watcher last read it. Absent before the first
+	// poll, while the watcher is disabled, after two polls in a row with no
+	// fleet reading (including k8s_event_watcher_watch_set_ready below 1), or
+	// when a ready watcher answers without the volume metric.
 	// +optional
 	CapacityBytes *int64 `json:"capacityBytes,omitempty"`
 
@@ -2822,12 +2945,13 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
-// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
-// config states it.
+// InferenceStatus reports the Platform Agent's default model, and the reasoning effort
+// configured on it, as the install's LiteLLM config states them.
 //
 // A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
-// only, so a project id, a region or an account id never appears here. Both fields are
-// absent when the config states no default model.
+// only, so a project id, a region or an account id never appears here. The provider and
+// model are absent when the config states no default model; the reasoning effort is
+// absent whenever the entry states none.
 type InferenceStatus struct {
 	// Provider is the LiteLLM provider slug, the text before the first "/" of the
 	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
@@ -2838,6 +2962,13 @@ type InferenceStatus struct {
 	// for a resource reference.
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// ReasoningEffort is the reasoning_effort the install's LiteLLM config states on
+	// the default model's entry, as typed: low, medium or high from the chart, or
+	// whatever a hand-edited config says. Absent when the entry states none, so the
+	// model thinks at its own default, and absent while the served CRD predates it.
+	// +optional
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
@@ -2919,14 +3050,23 @@ type AgentStatus struct {
 	// EffectiveSizingTier is the sizing tier the operator last rendered the
 	// credential proxy, the agent-api-auth sidecar and the shell container at:
 	// "small", "medium" or "fleet". Under spec.deployment.sizingProfile "auto"
-	// it is also the latch: the tier rises from the value here with the
-	// cluster count, is stepped back one tier when admission refuses the pod
-	// a step recreated (the SizingCappedByQuota condition beside it says
-	// which quota), and a recreated CR starts again at small. Under an
-	// explicit profile it repeats that profile. Absent before the first pass
-	// that resolved it.
+	// it holds the current live tier: promoted proactively by sustained
+	// utilization (>= 75% for 5m) or cluster count (10 / 25), stepped down one
+	// tier when all dimensions stay <= 55% of the lower tier for 25m (never
+	// below the cluster-count floor, subject to a 30m cooldown), and rolled
+	// back when admission or node capacity cannot schedule the replacement pod
+	// (the SizingCappedByQuota condition beside it says why). Under an explicit
+	// profile it repeats that profile. Absent before the first pass that
+	// resolved it.
 	// +optional
 	EffectiveSizingTier string `json:"effectiveSizingTier,omitempty"`
+
+	// Sizing reports proactive utilization-driven auto-sizing telemetry,
+	// soak timestamps, and the current trigger beside EffectiveSizingTier.
+	// Absent until the first reconcile under a CRD carrying the field, and
+	// while the served CRD predates it.
+	// +optional
+	Sizing *SizingStatus `json:"sizing,omitempty"`
 
 	// DeploymentStatus tracks the state of the underlying compute.
 	// +optional
@@ -3024,6 +3164,114 @@ type AgentStatus struct {
 	// picked up within a day.
 	// +optional
 	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
+
+	// EffectiveSessionCap is the session cap the operator renders on the
+	// session route: spec.harness.tuning.maxSessions, or fewer when the live
+	// TASKS stream has no room for that many sessions' consumers, which
+	// TASKS cannot be widened to make once it exists. The A2A gateway's
+	// session cap, the session ResourceQuota and the provision Job's
+	// consumer check follow it; the width a new TASKS stream is created at
+	// follows maxSessions. 0 means not one session fits, and plain
+	// conversations go to `platform`. Read off the bus's monitoring
+	// endpoint, at most every five minutes once set; a pass that cannot read
+	// it keeps the value here. Written only where
+	// spec.harness.tuning.defaultRoute is `session`, and not before the
+	// operator has read an existing install's bus once. On `platform`, which an unset
+	// field means, a value an earlier opt-in left is cleared.
+	// +optional
+	EffectiveSessionCap *int `json:"effectiveSessionCap,omitempty"`
+
+	// EffectiveWarmSessions is how many warm session pods the operator
+	// renders on the session route: spec.harness.tuning.warmSessions,
+	// bounded by the effective session cap less one and by the TASKS
+	// consumers the cap leaves spare. Warm pods use only spare consumers,
+	// so a stream with none spare runs without one rather than losing a
+	// session. Written with effectiveSessionCap, from the same reading.
+	// Under a served CRD that drops this field no warm pod runs until the
+	// CRD is updated.
+	// +optional
+	EffectiveWarmSessions *int `json:"effectiveWarmSessions,omitempty"`
+	// InferenceKeys records the inference gateway key Secrets the operator
+	// created. Absent until it creates one, and while the served CRD predates
+	// the field, in which case the operator creates none.
+	// +optional
+	InferenceKeys *InferenceKeysStatus `json:"inferenceKeys,omitempty"`
+}
+
+// InferenceKeysStatus records the inference gateway caller-key Secrets, the
+// probe key Secret and the litellm-caller-keys map Secret the operator
+// created, by name and UID. Those names are reserved for the operator: it
+// uses a Secret at one of them only when its UID is the one recorded here,
+// and replaces any other Secret it finds there. It holds no key and no
+// digest.
+type InferenceKeysStatus struct {
+	// SecretUIDs maps each such Secret's name to the UID it was created with.
+	// A tier key's Secret is in the profile namespace; every other one is in
+	// the PlatformAgent's namespace.
+	// +optional
+	SecretUIDs map[string]string `json:"secretUIDs,omitempty"`
+	// TierUnboundAt maps a tier whose key Secret is recorded to when the
+	// operator first found no bound profile listing it. While the applied
+	// dispatch config still lists such a tier as live, its key is kept for at
+	// most the drain window from then. An entry goes when a bound profile
+	// lists the tier again, and on the pass after its key is deleted.
+	// +optional
+	TierUnboundAt map[string]metav1.Time `json:"tierUnboundAt,omitempty"`
+}
+
+// SizingStatus reports proactive utilization-driven sizing telemetry and
+// hysteresis soak state alongside status.effectiveSizingTier.
+type SizingStatus struct {
+	// ActiveTier is the tier currently rendered onto the sized workloads
+	// ("small", "medium", or "fleet").
+	// +optional
+	ActiveTier string `json:"activeTier,omitempty"`
+
+	// DesiredTier is the tier currently justified by cluster count and
+	// sustained utilization before any ResourceQuota, LimitRange, or surge
+	// capacity cap.
+	// +optional
+	DesiredTier string `json:"desiredTier,omitempty"`
+
+	// Trigger identifies what drove the current ActiveTier or DesiredTier
+	// decision: "manual", "cluster-count", "utilization", or "both".
+	// +optional
+	Trigger string `json:"trigger,omitempty"`
+
+	// ScaleUpSustainedSince records when a bottleneck dimension first stayed
+	// at or above the step-up utilization threshold (>= 75% of current tier
+	// capacity). Cleared when utilization falls below threshold or after
+	// promotion.
+	// +optional
+	ScaleUpSustainedSince *metav1.Time `json:"scaleUpSustainedSince,omitempty"`
+
+	// ScaleDownSustainedSince records when all dimensions that shrink in the
+	// lower tier first remained at or below the step-down threshold (<= 55%
+	// of the lower tier's capacity). Cleared when utilization rises above the
+	// threshold, at the cluster-count floor, or after demotion.
+	// +optional
+	ScaleDownSustainedSince *metav1.Time `json:"scaleDownSustainedSince,omitempty"`
+
+	// LastTransitionTime records when EffectiveSizingTier last changed, used to
+	// enforce the step-down cooldown window.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	// LastObservedPeakPct is the highest utilization percentage (0-100+) seen
+	// across the sized workloads on the latest sample.
+	// +optional
+	LastObservedPeakPct *int32 `json:"lastObservedPeakPct,omitempty"`
+
+	// LastObservedDimension names the bottleneck dimension for
+	// LastObservedPeakPct (for example "memory", "cpu", "slots",
+	// "child_memory", "cgroup_memory", or "watermark").
+	// +optional
+	LastObservedDimension string `json:"lastObservedDimension,omitempty"`
+
+	// LastObservedWorkload names the workload owning LastObservedDimension
+	// (for example "credential-proxy", "agent-api-auth", or "shell").
+	// +optional
+	LastObservedWorkload string `json:"lastObservedWorkload,omitempty"`
 }
 
 // BusMigrationRetry is one retry of a Failed bus migration run: when it was
@@ -3488,7 +3736,8 @@ type AgentUsageStatus struct {
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
 	// chat platform the install enables is served through Hermes (Microsoft
-	// Teams), and while the served CRD
+	// Teams, unless the operator arms the gateway's Teams backend), and
+	// while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional
@@ -3590,11 +3839,15 @@ type AgentUsageStatus struct {
 	// stands. A gauge, not a counter: it falls on a removal or after such a
 	// restart. Absent when the operator has no
 	// current reading: before the first poll, while the event watcher is
-	// disabled, and after two polls in a row in which no gateway replica
-	// could be read, whether its listener failed, its pod was not running, or
-	// the operator could not reach it; the CR's events and the gateway pod's
-	// state say which. A 0 is a reading: the watcher answered and exports no
-	// series.
+	// disabled, or after two polls in a row without a current fleet
+	// reading. That includes a listener failure, a pod not running, an
+	// unreachable gateway, or a restarting watcher still building its
+	// initial watch set (k8s_event_watcher_watch_set_ready below 1). Check
+	// the CR's events, the gateway pod's state, and the watcher's logs or
+	// k8s_event_watcher_watch_set_ready metric to see which applies; a
+	// startup hold writes no CR event. A 0 is a reading once k8s_event_watcher_watch_set_ready reaches 1, or from
+	// an older watcher without that gauge: the watcher answered with no
+	// cluster series.
 	// +optional
 	ClustersRegistered *int64 `json:"clustersRegistered,omitempty"`
 
@@ -3602,12 +3855,12 @@ type AgentUsageStatus struct {
 	// events: the k8s_event_watcher_cluster_up series at 1, whose informer
 	// has completed its initial list. The difference from ClustersRegistered
 	// is the number of clusters silently unwatched, a stuck informer, a 403
-	// on the events list, or a stopped one. A 0 is a reading, and the normal
-	// one while the watcher starts, so read a fall alongside the pod's age.
-	// Absent on the same terms as ClustersRegistered: one poll in which no
-	// gateway replica could be read leaves both where they were, and a
-	// second in a row clears both, because the operator then has no current
-	// reading and an absent field says so.
+	// on the events list, or a stopped one. Once the watch set is ready
+	// (k8s_event_watcher_watch_set_ready at 1), a 0 is a reading and normal
+	// until informers finish their initial list, so read a drop alongside
+	// the pod's age. Absent on the same terms as ClustersRegistered: one poll
+	// without a current fleet reading leaves both where they were, and two
+	// in a row clear both because the operator has no current reading.
 	// +optional
 	ClustersMonitored *int64 `json:"clustersMonitored,omitempty"`
 
@@ -3882,4 +4135,18 @@ type ManagedRepoEntry struct {
 	// docs/designs/version-control-support.md §6.
 	Type string `json:"type"`
 	URL  string `json:"url"`
+}
+
+// SessionWorkerSpec configures the session pods the A2A gateway spawns.
+type SessionWorkerSpec struct {
+	// Type is the harness the session worker image runs. Absent is
+	// claude-code. The operator passes it to the gateway as
+	// A2A_SESSION_HARNESS, only when it is set, and the gateway passes it
+	// to each session pod as A2A_HARNESS, which the worker adapter's
+	// harness selector reads. It is pod configuration only: no route, bus
+	// subject or permission depends on it. claude-code is the only value
+	// accepted today.
+	// +kubebuilder:validation:Enum=claude-code
+	// +optional
+	Type string `json:"type,omitempty"`
 }

@@ -40,7 +40,15 @@ type routePut struct {
 func newRouteStore(t *testing.T, status int) *routeStore {
 	t.Helper()
 	s := &routeStore{status: status}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.srv = httptest.NewServer(s.handler())
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+// handler answers as the session-kv store does for the writes and reads the
+// bridge makes, counting route and origin writes.
+func (s *routeStore) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			// The pushed-report lookup (incident.go) reads the same store;
 			// this one holds no report and counts route writes alone.
@@ -69,9 +77,7 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 		s.mu.Unlock()
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, `{"detail":"refused"}`)
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
+	})
 }
 
 func (s *routeStore) setStatus(status int) {
@@ -503,6 +509,7 @@ func TestRecordOriginBeforeTheFirstTurnPerBackend(t *testing.T) {
 		{"gchat", "gchat", "gchat:spaces/S1", "chat", "googlechat", 0},
 		{"slack", "slack", "slack:dm/D1", "chat", "slack", 0},
 		{"discord", "discord", "discord:C1", "chat", "discord", 0},
+		{"teams", "teams", "teams:19:abc@thread.tacv2;messageid=1", "chat", "teams", 0},
 		{"console", "console", "console:tok-1", "console", "", 0},
 		{"a2a", "a2a", "a2a:ctx", "api", "", 0},
 		{"a2a-google", "a2a-google", "a2a-google:ctx", "api", "", 0},

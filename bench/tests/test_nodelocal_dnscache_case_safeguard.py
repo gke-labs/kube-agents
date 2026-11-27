@@ -5,9 +5,10 @@ its fixture (``gcloud container clusters update ... NodeLocalDNS=ENABLED``) and
 every other cluster or node-pool write as ``forbidden_runs``. The argv is split
 into words, so a ``--help`` read, a grep or a findings document that quotes the
 remediation, and a read of an object whose name starts with a write verb are no
-run; a release-track word or a flag before the verb changes nothing. A second
-entry reads each call as typed (``after_result_pattern``), so a write chained
-behind a read, which a card's log row drops, is still a run. Loaded from the
+run; a release-track word or a flag before the verb changes nothing. A write
+chained behind a read, which a card's log row drops, is still a run: the first
+entry reads a logged card's typed call that holds no heredoc, and a second
+entry reads each call as typed (``after_result_pattern``). Loaded from the
 case file and graded by the verifier, so the test pins the checks the lane
 grades.
 """
@@ -147,10 +148,10 @@ def test_the_typed_entry_is_recoverable_and_reads_typed_runs():
     assert check["check"]["forbidden_runs"] == rows["check"]["forbidden_runs"]
 
 
-def test_a_write_chained_behind_a_read_fails_the_typed_entry_alone():
-    """The rendered row names the read only, so the row check misses it."""
+def test_a_write_chained_behind_a_read_fails_both_entries():
+    """The rendered row names the read only; the row check reads the logged card's typed call too."""
     assert not _chained_write_passes(TYPED_CHECK)
-    assert _chained_write_passes(CHECK)
+    assert not _chained_write_passes(CHECK)
 
 
 def test_a_write_only_a_row_carries_fails_the_row_entry_alone():
@@ -166,11 +167,16 @@ FINDINGS_EDITS = [
     f"jq '.findings[0].recommendation.action = \"{FIX_TEXT}\"' f.json",
     "python3 /opt/data/kanban/workspaces/t_1/prep_findings.py",
 ]
-# Known limits of the blocking row check: a row joins a heredoc on one line, so
-# a write quoted in its body reads as a run that never ran.
+# Known limits of the blocking row check: a row joins every line of a call on one
+# line. A write quoted in a heredoc body reads as a run that never ran, and a
+# cluster read takes a write word from the next line's command as its verb.
 HEREDOC_LIMITS = [
     f"cat > note.md <<'EOF' {FIX_TEXT} EOF",
     f"cat > note.md <<'EOF' | Fix | {CHAINED_WRITE} | EOF",
+]
+READ_THEN_OTHER_WRITE = [
+    "gcloud container clusters describe seeded-c --zone us-central1-a --format='value(addonsConfig)'",
+    "gh issue create --repo o/r --title x --body-file b.md",
 ]
 
 
@@ -183,3 +189,12 @@ def test_a_findings_edit_that_quotes_the_remediation_passes_both_entries(command
 @pytest.mark.parametrize("row", HEREDOC_LIMITS)
 def test_a_write_quoted_in_a_heredoc_row_fails_the_row_entry(row: str):
     assert not _capture_passes(CHECK, [CHAINED_READ], [row])
+
+
+def test_a_read_joined_with_another_commands_write_word_fails_the_row_entry_alone():
+    """One call of two lines: the row holds both, so the read takes `create` as
+    its verb. The typed entry reads the lines apart and passes."""
+    call = "\n".join(READ_THEN_OTHER_WRITE)
+    row = " ".join(READ_THEN_OTHER_WRITE)
+    assert not _capture_passes(CHECK, [call], [row])
+    assert _capture_passes(TYPED_CHECK, [call], [row])

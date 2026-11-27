@@ -305,18 +305,98 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
                 self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
         self.assertEqual(self.upstream_requests, [])
 
+    def metadata_call(self, tool, name, request_id=6):
+        return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {"name": tool, "arguments": {"name": name}}}
+
+    def test_a_metadata_tool_on_an_excluded_cluster_never_reaches_the_upstream(self):
+        import scope_exclude
+
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/scratch"),
+            self.metadata_call("get_node_pool", "projects/p/locations/us-east4/clusters/scratch/nodePools/default-pool"),
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "list_node_pools",
+                                                                            "arguments": {"parent": "projects/p/locations/us-east4/clusters/scratch"}}},
+            # One the broker can't tie to a cluster, while any is excluded.
+            self.metadata_call("get_cluster", "projects/p/locations/-/clusters/scratch"),
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/%73cratch"),
+            tools_call("get_cluster"),
+        ):
+            with self.subTest(message=message):
+                status, _, body = self._request(message=message)
+                self.assertEqual(status, 200)
+                reply = json.loads(body)
+                self.assertTrue(reply["result"]["isError"], reply)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
+        self.assertEqual(self.upstream_requests, [])
+
+    def hold(self, *clusters):
+        """Hold the handler to a hold.json holding these triples, and nothing excluded."""
+        import os
+        import tempfile
+
+        import scope_exclude
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        hold_file = os.path.join(directory.name, "hold.json")
+        with open(hold_file, "w", encoding="utf-8") as stream:
+            json.dump({"clusters": [
+                {"projectId": p, "location": l, "clusterName": c} for p, l, c in clusters]}, stream)
+        original = CredentialProxyHandler.__dict__.get("exclusions")
+        self.addCleanup(setattr, CredentialProxyHandler, "exclusions", original)
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(
+            path=lambda: "", holds=scope_exclude.Holds(path=lambda: hold_file))
+
+    def test_a_hold_refuses_in_cluster_tools_and_leaves_metadata_tools_alone(self):
+        import scope_exclude
+
+        self.hold(("p", "us-east4", "paused"))
+        status, _, body = self._request(message=self.k8s_call("projects/p/locations/us-east4/clusters/paused"))
+        reply = json.loads(body)
+        self.assertTrue(reply["result"]["isError"], reply)
+        self.assertIn(scope_exclude.RULE_HELD_CLUSTER, reply["result"]["content"][0]["text"])
+        self.assertEqual(self.upstream_requests, [])
+        status, _, body = self._request(
+            message=self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/paused"))
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("isError", json.loads(body).get("result", {}))
+        self.assertEqual(len(self.upstream_requests), 1)
+
+    def test_a_metadata_name_that_only_starts_like_another_cluster_is_refused(self):
+        import scope_exclude
+
+        self.exclude(("p", "us-east4", "scratch"))
+        for message in (
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/other/../scratch"),
+            self.metadata_call("get_node_pool", "projects/p/locations/us-east4/clusters/other/nodePools/../../scratch"),
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/other/nodePools/x"),
+        ):
+            with self.subTest(message=message):
+                _, _, body = self._request(message=message)
+                reply = json.loads(body)
+                self.assertTrue(reply["result"]["isError"], reply)
+                self.assertIn(scope_exclude.RULE_EXCLUDED_CLUSTER, reply["result"]["content"][0]["text"])
+        self.assertEqual(self.upstream_requests, [])
+
     def test_control_plane_tools_and_other_clusters_still_reach_the_upstream(self):
         self.exclude(("p", "us-east4", "scratch"))
         for message in (
             self.k8s_call("projects/p/locations/us-east4/clusters/other"),
-            tools_call("get_cluster"),
+            self.metadata_call("get_cluster", "projects/p/locations/us-east4/clusters/other"),
+            self.metadata_call("get_node_pool", "projects/p/locations/us-east4/clusters/other/nodePools/default-pool"),
+            # A field mask is not a resource name: the gke-reliability skill's call.
+            {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "get_cluster", "arguments": {
+                "name": "projects/p/locations/us-east4/clusters/other",
+                "readMask": "location,locations,nodePools.locations"}}},
             tools_call("list_clusters"),
         ):
             with self.subTest(message=message):
                 status, _, body = self._request(message=message)
                 self.assertEqual(status, 200, body)
                 self.assertNotIn("isError", json.loads(body).get("result", {}))
-        self.assertEqual(len(self.upstream_requests), 3)
+        self.assertEqual(len(self.upstream_requests), 5)
 
     def test_a_write_tool_never_reaches_the_upstream(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
@@ -429,6 +509,87 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         # The message itself reached the upstream: this is the relayed path,
         # not a refusal written through _json.
         self.assertEqual(1, len(self.upstream_requests))
+
+
+
+def _cluster(name, location="us-east4", project="p"):
+    # The gke server's shape (captured on a dev install, names redacted): each
+    # listed cluster is a JSON string, in content[].text and structuredContent.
+    return json.dumps({"name": name, "location": location, "status": "RUNNING",
+                       "selfLink": f"https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{name}"})
+
+
+def _listing_reply(key, items):
+    document = {key: items}
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+        "content": [{"type": "text", "text": json.dumps(document)}], "structuredContent": document}}).encode()
+
+
+class ListingReplyTest(unittest.TestCase):
+    """#7031: a gke listing's reply drops excluded clusters for the filtered callers.
+    It borrows McpRelayOverTheSocketTest's live relay and helpers, not its tests."""
+
+    _restore = staticmethod(McpRelayOverTheSocketTest._restore)
+    _request = McpRelayOverTheSocketTest._request
+    exclude = McpRelayOverTheSocketTest.exclude
+
+    def setUp(self):
+        McpRelayOverTheSocketTest.setUp(self)
+        original = credential_proxy.LISTING_FILTERED_ROLES
+        self.addCleanup(setattr, credential_proxy, "LISTING_FILTERED_ROLES", original)
+        # The platform agent's MCP children call as chat: option A's set.
+        credential_proxy.LISTING_FILTERED_ROLES = original | {credential_proxy.CALLER_ROLE_CHAT}
+
+    def listed(self, body, key):
+        result = json.loads(body)["result"]
+        text = json.loads(result["content"][0]["text"])[key]
+        structured = result["structuredContent"][key]
+        return [json.loads(i)["name"] for i in text], [json.loads(i)["name"] for i in structured]
+
+    def test_list_clusters_drops_an_excluded_cluster_in_both_places(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        self.reply["body"] = _listing_reply("clusters", [_cluster("scratch"), _cluster("prod"), _cluster("scratch", "us-west1")])
+        status, _, body = self._request(message=tools_call("list_clusters"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.listed(body, "clusters"), (["prod", "scratch"], ["prod", "scratch"]))
+
+    def test_list_operations_drops_operations_on_an_excluded_cluster(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        ops = [json.dumps({"name": n, "targetLink": f"https://container.googleapis.com/v1/projects/p/locations/us-east4/clusters/{c}"})
+               for n, c in (("op-1", "scratch"), ("op-2", "prod"),
+                            ("op-3", "scratch/nodePools/default-pool"))]
+        self.reply["body"] = _listing_reply("operations", ops)
+        status, _, body = self._request(message=tools_call("list_operations"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.listed(body, "operations"), (["op-2"], ["op-2"]))
+
+    def test_an_unreadable_listing_is_refused_while_any_is_excluded(self):
+        self.exclude(("p", "us-east4", "scratch"))
+        for body in (
+            b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"not json"}]}}',
+            _listing_reply("clusters", [json.dumps({"name": "x"})]),
+            # No recognised carrier: the list sits somewhere the filter doesn't read.
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"clusters": [_cluster("scratch")]}}).encode(),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).encode(),
+            # A carrier without the list key, in either place.
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+                "content": [{"type": "text", "text": json.dumps({"items": [_cluster("scratch")]})}]}}).encode(),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"items": [_cluster("scratch")]}}}).encode(),
+        ):
+            with self.subTest(body=body):
+                self.reply["body"] = body
+                status, _, _ = self._request(message=tools_call("list_clusters"))
+                self.assertEqual(status, 502)
+
+    def test_nothing_changes_with_nothing_excluded_or_for_an_unfiltered_caller(self):
+        body = _listing_reply("clusters", [_cluster("scratch")])
+        self.reply["body"] = body
+        status, _, out = self._request(message=tools_call("list_clusters"))
+        self.assertEqual((status, out), (200, body))
+        credential_proxy.LISTING_FILTERED_ROLES = frozenset()
+        self.exclude(("p", "us-east4", "scratch"))
+        status, _, out = self._request(message=tools_call("list_clusters"))
+        self.assertEqual((status, out), (200, body))
 
 
 if __name__ == "__main__":

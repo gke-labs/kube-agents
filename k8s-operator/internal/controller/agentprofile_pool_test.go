@@ -198,7 +198,7 @@ func TestWarmPoolsFollowTheProfilesInteractiveTiers(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: profilePoolName("auditor", "read")}, read); err != nil {
 		t.Fatalf("no warm pool for the read tier: %v", err)
 	}
-	if *read.Spec.Replicas != int32(resolveProfileWarmReplicas(agent)) || read.Spec.Template.Spec.ServiceAccountName != "agentprofile-auditor-read" {
+	if *read.Spec.Replicas != int32(resolveProfileWarmReplicas(agent, &profile)) || read.Spec.Template.Spec.ServiceAccountName != "agentprofile-auditor-read" {
 		t.Errorf("the read pool: replicas %d, serviceAccount %q", *read.Spec.Replicas, read.Spec.Template.Spec.ServiceAccountName)
 	}
 	if err := pool("unattended"); !apierrors.IsNotFound(err) {
@@ -578,5 +578,49 @@ func TestAProfilePastTheToolLimitGetsNoPoolWithoutImageVolumes(t *testing.T) {
 	}
 	if err := pool("big"); err != nil {
 		t.Errorf("with image volumes the profile got no pool: %v", err)
+	}
+}
+
+// TestEverySecretSourcedWorkerVariableIsNamedForTheWorker: a profile worker's
+// container takes no envFrom Secret, and every env entry it takes from a
+// Secret is named in envToolWithheld, so the worker withholds it from its
+// tools. Today it takes none; a Secret-sourced variable added later is named
+// by construction.
+func TestEverySecretSourcedWorkerVariableIsNamedForTheWorker(t *testing.T) {
+	agent := a2aTestAgent()
+	profile := testAgentProfile(agent.Namespace, "auditor")
+	for _, mode := range []profileWorkerMode{profileWorkerPool, profileWorkerOneShot} {
+		spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", mode, false)
+		for _, c := range append(slices.Clone(spec.InitContainers), spec.Containers...) {
+			for _, from := range c.EnvFrom {
+				if from.SecretRef != nil {
+					t.Errorf("container %s takes envFrom Secret %s, whose keys the worker can't be told", c.Name, from.SecretRef.Name)
+				}
+			}
+			listed := map[string]bool{}
+			for _, e := range c.Env {
+				if e.Name == envToolWithheld {
+					for _, n := range strings.Split(e.Value, ",") {
+						listed[n] = true
+					}
+				}
+			}
+			for _, e := range c.Env {
+				if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && !listed[e.Name] {
+					t.Errorf("container %s takes %s from a Secret without naming it in %s", c.Name, e.Name, envToolWithheld)
+				}
+			}
+		}
+	}
+	env := withToolWithheldList([]corev1.EnvVar{
+		{Name: "PLAIN", Value: "x"},
+		{Name: "ACME_DSN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "dsn"}}},
+		{Name: "ACME_ENDPOINT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "url"}}},
+	})
+	if last := env[len(env)-1]; last.Name != envToolWithheld || last.Value != "ACME_DSN,ACME_ENDPOINT" {
+		t.Errorf("rendered %+v; want %s=ACME_DSN,ACME_ENDPOINT", last, envToolWithheld)
+	}
+	if got := withToolWithheldList([]corev1.EnvVar{{Name: "PLAIN", Value: "x"}}); len(got) != 1 {
+		t.Errorf("a container with no Secret-sourced variable gained %d entries", len(got)-1)
 	}
 }

@@ -25,6 +25,10 @@
 # change only its own annotations and spec.integration.forges, repositories and
 # github on the PlatformAgent.
 #
+# And templates/agentschedule-builtin-admission-policy.yaml: only the operator may
+# make or unmake a built-in AgentSchedule (its origin: builtin label and controller
+# reference) or change a built-in's spec (spec.suspend excepted).
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -162,15 +166,15 @@ operator:
     enabled: true
   # The MCP server (<agent>-a2a-mcp), a Model Context Protocol endpoint that lets
   # an external coding agent or IDE talk to the install over its message bus.
-  # true sets A2A_MCP_DOOR=true on the controller manager, which then renders
-  # the server's Deployment, Service, deny-all ingress NetworkPolicy and
-  # bearer-token Secret beside every PlatformAgent it manages; the quota
-  # preflight counts its pod. Setting this back to false removes all of it, the
-  # token included. An A2A_MCP_DOOR entry in extraEnv wins: the chart then
-  # renders only that entry. What it renders and how to connect: the site's
-  # "MCP server" reference page.
+  # Rendered beside every PlatformAgent the operator manages: Deployment,
+  # Service, ServiceAccount, deny-all ingress NetworkPolicy and bearer-token
+  # Secret. false sets A2A_MCP_DOOR=false on the controller manager, which
+  # removes all of it, the token included; the quota preflight still counts its
+  # one pod from footprint.yaml (an over-count in the safe direction). An
+  # A2A_MCP_DOOR entry in extraEnv wins: the chart then renders only that entry.
+  # What it renders and how to connect: the site's "MCP server" reference page.
   mcpServer:
-    enabled: false
+    enabled: true
   # The AgentProfile dispatcher (<agent>-a2a-dispatcher), which offers each
   # profile task to a worker in the profile's warm pool, or runs an unattended
   # one as a Job. Rendered beside every PlatformAgent the operator manages.
@@ -201,6 +205,20 @@ operator:
   # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
   # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
   slackTestUsers: []
+  # How many delegate requests one AgentProfile task may make, each minted or
+  # refused using one up (the A2A gateway's delegation.rounds rule). 1, the
+  # only value supported until a profile task's later rounds ship: the schema
+  # and the render refuse anything else. Rendered onto the gateway as
+  # A2A_DELEGATION_ROUNDS_MAX by the controller manager, which renders 1 for
+  # any other value it carries and says so in its log.
+  delegation:
+    roundsMax: 1
+  # The A2A gateway's Microsoft Teams backend is off until the operator runs
+  # with A2A_TEAMS_BACKEND=true (an extraEnv entry; no value key yet): with it,
+  # a PlatformAgent whose integration.teams is enabled has the gateway, not the
+  # Planning Agent's adapter, consume the broker's Teams queue. Without it the
+  # Planning Agent path stays, which is what an upgrade must not move on its
+  # own. docs/chatops/microsoft-teams.md has the details.
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -374,6 +392,16 @@ litellm:
   # same name here. envFrom does not roll the pods on a Secret change:
   # `kubectl rollout restart deployment/litellm` after rotating it.
   envFromSecret: ""
+  masterKey:
+    # The gateway's admin key, in the litellm-master-key Secret (key
+    # LITELLM_MASTER_KEY). true: the chart generates it on first install and
+    # keeps it across upgrades with lookup. false: the chart renders no Secret
+    # and reads litellm-master-key only if you created it; without it the
+    # gateway runs with no admin key, and the caller-auth hook still checks
+    # every caller. Set false where the chart is rendered offline (Argo CD and
+    # other helm template pipelines), where lookup finds nothing and a
+    # generated key would change on every render.
+    generate: true
   # Empty selects the per-provider default (mirrors common.sh).
   # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
   # anthropic--* name) gets
@@ -1142,7 +1170,8 @@ platformAgent:
   # sidecar's event-metrics port (9095) and, under its own PodMonitoring that
   # selects the leader label, the chat_metrics plugin serves its on the
   # platform-agent container's chat-metrics port (9097), and the credential proxy, where the
-  # broker serves its own on the metrics-only cred-metrics port (8766), and
+  # broker serves its metrics (and under sizingProfile: auto in-cluster, operator
+  # active-standby handoff endpoints; 404 otherwise) on cred-metrics port (8766), and
   # the A2A gateway, which serves its counters on
   # the metrics-only a2a-metrics port (9096). The operator's policies admit the
   # collector's namespace, gke-gmp-system, and the operator's own pods on those
@@ -1397,6 +1426,18 @@ platformAgent:
       # maxSessions caps the A2A session pods the install runs at once; the
       # operator's default applies when it is unset.
       # maxSessions: 10
+      # sessionIdleMinutes is how long a session pod is kept after the last
+      # message in its conversation (default 30); a running task always keeps
+      # it, and the next message after a reap gets a new pod with the
+      # conversation's history. It also bounds how long a Slack thread stays
+      # live without a fresh mention after its last task.
+      # sessionIdleMinutes: 30
+      # dmSessionIdleMinutes replaces it for a DM conversation with one
+      # message so far (default 5), so a one-question DM frees its slot of
+      # maxSessions sooner; a second message puts the conversation back on
+      # sessionIdleMinutes. A value above sessionIdleMinutes has no effect
+      # beyond it.
+      # dmSessionIdleMinutes: 5
       # sessionResources are the session pods' CPU and memory requests and
       # limits; only cpu and memory are read. Each key you set to a positive
       # value replaces its default (requests 150m / 320Mi, limits 2 / 2Gi) and
@@ -1413,12 +1454,21 @@ platformAgent:
       #     memory: 384Mi
       # defaultRoute is where the A2A gateway sends a plain conversation's first
       # message: platform to the Platform Agent, session to a session pod of the
-      # conversation's own. Unset means platform; a later release flips the
-      # default to session. The Platform Agent stays reachable by handle either
-      # way. A change rolls the gateway and the Platform Agent pod. Against a
-      # PlatformAgent CRD that predates the field the chart fails; apply crds/
-      # first (upgrade.sh does).
+      # conversation's own. Unset means platform, today's behaviour. session
+      # opts in, with the session cap fitted to the bus's TASKS stream
+      # (status.effectiveSessionCap). The Platform Agent stays reachable by
+      # handle either way. A change rolls the gateway and the Platform Agent
+      # pod. Against a PlatformAgent CRD that predates the field the chart
+      # fails; apply crds/ first (upgrade.sh does).
       # defaultRoute: platform
+      # warmSessions is how many warm session pods the gateway keeps ready on
+      # the session route, so a new conversation's first turn skips scheduling
+      # and the image pull. Unset means 1. Each costs one session pod's requests
+      # (sessionResources) while it waits, billed on Autopilot; 0 turns the pool
+      # off. It never takes the session cap's last slot. Against a PlatformAgent
+      # CRD that predates the field the chart fails; apply crds/ first
+      # (upgrade.sh does).
+      # warmSessions: 0
       # busReplicas is how many NATS servers run the install's bus: 3 runs a
       # cluster with R3 streams that rides out a node drain, 1 a single server
       # that is down for each pod restart. A cluster needs three nodes; set 1 on a
@@ -1448,7 +1498,8 @@ platformAgent:
       # 6 unless set), childReserve the share of it kept for child tasks (default
       # max(1, ceil(ceiling/3)); with the interactive reserve, trimmed to leave a
       # free slot, so ceilings 1, 2 and 4 warn), and warmReplicas the warm workers kept per
-      # interactive (profile, tier) (default 1). The <release namespace>-profiles
+      # interactive (profile, tier) (default 1, or on defaultRoute: session the
+      # profile's concurrency split over its interactive tiers). The <release namespace>-profiles
       # namespace's pod quota is the warm workers, a surge pod per warm pool, and
       # the ceiling. The dispatcher's intervals: leaseSeconds (90), renewSeconds
       # (20), restartGraceSeconds (60) and acceptTimeoutSeconds (10); a lease is
@@ -1531,10 +1582,13 @@ platformAgent:
     # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
     #
-    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table
-    # (deploy/sandbox/kubectl-costs.json) its admission charges fleet-wide reads
+    # KUBEAGENTS_KUBECTL_COST_TIER: the column of the kubectl cost table
+    # (deploy/sandbox/kubectl-costs.json) that fleet-wide reads are charged
     # from; "fleet" for clusters of tens of thousands of Pods, unset for
-    # "default". Also forwarded to the shell sandbox only.
+    # "default". Forwarded to the shell sandbox, to the credential broker
+    # (stateful and exec tiers), which charges a brokered cluster-wide kubectl
+    # read from the same column, and, under the session cluster view, to the
+    # A2A gateway for the session pods it starts.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
@@ -1698,12 +1752,15 @@ platformAgent:
     # The preset the credential proxy, the agent-api-auth sidecar and the shell
     # container start from, forwarded to the CR as spec.deployment.sizingProfile
     # when set: small (the operator's defaults, and what an unset value means),
-    # medium, fleet, or auto, which steps the tier up as the fleet the operator
-    # counts grows, from the tier the CR's status last recorded (a count that
-    # falls never lowers it), holding a step the namespace's ResourceQuota has
-    # no room for or a LimitRange bound refuses, stepping back one tier when
-    # admission refuses the pod a step recreated, and saying so in the CR's
-    # SizingCappedByQuota condition. The three
+    # medium, fleet, or auto, which sets a cluster-count floor (medium at 10
+    # clusters, fleet at 25) and steps up on sustained utilization (>= 75% for 5m)
+    # or steps down one tier at a time to the floor (<= 55% for 25m after a
+    # 30m cooldown). Only auto enables active-standby RollingUpdate on
+    # credential-proxy (default and fixed profiles keep Recreate). Under auto the
+    # operator checks ResourceQuota (including credential-proxy RollingUpdate surge
+    # headroom) and LimitRange bounds on each transition, rolling back a Pending
+    # surge past 2m (SurgeUnschedulable) or admission quota refusal while keeping
+    # the active broker pod running, reporting it in SizingCappedByQuota. The three
     # resources overrides above and in harness.experimental.shellSandbox are
     # applied per key over the preset, so an explicit key always wins. The
     # quota preflight counts medium and fleet at their rows and auto at the
@@ -1774,10 +1831,8 @@ platformAgent:
     # with CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on its container so the mode an
     # install is in is readable from the Deployment; `enabled: true` renders
     # the mapping into the broker's ConfigMap and sets it to 1. The key this
-    # block replaced, `scopedServiceAccounts`, is still admitted by the schema
-    # as an empty list for one release, because every earlier release record
-    # carries it empty and a retag re-applies the record; a populated one is
-    # refused by name (values.schema.json). Enabled with
+    # block replaced, `scopedServiceAccounts`, is refused by name, empty or
+    # populated (values.schema.json). Enabled with
     # an empty list is refused at `helm install`: the broker refuses to start
     # on an empty pool.
     #
@@ -1894,6 +1949,9 @@ platformAgent:
   # The credential broker and kube-proxy refuse every route to an excluded
   # cluster's Kubernetes API; the project's cluster list and a cluster's
   # describe stay readable. Spell the project by its ID.
+  # spec.hold, an operator's pause on clusters, is not a chart value: set it on
+  # the PlatformAgent with kubectl patch; the chart never renders it, so an
+  # upgrade leaves it in place.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
@@ -2107,6 +2165,17 @@ platformAgent:
       homeChannel: ""
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
+      # The receiver for the messages Microsoft delivers to the bot. Off, the
+      # bot can post to Teams but a message typed in Teams does not reach the
+      # agent: Bot Framework delivers by an HTTPS request to the address
+      # registered for the bot, and nothing in the install listens for it. On,
+      # the operator runs a small pod that verifies Microsoft's signed token on
+      # each request, pins tenantId (required), and hands the message to the
+      # broker's Teams queue; expose its Service (<agent>-teams-inbound, port
+      # 8100, path /api/v1/teams/events) with your own Ingress and TLS
+      # certificate and register that address as the bot's messaging endpoint.
+      inbound:
+        enabled: false
 
 # AgentPlugins deployed into the cluster.
 plugins:
@@ -2311,6 +2380,45 @@ profiles:
       activeDeadlineSeconds: 1800
       ttlSecondsAfterFinished: 600
     concurrency: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  # The fleet-audit profile (#5623, #5620): the parent of the install's
+  # fleet-wide scheduled audits and of onboarding's first inventory
+  # (`agents/fleet-audit/persona`). It reads no cluster itself: each cluster's
+  # checks run as a delegated `cluster` task. Off until the onboarding PR runs
+  # a schedule on it.
+  fleetAudit:
+    enabled: false
+    description: >-
+      Fleet-wide audit runner: hands each in-scope cluster's read-only checks
+      to the cluster profile as one delegated task per cluster, collects their
+      results, and composes the audit's findings and report. Never reads or
+      changes a cluster itself.
+    persona:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/persona-fleet-audit
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 120
+    # A scheduled audit runs at unattended. No read tier until the persona
+    # can do an on-demand run: a read tier on the card makes the profile a
+    # delegate target of every chat session, and today a run without dry_run
+    # only says it can't and stops.
+    allowedTiers:
+      - unattended
+    lifecycle:
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 600
+    concurrency: 1
     resources:
       requests:
         cpu: 250m

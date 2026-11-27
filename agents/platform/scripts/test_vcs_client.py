@@ -10,6 +10,7 @@ never builds an argparse namespace. These tests are that caller.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import io
 import json
@@ -194,6 +195,39 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "PROTECTED_BRANCH")
         self.assertEqual(caught.exception.as_json(), {"error": "no", "code": "PROTECTED_BRANCH", "detail": "d"})
 
+    def _refused_with(self, status, payload, verb="publish"):
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(status, payload)
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call(verb, {})
+        return caught.exception
+
+    def test_a_refusal_code_that_is_not_a_text_is_no_code(self):
+        """The callers look the code up in a set, and a list cannot enter one: the lookup
+        raised TypeError. The rest of the refusal stays."""
+        known = frozenset({"PROTECTED_BRANCH"})
+        for code in (["PROTECTED_BRANCH"], {"name": "PROTECTED_BRANCH"}, 7, True, ""):
+            with self.subTest(code=code):
+                refused = self._refused_with(409, {"error": "no", "code": code, "detail": "d"})
+                self.assertIsNone(refused.code)
+                self.assertNotIn(refused.code, known)
+                self.assertEqual({"error": "no", "detail": "d"}, refused.as_json())
+
+    def test_a_404_with_a_code_that_is_not_a_text_reads_as_a_404_with_no_code(self):
+        """A 404 with no code is a broker that does not serve the verb."""
+        for code in (["FORGE_NOT_FOUND"], {"name": "FORGE_NOT_FOUND"}, 7, ""):
+            with self.subTest(code=code):
+                refused = self._refused_with(404, {"status": "not_found", "code": code}, verb="issue-update")
+                self.assertEqual(vcs_client.BROKER_ROUTE_UNSUPPORTED, refused.code)
+
+    def test_the_error_keeps_a_code_that_is_a_text_and_drops_each_other_value(self):
+        self.assertEqual("BASE_MOVED", vcs_client.VcsError("moved", code="BASE_MOVED").code)
+        for code in (["BASE_MOVED"], ("BASE_MOVED",), {"BASE_MOVED": 1}, 7, True, "", None):
+            with self.subTest(code=code):
+                self.assertIsNone(vcs_client.VcsError("moved", code=code).code)
+
     def test_a_path_refusal_keeps_the_revision_the_broker_read(self):
         error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "refused", payload={"error": "no", "code": "PATH_NOT_FOUND", "revision": "a" * 40}
@@ -295,7 +329,7 @@ class ForgeCallTest(unittest.TestCase):
 
     def test_a_body_nested_too_deep_for_the_parser_reads_as_an_error_of_this_module_on_both_paths(self):
         """Through the real `vcs_call`, with the parser's RecursionError given
-        directly: a 2xx reads as an answer that is not JSON, a refusal as its
+        directly: a 2xx reads as an answer that is too deep, a refusal as its
         status. No consumer meets the RecursionError."""
         environment = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
         client = vcs_client.credential_proxy_client
@@ -308,7 +342,7 @@ class ForgeCallTest(unittest.TestCase):
             with self.assertRaises(vcs_client.VcsError) as caught:
                 vcs_client.call("capabilities", {"repository": "acme/infra"})
         self.assertIsNone(caught.exception.code)
-        self.assertIn("not JSON", str(caught.exception))
+        self.assertEqual(str(caught.exception), vcs_client.ANSWER_TOO_DEEP_TEXT)
 
         refusal = urllib.error.HTTPError("http://127.0.0.1:1/v1/vcs/capabilities", 502, "refused", {}, io.BytesIO(b"[]"))
         self.addCleanup(refusal.close)
@@ -319,6 +353,117 @@ class ForgeCallTest(unittest.TestCase):
                 vcs_client.call("capabilities", {"repository": "acme/infra"})
         self.assertIsNone(caught.exception.code)
         self.assertIn("HTTP 502", str(caught.exception))
+
+    DEEP_ENVIRONMENT = {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1", "CREDENTIAL_PROXY_TOKEN_FILE": ""}
+    PROPOSAL_URL = "https://forge.example/acme/infra/pull/7"
+
+    @staticmethod
+    def nested_lists(levels: int) -> bytes:
+        """The JSON text of `levels` lists, one inside the other. The compact form: 2 x `levels` bytes."""
+        return b"[" * levels + b"]" * levels
+
+    def call_with_the_proposal_title(self, title: bytes):
+        """`call("proposal-create")` through the real `vcs_call`; (the answer or the error, the stderr lines)."""
+        body = b'{"proposal": {"url": "%s", "number": 7, "title": %s}, "claim": "c-1"}' % (self.PROPOSAL_URL.encode(), title)
+        client = vcs_client.credential_proxy_client
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, self.DEEP_ENVIRONMENT), mock.patch.object(
+            client, "open_broker_request", lambda request, *args, **kwargs: io.BytesIO(body)
+        ), contextlib.redirect_stderr(stderr):
+            try:
+                result = vcs_client.call("proposal-create", {})
+            except vcs_client.VcsError as exc:
+                result = exc
+        return result, stderr.getvalue().splitlines()
+
+    def test_the_bound_of_the_broker_client_is_a_decision(self):
+        # A decision: under the limit of each encoder and of `repr` on each Python
+        # that the client runs on, and far above the depth of an answer of the broker.
+        self.assertEqual(vcs_client.credential_proxy_client.MAX_VCS_BODY_DEPTH, 500)
+
+    def test_a_proposal_answer_nested_deeper_than_the_bound_is_one_error_and_no_record(self):
+        """The answer object and its `proposal` are two levels; the title holds the rest."""
+        bound = vcs_client.credential_proxy_client.MAX_VCS_BODY_DEPTH
+        answer, lines = self.call_with_the_proposal_title(self.nested_lists(bound - 2))
+        self.assertIsInstance(answer, dict)
+        self.assertNotIn("claim", answer)
+        self.assertEqual([json.loads(line)["proposal"]["url"] for line in lines], [self.PROPOSAL_URL])
+
+        for levels in (bound - 1, bound, 4 * bound):
+            with self.subTest(levels=levels):
+                error, lines = self.call_with_the_proposal_title(self.nested_lists(levels))
+                self.assertIsInstance(error, vcs_client.VcsError)
+                self.assertEqual(error.as_json(), {"error": vcs_client.ANSWER_TOO_DEEP_TEXT})
+                self.assertIn("may have taken effect", vcs_client.ANSWER_TOO_DEEP_TEXT)
+                self.assertNotIn("retry", vcs_client.ANSWER_TOO_DEEP_TEXT.lower())
+                self.assertEqual(lines, [])
+
+    def test_a_refusal_nested_deeper_than_the_bound_keeps_its_code_and_loses_the_deep_part(self):
+        """The refusal object is one level; a value has the rest. The caller's rules read the code."""
+        client = vcs_client.credential_proxy_client
+        bound = client.MAX_VCS_BODY_DEPTH
+        sent = []
+
+        def refuse_with(status: int, body: bytes):
+            def refuse(request, *args, **kwargs):
+                sent.append(request.full_url)
+                raise urllib.error.HTTPError(request.full_url, status, "refused", {}, io.BytesIO(body))
+
+            with mock.patch.dict(os.environ, self.DEEP_ENVIRONMENT), mock.patch.object(client, "open_broker_request", refuse):
+                with self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.call("issue-update", {})
+            return caught.exception
+
+        at_the_bound = refuse_with(422, b'{"error": %s, "code": "FORGE_REJECTED"}' % self.nested_lists(bound - 1))
+        self.assertEqual(at_the_bound.code, "FORGE_REJECTED")
+        self.assertEqual(json.loads(json.dumps(at_the_bound.as_json()))["code"], "FORGE_REJECTED")
+
+        for levels in (bound, 4 * bound):
+            deep = self.nested_lists(levels)
+            with self.subTest(levels=levels):
+                sent.clear()
+                error = refuse_with(422, b'{"error": %s, "code": "FORGE_REJECTED"}' % deep)
+                self.assertEqual(error.as_json(), {"error": "HTTP 422", "code": "FORGE_REJECTED"})
+                self.assertEqual(len(sent), 1)
+                error = refuse_with(409, b'{"error": "the base branch moved", "code": "BASE_MOVED", "detail": %s}' % deep)
+                self.assertEqual(
+                    error.as_json(),
+                    {"error": "the base branch moved", "code": "BASE_MOVED", "detail": "left out: nested too deep to read"},
+                )
+                # A coded 404 is the forge's answer, and not a broker that is too old for the verb.
+                error = refuse_with(404, b'{"error": "no such repository", "code": "FORGE_NOT_FOUND", "detail": %s}' % deep)
+                self.assertEqual(error.code, "FORGE_NOT_FOUND")
+                # A 404 whose code is too deep has a code that the client does not know: not a missing route either.
+                error = refuse_with(404, b'{"error": "no such repository", "code": %s}' % deep)
+                self.assertEqual((str(error), error.code), ("no such repository", "left out: nested too deep to read"))
+                error = refuse_with(429, b'{"error": "rate limited", "code": "FORGE_RATE_LIMITED", "entries": %s}' % deep)
+                self.assertEqual((error.code, error.entries), ("FORGE_RATE_LIMITED", None))
+
+    def test_a_value_at_the_bound_is_one_that_the_verbs_can_use(self):
+        """The deepest value the bound lets pass, in the places that use a value of an answer:
+        the text of a refusal, `str` of a field, and the session record with its indent."""
+        client = vcs_client.credential_proxy_client
+        value = json.loads(self.nested_lists(client.MAX_VCS_BODY_DEPTH - 1))
+        text_length = 2 * (client.MAX_VCS_BODY_DEPTH - 1)
+        self.assertEqual(len(str(value)), text_length)
+        self.assertEqual(len(str(client.WorkspaceRequestError(422, {"error": value}))), text_length)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(vcs_client, "SESSIONS", Path(tmp) / ".sessions"):
+            vcs_client.save_session(
+                {"forge": "local", "repo": "acme/infra", "branch": "main", "revision": value, "baseBranch": value}
+            )
+            recorded = json.loads(vcs_client.session_path("local", "acme/infra", "main").read_text())
+        # assertTrue, not assertEqual: a failure report of this depth is a RecursionError of pprint.
+        self.assertTrue(recorded["revision"] == value and recorded["baseBranch"] == value)
+
+    def test_the_record_of_an_opened_proposal_is_left_out_when_the_encoder_gives_up(self):
+        """`_say_opened` never raises: a `target` of the caller that the encoder cannot take leaves the record out."""
+        stderr = io.StringIO()
+        gives_up = mock.patch.object(
+            vcs_client.json, "dumps", side_effect=RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+        )
+        with gives_up, contextlib.redirect_stderr(stderr):
+            vcs_client._say_opened({"proposal": {"url": self.PROPOSAL_URL}}, target={"finding_id": "f-1"})
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_a_coded_forge_404_is_still_the_forge_s_answer(self):
         """The other half: a bare 404 is the only one read as a missing route.
@@ -655,6 +800,42 @@ class WorkingCopyTest(unittest.TestCase):
     def _record(self) -> dict:
         return json.loads((vcs_client.SESSIONS / "local__acme__infra__main.json").read_text())
 
+    def test_a_publish_answer_with_a_branch_or_revision_that_is_not_a_text_is_an_error_and_the_record_stays(self):
+        """The broker did the publish. The record has the branch as a key, which a list cannot
+        be, and a made-up name there is worse than the error. An absent value (None here) and an
+        empty text are no name either."""
+        cloned = vcs_client.clone("acme/infra")
+        vcs_client.branch("acme/infra", "fix/one")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("change a", spec="acme/infra")
+        record_files = sorted(vcs_client.SESSIONS.iterdir())
+        before = {path: path.read_bytes() for path in record_files}
+        good_call = self.call
+        for field in ("branch", "revision"):
+            for value in (["fix/one"], {"name": "fix/one"}, 7, None, ""):
+                with self.subTest(field=field, value=value):
+                    self.published.clear()
+
+                    def call(verb, payload, field=field, value=value):
+                        answer = good_call(verb, payload)
+                        if verb == "publish":
+                            answer[field] = value
+                        return answer
+
+                    with mock.patch.object(vcs_client, "call", call), self.assertRaises(vcs_client.VcsError) as caught:
+                        vcs_client.publish("acme/infra")
+                    self.assertEqual(
+                        f"the broker's answer has no usable `{field}`; the request reached the broker and may have taken effect",
+                        str(caught.exception),
+                    )
+                    self.assertIsNone(caught.exception.code)
+                    self.assertEqual(1, len(self.published), "the publish went to the broker one time")
+                    self.assertEqual(before, {path: path.read_bytes() for path in sorted(vcs_client.SESSIONS.iterdir())})
+                    self.assertEqual(list(vcs_client.ROOT.glob("*.bundle")), [])
+        # The control: with the answer as the broker sends it, the same publish goes into the record.
+        vcs_client.publish("acme/infra")
+        self.assertNotEqual(before, {path: path.read_bytes() for path in sorted(vcs_client.SESSIONS.iterdir())})
+
     def test_clone_carries_the_pinned_base_into_the_record_and_the_answer(self):
         self.clone_extra = {"baseBranch": "release"}
         cloned = vcs_client.clone("acme/infra")
@@ -944,6 +1125,73 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertTrue((tree / "b.txt").exists() or git(tree, "rev-parse", "fix/b").stdout)
         # `--force` is still the way past it.
         vcs_client.clone("acme/infra", key="work", force=True)
+
+    #: Stands for a key that the answer does not have.
+    ABSENT_FROM_THE_ANSWER = object()
+
+    def call_with_one_value_of_the_answer(self, field, value):
+        """The stand-in `call` of this class, with one value of its answer replaced or taken out."""
+        good_call = self.call
+
+        def call(verb, payload):
+            answer = good_call(verb, payload)
+            if value is self.ABSENT_FROM_THE_ANSWER:
+                del answer[field]
+            else:
+                answer[field] = value
+            return answer
+
+        return call
+
+    def test_a_forced_clone_with_an_answer_it_cannot_use_leaves_the_copy_as_it_was(self):
+        """A `--force` clone removes the existing copy. The answer's `branch`, `revision` and
+        bundle are used after that, so a value that fails there left a record with no tree. The
+        clone reads them first, and the copy with its work is still there after the error."""
+        cloned = vcs_client.clone("acme/infra", key="work")
+        tree = Path(cloned["path"])
+        (tree / "kept.txt").write_text("work that is not published\n")
+        record_files = sorted(vcs_client.SESSIONS.iterdir())
+        before = {path: path.read_bytes() for path in record_files}
+        absent = self.ABSENT_FROM_THE_ANSWER
+        broken = [("branch", value) for value in (["main"], {"name": "main"}, 7, None, "", absent)]
+        broken += [("revision", value) for value in (["abc"], {"sha": "abc"}, 7, None, "", absent)]
+        broken += [("bundleBase64", value) for value in (["QUJD"], {"data": "QUJD"}, 7, None, "", absent)]
+        # Texts that are not base64: a wrong count of characters; characters that a decoder
+        # with no `validate` drops, which leaves no bytes, or the bytes of "ABC"; not ASCII.
+        broken += [("bundleBase64", value) for value in ("QUJ", "!!!!", "====", "QU JD\n", "éééé")]
+        for field, value in broken:
+            with self.subTest(field=field, value=value):
+                call = self.call_with_one_value_of_the_answer(field, value)
+                with mock.patch.object(vcs_client, "call", call), self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.clone("acme/infra", key="work", force=True)
+                self.assertEqual(
+                    f"the broker's answer has no usable `{field}`; the working copy is as it was", str(caught.exception)
+                )
+                self.assertEqual("work that is not published\n", (tree / "kept.txt").read_text())
+                self.assertEqual(before, {path: path.read_bytes() for path in sorted(vcs_client.SESSIONS.iterdir())})
+                self.assertEqual(list(vcs_client.ROOT.glob("*.bundle")), [])
+        # The control: with the answer as the broker sends it, the forced clone replaces the copy.
+        vcs_client.clone("acme/infra", key="work", force=True)
+        self.assertFalse((tree / "kept.txt").exists())
+        self.assertTrue((tree / "a.txt").exists())
+
+    def test_a_first_clone_with_an_answer_it_cannot_use_makes_no_copy(self):
+        absent = self.ABSENT_FROM_THE_ANSWER
+        # Without the check, an answer with no `revision` left a tree with no record, and a
+        # `revision` of None made a record that lets a later clone replace unpublished work.
+        broken = (("branch", ["main"]), ("branch", absent), ("revision", absent), ("revision", None), ("bundleBase64", "QUJ"))
+        for field, value in broken:
+            with self.subTest(field=field, value=value):
+                call = self.call_with_one_value_of_the_answer(field, value)
+                with mock.patch.object(vcs_client, "call", call), self.assertRaises(vcs_client.VcsError) as caught:
+                    vcs_client.clone("acme/infra")
+                self.assertEqual(
+                    f"the broker's answer has no usable `{field}`; the working copy is as it was", str(caught.exception)
+                )
+                self.assertFalse(vcs_client.SESSIONS.exists() and any(vcs_client.SESSIONS.iterdir()))
+                self.assertFalse(
+                    vcs_client.ROOT.exists() and any(p for p in vcs_client.ROOT.iterdir() if p.name != ".sessions")
+                )
 
     def test_a_second_clone_of_a_copy_with_everything_published_is_not_refused(self):
         cloned = vcs_client.clone("acme/infra", key="work")

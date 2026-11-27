@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -204,14 +205,50 @@ func TestChildResultRoundTrip(t *testing.T) {
 	}
 }
 
+// A batch entry that never got a child ends with its entry and no task id,
+// failed, and reads back the same.
+func TestChildResultForAnEntryThatNeverStarted(t *testing.T) {
+	in := ChildResult{Entry: 3, Addressee: "cluster", State: StateFailed, Text: "not started"}
+	part, err := ChildResultPart(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ChildResultOf([]Part{part}); !ok || got != in {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, in)
+	}
+	withID := ChildResult{ChildTaskID: "task-7", Entry: 2, State: StateCanceled}
+	part, err = ChildResultPart(withID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ChildResultOf([]Part{part}); !ok || got != withID {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, withID)
+	}
+}
+
+// A single delegation's result carries no entry on the wire, so a reader
+// built before entries reads it unchanged.
+func TestASingleChildResultCarriesNoEntry(t *testing.T) {
+	part, err := ChildResultPart(ChildResult{ChildTaskID: "task-7", Addressee: "cluster", State: StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(part.Data), "entry") {
+		t.Fatalf("wire = %s", part.Data)
+	}
+}
+
 // A child result names a finished task: no id, a non-terminal state or text
 // past the cap is refused on the way out and skipped on the way in.
 func TestChildResultRefusesWhatIsNotAnEnd(t *testing.T) {
 	for name, c := range map[string]ChildResult{
-		"no task id":           {State: StateCompleted},
-		"a task id with a dot": {ChildTaskID: "task.7", State: StateCompleted},
-		"a working state":      {ChildTaskID: "task-7", State: StateWorking},
-		"text past the cap":    {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
+		"no task id":                  {State: StateCompleted},
+		"no task id, completed entry": {Entry: 1, State: StateCompleted},
+		"a negative entry":            {ChildTaskID: "task-7", Entry: -1, State: StateCompleted},
+		"an entry past the batch cap": {Entry: DelegateBatchMax + 1, State: StateFailed},
+		"a task id with a dot":        {ChildTaskID: "task.7", State: StateCompleted},
+		"a working state":             {ChildTaskID: "task-7", State: StateWorking},
+		"text past the cap":           {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ChildResultPart(c); err == nil {
@@ -318,6 +355,148 @@ func TestDelegateTargetsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestScopeClustersRoundTrip(t *testing.T) {
+	want := ScopeClusters{Count: 3, Truncated: true, Clusters: []ScopeCluster{
+		{Project: "proj-a", Location: "us-central1", Cluster: "prod-1"},
+		{Project: "proj-b", Location: "europe-west1-b", Cluster: "edge"},
+	}}
+	part, err := ScopeClustersPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(part.Data), `"cursor":""`) {
+		t.Errorf("part = %s, want the reserved cursor present and empty", part.Data)
+	}
+	text := Part{Kind: "text", Text: "sweep the fleet"}
+	got, ok, err := ScopeClustersOf([]Part{text, part})
+	if err != nil || !ok {
+		t.Fatalf("ScopeClustersOf = %v %v", ok, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, ok, err := ScopeClustersOf([]Part{text}); ok || err != nil {
+		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+	empty, err := ScopeClustersPart(ScopeClusters{})
+	if err != nil || string(empty.Data) != `{"scopeClusters":{"count":0,"clusters":[],"truncated":false,"cursor":""}}` {
+		t.Fatalf("empty page = %s, %v", empty.Data, err)
+	}
+	if _, ok, err := ScopeClustersOf([]Part{part, part}); !ok || err == nil {
+		t.Errorf("two parts: ok %v err %v, want found and refused", ok, err)
+	}
+}
+
+// The bounds hold both ways: a bad shape is refused on the way out, and is
+// an error, not a skip, on the way in.
+func TestScopeClustersBounds(t *testing.T) {
+	one := ScopeCluster{Project: "p", Location: "l", Cluster: "c"}
+	page := func(n int) []ScopeCluster {
+		out := make([]ScopeCluster, n)
+		for i := range out {
+			out[i] = ScopeCluster{Project: "p", Location: "l", Cluster: "c" + strconv.Itoa(i)}
+		}
+		return out
+	}
+	long := strings.Repeat("a", 63)
+	widest := make([]ScopeCluster, ScopeClustersPageMax)
+	for i := range widest {
+		widest[i] = ScopeCluster{Project: long, Location: long, Cluster: long}
+	}
+	// The widest page and unlisted list of the longest labels fit the byte
+	// bound, so the byte bound never cuts a page the other rules allow.
+	unlisted := make([]string, ScopeClustersUnlistedMax)
+	for i := range unlisted {
+		unlisted[i] = long
+	}
+	if _, err := ScopeClustersPart(ScopeClusters{Count: 1 << 20, Truncated: true, Clusters: widest,
+		Unknown: true, UnlistedProjects: unlisted, UnlistedCount: 1 << 20, OldestListing: "2026-11-23T10:00:00Z"}); err != nil {
+		t.Fatalf("widest page refused: %v", err)
+	}
+	for name, s := range map[string]ScopeClusters{
+		"page past the max":      {Count: ScopeClustersPageMax + 1, Clusters: page(ScopeClustersPageMax + 1)},
+		"count under page":       {Count: 1, Truncated: false, Clusters: page(2)},
+		"negative count":         {Count: -1},
+		"truncated, all here":    {Count: 1, Truncated: true, Clusters: []ScopeCluster{one}},
+		"cut, not truncated":     {Count: 2, Clusters: []ScopeCluster{one}},
+		"cursor set":             {Count: 1, Clusters: []ScopeCluster{one}, Cursor: "next"},
+		"empty project":          {Count: 1, Clusters: []ScopeCluster{{Location: "l", Cluster: "c"}}},
+		"dotted location":        {Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "us.central1", Cluster: "c"}}},
+		"upper-case cluster":     {Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "Prod"}}},
+		"label past 63":          {Count: 1, Clusters: []ScopeCluster{{Project: long + "a", Location: "l", Cluster: "c"}}},
+		"unknown, not truncated": {Count: 0, Unknown: true},
+		"unlisted past the max":  {UnlistedProjects: append(slices.Clone(unlisted), "p"), UnlistedCount: ScopeClustersUnlistedMax + 1},
+		"unlisted count under":   {UnlistedProjects: []string{"p", "q"}, UnlistedCount: 1},
+		"unlisted not a label":   {UnlistedProjects: []string{"P_1"}, UnlistedCount: 1},
+		"oldest not a time":      {Count: 1, Clusters: []ScopeCluster{one}, OldestListing: "yesterday"},
+		"unbounded, known":       {Unbounded: true},
+		"unbounded, unlisted":    {Unbounded: true, Unknown: true, Truncated: true, UnlistedProjects: []string{"p"}, UnlistedCount: 1},
+		"parent-scoped, two":     {ParentScoped: true, Count: 2, Truncated: true, Clusters: []ScopeCluster{one}},
+		"parent-scoped, unknown": {ParentScoped: true, Unknown: true, Truncated: true},
+	} {
+		if _, err := ScopeClustersPart(s); err == nil {
+			t.Errorf("%s: ScopeClustersPart accepted %+v", name, s)
+		}
+		raw, _ := json.Marshal(map[string]ScopeClusters{"scopeClusters": s})
+		if _, ok, err := ScopeClustersOf([]Part{{Kind: "data", Data: raw}}); !ok || err == nil {
+			t.Errorf("%s: ScopeClustersOf = ok %v err %v, want found and refused", name, ok, err)
+		}
+	}
+	noList := Part{Kind: "data", Data: json.RawMessage(`{"scopeClusters":{"count":0}}`)}
+	if _, ok, err := ScopeClustersOf([]Part{noList}); !ok || err == nil {
+		t.Errorf("no clusters list: ok %v err %v, want found and refused", ok, err)
+	}
+}
+
+// The fields that say what a page can't (unknown, unlisted, the oldest
+// listing) round-trip, and are absent from a part that doesn't set them, so
+// that part is byte for byte the shape first written.
+func TestScopeClustersUnknownAndUnlisted(t *testing.T) {
+	want := ScopeClusters{Count: 1, Truncated: true, Unknown: true,
+		Clusters:         []ScopeCluster{{Project: "proj-a", Location: "us-central1", Cluster: "prod-1"}},
+		UnlistedProjects: []string{"mgmt", "proj-x"}, UnlistedCount: 3, OldestListing: "2026-11-23T10:00:00Z"}
+	part, err := ScopeClustersPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := ScopeClustersOf([]Part{part})
+	if err != nil || !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ScopeClustersOf = %+v %v %v, want %+v", got, ok, err, want)
+	}
+	for name, s := range map[string]ScopeClusters{
+		"parent-scoped":               {ParentScoped: true, Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}},
+		"parent-scoped, out of scope": {ParentScoped: true, Clusters: []ScopeCluster{}},
+		"unbounded":                   {Unbounded: true, Unknown: true, Truncated: true, Clusters: []ScopeCluster{}},
+	} {
+		part, err := ScopeClustersPart(s)
+		if err != nil {
+			t.Errorf("%s refused: %v", name, err)
+			continue
+		}
+		if got, _, err := ScopeClustersOf([]Part{part}); err != nil || !reflect.DeepEqual(got, s) {
+			t.Errorf("%s: round trip %+v %v", name, got, err)
+		}
+	}
+	// Unknown with nothing known: an empty page, still truncated.
+	if _, err := ScopeClustersPart(ScopeClusters{Unknown: true, Truncated: true}); err != nil {
+		t.Errorf("unknown empty page refused: %v", err)
+	}
+	// Unknown lets the count stand under what a page would hold.
+	if _, err := ScopeClustersPart(ScopeClusters{Count: 1, Truncated: true, Unknown: true,
+		Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}}); err != nil {
+		t.Errorf("unknown with all known clusters on the page refused: %v", err)
+	}
+	plain, err := ScopeClustersPart(ScopeClusters{Count: 1, Clusters: []ScopeCluster{{Project: "p", Location: "l", Cluster: "c"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"unknown", "unlistedProjects", "unlistedCount", "oldestListing", "parentScoped", "unbounded"} {
+		if strings.Contains(string(plain.Data), key) {
+			t.Errorf("a part without %s carries it: %s", key, plain.Data)
+		}
+	}
+}
+
 func TestReplyToRoundTrip(t *testing.T) {
 	want := ReplyTo{TaskID: "task-0a1b2c3d"}
 	part, err := ReplyToPart(want)
@@ -405,6 +584,10 @@ func TestWholeConversationKey(t *testing.T) {
 		"gchat:space/spaces/AAA/threads/BBB": true,
 		"slack:C0HOME/1712.0001":             false, "slack:dm/D123/1712.0001": false, "gchat:spaces/AAA/threads/BBB": false,
 		"gchat:dm/spaces/DDD/threads/TTT": false, "console:abc": false, "inject:bench-7": false, "": false,
+		// Teams: a personal chat, a group chat and a channel's own id are
+		// shared; a channel thread's id, with its token in either spelling, is not.
+		"teams:a:1UxxASmI": true, "teams:19:group@thread.v2": true, "teams:19:chan@thread.tacv2": true,
+		"teams:19:chan@thread.tacv2;messageid=1794603936403": false, "teams:19:chan@thread.tacv2;messageId=1794603936403": false,
 	} {
 		if got := WholeConversationKey(key); got != want {
 			t.Errorf("WholeConversationKey(%q) = %v, want %v", key, got, want)
@@ -418,6 +601,7 @@ func TestThreadKeyedConversation(t *testing.T) {
 		"slack:dm/D123/1712.0001": true,
 		"slack:dm/D123":           false, "gchat:space/spaces/AAA": false, "gchat:dm/spaces/DDD": false,
 		"console:abc": false, "inject:bench-7": false, "a2a:x": false, "discord:g1/t1": false, "": false,
+		"teams:19:chan@thread.tacv2;messageid=1794603936403": true, "teams:a:1UxxASmI": false, "teams:19:chan@thread.tacv2": false,
 	} {
 		if got := ThreadKeyedConversation(key); got != want {
 			t.Errorf("ThreadKeyedConversation(%q) = %v, want %v", key, got, want)
@@ -612,6 +796,154 @@ func TestDelegateTargetsCarryTheWidth(t *testing.T) {
 	for _, w := range []int{-1, DelegateBatchMax + 1} {
 		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, WidthMax: w}); err == nil {
 			t.Errorf("width %d accepted", w)
+		}
+	}
+}
+
+// TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText: the
+// parent's model reads the text, so it must be there and within the cap.
+func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing.T) {
+	p, err := DelegationRefusalPart(DelegationRefusal{Text: "⚠️ delegation refused: out of scope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := DelegationRefusalOf([]Part{{Kind: "text", Text: "x"}, p})
+	if !ok || got.Text != "⚠️ delegation refused: out of scope" {
+		t.Fatalf("round trip = %+v, %v", got, ok)
+	}
+	if _, ok := ChildResultOf([]Part{p}); ok {
+		t.Fatal("a refusal read as a child result")
+	}
+	for _, text := range []string{"", strings.Repeat("a", ChildResultTextCap+1)} {
+		if _, err := DelegationRefusalPart(DelegationRefusal{Text: text}); err == nil {
+			t.Fatalf("a refusal with %d bytes of text was built", len(text))
+		}
+	}
+	bad := Part{Kind: "data", Data: []byte(`{"delegationRefused":{"text":""}}`)}
+	if _, ok := DelegationRefusalOf([]Part{bad}); ok {
+		t.Fatal("an empty refusal was read")
+	}
+}
+
+// TestDelegationRefusalRoundRoundTripsAndIsStrict: a round-one refusal goes
+// out with no round field, as it did before the field, and a later round
+// round-trips. A round that isn't a JSON number, or is out of bounds, makes
+// the part no refusal, rather than a round-one refusal that would end the
+// parent's wait; a later-round refusal is held to the same text bounds.
+func TestDelegationRefusalRoundRoundTripsAndIsStrict(t *testing.T) {
+	first, err := DelegationRefusalPart(DelegationRefusal{Text: "no"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(first.Data), "round") {
+		t.Fatalf("a round-one refusal carries the round field: %s", first.Data)
+	}
+	if got, ok := DelegationRefusalOf([]Part{first}); !ok || got.Round != 0 {
+		t.Fatalf("round-one refusal read back = %+v, %v; want no round", got, ok)
+	}
+	rep, err := DelegationRefusalPart(DelegationRefusal{Text: "again", Round: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"delegationRefused":{"text":"again","round":2}}`; string(rep.Data) != want {
+		t.Fatalf("round-two refusal = %s, want %s", rep.Data, want)
+	}
+	if got, ok := DelegationRefusalOf([]Part{rep}); !ok || got.Round != 2 || got.Text != "again" {
+		t.Fatalf("round-two refusal read back = %+v, %v", got, ok)
+	}
+	if _, err := DelegationRefusalPart(DelegationRefusal{Text: "x", Round: DelegateRoundsCeiling}); err != nil {
+		t.Fatalf("a refusal at the ceiling round was refused: %v", err)
+	}
+	for _, raw := range []string{
+		`{"delegationRefused":{"text":"x","round":"2"}}`,
+		`{"delegationRefused":{"text":"x","round":true}}`,
+		`{"delegationRefused":{"text":"x","round":{}}}`,
+		`{"delegationRefused":{"text":"x","round":-1}}`,
+		`{"delegationRefused":{"text":"x","round":17}}`,
+		`{"delegationRefused":{"text":"x","round":1000000}}`,
+		`{"delegationRefused":{"text":"","round":2}}`,
+	} {
+		if got, ok := DelegationRefusalOf([]Part{{Kind: "data", Data: []byte(raw)}}); ok {
+			t.Errorf("%s read as %+v", raw, got)
+		}
+	}
+	for _, r := range []DelegationRefusal{
+		{Text: "", Round: 2},
+		{Text: strings.Repeat("a", ChildResultTextCap+1), Round: 2},
+		{Text: "x", Round: -1},
+		{Text: "x", Round: DelegateRoundsCeiling + 1},
+	} {
+		if _, err := DelegationRefusalPart(r); err == nil {
+			t.Errorf("a refusal with %d bytes of text, round %d, was built", len(r.Text), r.Round)
+		}
+	}
+}
+
+// TestChildResultCarriesItsRound: a round-one end carries no round on the
+// wire, a later round round-trips, and a round out of bounds is refused on
+// the way out and skipped on the way in.
+func TestChildResultCarriesItsRound(t *testing.T) {
+	one, err := ChildResultPart(ChildResult{ChildTaskID: "task-7", Entry: 1, State: StateCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(one.Data), "round") {
+		t.Fatalf("a round-one end carries the round field: %s", one.Data)
+	}
+	for _, round := range []int{2, DelegateRoundsCeiling} {
+		in := ChildResult{ChildTaskID: "task-7", Entry: 1, State: StateCompleted, Round: round}
+		part, err := ChildResultPart(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := ChildResultOf([]Part{part}); !ok || got != in {
+			t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, in)
+		}
+	}
+	for _, round := range []int{-1, DelegateRoundsCeiling + 1} {
+		c := ChildResult{ChildTaskID: "task-7", Entry: 1, State: StateCompleted, Round: round}
+		if _, err := ChildResultPart(c); err == nil {
+			t.Errorf("round %d built", round)
+		}
+		data, _ := json.Marshal(map[string]ChildResult{"childResult": c})
+		if _, ok := ChildResultOf([]Part{{Kind: "data", Data: data}}); ok {
+			t.Errorf("round %d read", round)
+		}
+	}
+	str := Part{Kind: "data", Data: []byte(`{"childResult":{"childTaskId":"task-7","state":"completed","round":"2"}}`)}
+	if _, ok := ChildResultOf([]Part{str}); ok {
+		t.Error("a string round was read")
+	}
+}
+
+// TestDelegateTargetsCarryTheRounds: an unset RoundsMax is off the wire and
+// reads as one; a set one round-trips; one out of bounds is refused.
+func TestDelegateTargetsCarryTheRounds(t *testing.T) {
+	plain, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.Data), "roundsMax") {
+		t.Fatalf("an unset rounds max is on the wire: %s", plain.Data)
+	}
+	if r := (DelegateTargets{}).Rounds(); r != 1 {
+		t.Fatalf("absent rounds = %d, want 1", r)
+	}
+	part, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}, RoundsMax: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := DelegateTargetsOf([]Part{part})
+	if err != nil || !ok || got.RoundsMax != 3 || got.Rounds() != 3 {
+		t.Fatalf("got %+v ok=%v err=%v", got, ok, err)
+	}
+	for _, r := range []int{-1, DelegateRoundsCeiling + 1} {
+		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, RoundsMax: r}); err == nil {
+			t.Errorf("rounds %d accepted", r)
+		}
+		raw := []byte(fmt.Sprintf(`{"delegateTargets":{"targets":[],"roundsMax":%d}}`, r))
+		if _, _, err := DelegateTargetsOf([]Part{{Kind: "data", Data: raw}}); err == nil {
+			t.Errorf("rounds %d read", r)
 		}
 	}
 }

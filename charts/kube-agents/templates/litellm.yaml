@@ -180,6 +180,46 @@
 {{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
 {{- end }}
 {{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
+{{- /*
+  The caller-auth hook, which general_settings.custom_auth names (the config
+  helper in _helpers.tpl). Not a callback: LiteLLM awaits it on every
+  authenticated route. Its docstring says what it admits and why no raw key
+  leaves it.
+*/}}
+{{- $callerAuthSource := .Files.Get "files/litellm_caller_auth.py" }}
+{{- if empty $callerAuthSource }}
+{{- fail "the chart's files/litellm_caller_auth.py is missing" }}
+{{- end }}
+{{- /*
+  The gateway's master key: generated here when the Secret is absent and
+  carried forward with lookup on every upgrade, as platform-agent-secret.yaml
+  does for its generated values. lookup returns nothing under helm template
+  and --dry-run, so a rendered-only manifest shows a fresh value. The sk-
+  prefix makes LiteLLM hash the key wherever it would log one. Mounted into
+  the gateway container only.
+*/}}
+{{- $masterKeySecretName := "litellm-master-key" }}
+{{- $masterKeySecretKey := "LITELLM_MASTER_KEY" }}
+{{- $masterKeyPrefix := "sk-" }}
+{{- $masterKeyLength := 48 }}
+{{- $existingMasterKeySecret := lookup "v1" "Secret" .Release.Namespace $masterKeySecretName }}
+{{- $existingMasterKey := get ((get ($existingMasterKeySecret | default dict) "data") | default dict) $masterKeySecretKey }}
+{{- $masterKey := ternary ($existingMasterKey | b64dec) (printf "%s%s" $masterKeyPrefix (randAlphaNum $masterKeyLength)) (not (empty $existingMasterKey)) }}
+{{- /* litellm.masterKey.generate=false (offline renders): no Secret here, and
+       the gateway reads one only if someone created it. */}}
+{{- $generateMasterKey := ne ((.Values.litellm.masterKey | default dict).generate) false }}
+{{- /*
+  The caller-key map: digests of the caller keys and their classes, never a
+  key. The operator writes this Secret (its inference_keys.go); until it
+  does, the optional volume is empty and the hook knows no caller key, so it
+  admits a call only as keyless.
+  Mounted as a directory, not subPath, so the kubelet's in-place updates
+  reach the file and the hook's re-read sees them without a restart. The
+  directory and file name are the hook's DEFAULT_CALLER_KEYS_FILE.
+*/}}
+{{- $callerKeysSecretName := "litellm-caller-keys" }}
+{{- $callerKeysDir := "/etc/litellm/caller-keys" }}
+{{- $callerKeysMode := 288 }}{{- /* 0440 */}}
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
@@ -263,7 +303,7 @@
 {{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds "budget" .Values.litellm.budget "replicas" .Values.litellm.replicaCount) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  and cache-marker hooks, the rule file, the two redaction modules, the OAuth2
+  and cache-marker hooks, the caller-auth hook, the rule file, the two redaction modules, the OAuth2
   hook, the session-affinity hook and the optional trace logger are subPath
   mounts too, so an edit to any of them has to roll the pods the same way an
   edit to config.yaml does. With redaction or trace logging off their extras
@@ -271,7 +311,7 @@
   while those hooks are not shipped. The slot count reaches the pod as an env
   var, which rolls it by itself.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $sessionAffinitySource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $callerAuthSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $sessionAffinitySource }}
 {{- /*
   The shadow-mode replay proxy (litellm.replayShadow; values.yaml says what it
   is). On, it and the LiteLLM pods are told apart by one label key with two
@@ -297,6 +337,8 @@ data:
     {{- $thinkingReplaySource | nindent 4 }}
   litellm_cache_control_strip_callback.py: |
     {{- $cacheControlStripSource | nindent 4 }}
+  litellm_caller_auth.py: |
+    {{- $callerAuthSource | nindent 4 }}
   {{- if $redactionEnabled }}
   redaction.yaml: |
     {{- $redactionConfig | nindent 4 }}
@@ -320,6 +362,20 @@ data:
   litellm_session_affinity_callback.py: |
     {{- $sessionAffinitySource | nindent 4 }}
   {{- end }}
+{{- if $generateMasterKey }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $masterKeySecretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ $masterKeySecretKey }}: {{ $masterKey | quote }}
+{{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
 {{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
@@ -440,12 +496,26 @@ spec:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
               value: /tmp
-            # LiteLLM v1.104.0+ refuses to boot without a master key unless permitted.
-            # In kube-agents, LiteLLM is an in-cluster gateway on a private Service
-            # protected by NetworkPolicy, and internal callers authenticate at the
-            # transport boundary rather than via LiteLLM's user-auth layer.
+            # The master key general_settings.master_key reads, from the Secret
+            # rendered above. Not optional when the chart generates it: the
+            # Secret is in the same release, so a pod without it is a broken
+            # install and fails to start rather than booting with no admin key.
+            # With litellm.masterKey.generate=false the chart renders no Secret,
+            # so the reference is optional, and LiteLLM needs the permit below
+            # to boot without one. Callers never get it; the caller-auth hook
+            # admits them by their own keys.
+            - name: {{ $masterKeySecretKey }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $masterKeySecretName }}
+                  key: {{ $masterKeySecretKey }}
+                  {{- if not $generateMasterKey }}
+                  optional: true
+                  {{- end }}
+            {{- if not $generateMasterKey }}
             - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
               value: "true"
+            {{- end }}
             {{- $retryAfter := int ($fallback.retryAfterSeconds | default 0) }}
             {{- if gt $retryAfter 8 }}
             # LiteLLM applies router_settings.retry_after as the floor of its pause
@@ -592,6 +662,12 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_cache_control_strip_callback.py
               subPath: litellm_cache_control_strip_callback.py
+            - name: config-volume
+              mountPath: /app/litellm_caller_auth.py
+              subPath: litellm_caller_auth.py
+            - name: caller-keys
+              mountPath: {{ $callerKeysDir }}
+              readOnly: true
             {{- if $oauthHookEnabled }}
             - name: config-volume
               mountPath: /app/litellm_oauth2_callback.py
@@ -643,6 +719,11 @@ spec:
         - name: config-volume
           configMap:
             name: litellm-config
+        - name: caller-keys
+          secret:
+            secretName: {{ $callerKeysSecretName }}
+            optional: true
+            defaultMode: {{ $callerKeysMode }}
         {{- if and (eq $provider "openai_compatible") $openaiCompatibleCA.name }}
         - name: openai-compatible-ca
           secret:

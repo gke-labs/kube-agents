@@ -485,6 +485,9 @@ plugins:
     # the eval run, case and repetition to each model request's headers for the
     # replay proxy's log (plugins/eval_run_tag/__init__.py). Off, it registers nothing.
     - eval_run_tag
+    # Injects the backing model and provider identity resolved from the profile's
+    # LiteLLM gateway (`model.base_url`) into `[RUNTIME MODEL IDENTITY]`.
+    - model_identity
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt. Without it Hermes falls back to 20,000 whenever the model window is

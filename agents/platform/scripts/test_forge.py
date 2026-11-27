@@ -828,6 +828,63 @@ class MainTest(unittest.TestCase):
             answer = forge.call("proposal-commits", {"number": 12, "limit": 100}, REPO)
         self.assertEqual(answer["commits"][0]["sha"], "b" * 40)
 
+    def test_open_memory_proposal_pr_round_trips_through_sandbox_and_cleans_up(self):
+        import shutil
+        import tempfile
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(tmp_dir, ignore_errors=True))
+        ws = tmp_dir / "ws"
+        ws.mkdir(parents=True)
+
+        def far_side(argv, **kwargs):
+            out = io_text("")
+            with mock.patch.object(sys, "stdin", io_text(kwargs["stdin"])), \
+                 mock.patch.object(sys, "stdout", out):
+                rc = forge.main(argv[2:])
+            return subprocess.CompletedProcess(argv, rc, stdout=out.getvalue(), stderr="")
+
+        def fake_call(verb, payload):
+            self.broker(verb, payload)
+            if verb == "proposal-create":
+                return {"proposal": {"url": "https://forge.invalid/pulls/88", "number": 88}}
+            return {}
+
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", lambda: True), \
+             mock.patch.object(sandbox_exec, "run", far_side), \
+             mock.patch.object(vcs_client, "call", side_effect=fake_call), \
+             mock.patch.object(vcs_client, "clone", return_value={"path": str(ws), "branch": "main", "baseBranch": "main"}) as clone_m, \
+             mock.patch.object(vcs_client, "branch", return_value={"exitCode": 0}) as branch_m, \
+             mock.patch.object(vcs_client, "commit", return_value={"revision": "c1"}) as commit_m, \
+             mock.patch.object(vcs_client, "publish", return_value={"revision": "c1", "decisionMemoryMarkdown": "### Prior decisions and lessons\n- DEC-2026-001"}) as pub_m, \
+             mock.patch.object(vcs_client, "discard", return_value={"removed": str(ws)}) as disc_m:
+            res = forge.open_memory_proposal_pr(
+                repo=REPO,
+                branch="platform-agent/memory/DEC-2026-010",
+                rel_path="knowledge/decisions/DEC-2026-010.md",
+                pr_markdown="---\nid: DEC-2026-010\nstatus: active\n---\n",
+                title="docs(knowledge): record DEC-2026-010 (Keep ttl)",
+                body="Records DEC-2026-010.",
+            )
+
+        self.assertEqual(res, {"url": "https://forge.invalid/pulls/88", "number": 88, "revision": "c1"})
+        clone_m.assert_called_once_with(REPO, key="platform-agent/memory/DEC-2026-010")
+        branch_m.assert_called_once_with(REPO, name="platform-agent/memory/DEC-2026-010", key="platform-agent/memory/DEC-2026-010")
+        commit_m.assert_called_once_with(
+            "docs(knowledge): record DEC-2026-010 (Keep ttl)",
+            paths=["knowledge/decisions/DEC-2026-010.md"],
+            spec=REPO,
+            key="platform-agent/memory/DEC-2026-010",
+        )
+        pub_m.assert_called_once_with(REPO, target="main", key="platform-agent/memory/DEC-2026-010")
+        created_payload = self.broker.one("proposal-create")
+        self.assertIn("### Prior decisions and lessons", created_payload["body"])
+        self.assertEqual(disc_m.call_count, 2)
+        self.assertEqual(
+            (ws / "knowledge/decisions/DEC-2026-010.md").read_text(encoding="utf-8"),
+            "---\nid: DEC-2026-010\nstatus: active\n---\n",
+        )
+
 
 def io_text(value: str):
     import io
@@ -1613,6 +1670,77 @@ class AgentPullRequestOnAHostQualifiedRepoTest(unittest.TestCase):
         self.assertFalse(
             forge.is_agent_pull_request(self.pr("stranger/live"), self.REPO, "bot")
         )
+
+
+class SnapshotRefusalEnvelopeTest(BrokerCase):
+    """Verify `ForgeError` preserves `revision` and `entries` locally and across the sandbox hop."""
+
+    def test_direct_refusal_preserves_revision_and_entries(self):
+        entries = [
+            {"path": "docs", "type": "tree", "bytes": 4096},
+            {"path": "src", "type": "tree", "bytes": 20000000},
+        ]
+        self.broker.refuse["snapshot"] = vcs_client.VcsError(
+            "snapshot exceeds ceiling",
+            code="SNAPSHOT_TOO_LARGE",
+            detail="name paths to narrow",
+            revision="abc123def456",
+            entries=entries,
+        )
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("snapshot", {"maxBytes": 8388608}, REPO)
+        self.assertEqual(ctx.exception.reason, "SNAPSHOT_TOO_LARGE")
+        self.assertEqual(ctx.exception.revision, "abc123def456")
+        self.assertEqual(ctx.exception.entries, entries)
+
+    def test_sandbox_hop_round_trips_revision_and_entries(self):
+        entries = [{"path": "knowledge", "type": "tree", "bytes": 1024}]
+        self.broker.refuse["snapshot"] = vcs_client.VcsError(
+            "snapshot exceeds ceiling",
+            code="SNAPSHOT_TOO_LARGE",
+            detail="narrow with paths",
+            revision="feedface1234",
+            entries=entries,
+        )
+
+        def far_side(argv, **kwargs):
+            out = io_text("")
+            with mock.patch.object(sys, "stdin", io_text(kwargs["stdin"])), \
+                 mock.patch.object(sys, "stdout", out):
+                rc = forge.main(argv[2:])
+            return subprocess.CompletedProcess(argv, rc, stdout=out.getvalue(), stderr="")
+
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", lambda: True), \
+             mock.patch.object(sandbox_exec, "run", far_side):
+            with self.assertRaises(forge.ForgeError) as ctx:
+                forge.call("snapshot", {"maxBytes": 8388608}, REPO)
+
+        self.assertEqual(ctx.exception.reason, "SNAPSHOT_TOO_LARGE")
+        self.assertEqual(ctx.exception.revision, "feedface1234")
+        self.assertEqual(ctx.exception.entries, entries)
+
+    def test_sandbox_hop_round_trips_path_not_found_revision_without_entries(self):
+        self.broker.refuse["snapshot"] = vcs_client.VcsError(
+            "path not found",
+            code="PATH_NOT_FOUND",
+            revision="deadbeef9999",
+        )
+
+        def far_side(argv, **kwargs):
+            out = io_text("")
+            with mock.patch.object(sys, "stdin", io_text(kwargs["stdin"])), \
+                 mock.patch.object(sys, "stdout", out):
+                rc = forge.main(argv[2:])
+            return subprocess.CompletedProcess(argv, rc, stdout=out.getvalue(), stderr="")
+
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", lambda: True), \
+             mock.patch.object(sandbox_exec, "run", far_side):
+            with self.assertRaises(forge.ForgeError) as ctx:
+                forge.call("snapshot", {"paths": ["docs"]}, REPO)
+
+        self.assertEqual(ctx.exception.reason, "PATH_NOT_FOUND")
+        self.assertEqual(ctx.exception.revision, "deadbeef9999")
+        self.assertIsNone(ctx.exception.entries)
 
 
 if __name__ == "__main__":

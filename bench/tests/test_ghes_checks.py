@@ -311,10 +311,6 @@ def test_client_for_takes_the_api_root():
 
 # --- BENCH_FORGE_CA_FILE ----------------------------------------------------
 
-# The DER bytes of the object identifier of the curve prime256v1. A key that names its
-# curve holds them; a key that writes the curve's parameters in full does not.
-PRIME256V1_OID = bytes.fromhex("06082a8648ce3d030107")
-
 
 @pytest.fixture
 def private_ca_server(tmp_path):
@@ -356,16 +352,6 @@ def private_ca_server(tmp_path):
 
 def test_a_private_ca_is_trusted_only_when_named(private_ca_server, monkeypatch):
     url, ca = private_ca_server
-    # Only where the host's openssl is LibreSSL (macOS): it writes the curve's parameters in
-    # full, and the TLS client refuses such a key. With OpenSSL the test always runs, so a
-    # key that the client refuses fails it there.
-    libressl = "LibreSSL" in subprocess.run(["openssl", "version"], capture_output=True, text=True, check=True).stdout
-    if libressl and PRIME256V1_OID not in ssl.PEM_cert_to_DER_cert(ca.read_text()):
-        pytest.skip(
-            "this machine's openssl is LibreSSL and made the CA's key with explicit EC parameters, which "
-            "the TLS client refuses; the test shows a private CA that is trusted only when "
-            "BENCH_FORGE_CA_FILE names it"
-        )
     monkeypatch.setattr(verifiers, "_FORGE_READ_RETRY_PAUSE_SEC", 0)
     with pytest.raises(OSError, match="CERTIFICATE_VERIFY_FAILED"):
         verifiers._http_get_json(f"{url}/repos/a/b", "ghs_fake", 5)
@@ -406,6 +392,32 @@ def test_the_server_certificate_is_refused_as_the_ca(private_ca_server):
     leaf = ca.parent / "tls.crt"
     with pytest.raises(forges.UnknownForge, match="no CA certificate"):
         forges.forge_ssl_context({forges.FORGE_CA_FILE_ENV_VAR: str(leaf)})
+
+
+def test_make_certs_asks_for_a_named_curve_in_each_key(tmp_path):
+    """LibreSSL, the openssl of macOS, writes a key's curve parameters in full
+    unless the key options ask for the curve's name, and a TLS client on
+    OpenSSL 3 refuses such a key. OpenSSL names the curve by default, so on
+    Linux only the options show that the script asks. The encoding option
+    must come after the curve option."""
+    real = shutil.which("openssl")
+    if not real:
+        pytest.skip("openssl is not on PATH")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    log = tmp_path / "openssl.log"
+    (fake / "openssl").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexec "{real}" "$@"\n')
+    (fake / "openssl").chmod(0o755)
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "hack" / "ghes-proxy" / "make-certs.sh"), "localhost", str(tmp_path / "out")],
+        check=True,
+        capture_output=True,
+        env={"PATH": f"{fake}:/usr/bin:/bin"},
+    )
+    new_keys = [call for call in log.read_text().splitlines() if "-newkey ec" in call]
+    assert len(new_keys) == 2, new_keys
+    for call in new_keys:
+        assert "-pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve" in call, call
 
 
 def test_make_certs_shows_why_openssl_failed(tmp_path):

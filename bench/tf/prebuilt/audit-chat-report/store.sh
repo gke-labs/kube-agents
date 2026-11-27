@@ -13,26 +13,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The report-store step of bench/tf/prebuilt/audit-chat-report, run in the shell
-# sandbox. Two commands, each taking the stream's store directory:
+# The report-store step of bench/tf/prebuilt/audit-chat-report. Two commands,
+# each taking the stream's store directory and the path of the digest record its
+# last scheduled run left:
 #
-#   move <store>     rename every latest.json under it to latest.json.bench-moved
-#   restore <store>  put back each renamed copy whose latest.json the run did not
-#                    replace, and delete the rest
+#   move <store> <digest>     rename every latest.json under the store to
+#                             latest.json.bench-moved, and the digest record
+#                             likewise
+#   restore <store> <digest>  put back each renamed copy the run did not replace,
+#                             and delete the rest
 #
-# A store that does not exist is left alone by both.
+# The digest record goes with the report because `precheck` reads it alone to
+# call a fleet unchanged, and then closes a scheduled run from the newest stored
+# document, which the run ring still holds when latest.json is gone.
+#
+# A store or a record that does not exist is left alone by both, and so is one
+# passed as an empty argument. With the file store, main.tf runs this once in the
+# shell sandbox, which holds both. With the broker store (#6110), the store's
+# files are on the gateway pod's data volume and the digest record stays in the
+# sandbox's scratch, so main.tf runs it twice, each time with the other path
+# empty: in the agent container for the store, in the sandbox for the record.
 set -eu
 
 suffix=.bench-moved
 command=$1
 store=$2
-[ -d "$store" ] || exit 0
+digest=$3
 
 case "$command" in
   move)
+    if [ -n "$digest" ] && [ -e "$digest" ]; then mv "$digest" "$digest$suffix"; fi
+    [ -n "$store" ] && [ -d "$store" ] || exit 0
     find "$store" -name latest.json | while read -r f; do mv "$f" "$f$suffix"; done
     ;;
   restore)
+    if [ -n "$digest" ] && [ -e "$digest$suffix" ]; then
+      if [ -e "$digest" ]; then rm -f "$digest$suffix"; else mv "$digest$suffix" "$digest"; fi
+    fi
+    [ -n "$store" ] && [ -d "$store" ] || exit 0
     find "$store" -name "latest.json$suffix" | while read -r f; do
       original=${f%"$suffix"}
       if [ -e "$original" ]; then rm -f "$f"; else mv "$f" "$original"; fi

@@ -658,7 +658,11 @@ Layout:
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for. Amended 9/28: the
+  between calls are named there as what the term does not size for. The supervisor
+  cutoff's stored-time ephemerals (#6466; up to four per gateway or MCP server process, each
+  held about five seconds) are deliberately not in `a2aTasksReservedConsumersFor` and come
+  out of the stream's headroom: an existing `TASKS` stream can't grow to a wider reserve,
+  and the provision check would refuse it on the upgrade. Amended 9/28: the
   replay term scales with the bridge's worker count, which the render reads as
   `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` and, when the operator renders the
   bridge itself, off the operator's `A2A_BRIDGE_CONCURRENCY` setting, read by the same rule
@@ -779,8 +783,7 @@ Layout:
   ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
-  other legitimate destination, save the credential broker on its one port when the
-  operator's `A2A_SESSION_CLUSTER_VIEW` flag is on; see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
+  other legitimate destination, save the credential broker on its one port under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it); see `spec-mode-switch.md`). **Amended 9/8:** a session pod now carries a
   ServiceAccount and a projected bus token, so the reason for the fence's shape changed
   while the fence did not. The kubelet delivers that token through a volume, so the
   credential arrives without the pod dialling anything, and this policy is what withholds
@@ -846,13 +849,15 @@ Layout:
   `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
   the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
   console's read surface and `chat.console.*.in`, without the console's confirmation subject.
+  **Amended:** the MCP server now runs by default unless `A2A_MCP_DOOR` is `false` (set by
+  the chart's `operator.mcpServer.enabled: false`).
 
 - **The notify route.** The agent's proactive posts to the chat home channel, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains
-  publish on `chat.notify.gchat`, `chat.notify.slack` and `chat.notify.console` (one subject per
+  publish on `chat.notify.gchat`, `chat.notify.slack`, `chat.notify.teams` and `chat.notify.console` (one subject per
   backend the gateway can hold, and the console's) and subscribe on `chat.notify.reply.agent.>`;
-  the gateway user gains the matching grants (subscribe on the three request subjects, publish on
+  the gateway user gains the matching grants (subscribe on the four request subjects, publish on
   the reply namespace). No other
   principal holds either subject. The reply namespace is its own rather than the agent's
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
@@ -1244,13 +1249,19 @@ process, with concurrent presentations of one token sharing one review; a failur
 never remembered, and the identity-map lookup is not cached, so a map change reaches the
 next connection as before. A reconnecting fleet therefore costs one review per distinct
 token per thirty seconds, its retries are free, and the log line for an authorized
-connection says whether its review was `fresh` or `cached`. Measured, not read off the
-code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connection says whether its review was `fresh` or `cached`. Three tests in
+`a2a/authcallout` measure the pool. `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
 connects sixty-four clients with distinct tokens to the operator's rendered server, holds
-every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
-`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
-handler directly with a 50ms review each and asserts every one is answered inside a
-second, sixteen abreast. Before this the
+every review until sixteen are in flight, and asserts the peak is exactly sixteen.
+`TestSixtyFourCallbacksAreDecidedInFourRoundsSixteenAbreast` starts sixty-four decisions
+with no server and no handler in front of them, holds every review, and releases the
+reviews one round at a time; it asserts that each round is exactly sixteen reviews, that
+no request waiting behind a held round is reviewed or answered, and that sixty-four
+requests take four rounds. `TestHandleReturnsBeforeTheDecisionIsMade` asserts that the
+handler returns while its request's review is still waiting. No test asserts a wall
+clock. Sixty-four connections answered inside a second at a 50ms review is derived from
+the four rounds, which are 200ms of review against 3.2s one at a time; what a decision
+costs outside its review is logged by the round test and has no bound. Before this the
 handler did its TokenReview inline and a replica answered one request at a time, and
 twelve A2A workers reconnecting per replica were enough to queue past the first-ping
 timer, each failed connect reconnecting and reviewing again; that outage was the

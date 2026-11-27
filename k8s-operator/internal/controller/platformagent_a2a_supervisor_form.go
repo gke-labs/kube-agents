@@ -1,0 +1,432 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// Moving profile tasks' terminals to the six-token supervisor subject
+// (a2a.tasks.p.<profile>.<task>.supervisor, #5301) is ordered so that nothing
+// writes the new form before every reader that can run watches it:
+//
+//  1. The readers: the A2A gateway, the agent pod (its hermes-bridge sidecar
+//     folds task ends) and, when rendered, the MCP server, each fully rolled
+//     out on the template this operator renders. This release's images read
+//     both forms (#5644), so a finished rollout means no older reader is left.
+//  2. Then the provision Job writes the gateway relay durable's third filter,
+//     so the relay delivers six-token terminals live, not only by heal.
+//  3. Then, once that Job has succeeded, the dispatch config's
+//     profileSupervisorForm is "profile", and the dispatcher writes the six-
+//     token form. Its grant names both forms whatever the switch says, so the
+//     switch never comes ahead of the grant.
+//
+// The order latches on the ProfileSupervisorForm condition: once step 3 is
+// reached it stays reached, so a later release's gateway roll doesn't take the
+// third filter away and switch the dispatcher back for the length of the roll.
+// Only a rollback two releases, past #5644, could bring back a reader that
+// doesn't watch the six-token form, which the N->N-1 rollback rule doesn't
+// cover.
+const (
+	a2aProfileSupervisorFormCondition = "ProfileSupervisorForm"
+	a2aProfileSupervisorFormReason    = "SixTokenSupervisorSubject"
+	a2aProfileSupervisorFormValue     = "profile"
+)
+
+// The gate the readers take from the latch (#5301 PR 4). Past the cutoff, a
+// five-token supervisor terminal on a profile task is not that task's
+// terminal: the dispatcher writes the six-token form from the latch on, and
+// the margin covers its pick-up of the switched dispatch config and a
+// terminal already in flight. One stored before the cutoff still counts, so
+// history and heals keep every terminal the dispatcher wrote before it
+// switched.
+//
+// The gate holds against the gateway, whose grant still reaches the
+// five-token form, so its two inputs are this operator's alone: the cutoff
+// env on the reader's Deployment, and the profile names file, a ConfigMap
+// the readers mount. Which addressees are profiles comes from that file and
+// nothing else. The gateway's Role reaches no ConfigMap but its home-channel
+// record (get, patch) and, under mode next, the resolved scope (get); it can
+// get, not patch, its own Deployment; and its bus grants publish nothing on
+// DIRECTORY. The MCP server mounts no ServiceAccount token at all.
+const (
+	// a2aProfileSupervisorCutoffEnvVar is lib.EnvProfileSupervisorCutoff in
+	// a2a/lib/supervisor_cutoff.go; the gateway and the MCP server read it.
+	a2aProfileSupervisorCutoffEnvVar = "A2A_PROFILE_SUPERVISOR_CUTOFF"
+	// a2aProfileSupervisorCutoffMargin is how long after the latch the
+	// cutoff falls.
+	a2aProfileSupervisorCutoffMargin = 10 * time.Minute
+	// a2aProfileNamesEnvVar is lib.EnvProfileNamesFile: the path of the
+	// profile names file in the reader's container.
+	a2aProfileNamesEnvVar = "A2A_PROFILE_NAMES_FILE"
+	// The profile names ConfigMap's key, volume and mount. The mount is the
+	// whole directory (no subPath), so the kubelet refreshes the file in
+	// place and a profile bound or unbound reaches the readers without a
+	// roll; they re-read it every 30 seconds.
+	a2aProfileNamesKey       = "profiles.json"
+	a2aProfileNamesVolume    = "a2a-profile-names"
+	a2aProfileNamesMountPath = "/etc/a2a-profile-names"
+)
+
+// a2aProfileNamesName is the profile names ConfigMap.
+func a2aProfileNamesName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-profile-names"
+}
+
+// a2aProfileSupervisorLatchedAt is the persisted ProfileSupervisorForm
+// latch's LastTransitionTime, and whether the install has latched: the
+// condition as the API server holds it, so it reads latched one pass after
+// the pass that latches. The latch never moves once True, so the time is
+// stable. Not latched (absent, held, or a latch with no transition time to
+// anchor on), the readers get no gate and their pod templates are exactly
+// what they were.
+func a2aProfileSupervisorLatchedAt(agent *agentv1alpha1.PlatformAgent) (time.Time, bool) {
+	c := meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	if c == nil || c.Status != metav1.ConditionTrue || c.LastTransitionTime.IsZero() {
+		return time.Time{}, false
+	}
+	return c.LastTransitionTime.Time, true
+}
+
+// a2aProfileSupervisorCutoffEnv is the gate's env for the gateway and the MCP
+// server once latched: the cutoff, the latch's time plus the margin in
+// RFC3339 UTC, and the profile names file's path. Nil when not latched, so
+// nothing rolls.
+func a2aProfileSupervisorCutoffEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	at, ok := a2aProfileSupervisorLatchedAt(agent)
+	if !ok {
+		return nil
+	}
+	cutoff := at.Add(a2aProfileSupervisorCutoffMargin).UTC().Format(time.RFC3339)
+	return []corev1.EnvVar{
+		{Name: a2aProfileSupervisorCutoffEnvVar, Value: cutoff},
+		{Name: a2aProfileNamesEnvVar, Value: a2aProfileNamesMountPath + "/" + a2aProfileNamesKey},
+	}
+}
+
+// withA2AProfileNamesFile mounts the profile names file into the named
+// container of spec once latched. The volume is optional: a pod that starts
+// before the ConfigMap exists reads every addressee as a profile (lib's
+// ProfileNames fails closed) until the kubelet puts the file there.
+func withA2AProfileNamesFile(agent *agentv1alpha1.PlatformAgent, spec *corev1.PodSpec, container string) {
+	if _, ok := a2aProfileSupervisorLatchedAt(agent); !ok {
+		return
+	}
+	for i := range spec.Containers {
+		if spec.Containers[i].Name != container {
+			continue
+		}
+		spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts,
+			corev1.VolumeMount{Name: a2aProfileNamesVolume, MountPath: a2aProfileNamesMountPath, ReadOnly: true})
+		spec.Volumes = append(spec.Volumes, corev1.Volume{
+			Name: a2aProfileNamesVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aProfileNamesName(agent)},
+				Optional:             ptr.To(true),
+			}},
+		})
+		return
+	}
+}
+
+// a2aProfileNamesFile is the file's shape, which lib.ParseProfileNames reads.
+type a2aProfileNamesFile struct {
+	Profiles []string `json:"profiles"`
+}
+
+// buildA2AProfileNamesConfigMap renders names, sorted and without repeats,
+// into the profile names ConfigMap. The caller passes the names nats.conf
+// denies the gateway the supervisor subjects of (dispatcherGrantNames: the
+// admitted profiles and the ones still draining), so a reader's profile and
+// the bus's deny are one set. A name that isn't one subject token addresses
+// no task and is left out, as the deny leaves it out.
+func buildA2AProfileNamesConfigMap(agent *agentv1alpha1.PlatformAgent, names []string) (*corev1.ConfigMap, error) {
+	f := a2aProfileNamesFile{Profiles: []string{}}
+	for _, n := range names {
+		if n == "" || strings.ContainsAny(n, ".*> \t\r\n") {
+			continue
+		}
+		f.Profiles = append(f.Profiles, n)
+	}
+	sort.Strings(f.Profiles)
+	f.Profiles = slices.Compact(f.Profiles)
+	raw, err := json.Marshal(f)
+	if err != nil {
+		return nil, err
+	}
+	return &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aProfileNamesName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "profile-names")},
+		Data:       map[string]string{a2aProfileNamesKey: string(raw) + "\n"},
+	}, nil
+}
+
+// applyA2AProfileNames renders the profile names ConfigMap once the install
+// has latched, and nothing before: an unlatched install's readers mount
+// nothing and read nothing. Once rendered it is kept current every pass.
+// namesErr is the error the names came with (dispatcherGrantNamesErr): with
+// one, nothing is applied and the pass fails, so the ConfigMap keeps the names
+// last rendered. Rendering an empty list instead would tell both readers that
+// no addressee is a profile, which is the gate failing open.
+func (r *PlatformAgentReconciler) applyA2AProfileNames(ctx context.Context, agent *agentv1alpha1.PlatformAgent, names []string, namesErr error) error {
+	if _, ok := a2aProfileSupervisorLatchedAt(agent); !ok {
+		return nil
+	}
+	if namesErr != nil {
+		return fmt.Errorf("failed to render the profile names for the supervisor cutoff; keeping the ConfigMap as it is: %w", namesErr)
+	}
+	cm, err := buildA2AProfileNamesConfigMap(agent, names)
+	if err != nil {
+		return err
+	}
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, cm); err != nil {
+		return fmt.Errorf("failed to apply the profile names ConfigMap: %w", err)
+	}
+	return nil
+}
+
+// a2aDeploymentFullyOnTemplate reports whether dep has finished rolling out its
+// current template: the controller has observed this generation, every replica
+// is on it and available, and no pod from an older template is left.
+func a2aDeploymentFullyOnTemplate(dep *appsv1.Deployment) bool {
+	desired := int32(1)
+	if dep.Spec.Replicas != nil {
+		desired = *dep.Spec.Replicas
+	}
+	return dep.Status.ObservedGeneration >= dep.Generation &&
+		dep.Status.UpdatedReplicas == desired &&
+		dep.Status.Replicas == desired &&
+		dep.Status.AvailableReplicas >= desired
+}
+
+// a2aSupervisorReader is one workload whose container reads a profile task's
+// terminal, and the image this operator renders for that container from its
+// own release defaults.
+type a2aSupervisorReader struct {
+	name      string
+	container string
+	// image is this release's reader: the image whose readers parse the
+	// six-token form.
+	image string
+	// rendered is the image this operator renders for the reader on this
+	// install. It differs from image only where a spec pins it (the agent
+	// pod's hermes-bridge, derived from a pinned spec.deployment.image): a
+	// standing hold, which no rollout of this release will clear.
+	rendered string
+	// optional readers that aren't deployed don't hold the gate: one
+	// rendered later is this release's, which reads both forms.
+	optional bool
+}
+
+// a2aProfileSupervisorReaders are the workloads whose containers read a
+// profile task's terminal: the A2A gateway, the agent pod's hermes-bridge (a
+// Deployment, or a StatefulSet for a multi-replica agent on RWO storage), and
+// the MCP server when its door is on.
+func a2aProfileSupervisorReaders(agent *agentv1alpha1.PlatformAgent) []a2aSupervisorReader {
+	readers := []a2aSupervisorReader{
+		{name: a2aGatewayName(agent), image: a2aGatewayImage(), rendered: a2aGatewayImage()},
+		{name: agent.Name + "-gateway", container: a2aBridgeContainerName, image: a2aBridgeImage(defaultPlatformAgentImage()),
+			rendered: a2aBridgeImage(resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage()))},
+	}
+	if a2aMCPDoorEnabled() {
+		readers = append(readers, a2aSupervisorReader{name: a2aMCPName(agent), image: a2aConsoleImage(), rendered: a2aConsoleImage(), optional: true})
+	}
+	return readers
+}
+
+// templateRunsImage reports whether spec has the container (any container when
+// name is empty) on image.
+func templateRunsImage(spec corev1.PodSpec, name, image string) bool {
+	for _, c := range spec.Containers {
+		if (name == "" || c.Name == name) && c.Image == image {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aStatefulSetFullyOnTemplate is a2aDeploymentFullyOnTemplate for a
+// StatefulSet: every replica on the update revision and ready.
+func a2aStatefulSetFullyOnTemplate(sts *appsv1.StatefulSet) bool {
+	desired := int32(1)
+	if sts.Spec.Replicas != nil {
+		desired = *sts.Spec.Replicas
+	}
+	return sts.Status.ObservedGeneration >= sts.Generation &&
+		sts.Status.UpdatedReplicas == desired && sts.Status.Replicas == desired &&
+		sts.Status.ReadyReplicas >= desired && sts.Status.CurrentRevision == sts.Status.UpdateRevision
+}
+
+// a2aSupervisorReadersOnTemplate reports whether every profile-terminal reader
+// runs the image this operator renders for it and has finished rolling it out,
+// and names the first that doesn't. Comparing the live template's image, not
+// only the rollout, keeps a reader from an older release that happens to be
+// fully rolled out (a pass that failed before re-applying it) from opening the
+// gate; an install that pins an agent image other than this release's, and so another bridge,
+// stays on the five-token form.
+func (r *PlatformAgentReconciler) a2aSupervisorReadersOnTemplate(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
+	ok, blocker, _, err := r.a2aSupervisorReadersCheck(ctx, agent)
+	return ok, blocker, err
+}
+
+// a2aSupervisorReadersCheck is a2aSupervisorReadersOnTemplate, also saying
+// whether the blocker is a standing hold: a reader this operator renders on an
+// image other than this release's (a pinned agent image's bridge). A live
+// reader still on an older release's image is not one: this pass, or the
+// next, applies this release's render, so it is a rollout in flight, like one
+// still rolling, even before the apply.
+func (r *PlatformAgentReconciler) a2aSupervisorReadersCheck(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, bool, error) {
+	for _, rd := range a2aProfileSupervisorReaders(agent) {
+		if rd.rendered != rd.image {
+			return false, rd.name, true, nil
+		}
+		key := client.ObjectKey{Namespace: agent.Namespace, Name: rd.name}
+		dep := &appsv1.Deployment{}
+		err := r.a2aReader().Get(ctx, key, dep)
+		switch {
+		case err == nil:
+			if !templateRunsImage(dep.Spec.Template.Spec, rd.container, rd.image) {
+				return false, rd.name, false, nil
+			}
+			if !a2aDeploymentFullyOnTemplate(dep) {
+				return false, rd.name, false, nil
+			}
+			continue
+		case !apierrors.IsNotFound(err):
+			return false, rd.name, false, err
+		}
+		sts := &appsv1.StatefulSet{}
+		if err := r.a2aReader().Get(ctx, key, sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				if rd.optional {
+					continue
+				}
+				return false, rd.name, false, nil
+			}
+			return false, rd.name, false, err
+		}
+		if !templateRunsImage(sts.Spec.Template.Spec, rd.container, rd.image) {
+			return false, rd.name, false, nil
+		}
+		if !a2aStatefulSetFullyOnTemplate(sts) {
+			return false, rd.name, false, nil
+		}
+	}
+	return true, "", false, nil
+}
+
+// a2aProfileSupervisorFormFor says how far this pass takes the move: whether
+// the provision Job renders the relay's third filter, and the dispatch config's
+// profileSupervisorForm. A non-empty form is the latch wanted; the status
+// writers save it (setProfileSupervisorFormCondition), as they save
+// BusProvisioned, so a settled pass that changes nothing else still writes it.
+func (r *PlatformAgentReconciler) a2aProfileSupervisorFormFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (thirdFilter bool, form string, err error) {
+	thirdFilter, form, _, err = r.a2aProfileSupervisorFormAndHold(ctx, agent)
+	return thirdFilter, form, err
+}
+
+// a2aProfileSupervisorFormAndHold is a2aProfileSupervisorFormFor, also naming
+// a reader that holds the install on the five-token form because it runs an
+// image other than this operator's render (heldBy, empty otherwise).
+func (r *PlatformAgentReconciler) a2aProfileSupervisorFormAndHold(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (thirdFilter bool, form, heldBy string, err error) {
+	latched := meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	if !latched {
+		ready, blocker, image, err := r.a2aSupervisorReadersCheck(ctx, agent)
+		if err != nil || !ready {
+			if image {
+				heldBy = blocker
+			}
+			return false, "", heldBy, err
+		}
+	}
+	if latched {
+		return true, a2aProfileSupervisorFormValue, "", nil
+	}
+	// Readers ready: the third filter renders. The switch waits for the
+	// Job that applies it.
+	job := a2aProvisionJobForm(agent, true)
+	existing := &batchv1.Job{}
+	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(job), existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, "", "", nil
+		}
+		return true, "", "", err
+	}
+	if existing.Status.Succeeded == 0 {
+		return true, "", "", nil
+	}
+	return true, a2aProfileSupervisorFormValue, "", nil
+}
+
+// a2aProfileSupervisorFormHeldReason is the condition's False reason: a
+// profile-terminal reader runs an image other than this operator's render, so
+// the install stays on the five-token supervisor subject.
+const a2aProfileSupervisorFormHeldReason = "ReaderNotOnReleaseImage"
+
+func profileSupervisorFormHeldMessage(heldBy string) string {
+	return heldBy + " is rendered on an image other than this release's (the hermes-bridge of a pinned spec.deployment.image), so profile terminals stay on the five-token supervisor subject; a later release that drops that subject keeps it for this install while this holds, and setting the pin to this release's tag or removing it clears it"
+}
+
+// profileSupervisorFormConditionCurrent reports whether the CR already carries
+// the condition as wanted: True once latched (never removed), False naming the
+// reader that holds it on the legacy subject, or absent.
+func profileSupervisorFormConditionCurrent(agent *agentv1alpha1.PlatformAgent, latch bool, heldBy string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	switch {
+	case existing != nil && existing.Status == metav1.ConditionTrue:
+		return true
+	case latch:
+		return false
+	case heldBy != "":
+		return existing != nil && existing.Status == metav1.ConditionFalse && existing.Message == profileSupervisorFormHeldMessage(heldBy)
+	default:
+		return existing == nil
+	}
+}
+
+// setProfileSupervisorFormCondition writes the wanted state: the latch (never
+// removed once True), the hold, or nothing.
+func setProfileSupervisorFormCondition(agent *agentv1alpha1.PlatformAgent, latch bool, heldBy string, now metav1.Time) {
+	if meta.IsStatusConditionTrue(agent.Status.Conditions, a2aProfileSupervisorFormCondition) {
+		return
+	}
+	switch {
+	case latch:
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type: a2aProfileSupervisorFormCondition, Status: metav1.ConditionTrue,
+			Reason:             a2aProfileSupervisorFormReason,
+			Message:            "every profile-task reader watches the six-token supervisor subject and the gateway relay filters it, so the dispatcher writes profile terminals there",
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	case heldBy != "":
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type: a2aProfileSupervisorFormCondition, Status: metav1.ConditionFalse,
+			Reason:             a2aProfileSupervisorFormHeldReason,
+			Message:            profileSupervisorFormHeldMessage(heldBy),
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		})
+	default:
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aProfileSupervisorFormCondition)
+	}
+}

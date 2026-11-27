@@ -10,7 +10,9 @@ module is both halves on session-kv's side:
 - :func:`snapshot_section` is the board snapshot's ``dial`` section: the level,
   who set it and when, the admin list, and per kind of fix and managed
   repository the clean merges it has earned (``clean_merges``) and whether its
-  rules-file pull request is off, pending or merged.
+  rules-file pull request is off, pending or merged. When the post-merge
+  check steps an auto-merging kind down (:func:`adopt_step_downs`), the row
+  follows the step-down's rules pull request as it would a Stop's.
 - :func:`handle` answers ``dial.level``, ``dial.request`` and ``dial.stop``.
   It checks the switch and the admin list itself (the gateway's check only
   decides what to draw), records the change, reports a level to the
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -48,6 +51,10 @@ import kubeagents_switches
 from fix_recipes import registry
 
 logger = logging.getLogger(__name__)
+# The credential broker is an in-cluster Service: a proxy from the environment
+# must not get the level report and its bearer token, and urllib does not leave
+# out a cluster host by itself.
+_BROKER_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 STATE_NAME = "kube-agents/dial.json"
 #: The managed .env key (``KUBEAGENTS_DIAL_ADMINS``), which the operator pins.
@@ -96,6 +103,13 @@ BUSY = "A change to this switch is already running."
 SWITCH_FAILED = "The switch did not run: {reason}"
 OPENING = "Opening the rules pull request for {repo}; the row shows it once it is open."
 CLOSING = "Changing the rules file for {repo}; the row shows the result."
+STEPPING_DOWN = "Stepping down: {fix} was still broken after it merged."
+STEPPED_DOWN = "Stepped down: {fix} was still broken after it merged. Delete its deny rule to allow it again."
+STEP_DOWN_STOPPING = "Already stopping: the step-down's rules pull request turns it off once it merges."
+STEP_DOWN_OPEN = "A step-down's rules pull request is open for this kind; merge or close it first."
+#: The post-merge record of a fix the step-down acted on, and where it names the rules pull request.
+STEPPED_DOWN_FOLLOWUP = "stepped-down"
+_PULL_NUMBER = re.compile(r"/(?:pull|pulls|merge_requests|pull-requests)/(\d+)/?$")
 
 _write_lock = threading.Lock()
 _busy: set[tuple[str, str]] = set()
@@ -224,12 +238,99 @@ def _repo_state(entry: dict) -> tuple[str, dict | None]:
     return STATE_OFF, None
 
 
+def step_downs(session_db: Any) -> dict[tuple[str, str, str], list[dict]]:
+    """``{(repo_key, kind, environment): [{merged_at, fix, pr, number}, ...]}``, oldest fix first.
+
+    A step-down is a still-broken fix whose post-merge follow-up opened a deny rule's pull
+    request (``followup_detail.stepDown``). A follow-up that refused the rule, or one a person
+    merged, opens none and is not one. No table, or one missing a column, is none.
+    """
+    try:
+        rows = session_db.execute(
+            f"SELECT repo, number, kind, environment, merged_at, followup_detail FROM {clean_merges.RECORDS_TABLE} "
+            "WHERE followup_state = ?", (STEPPED_DOWN_FOLLOWUP,)
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — no step-downs rather than no board
+        logger.debug("dial: could not read step-downs: %s", exc)
+        return {}
+    found: dict[tuple[str, str, str], list[dict]] = {}
+    for repo, number, kind, environment, merged_at, detail in rows:
+        key, merged = clean_merges.repo_key(repo), clean_merges._parse_time(merged_at)
+        try:
+            pr = json.loads(detail or "{}").get("stepDown")
+        except (ValueError, AttributeError):
+            pr = None
+        match = _PULL_NUMBER.search(pr) if isinstance(pr, str) else None
+        if not key or not isinstance(kind, str) or merged is None or match is None:
+            continue
+        group = (key, kind, environment.strip().lower() if isinstance(environment, str) else "")
+        found.setdefault(group, []).append({"merged_at": merged, "fix": number if type(number) is int else 0,
+                                            "pr": pr, "number": int(match.group(1))})
+    for downs in found.values():
+        downs.sort(key=lambda down: down["merged_at"])
+    return found
+
+
+def adopt_step_downs(session_db: Any, state: dict) -> dict:
+    """Record each step-down of a kind that auto-merges here as its pending rules pull request.
+
+    Only a fix merged after auto-merge was requested counts, so a new request starts over; an
+    entry with no ``set_at`` is left alone. The oldest such step-down is followed first: if its
+    pull request is closed, the row comes back on as of that fix and takes up the next one. The entry then settles as a Stop's does
+    (:func:`refresh_pending`): off once the deny rule merges, back on if it is closed. Returns the
+    record as it stands after.
+    """
+    found = step_downs(session_db)
+    due = []
+    for kind, _title, environment in FIX_KINDS:
+        for key, entry in state["kinds"].get(kind, {}).items():
+            set_at = entry.get("set_at")
+            if _repo_state(entry)[0] != STATE_ON or type(set_at) is not int:
+                continue
+            down = next((d for d in found.get((key, kind, environment), []) if d["merged_at"].timestamp() > set_at),
+                        None)
+            if down is None:
+                continue
+            due.append((kind, key, entry, down))
+    if not due:
+        return state
+
+    def change(raw: dict) -> None:
+        for kind, key, entry, down in due:
+            repos = (raw.get("kinds") or {}).get(kind) or {}
+            # Only the entry this read saw: a tap since then decides.
+            if repos.get(key) != entry:
+                continue
+            # A closed rules pull request puts the kind back on as of this fix, so the same step-down
+            # is not taken up again; only a later one is.
+            merged = math.ceil(down["merged_at"].timestamp())
+            repos[key] = {"on": False, "state": SWITCH_PROPOSED, "url": entry.get("url"), "pr": down["pr"],
+                          "number": down["number"], "stepped_down": down["fix"], "set_at": merged,
+                          "before": {"on": True, "state": STATE_ON, "set_at": merged}}
+
+    try:
+        _write(change)
+    except (UnreadableRecord, OSError) as exc:
+        logger.warning("dial: not recording a step-down: %s", exc)
+        return state
+    return read_state()
+
+
+def _step_down_note(entry: dict, switch: str) -> str:
+    """The row's note while a step-down's rules pull request is open, and once it merged."""
+    fix = entry.get("stepped_down")
+    if type(fix) is not int or switch == STATE_ON:
+        return ""
+    text = f"PR #{fix}" if fix > 0 else "a fix"
+    return (STEPPING_DOWN if switch == STATE_PENDING else STEPPED_DOWN).format(fix=text)
+
+
 def snapshot_section(session_db: Any, now: datetime | None = None, repos: list[str] | None = None) -> dict:
     """The board snapshot's ``dial`` section. Only ``{"enabled": false}`` while the switch is off."""
     if not enabled():
         return {"enabled": False}
     now = now or datetime.now(timezone.utc)
-    state = read_state()
+    state = adopt_step_downs(session_db, read_state())
     try:
         urls = managed_repos() if repos is None else repos
     except Exception as exc:  # noqa: BLE001 — no repositories rather than no board
@@ -262,7 +363,7 @@ def snapshot_section(session_db: Any, now: datetime | None = None, repos: list[s
             }
             if pending is not None:
                 row["pending_pr"] = pending
-            note = recorded.get(key, {}).get("note")
+            note = recorded.get(key, {}).get("note") or _step_down_note(recorded.get(key, {}), switch)
             if isinstance(note, str) and note:
                 row["note"] = note
             rows.append(row)
@@ -315,7 +416,7 @@ def report_level(level: str) -> bool:
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=BROKER_TIMEOUT_SECONDS) as response:
+        with _BROKER_OPENER.open(request, timeout=BROKER_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read() or b"{}")
     except Exception as exc:  # noqa: BLE001 — reported again on the next pick
         logger.warning("dial: could not report the level %s to the broker: %s", level, exc)
@@ -443,6 +544,9 @@ def refresh_pending(due: list[tuple[str, str, dict]]) -> None:
                 before = current.get("before") if isinstance(current.get("before"), dict) else {"on": not wanted_on}
                 was_on = before.get("on") is True and before.get("state", STATE_ON) == STATE_ON
                 repos[key] = {"on": was_on, "state": STATE_ON if was_on else STATE_OFF, "url": current.get("url")}
+                # The request's time travels back with it, so a later step-down still counts against it.
+                if was_on and type(before.get("set_at")) is int:
+                    repos[key]["set_at"] = before["set_at"]
 
         try:
             _write(settle)
@@ -504,6 +608,13 @@ def _switch(action: str, user: str, payload: dict) -> dict:
     if not key or url is None:
         return _answer(action, False, NOT_MANAGED)
     state = read_state()
+    current = state["kinds"].get(kind, {}).get(key, {})
+    # The step-down's branch is not the switch's, so a tap would open a second rules pull
+    # request and stop following the first.
+    if _repo_state(current)[0] == STATE_PENDING and type(current.get("stepped_down")) is int:
+        if action == ACTION_STOP:
+            return _answer(action, True, STEP_DOWN_STOPPING)
+        return _answer(action, False, STEP_DOWN_OPEN)
     turning_on = action == ACTION_REQUEST
     if turning_on and state["level"] != LEVEL_AUTOMERGE:
         return _answer(action, False, NEEDS_AUTOMERGE)
@@ -552,7 +663,8 @@ def _run_switch(action: str, user: str, kind: str, environment: str, key: str, u
             _note(kind, key, previous, f"Not changed: {result.get('reason') or 'the switch refused'}.")
             return
         before = previous.get("before") if pending and isinstance(previous.get("before"), dict) else {
-            "on": previous.get("on") is True, "state": previous.get("state") or STATE_OFF}
+            "on": previous.get("on") is True, "state": previous.get("state") or STATE_OFF,
+            **({"set_at": previous["set_at"]} if type(previous.get("set_at")) is int else {})}
         entry = {
             "on": turning_on,
             "state": outcome,

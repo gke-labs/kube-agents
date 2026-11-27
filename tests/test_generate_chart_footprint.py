@@ -586,14 +586,14 @@ class A2AStackFootprintTest(unittest.TestCase):
         self.assertEqual(storage["dataClaims"], 2)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 1580m and 2896Mi,
+        """The A2A stack's standing requests, provisioning Job aside: 1680m and 3024Mi,
         with the default three NATS servers, each with the JetStream metrics exporter
-        beside it (#4477), and the profile dispatcher (960m and 1648Mi with one server)."""
+        beside it (#4477), the MCP server and the profile dispatcher (1060m and 1776Mi with one server)."""
         standing = [k for k in self.following if k.startswith("a2a") and k != "a2aProvision"]
         bridge = self.following["agentPod"]["hermesBridge"]
         cpu = sum(self.following[k]["cpuMillisRequest"] for k in standing) + bridge["cpuMillisRequest"]
         memory = sum(self.following[k]["memoryBytesRequest"] for k in standing) + bridge["memoryBytesRequest"]
-        self.assertEqual((cpu, memory), (1580, 2896 * _MIB))
+        self.assertEqual((cpu, memory), (1680, 3024 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _golden_with(_scale_callout_deployment):
@@ -940,6 +940,51 @@ def _a2a_gateway_env(docs):
         if container["name"] == gcf._A2A_WORKLOADS[gcf._A2A_GATEWAY][2][0]:
             return container["env"]
     raise AssertionError("the A2A gateway container is not in the golden")
+
+
+class TeamsInboundFootprintTest(unittest.TestCase):
+    """One Teams inbound receiver pod, read from the operator's fixed resource constants,
+    the source the operator itself renders the pod from."""
+
+    _GO = """package controller
+
+const (
+	teamsInboundCPURequest    = "{cpu_req}"
+	teamsInboundMemoryRequest = "64Mi"
+	teamsInboundCPULimit      = "200m"
+	teamsInboundMemoryLimit   = "128Mi"
+)
+"""
+
+    def test_the_entry_is_the_operators_constants(self):
+        data = gcf.extract_footprint()
+        self.assertNotIn("teamsInboundReceiver", data["operatorRendered"])
+        entry = data["operatorRenderedPerReplica"]["teamsInboundReceiver"]
+        text = gcf._TEAMS_INBOUND_SOURCE.read_text()
+        for (section, key), name in gcf._TEAMS_INBOUND_CONSTANTS.items():
+            match = re.search(name + r'\s*=\s*"([^"]+)"', text)
+            self.assertIsNotNone(match, name)
+            self.assertEqual(entry[section][key], match.group(1), name)
+        self.assertEqual(entry["pods"], 1)
+        self.assertEqual(entry["cpuMillisRequest"], gcf.parse_cpu_millis(entry["requests"]["cpu"]))
+        self.assertEqual(entry["memoryBytesLimit"], gcf.parse_bytes(entry["limits"]["memory"]))
+        self.assertEqual(entry["ephemeralStorageBytesRequest"], 0)
+        self.assertEqual(entry["ephemeralStorageBytesLimit"], 0)
+
+    def test_a_changed_constant_moves_the_entry(self):
+        """The entry follows the source, not a copy of today's numbers."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "platformagent_teams_inbound.go"
+            source.write_text(self._GO.format(cpu_req="75m"))
+            self.assertEqual(gcf._teams_inbound_entry(source)["cpuMillisRequest"], 75)
+
+    def test_a_missing_constant_fails_rather_than_counting_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "platformagent_teams_inbound.go"
+            source.write_text("package controller\n")
+            with self.assertRaises(ValueError) as caught:
+                gcf._teams_inbound_entry(source)
+            self.assertIn("teamsInboundCPURequest", str(caught.exception))
 
 
 class SessionPodFootprintTest(unittest.TestCase):

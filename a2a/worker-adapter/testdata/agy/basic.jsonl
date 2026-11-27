@@ -1,0 +1,5 @@
+{"event":"init","conversation_id":"4b8bd7f1-c65a-4838-9df9-691d34b6e480","init":{"model":"model-default","cwd":"/scratch/w1","tools":["ask_custom_permission","ask_permission","ask_question"],"permission_mode":"request-review"}}
+{"event":"step_update","step_update":{"conversation_id":"4b8bd7f1-c65a-4838-9df9-691d34b6e480","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"4b8bd7f1-c65a-4838-9df9-691d34b6e480","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"pong"}}
+{"event":"step_update","step_update":{"conversation_id":"4b8bd7f1-c65a-4838-9df9-691d34b6e480","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"\n","duration_seconds":2.297764719,"usage":{"input_tokens":7828,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":7829}}}
+{"event":"result","result":{"conversation_id":"4b8bd7f1-c65a-4838-9df9-691d34b6e480","status":"SUCCESS","response":"pong\n","duration_seconds":2.3498064960000002,"num_turns":1,"usage":{"input_tokens":7828,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":7829}}}

@@ -22,7 +22,9 @@ func chainTestGateway() *Gateway {
 	return &Gateway{cfg: &Config{Namespace: chainTestNamespace}}
 }
 
-func TestAProfileParentWithoutARecordedScopeOrAtUnattendedMayNotDelegate(t *testing.T) {
+// A profile parent with no recorded scope may not delegate; an unattended one
+// with a scope may (#6744), its children minted at the read tier.
+func TestAProfileParentWithoutARecordedScopeMayNotDelegate(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name   string
@@ -30,7 +32,7 @@ func TestAProfileParentWithoutARecordedScopeOrAtUnattendedMayNotDelegate(t *test
 		rule   string
 	}{
 		{"scope not on record", TaskRef{Addressee: "chat", Tier: "read"}, ruleDelegationParentScopeUnknown},
-		{"unattended", TaskRef{Addressee: "chat", Tier: "unattended", Scope: installScope}, ruleDelegationUnattendedParent},
+		{"unattended with a scope", TaskRef{Addressee: "chat", Tier: "unattended", Scope: installScope}, ""},
 		{"read with a scope", TaskRef{Addressee: "chat", Tier: "read", Scope: installScope}, ""},
 	}
 	for _, tc := range cases {
@@ -189,7 +191,7 @@ func TestAGenericAddressThatResolvesToAProfileOnTheChainIsACycle(t *testing.T) {
 func TestAProfileParentsChildCarriesTheChainAndBothRecordTheirScopes(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "console:tab-chain"
 	turn := profileTurn(conv, "chat", nil)
@@ -227,7 +229,7 @@ func TestAProfileParentsChildCarriesTheChainAndBothRecordTheirScopes(t *testing.
 func TestAProfileParentWhoseScopeIsNotOnRecordMintsNothing(t *testing.T) {
 	t.Parallel()
 	r := startProfileRig(t)
-	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Delegates: true})
 	ctx := context.Background()
 	conv := "console:tab-noscope"
 	turn := profileTurn(conv, "chat", nil)
