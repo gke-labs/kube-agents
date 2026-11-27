@@ -1,6 +1,7 @@
 package workeradapter
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode"
@@ -28,6 +29,8 @@ func TestAnActivityTitleDropsAFileNamesNonPrintingCharacters(t *testing.T) {
 		{"invoice\u202egpj.exe", "invoicegpj.exe"},
 		{"zero\u200bwidth.go", "zerowidth.go"},
 		{"\n\t\u202e", ""},
+		// A line or paragraph separator is a line break too.
+		{"two\u2028lines.md", "twolines.md"},
 	} {
 		for _, f := range fileTools {
 			got := titleOf(t, f.tool, map[string]any{f.key: "/scratch/" + c.name})
@@ -108,6 +111,49 @@ func TestAnActivityTitleScrubsAFileNameBeforeClippingIt(t *testing.T) {
 					t.Errorf("activityTitle(%s, %q) = %q, carries %U", f.tool, name, got, r)
 				}
 			}
+		}
+	}
+}
+
+// Any space character in a file name becomes a plain space rather than
+// going with the other non-printing characters, so a name written with a
+// no-break or ideographic space keeps its gap.
+func TestAnActivityTitleKeepsAFileNamesSpacesAsSpaces(t *testing.T) {
+	for name, want := range map[string]string{
+		"my\u00a0notes.txt":    "my notes.txt",
+		"会議\u3000メモ.md":        "会議 メモ.md",
+		"thin\u2009space.yaml": "thin space.yaml",
+	} {
+		for _, f := range fileTools {
+			if got := titleOf(t, f.tool, map[string]any{f.key: "/scratch/" + name}); got != f.tool+" "+want {
+				t.Errorf("activityTitle(%s, %q) = %q, want %q", f.tool, name, got, f.tool+" "+want)
+			}
+		}
+	}
+}
+
+// A value the task has seen, with no shape the scrubber knows, is redacted
+// from a file name before the clip, as publishActivity builds the title: a
+// clip first would cut the value in two, and its head, no longer the value,
+// would pass the title's later scrub.
+func TestAPublishedTitleRedactsASeenValueBeforeClippingTheFileName(t *testing.T) {
+	// Made up for this test: sixteen bytes with no recognisable shape.
+	const seen = "Zq8vT2mWc4xLp9Rb"
+	a := &adapter{}
+	a.seen.Add(seen)
+	// Placed so a clip at the limit would keep the value's first seven bytes.
+	name := strings.Repeat("x", activityFileNameMaxBytes-len(activityFileNameClipMark)-7) + seen + ".txt"
+	for _, f := range fileTools {
+		input, err := json.Marshal(map[string]any{f.key: "/scratch/" + name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := a.scrub(activityTitleScrubbed(f.tool, input, a.scrub))
+		if strings.Contains(got, seen[:7]) {
+			t.Errorf("published title for %s = %q, carries the head of a seen value", f.tool, got)
+		}
+		if len(strings.TrimPrefix(got, f.tool+" ")) > activityFileNameMaxBytes {
+			t.Errorf("published title for %s = %q, file name over %d bytes", f.tool, got, activityFileNameMaxBytes)
 		}
 	}
 }

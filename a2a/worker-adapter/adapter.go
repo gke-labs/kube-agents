@@ -1821,7 +1821,7 @@ func (a *adapter) publishActivity(ctx context.Context, ev Event) {
 	}
 	fields := map[string]any{
 		"tool":  ev.Tool,
-		"title": a.scrub(activityTitle(ev.Tool, ev.Input)),
+		"title": a.scrub(activityTitleScrubbed(ev.Tool, ev.Input, a.scrub)),
 	}
 	if activityCallID.MatchString(ev.CallID) {
 		fields["callId"] = ev.CallID
@@ -2766,6 +2766,14 @@ func chunkString(s string, size int) []string {
 // scrub's shape rules here, and the caller scrubs it again with the task's
 // seen values, so a seen value that looks like a bare word is redacted too.
 func activityTitle(tool string, input json.RawMessage) string {
+	return activityTitleScrubbed(tool, input, answerscrub.ScrubInline)
+}
+
+// activityTitleScrubbed is activityTitle with the file name scrubbed by
+// scrub before it is clipped: the adapter passes its own scrub, which also
+// redacts the values the task has seen, so a clip can't cut one of those in
+// two and leave its head for the title's later scrub to miss.
+func activityTitleScrubbed(tool string, input json.RawMessage, scrub func(string) string) string {
 	var args map[string]any
 	_ = json.Unmarshal(input, &args)
 	str := func(k string) string { v, _ := args[k].(string); return strings.TrimSpace(v) }
@@ -2774,7 +2782,7 @@ func activityTitle(tool string, input json.RawMessage) string {
 		if path == "" {
 			return
 		}
-		if name := activityFileName(filepath.Base(path)); name != "" {
+		if name := activityFileName(filepath.Base(path), scrub); name != "" {
 			title = tool + " " + name
 		}
 	}
@@ -2797,20 +2805,27 @@ func activityTitle(tool string, input json.RawMessage) string {
 }
 
 // activityFileName is a file's base name as an activity title carries it:
-// non-printing characters (line breaks, escape sequences, bidirectional
-// overrides, zero-width characters) dropped, secrets scrubbed, and the
-// result clipped to activityFileNameMaxBytes on a rune boundary. The
-// characters go first, so the scrubber sees a secret one of them split; the
-// scrub comes before the clip, so a cut can't leave part of a secret the
-// scrubber no longer recognises. Empty when nothing printable is left.
-func activityFileName(base string) string {
+// any space character as a plain space, other non-printing characters (line
+// breaks, escape sequences, bidirectional overrides, zero-width characters,
+// U+FFFD) dropped, scrubbed by scrub, and clipped to
+// activityFileNameMaxBytes on a rune boundary. The characters go first, so
+// the scrub sees a secret one of them split; the scrub comes before the
+// clip, so a cut can't leave part of a secret, by its shape or one the task
+// has seen, that a later scrub no longer recognises. Empty when nothing
+// printable is left.
+func activityFileName(base string, scrub func(string) string) string {
 	name := strings.Map(func(r rune) rune {
-		if r == utf8.RuneError || !unicode.IsPrint(r) {
+		switch {
+		case r == utf8.RuneError:
+			return -1
+		case unicode.Is(unicode.Zs, r):
+			return ' '
+		case !unicode.IsPrint(r):
 			return -1
 		}
 		return r
 	}, base)
-	name = answerscrub.ScrubInline(name)
+	name = scrub(name)
 	if len(name) <= activityFileNameMaxBytes {
 		return name
 	}
