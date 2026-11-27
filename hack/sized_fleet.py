@@ -78,7 +78,7 @@ DEFAULT_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 GHCR_HOST = "ghcr.io"
 # An Artifact Registry Docker host answers the caller's Google access token, not an anonymous one.
 ARTIFACT_REGISTRY_HOST = re.compile(r"^[a-z0-9-]+-docker\.pkg\.dev$")
-ACCESS_TOKEN_COMMAND = (kube.GCLOUD, "auth", "print-access-token")
+ACCESS_TOKEN_COMMAND = [kube.GCLOUD, "auth", "print-access-token"]
 # The chart value that puts every first-party image on one registry prefix; empty is the default.
 IMAGE_REGISTRY_KEY = "global.imageRegistry"
 IMAGES_FILE = REPO / "images.json"
@@ -705,9 +705,12 @@ def image_published(sha: str) -> bool:
 
 @functools.cache
 def google_access_token() -> str:
-    """The caller's Google access token, asked for once a run."""
-    return subprocess.run(ACCESS_TOKEN_COMMAND, capture_output=True, text=True, check=True,
-                          timeout=REGISTRY_TIMEOUT_SECONDS).stdout.strip()
+    """The caller's Google access token, asked for once a run.
+
+    Through kube.run, as every other gcloud call here: a credential blip is retried, and a
+    failure carries gcloud's own message.
+    """
+    return kube.run(ACCESS_TOKEN_COMMAND, timeout=REGISTRY_TIMEOUT_SECONDS).strip()
 
 
 def registry_token(host: str, repo: str) -> str:

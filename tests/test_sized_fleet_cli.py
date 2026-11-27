@@ -230,15 +230,31 @@ class RegistryPrefixTest(unittest.TestCase):
     def test_artifact_registry_takes_the_callers_google_token_and_ghcr_an_anonymous_one(self):
         self.addCleanup(cli.google_access_token.cache_clear)
         cli.google_access_token.cache_clear()
-        gcloud = mock.Mock(stdout="google-token\n")
-        with mock.patch.object(cli.subprocess, "run", return_value=gcloud) as run, \
+        with mock.patch.object(cli.kube, "run", return_value="google-token\n") as run, \
                 mock.patch.object(cli.urllib.request, "urlopen") as urlopen:
             self.assertEqual(cli.registry_token("us-docker.pkg.dev", "p/r/platform-agent"), "google-token")
             self.assertEqual(cli.registry_token("us-docker.pkg.dev", "p/r/k8s-operator"), "google-token")
-        self.assertEqual(tuple(run.call_args.args[0]), cli.ACCESS_TOKEN_COMMAND)
+        self.assertEqual(run.call_args.args[0], cli.ACCESS_TOKEN_COMMAND)
         self.assertIsNotNone(run.call_args.kwargs["timeout"])
         self.assertEqual(run.call_count, 1, "the token is asked for once a run, not once an image")
         urlopen.assert_not_called()
+
+    def test_a_token_blip_is_retried_and_a_failure_carries_gclouds_message(self):
+        """The token goes through the runner every other gcloud call uses."""
+        self.addCleanup(cli.google_access_token.cache_clear)
+        cli.google_access_token.cache_clear()
+        blip = mock.Mock(returncode=1, stdout="", stderr="ERROR: There was a problem refreshing your current auth tokens")
+        token = mock.Mock(returncode=0, stdout="google-token\n", stderr="")
+        with mock.patch.object(cli.kube.subprocess, "run", side_effect=[blip, token]) as run, \
+                mock.patch.object(cli.kube.time, "sleep"):
+            self.assertEqual(cli.google_access_token(), "google-token")
+        self.assertEqual(run.call_count, 2)
+        cli.google_access_token.cache_clear()
+        denied = mock.Mock(returncode=1, stdout="", stderr="ERROR: (gcloud.auth.print-access-token) no active account")
+        with mock.patch.object(cli.kube.subprocess, "run", return_value=denied):
+            with self.assertRaises(cli.kube.CommandError) as failure:
+                cli.google_access_token()
+        self.assertIn("no active account", str(failure.exception))
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"token": "anonymous-token"}'
         with mock.patch.object(cli.subprocess, "run") as run, \
