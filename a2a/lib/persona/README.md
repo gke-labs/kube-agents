@@ -209,8 +209,8 @@ worker refuses `antigravity`, which has no persona adapter yet.
     `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
     `-` and `/`, and a script when the persona doesn't grant `shell`.
   - The server name `a2a` is reserved, for every harness, for the worker's
-    own delegate server, which the worker adds per turn (core-agent: once
-    #6789 lands).
+    own delegate server, which the worker adds per turn (a core-agent turn
+    doesn't carry it yet).
 
 ## An example
 
