@@ -60,6 +60,12 @@ const (
 	// teamsBoardTapSep joins a message id and a row's index into the key
 	// one press at a time holds.
 	teamsBoardTapSep = "#"
+	// teamsBoardLabelRunes bounds the row's text a button carries, cut with
+	// teamsBoardLabelCut, and teamsBoardPostedLine is a press's line posted
+	// on its own: the row's text, then the line.
+	teamsBoardLabelRunes = 120
+	teamsBoardLabelCut   = "…"
+	teamsBoardPostedLine = "%s: %s"
 
 	// The reasons a board press is not a turn, for the pull loop's log.
 	teamsBoardNoRow      = "a board press with no row, card or action"
@@ -69,6 +75,7 @@ const (
 	teamsBoardUnverified = "a board press from a sender the install does not serve"
 	teamsBoardBusy       = "a second press on a board row being pressed"
 	teamsBoardTaken      = "a board press, acted on off the pull loop"
+	teamsBoardStale      = "a board press on a row its card no longer draws buttons for"
 )
 
 var (
@@ -90,6 +97,17 @@ func (a *TeamsAdapter) SetBoardAdmits(admits BoardAdmits) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.boardAdmits = admits
+}
+
+// teamsBoardLabel is the row's text as its buttons carry it, on one line and
+// cut at teamsBoardLabelRunes: what names the task in a press's line that
+// is posted on its own.
+func teamsBoardLabel(text string) string {
+	label := []rune(strings.TrimSpace(strings.TrimPrefix(gchatOneLine(text), teamsChatRowBullet)))
+	if len(label) > teamsBoardLabelRunes {
+		return string(label[:teamsBoardLabelRunes-len([]rune(teamsBoardLabelCut))]) + teamsBoardLabelCut
+	}
+	return string(label)
 }
 
 // teamsBoardRowSets is one set per row that asks for buttons, in the rows'
@@ -117,6 +135,7 @@ func teamsBoardRowSets(rows []chatmsg.Row) []map[string]any {
 					teamsPressVerbKey:   action,
 					teamsPressRowKey:    i,
 					teamsPressTasksKey:  tasks,
+					teamsPressLabelKey:  teamsBoardLabel(r.Text),
 				},
 			})
 		}
@@ -222,6 +241,13 @@ func (a *TeamsAdapter) boardPress(act *teamsActivity, press teamsPress, conversa
 		a.mu.Unlock()
 		return teamsBoardBusy
 	}
+	// A card the adapter holds says whether the row still takes a press: a
+	// row already settled, or one that stands for other cards now, is a
+	// press from a screen that had not caught up, and acts on nothing.
+	if card, held := a.uxLocked().cards[message]; held && !card.closed && !teamsBoardRowOpen(card, *press.Row, strings.Join(tasks, teamsBoardTaskSeparator)) {
+		a.mu.Unlock()
+		return teamsBoardStale
+	}
 	if a.boardTaps == nil {
 		a.boardTaps = map[string]bool{}
 	}
@@ -231,7 +257,7 @@ func (a *TeamsAdapter) boardPress(act *teamsActivity, press teamsPress, conversa
 	a.boarding.Add(1)
 	go func() {
 		defer a.boarding.Done()
-		a.runBoardPress(actor, teamsConversationID(conversation), message, key, press.Verb, *press.Row, tasks, name)
+		a.runBoardPress(actor, teamsConversationID(conversation), message, key, press.Verb, *press.Row, tasks, name, teamsBoardLabel(press.Label))
 	}()
 	return teamsBoardTaken
 }
@@ -240,7 +266,7 @@ func (a *TeamsAdapter) boardPress(act *teamsActivity, press teamsPress, conversa
 // the press's line when the adapter no longer holds the card. The row's
 // claim is released at the end, under the message's edit lock, so a second
 // press cannot draw the row before the first has.
-func (a *TeamsAdapter) runBoardPress(actor BoardActor, conversation, message, key, verb string, row int, tasks []string, name string) {
+func (a *TeamsAdapter) runBoardPress(actor BoardActor, conversation, message, key, verb string, row int, tasks []string, name, label string) {
 	ctx, cancel := context.WithTimeout(context.Background(), slackBoardTimeout)
 	defer cancel()
 	res, err := actor(ctx, lib.BoardAction{Action: verb, Tasks: tasks, By: name})
@@ -272,9 +298,30 @@ func (a *TeamsAdapter) runBoardPress(actor BoardActor, conversation, message, ke
 			a.log.Warn("teams: drawing a pressed board row failed; posting its line in the conversation", "conversation", conversation, "err", err)
 		}
 	}
+	// A line posted on its own names its task: no card above it says which.
+	if label != "" {
+		line = fmt.Sprintf(teamsBoardPostedLine, label, line)
+	}
 	if _, err := a.Post(conversation, line); err != nil {
 		a.log.Warn("teams: posting a board press's line failed", "conversation", conversation, "err", err)
 	}
+}
+
+// teamsBoardRowOpen reports whether card still draws buttons under row for
+// the cards tasks names.
+func teamsBoardRowOpen(card teamsChatCard, row int, tasks string) bool {
+	for _, action := range card.rest {
+		if action["type"] != teamsBoardRowType || action[teamsBoardRowNumber] != row {
+			continue
+		}
+		buttons, _ := action[teamsBoardRowActions].([]map[string]any)
+		for _, button := range buttons {
+			if data, _ := button["data"].(map[string]any); data[teamsPressTasksKey] == tasks {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // teamsBoardRowDrawn is card with row's line put in: under the row, in

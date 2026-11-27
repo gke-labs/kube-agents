@@ -66,9 +66,14 @@ type fakeTeamsBoardActor struct {
 	outcome string
 	err     error
 	got     []lib.BoardAction
+	// hold, when set, keeps every action waiting until it is closed.
+	hold chan struct{}
 }
 
 func (f *fakeTeamsBoardActor) act(_ context.Context, a lib.BoardAction) (*lib.BoardActionResult, error) {
+	if f.hold != nil {
+		<-f.hold
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.got = append(f.got, a)
@@ -261,7 +266,9 @@ func TestTeamsBoardPressRefusals(t *testing.T) {
 func TestTeamsBoardPressOnAForgottenCardActsAndPostsItsLine(t *testing.T) {
 	actor := &fakeTeamsBoardActor{outcome: lib.BoardOutcomeDone}
 	a, relay := testTeamsBoardAdapter(t, actor)
-	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:98", "posted-before-the-restart", testTeamsBoardPress(chatmsg.RowActionRetry, 0, "t_1")))); reason != teamsBoardTaken {
+	press := testTeamsBoardPress(chatmsg.RowActionRetry, 0, "t_1")
+	press[teamsPressLabelKey] = "Roll out checkout (blocked 2d)"
+	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:98", "posted-before-the-restart", press))); reason != teamsBoardTaken {
 		t.Fatalf("press: %q", reason)
 	}
 	a.boarding.Wait()
@@ -274,7 +281,8 @@ func TestTeamsBoardPressOnAForgottenCardActsAndPostsItsLine(t *testing.T) {
 	if n != 1 || method != "POST" || endpoint != "v3/conversations/"+testTeamsChannel+"/activities" {
 		t.Fatalf("calls %d: %v %v", n, method, endpoint)
 	}
-	if text := teamsCallText(t, relay, 0); !strings.HasPrefix(text, gchatBoardRetriedNote) || !testTeamsBoardSettled.MatchString(text) {
+	// The line names its task: no card above it says which row was pressed.
+	if text := teamsCallText(t, relay, 0); !strings.HasPrefix(text, "Roll out checkout (blocked 2d): "+gchatBoardRetriedNote) || !testTeamsBoardSettled.MatchString(text) {
 		t.Fatalf("the posted line reads %q", text)
 	}
 }
@@ -330,5 +338,68 @@ func TestTeamsPlaceBoardRowsMatchesInOrder(t *testing.T) {
 	want := "• same\n[first]\n• same\n[second]\n• other\n[third]"
 	if strings.Join(got, "\n") != want {
 		t.Fatalf("body\n%s\nwant\n%s", strings.Join(got, "\n"), want)
+	}
+}
+
+// A row's buttons carry the row's text, on one line and bounded, so a
+// press's line posted on its own can name its task.
+func TestTeamsBoardButtonsCarryTheRowsText(t *testing.T) {
+	long := strings.Repeat("é", teamsBoardLabelRunes+5)
+	sets := teamsBoardRowSets([]chatmsg.Row{
+		{Text: "Roll out\ncheckout", Tasks: []string{"t_1"}, Actions: []string{chatmsg.RowActionRetry}},
+		{Text: long, Tasks: []string{"t_2"}, Actions: []string{chatmsg.RowActionDrop}},
+	})
+	if len(sets) != 2 {
+		t.Fatalf("%d sets, want 2", len(sets))
+	}
+	label := func(set map[string]any) string {
+		return set[teamsBoardRowActions].([]map[string]any)[0]["data"].(map[string]any)[teamsPressLabelKey].(string)
+	}
+	if got := label(sets[0]); got != "Roll out checkout" {
+		t.Fatalf("label %q", got)
+	}
+	got := label(sets[1])
+	if n := len([]rune(got)); n != teamsBoardLabelRunes || !strings.HasSuffix(got, teamsBoardLabelCut) || teamsBoardLabel(got) != got {
+		t.Fatalf("cut label is %d runes: %q", n, got)
+	}
+}
+
+// One press per row at a time, and a row a press settled takes no other: a
+// press from a screen that still shows the buttons acts on nothing and
+// leaves the settled line as it is.
+func TestTeamsBoardRowTakesOnePressAndNoneOnceSettled(t *testing.T) {
+	actor := &fakeTeamsBoardActor{outcome: lib.BoardOutcomeDone, hold: make(chan struct{})}
+	a, relay := testTeamsBoardAdapter(t, actor)
+	id, _, err := a.PostNotifyMessage(testTeamsChannel, "", OutMessage{Text: "Two tasks are stuck.", Chat: testTeamsBoardMessage()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	press := func(delivery, verb, tasks string) string {
+		_, reason := a.classify(decodeTeamsActivity(t, testTeamsPress(delivery, id, testTeamsBoardPress(verb, 0, tasks))))
+		return reason
+	}
+	if reason := press("f:70", chatmsg.RowActionRetry, "t_1,t_2"); reason != teamsBoardTaken {
+		t.Fatalf("first press: %q", reason)
+	}
+	if reason := press("f:71", chatmsg.RowActionDrop, "t_1,t_2"); reason != teamsBoardBusy {
+		t.Fatalf("a press while the first is acting: %q", reason)
+	}
+	close(actor.hold)
+	a.boarding.Wait()
+	if reason := press("f:72", chatmsg.RowActionDrop, "t_1,t_2"); reason != teamsBoardStale {
+		t.Fatalf("a press on the settled row: %q", reason)
+	}
+	if reason := press("f:73", chatmsg.RowActionRetry, "t_9"); reason != teamsBoardStale {
+		t.Fatalf("a press naming other cards: %q", reason)
+	}
+	a.boarding.Wait()
+	if n := len(actor.calls()); n != 1 {
+		t.Fatalf("%d board actions, want 1", n)
+	}
+	relay.mu.Lock()
+	n := len(relay.apiCall)
+	relay.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d calls, want the post and one redraw", n)
 	}
 }
