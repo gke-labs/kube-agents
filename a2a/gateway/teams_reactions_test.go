@@ -48,9 +48,8 @@ func TestTeamsMarksAPersonsMessageWithTheBotsOwnReaction(t *testing.T) {
 }
 
 // Nothing is called for a token with no reaction (done leaves none) or for
-// an ask with no message id. With the marks turned off no reaction is added,
-// and one already drawn still comes off; turned back on, the add goes out
-// again.
+// an ask with no message id. With the marks turned off no reaction is added
+// and none is taken off; turned back on, both calls go out again.
 func TestTeamsMarkCallsNothingWithoutAReactionAMessageOrTheSwitch(t *testing.T) {
 	relay := newFakeTeamsRelay(t, nil)
 	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
@@ -77,18 +76,21 @@ func TestTeamsMarkCallsNothingWithoutAReactionAMessageOrTheSwitch(t *testing.T) 
 	if err := a.React(key, "act-1", "failed"); err != nil {
 		t.Errorf("marks off: react: %v", err)
 	}
-	if n := calls(); n != 0 {
-		t.Fatalf("%d calls went out for marks that draw nothing", n)
-	}
 	if err := a.RemoveReaction(key, "act-1", "question"); err != nil {
 		t.Errorf("marks off: remove: %v", err)
 	}
+	if n := calls(); n != 0 {
+		t.Fatalf("%d calls went out for marks that draw nothing or with the marks off", n)
+	}
+	a.SetMessageMarks(true)
+	if err := a.RemoveReaction(key, "act-1", "question"); err != nil {
+		t.Fatalf("marks on: remove: %v", err)
+	}
 	relay.mu.Lock()
 	if len(relay.apiCall) != 1 || relay.apiCall[0]["method"] != http.MethodDelete {
-		t.Fatalf("marks off: a reaction already drawn was not taken off: %v", relay.apiCall)
+		t.Fatalf("marks on: the removal did not go out: %v", relay.apiCall)
 	}
 	relay.mu.Unlock()
-	a.SetMessageMarks(true)
 	if err := a.React(key, "act-1", "failed"); err != nil {
 		t.Fatalf("marks on: react: %v", err)
 	}

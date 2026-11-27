@@ -3249,7 +3249,7 @@ with a body, the only path the passthrough admits a DELETE on. The mark tokens s
 as on Slack, under the ids of Teams's reactions reference (`teamsMarkReaction`); a token with no
 id or an ask with no message id calls nothing, and with the marks turned off
 (`A2A_TEAMS_MESSAGE_MARKS=false` on the operator, carried to the gateway; on otherwise) nothing is
-added while a mark already drawn still comes off. A turn that files cards keeps its mark past the
+added or taken off, so a mark drawn before the switch went off stays on its message. A turn that files cards keeps its mark past the
 acknowledgement on Slack only (`cardsMark`), so on Teams the kind comes off at the acknowledgement,
 is drawn again by the mark the cards' plan notify carries (`notifyMarker`), and comes off when the
 cards settle it. Teams answers a repeated add or

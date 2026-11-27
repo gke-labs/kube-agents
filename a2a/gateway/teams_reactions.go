@@ -34,9 +34,10 @@ var teamsMarkReaction = map[string]string{
 }
 
 // SetMessageMarks turns the marks on a person's message on or off
-// (Config.TeamsMessageMarks). Off, React calls nothing; RemoveReaction still
-// takes a reaction off, so a mark drawn before the switch went off does not
-// stay on the message.
+// (Config.TeamsMessageMarks). Off, neither React nor RemoveReaction calls
+// anything: the gateway records a mark whether or not the adapter drew it,
+// so a removal it asks for is no sign a reaction is there. A mark drawn
+// before a restart that turned the switch off stays on its message.
 func (a *TeamsAdapter) SetMessageMarks(on bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -55,9 +56,13 @@ func (a *TeamsAdapter) React(conversation, messageID, token string) error {
 }
 
 // RemoveReaction takes the bot's own reaction for token off the message
-// (Adapter.RemoveReaction), with the marks on or off; Teams lets a bot
-// remove only its own, and removing one that is not there is no error.
+// (Adapter.RemoveReaction); a nil no-op with the marks turned off. Teams
+// lets a bot remove only its own, and removing one that is not there is no
+// error.
 func (a *TeamsAdapter) RemoveReaction(conversation, messageID, token string) error {
+	if !a.marksOn() {
+		return nil
+	}
 	return a.reaction(conversation, messageID, token, http.MethodDelete)
 }
 
