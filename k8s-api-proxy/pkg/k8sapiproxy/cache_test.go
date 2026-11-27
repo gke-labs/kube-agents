@@ -128,6 +128,14 @@ func TestMemoryCacheStoreLRUEvictionAndFrequency(t *testing.T) {
 // path that names no cluster.
 const testClusterPrefix = "/clusters/" + InClusterID
 
+const (
+	// flightJoinTimeout bounds waitForFlightWaiters. It only decides how long a test that is
+	// already failing takes to say so, so it is far above what a loaded machine needs.
+	flightJoinTimeout = 30 * time.Second
+	// flightJoinPollInterval is how often waitForFlightWaiters re-reads the cache's flights.
+	flightJoinPollInterval = time.Millisecond
+)
+
 // newClusterRequest builds a request for the in-cluster API server unless target already names a
 // cluster.
 func newClusterRequest(method, target string, body io.Reader) *http.Request {
@@ -270,13 +278,13 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 	store.now = clock
 
 	var upstreamCalls atomic.Int32
-	gate := make(chan struct{})
-	close(gate)
+	// servicesGate holds the upstream's answer for the services path, which only step 4 requests.
+	servicesGate := make(chan struct{})
 
 	upstream := &fakeUpstream{
 		handler: func(_ string, req *http.Request) (*http.Response, error) {
 			if req.URL.Path == "/api/v1/namespaces/default/services" {
-				<-gate
+				<-servicesGate
 			}
 			n := upstreamCalls.Add(1)
 			return &http.Response{
@@ -375,7 +383,8 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 	}
 
 	// 4. Trigger a coalesced metric with two concurrent requests on /api/v1/namespaces/default/services.
-	gate = make(chan struct{})
+	// The upstream is released only once both have joined the one fetch: released earlier, the
+	// first would store its response and the second would be a hit.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	for i := 0; i < 2; i++ {
@@ -384,8 +393,7 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 			serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil))
 		}()
 	}
-	time.Sleep(20 * time.Millisecond)
-	close(gate)
+	releaseOnceJoined(t, h, 2, servicesGate)
 	wg.Wait()
 
 	exposition := scrapeMetricsText(t, metrics)
@@ -676,6 +684,44 @@ func (s *countingGetStore) Get(ctx context.Context, key string) ([]byte, bool, e
 	return s.MemoryCacheStore.Get(ctx, key)
 }
 
+// waitForFlightWaiters blocks until the handler's cache holds exactly one fetch in flight
+// with want callers waiting on it, read under the cache's own lock. A caller counted there
+// has joined the fetch and takes its result, so a test that releases the upstream after
+// this returns knows which callers coalesced. When the count is not reached in
+// flightJoinTimeout it calls unblock, which must release the held upstream so the test's
+// goroutines can finish, and fails the test.
+func waitForFlightWaiters(t *testing.T, h http.Handler, want int, unblock func()) {
+	t.Helper()
+	c := h.(*handler).cache
+	deadline := time.Now().Add(flightJoinTimeout)
+	for {
+		c.flightMu.Lock()
+		flights := len(c.flights)
+		waiters := make([]int, 0, flights)
+		for _, call := range c.flights {
+			waiters = append(waiters, call.waiters)
+		}
+		c.flightMu.Unlock()
+		if flights == 1 && waiters[0] == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			unblock()
+			t.Fatalf("after %v the cache has %d fetches in flight with waiters %v, want 1 fetch with %d waiters",
+				flightJoinTimeout, flights, waiters, want)
+		}
+		time.Sleep(flightJoinPollInterval)
+	}
+}
+
+// releaseOnceJoined closes release, the channel holding the upstream, once want callers
+// wait on the one fetch in flight.
+func releaseOnceJoined(t *testing.T, h http.Handler, want int, release chan struct{}) {
+	t.Helper()
+	waitForFlightWaiters(t, h, want, func() { close(release) })
+	close(release)
+}
+
 func TestHandlerCacheSingleflightCoalescing(t *testing.T) {
 	const workers = 10
 	store := &countingGetStore{
@@ -714,10 +760,9 @@ func TestHandlerCacheSingleflightCoalescing(t *testing.T) {
 		}(i)
 	}
 
-	// Wait until all 10 requests have checked Store.Get and entered singleflight.
+	// Wait until all 10 requests have checked Store.Get and joined the one fetch.
 	<-store.allSeen
-	time.Sleep(15 * time.Millisecond)
-	close(releaseUpstream)
+	releaseOnceJoined(t, h, workers, releaseUpstream)
 	wg.Wait()
 
 	if got := upstreamCalls.Load(); got != 1 {
@@ -1087,9 +1132,13 @@ func TestHandlerCacheLeaderCancelRefreshEvictionAndExpiredInvalidation(t *testin
 		defer wg.Done()
 		recFollower = serve(h, reqFollower)
 	}()
-	time.Sleep(15 * time.Millisecond)
+	// The leader is canceled only once the follower has joined its fetch, and the upstream is
+	// released only once the leader has left it: released earlier, the leader could take the
+	// fetch's result instead of its cancellation.
+	unblockLeader := func() { close(releaseLeader) }
+	waitForFlightWaiters(t, h, 2, unblockLeader)
 	cancelLeader()
-	time.Sleep(5 * time.Millisecond)
+	waitForFlightWaiters(t, h, 1, unblockLeader)
 	close(releaseLeader)
 	wg.Wait()
 
@@ -1210,8 +1259,7 @@ func TestHandlerCacheSecretRefusalAuditAndLeaderCancelRace(t *testing.T) {
 	}()
 
 	<-store.allSeen
-	time.Sleep(15 * time.Millisecond)
-	close(releaseUpstream)
+	releaseOnceJoined(t, h, 2, releaseUpstream)
 	wg.Wait()
 
 	if rec1.Code != http.StatusBadGateway || rec2.Code != http.StatusBadGateway {
@@ -1269,6 +1317,7 @@ func TestHandlerCacheSecretRefusalAuditAndLeaderCancelRace(t *testing.T) {
 		serve(hRace, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil))
 	}()
 	<-storeRace.allSeen
+	waitForFlightWaiters(t, hRace, 2, func() { close(releaseRace) })
 	cancel()
 	close(releaseRace)
 	wgRace.Wait()
@@ -2016,8 +2065,7 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 	}()
 
 	<-store.allSeen
-	time.Sleep(15 * time.Millisecond)
-	close(releasePods)
+	releaseOnceJoined(t, h, 2, releasePods)
 	wg.Wait()
 
 	if got := podCalls.Load(); got != 1 {
@@ -2179,8 +2227,7 @@ func TestHandlerCacheNoStoreFlightAnswersLeaderAsBypassAndCoalescesSharer(t *tes
 		}()
 	}
 	<-store.allSeen
-	time.Sleep(15 * time.Millisecond)
-	close(release)
+	releaseOnceJoined(t, h, workers, release)
 	wg.Wait()
 
 	if got := upstreamCalls.Load(); got != 1 {
