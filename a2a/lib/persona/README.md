@@ -36,6 +36,20 @@ authenticates the pod and applies the broker's tool policy and audit log.
 There is no direct-URL kind: `Load` refuses `url:` in `mcp.yaml`, because
 a server reached around the broker would be outside both.
 
+A persona declares no hook. `persona.yaml` has no `hooks` key, and `Load`
+refuses an unknown top-level key there. A key below `harness.<name>` loads,
+but it makes no hook: the Claude Code adapter ignores it with a warning. A
+skill's frontmatter that carries `hooks` is refused, and the profile worker
+writes each task's `settings.json` itself, as an empty object. The reason is
+the rule of this format: a persona is written once for every harness, so
+nothing in it can depend on a feature of one harness. A hook is a feature of
+Claude Code. This package renders a persona for `claude-code` and for
+`core-agent`, and an AgentProfile's `spec.harness.type` accepts `claude-code`
+only, so a hook could be rendered for one harness only today. Rows 1 and 15
+of [the hooks design](../../../docs/designs/profile-worker-hooks.md) record
+the decision: no hook mechanism is built now, and a later design can open
+one.
+
 `Load` also refuses:
 
 - a persona whose files differ from its `skills_manifest.sha256`, or one
@@ -93,6 +107,7 @@ manifest is left out, because a skill's files are rendered.
 that `scope` selects, for a tree that is not a persona directory. The
 session worker uses it on its Claude Code home, where only `CLAUDE.md` and
 `skills/` are the image's and the harness keeps its own state beside them.
+Another harness's worker runs it over that harness's persona directory.
 Paths outside the scope are not entered, and a manifest entry outside it is
 refused.
 
@@ -161,6 +176,22 @@ worker refuses `antigravity`, which has no persona adapter yet.
     grant takes the server's `include` list.
   - Tools pass through as the manifest names them, for the harness's tool
     grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+  - A profile worker's core-agent tool grant is read from this rendering
+    (`workeradapter.PersonaToolPolicy`) and grants what the Claude Code
+    rendering does: `read_file` the read tools, `shell` any command
+    (compound ones included, as Claude Code's Bash), `web_search` Gemini's
+    server-side Google Search, and each MCP server's listed tools; no
+    file-write tool. A turn whose persona grants the shell runs in
+    core-agent's mode that doesn't refuse an unmatched call, since its allow
+    rules can't express a compound command; registration, the harness's
+    before-tool check, deny rules and core-agent's shell denylist still
+    hold, and the read tools aren't workspace-scoped there (the shell reads
+    anywhere it can reach anyway). The shell's boundary is the sandbox and
+    the broker, as on Claude Code. Without the shell, the read tools stay
+    inside the workspace. Search is server-side and
+    not gated per call, as WebSearch is on Claude Code, and works only where
+    the model endpoint offers it beside function calls (Gemini 3 or later,
+    by model name).
   - Each `SKILL.md` frontmatter is written back with only the keys the
     harness reads, read as exactly one YAML document between exact `---`
     lines.

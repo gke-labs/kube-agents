@@ -1,0 +1,20 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "**First look at your fleet: done**\n\n1 cluster scanned in full · no critical item in this scan's 9 checks\n\n4 smaller items are queued.\n\n**What the scan checked**\nstartup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities",
+    "actions": [
+      {
+        "data": {
+          "choice": 0,
+          "kageAction": "choice",
+          "label": "See all 4 items",
+          "reply": "See all 4 items"
+        },
+        "style": "positive",
+        "title": "See all 4 items",
+        "type": "Action.Submit"
+      }
+    ]
+  }
+]

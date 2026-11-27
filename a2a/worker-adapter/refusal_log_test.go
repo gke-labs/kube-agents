@@ -101,8 +101,9 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 // TestACoreAgentToolCallsActivityCarriesItsCallID: end to end, a core-agent
 // tool call's activity entry carries the harness's call id as callId,
 // beside the input and never in it, so it joins a refused-call record; the
-// input is passed as it was. A harness that gives no id, Claude Code here,
-// gets no callId key at all.
+// input is passed as it was. So does a Claude Code tool call's, whose id the
+// driver reads from the tool_use block. A call with no id gets no callId key
+// at all.
 func TestACoreAgentToolCallsActivityCarriesItsCallID(t *testing.T) {
 	for _, c := range []struct {
 		name, script string
@@ -119,6 +120,11 @@ echo '{"type":"result","text":"done"}'
 		{"claude-code", `
 read first || exit 1
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"kubectl get pods"}}]}}'
+echo '{"type":"result","subtype":"success","result":"done"}'
+`, nil, "toolu_1"},
+		{"no-id", `
+read first || exit 1
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"kubectl get pods"}}]}}'
 echo '{"type":"result","subtype":"success","result":"done"}'
 `, nil, ""},
 	} {

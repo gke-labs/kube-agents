@@ -367,6 +367,39 @@ class FetchUsagePeaksTest(unittest.TestCase):
         self.assertEqual(aligners[fw.CPU_METRIC], "ALIGN_RATE")
         self.assertEqual(aligners[fw.MEM_METRIC], "ALIGN_MAX")
 
+    def test_cpu_is_bucketed_by_the_minute_and_memory_by_five(self):
+        # `ALIGN_RATE` averages over its bucket: at 300 seconds a 45-second
+        # burst at a 200m limit reads as 30m, 15% of the request and under
+        # check 3.1's 20% bar; at 60 seconds it reads as 75m or more.
+        # `test_the_burst_profile_gets_no_cut` holds what the check does with
+        # a peak that the burst reaches.
+        session = FakeSession(cpu=[series_of("d", "p", 1.0)], mem=[series_of("d", "p", MIB)])
+        _, _, result = self.fetch(session)
+        periods = {c["filter"].split('"')[1]: c["aggregation.alignmentPeriod"] for c in session.calls}
+        self.assertEqual(periods, {fw.CPU_METRIC: "60s", fw.MEM_METRIC: "300s"})
+        for request in requests_in_label(result.argv[0]):
+            self.assertEqual(request["aggregation.alignmentPeriod"], periods[request["filter"].split('"')[1]])
+
+    def test_each_peak_is_the_answer_to_its_own_period(self):
+        class ByPeriod(FakeSession):
+            """One series for each metric and period; the value names the pair."""
+
+            answers = {
+                (fw.CPU_METRIC, "60s"): 0.15,
+                (fw.CPU_METRIC, "300s"): 0.03,
+                (fw.MEM_METRIC, "60s"): 96 * MIB,
+                (fw.MEM_METRIC, "300s"): 64 * MIB,
+            }
+
+            def get(self, url, params=None, timeout=None):
+                self.calls.append(dict(params or {}))
+                value = self.answers[(params["filter"].split('"')[1], params["aggregation.alignmentPeriod"])]
+                return FakeResponse(200, {"timeSeries": [series_of("default", "cpu-burst-1", value)]})
+
+        peaks, ok, _ = self.fetch(ByPeriod())
+        self.assertTrue(ok)
+        self.assertEqual(peaks[("default", "cpu-burst-1")], (0.15, 64.0))
+
     def test_both_reads_are_filtered_to_the_clusters_location(self):
         # Two clusters named `prod-usc1` in one project, at different
         # locations, would otherwise have their pods' series summed together.
@@ -404,6 +437,12 @@ class FetchMemoryMeansTest(unittest.TestCase):
         self.assertEqual(params["aggregation.perSeriesAligner"], "ALIGN_MAX")
         self.assertEqual(params["secondaryAggregation.perSeriesAligner"], "ALIGN_MEAN")
         self.assertEqual(params["filter"].split('"')[1], fw.MEM_METRIC)
+
+    def test_the_mean_keeps_the_five_minute_bucket(self):
+        # The one-minute bucket is the CPU peak's alone.
+        session = FakeSession(mem=[series_of("default", "api-1", 512 * MIB)])
+        self.fetch(session)
+        self.assertEqual(session.calls[0]["aggregation.alignmentPeriod"], "300s")
 
     def test_cpu_is_never_queried(self):
         # Memory only, by design: one extra round trip per cluster, not two.

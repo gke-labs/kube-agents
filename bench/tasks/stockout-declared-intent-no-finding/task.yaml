@@ -79,12 +79,17 @@ verification_spec:
     check:
       # The declaration names one pool. A run that lists no
       # single-zone-nodepool finding at all declared more than the note did,
-      # or never ran the check; on the seeded fleet the finding left is
-      # seeded-a's pinned-inference-pool (role hpa-saturated).
+      # or never ran the check; on the seeded fleet a finding left is
+      # seeded-a's pinned-inference-pool (role hpa-saturated). The pattern
+      # names the check and the pool in one id (a `.` stays on one id),
+      # because seeded-a's dev-reserved-pool and seeded-c's default pool have
+      # a single-zone-nodepool finding too, and one of those alone must not
+      # pass for the pool that the declaration could have taken in.
       type: ledger_issue_contains
       audit: stockout-prevention
       scope: finding_ids
-      required_phrases: ["single-zone-nodepool."]
+      required_patterns:
+        - 'single-zone-nodepool\..+\.nodepool-pinned-inference-pool'
   - name: the-ledger-names-the-declaration
     role: objective
     mode: assert

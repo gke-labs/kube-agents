@@ -163,7 +163,7 @@ class RunTest(unittest.TestCase):
         self.assertFalse(result["checks"]["no_crash"]["passed"])
         self.assertFalse(result["green"])
 
-    def run_with_soak_hook(self, hook):
+    def run_with_soak_hook(self, hook, before_reset=None):
         now = [0.0]
         statuses = {j: "completed" for j in sr.audits()}
         with mock.patch.object(sr.operations, "reset"), \
@@ -174,6 +174,7 @@ class RunTest(unittest.TestCase):
                 mock.patch.object(sr, "log_lines", return_value=[]):
             return sr.run(project="p", host_cluster="h", host_context="ctx", namespace="ns",
                           check_fleet=lambda: {"findings": []}, soak_seconds=3600, during_soak=hook,
+                          before_reset=before_reset,
                           clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s)), now
 
     def test_the_soak_hook_runs_once_at_the_soak_start(self):
@@ -189,6 +190,18 @@ class RunTest(unittest.TestCase):
         self.assertTrue(result["green"], result)
         self.assertTrue(any("relay closed" in e for e in record.errors))
         self.assertGreaterEqual(now[0] - record.burst_seconds, 3600)
+
+    def test_the_records_are_kept_before_the_reset_and_a_failed_keep_is_a_note(self):
+        # The reset deletes the session records, so the hook must run while reset has not yet been called.
+        seen = []
+        self.run_with_soak_hook(None, before_reset=lambda: seen.append(sr.operations.reset.call_count))
+        self.assertEqual(seen, [0])
+
+        def keep():
+            raise RuntimeError("archive failed")
+        (record, result), _ = self.run_with_soak_hook(None, before_reset=keep)
+        self.assertTrue(result["green"], result)
+        self.assertTrue(any("archive failed" in e for e in record.errors))
 
 
 class RemarkTest(unittest.TestCase):

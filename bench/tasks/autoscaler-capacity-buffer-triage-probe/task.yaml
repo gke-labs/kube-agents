@@ -1,0 +1,147 @@
+# Skill-guidance probe for gke-cluster-autoscaler (#2635): CapacityBuffer
+# (`autoscaling.x-k8s.io/v1beta1`, GKE 1.35.2+) placeholder pods under
+# `buffer.x-k8s.io/active-capacity` live only inside Cluster Autoscaler memory,
+# so `kubectl get pods` shows 0 Pending pods even when a standby buffer fails to
+# provision. Reactive triage inspects `kubectl get
+# capacitybuffers.autoscaling.x-k8s.io -A` and `kubectl describe
+# capacitybuffer.autoscaling.x-k8s.io <name> -n <namespace>`, checking the real
+# `v1beta1` condition triad (`ReadyForProvisioning=False` for config/template/
+# billing-model errors, `LimitedByQuotas=True` for namespace ResourceQuota caps,
+# `Provisioning=False` for placeholder construction/injection failures) and
+# `NotTriggerScaleUp` events on the CapacityBuffer object for scale-up
+# starvation (healthy `v1beta1` buffers stay `Provisioning=True` with
+# `FakePodsInjected` and emit no `Ready` condition).
+#
+# Following autoscaler-pending-generated-workloads-probe and
+# autoscaler-zonal-stockout-cooldown-scope-probe, the prompt instructs the agent
+# to load `gke-cluster-autoscaler` before searching documentation while naming
+# no API group, condition name, or event reason so echoing the prompt cannot
+# pass, and `no-doc-or-web-search-rabbit-hole` forbids worker web or Developer
+# Knowledge searches so an install without the updated skill cannot answer from
+# external docs or issues. Each reply objective grades one labeled line
+# (`COMMAND:`, `CONDITIONS:`) under `fold_decoration: true`:
+# - `COMMAND:` must give a read-only `kubectl get` over
+#   `capacitybuffers.autoscaling.x-k8s.io` (or
+#   `capacitybuffers.v1beta1.autoscaling.x-k8s.io`) across all namespaces (`-A`
+#   or `--all-namespaces`), refusing wrong API groups (`autoscaling.gke.io`),
+#   invalid `resource.group/version` syntax, and mutating verbs.
+# - `CONDITIONS:` must bind `ReadyForProvisioning=False`, `LimitedByQuotas=True`,
+#   and `Provisioning=False` tightly to their own boolean values without crossing
+#   `,`, `;`, `.`, or the opposite boolean, reject inverted pairings, negation
+#   tokens (`not`/`no`/`never`/`n't`/`!=`), and v1alpha1 `Ready=False`, and name
+#   `NotTriggerScaleUp`.
+# `bench/tests/test_autoscaler_capacity_buffer_triage_verdict.py` pins these
+# checks on positive and negative replies, including inverted booleans,
+# `expected_output`, and verbatim prompt echo.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: autoscaler-capacity-buffer-triage-probe
+name: Reactive CapacityBuffer triage lists capacitybuffers.autoscaling.x-k8s.io and checks v1beta1 failure conditions and NotTriggerScaleUp events
+owner: fkc1e100
+domain: capacity
+
+prompt: >-
+  Our GKE 1.35.8 cluster uses a CapacityBuffer to keep warm standby headroom
+  on a custom ComputeClass ahead of a traffic cutover. No warm nodes have
+  appeared, yet listing pods across all namespaces shows zero Pending pods
+  and no pod-scheduling alerts have fired. Load the installed
+  gke-cluster-autoscaler skill and answer from it before searching
+  documentation. Why do Pending pods stay at zero here, what read-only
+  command lists every CapacityBuffer across the cluster, which v1beta1 status
+  conditions (with their exact boolean values) distinguish configuration or
+  template errors, namespace quota caps, and placeholder creation failures,
+  and which event on the buffer object identifies scale-up starvation when
+  provisioning stays active in steady state? End your answer with two lines,
+  each on its own line: `COMMAND: ` giving only the exact read-only command
+  to list all CapacityBuffer objects across all namespaces using their
+  fully-qualified API resource name; and `CONDITIONS: ` naming the exact
+  CapacityBuffer v1beta1 status condition types and boolean values for
+  configuration/template errors, namespace quota caps, and placeholder
+  creation failures, together with the event emitted on the CapacityBuffer
+  object for scale-up starvation. If you hand this question to another agent,
+  pass these instructions word for word, and keep its two lines in your
+  reply. Do not run commands and do not apply anything.
+expected_output: >-
+  Under `buffer.x-k8s.io/active-capacity`, CapacityBuffer placeholder pods
+  exist only inside Cluster Autoscaler memory, so listing pods shows zero
+  Pending pods even when the buffer cannot get nodes, and real workloads
+  schedule onto the warm spare capacity held by those placeholders.
+  `TriggeredScaleUp` and `NotTriggerScaleUp` events are emitted on the
+  CapacityBuffer object itself rather than on a Pod. Inspect all buffers with
+  `kubectl get capacitybuffers.autoscaling.x-k8s.io -A` and `kubectl describe
+  capacitybuffer.autoscaling.x-k8s.io <name> -n <namespace>`. Upstream
+  `autoscaling.x-k8s.io/v1beta1` emits `ReadyForProvisioning`,
+  `LimitedByQuotas`, and `Provisioning` only — healthy steady-state buffers
+  remain `Provisioning=True` (`reason: FakePodsInjected`) with no `Ready`
+  condition. `ReadyForProvisioning=False` indicates a configuration,
+  PodTemplate, or billing-model error; `LimitedByQuotas=True` indicates a
+  namespace ResourceQuota cap on `status.replicas`; `Provisioning=False`
+  indicates a placeholder creation or injection failure (such as
+  `FailedToGetPodTemplate` or `FailedToMakeFakePods`, excluding benign
+  `BufferIsEmpty` at zero replicas); and `NotTriggerScaleUp` events on the
+  CapacityBuffer object indicate scale-up starvation on the backing
+  ComputeClass.
+
+  COMMAND: kubectl get capacitybuffers.autoscaling.x-k8s.io -A
+
+  CONDITIONS: ReadyForProvisioning=False for configuration/template errors; LimitedByQuotas=True for namespace quota caps; Provisioning=False for placeholder creation failures; NotTriggerScaleUp events on the CapacityBuffer object for scale-up starvation.
+infrastructure:
+  deployer: noop
+validated: true
+
+verification_spec:
+  - name: command-lists-capacitybuffers-fqn
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^command:(?=[^\\n]*\\bkubectl\\b)(?=[^\\n]*\\bget\\b)(?=[^\\n]*(?<![a-z0-9.-])capacitybuffers?(?:\\.v[0-9]+(?:(?:alpha|beta)[0-9]+)?)?\\.autoscaling\\.x-k8s\\.io(?![a-z0-9/-]|\\.[a-z0-9]))(?=[^\\n]*(?:(?<=\\s)-a(?![a-z0-9-])|--all-namespaces\\b))[^\\n]+$"
+      forbidden_patterns:
+        - "(?m)^command:[^\\n]*(?:autoscaling\\.gke\\.io|\\b(?:apply|patch|delete|create|edit|scale|not|no|never)\\b|don't|\\?)"
+  - name: conditions-name-v1beta1-triad-and-starvation-event
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "(?m)^conditions:[^\\n]*\\breadyforprovisioning\\b(?:(?!\\b(?:true|not|limitedbyquotas|provisioning|ready)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
+        - "(?m)^conditions:[^\\n]*\\blimitedbyquotas\\b(?:(?!\\b(?:false|not|readyforprovisioning|provisioning|ready)\\b)[^,\\n;.]){0,24}\\btrue\\b"
+        - "(?m)^conditions:[^\\n]*\\bprovisioning\\b(?:(?!\\b(?:true|not|readyforprovisioning|limitedbyquotas|ready)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
+        - "(?m)^conditions:[^\\n]*\\bnottriggerscaleup\\b"
+      forbidden_patterns:
+        - "(?m)^conditions:[^\\n]*(?:\\?|(?:\\b(?:not|no|never)\\b|n't\\b|!=))"
+        - "(?m)^conditions:[^\\n]*\\breadyforprovisioning\\b(?:(?!\\b(?:false|limitedbyquotas|provisioning|ready)\\b)[^,\\n;.]){0,24}\\btrue\\b"
+        - "(?m)^conditions:[^\\n]*\\blimitedbyquotas\\b(?:(?!\\b(?:true|readyforprovisioning|provisioning|ready)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
+        - "(?m)^conditions:[^\\n]*\\bprovisioning\\b(?:(?!\\b(?:false|readyforprovisioning|limitedbyquotas|ready)\\b)[^,\\n;.]){0,24}\\btrue\\b"
+        - "(?m)^conditions:[^\\n]*\\bready\\b(?:(?!\\b(?:readyforprovisioning|limitedbyquotas|provisioning)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
+  - name: no-doc-or-web-search-rabbit-hole
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names:
+            - "web_search"
+            - "mcp__developer_knowledge__search_documents"
+            - "mcp_developer_knowledge_search_documents"
+            - "mcp__developer_knowledge__get_documents"
+            - "mcp_developer_knowledge_get_documents"
+            - "mcp__developer_knowledge__answer_query"
+            - "mcp_developer_knowledge_answer_query"
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

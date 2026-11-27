@@ -949,11 +949,11 @@ func truncateBytes(s string, n int) string {
 
 // publishDispatchStop writes the stop record for a profile task, beside the
 // cancel already sent on its `…in`, for the dispatcher, which has no read on
-// `…in` (addendum 9 on #3655). The stream and the dispatcher's reader aren't
-// in this tree yet: until they are, the publish gets no ack and is logged,
-// and a task still queued runs when a slot frees. A task addressed to platform or a session has no record. A
-// failed publish is logged and leaves the cancel standing: a held task still
-// gets the cancel, and only one still queued would run.
+// `…in` (addendum 9 on #3655). The dispatcher ends a task it still holds
+// queued when it finds the record (a2a/dispatch/stop.go). A task addressed
+// to platform or a session has no record. A failed publish is logged and
+// leaves the cancel standing: a held task still gets the cancel, and only
+// one still queued would run.
 func (g *Gateway) publishDispatchStop(ctx context.Context, ref TaskRef) {
 	if ref.Tier == "" {
 		return

@@ -1461,6 +1461,15 @@ VCS_READINGS_OUTCOME_LABEL = "outcome"
 VCS_READINGS_LE_LABEL = "le"
 VCS_READINGS_READING_LABEL = "reading"
 VCS_READINGS_REASON_LABEL = "reason"
+# The forge health gauge's two values. Its families name a forge by provider
+# alone (VCS_PROVIDER_LABEL): a host is not a closed vocabulary.
+VCS_FORGE_CONNECTED = 1
+VCS_FORGE_NOT_CONNECTED = 0
+# What a failed sweep token mint is reported as: no credential could be had
+# for the repository. The forge was never asked, so no forge code applies.
+SWEEP_CREDENTIAL_UNAVAILABLE_CODE = "FORGE_CREDENTIAL_UNAVAILABLE"
+SWEEP_CREDENTIAL_UNAVAILABLE_STATUS = int(HTTPStatus.BAD_GATEWAY)
+SWEEP_CREDENTIAL_UNAVAILABLE_TEXT = "no sweep credential could be minted for {repository}: {cause}"
 # The `le` value of the last edge of the per-proposal gauge, its count.
 VCS_READINGS_LE_INF = "+Inf"
 # The failure counter's closed `reason` vocabulary; any other word is `other`.
@@ -14747,13 +14756,26 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
     if forge.name == GITHUB_PROVIDER:
         api_url = forge.api_url or GITHUB_COM_API_URL
         whoami_graphql = forge.whoami_graphql or GITHUB_COM_GRAPHQL_URL
+
+        def sweep_headers() -> dict[str, str]:
+            try:
+                token = executor.mint_sweep_credential(forge.name, repo)
+            except PermissionError:
+                raise  # not a managed repository: the caller's own refusal
+            except (RuntimeError, OSError) as exc:
+                # The mint failed or timed out before the forge was asked. Said
+                # as a refusal with a code, so the sweep reads "no credential"
+                # and not a fault of the forge's.
+                raise providers.WorkspaceError(
+                    SWEEP_CREDENTIAL_UNAVAILABLE_TEXT.format(repository=repo, cause=type(exc).__name__),
+                    status=SWEEP_CREDENTIAL_UNAVAILABLE_STATUS,
+                    code=SWEEP_CREDENTIAL_UNAVAILABLE_CODE,
+                ) from exc
+            return {SWEEP_AUTHORIZATION_HEADER: SWEEP_AUTHORIZATION_FORMAT.format(token=token)}
+
         transport = providers.HttpTransport(
             api_url,
-            lambda: {
-                SWEEP_AUTHORIZATION_HEADER: SWEEP_AUTHORIZATION_FORMAT.format(
-                    token=executor.mint_sweep_credential(forge.name, repo)
-                )
-            },
+            sweep_headers,
             forge.error_overrides,
             timeout=executor.timeout_seconds,
             max_bytes=executor.max_output_bytes,
@@ -15398,7 +15420,8 @@ class ProxyMetrics:
     admission wait histogram and refusals counter by bound, the slot and
     child-memory gauges beside their caps when an executor is wired, and the
     proposal readings the readings sweep sets (`set_readings`) with its
-    failure counter.
+    failure counter, and the forge health the same sweep sets
+    (`set_forge_health`).
 
     Hand-rolled: prometheus_client is not in the image, and what is needed is
     small enough that adding a dependency to the one container holding every
@@ -15420,6 +15443,9 @@ class ProxyMetrics:
         self._outcomes: vcs_readings.OutcomesReading | None = None
         self._details: vcs_readings.DetailsReading | None = None
         self._reading_failures: dict[str, int] = {}
+        # None until the sweep first reports; an empty tuple once it has and
+        # no managed repository names a forge.
+        self._forge_health: tuple[vcs_readings.ForgeHealth, ...] | None = None
         self._failures: dict[tuple[str, str], int] = {}
         # Per (tool, class): cumulative bucket counts (one per
         # TOOL_DURATION_BUCKETS bound, the +Inf bucket being the count), the
@@ -15551,6 +15577,73 @@ class ProxyMetrics:
             if details is not None:
                 self._details = details
 
+    def set_forge_health(self, health: Sequence[vcs_readings.ForgeHealth]) -> None:
+        """Each provider's managed repositories by connection state, from the sweep that just ran; it replaces the last.
+
+        A provider this image does not ship is counted as LABEL_OTHER, here
+        rather than at render, so two such providers are one series and not
+        two samples under one label.
+        """
+        merged: dict[str, tuple[collections.Counter, float]] = {}
+        for forge in health:
+            provider = forge.provider if forge.provider in VCS_PROVIDERS else LABEL_OTHER
+            counts, checked_at = merged.get(provider, (collections.Counter(), forge.checked_at))
+            counts.update(dict(forge.repositories))
+            merged[provider] = (counts, max(checked_at, forge.checked_at))
+        report = tuple(
+            vcs_readings.ForgeHealth(
+                provider,
+                tuple((state, counts[state]) for state in vcs_readings.CONNECTION_STATES if counts[state]),
+                checked_at,
+            )
+            for provider, (counts, checked_at) in sorted(merged.items())
+        )
+        with self._lock:
+            self._forge_health = report
+
+    @staticmethod
+    def _render_forge_health(lines: list[str], health: tuple[vcs_readings.ForgeHealth, ...] | None, now: float) -> None:
+        """The forges the managed repositories live on, by provider. Absent
+        before the first sweep and on an install with no managed repository. A
+        provider's connected and repository series are omitted once its last
+        attempt is older than VCS_READINGS_STALE_SECONDS; its age gauge stays,
+        so a sweep that stopped shows as stale rather than as a forge still
+        connected."""
+        if not health:
+            return
+
+        def labels(forge: vcs_readings.ForgeHealth) -> str:
+            return f'{VCS_PROVIDER_LABEL}="{_escape_label_value(forge.provider)}"'
+
+        fresh = [forge for forge in health if now - forge.checked_at <= vcs_readings.VCS_READINGS_STALE_SECONDS]
+        if fresh:
+            lines += [
+                f"# HELP {vcs_readings.VCS_FORGE_CONNECTED_METRIC} Whether every managed repository on the provider's forges answered the last readings sweep (1) or one did not (0).",
+                f"# TYPE {vcs_readings.VCS_FORGE_CONNECTED_METRIC} gauge",
+            ]
+            for forge in fresh:
+                value = VCS_FORGE_CONNECTED if forge.connected else VCS_FORGE_NOT_CONNECTED
+                lines.append(f"{vcs_readings.VCS_FORGE_CONNECTED_METRIC}{{{labels(forge)}}} {value}")
+            lines += [
+                f"# HELP {vcs_readings.VCS_FORGE_REPOSITORIES_METRIC} Managed repositories on the provider's forges by how the last readings sweep left each one's connection.",
+                f"# TYPE {vcs_readings.VCS_FORGE_REPOSITORIES_METRIC} gauge",
+            ]
+            for forge in fresh:
+                counts = dict(forge.repositories)
+                for state in sorted(vcs_readings.CONNECTION_STATES):
+                    lines.append(
+                        f'{vcs_readings.VCS_FORGE_REPOSITORIES_METRIC}{{{labels(forge)},{VCS_READINGS_STATE_LABEL}="{state}"}} '
+                        f"{counts.get(state, 0)}"
+                    )
+        lines += [
+            f"# HELP {vcs_readings.VCS_FORGE_CHECKED_AGE_METRIC} Seconds since the readings sweep last attempted a managed repository of the provider; present from the first sweep on, however old.",
+            f"# TYPE {vcs_readings.VCS_FORGE_CHECKED_AGE_METRIC} gauge",
+        ]
+        for forge in health:
+            lines.append(
+                f"{vcs_readings.VCS_FORGE_CHECKED_AGE_METRIC}{{{labels(forge)}}} {max(now - forge.checked_at, 0.0):.3f}"
+            )
+
     def record_reading_failure(self, reason: str) -> None:
         reason = reason if reason in VCS_READINGS_FAILURE_REASONS else LABEL_OTHER
         with self._lock:
@@ -15619,6 +15712,15 @@ class ProxyMetrics:
                 f"# TYPE {vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} gauge",
                 f"{vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} {details.ignored}",
             ]
+            lines += [
+                f"# HELP {vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC} Stockout-investigator proposals the install authored in its managed repositories, by state as the forge reports it now; closed is closed without a merge.",
+                f"# TYPE {vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC} gauge",
+            ]
+            for state in vcs_readings.STATES:
+                lines.append(
+                    f'{vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC}{{{VCS_READINGS_STATE_LABEL}="{state}"}} '
+                    f"{details.stockout_proposals.get(state, 0)}"
+                )
         ages = [
             (name, reading)
             for name, reading in ((vcs_readings.READING_OUTCOMES, outcomes), (vcs_readings.READING_DETAILS, details))
@@ -15660,6 +15762,7 @@ class ProxyMetrics:
             outcomes = self._outcomes
             details = self._details
             reading_failures = sorted(self._reading_failures.items())
+            forge_health = self._forge_health
             failures = sorted(self._failures.items())
             durations = {
                 key: (list(self._duration_buckets[key]), self._duration_sum[key], self._duration_count[key])
@@ -15789,7 +15892,9 @@ class ProxyMetrics:
                 f'{DECISION_MEMORY_CHECKS_METRIC}{{{DECISION_MEMORY_VERDICT_LABEL}="{_escape_label_value(verdict)}"}} {count}'
             )
         # Wall clock, as the readings' `taken_at` is.
-        self._render_readings(lines, outcomes, details, reading_failures, time.time())
+        now = time.time()
+        self._render_readings(lines, outcomes, details, reading_failures, now)
+        self._render_forge_health(lines, forge_health, now)
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind (a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error) and, for a command past its deadline, the tool it ran; every other kind carries tool={BROKER_FAILURE_TOOL_NONE}.",
             f"# TYPE {BROKER_FAILURES_METRIC} counter",

@@ -1143,6 +1143,12 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 				// line's end. A comment redacted with the value
 				// (commentReadsAsValue) is read too.
 				scrubEnvRest("value: "+s[lo:redactHi], sink)
+			} else if !unquoted && sink != nil {
+				// A quoted value's content is read the same way: a pair
+				// inside it ("Password=x" in a quoted DSN) is tracked, as
+				// it is when the entry isn't read as an env value at all
+				// (#7372).
+				scrubEnvRest("value: "+s[lo:hi], sink)
 			}
 		}
 	}
@@ -1152,9 +1158,10 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 	return redactSpans(s, spans)
 }
 
-// scrubEnvRest is scrubInlineTo, run over the text after an env value's
-// first , } or ] for what it tracks; set in init, since the rules include
-// scrubEnvNameValuePairs itself.
+// scrubEnvRest is scrubInlineTo, run for what it tracks over env value text
+// the env rule redacted whole: an unquoted value read to its line's end, a
+// quoted value's content, or a commented-out value; set in init, since the
+// rules include scrubEnvNameValuePairs itself.
 var scrubEnvRest func(s string, sink secretSink) string
 
 func init() { scrubEnvRest = scrubInlineTo }

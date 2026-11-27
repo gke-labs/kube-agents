@@ -10,6 +10,14 @@ touches each terminal proposal carried, and how many old open proposals nobody
 has touched (step 2, per-proposal reads behind a cache and an hourly budget,
 which stop while the forge reports the credential's quota nearly spent).
 
+The same attempts say whether each forge answers. Every sweep hands the
+metrics object one `ForgeHealth` a provider: its managed repositories by
+connection state (`CONNECTION_STATES`), so an operator can see which forge an
+install uses and whether its credential still works before any request is made.
+The provider is the only thing that names a forge there: a host is text from
+configuration, or from a managed key no forge serves, and the broker's metrics
+carry closed vocabularies only.
+
 Each reading is all or nothing over the repositories that require it: a
 repository that fails a step withholds the reading that step feeds, and the
 metrics object keeps the previous one. Nothing here serves a request, and no
@@ -96,8 +104,15 @@ VCS_PROPOSALS_CLOSED_BY_METRIC = "kubeagents_vcs_proposals_closed_by"
 VCS_PROPOSAL_TOUCHES_METRIC = "kubeagents_vcs_proposal_touches"
 VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC = "kubeagents_vcs_proposal_touches_per_proposal"
 VCS_PROPOSALS_IGNORED_METRIC = "kubeagents_vcs_proposals_ignored"
+VCS_STOCKOUT_PROPOSALS_METRIC = "kubeagents_vcs_stockout_proposals"
 VCS_READINGS_AGE_METRIC = "kubeagents_vcs_readings_age_seconds"
 VCS_READINGS_FAILURES_METRIC = "kubeagents_vcs_readings_failures_total"
+# The forge health the same sweep reports: whether each forge the managed
+# repositories live on answered, how many repositories it holds in each
+# connection state, and how old that answer is.
+VCS_FORGE_CONNECTED_METRIC = "kubeagents_vcs_forge_connected"
+VCS_FORGE_REPOSITORIES_METRIC = "kubeagents_vcs_forge_repositories"
+VCS_FORGE_CHECKED_AGE_METRIC = "kubeagents_vcs_forge_checked_age_seconds"
 
 # The closed label vocabularies.
 STATE_OPEN = "open"
@@ -143,6 +158,11 @@ EVENT_COMMENT = "comment"
 EVENT_COMMIT = "commit"
 # The form the `pr_comments` sweep accepts as a person steering the agent.
 AGENT_ADDRESS_PREFIX = "/agent"
+# Fixed source-branch prefix cut by the stockout investigator skill.
+STOCKOUT_BRANCH_PREFIX = "platform-agent/remediate-stockout-"
+# Neutral proposal dict fields read from `proposal_view` for branch classification.
+PROPOSAL_VIEW_PROPOSAL_FIELD = "proposal"
+PROPOSAL_SOURCE_FIELD = "source"
 
 # The install's git author addresses, none of which a forge links to an
 # account, so its commits are told by email (design section 4).
@@ -151,6 +171,40 @@ INSTALL_COMMIT_EMAIL_ENVS = ("CREDENTIAL_PROXY_GIT_AUTHOR_EMAIL", "KUBE_AGENTS_V
 WORKSPACE_NOREPLY_EMAIL = "platform-agent@users.noreply.{host}"
 APP_NOREPLY_EMAIL = "{app_id}+{slug}[bot]@users.noreply.github.com"
 GITHUB_APP_ID_ENV = "GITHUB_APP_ID"
+# How a managed repository's last attempt left its connection to the forge.
+# `ok` is a forge that answered the listing with a credential it accepted,
+# whatever the reading then lacked (a truncated walk, a cold cache, a spent
+# quota floor are not connection faults).
+CONNECTION_OK = "ok"
+# The forge refused the credential, or no credential could be had for the
+# repository (a failed mint, a missing token file).
+CONNECTION_UNAUTHORIZED = "unauthorized"
+# The forge has no such repository for this credential. On GitHub that is also
+# a private repository the App is not installed on.
+CONNECTION_NOT_FOUND = "not_found"
+# The forge did not answer: a network or TLS fault, a timeout, a 5xx.
+CONNECTION_UNREACHABLE = "unreachable"
+CONNECTION_RATE_LIMITED = "rate_limited"
+# The credential cannot say which account it is, so the sweep reads nothing.
+CONNECTION_IDENTITY = "identity"
+CONNECTION_OTHER = "other"
+# In the order a forge's worst repository is named: the first present wins.
+CONNECTION_STATES = (
+    CONNECTION_UNAUTHORIZED,
+    CONNECTION_NOT_FOUND,
+    CONNECTION_UNREACHABLE,
+    CONNECTION_IDENTITY,
+    CONNECTION_RATE_LIMITED,
+    CONNECTION_OTHER,
+    CONNECTION_OK,
+)
+# The broker's refusal codes (`WorkspaceError.fields["code"]`) by the
+# connection state each stands for.
+UNAUTHORIZED_CODES = frozenset({"FORGE_UNAUTHENTICATED", "FORGE_FORBIDDEN", "FORGE_CREDENTIAL_UNAVAILABLE"})
+NOT_FOUND_CODES = frozenset({"FORGE_NOT_FOUND"})
+UNREACHABLE_CODES = frozenset({"FORGE_UNAVAILABLE", "FORGE_CALL_FAILED", "FORGE_TLS_UNTRUSTED", "UPSTREAM_TIMEOUT"})
+# The provider of a managed key that names none.
+PROVIDER_UNKNOWN = "other"
 # An App installation's login carries this marking, and the forge's author
 # filter names the App as `app/<slug>`.
 AUTOMATION_SUFFIX = "[bot]"
@@ -182,6 +236,7 @@ class ProposalRecord:
     created: str
     touches: Counter = field(default_factory=Counter)
     closer: str = ""  # "install" | "human" | "bot" | ""
+    stockout: bool = False
 
 
 @dataclass
@@ -200,6 +255,12 @@ class DetailsReading:
     buckets: dict[str, dict[float, int]]
     ignored: int
     taken_at: float
+    stockout_proposals: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STATES, 0))
+
+
+def is_stockout_branch(branch: str) -> bool:
+    """Whether a proposal's source branch was cut by the stockout investigator."""
+    return isinstance(branch, str) and branch.startswith(STOCKOUT_BRANCH_PREFIX)
 
 
 def install_commit_emails(host: str, app_login: str, app_id: str | None) -> frozenset[str]:
@@ -316,6 +377,53 @@ def _known_quota(transport: Any) -> Any:
     return reading
 
 
+@dataclass(frozen=True)
+class ForgeHealth:
+    """A provider's managed repositories by connection state, as one sweep left them.
+
+    One a provider, not one a host: two hosts of one provider (gitlab.com and
+    a self-managed GitLab) are counted together.
+    """
+
+    provider: str
+    # (state, repositories) for every state that holds at least one.
+    repositories: tuple[tuple[str, int], ...]
+    # When a repository of the provider was last attempted. A repository
+    # whose credential cannot name itself is not attempted again, so a
+    # provider that holds only such repositories keeps the time they were found.
+    checked_at: float
+
+    @property
+    def connected(self) -> bool:
+        """Every managed repository on the forge answered."""
+        return all(state == CONNECTION_OK for state, _ in self.repositories)
+
+
+def connection_state(exc: BaseException) -> str:
+    """The connection state a failed forge call stands for."""
+    if isinstance(exc, WorkspaceError):
+        code = exc.fields.get("code")
+        if code == RATE_LIMITED_CODE:
+            return CONNECTION_RATE_LIMITED
+        if code in UNAUTHORIZED_CODES:
+            return CONNECTION_UNAUTHORIZED
+        if code in NOT_FOUND_CODES:
+            return CONNECTION_NOT_FOUND
+        if code in UNREACHABLE_CODES:
+            return CONNECTION_UNREACHABLE
+        return CONNECTION_OTHER
+    if isinstance(exc, PermissionError):
+        return CONNECTION_UNAUTHORIZED  # a credential the broker would not mint for this repository
+    if isinstance(exc, OSError):
+        return CONNECTION_UNREACHABLE  # a socket or TLS fault no transport wrapped, a timeout among them
+    return CONNECTION_OTHER
+
+
+def _worse(first: str, second: str) -> str:
+    """The connection state CONNECTION_STATES names first."""
+    return min(first, second, key=CONNECTION_STATES.index)
+
+
 def _reason(exc: BaseException) -> str:
     if isinstance(exc, WorkspaceError) and exc.fields.get("code") == RATE_LIMITED_CODE:
         return REASON_RATE_LIMITED
@@ -373,6 +481,8 @@ class _Attempt:
     # bound that is still warming records both `truncated` and `warming`.
     reasons: list[str] = field(default_factory=list)
     nameless: bool = False
+    # How the attempt left the repository's connection to its forge.
+    connection: str = CONNECTION_OK
 
 
 class ReadingsSweep:
@@ -410,6 +520,8 @@ class ReadingsSweep:
         self._author_ids: dict[str, Any] = {}
         self._emails: dict[str, frozenset[str]] = {}
         self._nameless: set[str] = set()
+        # The provider each nameless key was found on, and when.
+        self._nameless_found: dict[str, tuple[str, float]] = {}
         self._nameless_logged = False
         # Step 2's token bucket, in forge calls: refilled at the hourly rate,
         # holding at most one sweep's share so the hour's calls spread evenly.
@@ -472,6 +584,7 @@ class ReadingsSweep:
             LOGGER.warning("proposal readings skipped: managed repositories unreadable type=%s", type(exc).__name__)
             return
         if not managed:
+            self._metrics.set_forge_health(())  # no managed repository, so no forge to report
             return
         self._refill()
         self._bound = {}
@@ -479,12 +592,23 @@ class ReadingsSweep:
         outcomes_whole = details_whole = True
         scopes: set[tuple[str, str]] = set()
         required = 0
+        now = time.time()
+        health: dict[str, Counter] = {}
+        attempted: dict[str, float] = {}
         for key in managed:
             if key in self._nameless:
+                # Not attempted again: its provider and its time are the ones found when it was.
+                provider, found_at = self._nameless_found.get(key) or (self._provider_of(key), now)
+                health.setdefault(provider, Counter())[CONNECTION_IDENTITY] += 1
+                attempted[provider] = max(attempted.get(provider, found_at), found_at)
                 continue
             attempt = self._attempt(key)
+            provider = self._provider_of(key)
+            health.setdefault(provider, Counter())[attempt.connection] += 1
+            attempted[provider] = now
             if attempt.nameless:
                 self._nameless.add(key)
+                self._nameless_found[key] = (provider, now)
                 self._metrics.record_reading_failure(REASON_IDENTITY)
                 self._log_nameless(key)
                 continue
@@ -500,9 +624,12 @@ class ReadingsSweep:
             else:
                 details_whole = False
         self._evict_unmanaged(managed)
+        self._metrics.set_forge_health(tuple(
+            ForgeHealth(provider, tuple((state, counts[state]) for state in CONNECTION_STATES if counts[state]), attempted[provider])
+            for provider, counts in sorted(health.items())
+        ))
         if not required:
             return
-        now = time.time()
         outcomes = None
         if outcomes_whole:
             outcomes = OutcomesReading(totals[STATE_OPEN], totals[STATE_MERGED], totals[STATE_CLOSED], now)
@@ -514,7 +641,7 @@ class ReadingsSweep:
         try:
             self._bind(key)
             if not self._login(key):
-                return _Attempt(nameless=True)
+                return _Attempt(nameless=True, connection=CONNECTION_IDENTITY)
             proposals, truncated, _ = self._list(key)
         except _ForeignAuthor:
             LOGGER.warning("proposal readings: %s listed a proposal another account authored", key)
@@ -526,7 +653,9 @@ class ReadingsSweep:
             LOGGER.warning("proposal readings: %s listed a proposal with no usable number", key)
             return _Attempt(reasons=[REASON_FORGE])
         except Exception as exc:  # noqa: BLE001 -- one repository never ends the sweep
-            return self._failed(key, exc, _Attempt())
+            # The bind, the identity and the listing are the connection: what
+            # failed here is the state the repository is left in.
+            return self._failed(key, exc, _Attempt(), connection=True)
         attempt = _Attempt(reasons=[REASON_TRUNCATED] if truncated else [])
         if truncated:
             # A tally that fails withholds the outcomes reading alone: the
@@ -550,9 +679,17 @@ class ReadingsSweep:
         return attempt
 
     @staticmethod
-    def _failed(key: str, exc: Exception, attempt: _Attempt) -> _Attempt:
+    def _failed(key: str, exc: Exception, attempt: _Attempt, connection: bool = False) -> _Attempt:
+        """Record a failed step. `connection` is the bind, identity and listing
+        phase, whose failure is the repository's connection state. A later read
+        that fails came after the forge answered with a credential it accepted:
+        it leaves the connection as it was, unless the forge refused it for its
+        request quota, which is a state of the credential's whole reach."""
         reason = _reason(exc)
         attempt.reasons.append(reason)
+        state = connection_state(exc)
+        if connection or state == CONNECTION_RATE_LIMITED:
+            attempt.connection = _worse(attempt.connection, state)
         LOGGER.warning(
             "proposal readings: %s failed reason=%s type=%s code=%s",
             key,
@@ -561,6 +698,20 @@ class ReadingsSweep:
             exc.fields.get("code") if isinstance(exc, WorkspaceError) else "",
         )
         return attempt
+
+    def _provider_of(self, key: str) -> str:
+        """The provider a managed key's repository lives on.
+
+        From the forge the key was bound to this sweep; for a key that did not
+        resolve, from the key itself (`provider:host/path`), which is all that
+        is known of it. The metrics object holds the value to the providers
+        this image ships.
+        """
+        bound = self._bound.get(key)
+        if bound is not None:
+            return str(bound.forge.name)
+        provider, separator, _ = key.partition(MANAGED_KEY_SEPARATOR)
+        return provider if separator and provider else PROVIDER_UNKNOWN
 
     def _log_nameless(self, key: str) -> None:
         if self._nameless_logged:
@@ -890,6 +1041,12 @@ class ReadingsSweep:
         closer = self._closer(bound, number, login) if state == STATE_CLOSED else ""
         if truncated or capped:
             self._metrics.record_reading_failure(REASON_DETAIL_TRUNCATED)
+        proposal_detail = view.get(PROPOSAL_VIEW_PROPOSAL_FIELD)
+        source_branch = (
+            proposal_detail.get(PROPOSAL_SOURCE_FIELD)
+            if isinstance(proposal_detail, dict)
+            else None
+        ) or ""
         return ProposalRecord(
             number=number,
             state=state,
@@ -897,6 +1054,7 @@ class ReadingsSweep:
             created=str(proposal.get("created") or ""),
             touches=touches,
             closer=closer,
+            stockout=is_stockout_branch(str(source_branch)),
         )
 
     @staticmethod
@@ -967,6 +1125,7 @@ class ReadingsSweep:
 
     def _details_reading(self, scopes: set[tuple[str, str]], now: float) -> DetailsReading:
         closed_by = dict.fromkeys(CLOSERS, 0)
+        stockout_proposals = dict.fromkeys(STATES, 0)
         touches: Counter = Counter()
         totals: dict[str, list[int]] = {outcome: [] for outcome in OUTCOMES}
         ignored = 0
@@ -979,6 +1138,8 @@ class ReadingsSweep:
                 totals[record.state].append(human)
             if record.state == STATE_CLOSED and record.closer in closed_by:
                 closed_by[record.closer] += 1
+            if record.stockout and record.state in stockout_proposals:
+                stockout_proposals[record.state] += 1
             created = _epoch(record.created)
             if (
                 record.state == STATE_OPEN
@@ -993,4 +1154,5 @@ class ReadingsSweep:
             buckets={outcome: bucket_counts(totals[outcome]) for outcome in OUTCOMES},
             ignored=ignored,
             taken_at=now,
+            stockout_proposals=stockout_proposals,
         )

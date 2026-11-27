@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -367,7 +366,7 @@ type podSpawner struct {
 }
 
 func newPodSpawner(cfg *Config, log *slog.Logger) (*podSpawner, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := InClusterRESTConfig()
 	if err != nil {
 		return nil, err
 	}
