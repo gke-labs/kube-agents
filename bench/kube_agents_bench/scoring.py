@@ -1138,7 +1138,8 @@ def _inputless_argument_checks(spec: CaseSpec, record: RunRecord) -> set[str]:
     (:attr:`CaseSpec.trace_argument_checks`): on a record holding a router
     call whose executor sent no input to a tool an entry's ``arguments``
     leaves name, a positive entry that failed, a negated one that passed,
-    and a mixed one whatever it recorded. The empty ``args`` match no
+    and a mixed one that passed or failed. An entry that errored stays,
+    for rung 2: empty args can't cause an error. The empty ``args`` match no
     pattern, so a positive entry's pass and a negated one's fail came from
     calls that carried their input, and stay graded."""
     inputless = _inject_inputless_tools(record.trajectory)
@@ -1151,7 +1152,10 @@ def _inputless_argument_checks(spec: CaseSpec, record: RunRecord) -> set[str]:
         if entry is None or not _reads_inputless_call(tools, inputless):
             continue
         if polarity == ARGUMENTS_MIXED:
-            out.add(name)
+            # Either grade could be the empty args'; an error can't be (a
+            # pattern over ``{}`` just doesn't match), so it stays for rung 2.
+            if _entry_passed(entry) or _entry_failed(entry):
+                out.add(name)
         elif polarity == ARGUMENTS_NEGATED:
             if _entry_passed(entry):
                 out.add(name)
@@ -1386,7 +1390,7 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     :attr:`CaseSpec.trace_argument_checks` whose ``arguments`` leaves name
     that call's tool is set aside when it may have graded wrong: a
     positive one that failed, a ``none`` one that passed, a mixed one
-    always (:func:`_inputless_argument_checks`). That includes a compound
+    that passed or failed (:func:`_inputless_argument_checks`). That includes a compound
     beside an applicable leaf, such as an ``any`` of the call and a phrase.
 
     None on the api transport, on a record with no blind entry in its report

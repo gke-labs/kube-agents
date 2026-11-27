@@ -3809,9 +3809,10 @@ def test_polarity_counts_none_ancestors_across_compounds(write_task):
     )
 
 
-def test_a_mixed_entry_is_set_aside_whatever_it_recorded(write_task, inject_run):
+def test_a_mixed_entry_is_set_aside_when_it_passed_or_failed(write_task, inject_run):
     """With leaves on both sides of a ``none``, the empty args could have
-    turned either way, so a pass and a fail are both set aside."""
+    turned either way, so a pass and a fail are both set aside. An error
+    stays graded."""
     spec = load_case(
         write_task(
             "mixed-read",
@@ -3856,6 +3857,9 @@ def test_a_mixed_entry_is_set_aside_whatever_it_recorded(write_task, inject_run)
     for status in ("pass", "fail"):
         rep = classify_rep(spec, inject_run(mutate=shape(status)), 1)
         assert rep.not_applicable_checks == [BASH_ARGS_OBJECTIVE], (status, rep.reason)
+    # An error isn't the empty args' doing: it stays, and rung 2 blocks on it.
+    errored = classify_rep(spec, inject_run(mutate=shape("error")), 1)
+    assert errored.not_applicable_checks == [] and errored.rung is Rung.CHECK_DID_NOT_RUN, errored.reason
 
 
 def test_an_inputless_worker_entry_is_not_the_routers(write_task, inject_run):
