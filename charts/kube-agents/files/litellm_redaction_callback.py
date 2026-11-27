@@ -543,6 +543,13 @@ class KubeAgentsRedactionCallback(CustomLogger):
             # For a tool output, source is already the text rules' result
             # over the string it came as (see _decode_output).
             text = source if keep else self._encode(walked, style)
+            # A re-encoded tool output gets the text rules once more, over
+            # its decoded form (a key name the walk leaves as it is, say).
+            # Only adds: the text it starts from is already masked.
+            if not keep and style is not None:
+                text, made = AuditRedactor.redact_counted(text, self._rules)
+                for name, count in made.items():
+                    counts[name] = counts.get(name, 0) + count
             self._put(redacted, path, text)
         for path, original in kept:
             self._put(redacted, path, original)
