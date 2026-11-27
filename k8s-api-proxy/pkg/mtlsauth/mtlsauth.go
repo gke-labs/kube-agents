@@ -25,9 +25,10 @@
 // the DNS SAN or the subject common name. No other field is tried when it is missing, and
 // a certificate carrying more than one value of the chosen field is refused, since which
 // one names the peer would be a guess. Names are compared exactly, with no case folding
-// or pattern. A URI is compared as net/url writes it back, which lower-cases the scheme
-// and changes nothing else of an identifier such as a SPIFFE ID; a URI with userinfo, a
-// query or a fragment, even an empty one, is refused. X.509 name constraints do not apply
+// or pattern. A URI name is the certificate's own text with the scheme in lower case and
+// nothing else changed: a URI that net/url would write back differently (a space it would
+// escape, for example), or that has userinfo, a query, a fragment, even an empty one, or
+// a "." or ".." path segment, plain or percent-encoded, is refused. X.509 name constraints do not apply
 // to the subject common name: with SourceCN, a name-constrained CA in the bundle can
 // still issue any name.
 //
@@ -37,12 +38,15 @@
 // authenticators does next.
 //
 //   - No client certificate, more certificates than the bound, a certificate that does
-//     not verify against this authenticator's bundle, a certificate without exactly one
-//     usable name in the configured field, and a name the allowlist or the prefix does not
-//     admit: a plain error. The
-//     certificate was not shown to be this authenticator's to judge, so a chain offers the
-//     request to the next authenticator. A certificate issued for the other authenticator
-//     of this package, under its own CA, ends here.
+//     not verify against this authenticator's bundle, and a certificate without exactly
+//     one usable name in the configured field: a plain error. The certificate was not
+//     shown to be this authenticator's to judge, so a chain offers the request to the
+//     next authenticator. A certificate issued for the other authenticator of this
+//     package, under its own CA, falls through this way.
+//   - A certificate that verified against this bundle and whose name AllowedIdentities,
+//     RequiredURIPrefix or AllowedNames does not admit: a plain error as well. This one is
+//     the authenticator's to judge, and it returns a plain error by choice, so that a
+//     chain can admit the caller another way, as the filters of pkg/jwtauth do.
 //   - A front proxy that verified and is in AllowedNames, whose identity headers are
 //     missing, empty, repeated, or name a partition that is not allowed: an error wrapping
 //     k8sapiproxy.ErrCallerRefused. The request is the proxy's, and a proxy that names no
@@ -51,10 +55,20 @@
 //     authenticators after this one: put FrontProxyAuthenticator first. An authenticator
 //     ahead of it that reads a bearer token would admit a front proxy's request under the
 //     token's identity before the headers are looked at.
-//   - Neither authenticator returns k8sapiproxy.ErrAuthenticationUnavailable: verification
-//     needs nothing but the bundle in memory. A bundle that cannot be read or parsed after
-//     a change is reported through the reload options and the last good one keeps
-//     verifying; only the constructor fails on a bundle that does not load.
+//
+// Only the header failures of a front proxy that verifies now are final. A proxy whose
+// certificate expired, or whose CA was rotated out of the bundle, is a peer like any
+// other to this authenticator, and its requests fall through. In a chain with a
+// bearer-token authenticator behind it, a request such a proxy forwards with the caller's
+// own Authorization header is then admitted under the token's identity and that
+// authenticator's partition. Do not chain a bearer-token authenticator behind
+// FrontProxyAuthenticator on a listener where the proxy forwards callers' Authorization,
+// or have the proxy strip it.
+//
+// Neither authenticator returns k8sapiproxy.ErrAuthenticationUnavailable: verification
+// needs nothing but the bundle in memory. A bundle that cannot be read or parsed after a
+// change is reported through the reload options and the last good one keeps verifying;
+// only the constructor fails on a bundle that does not load.
 package mtlsauth
 
 import (
@@ -63,6 +77,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -88,6 +103,13 @@ const (
 	// uriDelimiters start a query or a fragment, which a URI used as a name cannot have,
 	// even an empty one (the SPIFFE ID rule).
 	uriDelimiters = "?#"
+	// uriSchemeEnd ends a URI's scheme, the one part net/url writes back in lower case.
+	uriSchemeEnd     = ":"
+	uriPathSeparator = "/"
+	// uriDotSegment and uriParentSegment are the path segments a consumer may resolve
+	// away, so that two paths name one place.
+	uriDotSegment    = "."
+	uriParentSegment = ".."
 	// sanURITag is the tag of a uniformResourceIdentifier in a subject alternative name
 	// (RFC 5280 section 4.2.1.6).
 	sanURITag = 6
@@ -102,10 +124,13 @@ var (
 
 	errNoClientCertificate = errors.New("the request carries no client certificate")
 	errTooManyCertificates = errors.New("the peer presented more certificates than are verified")
-	errURINotPlain         = errors.New("the client certificate's URI has userinfo, a query or a fragment")
-	errNotVerified         = errors.New("the client certificate does not verify against the configured CA bundle")
-	errNoName              = errors.New("the client certificate has no value in the configured field")
-	errSeveralNames        = errors.New("the client certificate has more than one value in the configured field")
+	errURINotPlain         = errors.New("the client certificate's URI is not written in the form a name is read from")
+
+	// dots writes a percent-encoded dot as the dot a path segment is compared with.
+	dots            = strings.NewReplacer("%2e", ".", "%2E", ".")
+	errNotVerified  = errors.New("the client certificate does not verify against the configured CA bundle")
+	errNoName       = errors.New("the client certificate has no value in the configured field")
+	errSeveralNames = errors.New("the client certificate has more than one value in the configured field")
 )
 
 // peerVerifier verifies a request's client certificate against one CA bundle and reads
@@ -194,21 +219,51 @@ func certificateName(cert *x509.Certificate, source IdentitySource) (string, err
 	case values[0] == "":
 		return "", errNoName
 	}
-	if source == SourceURI && !plainURI(cert) {
+	if source == SourceURI && !plainURI(cert, values[0]) {
 		return "", errURINotPlain
 	}
 	return values[0], nil
 }
 
-// plainURI reports whether the one URI SAN of cert is free of userinfo, a query and a
-// fragment. cert.URIs cannot say: net/url drops an empty fragment, so the delimiters are
-// looked for in the bytes the certificate carries.
-func plainURI(cert *x509.Certificate) bool {
-	if cert.URIs[0].User != nil {
+// plainURI reports whether the one URI SAN of cert is in the form a name is read from:
+// what uriNameProblem allows, once the scheme is in lower case. cert.URIs cannot say:
+// net/url drops an empty fragment and re-escapes what it parsed, so the text is taken
+// from the bytes the certificate carries and must be the name itself.
+func plainURI(cert *x509.Certificate, name string) bool {
+	raw, ok := rawURINames(cert)
+	if !ok || len(raw) != 1 {
 		return false
 	}
-	raw, ok := rawURINames(cert)
-	return ok && len(raw) == 1 && !strings.ContainsAny(raw[0], uriDelimiters)
+	written := raw[0]
+	if i := strings.Index(written, uriSchemeEnd); i >= 0 {
+		written = strings.ToLower(written[:i]) + written[i:]
+	}
+	return written == name && uriNameProblem(written) == ""
+}
+
+// uriNameProblem says why raw cannot be a URI name, or "" when it can. A name is a URI
+// that net/url writes back exactly as it was written, so that two spellings never stand
+// for one name, and that has no userinfo, query, fragment (not even an empty one) or dot
+// segment in its path.
+func uriNameProblem(raw string) string {
+	uri, err := url.Parse(raw)
+	switch {
+	case err != nil:
+		return "is not a URI"
+	case uri.String() != raw:
+		return fmt.Sprintf("is not in the form it is compared in, %q", uri.String())
+	case uri.User != nil:
+		return "has userinfo"
+	case strings.ContainsAny(raw, uriDelimiters):
+		return "has a query or a fragment"
+	}
+	for _, segment := range strings.Split(uri.EscapedPath(), uriPathSeparator) {
+		switch dots.Replace(segment) {
+		case uriDotSegment, uriParentSegment:
+			return "has a dot segment in its path"
+		}
+	}
+	return ""
 }
 
 // rawURINames returns the URI subject alternative names of cert as they are encoded; ok

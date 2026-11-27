@@ -103,54 +103,43 @@ func NewFrontProxyAuthenticator(cfg FrontProxyConfig) (*FrontProxyAuthenticator,
 	if len(cfg.UsernameHeaders) == 0 {
 		return nil, fmt.Errorf("mtlsauth: %s.%s is required", frontProxyConfigName, usernameHeadersField)
 	}
+	a := &FrontProxyAuthenticator{allowedNames: allowedNames}
 	// One header read as two fields would let one value be, say, both the caller and its
 	// partition.
-	seen := map[string]string{}
-	var lists [][]string
+	listed := map[string]string{}
 	for _, field := range []struct {
 		name  string
 		names []string
+		into  *[]string
 	}{
-		{usernameHeadersField, cfg.UsernameHeaders},
-		{uidHeadersField, cfg.UIDHeaders},
-		{groupHeadersField, cfg.GroupHeaders},
-		{partitionHeadersField, cfg.PartitionHeaders},
+		{usernameHeadersField, cfg.UsernameHeaders, &a.usernameHeaders},
+		{uidHeadersField, cfg.UIDHeaders, &a.uidHeaders},
+		{groupHeadersField, cfg.GroupHeaders, &a.groupHeaders},
+		{partitionHeadersField, cfg.PartitionHeaders, &a.partitionHeaders},
 	} {
 		// The handler's own check, so every name can go into its ExtraCallerHeaders.
 		if err := k8sapiproxy.ValidateCallerHeaderNames(field.names); err != nil {
 			return nil, fmt.Errorf("mtlsauth: %s.%s %w", frontProxyConfigName, field.name, err)
 		}
-		canonical := make([]string, 0, len(field.names))
 		for _, name := range field.names {
 			key := http.CanonicalHeaderKey(name)
-			if first, dup := seen[key]; dup {
+			if first, dup := listed[key]; dup {
 				return nil, fmt.Errorf("mtlsauth: %s.%s entry %q is already listed in %s", frontProxyConfigName, field.name, name, first)
 			}
-			seen[key] = field.name
-			canonical = append(canonical, key)
+			listed[key] = field.name
+			*field.into = append(*field.into, key)
 		}
-		lists = append(lists, canonical)
 	}
-	allowedPartitions, err := newAllowlist(allowedPartitionsName, cfg.AllowedPartitions)
-	if err != nil {
+	if a.allowedPartitions, err = newAllowlist(allowedPartitionsName, cfg.AllowedPartitions); err != nil {
 		return nil, err
 	}
-	if len(allowedPartitions) > 0 && len(cfg.PartitionHeaders) == 0 {
+	if len(a.allowedPartitions) > 0 && len(cfg.PartitionHeaders) == 0 {
 		return nil, fmt.Errorf("mtlsauth: %s requires %s.%s", allowedPartitionsName, frontProxyConfigName, partitionHeadersField)
 	}
-	peer, err := newPeerVerifier(frontProxyConfigName, nameSourceField, cfg.ClientCAFile, cfg.NameSource, cfg.Reload, cfg.Now)
-	if err != nil {
+	if a.peer, err = newPeerVerifier(frontProxyConfigName, nameSourceField, cfg.ClientCAFile, cfg.NameSource, cfg.Reload, cfg.Now); err != nil {
 		return nil, err
 	}
-	return &FrontProxyAuthenticator{
-		peer:              peer,
-		allowedNames:      allowedNames,
-		usernameHeaders:   lists[0],
-		uidHeaders:        lists[1],
-		groupHeaders:      lists[2],
-		partitionHeaders:  lists[3],
-		allowedPartitions: allowedPartitions,
-	}, nil
+	return a, nil
 }
 
 // HeaderNames returns every header the authenticator reads a caller's identity from, in

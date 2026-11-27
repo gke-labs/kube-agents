@@ -109,14 +109,17 @@ loading is reported and the last good one keeps verifying, so neither authentica
 The peer's name comes from the one certificate field the configuration names (`uri`, `dns` or
 `cn`). No other field is tried when it is missing, and a certificate with two values there (two
 URI SANs, two DNS SANs, two common names) is refused. Names are compared exactly, with no case
-folding or pattern. A URI is compared as Go's `net/url` writes it back, which lower-cases the
-scheme, and a URI with userinfo, a query or a fragment, even an empty one, is refused. X.509
+folding or pattern. A URI name is the certificate's own text with the scheme in lower case and
+nothing else changed: a URI that Go's `net/url` would write back differently (a space it would
+escape, for example), or that has userinfo, a query, a fragment, even an empty one, or a `.` or
+`..` path segment, plain or percent-encoded, is refused. X.509
 name constraints do not apply to the subject common name, so with `cn` a name-constrained CA in
 the bundle can still issue any name.
 `ClientCertAuthenticator` uses the name as `CallerIdentity.Username` and fills nothing else;
 `AllowedIdentities` admits only the listed names and `RequiredURIPrefix` (with `uri` only) only
-names that start with it; the prefix must end in `/`, so that it cannot match a longer trust
-domain or path segment. Without either, every client certificate
+names that start with it; the prefix must be a URI with a scheme and a host, written as a name
+is, and end in `/`, so that it cannot match a longer trust domain or path segment or every trust
+domain. With `uri`, an `AllowedIdentities` entry that no name could equal is an error too. Without either, every client certificate
 the CA issues is a caller.
 
 `FrontProxyAuthenticator` requires the peer's name in `AllowedNames` and then believes the
@@ -143,6 +146,17 @@ request from an allowed proxy that forwards a token is admitted under the token'
 the empty partition, and the headers are never read. The binary's chain is not exported and has
 no mode for these authenticators, so an embedder that combines them writes its own chain, which
 must stop at an error wrapping `ErrCallerRefused`.
+
+Only the header failures of a front proxy that verifies now are final. A proxy whose certificate
+expired, or whose CA was rotated out of the bundle, is a peer like any other to the
+authenticator, and its requests fall through. With a bearer-token authenticator behind it, a
+request such a proxy forwards with the caller's own `Authorization` header is then admitted
+under the token's identity and that authenticator's partition. Do not chain a bearer-token
+authenticator behind the front-proxy authenticator on a listener where the proxy forwards
+callers' `Authorization`, or have the proxy strip it. A certificate that verified but whose name
+`AllowedIdentities`, `RequiredURIPrefix` or `AllowedNames` does not admit is the authenticator's
+to judge, and is still a plain error by choice, so a chain can admit the caller another way, as
+`jwtauth`'s filters do.
 
 `upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or

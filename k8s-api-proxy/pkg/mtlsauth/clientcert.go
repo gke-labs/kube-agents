@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -37,12 +38,17 @@ type ClientCertConfig struct {
 	// A certificate without exactly one value there is refused.
 	IdentitySource IdentitySource
 	// AllowedIdentities, when not empty, lists the identities admitted, compared exactly.
-	// Entries are trimmed and empty ones dropped; a list left with none is an error.
+	// Entries are trimmed and empty ones dropped; a list left with none is an error. With
+	// SourceURI an entry no certificate's name could equal (an upper-case scheme, text
+	// net/url would re-escape, a query) is an error too.
 	AllowedIdentities []string
 	// RequiredURIPrefix, when set, refuses a certificate whose URI does not start with it.
 	// It is valid only with SourceURI and must end in "/" ("spiffe://example.org/", not
 	// "spiffe://example.org"): the comparison is on the text alone, and a prefix cut
-	// anywhere else would also match a longer trust domain or path segment.
+	// anywhere else would also match a longer trust domain or path segment. It is trimmed,
+	// and must be a URI with a scheme and a host, written as a certificate's name is: a
+	// prefix that admits every host ("spiffe://") or that no name could start with is an
+	// error.
 	RequiredURIPrefix string
 	// Reload tunes how ClientCAFile is checked for changes and where a failed reload is
 	// reported.
@@ -63,21 +69,49 @@ type ClientCertAuthenticator struct {
 // NewClientCertAuthenticator returns a ClientCertAuthenticator for cfg, or an error when
 // cfg is incomplete or ClientCAFile does not load.
 func NewClientCertAuthenticator(cfg ClientCertConfig) (*ClientCertAuthenticator, error) {
-	if cfg.RequiredURIPrefix != "" && cfg.IdentitySource != "" && cfg.IdentitySource != SourceURI {
-		return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix requires %s %q", clientCertConfigName, identitySourceField, SourceURI)
-	}
-	if cfg.RequiredURIPrefix != "" && !strings.HasSuffix(cfg.RequiredURIPrefix, uriPrefixEnd) {
-		return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix %q must end in %q", clientCertConfigName, cfg.RequiredURIPrefix, uriPrefixEnd)
+	prefix := strings.TrimSpace(cfg.RequiredURIPrefix)
+	if prefix != "" {
+		if cfg.IdentitySource != "" && cfg.IdentitySource != SourceURI {
+			return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix requires %s %q", clientCertConfigName, identitySourceField, SourceURI)
+		}
+		if problem := uriPrefixProblem(prefix); problem != "" {
+			return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix %q %s", clientCertConfigName, prefix, problem)
+		}
 	}
 	allowed, err := newAllowlist(allowedIdentitiesName, cfg.AllowedIdentities)
 	if err != nil {
 		return nil, err
 	}
+	if cfg.IdentitySource == SourceURI {
+		for identity := range allowed {
+			if problem := uriNameProblem(identity); problem != "" {
+				return nil, fmt.Errorf("mtlsauth: %s entry %q %s, so no certificate could match it", allowedIdentitiesName, identity, problem)
+			}
+		}
+	}
 	peer, err := newPeerVerifier(clientCertConfigName, identitySourceField, cfg.ClientCAFile, cfg.IdentitySource, cfg.Reload, cfg.Now)
 	if err != nil {
 		return nil, err
 	}
-	return &ClientCertAuthenticator{peer: peer, allowed: allowed, requiredURIPrefix: cfg.RequiredURIPrefix}, nil
+	return &ClientCertAuthenticator{peer: peer, allowed: allowed, requiredURIPrefix: prefix}, nil
+}
+
+// uriPrefixProblem says why prefix cannot be a RequiredURIPrefix, or "" when it can: it
+// must be the start of a URI name, down to the end of a whole path segment, and name the
+// host, so that it cannot match a longer host or segment or every host there is.
+func uriPrefixProblem(prefix string) string {
+	if problem := uriNameProblem(prefix); problem != "" {
+		return problem
+	}
+	// uriNameProblem parsed it already.
+	uri, _ := url.Parse(prefix)
+	switch {
+	case uri.Scheme == "" || uri.Host == "":
+		return "must have a scheme and a host"
+	case !strings.HasSuffix(prefix, uriPrefixEnd):
+		return "must end in " + uriPrefixEnd
+	}
+	return ""
 }
 
 // AuthenticateRequest admits r when its connection's client certificate verifies and its

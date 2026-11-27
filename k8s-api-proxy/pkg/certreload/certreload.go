@@ -305,7 +305,8 @@ type caUnion struct {
 // file is checked and reloaded on its own: when one changes into something that does not
 // load, opts.OnReloadError is called for it and its last good certificates stay in the
 // pool, while a change to another file is still picked up. OnReloadError runs with none
-// of the pool's locks held, so it may call Pool. It fails when files is empty, names an
+// of the pool's locks held, so it may call Pool; one that panics loses the other failures
+// collected in that check. It fails when files is empty, names an
 // empty path, or any file does not load.
 func NewCAPoolUnion(files []string, opts Options) (*CAPool, error) {
 	if len(files) == 0 {
