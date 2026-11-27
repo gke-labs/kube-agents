@@ -1353,7 +1353,6 @@
 # audit report and a newer run-start record never marked done, from the shell
 # sandbox; report_contains grades the reply. Red on main, which has no record.
 # Read-only turn, no fixture; the stack holds the infra lock and the stream's.
-./tasks/fleet-audit-unfinished-run-reported/task.yaml
 
 # A drift run over a coverage gap keeps the previous finding on the cluster it
 # did not compare as a held row, with its id in the ledger's hidden block.
