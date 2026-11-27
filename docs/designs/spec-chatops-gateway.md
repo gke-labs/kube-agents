@@ -2454,10 +2454,12 @@ by the operator upgrade that brings the arm: the broker is no longer handed the 
 gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
 not exit: the console is the mux's essential backend, so the Slack backend is contained and
 retried on a backoff, the pod stays Running and Ready, and Slack has no consumer until the
-Secret holds one workspace's token or Slack is turned off. Nothing in the CR's
-`.status` says why, since no `A2AGateway` condition is written for a gateway the arm called
-configured; the gateway pod's log carries the cause, and its events do for a missing Secret
-or key. Reading the Secret in the arm would catch it, at the cost of a
+Secret holds one workspace's token or Slack is turned off. No `A2AGateway` condition is written
+for a gateway the arm called configured, though after two consecutive five-minute usage polls
+reading `kubeagents_a2a_gateway_slack_connected` as `0` the usage poller surfaces the outage in
+`.status` as `SlackConnected=False` (`ConnectionFailed`) and `Degraded=True`
+(`SlackConnectionFailed`) without changing `Ready` or `phase`; the gateway pod's log carries the
+specific `invalid_auth` cause, and its events carry a missing Secret or key. Reading the Secret in the arm would catch it, at the cost of a
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
 CR-only arm was kept and the limitation documented instead (2026-10-06). The installer
 checks the applies it makes (#2812). `install.sh`, its menu's apply and a full `upgrade.sh`

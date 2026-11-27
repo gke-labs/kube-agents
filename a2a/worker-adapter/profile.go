@@ -64,6 +64,9 @@ type ProfileWorkerConfig struct {
 	RequirePersonaIntegrity bool
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
+	// Workdir is the harness's working directory, the workspace a
+	// core-agent grant's file tools are confined to.
+	Workdir string
 	// Relay is how the rendered persona's MCP servers reach the broker's
 	// relay (ProfileRelay, #5495). Empty drops every MCP server the persona
 	// declares, and the render says so.
@@ -157,6 +160,18 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 			return err
 		}
 		logPersonaWarnings(cfg.Logger, w.persona)
+	}
+	// core-agent takes its tool grant in each turn's envelope, from the
+	// driver: the persona's replaces the session grant the pod's driver
+	// started with, or the worker stops here. Without a persona there is no
+	// profile grant to give it.
+	if pw.Harness == persona.CoreAgent {
+		if w.persona == nil {
+			return fmt.Errorf("a core-agent profile worker needs a persona for its tool grant")
+		}
+		if w.cfg.Driver, err = coreAgentProfileDriver(w.cfg.driver(), *w.persona, pw.Workdir); err != nil {
+			return fmt.Errorf("the persona's core-agent tool grant: %w", err)
+		}
 	}
 	sub, err := b.nc.ChanSubscribe(lib.DispatchSubject(cfg.Profile, pw.Tier, cfg.PodName), w.msgs)
 	if err != nil {

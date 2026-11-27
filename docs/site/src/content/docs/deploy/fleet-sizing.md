@@ -278,7 +278,9 @@ caveat beside it:
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
 the shell sandbox, where the audits run. `KUBEAGENTS_KUBECTL_COST_TIER` also goes to the A2A gateway
-for its session Pods and to the credential broker's stateful and exec tiers. Every name the operator
+for its session Pods and to the credential broker's stateful and exec tiers. Literal proxy entries (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase forms; `valueFrom`
+entries are ignored) also forward to `<name>-a2a-gateway` ([Guarantee and
+limitation](/kube-agents/reference/credential-isolation/#guarantee-and-limitation)). Every name the operator
 does not reserve passes to the credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 

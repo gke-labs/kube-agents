@@ -40,12 +40,12 @@ func startSlackClickRig(t *testing.T) *slackClickRig {
 	if err := os.WriteFile(mapFile, []byte("U1 test:one\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-slack-clicks"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test-slack-clicks"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}

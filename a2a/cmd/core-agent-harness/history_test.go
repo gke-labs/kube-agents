@@ -9,6 +9,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +55,7 @@ func (m *echoModel) GenerateContent(_ context.Context, req *llm.Request, _ bool)
 func withModel(t *testing.T, m llm.LLM) {
 	t.Helper()
 	prev := newModel
-	newModel = func(context.Context, string) (adkmodel.LLM, error) { return models.Adapt(m), nil }
+	newModel = func(context.Context, string, bool) (adkmodel.LLM, error) { return models.Adapt(m), nil }
 	t.Cleanup(func() { newModel = prev })
 }
 
@@ -263,10 +264,20 @@ func TestARefusedCallReachesTheHarnesssStderr(t *testing.T) {
 type replyModel struct {
 	callModel
 	responses []map[string]any
+	// offered are the function declarations of the first request.
+	offered []string
 }
 
 func (m *replyModel) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
 	m.mu.Lock()
+	if m.offered == nil && req.Config != nil {
+		m.offered = []string{}
+		for _, tl := range req.Config.Tools {
+			for _, fd := range tl.FunctionDeclarations {
+				m.offered = append(m.offered, fd.Name)
+			}
+		}
+	}
 	for _, c := range req.Contents {
 		for _, p := range c.Parts {
 			if p.FunctionResponse != nil {
@@ -309,6 +320,43 @@ func TestARefusedShellCommandTellsTheModelWhatToDo(t *testing.T) {
 			got, _ := m.responses[0]["error"].(string)
 			if !strings.Contains(got, c.want) || !strings.Contains(got, "requires an allowlist entry") {
 				t.Errorf("the model read %q, want the gate's refusal and %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestAPersonaTurnRunsACompoundCommand: through the harness's own turn, a
+// persona's shell runs a compound command, where a prefix grant refuses it.
+func TestAPersonaTurnRunsACompoundCommand(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		policy coreagentwire.Policy
+		want   string
+	}{
+		{"persona shell", coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:*"}, AnyShellCommand: true}, "stdout"},
+		{"prefix grant", coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:echo", "bash:echo *"}}, "error"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": "echo a | tr a b && echo $((1+1))"}}}}
+			withModel(t, m)
+			runTurn(t, t.TempDir(), coreagentwire.Envelope{Message: "go", Policy: c.policy})
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if len(m.responses) != 1 {
+				t.Fatalf("responses %v", m.responses)
+			}
+			if _, ok := m.responses[0][c.want]; !ok {
+				t.Errorf("the model read %v, want a %s", m.responses[0], c.want)
+			}
+			// The mode changes only the gate's decisions: the model is
+			// offered the policy's tools and nothing the mode could add
+			// (spawn, background agents, other built-ins).
+			slices.Sort(m.offered)
+			if !slices.Equal(m.offered, []string{"bash"}) {
+				t.Errorf("the model was offered %q, want only bash", m.offered)
+			}
+			if c.want == "stdout" && m.responses[0]["stdout"] != "b\n2\n" {
+				t.Errorf("stdout %q, want the compound's output", m.responses[0]["stdout"])
 			}
 		})
 	}

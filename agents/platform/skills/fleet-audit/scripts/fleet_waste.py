@@ -339,7 +339,12 @@ CUT_NAME_KINDS = {"Deployment": True, "ReplicaSet": False}
 # one away and understates the peak. The secondary pass then takes the max
 # across those buckets, which is the number we want, and collapses the
 # response to one point per pod: measured on a 137-pod cluster, one page and
-# 0.3s rather than ten pages and 3.3s, with both routes agreeing on all 137.
+# 0.3s rather than ten pages and 3.3s, with both routes agreeing on all 137
+# (measured with this period for CPU and memory).
+#
+# This is the period of the memory reads (the peak and the mean), where
+# `ALIGN_MAX` averages nothing. The averaging reason above is the CPU rate's,
+# and the CPU rate has its own period, `CPU_USAGE_ALIGNMENT_S`.
 USAGE_ALIGNMENT_S = 300
 MONITORING_SCOPE = "https://www.googleapis.com/auth/monitoring.read"
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
@@ -372,6 +377,25 @@ POD_GROUP_BY_FIELDS = ["resource.labels.namespace_name", "resource.labels.pod_na
 MONITORING_CURL_PREFIX = 'curl -sG --oauth2-bearer "$(gcloud auth print-access-token)"'
 CPU_METRIC = "kubernetes.io/container/cpu/core_usage_time"
 MEM_METRIC = "kubernetes.io/container/memory/used_bytes"
+# The CPU peak's primary period. `ALIGN_RATE` averages the counter over its
+# bucket, so `USAGE_ALIGNMENT_S` reads a 45-second burst at the limit as 15%
+# of that limit. 60 seconds is the period the metric is sampled at; memory's
+# `ALIGN_MAX` averages nothing and keeps the wider bucket.
+#
+# The cost of the short bucket: the counter has about one sample per bucket,
+# so one bucket can take more than its share of a steady use and the next
+# one less, and the peak is the largest bucket of the window. Measured on a
+# workload held at a constant use by its limit, the peak reads up to about
+# 30% high at 60 seconds (about 5% at 300). The error has one direction: a
+# finding just under the bar can be missed and a proposed resize is larger;
+# no finding is wrong and no proposed cut is deeper.
+#
+# The same direction for a start burst: the read covers each pod's whole
+# series, its first hour too, so a pod that is at its limit for some tens of
+# seconds at its start reads that as the week's peak for seven days, where
+# the wider bucket averaged it away. Such a workload gets a larger target or
+# no finding in that time.
+CPU_USAGE_ALIGNMENT_S = 60
 # Cloud Monitoring's aggregation enums, as the query string spells them.
 ALIGN_RATE = "ALIGN_RATE"
 ALIGN_MAX = "ALIGN_MAX"
@@ -1361,11 +1385,12 @@ def _pod_series_params(
     primary: str, secondary: str, window_hours: int,
 ) -> dict:
     """The query `_read_pod_series` sends, less paging; its label renders the same dict."""
+    alignment_s = CPU_USAGE_ALIGNMENT_S if metric == CPU_METRIC else USAGE_ALIGNMENT_S
     return {
         "filter": f'metric.type="{metric}" AND {_cluster_filter(cluster, location)}' + (MEM_NON_EVICTABLE_FILTER if metric == MEM_METRIC else ""),
         "interval.startTime": start.strftime(MONITORING_TIME_FORMAT),
         "interval.endTime": now.strftime(MONITORING_TIME_FORMAT),
-        "aggregation.alignmentPeriod": f"{USAGE_ALIGNMENT_S}s",
+        "aggregation.alignmentPeriod": f"{alignment_s}s",
         "aggregation.perSeriesAligner": primary,
         "aggregation.crossSeriesReducer": REDUCE_SUM,
         "aggregation.groupByFields": POD_GROUP_BY_FIELDS,
