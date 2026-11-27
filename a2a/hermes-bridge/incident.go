@@ -261,19 +261,20 @@ func (b *Bridge) incidentReplyTo(env *lib.Envelope, parts []lib.Part) string {
 
 // getIncident reads the report stored at addr, or errNoIncident.
 func (b *Bridge) getIncident(ctx context.Context, addr incidentAddress) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, incidentTimeout)
-	defer cancel()
 	q := url.Values{"chat_id": {addr.chatID}, "thread_id": {addr.threadID}}
 	target := strings.TrimRight(b.cfg.RouteURL, "/") + incidentPath + "?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	resp, cancel, err := b.storeDo(ctx, incidentTimeout, func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+b.cfg.RouteKey)
+		return req, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+b.cfg.RouteKey)
-	resp, err := b.routeClient.Do(req)
-	if err != nil {
-		return "", err
-	}
+	defer cancel()
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return "", errNoIncident

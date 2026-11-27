@@ -14,9 +14,17 @@
 
 """Plant and remove the previous scheduled run of bench/tasks/fleet-audit-unchanged-manifest-skips-synthesis.
 
-main.tf runs this in the container that runs `audit_report.py finish`, as
-`python3 - <mode> <scripts dir> <mark> [<collector_args>...]`. That container
-holds the report store and the scratch directory on its own volume.
+main.tf runs this as `python3 - <mode> <scripts dir> <mark> [<args>...]`. `plant`
+runs in the container that runs `audit_report.py finish`, which holds the
+scratch directory. Where the report store's files are depends on
+FLEET_AUDIT_REPORT_STORE, which the operator renders on the shell sandbox's
+shell container. Unset, empty or `file`: on that same container's volume, and
+`teardown` undoes everything there. `broker` (#6110): the shell writes through
+the credential broker, whose files are under the same root on the gateway pod's
+data volume, so main.tf undoes the plant in three steps: `state` (the plant's
+record, from the scratch), `teardown-store <state>` in the gateway's
+`platform-agent` container, and `teardown-scratch` back where the plant ran.
+Any other value stops `plant` before its `start`.
 
 plant: runs the previous scheduled run of the fleet-consistency-drift stream
 the way a worker does, with no model: `start`, the drift collector with the
@@ -68,6 +76,15 @@ PLANTED_MANIFEST_SUFFIX = ".planted"
 # already carries the findings the stored document shows no mark.
 PLANT_STATE_NAME = ".bench-unchanged-manifest-digest-plant.json"
 DIGEST_RECORD_TEMPLATE = "last_scheduled_digest_{audit_id}.json"
+# The report store's switch, which the operator renders on the sandbox's shell
+# container (report_status.py: REPORT_STORE_ENV).
+REPORT_STORE_ENV = "FLEET_AUDIT_REPORT_STORE"
+REPORT_STORE_FILE = "file"
+REPORT_STORE_BROKER = "broker"
+# The broker store's record of who wrote an envelope, beside it with this
+# suffix in place of `.json` (audit_report_store.py: REPORT_WRITER_SUFFIX).
+# The file store writes none.
+WRITER_SUFFIX = ".writer"
 MIN_ARGC = 4
 ROOT_UID = 0
 STDERR_TAIL_CHARS = 500
@@ -86,6 +103,19 @@ def ensure_proxy_path(proxy_bin: str = CREDENTIAL_PROXY_BIN) -> None:
     entries = [entry for entry in current.split(os.pathsep) if entry]
     if proxy_bin not in entries:
         os.environ["PATH"] = os.pathsep.join([proxy_bin, *entries])
+
+
+def report_store() -> str:
+    """`file` or `broker`, from this container's FLEET_AUDIT_REPORT_STORE; exits on any other value."""
+    value = os.environ.get(REPORT_STORE_ENV, "")
+    if value in ("", REPORT_STORE_FILE):
+        return REPORT_STORE_FILE
+    if value == REPORT_STORE_BROKER:
+        return REPORT_STORE_BROKER
+    sys.exit(
+        f"ERROR: {REPORT_STORE_ENV}={value!r} on the shell sandbox is neither "
+        f"{REPORT_STORE_FILE!r} nor {REPORT_STORE_BROKER!r}, so which report store to use is unknown."
+    )
 
 
 def become_data_owner(data_root: str = DATA_ROOT) -> str:
@@ -183,7 +213,7 @@ def plant_state_path(audit_report) -> Path:
     return Path(audit_report.SCRATCH_DIR) / PLANT_STATE_NAME
 
 
-def stored_envelope(audit_report) -> tuple[dict | None, str]:
+def stored_envelope(audit_report, store: str = REPORT_STORE_FILE) -> tuple[dict | None, str]:
     """The newest published envelope of the ledger this install publishes the stream to, and its repository.
 
     None, and the caller tears down and abandons, where the resolver refuses
@@ -197,9 +227,14 @@ def stored_envelope(audit_report) -> tuple[dict | None, str]:
     except RuntimeError as exc:
         print(f"{AUDIT} resolves no repository: {exc}", file=sys.stderr)
         return None, audit_report.NO_FORGE_REPO
-    latest = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
     try:
-        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        if store == REPORT_STORE_BROKER:
+            # Through the broker: the store's files are not in this container.
+            text = audit_report.report_store_dir(AUDIT, repo).read(audit_report.REPORT_LATEST_NAME)
+        else:
+            latest = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
+            text = latest.read_text(encoding="utf-8")
+        envelope = json.loads(text)
     except (OSError, ValueError):
         return None, repo
     if not isinstance(envelope, dict) or audit_report.is_diverted(envelope):
@@ -219,7 +254,17 @@ def abandon(audit_report, why: str) -> int:
     return 1
 
 
+def undo_here(audit_report, mark: str, store: str) -> None:
+    """A failed plant's own teardown: all of it with the file store; with the broker
+    store only the scratch, since main.tf removes the store's envelopes where they are."""
+    if store == REPORT_STORE_BROKER:
+        teardown_scratch(audit_report)
+    else:
+        teardown(audit_report, mark)
+
+
 def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> int:
+    store = report_store()
     started = datetime.now(timezone.utc)
     code, line = run_cli(audit_report, ["start", "--audit", AUDIT])
     if code != 0:
@@ -249,20 +294,20 @@ def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> i
     if code != 0:
         # An exit 2 (a rejected document, a lost broker) keeps the note for
         # the re-run a worker would make; this run makes none.
-        teardown(audit_report, mark)
+        undo_here(audit_report, mark, store)
         return abandon(audit_report, f"finish exited {code}; the previous run was not planted.")
     try:
         payload = json.loads(line.strip().splitlines()[-1])
     except (ValueError, IndexError):
         payload = {}
-    envelope, repo = stored_envelope(audit_report)
+    envelope, repo = stored_envelope(audit_report, store)
     finished_at = str((envelope or {}).get("finished_at") or "")
     try:
         finished = datetime.fromisoformat(finished_at)
     except ValueError:
         finished = None
     if envelope is None or not envelope.get("scheduled") or finished is None or finished < started:
-        teardown(audit_report, mark)
+        undo_here(audit_report, mark, store)
         return abandon(
             audit_report,
             f"the report store of {repo} does not hold this scheduled run as a published one (newest: {finished_at or 'none'}).",
@@ -331,6 +376,11 @@ def restore_store(directory: Path, audit_report) -> str:
     remaining = sorted(runs.glob("*.json")) if runs.is_dir() else []
     if remaining:
         latest.write_bytes(remaining[-1].read_bytes())
+        # The broker store keeps latest's writer as a copy of its run's, as its
+        # own PUT of latest does; the file store has no writer to copy.
+        writer = remaining[-1].with_suffix(WRITER_SUFFIX)
+        if writer.exists():
+            latest.with_suffix(WRITER_SUFFIX).write_bytes(writer.read_bytes())
         return "restored"
     for empty in (runs, directory):
         try:
@@ -340,14 +390,18 @@ def restore_store(directory: Path, audit_report) -> str:
     return "removed"
 
 
-def teardown(audit_report, mark: str) -> int:
-    """Remove the planted run and what it led to: any envelope with the mark, every envelope of the
-    planted repository stored at or after the planted run, and the scratch files; then put each
-    repository store touched back as it was (`restore_store`)."""
+def plant_state(audit_report) -> dict:
+    """The plant's record of its run (its repository and `finished_at`), or {}."""
     try:
         state = json.loads(plant_state_path(audit_report).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        state = {}
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _since_planted(audit_report, state: dict):
+    """`teardown`'s rule beyond the mark: every envelope of the planted repository stored at or after
+    the planted run, from the plant's own `state` in the same container."""
     since = _parsed(state.get("finished_at"))
     repo_dir = None
     if state.get("repo") and since is not None:
@@ -355,6 +409,58 @@ def teardown(audit_report, mark: str) -> int:
             repo_dir = Path(audit_report.reports_dir_for(AUDIT, str(state["repo"]))).resolve()
         except (ValueError, OSError):
             repo_dir = None
+    return lambda path, text: _stored_since(path, repo_dir, since, text)
+
+
+def _finished(text: str) -> datetime | None:
+    try:
+        return _parsed(json.loads(text).get("finished_at"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _closed_from_planted(audit_report, state: dict):
+    """`teardown-store`'s rule beyond the mark, or None and why when `state` does not validate.
+
+    `state` comes back from the sandbox, which this container does not trust, so
+    it drives no deletion until it checks out: its `repo` must be the stream's own
+    repository as the plant resolved it, and its `finished_at` must be that of an
+    envelope stored there. Then only the envelopes at that time (the planted run)
+    and at the next time after it (the run closed from it) go.
+    """
+    since = _parsed(state.get("finished_at"))
+    if since is None or not isinstance(state.get("repo"), str):
+        return None, "it names no repository or no finished_at"
+    try:
+        repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+        repo_dir = Path(audit_report.reports_dir_for(AUDIT, repo)).resolve()
+    except (RuntimeError, ValueError, OSError) as exc:
+        return None, f"the stream's repository does not resolve here: {exc}"
+    if state["repo"] != repo:
+        return None, f"it names {state['repo']!r}, not the stream's repository {repo!r}"
+    times = set()
+    for path in _store_files(audit_report):
+        if path.resolve().is_relative_to(repo_dir):
+            try:
+                finished = _finished(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            if finished is not None:
+                times.add(finished)
+    if since not in times:
+        return None, f"no envelope of {repo} finished at {state['finished_at']}"
+    closing = {since, *sorted(t for t in times if t > since)[:1]}
+
+    def rule(path: Path, text: str) -> bool:
+        return path.is_relative_to(repo_dir) and _finished(text) in closing
+
+    return rule, ""
+
+
+def _remove_store(audit_report, mark: str, rule) -> tuple[int, list[str]]:
+    """Remove from the store any envelope with the mark and any that `rule(path, text)` names; then
+    put each repository store touched back as it was (`restore_store`). The count removed, and what
+    became of each store touched."""
     removed = 0
     touched: set[Path] = set()
     for path in _store_files(audit_report):
@@ -362,11 +468,19 @@ def teardown(audit_report, mark: str) -> int:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             continue
-        if mark in text or _stored_since(path.resolve(), repo_dir, since, text):
+        if mark in text or rule(path.resolve(), text):
             path.unlink()
+            # The broker store's writer record goes with its envelope, or the
+            # broker names a writer for an envelope that is gone.
+            path.with_suffix(WRITER_SUFFIX).unlink(missing_ok=True)
             removed += 1
             touched.add(_store_directory(path, audit_report))
     restored = [f"{directory.name}: {restore_store(directory, audit_report)}" for directory in sorted(touched)]
+    return removed, restored
+
+
+def _remove_scratch(audit_report) -> int:
+    """Remove the digest record, the planted manifest and the plant's record; the count removed."""
     extra = 0
     for path in (digest_record_path(audit_report), planted_manifest_path(audit_report), plant_state_path(audit_report)):
         try:
@@ -374,6 +488,15 @@ def teardown(audit_report, mark: str) -> int:
             extra += 1
         except FileNotFoundError:
             continue
+    return extra
+
+
+def teardown(audit_report, mark: str) -> int:
+    """Remove the planted run and what it led to: any envelope with the mark, every envelope of the
+    planted repository stored at or after the planted run, and the scratch files; then put each
+    repository store touched back as it was (`restore_store`). The file store: one volume holds both."""
+    removed, restored = _remove_store(audit_report, mark, _since_planted(audit_report, plant_state(audit_report)))
+    extra = _remove_scratch(audit_report)
     print(
         f"removed {removed} stored envelope(s) of the planted run and the runs closed from it, and {extra} scratch file(s)"
         + (f"; store {', '.join(restored)}." if restored else ".")
@@ -381,9 +504,40 @@ def teardown(audit_report, mark: str) -> int:
     return 0
 
 
+def teardown_store(audit_report, mark: str, state: dict) -> int:
+    """The broker store's half of `teardown`, run where its files are, with the plant's `state`.
+
+    A `state` that does not validate (`_closed_from_planted`) removes only the
+    envelopes that carry the mark, with a WARNING.
+    """
+    rule, why = _closed_from_planted(audit_report, state)
+    if rule is None:
+        print(
+            f"WARNING: the plant's record is not one to delete by ({why}); removing only the envelopes "
+            "that carry the mark.",
+            file=sys.stderr,
+        )
+        rule = lambda path, text: False  # noqa: E731 - the mark alone
+    removed, restored = _remove_store(audit_report, mark, rule)
+    print(
+        f"removed {removed} stored envelope(s) of the planted run and the runs closed from it"
+        + (f"; store {', '.join(restored)}." if restored else ".")
+    )
+    return 0
+
+
+def teardown_scratch(audit_report) -> int:
+    """The broker store's other half of `teardown`, run where the plant ran."""
+    print(f"removed {_remove_scratch(audit_report)} scratch file(s).")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < MIN_ARGC:
-        print("usage: python3 - plant|teardown <scripts dir> <mark> [collector args...]", file=sys.stderr)
+        print(
+            "usage: python3 - plant|teardown|state|teardown-store|teardown-scratch <scripts dir> <mark> [args...]",
+            file=sys.stderr,
+        )
         return 2
     mode, scripts, mark = argv[1:4]
     collector_args = [arg for arg in argv[4:] if arg]
@@ -393,6 +547,17 @@ def main(argv: list[str]) -> int:
         return plant(audit_report, mark, scripts, collector_args)
     if mode == "teardown":
         return teardown(audit_report, mark)
+    if mode == "state":
+        print(json.dumps(plant_state(audit_report)))
+        return 0
+    if mode == "teardown-store":
+        try:
+            state = json.loads(argv[4]) if len(argv) > MIN_ARGC else {}
+        except ValueError:
+            state = {}
+        return teardown_store(audit_report, mark, state if isinstance(state, dict) else {})
+    if mode == "teardown-scratch":
+        return teardown_scratch(audit_report)
     print(f"unknown mode {mode!r}", file=sys.stderr)
     return 2
 

@@ -24,8 +24,10 @@ stored record is one that `finish` trusts.
 
 seed: opens one fleet-consistency-drift ledger with one finding on the host
 cluster, under the `label-keys` facet, and writes the stored record of that
-ledger. It also writes the issue number to `SEEDED_ISSUE_NAME` in the stream's
-report store directory, which the stored record has made. The host cluster carries no environment label, so the drift collector
+ledger. It also writes the issue number to `SEEDED_ISSUE_NAME`: in the stream's
+report store directory, which the stored record has made, with the file store,
+and in the sandbox's scratch with the broker store, which is not a directory
+here (FLEET_AUDIT_REPORT_STORE, `report_store`). The host cluster carries no environment label, so the drift collector
 compares it on no facet: the next run has a coverage gap on the host and does
 not check `label-keys` there. The cluster name is spelled as the drift
 collector spells a target, `<project>/<location>/<name>`. Exits 1 when the
@@ -46,6 +48,7 @@ without the fix does), so the teardown does not look for the name.
 """
 
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -76,6 +79,44 @@ SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
 # do not see it.
 SEEDED_ISSUE_NAME = "eval-unread-target-issue.json"
 OPEN_STATE = "open"
+# The report store's switch, which the operator renders on the sandbox's shell
+# container (report_status.py: REPORT_STORE_ENV). Unset, empty or `file` is the
+# store in this pod's own directory; `broker` is the store the credential broker
+# serves, whose files are not in this pod. audit_report picks the store the same
+# way, so its writes and this script's reads agree; any other value stops the
+# script rather than guess which store the run uses.
+REPORT_STORE_ENV = "FLEET_AUDIT_REPORT_STORE"
+REPORT_STORE_FILE = "file"
+REPORT_STORE_BROKER = "broker"
+# Where the seeded issue's number is kept with the broker store: the sandbox's
+# scratch, since the store is not a directory in this pod.
+BENCH_SCRATCH = "/opt/data/scratch/bench-ledgers"
+
+
+def report_store():
+    """`file` or `broker`, from this container's FLEET_AUDIT_REPORT_STORE; exits on any other value."""
+    value = os.environ.get(REPORT_STORE_ENV, "")
+    if value in ("", REPORT_STORE_FILE):
+        return REPORT_STORE_FILE
+    if value == REPORT_STORE_BROKER:
+        return REPORT_STORE_BROKER
+    sys.exit(
+        f"ERROR: {REPORT_STORE_ENV}={value!r} on the shell sandbox is neither "
+        f"{REPORT_STORE_FILE!r} nor {REPORT_STORE_BROKER!r}, so which report store to use is unknown."
+    )
+
+
+def latest_is_stored(audit_report, audit_id, repo):
+    """True when the store the run uses holds the stream's latest.json for `repo`."""
+    if report_store() == REPORT_STORE_BROKER:
+        return audit_report.report_store_dir(audit_id, repo).has(audit_report.REPORT_LATEST_NAME)
+    latest = audit_report.reports_dir_for(audit_id, repo) / audit_report.REPORT_LATEST_NAME
+    return latest.is_file()
+
+
+def scratch_path(audit_id, repo, name):
+    """`name` under BENCH_SCRATCH for one stream's repository."""
+    return Path(BENCH_SCRATCH) / audit_id / repo.lower().replace("/", "%2F") / name
 
 
 def target_name(project, location, cluster):
@@ -179,18 +220,28 @@ def seed(audit_report, project, location, cluster, repo, now):
 
 
 def seeded_issue_path(audit_report, repo):
+    if report_store() == REPORT_STORE_BROKER:
+        return scratch_path(AUDIT_ID, repo, SEEDED_ISSUE_NAME)
     return audit_report.reports_dir_for(AUDIT_ID, repo) / SEEDED_ISSUE_NAME
 
 
 def record_seeded_issue(audit_report, repo, number):
     """Write the seeded issue number where the teardown reads it.
 
-    Only into a directory that is there: the stored record makes it, and this
-    script does not make the report store. A number that is not written
-    leaves the teardown with the issue list alone, so the failure is a warning.
+    With the file store, only into a directory that is there: the stored
+    record makes it, and this script does not make the report store. With the
+    broker store, into the sandbox's scratch, made here. A number that is not
+    written leaves the teardown with the issue list alone, so the failure is a
+    warning.
     """
     path = seeded_issue_path(audit_report, repo)
-    if not path.parent.is_dir():
+    if report_store() == REPORT_STORE_BROKER:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"WARNING: could not make {path.parent}; #{number} is not recorded: {exc}", file=sys.stderr)
+            return
+    elif not path.parent.is_dir():
         print(
             f"WARNING: no report store directory {path.parent}; #{number} is not recorded.",
             file=sys.stderr,
@@ -247,9 +298,8 @@ def store_record(audit_report, data, rendered, number, url, repo, now):
     # `write_report` never fails the run, and `previous_run_memory` seeds a
     # memory from the ledger when the store has no directory. So check that
     # the file is there and that the memory is the one written here.
-    latest = audit_report.reports_dir_for(AUDIT_ID, repo) / audit_report.REPORT_LATEST_NAME
     memory = audit_report.previous_run_memory(AUDIT_ID, number, repo, rendered.body)
-    return latest.is_file() and memory is not None and not memory.get(SEEDED_FROM_LEDGER_KEY)
+    return latest_is_stored(audit_report, AUDIT_ID, repo) and memory is not None and not memory.get(SEEDED_FROM_LEDGER_KEY)
 
 
 def teardown(audit_report, repo):
@@ -295,6 +345,8 @@ def main(argv):
         )
     sys.path[:0] = [SKILL_SCRIPTS, PLATFORM_SCRIPTS]
     import audit_report  # noqa: PLC0415 -- the path is the sandbox's, set just above
+    # Before the forge is touched, so an unknown switch opens and closes nothing.
+    report_store()
 
     repo = audit_report.resolve_repo(AUDIT_ID, given)
     if mode == "seed":

@@ -1283,7 +1283,7 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # fleet reader's token), a `gcloud container clusters describe` on this job's
 # own credential, which already lists the same clusters above, a `gcloud
 # compute ... list` of a project-scoped role's objects or of the project's
-# reservations (the missing-reservation-pool role), a `gcloud compute
+# reservations (the two reservation roles), a `gcloud compute
 # instances get-serial-port-output` of the startup-fail VM, on the same
 # credential, or one GET of the leased repository's declared-intent note
 # (the catalog's `repository/...` assertions, #5827) with the grading read
@@ -5043,8 +5043,10 @@ unit_cost_hint() {
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that
     # the failed pulls it plants are older than the check's ten (3.28).
-    # Unmeasured: the audit band plus the wait.
-    obtainability-image-pull-failing) echo 1600 ;;
+    # Measured at 1030-1174s a repetition, the stack's wait included, on the
+    # main-e nightly (builds 2125379018969583616 and 2125741413462183936,
+    # 2026-11-25 and 11-26).
+    obtainability-image-pull-failing) echo 1200 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
     # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
     # kustomize case runs in the second phase (writes_alone), so its hint

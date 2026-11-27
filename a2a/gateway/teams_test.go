@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -928,4 +930,62 @@ func TestTeamsCardFencesNestAndCloseOnTheirOwnLength(t *testing.T) {
 	if teamsOpensFence("```kubectl get pods```") != 0 || teamsOpensFence("```bash") != 3 || teamsOpensFence("````") != 4 || !teamsClosesFence("```", 3) || teamsClosesFence("```yaml", 3) || teamsClosesFence("```", 4) {
 		t.Fatal("fence helpers")
 	}
+}
+
+func TestTeamsAdapterRelayBypassesHTTPProxy(t *testing.T) {
+	runWithProxyEnv(t, "TestTeamsAdapterRelayBypassesHTTPProxy", func(proxyURL string) {
+		const relayBase = "http://platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+		assertEnvProxyActive(t, relayBase+teamsRelayEventsPath, proxyURL)
+
+		var relayHits atomic.Int32
+		relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Host != "" {
+				http.Error(w, "unexpected proxy request "+r.URL.String(), http.StatusBadRequest)
+				return
+			}
+			relayHits.Add(1)
+			if r.URL.Path != teamsRelayEventsPath {
+				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"event":null}`)
+		}))
+		defer relaySrv.Close()
+
+		tokFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokFile, []byte("test-projected-token"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		a, err := NewTeamsAdapter(relayBase, tokFile, testTeamsTenant, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("NewTeamsAdapter: %v", err)
+		}
+		transport, ok := a.client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("client.Transport = %T, want *http.Transport", a.client.Transport)
+		}
+		if transport.Proxy != nil {
+			t.Fatal("client.Transport.Proxy != nil; in-cluster relay client must ignore proxy env vars")
+		}
+		relayAddr := relaySrv.Listener.Addr().String()
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if addr == "platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765" {
+				return dialer.DialContext(ctx, network, relayAddr)
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}
+
+		env, err := a.pullEvent(context.Background())
+		if err != nil {
+			t.Fatalf("pullEvent failed under HTTP_PROXY: %v", err)
+		}
+		if env != nil {
+			t.Fatalf("event = %+v, want nil", env)
+		}
+		if got := relayHits.Load(); got != 1 {
+			t.Fatalf("relay received %d request(s), want 1", got)
+		}
+	})
 }

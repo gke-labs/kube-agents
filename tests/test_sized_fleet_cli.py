@@ -238,3 +238,72 @@ class RunCaseInterruptTest(unittest.TestCase):
                 cli.run_case("./tasks/a/task.yaml", "a", {}, Path(tmp))
             self.assertEqual((Path(tmp) / "a.log").read_text(), "partial")
         killpg.assert_called_once_with(4242, cli.signal.SIGTERM)
+
+
+class CapabilityUsageTest(unittest.TestCase):
+    def test_each_window_is_attributed_from_one_read_with_its_own_counters(self):
+        windows = {"burst": {"start": "2026-11-11T19:00:00+00:00", "seconds": 3600, "tokens": {"tokens_input": 1}},
+                   "soak": {"start": "2026-11-11T20:00:00+00:00", "seconds": 3600, "tokens": {}}}
+        seen = []
+        with mock.patch.object(cli.attribution, "read_stores", return_value={"sessions": []}) as read, \
+                mock.patch.object(cli.attribution, "attribute",
+                                  side_effect=lambda s, start, end, litellm: seen.append((end - start, litellm)) or {}):
+            usage = cli.capability_usage("ctx", "ns", windows)
+        read.assert_called_once()
+        self.assertEqual(list(usage), ["burst", "soak"])
+        self.assertEqual(seen, [(3600, {"tokens_input": 1}), (3600, {})])
+
+
+class UsageWindowTest(unittest.TestCase):
+    def test_a_window_that_was_not_measured_costs_only_its_own_record(self):
+        windows = {"burst": {"start": "2026-11-11T19:00:00+00:00", "seconds": 3600, "tokens": {}}, "soak": {}}
+        with mock.patch.object(cli.attribution, "read_stores", return_value={"sessions": []}):
+            usage = cli.capability_usage("ctx", "ns", windows)
+        self.assertIn("overview", usage["burst"])
+        self.assertIn("error", usage["soak"])
+        self.assertIn("soak window (not read)", cli.attribution.markdown(usage))
+
+    def test_an_unread_memory_base_is_a_note_on_every_window(self):
+        windows = {"burst": {"start": "2026-11-11T19:00:00+00:00", "seconds": 3600, "tokens": {}},
+                   "soak": {"start": "2026-11-11T20:00:00+00:00", "seconds": 3600, "tokens": {}}}
+        with mock.patch.object(cli.attribution, "container_memory", side_effect=RuntimeError("monitoring down")), \
+                mock.patch.object(cli.model_counters, "vertex_tokens", return_value={}), \
+                mock.patch.object(cli.model_counters, "requests_by_account", return_value={}):
+            usage = cli.capability_usage("ctx", "ns", windows, project="p", stores={"sessions": []},
+                                         install=mock.Mock())
+        self.assertEqual(list(usage), ["burst", "soak"])
+        for window in usage.values():
+            self.assertIn("overview", window)
+            self.assertTrue(any(e.startswith("memory base") for e in window["errors"]))
+
+    def test_a_period_without_litellm_counters_is_checked_against_vertex_ai(self):
+        stores = {"sessions": [{"id": "s1", "source": "cli", "started_at": 10.0, "input_tokens": 70,
+                                "cache_read_tokens": 30, "output_tokens": 5}]}
+        with mock.patch.object(cli.model_counters, "vertex_tokens",
+                               return_value={cli.INSTALL_MODEL: {"input": 100, "output": 5}}), \
+                mock.patch.object(cli.model_counters, "requests_by_account", side_effect=RuntimeError("iam denied")):
+            usage = cli.measure_period(stores, "p", 0, 60)
+        self.assertEqual(usage["checks"]["sum"], {"source": "vertex", "ratio": {"input": 1.0, "output": 1.0},
+                                                  "passed": True})
+        # An unread caller list is a note on the period, not a lost period.
+        self.assertEqual(usage["requests_by_account"], {})
+        self.assertTrue(any(e.startswith("requests by account") for e in usage["errors"]))
+
+
+class InstallTimeoutTest(unittest.TestCase):
+    def test_a_helm_wait_that_runs_out_fails_once_and_is_not_retried(self):
+        calls = []
+
+        def helm(argv, **kwargs):
+            calls.append(argv[0])
+            return mock.Mock(returncode=1, stderr="Error: UPGRADE FAILED: context deadline exceeded", stdout=b"")
+
+        archive = mock.Mock(returncode=0, stdout=b"")
+        with tempfile.TemporaryDirectory(), \
+                mock.patch.object(cli.kube, "gcloud"), mock.patch.object(cli.kube, "run", return_value="{}"), \
+                mock.patch.object(cli, "check_host"), mock.patch.object(cli, "host_lease"), \
+                mock.patch.object(cli.subprocess, "run",
+                                  side_effect=lambda argv, **kw: helm(argv) if argv[0] == "helm" else archive):
+            with self.assertRaises(SystemExit):
+                cli.cmd_install(args(sha="abc", host_cluster="h", host_location="z", namespace="ns"))
+        self.assertEqual(calls, ["helm"])

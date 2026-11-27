@@ -16,7 +16,6 @@ import (
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
 )
 
 // "/feedback summary" (docs/designs/chat-feedback-command.md, part 7; issue
@@ -321,7 +320,7 @@ func newK8sUsageSource(cfg *Config) (*k8sUsageSource, error) {
 	if name == "" {
 		return nil, fmt.Errorf("the PlatformAgent name is unknown: set %s or A2A_OWNER_DEPLOYMENT", platformAgentNameEnv)
 	}
-	rc, err := rest.InClusterConfig()
+	rc, err := InClusterRESTConfig()
 	if err != nil {
 		return nil, err
 	}

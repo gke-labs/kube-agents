@@ -1031,6 +1031,20 @@ source "{_COMMON_SH}"
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout.strip(), MOCK_AR_REGISTRY_PREFIX)
 
+    def test_release_registry_prefixes(self):
+        """The registry prefix first; a second line only for another registry."""
+        registry = {"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX}
+        for same in ({}, {"ADDITIONAL_RELEASE_REGISTRY_PREFIX": ""}, {"ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX + "/"}):
+            proc = self._run_common_func('release_registry_prefixes', env={**registry, **same})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.split(), [MOCK_DEFAULT_REGISTRY_PREFIX])
+
+        proc = self._run_common_func(
+            'release_registry_prefixes', env={**registry, "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX + "/"}
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.split(), [MOCK_DEFAULT_REGISTRY_PREFIX, MOCK_CUSTOM_REGISTRY_PREFIX])
+
     def test_required_release_images_registry(self):
         cmd = 'echo "IMAGES=${REQUIRED_RELEASE_IMAGES[*]}"'
         proc = self._run_common_func(cmd)

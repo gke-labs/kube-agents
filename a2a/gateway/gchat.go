@@ -556,7 +556,7 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 	return &GoogleChatAdapter{
 		relayURL:   strings.TrimSuffix(relayURL, "/"),
 		tokenPath:  tokenPath,
-		client:     &http.Client{Timeout: gchatRelayTimeout},
+		client:     newRelayHTTPClient(gchatRelayTimeout),
 		log:        log,
 		seen:       map[string]bool{},
 		posted:     map[string]bool{},
