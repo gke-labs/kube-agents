@@ -177,6 +177,10 @@
                     "value": "/var/run/kube-agents/harness-config"
                   },
                   {
+                    "name": "FLEET_AUDIT_SCRATCH_DIR",
+                    "value": "/scratch"
+                  },
+                  {
                     "name": "A2A_DELEGATE_TOOL",
                     "value": "off"
                   },
@@ -469,6 +473,10 @@
               {
                 "name": "A2A_PROFILE_CONFIG_ROOT",
                 "value": "/var/run/kube-agents/harness-config"
+              },
+              {
+                "name": "FLEET_AUDIT_SCRATCH_DIR",
+                "value": "/scratch"
               },
               {
                 "name": "A2A_DELEGATE_TOOL",
@@ -799,6 +807,10 @@
                     "value": "/var/run/kube-agents/harness-config"
                   },
                   {
+                    "name": "FLEET_AUDIT_SCRATCH_DIR",
+                    "value": "/scratch"
+                  },
+                  {
                     "name": "A2A_DELEGATE_TOOL",
                     "value": "off"
                   },
@@ -1083,6 +1095,10 @@
               {
                 "name": "A2A_PROFILE_CONFIG_ROOT",
                 "value": "/var/run/kube-agents/harness-config"
+              },
+              {
+                "name": "FLEET_AUDIT_SCRATCH_DIR",
+                "value": "/scratch"
               },
               {
                 "name": "A2A_DELEGATE_TOOL",
@@ -1412,6 +1428,10 @@
                     "value": "/var/run/kube-agents/harness-config"
                   },
                   {
+                    "name": "FLEET_AUDIT_SCRATCH_DIR",
+                    "value": "/scratch"
+                  },
+                  {
                     "name": "A2A_DELEGATE_TOOL",
                     "value": "off"
                   },
@@ -1721,6 +1741,10 @@
               {
                 "name": "A2A_PROFILE_CONFIG_ROOT",
                 "value": "/var/run/kube-agents/harness-config"
+              },
+              {
+                "name": "FLEET_AUDIT_SCRATCH_DIR",
+                "value": "/scratch"
               },
               {
                 "name": "A2A_DELEGATE_TOOL",

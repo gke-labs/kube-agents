@@ -47,6 +47,10 @@ const (
 	// /healthz, pod-local.
 	profileWorkerStatusPort = 8080
 
+	// fleetAuditScratchDirEnv is the fleet-audit scripts' working directory
+	// (agents/platform/skills/fleet-audit/scripts/audit_report.py).
+	fleetAuditScratchDirEnv = "FLEET_AUDIT_SCRATCH_DIR"
+
 	profileWorkerScratchVolume = "scratch"
 	profileWorkerScratchPath   = "/scratch"
 	// 2Gi: the session worker, the same image and harness, left its 1Gi
@@ -129,6 +133,13 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_WORKDIR", Value: profileWorkerScratchPath},
 		{Name: "HOME", Value: profileWorkerHomePath},
 		{Name: "A2A_PROFILE_CONFIG_ROOT", Value: profileWorkerConfigPath},
+		// The fleet-audit scripts keep a run's working files (findings,
+		// manifest, the run record) under FLEET_AUDIT_SCRATCH_DIR, whose
+		// default /opt/data/scratch is on the read-only root here. The scratch
+		// mount itself, not a directory under it: the worker empties the mount
+		// after every task, which would remove a subdirectory too, and not
+		// every script path creates the directory before using it.
+		{Name: fleetAuditScratchDirEnv, Value: profileWorkerScratchPath},
 		// Children of a profile task go through the gateway, which a later
 		// change wires; until then the worker has no delegate tool.
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},
