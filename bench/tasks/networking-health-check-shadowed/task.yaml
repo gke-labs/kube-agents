@@ -1,5 +1,7 @@
 # NIGHTLY-TIER: a full audit, the same cost band as the other fleet-audit
-# cases, registered in hack/eval/nightly-cases.txt.
+# cases. Parked in FIXTURE_NOT_READY (scripts/validate_bench_cases.py) until
+# the fleet reconcile plants its fixture on every pool project; a follow-up
+# then registers it in hack/eval/nightly-cases.txt.
 #
 # The check this case grades is `firewall-health-check-shadowed`, networking
 # SOP §2.8: an enabled INGRESS DENY that, at a priority at or above an

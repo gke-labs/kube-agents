@@ -3019,6 +3019,15 @@ class HealthCheckShadowedTest(unittest.TestCase):
         self.assertIn("2 instance(s)", hits[0]["excerpt"])
         self.assertIn("web in us-central1-a, web in us-central1-b", hits[0]["excerpt"])
 
+    def test_port_zero_reads_as_the_whole_tcp_space(self):
+        """GCP accepts `0-65535` for every port; it and a block with no `ports`
+        key must cover each other, on the shadowing side and the remediation side."""
+        everything = hc_allow(ports=("0-65535",))
+        self.assertEqual(len(shadowed([everything, blanket_deny(ports=None)])[0]), 1)
+        fix = dict(hc_allow(name="fix", priority=800), allowed=[{"IPProtocol": "tcp"}])
+        self.assertEqual(shadowed([everything, blanket_deny(ports=None), fix])[0], [])
+        self.assertEqual(na._tcp_port_ranges([{"IPProtocol": "tcp", "ports": ["100-80", "80-", "x"]}]), [])
+
     def test_an_untargeted_allow_where_the_clusters_were_unread_is_undecided(self):
         hits, undecided = shadowed([hc_allow(), blanket_deny()], [], clusters_unread=["p1"])
         self.assertEqual(hits, [])

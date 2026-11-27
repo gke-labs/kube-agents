@@ -1893,7 +1893,7 @@
           "path": "priority",
           "op": "eq",
           "value": 1000,
-          "why": "the DENY at 900 shadows the allow only while the allow sits at its priority or below; moved to 900 or above it, the allow wins and there is no finding"
+          "why": "the DENY at 900 shadows the allow only while the allow sits at 900 or a higher number (a DENY wins a tie); moved to 899 or lower, the allow wins and there is no finding"
         },
         {
           "subject": "firewall/hc-shadow-allow-*",

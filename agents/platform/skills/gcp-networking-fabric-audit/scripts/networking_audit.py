@@ -1803,7 +1803,9 @@ def _tcp_port_ranges(block: list) -> list[tuple[int, int]]:
     """The TCP port ranges an `allowed[]` or `denied[]` block covers, as
     `(low, high)` pairs. An entry with no `ports` covers the whole TCP port
     space, the way `gke-<hash>-all` rules are written; `all` and the IANA
-    number count as TCP."""
+    number count as TCP. A range is clamped to that space, so `0-65535` and
+    no `ports` key read alike, and an inverted or half-written one is
+    dropped."""
     covered: list[tuple[int, int]] = []
     for entry in block or []:
         if str(entry.get("IPProtocol", "")).lower() not in TCP_PROTOCOL_TOKENS:
@@ -1813,12 +1815,14 @@ def _tcp_port_ranges(block: list) -> list[tuple[int, int]]:
             covered.append((TCP_PORT_MIN, TCP_PORT_MAX))
             continue
         for spec in specs:
-            low_text, _, high_text = str(spec).partition("-")
+            low_text, separator, high_text = str(spec).partition("-")
             try:
-                low, high = int(low_text), int(high_text or low_text)
+                low, high = int(low_text), int(high_text if separator else low_text)
             except ValueError:
                 continue
-            covered.append((low, high))
+            low, high = max(low, TCP_PORT_MIN), min(high, TCP_PORT_MAX)
+            if low <= high:
+                covered.append((low, high))
     return covered
 
 
