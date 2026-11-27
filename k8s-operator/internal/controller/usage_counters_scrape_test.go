@@ -1735,3 +1735,56 @@ func TestPodUsageSource_ReadsLiteLLMAtTheSlashedPathAndFollowsNoRedirect(t *test
 		t.Fatalf("the bare path was requested %d times, want once: the redirect was followed or retried", *bareHits)
 	}
 }
+
+func TestFoldUsageBody_ParsesA2ASlackConnectedGauge(t *testing.T) {
+	body := func(extra string) string {
+		return "# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 10\n" + extra
+	}
+
+	reading, err := foldUsageBody(strings.NewReader(body("kubeagents_a2a_gateway_slack_connected 0\n")), usageA2AChatCounters, []usageReadingKind{usageReadingPeople})
+	if err != nil {
+		t.Fatalf("scrape with gauge 0: %v", err)
+	}
+	if reading.SlackConnected == nil || *reading.SlackConnected {
+		t.Fatalf("SlackConnected = %v, want false", reading.SlackConnected)
+	}
+
+	reading, err = foldUsageBody(strings.NewReader(body("kubeagents_a2a_gateway_slack_connected 1\n")), usageA2AChatCounters, []usageReadingKind{usageReadingPeople})
+	if err != nil {
+		t.Fatalf("scrape with gauge 1: %v", err)
+	}
+	if reading.SlackConnected == nil || !*reading.SlackConnected {
+		t.Fatalf("SlackConnected = %v, want true", reading.SlackConnected)
+	}
+
+	// Standby replica or Slack unarmed: gauge absent -> nil.
+	reading, err = foldUsageBody(strings.NewReader(body("")), usageA2AChatCounters, []usageReadingKind{usageReadingPeople})
+	if err != nil {
+		t.Fatalf("scrape without gauge: %v", err)
+	}
+	if reading.SlackConnected != nil {
+		t.Fatalf("SlackConnected = %v, want nil when gauge is absent", *reading.SlackConnected)
+	}
+
+	// Non-A2A targets (broker and Hermes chat_metrics) ignore the gauge even
+	// though usageChatCounters pulls a2aAnswerFeedbackSeries in as a sibling.
+	reading, err = foldUsageBody(strings.NewReader(body("kubeagents_a2a_gateway_slack_connected 0\n")), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes})
+	if err != nil {
+		t.Fatalf("broker scrape: %v", err)
+	}
+	if reading.SlackConnected != nil {
+		t.Fatalf("broker scrape parsed SlackConnected = %v, want nil", *reading.SlackConnected)
+	}
+	reading, err = foldUsageBody(strings.NewReader(body("kubeagents_a2a_gateway_slack_connected 1\n")), usageChatCounters, []usageReadingKind{usageReadingOrigins})
+	if err != nil {
+		t.Fatalf("chat_metrics scrape: %v", err)
+	}
+	if reading.SlackConnected != nil {
+		t.Fatalf("chat_metrics scrape parsed SlackConnected = %v, want nil", *reading.SlackConnected)
+	}
+
+	// Negative sample fails the scrape as any wanted metric does.
+	if _, err := foldUsageBody(strings.NewReader(body("kubeagents_a2a_gateway_slack_connected -1\n")), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}); err == nil {
+		t.Fatal("negative slack_connected sample succeeded, want scrape error")
+	}
+}

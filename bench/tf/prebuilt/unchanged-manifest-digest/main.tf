@@ -22,10 +22,21 @@
 #     snapshot the collectors need as arguments on an install that declares a
 #     scope (the platform_control fleet_scope tool's collector_args), and the
 #     cron roster arm.py fires the job from;
-#   - the container that runs `audit_report.py finish` holds the report store
-#     and the scratch directory: the shell sandbox's `shell` container when the
-#     sandbox is on, else the gateway's `platform-agent` container, in the same
-#     order as `make fleet-audit-view`. plant.py runs there.
+#   - the container that runs `audit_report.py finish` holds the scratch
+#     directory: the shell sandbox's `shell` container when the sandbox is on,
+#     else the gateway's `platform-agent` container, in the same order as `make
+#     fleet-audit-view`. plant.py runs there.
+#
+# Where the report store's files are depends on FLEET_AUDIT_REPORT_STORE, which
+# the operator renders on the shell container and which is read here from the
+# pod spec (report_store). Unset, empty or `file`: on the plant's container's
+# volume beside the scratch, and plant.py's `teardown` undoes it all there.
+# `broker` (#6110): the shell writes through the credential broker, whose files
+# are under the same root on the gateway pod's data volume, so the teardown
+# removes the store's envelopes in the gateway's agent container
+# (var.agent_container) and the scratch files where the plant ran
+# (broker_teardown). Any other value
+# fails the apply before the plant, and the destroy before its teardown.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -42,13 +53,15 @@ locals {
   pod_selector = "app.kubernetes.io/name=platform-agent"
   # In this order: the sandbox first, then the gateway.
   store_containers = "shell platform-agent"
-  scripts_dir      = "/opt/data/skills/fleet-audit/scripts"
-  home             = "/opt/data"
-  python           = "/opt/hermes/.venv/bin/python3"
-  audit_job        = "fleet-consistency-drift"
-  pod_wait         = 5
-  plant_b64        = base64encode(file("${path.module}/plant.py"))
-  arm_b64          = base64encode(file("${path.module}/arm.py"))
+  # The container that carries the report store switch.
+  sandbox_container = "shell"
+  scripts_dir       = "/opt/data/skills/fleet-audit/scripts"
+  home              = "/opt/data"
+  python            = "/opt/hermes/.venv/bin/python3"
+  audit_job         = "fleet-consistency-drift"
+  pod_wait          = 5
+  plant_b64         = base64encode(file("${path.module}/plant.py"))
+  arm_b64           = base64encode(file("${path.module}/arm.py"))
   # The one line the fleet_scope tool hands the agent, read from the same
   # snapshot in the agent container; empty on an install with no declared scope.
   scope_script = <<-PY
@@ -67,22 +80,23 @@ locals {
 
 resource "null_resource" "previous_scheduled_run" {
   triggers = {
-    host_cluster     = var.host_cluster_name
-    host_location    = var.host_cluster_location
-    host_project     = var.project_id
-    namespace        = var.agent_namespace
-    deployment       = var.agent_deployment
-    container        = var.agent_container
-    mark             = var.mark
-    pod_selector     = local.pod_selector
-    store_containers = local.store_containers
-    scripts_dir      = local.scripts_dir
-    home             = local.home
-    python           = local.python
-    audit_job        = local.audit_job
-    pod_wait         = local.pod_wait
-    plant_b64        = local.plant_b64
-    arm_b64          = local.arm_b64
+    host_cluster      = var.host_cluster_name
+    host_location     = var.host_cluster_location
+    host_project      = var.project_id
+    namespace         = var.agent_namespace
+    deployment        = var.agent_deployment
+    container         = var.agent_container
+    mark              = var.mark
+    pod_selector      = local.pod_selector
+    store_containers  = local.store_containers
+    sandbox_container = local.sandbox_container
+    scripts_dir       = local.scripts_dir
+    home              = local.home
+    python            = local.python
+    audit_job         = local.audit_job
+    pod_wait          = local.pod_wait
+    plant_b64         = local.plant_b64
+    arm_b64           = local.arm_b64
   }
 
   provisioner "local-exec" {
@@ -93,6 +107,7 @@ resource "null_resource" "previous_scheduled_run" {
       planted=""
       pod=""
       container=""
+      store_kind=""
       arm() {
         printf '%s' '${local.arm_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" \
@@ -104,6 +119,48 @@ resource "null_resource" "previous_scheduled_run" {
           kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "$container" -- \
             env PYTHONDONTWRITEBYTECODE=1 python3 - "$@"
       }
+      # `file` or `broker`, from the env the operator rendered on the shell
+      # container of pod $1; any other value is an error that names it.
+      report_store() {
+        local out value
+        # The value on the first line; a valueFrom on the entry or any envFrom on
+        # the container after it, which the spec does not resolve.
+        out="$(kubectl get pod -n "${var.agent_namespace}" "$1" \
+          -o jsonpath='{.spec.containers[?(@.name=="${local.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${local.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${local.sandbox_container}")].envFrom}')" || return 1
+        value="$(printf '%s\n' "$out" | sed -n 1p)"
+        if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${local.sandbox_container} container of $1 is set indirectly (valueFrom or envFrom), so which report store to use is unknown." >&2
+          return 1
+        fi
+        case "$value" in
+          "" | file) echo file ;;
+          broker) echo broker ;;
+          *)
+            echo "ERROR: FLEET_AUDIT_REPORT_STORE='$value' on the ${local.sandbox_container} container of $1 is neither 'file' nor 'broker', so which report store to use is unknown." >&2
+            return 1
+            ;;
+        esac
+      }
+      # The broker store's teardown: the plant's record from the scratch in
+      # $pod/$container, the store's envelopes in the agent container, whose
+      # pod holds them, then the scratch files where the plant ran.
+      broker_teardown() {
+        local state status=0
+        state="$(printf '%s' '${local.plant_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "$container" -- \
+            env PYTHONDONTWRITEBYTECODE=1 python3 - state "${local.scripts_dir}" "${var.mark}" | tail -n 1)" || {
+          echo "WARNING: could not read the plant's record from the scratch; the store's teardown removes only the envelopes that carry the mark." >&2
+          state="{}"
+        }
+        printf '%s' '${local.plant_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" \
+            -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- \
+            env PYTHONDONTWRITEBYTECODE=1 python3 - teardown-store "${local.scripts_dir}" "${var.mark}" "$state" || status=1
+        printf '%s' '${local.plant_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "$container" -- \
+            env PYTHONDONTWRITEBYTECODE=1 python3 - teardown-scratch "${local.scripts_dir}" "${var.mark}" || status=1
+        return "$status"
+      }
       on_exit() {
         status=$?
         trap '' TERM INT
@@ -111,7 +168,10 @@ resource "null_resource" "previous_scheduled_run" {
         if [ "$status" -ne 0 ]; then
           echo "Apply failed (exit $status); undoing what it did." >&2
           arm clean "${local.home}" >&2 || echo "Could not clean the arm state; the next apply removes it first." >&2
-          if [ -n "$planted" ]; then
+          if [ -n "$planted" ] && [ "$store_kind" = broker ]; then
+            broker_teardown >&2 \
+              || echo "Teardown failed too; the next apply's plant overwrites the mark and its destroy removes it." >&2
+          elif [ -n "$planted" ]; then
             plant_store teardown "${local.scripts_dir}" "${var.mark}" >&2 \
               || echo "Teardown failed too; the next apply's plant overwrites the mark and its destroy removes it." >&2
           fi
@@ -150,6 +210,10 @@ resource "null_resource" "previous_scheduled_run" {
         exit 1
       fi
       read -r pod container <<<"$target"
+      store_kind=file
+      if [ "$container" = "${local.sandbox_container}" ]; then
+        store_kind="$(report_store "$pod")"
+      fi
 
       # The collector's scope arguments, as the agent would paste them.
       collector_args="$(printf '%s' '${local.scope_b64}' | base64 -d | \
@@ -194,11 +258,63 @@ resource "null_resource" "previous_scheduled_run" {
           ${self.triggers.python} - clean "${self.triggers.home}" \
         || echo "WARNING: could not clean the arm state; the next apply removes it first." >&2
 
+      # As in the apply: `file` or `broker` from the shell container's env in
+      # pod $1's spec, and any other value an error that names it.
+      report_store() {
+        local out value
+        # The value on the first line; a valueFrom on the entry or any envFrom on
+        # the container after it, which the spec does not resolve.
+        out="$(kubectl get pod -n "${self.triggers.namespace}" "$1" \
+          -o jsonpath='{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].envFrom}')" || return 1
+        value="$(printf '%s\n' "$out" | sed -n 1p)"
+        if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${self.triggers.sandbox_container} container of $1 is set indirectly (valueFrom or envFrom), so which report store to use is unknown." >&2
+          return 1
+        fi
+        case "$value" in
+          "" | file) echo file ;;
+          broker) echo broker ;;
+          *)
+            echo "ERROR: FLEET_AUDIT_REPORT_STORE='$value' on the ${self.triggers.sandbox_container} container of $1 is neither 'file' nor 'broker', so which report store to use is unknown." >&2
+            return 1
+            ;;
+        esac
+      }
+      # The broker store's teardown: the plant's record from the scratch in
+      # $pod/$container, the store's envelopes in the agent container, whose
+      # pod holds them, then the scratch files where the plant ran.
+      broker_teardown() {
+        local state status=0
+        state="$(printf '%s' '${self.triggers.plant_b64}' | base64 -d | \
+          kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "$container" -- \
+            env PYTHONDONTWRITEBYTECODE=1 python3 - state "${self.triggers.scripts_dir}" "${self.triggers.mark}" | tail -n 1)" || {
+          echo "WARNING: could not read the plant's record from the scratch; the store's teardown removes only the envelopes that carry the mark." >&2
+          state="{}"
+        }
+        printf '%s' '${self.triggers.plant_b64}' | base64 -d | \
+          kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
+            -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+            env PYTHONDONTWRITEBYTECODE=1 python3 - teardown-store "${self.triggers.scripts_dir}" "${self.triggers.mark}" "$state" || status=1
+        printf '%s' '${self.triggers.plant_b64}' | base64 -d | \
+          kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "$container" -- \
+            env PYTHONDONTWRITEBYTECODE=1 python3 - teardown-scratch "${self.triggers.scripts_dir}" "${self.triggers.mark}" || status=1
+        return "$status"
+      }
+
       for container in ${self.triggers.store_containers}; do
         for pod in $(kubectl get pods -n "${self.triggers.namespace}" -l "${self.triggers.pod_selector}" \
             --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'); do
           names="$(kubectl get pod -n "${self.triggers.namespace}" "$pod" -o jsonpath='{.spec.containers[*].name}')"
           if [[ " $names " == *" $container "* ]]; then
+            store_kind=file
+            if [ "$container" = "${self.triggers.sandbox_container}" ]; then
+              # errexit is off here, so a switch that cannot be resolved exits by hand.
+              store_kind="$(report_store "$pod")" || exit 1
+            fi
+            if [ "$store_kind" = broker ]; then
+              broker_teardown
+              exit
+            fi
             printf '%s' '${self.triggers.plant_b64}' | base64 -d | \
               kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "$container" -- \
                 env PYTHONDONTWRITEBYTECODE=1 python3 - teardown "${self.triggers.scripts_dir}" "${self.triggers.mark}"

@@ -104,13 +104,13 @@ func startInjectRigSpawning(t *testing.T, tweak func(*Config), spawn *fakeSpawne
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("inject-gateway-test"),
+	client, err := connectClientTest(ctx, url, lib.WithName("inject-gateway-test"),
 		lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("inject-executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("inject-executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}
