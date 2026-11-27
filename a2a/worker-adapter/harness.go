@@ -179,7 +179,9 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
 	stderr := &tailBuffer{max: stderrTailBytes}
-	cmd.Stderr = stderr
+	// The tail is kept for a failed turn's reason; refused tool calls the
+	// harness reports go to the worker's log as well (refusalLines).
+	cmd.Stderr = io.MultiWriter(stderr, &refusalLines{log: log})
 	// WaitDelay bounds every reap. A descendant that left the process group
 	// survives the group kill and can hold stderr open, and Wait reads stderr
 	// to EOF, so without a bound Wait blocks until that descendant exits.
@@ -244,6 +246,12 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 				// the contract owns only the lines it defines.
 				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), chatterEchoCap))
 				continue
+			}
+			// Each event carries when its line was read: taken here, not in
+			// the adapter's loop, which a slow publish can hold (Event.At).
+			at := time.Now()
+			for i := range evs {
+				evs[i].At = at
 			}
 			// A line with no events still goes through: the adapter checks
 			// for an abandon on every stdout line, as it always has.

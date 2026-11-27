@@ -47,10 +47,13 @@ type Envelope struct {
 }
 
 // Policy is a turn's tool policy: the tools the model is offered and the
-// rules a call is checked against before it runs. Its contents are filled
-// from the persona grant.
+// rules a call is checked against before it runs. The worker adapter fills
+// it from the worker's grant (a2a/lib/persona/toolgrant; a session pod's
+// allowlist today).
 type Policy struct {
-	// Tools names the built-in tools the model is offered; nothing else is.
+	// Tools names the built-in tools the model is offered. Beside them it is
+	// offered only the MCP tools MCP grants and the persona's read-only
+	// skill tools.
 	Tools []string `json:"tools,omitempty"`
 	// Allow and Deny are core-agent permission patterns (`tool:key` globs).
 	// A call no Allow pattern matches is refused, never prompted.
@@ -116,6 +119,12 @@ type Usage struct {
 	Cached   int64 `json:"cached,omitempty"`
 	Thoughts int64 `json:"thoughts,omitempty"`
 }
+
+// RefusalLogPrefix starts the one line the harness writes to its stderr for
+// each refused tool call: the prefix, the tool's name as a Go-quoted
+// string, and the reason in parentheses, never the call's arguments. The
+// worker forwards only such lines to its own log.
+const RefusalLogPrefix = "tool refused: "
 
 // IsHistoryBoundary reports whether a conversation event is a compaction
 // summary or a checkpoint. core-agent marks one in its custom metadata and

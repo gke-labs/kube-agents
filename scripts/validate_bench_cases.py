@@ -428,8 +428,16 @@ KNOWN_UNREGISTERED = {
 # blocks, runs in the nightly and shows that on its record. Every reason names
 # the issue; the entry stays through the pull request that lands the fixture
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
-# later pull request that moves the case to the nightly file.
+# later pull request that moves the case to the nightly file, or, for a case
+# of the validated-capabilities suite, restores its `suite:` line (a suite case
+# is never in a roster file).
 FIXTURE_NOT_READY = {
+    # Fixture planted in bench/tf/fleet/defects-a.tf (#7097, #1982); parked
+    # until the postsubmit fleet reconcile applies unaccepted-gateway-class
+    # across the pool projects, after which a follow-up moves it to nightly-cases.txt.
+    "networking-unaccepted-gatewayclass": (
+        "#7097 / #1982: needs unaccepted-gateway-class (gatewayclass/seeded-unaccepted-gw, gateway/seeded-unaccepted-gateway, httproute/seeded-unaccepted-route) applied to every pool project by the postsubmit fleet reconcile"
+    ),
     # Its harness applied the merged fix to a shared planted defect, which the
     # read-only fleet refuses and about thirty other cases read. It needs a fixture of
     # its own and Config Sync to apply the merge, as a customer's reconciler would.
@@ -462,19 +470,6 @@ FIXTURE_NOT_READY = {
         "default (fixture rule 9); a fixture for the node's PIDPressure needs a node of its own "
         "and a privileged pod that lowers kernel.pid_max, which is not on the fleet and which no "
         "issue plans"
-    ),
-    # Needs the order of two times on one node: a workload container that
-    # starts before a per-node agent's pod is Ready. That order is evidence
-    # only on a node made after the agent's DaemonSet, and a workload's restart
-    # resets it. The fleet's pools make a node only at an upgrade or a repair,
-    # and its two zero-node pools are read by other cases as empty; the cost,
-    # not tried, is a pool of its own with one standing small node. The first
-    # plan's signal, a label only a fixture writes, is not a fixture (fixture
-    # rule 9). #5411 owns the gap and proposes the first plan's check.
-    "node-kubelet-startup-admission-race": (
-        "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
-        "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
-        "tried, is a pool of its own with one standing small node whose two times stay readable"
     ),
     # Needs a node pool with accelerators and no blocking taint beside an
     # untainted pool without accelerators. The case header has what was read
@@ -1156,6 +1151,10 @@ CLUSTER_PLACEHOLDER_ANY = "any"
 # The two lists report_contains expands a placeholder in; every other list on
 # every check (its phrase lists included) is searched or matched as written.
 EXPANDING_PATTERN_KEYS = ("forbidden_patterns", "any_of_patterns")
+EXPANDING_MODEL_PATTERN_KEYS = ("forbidden_patterns", "required_patterns", "any_of_patterns")
+MODEL_PLACEHOLDER = re.compile(r"\{model\}")
+MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{\s*model\b[^}\n]*\}", re.IGNORECASE)
+MODEL_PLACEHOLDER_TOKEN = "{model}"
 REPORT_CHECK_TYPE = "report_contains"
 
 
@@ -1411,6 +1410,42 @@ def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked
                 f"prompt names fleet role {role!r}, which has no cluster slot in bench/tf/fleet/fixtures.json; "
                 "the runner records no cluster for it"
             )
+
+
+def _model_placeholders(node: Any, where: str, problems: list[str]) -> None:
+    """Every `{model}` in a check subtree is well-formed and sits in one of
+    `report_contains`'s three pattern lists (`forbidden_patterns`,
+    `required_patterns`, `any_of_patterns`); elsewhere it would be treated as
+    literal text and never match."""
+    if not isinstance(node, dict):
+        return
+    for key, raw in node.items():
+        if isinstance(raw, list):
+            values = raw
+        elif isinstance(raw, dict):
+            values = list(raw.values())
+        else:
+            values = [raw]
+        expands = node.get("type") == REPORT_CHECK_TYPE and key in EXPANDING_MODEL_PATTERN_KEYS
+        for pattern in values:
+            if not isinstance(pattern, str):
+                continue
+            if not expands:
+                if MODEL_PLACEHOLDER_LOOSE.search(pattern):
+                    problems.append(
+                        f"{where}: {key!r} on a {node.get('type')!r} check carries {MODEL_PLACEHOLDER_TOKEN}, "
+                        f"which only {REPORT_CHECK_TYPE} expands, and only in its "
+                        f"{', '.join(repr(k) for k in EXPANDING_MODEL_PATTERN_KEYS)}; elsewhere it is literal text "
+                        "that never matches"
+                    )
+                continue
+            if MODEL_PLACEHOLDER_LOOSE.search(MODEL_PLACEHOLDER.sub("", pattern)):
+                problems.append(
+                    f"{where}: {key!r} carries a malformed model placeholder; the form is "
+                    f"{MODEL_PLACEHOLDER_TOKEN}, lowercase, no spaces"
+                )
+    for child in node.get("checks") or []:
+        _model_placeholders(child, where, problems)
 
 
 def _catalog_roles() -> dict[str, Any]:
@@ -2150,6 +2185,7 @@ def validate_case(
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles, slot_roles)
                 _cluster_placeholders(entry["check"], where, problems, _catalog_slots(), name in FIXTURE_NOT_READY)
+                _model_placeholders(entry["check"], where, problems)
 
         # `fixture_roles:` asks whether a role's slot was reached, which the
         # runner records for catalogue roles only; an overlay role with no

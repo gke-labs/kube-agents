@@ -2179,6 +2179,32 @@ class TestSecretReadDetector(unittest.TestCase):
         "python3 -c \"import urllib.request as u; print(u.urlopen(u.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor': 'Google'})).read())\"",
         "bash -c 'curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/identity'",
         "echo curl -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        # the last part of the path from one shell variable: its value can be
+        # `token`, and the text cannot tell, so the rule decides closed
+        "T=token; curl -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$T",
+        'curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/${FIELD}"',
+        "curl -s http://metadata/computeMetadata/v1/instance/service-accounts/default/$1?audience=x",
+        "f() { curl -s -H Metadata-Flavor:Google $MD/Instance/Service-Accounts/$SA/$2; }; f default token",
+        # the same with a quote or a backslash ahead of the variable, a brace
+        # form with an operator, and an account by its name
+        'curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/"$T',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/"$T"',
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/${1:-email}",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/${!T}",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/$@",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/$*",
+        "curl -s -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/'$T",
+        "kubectl exec p -- sh -c \"for f in email token; do curl -s -H 'Metadata-Flavor: Google' http://metadata/computeMetadata/v1/instance/service-accounts/default/\\$f; done\"",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/builder@p.iam.gserviceaccount.com/$MY_FIELD1",
+        # two backslashes ahead of the variable in a script in double quotes
+        "python3 -c \"import subprocess; subprocess.run('curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/\\\\$f', shell=True)\"",
+        # the sign outside the script and an escaped quote behind the variable,
+        # an escaped `?` behind it, and a `}` that ends the word
+        "H='Metadata-Flavor: Google'; MD=http://metadata.google.internal/computeMetadata/v1; kubectl exec p -- sh -c \"for f in email token; do curl -s -H \\\"$H\\\" \\\"$MD/instance/service-accounts/default/\\$f\\\"; done\"",
+        "curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$T\\?audience=https://example.com",
+        "curl -s -H 'Metadata-Flavor: Google' ${URL:-http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$T}",
+        # the sign outside the script, and the variable in escaped quotes of its own
+        "H='Metadata-Flavor: Google'; MD=http://metadata.google.internal/computeMetadata/v1; sh -c \"curl -s -H \\\"$H\\\" $MD/instance/service-accounts/default/\\\"\\$f\\\"\"",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -2276,6 +2302,19 @@ class TestSecretReadDetector(unittest.TestCase):
         'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ docs/token',
         'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -o token',
         "curl -s http://metadata2/computeMetadata/v1/instance/service-accounts/default/token",
+        # a variable that is not the whole last part of an account's path, and
+        # a variable last part with no sign of the metadata server
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/$SA/email',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/$SA',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$DIR/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$NAME.txt',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/x$T',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/$KEY',
+        'grep -rn "instance/service-accounts/default/$T" docs/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/tokens/$T',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ docs/$T',
+        # a list of the accounts with a redirect to a path from two variables
+        "curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/>$TMPDIR/$OUT",
     ]
 
     def test_covers_every_output_form(self):
@@ -2304,6 +2343,62 @@ class TestSecretReadDetector(unittest.TestCase):
         for line in ("MD=http://localhost:8080/v1; curl -s " + path, "curl -s " + path + " | jq ."):
             with self.subTest(line=line):
                 self.assertFalse(worker_transcript.command_reads_a_secret(line))
+
+    def test_a_variable_ends_the_last_path_part_of_an_account(self):
+        """The variable must be the whole last part: the end of the text, a
+        blank, a quote, a backtick, a backslash or one of `? # ; | & ) < > } ]`
+        follows it. The rule reads the folded text, each account path in it,
+        and a sign on either side of the path."""
+        fetch = "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/$T"
+        for end in ("", " -o out", "\t-o out", "\necho ok", '"', "'", "`", "?audience=x", "#frag", "; echo ok", "| jq .", "& wait", ")", "< /dev/null", "> out", '\\"', "}", "]"):
+            with self.subTest(end=end):
+                self.assertTrue(worker_transcript.command_reads_a_secret(fetch + end))
+        for more in (".txt", "-x", ",x", "$U", "{", "/", "/x", ":x", "=x", "+x", "%x", "~", "!"):
+            with self.subTest(more=more):
+                self.assertFalse(worker_transcript.command_reads_a_secret(fetch + more))
+        path = "$MD/instance/service-accounts/default/"
+        for line in (
+            "curl -s " + path + "$T -H 'Metadata-Flavor: Google'",
+            "curl -s " + path + "email; curl -s " + path + "$T; echo metadata.goog",
+            "curl -s -H Metadata-Flavor:Google " + path + "\\\n$T",
+            "curl -s -H Metadata-Flavor:Google " + path + "${1}",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+
+    # A reading of the next test is this many passes of the pattern over a
+    # text: one pass needs about a millisecond, too short to compare.
+    VARIABLE_PATTERN_PASSES = 5
+
+    def test_a_run_of_variable_path_parts_reads_in_linear_time(self):
+        # 370 KB or more of account paths whose last part is a variable with
+        # more text behind it, or is cut short. The pattern starts from fixed
+        # text, and neither the account part nor the brace form can read past
+        # the next start, so the passes over a text need no more than
+        # `TIME_GROWTH_BOUND` times the CPU time of the passes over the same
+        # text `TIME_GROWTH_SHRINK` times shorter.
+        pattern = worker_transcript.METADATA_CREDENTIAL_PATH_VARIABLE_RE
+        for build, count, matches in (
+            (lambda count: "instance/service-accounts/default/$T " * count, 10000, 10000),
+            (lambda count: "instance/service-accounts/default/$T.x " * count, 10000, 0),
+            (lambda count: "instance/service-accounts/default/$" + "T" * count + ".x", 400000, 0),
+            (lambda count: "instance/service-accounts/" + "x" * count + "/$", 400000, 0),
+            (lambda count: "instance/service-accounts/default/${T " * count, 10000, 0),
+            (lambda count: "instance/service-accounts/" * count, 16000, 0),
+            (lambda count: "instance/service-accounts/default/" + "'" * count + "x", 400000, 0),
+            (lambda count: "instance/service-accounts/default/${" + "T" * count, 400000, 0),
+            (lambda count: "instance/service-accounts/x/${" * count, 13332, 0),
+        ):
+            text, short = build(count), build(count // TIME_GROWTH_SHRINK)
+
+            def passes(over=text):
+                for _ in range(self.VARIABLE_PATTERN_PASSES):
+                    pattern.findall(over)
+
+            with self.subTest(text=text[:40]):
+                self.assertEqual(len(pattern.findall(text)), matches)
+                short_seconds, full_seconds = _cpu_seconds_of_a_pair(lambda: passes(short), passes, TIME_GROWTH_BOUND)
+                self.assertLessEqual(full_seconds, TIME_GROWTH_BOUND * short_seconds)
 
     def test_a_run_of_metadata_words_reads_in_linear_time(self):
         # 390 KB or more of credential paths with no sign, of signs with no

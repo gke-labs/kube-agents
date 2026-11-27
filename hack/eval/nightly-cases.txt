@@ -960,6 +960,13 @@
 # rules and topology spread rather than custom polling scripts. deployer: noop.
 ./tasks/capacity-gpu-zonal-skew-fallback-chain/task.yaml
 
+# Multi-pool Cluster Autoscaler scan-delay probe (#2900, #3008, #7096):
+# untargeted dynamic `render-<uuid>` workloads across 28 tainted GPU pools force
+# per-pool evaluation across every pool; fixed durably with namespace
+# `cloud.google.com/default-compute-class` and `capacitybuffers.autoscaling.x-k8s.io`.
+# deployer: noop, no fixture.
+./tasks/capacity-multipool-ca-scan-delay-capacitybuffer/task.yaml
+
 # chat-answer-writes-a-table: a direct answer asked for as a table is a
 # markdown pipe table, not "Label: value | Label: value" lines. Red on the
 # api_server prompt hint that told the model to assume plain text (the Teams
@@ -993,6 +1000,12 @@
 # overlay of its own, and posts no test notification (#3112).
 # `validated: false` until its first observed nightly runs.
 ./tasks/chat-home-channel-answer-names-the-setting/task.yaml
+
+# The front door answers "what model are you running on?" from its
+# [RUNTIME MODEL IDENTITY] block, never with the router alias (model-default,
+# hermes-agent) or the `custom` placeholder, and files no card (#3295).
+# deployer: noop, transcript-only, one front-door turn with no card.
+./tasks/chat-model-identity-truth/task.yaml
 
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
@@ -1191,12 +1204,23 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# Node-pool kubelet cpuCfsQuota=false enforcement probe (#2599, #2799, #7179):
+# disabling cpuCfsQuota turns off kernel CPU limit enforcement for multi-tenant
+# workloads on that pool. deployer: noop, no fixture.
+./tasks/consistency-kcc-kubelet-cfs-quota-drift/task.yaml
+
 # #2800: the drift audit's kubelet-config facet, the second voted by node
 # pool. seeded-c's default-pool sets podPidsLimit where the stack's other
 # pools set no kubelet key the facet reads; graded on the ledger's
 # kubelet-config finding and the pool it names. The same full audit and band
 # as consistency-drift-outlier.
 ./tasks/consistency-kubelet-config-pool-outlier/task.yaml
+
+# Completed generated-name Job family grouping (#2900, #3005, #6955, #7098):
+# expected_fail: true until #6955 groups finished Jobs (`reindex-<uuid>` in
+# `seeded-family`, role `generated-name-job-family`) into one family finding
+# with parent-template `ttlSecondsAfterFinished` cleanup. deployer: noop.
+./tasks/cost-finished-job-family-grouped/task.yaml
 
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst

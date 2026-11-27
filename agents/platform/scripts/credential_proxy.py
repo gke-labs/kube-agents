@@ -15,6 +15,7 @@ import hmac
 import http.client
 import io
 import functools
+import ipaddress
 import gc
 import json
 import logging
@@ -417,6 +418,62 @@ PROC_COMM_FILE = "comm"
 ENVOY_PROCESS_NAME = "envoy"
 PROCESS_LABEL_BROKER = "broker"
 PROCESS_LABEL_ENVOY = "envoy"
+# Every request that authenticates with a pod-bound ServiceAccount token must
+# arrive from the pod the TokenReview names. The token names its pod in
+# user.extra (TOKEN_REVIEW_POD_NAME_EXTRA, TOKEN_REVIEW_POD_UID_EXTRA); the
+# API server answers that pod's addresses; and the connection's peer has to
+# be one of them. A token that leaves its pod is then refused from anywhere
+# else, for the hour it would otherwise stay valid.
+#
+# Where the peer address comes from depends on the listener. On a TCP
+# listener it is the socket's own peer and nothing else. On the Unix socket
+# behind Envoy (the broker Pod's shape, deploy/shared/envoy-credential-proxy.yaml)
+# the socket's peer is Envoy, so Envoy stamps the downstream connection's
+# direct remote address into POD_PEER_ADDRESS_HEADER on every listener,
+# overwriting whatever a caller sent under that name, and only that listener
+# reads it. The socket is 0600 in this container's own mount, which keeps out
+# every other uid but not the processes the broker itself starts (git, gcloud,
+# kubectl run as its uid); so the header is believed only on a connection whose
+# kernel-reported peer is the Envoy process whose pid start-services handed
+# over (EnvoyPeerCheck).
+#
+# The API server's TokenReview answer carries no pod address under any key
+# Kubernetes defines, so the addresses are always read from the pod object.
+POD_PEER_ADDRESS_HEADER = "X-Kube-Agents-Peer-Address"
+# How long a pod's addresses are reused before they are read again. Never
+# longer than the authenticator's own cache (ServiceAccountAuthenticator takes
+# the smaller), so a deleted pod's addresses go no later than its TokenReview answer.
+POD_ADDRESS_CACHE_SECONDS = 30.0
+# The most pods whose addresses are held at once. Past it a lookup is still
+# made and enforced; it just is not kept.
+POD_ADDRESS_CACHE_MAX_ENTRIES = 4096
+# How often the missing-permission line is repeated, per namespace.
+POD_ADDRESS_PERMISSION_LOG_SECONDS = 60.0
+# The TokenReview username of a ServiceAccount, whose namespace is the pod's.
+_SERVICE_ACCOUNT_USERNAME = re.compile(r"^system:serviceaccount:([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?):[^:]+\Z")
+# A pod name (a DNS-1123 subdomain) and a namespace (a DNS-1123 label): both
+# are interpolated into the API path, so anything else is refused first.
+_POD_NAME_SHAPE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?\Z")
+# Phases in which a pod's containers have all stopped: its address may already
+# be another pod's, and nothing in it can be calling.
+_POD_STOPPED_PHASES = frozenset({"Succeeded", "Failed"})
+# The pod read, on the API server, of the pod a token names.
+POD_READ_PATH = "/api/v1/namespaces/{namespace}/pods/{name}"
+# How far past its own read timeout a request waits on another request's read
+# of the same pod before giving up.
+POD_ADDRESS_WAIT_MARGIN_SECONDS = 1.0
+# The Envoy binary the image ships (deploy/docker/Dockerfile), the one
+# executable a Unix-socket peer may be.
+ENVOY_BINARY_PATH = "/usr/local/bin/envoy"
+# Envoy's pid, which start-services starts Envoy first to learn and hands to
+# this process alone, over any value the environment carried.
+ENVOY_PID_ENV = "CREDENTIAL_PROXY_ENVOY_PID"
+# Envoy's pid as start-services writes it: ASCII digits, nothing else.
+ENVOY_PID_SHAPE = re.compile(r"^[0-9]{1,10}\Z")
+# The size of the kernel's struct ucred (pid_t, uid_t, gid_t), SO_PEERCRED's answer.
+UCRED_SIZE = 12
+# /proc/<pid>/exe: the link to a process's executable.
+PROC_EXE_FILE = "exe"
 # /proc/<pid>/status fields, in kB: the resident set now and its high-water.
 PROC_STATUS_RSS_KEY = "VmRSS"
 PROC_STATUS_PEAK_KEY = "VmHWM"
@@ -1197,9 +1254,62 @@ HEALTHZ_PAYLOAD = {"status": "ok"}
 # and at one replica a caller fails to connect and falls back to the stateful
 # broker rather than reading `draining` for the whole drain. The requests
 # already in flight are not touched: readiness steers only new connections.
-# The broker keeps answering ok: it rolls with Recreate, so no other pod could
-# take its traffic.
+# On active-standby handoff (/control/drain), /healthz stays 200 across both
+# BROKER_STATE_DRAINING and BROKER_STATE_DRAINED until SIGTERM sets
+# shutting_down: new requests still routed here are refused with retryable 503
+# bound="draining" while Service Endpoints retains at least one endpoint until
+# the replacement pod activates and passes kubelet readiness.
 HEALTHZ_DRAINING_PAYLOAD = {"status": "draining"}
+HEALTHZ_STANDBY_PAYLOAD = {"status": "standby"}
+STANDBY_MODE_ENV = "CREDENTIAL_PROXY_STANDBY"
+STANDBY_TRUE_VALUES = frozenset({"1", "true", "yes"})
+CONTROL_FILE_ENV = "CREDENTIAL_PROXY_CONTROL_FILE"
+PEER_HEALTH_URL_ENV = "CREDENTIAL_PROXY_PEER_HEALTH_URL"
+CONTROL_STATUS_PATH = "/control/status"
+CONTROL_ACTIVATE_PATH = "/control/activate"
+CONTROL_DRAIN_PATH = "/control/drain"
+CONTROL_JSON_CONTENT_TYPE = "application/json"
+CONTROL_BEARER_PREFIX = "Bearer "
+CONTROL_MAX_REQUEST_BYTES = 1024
+CONTROL_ACTIVATE_MAX_REQUEST_BYTES = 4 << 20
+CONTROL_CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,10}")
+TASK_WRITES_KEY = "task_writes"
+TASK_WRITES_BRANCHES_KEY = "branches"
+TASK_WRITES_PROPOSALS_KEY = "proposals"
+TASK_WRITES_REPOSITORY_KEY = "repository"
+TASK_WRITES_BRANCH_KEY = "branch"
+TASK_WRITES_NUMBER_KEY = "number"
+TASK_WRITES_TASK_KEY = "task"
+TASK_WRITES_EXPIRES_AT_KEY = "expires_at"
+VCS_BUNDLE_BODY_MULTIPLIER = 2
+VCS_ROUTE_PREFIX = "/v1/vcs/"
+SLACK_CHAT_ROUTE_PREFIX = "/v1/chat/slack/"
+STANDBY_DEFERRED_ROUTES = frozenset({
+    ("GET", HEALTHZ_PATH),
+    ("GET", "/v1/chat/events"),
+    ("GET", "/v1/chat/a2a/events"),
+})
+BROKER_STATE_STANDBY = "standby"
+BROKER_STATE_ACTIVE = "active"
+BROKER_STATE_DRAINING = "draining"
+BROKER_STATE_DRAINED = "drained"
+HANDOFF_DRAIN_SECONDS = float(SHUTDOWN_DRAIN_SECONDS)
+# Backoff hints returned with pre-admission 503 bound="draining" refusals.
+# Once DRAINED, operator requeue (2s) + kubelet readinessPeriodSeconds (10s)
+# take up to ~12s; while DRAINING, settle (3s) + drain (30s) + end_wait (5s) +
+# cutover (~12s) can take up to ~50s, so 18s keeps four jittered [9s, 18s]
+# retries spanning [36s, 72s] and 5s avoids immediate post-drain storms.
+HANDOFF_DRAINING_RETRY_AFTER_SECONDS = 18
+HANDOFF_DRAINED_RETRY_AFTER_SECONDS = 5
+HANDOFF_SETTLE_POLL_SECONDS = 0.05
+HANDOFF_THREAD_NAME = "broker-handoff-drain"
+STANDBY_PEER_PROBE_INTERVAL_SECONDS = 3.0
+STANDBY_PEER_PROBE_TIMEOUT_SECONDS = 2.0
+# Match credentialProxyTerminationGraceSeconds (45s), exceeding both a 30s+5s
+# terminating pod drain and a 3x10s readiness probe flap, so a standby pod
+# never self-activates while a draining or transiently unready peer still runs.
+STANDBY_SELF_ACTIVATE_GRACE_SECONDS = 45.0
+STANDBY_WATCHDOG_THREAD_NAME = "broker-standby-watchdog"
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -1351,6 +1461,15 @@ VCS_READINGS_OUTCOME_LABEL = "outcome"
 VCS_READINGS_LE_LABEL = "le"
 VCS_READINGS_READING_LABEL = "reading"
 VCS_READINGS_REASON_LABEL = "reason"
+# The forge health gauge's two values. Its families name a forge by provider
+# alone (VCS_PROVIDER_LABEL): a host is not a closed vocabulary.
+VCS_FORGE_CONNECTED = 1
+VCS_FORGE_NOT_CONNECTED = 0
+# What a failed sweep token mint is reported as: no credential could be had
+# for the repository. The forge was never asked, so no forge code applies.
+SWEEP_CREDENTIAL_UNAVAILABLE_CODE = "FORGE_CREDENTIAL_UNAVAILABLE"
+SWEEP_CREDENTIAL_UNAVAILABLE_STATUS = int(HTTPStatus.BAD_GATEWAY)
+SWEEP_CREDENTIAL_UNAVAILABLE_TEXT = "no sweep credential could be minted for {repository}: {cause}"
 # The `le` value of the last edge of the per-proposal gauge, its count.
 VCS_READINGS_LE_INF = "+Inf"
 # The failure counter's closed `reason` vocabulary; any other word is `other`.
@@ -5722,6 +5841,10 @@ class InFlight:
             if self._count <= 0:
                 self._idle.notify_all()
 
+    def count(self) -> int:
+        with self._idle:
+            return self._count
+
     def wait_idle(self, deadline: float) -> int:
         """Wait until nothing is in flight or `deadline` passes; the count left."""
         with self._idle:
@@ -5948,15 +6071,17 @@ class ProfileTaskWrites:
         same new name the first wins and the second is refused;
       * a proposal is recorded for the task whose `proposal-create` opened it.
 
-    Process-local, which is only right because one broker pod serves
-    `/v1/vcs/`: the stateful broker renders one replica with the Recreate
-    strategy, so no second pod ever holds a different record (an operator test
-    pins both). If that route ever scales out, this record moves to shared
-    state first. Lost on a restart, which refuses rather than permits: a
-    branch on the remote with no claim, or a proposal with no record, is not
-    this task's. Entries expire with the task's credential plus
-    PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the credential's own
-    expiry is stated in.
+    Process-local, which stays single-writer across both rollout modes:
+    off-cluster uses Recreate, and in-cluster active-standby RollingUpdate
+    (maxSurge=1, maxUnavailable=0) keeps the standby pod out of /v1/*
+    (503 standby) until the outgoing broker reaches BROKER_STATE_DRAINED
+    (in_flight == 0) and exports its live confirmed writes over /control/drain
+    (and /control/status while drained) for /control/activate to import before
+    the replacement pod starts serving. Unplanned pod restarts still lose the
+    record and fail closed: a branch on the remote with no claim, or a
+    proposal with no record, is not this task's. Entries expire with the task's
+    credential plus PROFILE_TASK_RECORD_MARGIN_SECONDS, on the wall clock the
+    credential's own expiry is stated in.
     """
 
     def __init__(
@@ -6051,6 +6176,118 @@ class ProfileTaskWrites:
             owned = self._proposals.get((repository, number))
             return owned is not None and owned.task == task
 
+    def export_state(self) -> dict[str, list[dict[str, Any]]]:
+        """Return a JSON-serializable snapshot of live confirmed writes for handoff."""
+        with self._lock:
+            self._prune_locked()
+            return {
+                TASK_WRITES_BRANCHES_KEY: [
+                    {
+                        TASK_WRITES_REPOSITORY_KEY: repository,
+                        TASK_WRITES_BRANCH_KEY: branch,
+                        TASK_WRITES_TASK_KEY: owned.task,
+                        TASK_WRITES_EXPIRES_AT_KEY: owned.expires_at,
+                    }
+                    for (repository, branch), owned in sorted(self._branches.items())
+                    if owned.confirmed
+                ],
+                TASK_WRITES_PROPOSALS_KEY: [
+                    {
+                        TASK_WRITES_REPOSITORY_KEY: repository,
+                        TASK_WRITES_NUMBER_KEY: number,
+                        TASK_WRITES_TASK_KEY: owned.task,
+                        TASK_WRITES_EXPIRES_AT_KEY: owned.expires_at,
+                    }
+                    for (repository, number), owned in sorted(self._proposals.items())
+                ],
+            }
+
+    def import_state(self, data: Any) -> None:
+        """Atomically load live confirmed writes received from a drained predecessor."""
+        if data is None:
+            return
+        if not isinstance(data, dict):
+            raise ValueError("task_writes must be a JSON object")
+        raw_branches = data.get(TASK_WRITES_BRANCHES_KEY)
+        if raw_branches is None:
+            raw_branches = []
+        raw_proposals = data.get(TASK_WRITES_PROPOSALS_KEY)
+        if raw_proposals is None:
+            raw_proposals = []
+        if not isinstance(raw_branches, list) or not isinstance(raw_proposals, list):
+            raise ValueError("task_writes branches and proposals must be lists")
+
+        # Validate every entry before taking the lock so partial/malformed payloads never mutate state.
+        staged_branches: list[tuple[tuple[str, str], str, float]] = []
+        for item in raw_branches:
+            if not isinstance(item, dict):
+                raise ValueError("branch entry must be an object")
+            repo = item.get(TASK_WRITES_REPOSITORY_KEY)
+            branch = item.get(TASK_WRITES_BRANCH_KEY)
+            task = item.get(TASK_WRITES_TASK_KEY)
+            expires_at = item.get(TASK_WRITES_EXPIRES_AT_KEY)
+            if (
+                not isinstance(repo, str)
+                or not repo
+                or not isinstance(branch, str)
+                or not branch
+                or not isinstance(task, str)
+                or not task
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+                or not math.isfinite(expires_at)
+            ):
+                raise ValueError("invalid branch entry in task_writes")
+            staged_branches.append(((repo, branch), task, float(expires_at)))
+
+        staged_proposals: list[tuple[tuple[str, int], str, float]] = []
+        for item in raw_proposals:
+            if not isinstance(item, dict):
+                raise ValueError("proposal entry must be an object")
+            repo = item.get(TASK_WRITES_REPOSITORY_KEY)
+            number = item.get(TASK_WRITES_NUMBER_KEY)
+            task = item.get(TASK_WRITES_TASK_KEY)
+            expires_at = item.get(TASK_WRITES_EXPIRES_AT_KEY)
+            if (
+                not isinstance(repo, str)
+                or not repo
+                or isinstance(number, bool)
+                or not isinstance(number, int)
+                or not isinstance(task, str)
+                or not task
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+                or not math.isfinite(expires_at)
+            ):
+                raise ValueError("invalid proposal entry in task_writes")
+            staged_proposals.append(((repo, number), task, float(expires_at)))
+
+        with self._lock:
+            self._prune_locked()
+            now = self._clock()
+            for key, task, expires_at in staged_branches:
+                if expires_at <= now:
+                    continue
+                existing = self._branches.get(key)
+                if existing is not None:
+                    if existing.confirmed and existing.task == task:
+                        existing.expires_at = max(existing.expires_at, expires_at)
+                    continue
+                if self._full_locked():
+                    continue
+                self._branches[key] = _TaskOwned(task, expires_at, confirmed=True)
+            for key_p, task, expires_at in staged_proposals:
+                if expires_at <= now:
+                    continue
+                existing = self._proposals.get(key_p)
+                if existing is not None:
+                    if existing.task == task:
+                        existing.expires_at = max(existing.expires_at, expires_at)
+                    continue
+                if self._full_locked():
+                    continue
+                self._proposals[key_p] = _TaskOwned(task, expires_at)
+
 
 class ServiceAccountAuthenticator:
     """Verify a projected ServiceAccount token with a Kubernetes TokenReview.
@@ -6097,6 +6334,9 @@ class ServiceAccountAuthenticator:
     non-empty the a2a-chat audience is refused to anyone not named. Empty
     leaves the audience alone deciding, as an older operator's rendering, which
     names no a2a-chat callers, still needs.
+    ``pod_binding`` holds each request to the pod its token was issued to
+    (PodAddressBinding). It is not applied here, where only headers are
+    seen, but by the handler, which knows the connection's peer.
     ``profile_identities`` binds the profile role the way ``mcp_callers``
     binds the mcp one, empty meaning nobody: its keys are the profile workers'
     ServiceAccounts, each held to the profile audience and the only callers
@@ -6125,6 +6365,7 @@ class ServiceAccountAuthenticator:
         a2a_reports_callers: frozenset[str] = frozenset(),
         a2a_chat_callers: frozenset[str] = frozenset(),
         teams_inbound_callers: frozenset[str] = frozenset(),
+        pod_binding: PodAddressBinding | None = None,
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -6151,6 +6392,13 @@ class ServiceAccountAuthenticator:
         self.cache_seconds = cache_seconds
         self._cache: dict[str, _CacheEntry] = {}
         self._cache_lock = threading.Lock()
+        # The handler holds every request to the pod its token names through
+        # this (PodAddressBinding.check). build_authenticator always sets it;
+        # its addresses are never kept longer than a TokenReview answer is.
+        self.pod_binding = pod_binding
+        if pod_binding is not None:
+            pod_binding.cache_seconds = min(pod_binding.cache_seconds, self.cache_seconds)
+            pod_binding.timeout_seconds = min(pod_binding.timeout_seconds, self.timeout_seconds)
 
     def authenticate(self, headers: Any) -> Principal:
         header = headers.get("Authorization", "") or ""
@@ -6344,6 +6592,305 @@ class ServiceAccountAuthenticator:
             pod=pod if isinstance(pod, str) else "",
             pod_uid=pod_uid if isinstance(pod_uid, str) else "",
         )
+
+
+def _normalised_address(value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``value`` as an address, an IPv4-mapped IPv6 address as its IPv4 one; None if it is not one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+@dataclass(frozen=True)
+class _PodAddressEntry:
+    expires_at: float
+    addresses: frozenset
+
+
+class _PodAddressFlight:
+    """One pod read in progress, which concurrent requests for the same pod wait on."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.addresses: frozenset | None = None
+        self.refusal: str | None = None
+
+
+class PodAddressBinding:
+    """Hold a pod-bound token to the pod it was issued to, by the connection's peer address.
+
+    ``check`` runs on every authenticated request, cached TokenReview or not, since
+    the peer is per connection. It refuses, with AuthenticationError, a
+    principal with no pod or pod UID, a pod the API server does not return
+    (gone, unreadable, or this broker not permitted to read it), a pod whose
+    UID is not the token's, a stopped pod, a pod with no address, an unknown
+    peer, and a peer that is not one of the pod's addresses.
+
+    Only a pod read that passed every check is cached, keyed by namespace,
+    name and UID, for ``cache_seconds``; a refusal is never cached, so the
+    next request reads the pod again. Requests for the same pod that arrive
+    while it is being read wait for that one read (refused alike if it is
+    refused) rather than each making their own.
+    """
+
+    def __init__(
+        self,
+        api_host: str,
+        api_port: str,
+        ca_file: str,
+        token_file: str,
+        timeout_seconds: float = 10.0,
+        cache_seconds: float = POD_ADDRESS_CACHE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        max_entries: int = POD_ADDRESS_CACHE_MAX_ENTRIES,
+    ) -> None:
+        if not api_host:
+            raise ValueError("the Kubernetes API server address is not configured")
+        self.api_host = api_host
+        self.api_port = api_port
+        self.ca_file = ca_file
+        self.token_file = token_file
+        self.timeout_seconds = timeout_seconds
+        self.cache_seconds = max(0.0, cache_seconds)
+        self._clock = clock
+        self._max_entries = max_entries
+        self._cache: dict[tuple[str, str, str], _PodAddressEntry] = {}
+        self._inflight: dict[tuple[str, str, str], _PodAddressFlight] = {}
+        self._lock = threading.Lock()
+        self._permission_logged: dict[str, float] = {}
+
+    def check(self, principal: Principal, peer: str | None) -> None:
+        """Return if ``peer`` is one of the addresses of ``principal``'s pod; raise AuthenticationError otherwise."""
+        if not principal.pod or not principal.pod_uid:
+            raise AuthenticationError("the token names no pod to hold the request to")
+        match = _SERVICE_ACCOUNT_USERNAME.match(principal.workload or "")
+        if match is None:
+            raise AuthenticationError("the token's caller is not a ServiceAccount, so it names no pod namespace")
+        namespace = match.group(1)
+        if not _POD_NAME_SHAPE.match(principal.pod):
+            raise AuthenticationError("the token's pod name is not a pod name")
+        peer_address = _normalised_address(peer)
+        if peer_address is None:
+            raise AuthenticationError("the request's peer address is unknown")
+        addresses = self.addresses(namespace, principal.pod, principal.pod_uid)
+        if peer_address not in addresses:
+            raise AuthenticationError(
+                f"the request did not come from the token's pod {namespace}/{principal.pod} "
+                f"(peer {peer_address})"
+            )
+
+    def addresses(self, namespace: str, name: str, uid: str) -> frozenset:
+        """The pod's addresses, cached or read; raises AuthenticationError on any failure."""
+        key = (namespace, name, uid)
+        now = self._clock()
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                if entry.expires_at > now:
+                    return entry.addresses
+                del self._cache[key]
+            flight = self._inflight.get(key)
+            leader = flight is None
+            if leader:
+                flight = _PodAddressFlight()
+                self._inflight[key] = flight
+        if not leader:
+            # The leader's read is bounded by timeout_seconds; a little past
+            # that, give up rather than wait on a thread that never finished.
+            if not flight.done.wait(self.timeout_seconds + POD_ADDRESS_WAIT_MARGIN_SECONDS):
+                raise AuthenticationError("the token's pod could not be read in time")
+            if flight.addresses is None:
+                raise AuthenticationError(flight.refusal or "the token's pod could not be read")
+            return flight.addresses
+        try:
+            addresses = self._addresses_from(self._read_pod(namespace, name), namespace, name, uid)
+        except AuthenticationError as exc:
+            flight.refusal = str(exc)
+            raise
+        except Exception as exc:
+            flight.refusal = f"the token's pod could not be read: {type(exc).__name__}"
+            raise AuthenticationError(flight.refusal) from exc
+        else:
+            flight.addresses = addresses
+            if self.cache_seconds > 0:
+                now = self._clock()
+                with self._lock:
+                    self._cache = {k: e for k, e in self._cache.items() if e.expires_at > now}
+                    if len(self._cache) < self._max_entries:
+                        self._cache[key] = _PodAddressEntry(now + self.cache_seconds, addresses)
+            return addresses
+        finally:
+            with self._lock:
+                if self._inflight.get(key) is flight:
+                    del self._inflight[key]
+            flight.done.set()
+
+    def _own_token(self) -> str:
+        try:
+            return Path(self.token_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise AuthenticationError(
+                f"this pod's own API server token is unreadable: {type(exc).__name__}"
+            ) from exc
+
+    def _read_pod(self, namespace: str, name: str) -> Any:
+        path = POD_READ_PATH.format(
+            namespace=urllib.parse.quote(namespace, safe=""), name=urllib.parse.quote(name, safe="")
+        )
+        request = urllib.request.Request(
+            f"https://{self.api_host}:{self.api_port}{path}",
+            headers={"Accept": "application/json", "Authorization": f"Bearer {self._own_token()}"},
+            method="GET",
+        )
+        try:
+            context = ssl.create_default_context(cafile=self.ca_file or None)
+            # ProxyHandler({}): an in-cluster call carrying this broker's own
+            # bearer token never goes to a proxy named in the environment.
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == HTTPStatus.NOT_FOUND:
+                raise AuthenticationError(f"the token's pod {namespace}/{name} does not exist") from exc
+            if exc.code in (HTTPStatus.FORBIDDEN, HTTPStatus.UNAUTHORIZED):
+                self._log_missing_permission(namespace, exc.code)
+                raise AuthenticationError(
+                    f"this broker may not read pods in namespace {namespace} (HTTP {exc.code})"
+                ) from exc
+            raise AuthenticationError(f"the token's pod could not be read: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, RecursionError) as exc:
+            raise AuthenticationError(f"the token's pod could not be read: {type(exc).__name__}") from exc
+
+    def _log_missing_permission(self, namespace: str, code: int) -> None:
+        """Say once a minute per namespace that the broker lacks `get` on pods there."""
+        now = self._clock()
+        with self._lock:
+            last = self._permission_logged.get(namespace)
+            if last is not None and now - last < POD_ADDRESS_PERMISSION_LOG_SECONDS:
+                return
+            self._permission_logged[namespace] = now
+        LOGGER.error(
+            "ALERT the broker's ServiceAccount is refused get on pods in namespace %s (HTTP %d); "
+            "every request presenting a pod token from that namespace is refused until it may "
+            "read pods there again (the operator renders <agent>-credential-proxy-pod-read for this)",
+            _sanitize_for_logging(namespace),
+            code,
+        )
+
+    @staticmethod
+    def _addresses_from(pod: Any, namespace: str, name: str, uid: str) -> frozenset:
+        if not isinstance(pod, dict):
+            raise AuthenticationError("the token's pod was read as something other than an object")
+        metadata = pod.get("metadata")
+        status = pod.get("status")
+        if not isinstance(metadata, dict) or not isinstance(status, dict):
+            raise AuthenticationError("the token's pod has no metadata or status")
+        if metadata.get("name") != name or metadata.get("namespace", namespace) != namespace:
+            raise AuthenticationError("the pod read is not the token's pod")
+        if not isinstance(metadata.get("uid"), str) or metadata.get("uid") != uid:
+            raise AuthenticationError(f"the pod {namespace}/{name} is not the one the token was issued to (UID differs)")
+        if status.get("phase") in _POD_STOPPED_PHASES:
+            raise AuthenticationError(f"the token's pod {namespace}/{name} has stopped")
+        addresses = set()
+        pod_ips = status.get("podIPs")
+        if isinstance(pod_ips, list):
+            for item in pod_ips:
+                address = _normalised_address(item.get("ip") if isinstance(item, dict) else None)
+                if address is not None:
+                    addresses.add(address)
+        if not addresses:
+            address = _normalised_address(status.get("podIP"))
+            if address is not None:
+                addresses.add(address)
+        if not addresses:
+            raise AuthenticationError(f"the token's pod {namespace}/{name} has no address")
+        return frozenset(addresses)
+
+
+def _socket_peer_credentials(connection: Any) -> tuple[int, int, int] | None:
+    """(pid, uid, gid) of a Unix socket's peer, as the kernel recorded it at connect; None where unknown."""
+    option = getattr(socket, "SO_PEERCRED", None)
+    if option is None or connection is None:
+        return None
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, option, UCRED_SIZE)
+    except (OSError, AttributeError, TypeError):
+        return None
+    if len(raw) != UCRED_SIZE:
+        return None
+    # struct ucred: pid_t (signed), uid_t and gid_t (unsigned 32-bit). A signed
+    # read of a uid past 2**31 would never equal os.getuid().
+    pid = int.from_bytes(raw[0:4], sys.byteorder, signed=True)
+    uid = int.from_bytes(raw[4:8], sys.byteorder, signed=False)
+    gid = int.from_bytes(raw[8:12], sys.byteorder, signed=False)
+    return pid, uid, gid
+
+
+class EnvoyPeerCheck:
+    """Is a Unix-socket connection from the Envoy that start-services launched for this broker?
+
+    The broker and Envoy share a container and a uid, and so do the commands
+    the broker runs, so neither the socket's mode nor the peer's uid tells
+    Envoy apart from a brokered command that opens the socket itself. The
+    peer's pid does. start-services starts Envoy before this process and
+    hands it Envoy's pid (ENVOY_PID_ENV), and the container ends when Envoy
+    does, so that pid is Envoy's for this process's whole life. A connection
+    is admitted only when the kernel-reported peer (SO_PEERCRED) has exactly
+    that pid, this process's uid, and ENVOY_BINARY_PATH as its executable;
+    another process running the Envoy binary has another pid and is refused.
+    With no usable pid every connection is refused, as it is where the kernel
+    reports no peer credentials.
+    """
+
+    def __init__(self, pid: int | None, binary: str = ENVOY_BINARY_PATH, proc_root: str = PROC_ROOT) -> None:
+        self.pid = pid if isinstance(pid, int) and pid > 0 else None
+        self.binary = binary
+        self.proc_root = Path(proc_root)
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "EnvoyPeerCheck":
+        """The check for the pid start-services handed over; one that refuses everything, said loudly, without it."""
+        raw = (os.environ if environ is None else environ).get(ENVOY_PID_ENV, "") or ""
+        raw = raw.strip() if isinstance(raw, str) else ""
+        pid = None
+        # ASCII digits only: str.isdigit admits characters int() refuses.
+        if ENVOY_PID_SHAPE.match(raw):
+            try:
+                pid = int(raw) or None
+            except ValueError:
+                pid = None
+        if pid is None:
+            LOGGER.error(
+                "ALERT %s is %s, so no Unix-socket connection can be matched to Envoy; every "
+                "request presenting a pod token on the socket is refused until the broker is "
+                "started by start-services with Envoy's pid",
+                ENVOY_PID_ENV, "unset" if not raw else repr(raw[:32]),
+            )
+        return cls(pid)
+
+    def admits(self, connection: Any) -> bool:
+        if self.pid is None:
+            return False
+        credentials = _socket_peer_credentials(connection)
+        if credentials is None:
+            return False
+        pid, uid, _ = credentials
+        if pid != self.pid or uid != os.getuid():
+            return False
+        try:
+            executable = os.readlink(self.proc_root / str(pid) / PROC_EXE_FILE)
+        except OSError:
+            return False
+        return os.path.realpath(executable) == os.path.realpath(self.binary)
 
 
 # The profile role's configuration (#3889). All four are reserved against
@@ -6787,7 +7334,23 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "exists once the chat audience split does, so the profile audience is ignored",
                 PROFILE_AUDIENCE_ENV,
             )
+    api_host = os.getenv("KUBERNETES_SERVICE_HOST", "").strip()
+    api_port = os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443"
+    ca_file = os.getenv(
+        "CREDENTIAL_PROXY_KUBE_CA_FILE",
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+    ).strip()
+    token_file = os.getenv(
+        "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
+        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+    ).strip()
+    # Every role's token is pod-bound, so every request is held to its pod,
+    # read with the same client and credential the TokenReview uses.
+    pod_binding = PodAddressBinding(
+        api_host=api_host, api_port=api_port, ca_file=ca_file, token_file=token_file
+    ) if api_host else None
     return ServiceAccountAuthenticator(
+        pod_binding=pod_binding,
         audience_roles=audience_roles,
         allowed_callers=allowed,
         session_callers=session_callers,
@@ -6798,16 +7361,10 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         a2a_chat_callers=a2a_chat_callers,
         teams_inbound_callers=teams_inbound_callers,
         profile_identities=profile_identities,
-        api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
-        api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
-        ca_file=os.getenv(
-            "CREDENTIAL_PROXY_KUBE_CA_FILE",
-            "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-        ).strip(),
-        token_file=os.getenv(
-            "CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
-            "/var/run/secrets/kubernetes.io/serviceaccount/token",
-        ).strip(),
+        api_host=api_host,
+        api_port=api_port,
+        ca_file=ca_file,
+        token_file=token_file,
     )
 
 
@@ -7776,6 +8333,10 @@ class GoogleChatRelay:
             return False
         return True
 
+    def has_unsettled(self) -> bool:
+        with self._lock:
+            return bool(self._receipts)
+
     def release_unsettled(self) -> int:
         """Hand every unsettled receipt back to Pub/Sub; the count handed back.
 
@@ -8471,6 +9032,11 @@ class TeamsRelay:
                 self._attempts.pop(event_key, None)
             del self._receipts[receipt]
             return True
+
+    def undelivered(self) -> int:
+        """Events queued or pulled and not yet settled: what is lost if the process exits now."""
+        with self._lock:
+            return self._events.qsize() + len(self._receipts)
 
     def api_call(
         self,
@@ -14190,13 +14756,26 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
     if forge.name == GITHUB_PROVIDER:
         api_url = forge.api_url or GITHUB_COM_API_URL
         whoami_graphql = forge.whoami_graphql or GITHUB_COM_GRAPHQL_URL
+
+        def sweep_headers() -> dict[str, str]:
+            try:
+                token = executor.mint_sweep_credential(forge.name, repo)
+            except PermissionError:
+                raise  # not a managed repository: the caller's own refusal
+            except (RuntimeError, OSError) as exc:
+                # The mint failed or timed out before the forge was asked. Said
+                # as a refusal with a code, so the sweep reads "no credential"
+                # and not a fault of the forge's.
+                raise providers.WorkspaceError(
+                    SWEEP_CREDENTIAL_UNAVAILABLE_TEXT.format(repository=repo, cause=type(exc).__name__),
+                    status=SWEEP_CREDENTIAL_UNAVAILABLE_STATUS,
+                    code=SWEEP_CREDENTIAL_UNAVAILABLE_CODE,
+                ) from exc
+            return {SWEEP_AUTHORIZATION_HEADER: SWEEP_AUTHORIZATION_FORMAT.format(token=token)}
+
         transport = providers.HttpTransport(
             api_url,
-            lambda: {
-                SWEEP_AUTHORIZATION_HEADER: SWEEP_AUTHORIZATION_FORMAT.format(
-                    token=executor.mint_sweep_credential(forge.name, repo)
-                )
-            },
+            sweep_headers,
             forge.error_overrides,
             timeout=executor.timeout_seconds,
             max_bytes=executor.max_output_bytes,
@@ -14278,13 +14857,15 @@ def start_readings_sweep(executor: CommandExecutor, broker) -> None:
     if not readings_sweep_enabled():
         LOGGER.info("proposal readings sweep off (%s)", VCS_READINGS_ENV)
         return
-    vcs_readings.ReadingsSweep(
+    sweep = vcs_readings.ReadingsSweep(
         registry=broker.registry,
         transport_for=lambda forge, repo: sweep_transport_for(executor, forge, repo),
         metrics=CredentialProxyHandler.metrics,
         managed_repositories=managed_repositories,
         app_credential=sweep_app_credential,
-    ).start()
+    )
+    CredentialProxyHandler.readings_sweep = sweep
+    sweep.start()
     LOGGER.info("proposal readings sweep started")
 
 
@@ -14839,7 +15420,8 @@ class ProxyMetrics:
     admission wait histogram and refusals counter by bound, the slot and
     child-memory gauges beside their caps when an executor is wired, and the
     proposal readings the readings sweep sets (`set_readings`) with its
-    failure counter.
+    failure counter, and the forge health the same sweep sets
+    (`set_forge_health`).
 
     Hand-rolled: prometheus_client is not in the image, and what is needed is
     small enough that adding a dependency to the one container holding every
@@ -14861,6 +15443,9 @@ class ProxyMetrics:
         self._outcomes: vcs_readings.OutcomesReading | None = None
         self._details: vcs_readings.DetailsReading | None = None
         self._reading_failures: dict[str, int] = {}
+        # None until the sweep first reports; an empty tuple once it has and
+        # no managed repository names a forge.
+        self._forge_health: tuple[vcs_readings.ForgeHealth, ...] | None = None
         self._failures: dict[tuple[str, str], int] = {}
         # Per (tool, class): cumulative bucket counts (one per
         # TOOL_DURATION_BUCKETS bound, the +Inf bucket being the count), the
@@ -14992,6 +15577,73 @@ class ProxyMetrics:
             if details is not None:
                 self._details = details
 
+    def set_forge_health(self, health: Sequence[vcs_readings.ForgeHealth]) -> None:
+        """Each provider's managed repositories by connection state, from the sweep that just ran; it replaces the last.
+
+        A provider this image does not ship is counted as LABEL_OTHER, here
+        rather than at render, so two such providers are one series and not
+        two samples under one label.
+        """
+        merged: dict[str, tuple[collections.Counter, float]] = {}
+        for forge in health:
+            provider = forge.provider if forge.provider in VCS_PROVIDERS else LABEL_OTHER
+            counts, checked_at = merged.get(provider, (collections.Counter(), forge.checked_at))
+            counts.update(dict(forge.repositories))
+            merged[provider] = (counts, max(checked_at, forge.checked_at))
+        report = tuple(
+            vcs_readings.ForgeHealth(
+                provider,
+                tuple((state, counts[state]) for state in vcs_readings.CONNECTION_STATES if counts[state]),
+                checked_at,
+            )
+            for provider, (counts, checked_at) in sorted(merged.items())
+        )
+        with self._lock:
+            self._forge_health = report
+
+    @staticmethod
+    def _render_forge_health(lines: list[str], health: tuple[vcs_readings.ForgeHealth, ...] | None, now: float) -> None:
+        """The forges the managed repositories live on, by provider. Absent
+        before the first sweep and on an install with no managed repository. A
+        provider's connected and repository series are omitted once its last
+        attempt is older than VCS_READINGS_STALE_SECONDS; its age gauge stays,
+        so a sweep that stopped shows as stale rather than as a forge still
+        connected."""
+        if not health:
+            return
+
+        def labels(forge: vcs_readings.ForgeHealth) -> str:
+            return f'{VCS_PROVIDER_LABEL}="{_escape_label_value(forge.provider)}"'
+
+        fresh = [forge for forge in health if now - forge.checked_at <= vcs_readings.VCS_READINGS_STALE_SECONDS]
+        if fresh:
+            lines += [
+                f"# HELP {vcs_readings.VCS_FORGE_CONNECTED_METRIC} Whether every managed repository on the provider's forges answered the last readings sweep (1) or one did not (0).",
+                f"# TYPE {vcs_readings.VCS_FORGE_CONNECTED_METRIC} gauge",
+            ]
+            for forge in fresh:
+                value = VCS_FORGE_CONNECTED if forge.connected else VCS_FORGE_NOT_CONNECTED
+                lines.append(f"{vcs_readings.VCS_FORGE_CONNECTED_METRIC}{{{labels(forge)}}} {value}")
+            lines += [
+                f"# HELP {vcs_readings.VCS_FORGE_REPOSITORIES_METRIC} Managed repositories on the provider's forges by how the last readings sweep left each one's connection.",
+                f"# TYPE {vcs_readings.VCS_FORGE_REPOSITORIES_METRIC} gauge",
+            ]
+            for forge in fresh:
+                counts = dict(forge.repositories)
+                for state in sorted(vcs_readings.CONNECTION_STATES):
+                    lines.append(
+                        f'{vcs_readings.VCS_FORGE_REPOSITORIES_METRIC}{{{labels(forge)},{VCS_READINGS_STATE_LABEL}="{state}"}} '
+                        f"{counts.get(state, 0)}"
+                    )
+        lines += [
+            f"# HELP {vcs_readings.VCS_FORGE_CHECKED_AGE_METRIC} Seconds since the readings sweep last attempted a managed repository of the provider; present from the first sweep on, however old.",
+            f"# TYPE {vcs_readings.VCS_FORGE_CHECKED_AGE_METRIC} gauge",
+        ]
+        for forge in health:
+            lines.append(
+                f"{vcs_readings.VCS_FORGE_CHECKED_AGE_METRIC}{{{labels(forge)}}} {max(now - forge.checked_at, 0.0):.3f}"
+            )
+
     def record_reading_failure(self, reason: str) -> None:
         reason = reason if reason in VCS_READINGS_FAILURE_REASONS else LABEL_OTHER
         with self._lock:
@@ -15101,6 +15753,7 @@ class ProxyMetrics:
             outcomes = self._outcomes
             details = self._details
             reading_failures = sorted(self._reading_failures.items())
+            forge_health = self._forge_health
             failures = sorted(self._failures.items())
             durations = {
                 key: (list(self._duration_buckets[key]), self._duration_sum[key], self._duration_count[key])
@@ -15230,7 +15883,9 @@ class ProxyMetrics:
                 f'{DECISION_MEMORY_CHECKS_METRIC}{{{DECISION_MEMORY_VERDICT_LABEL}="{_escape_label_value(verdict)}"}} {count}'
             )
         # Wall clock, as the readings' `taken_at` is.
-        self._render_readings(lines, outcomes, details, reading_failures, time.time())
+        now = time.time()
+        self._render_readings(lines, outcomes, details, reading_failures, now)
+        self._render_forge_health(lines, forge_health, now)
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind (a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error) and, for a command past its deadline, the tool it ran; every other kind carries tool={BROKER_FAILURE_TOOL_NONE}.",
             f"# TYPE {BROKER_FAILURES_METRIC} counter",
@@ -15248,10 +15903,372 @@ class ProxyMetrics:
         return "\n".join(lines) + "\n"
 
 
-class MetricsHandler(BaseHTTPRequestHandler):
-    """The metrics-only listener: GET /metrics, and nothing else.
+def standby_mode_enabled() -> bool:
+    """Whether the broker starts in standby until the operator activates it."""
+    return os.getenv(STANDBY_MODE_ENV, "").strip().lower() in STANDBY_TRUE_VALUES
 
-    Unauthenticated, like /healthz on the credentialed listener, because its
+
+def control_file_from_env() -> Path | None:
+    """Path to the operator-provisioned control bearer file, or None when unset."""
+    raw = os.getenv(CONTROL_FILE_ENV, "").strip()
+    return Path(raw) if raw else None
+
+
+def peer_health_url_from_env() -> str:
+    """Service /healthz URL polled in standby for self-recovery, or '' when unset."""
+    return os.getenv(PEER_HEALTH_URL_ENV, "").strip()
+
+
+STANDBY_PEER_ALLOWED_SCHEMES = frozenset({"http", "https"})
+HTTP_DEFAULT_PORT = 80
+HTTPS_DEFAULT_PORT = 443
+PEER_PROBE_METHOD = "GET"
+PEER_PROBE_HEADERS = {"Connection": "close"}
+
+
+def _probe_peer_healthz(
+    url: str, timeout: float = STANDBY_PEER_PROBE_TIMEOUT_SECONDS
+) -> bool | None:
+    """Probe the broker Service /healthz.
+
+    Returns:
+      True: active peer responded 200 (stay in standby).
+      False: peer answered non-200 or TCP ConnectionRefused (0 ready backends
+        after DNS resolution succeeded), indicating no active peer.
+      None: DNS, timeout, network, URL, or HTTP parse failure; peer state is
+        unknown so standby fails closed and does not self-activate.
+    """
+    if not url:
+        return None
+    conn: http.client.HTTPConnection | None = None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in STANDBY_PEER_ALLOWED_SCHEMES or not parts.hostname:
+            return None
+        target = parts.path or HEALTHZ_PATH
+        if parts.query:
+            target = f"{target}?{parts.query}"
+        port = parts.port or (HTTPS_DEFAULT_PORT if parts.scheme == "https" else HTTP_DEFAULT_PORT)
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(parts.hostname, port, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(parts.hostname, port, timeout=timeout)
+        conn.request(PEER_PROBE_METHOD, target, headers=PEER_PROBE_HEADERS)
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status == HTTPStatus.OK
+    except ConnectionRefusedError:
+        return False
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        LOGGER.warning(
+            "standby peer health probe inconclusive (%s): %s",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    finally:
+        if conn is not None:
+            with contextlib.suppress(OSError):
+                conn.close()
+
+
+class BrokerLifecycle:
+    """State machine for warm standby startup, operator activation, and handoff drain."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        control_file: Path | None = None,
+        relays: Sequence[GoogleChatRelay] = (),
+        in_memory_relays: Sequence[Any] | None = None,
+        executor: CommandExecutor | None = None,
+        drain_seconds: float = HANDOFF_DRAIN_SECONDS,
+        settle_seconds: float = SHUTDOWN_SETTLE_SECONDS,
+        end_wait_seconds: float = SHUTDOWN_END_WAIT_SECONDS,
+        peer_health_url: str = "",
+        peer_active_probe: Callable[[], bool | None] | None = None,
+        peer_probe_interval_seconds: float = STANDBY_PEER_PROBE_INTERVAL_SECONDS,
+        self_activate_grace_seconds: float = STANDBY_SELF_ACTIVATE_GRACE_SECONDS,
+        external_stop: threading.Event | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.enabled = enabled
+        self.control_file = control_file
+        self._relays = tuple(relays)
+        self._in_memory_relays_override = (
+            tuple(in_memory_relays) if in_memory_relays is not None else None
+        )
+        self._executor = executor
+        self._drain_seconds = drain_seconds
+        self._settle_seconds = settle_seconds
+        self._end_wait_seconds = end_wait_seconds
+        if peer_active_probe is None and peer_health_url:
+            peer_active_probe = lambda: _probe_peer_healthz(peer_health_url)
+        self._peer_active_probe = peer_active_probe
+        self._peer_probe_interval_seconds = peer_probe_interval_seconds
+        self._self_activate_grace_seconds = self_activate_grace_seconds
+        self._external_stop = external_stop
+        self._watchdog_stop = threading.Event()
+        self._watchdog_started = False
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._warm = False
+        self._state = BROKER_STATE_STANDBY if enabled else BROKER_STATE_ACTIVE
+        self._on_activate: Callable[[], None] | None = None
+        self._drain_started = False
+
+    def _run_standby_watchdog(self) -> None:
+        no_peer_since: float | None = None
+        while not self._watchdog_stop.is_set() and (
+            self._external_stop is None or not self._external_stop.is_set()
+        ):
+            with self._lock:
+                still_standby = (
+                    self.enabled and self._warm and self._state == BROKER_STATE_STANDBY
+                )
+            if not still_standby:
+                return
+            probe = self._peer_active_probe
+            if probe is None:
+                return
+            try:
+                peer_state = probe()
+            except Exception as exc:
+                LOGGER.warning(
+                    "standby watchdog peer health probe raised %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                peer_state = None
+            if self._watchdog_stop.is_set() or (
+                self._external_stop is not None and self._external_stop.is_set()
+            ):
+                return
+            if peer_state is False:
+                now = self._clock()
+                if no_peer_since is None:
+                    no_peer_since = now
+                elif now - no_peer_since >= self._self_activate_grace_seconds:
+                    status, _ = self.activate()
+                    if status == HTTPStatus.OK:
+                        LOGGER.warning(
+                            "credential proxy self-activated from standby after %.1fs with no active peer",
+                            self._self_activate_grace_seconds,
+                        )
+                    return
+            else:
+                # Reset on confirmed active peer (True) or unknown failure (None) so
+                # DNS/network faults cannot advance the grace window toward split-brain.
+                no_peer_since = None
+            self._watchdog_stop.wait(self._peer_probe_interval_seconds)
+
+    def stop_watchdog(self) -> None:
+        """Stop the standby peer-health watchdog if running."""
+        self._watchdog_stop.set()
+
+    def _in_memory_relays(self) -> tuple[Any, ...]:
+        if self._in_memory_relays_override is not None:
+            return self._in_memory_relays_override
+        relays: list[Any] = []
+        for relay in (CredentialProxyHandler.slack_relay, CredentialProxyHandler.teams_relay):
+            if relay is not None:
+                relays.append(relay)
+        return tuple(relays)
+
+    def _has_unsettled_work(self) -> bool:
+        if any(relay.has_unsettled() for relay in self._relays):
+            return True
+        for relay in self._in_memory_relays():
+            undelivered = getattr(relay, "undelivered", None)
+            if callable(undelivered):
+                count = undelivered()
+                if isinstance(count, int) and count > 0:
+                    return True
+        return False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def warm(self) -> bool:
+        with self._lock:
+            return self._warm
+
+    def set_warm(self, on_activate: Callable[[], None] | None = None) -> None:
+        cb: Callable[[], None] | None = None
+        start_watchdog = False
+        with self._lock:
+            self._warm = True
+            self._on_activate = on_activate
+            if not self.enabled and self._state == BROKER_STATE_ACTIVE:
+                cb = self._on_activate
+                self._on_activate = None
+            elif (
+                self.enabled
+                and self._state == BROKER_STATE_STANDBY
+                and self._peer_active_probe is not None
+                and not self._watchdog_started
+            ):
+                self._watchdog_started = True
+                start_watchdog = True
+        if start_watchdog:
+            threading.Thread(
+                target=self._run_standby_watchdog,
+                name=STANDBY_WATCHDOG_THREAD_NAME,
+                daemon=True,
+            ).start()
+        if cb is not None:
+            cb()
+
+    def snapshot(self) -> dict[str, Any]:
+        unsettled = sum(1 for r in self._relays if r.has_unsettled())
+        with self._lock:
+            return self._locked_snapshot(unsettled=unsettled)
+
+    def activate(self, task_writes: Any = None) -> tuple[HTTPStatus, dict[str, Any]]:
+        cb: Callable[[], None] | None = None
+        unsettled = sum(1 for r in self._relays if r.has_unsettled())
+        with self._lock:
+            if self._external_stop is not None and self._external_stop.is_set():
+                return HTTPStatus.CONFLICT, {**self._locked_snapshot(unsettled=unsettled), "error": "pod is shutting down"}
+            if self._state in (BROKER_STATE_DRAINING, BROKER_STATE_DRAINED):
+                return HTTPStatus.CONFLICT, {**self._locked_snapshot(unsettled=unsettled), "error": "pod is draining"}
+            if not self._warm:
+                return HTTPStatus.SERVICE_UNAVAILABLE, {**self._locked_snapshot(unsettled=unsettled), "error": "broker warming"}
+            if self._state == BROKER_STATE_STANDBY:
+                if task_writes is not None:
+                    try:
+                        CredentialProxyHandler.profile_task_writes.import_state(task_writes)
+                    except ValueError as exc:
+                        return HTTPStatus.BAD_REQUEST, {**self._locked_snapshot(unsettled=unsettled), "error": str(exc)}
+                self._state = BROKER_STATE_ACTIVE
+                self._watchdog_stop.set()
+                cb = self._on_activate
+                self._on_activate = None
+        if cb is not None:
+            cb()
+            LOGGER.info("credential proxy activated by operator control")
+        return HTTPStatus.OK, self.snapshot()
+
+    def _locked_snapshot(self, *, unsettled: int | None = None) -> dict[str, Any]:
+        if unsettled is None:
+            unsettled = sum(1 for r in self._relays if r.has_unsettled())
+        snap: dict[str, Any] = {
+            "state": self._state,
+            "warm": self._warm,
+            "enabled": self.enabled,
+            "in_flight": CredentialProxyHandler.in_flight.count(),
+            "unsettled_chat": unsettled,
+        }
+        if self._state == BROKER_STATE_DRAINED:
+            snap[TASK_WRITES_KEY] = CredentialProxyHandler.profile_task_writes.export_state()
+        return snap
+
+    def _finish_drain(self) -> None:
+        if self._has_unsettled_work():
+            deadline = time.monotonic() + self._settle_seconds
+            while time.monotonic() < deadline and self._has_unsettled_work():
+                time.sleep(min(HANDOFF_SETTLE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        left = CredentialProxyHandler.in_flight.wait_idle(time.monotonic() + self._drain_seconds)
+        if left and self._executor is not None:
+            LOGGER.warning(
+                "handoff drain: %d request(s) still in flight after %ss; ending their commands",
+                left, self._drain_seconds,
+            )
+            self._executor.end_commands.set()
+            left = CredentialProxyHandler.in_flight.wait_idle(time.monotonic() + self._end_wait_seconds)
+        if left:
+            LOGGER.warning("handoff drain: %d request(s) still open; releasing chat receipts", left)
+        released = sum(relay.release_unsettled() for relay in self._relays)
+        with self._lock:
+            self._state = BROKER_STATE_DRAINED
+        LOGGER.info("handoff drain complete: released=%d unsettled chat receipt(s)", released)
+
+    def drain(self) -> tuple[HTTPStatus, dict[str, Any]]:
+        start_worker = False
+        with self._lock:
+            if self._state == BROKER_STATE_DRAINED:
+                return HTTPStatus.OK, self._locked_snapshot()
+            self._state = BROKER_STATE_DRAINING
+            self._watchdog_stop.set()
+            self._on_activate = None
+        CredentialProxyHandler.draining.set()
+        CredentialProxyHandler.handoff_draining.set()
+        slack = CredentialProxyHandler.slack_relay
+        if slack is not None:
+            slack.stop_intake()
+        sweep = CredentialProxyHandler.readings_sweep
+        if sweep is not None:
+            sweep.stop()
+        idle = CredentialProxyHandler.in_flight.count() == 0
+        unsettled = self._has_unsettled_work()
+        if idle and not unsettled:
+            for relay in self._relays:
+                relay.release_unsettled()
+            with self._lock:
+                self._state = BROKER_STATE_DRAINED
+                self._drain_started = True
+            LOGGER.info("handoff drain complete immediately (idle)")
+            return HTTPStatus.OK, self.snapshot()
+        with self._lock:
+            if not self._drain_started:
+                self._drain_started = True
+                start_worker = True
+        if start_worker:
+            threading.Thread(target=self._finish_drain, name=HANDOFF_THREAD_NAME, daemon=True).start()
+        return HTTPStatus.OK, self.snapshot()
+
+    def verify_bearer(self, header_value: str) -> HTTPStatus | None:
+        if self.control_file is None:
+            return HTTPStatus.NOT_FOUND
+        try:
+            expected = self.control_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return HTTPStatus.SERVICE_UNAVAILABLE
+        if not expected:
+            return HTTPStatus.SERVICE_UNAVAILABLE
+        if not header_value.startswith(CONTROL_BEARER_PREFIX):
+            return HTTPStatus.UNAUTHORIZED
+        presented = header_value[len(CONTROL_BEARER_PREFIX):].strip()
+        if not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+            return HTTPStatus.UNAUTHORIZED
+        return None
+
+
+def healthz_response() -> tuple[HTTPStatus, dict[str, Any]]:
+    """Return the /healthz HTTP status and JSON body for active, standby, or draining state."""
+    role = CredentialProxyHandler.broker_role
+    lifecycle = CredentialProxyHandler.lifecycle
+    if role == EXEC_ROLE and CredentialProxyHandler.draining.is_set():
+        return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+    if CredentialProxyHandler.shutting_down.is_set():
+        return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+    if lifecycle is not None:
+        state = lifecycle.state
+        # Keep /healthz 200 across both BROKER_STATE_DRAINING and BROKER_STATE_DRAINED
+        # until SIGTERM sets shutting_down: Service Endpoints retain this pod (which
+        # rejects new commands with retryable 503 bound="draining", keeping open/reply
+        # routes reachable) so endpoints never drop to zero before the standby activates
+        # and passes readiness.
+        if state in (BROKER_STATE_DRAINING, BROKER_STATE_DRAINED):
+            return HTTPStatus.OK, HEALTHZ_PAYLOAD
+        if lifecycle.enabled and state == BROKER_STATE_STANDBY:
+            return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_STANDBY_PAYLOAD
+        return HTTPStatus.OK, HEALTHZ_PAYLOAD
+    if CredentialProxyHandler.handoff_draining.is_set() or (
+        role == ROLE_BROKER and CredentialProxyHandler.draining.is_set()
+    ):
+        return HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD
+    return HTTPStatus.OK, HEALTHZ_PAYLOAD
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """The port-8766 HTTP listener: unauthenticated GET /metrics plus bearer-authenticated /control/*.
+
+    /metrics is unauthenticated, like /healthz on the credentialed listener, because its
     readers, the managed-Prometheus collector and the operator's usage
     poller, hold no caller token; the operator's NetworkPolicy on this pod is
     what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
@@ -15302,7 +16319,45 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             LOGGER.debug("metrics request not answered type=%s", type(exc).__name__)
 
+    def _write_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", CONTROL_JSON_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _control_authorized(self, *, drain_on_reject: bool = False) -> BrokerLifecycle | None:
+        lifecycle = CredentialProxyHandler.lifecycle
+        if lifecycle is None or lifecycle.control_file is None:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return None
+        rejection = lifecycle.verify_bearer(self.headers.get("Authorization", ""))
+        if rejection == HTTPStatus.NOT_FOUND:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return None
+        if rejection == HTTPStatus.UNAUTHORIZED:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return None
+        if rejection is not None:
+            if drain_on_reject:
+                drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+            self._write_json(rejection, {"error": "control credential unavailable"})
+            return None
+        return lifecycle
+
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == CONTROL_STATUS_PATH:
+            lifecycle = self._control_authorized()
+            if lifecycle is not None:
+                self._write_json(HTTPStatus.OK, lifecycle.snapshot())
+            return
         if self.path != METRICS_PATH:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -15312,6 +16367,66 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_control_activate_task_writes(self) -> tuple[bool, Any]:
+        """Parse an optional JSON body on POST /control/activate, returning (ok, task_writes)."""
+        if self.headers.get("Transfer-Encoding"):
+            self._write_json(HTTPStatus.LENGTH_REQUIRED, {"error": "chunked control bodies are not supported"})
+            self.close_connection = True
+            return False, None
+        raw_lengths = self.headers.get_all("Content-Length") or []
+        if not raw_lengths:
+            return True, None
+        if len(set(raw_lengths)) != 1 or not CONTROL_CONTENT_LENGTH_RE.fullmatch(raw_lengths[0].strip()):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "invalid Content-Length"})
+            self.close_connection = True
+            return False, None
+        length = int(raw_lengths[0].strip())
+        if length == 0:
+            return True, None
+        if length > CONTROL_ACTIVATE_MAX_REQUEST_BYTES:
+            self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "control activate body exceeds limit"})
+            self.close_connection = True
+            return False, None
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            return False, None
+        if len(body) < length:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "control activate body ended early"})
+            self.close_connection = True
+            return False, None
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError, RecursionError):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "control activate body must be JSON"})
+            return False, None
+        if not isinstance(parsed, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"error": "control activate body must be a JSON object"})
+            return False, None
+        return True, parsed.get(TASK_WRITES_KEY)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path not in (CONTROL_ACTIVATE_PATH, CONTROL_DRAIN_PATH):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        if self.path == CONTROL_DRAIN_PATH:
+            drain_request_body(self, CONTROL_MAX_REQUEST_BYTES)
+            lifecycle = self._control_authorized()
+            if lifecycle is None:
+                return
+            status, payload = lifecycle.drain()
+            self._write_json(status, payload)
+            return
+        lifecycle = self._control_authorized(drain_on_reject=True)
+        if lifecycle is None:
+            return
+        ok, task_writes = self._read_control_activate_task_writes()
+        if not ok:
+            return
+        status, payload = lifecycle.activate(task_writes=task_writes)
+        self._write_json(status, payload)
 
     def log_message(self, message: str, *args: Any) -> None:
         # A scrape every thirty seconds is not an audit event, and the broker's
@@ -15346,9 +16461,11 @@ class MetricsServer(HandlerErrorsToLog, ConnectionCap, ThreadingHTTPServer):
 class HealthHandler(MetricsHandler):
     """The health-only listener: GET /healthz, and nothing else.
 
-    MetricsHandler's bounds, deadline and silence, serving the answer the
-    credentialed listener's /healthz gives outside an exec pod's drain (see
-    HEALTHZ_DRAINING_PAYLOAD), and nothing the process knows:
+    MetricsHandler's bounds, deadline and silence, serving `healthz_response()`
+    (matching the credentialed listener's `/healthz`: `503 {"status":"standby"}`
+    in standby, `503 {"status":"draining"}` on exec drain or shutdown, and
+    `200 {"status":"ok"}` while active or holding endpoints during handoff before
+    SIGTERM), and nothing else the process knows:
     unauthenticated, like that route, because the probe runs before any
     token would be available and reveals nothing. A separate port so that a
     credentialed listener at its thread cap still reads as alive.
@@ -15360,12 +16477,16 @@ class HealthHandler(MetricsHandler):
         if self.path != HEALTHZ_PATH:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        body = json.dumps(HEALTHZ_PAYLOAD, separators=(",", ":")).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        status, payload = healthz_response()
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.send_error(HTTPStatus.NOT_FOUND)
 
 
 class HealthServer(MetricsServer):
@@ -15549,6 +16670,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # refused half-way and a retry never runs one twice; the drain waits on
     # in_flight.
     draining = threading.Event()
+    handoff_draining = threading.Event()
+    readings_sweep: vcs_readings.ReadingsSweep | None = None
+    lifecycle: BrokerLifecycle | None = None
     in_flight = InFlight()
     # The read-only Cloud API relay's credential and transport. Armed by
     # serve() unconditionally, like the exec route: the shell role always
@@ -15604,6 +16728,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     report_profiles: frozenset[str] = frozenset()
     # Set per request once the caller is identified; read by the policy layer.
     principal: Principal | None = None
+    # Who may speak for a Unix-socket connection's peer (_peer_address): the
+    # Envoy beside the broker, and nothing else in its container.
+    # Refuses everything until serve() builds it from ENVOY_PID_ENV.
+    envoy_peer: EnvoyPeerCheck = EnvoyPeerCheck(None)
     # What the metrics listener serves. One registry per process; a test that
     # wants a clean one assigns a fresh ProxyMetrics here.
     metrics: ProxyMetrics = ProxyMetrics()
@@ -15624,12 +16752,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         present on the route they tested and None on the two they did not.
         """
         try:
-            self.principal = self.authenticator.authenticate(self.headers)
+            principal = self.authenticator.authenticate(self.headers)
+            # Per request, after the TokenReview, cached or not: the
+            # token is good, and now it has to be coming from its own pod.
+            binding = getattr(self.authenticator, "pod_binding", None)
+            if binding is not None:
+                binding.check(principal, self._peer_address())
+            self.principal = principal
         except AuthenticationError as exc:
+            self.principal = None
             LOGGER.warning(
                 "rejected an unauthenticated request path=%s reason=%s",
                 _sanitize_for_logging(self.path),
-                exc,
+                _sanitize_for_logging(str(exc), max_length=256),
             )
             self._json(
                 HTTPStatus.UNAUTHORIZED, {"error": "caller could not be authenticated"}
@@ -15640,6 +16775,31 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self.principal.role == CALLER_ROLE_PROFILE and not self._admit_task(self.principal):
             return None
         return self.principal
+
+    def _peer_address(self) -> str | None:
+        """The address of the connection's peer, for PodAddressBinding; None when unknown.
+
+        A TCP listener's own socket peer, and on it nothing a header says. On
+        the Unix socket the peer is Envoy, the one thing that can reach it,
+        which stamps the downstream connection's direct remote address into
+        POD_PEER_ADDRESS_HEADER over anything the caller sent. Believed only
+        on a connection EnvoyPeerCheck admits, and only as exactly one value;
+        PodAddressBinding then refuses anything that is not one bare address.
+        """
+        address = self.client_address
+        if isinstance(address, tuple) and address and isinstance(address[0], str) and address[0]:
+            return address[0]
+        if isinstance(self.server, socketserver.UnixStreamServer):
+            if not self.envoy_peer.admits(self.connection):
+                LOGGER.warning(
+                    "a Unix-socket connection did not come from Envoy; its peer header is not believed path=%s",
+                    _sanitize_for_logging(self.path),
+                )
+                return None
+            values = self.headers.get_all(POD_PEER_ADDRESS_HEADER) or []
+            if len(values) == 1:
+                return values[0].strip()
+        return None
 
     def _admit_task(self, principal: Principal) -> bool:
         """Bind a profile caller's task credential, or answer 403 and return False.
@@ -15866,8 +17026,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         return report
 
     def _refused_while_shutting_down(self, **fields: Any) -> bool:
-        """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""
-        if not self.shutting_down.is_set():
+        """Answer a Chat event pull 503 SHUTDOWN_ERROR while stopping, draining, or in standby."""
+        lifecycle = self.lifecycle
+        standby = lifecycle is not None and lifecycle.enabled and lifecycle.state != BROKER_STATE_ACTIVE
+        if not self.shutting_down.is_set() and not self.handoff_draining.is_set() and not standby:
             return False
         self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": SHUTDOWN_ERROR, **fields})
         return True
@@ -16014,10 +17176,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
-        if self.broker_role == EXEC_ROLE and self.draining.is_set():
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE, HEALTHZ_DRAINING_PAYLOAD)
-            return
-        self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
+        status, payload = healthz_response()
+        self._json(status, payload)
 
     def do_PUT(self) -> None:  # noqa: N802
         self._serve_audit_report_write()
@@ -18564,7 +19724,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # resets the connection, and a caller still sending a large body (a
         # publish bundle) reads a broken pipe in place of the refusal, which
         # vcs_client reports as a broker fault (#6247).
-        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
+        body_limit = self._vcs_body_limit()
         if not vcs_verb_permitted(role, verb):
             LOGGER.warning(
                 "vcs verb refused for role role=%s verb=%s rule=%s",
@@ -19227,6 +20387,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._counted_in_flight = False
             self.in_flight.leave()
 
+    def _vcs_body_limit(self) -> int:
+        return max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * VCS_BUNDLE_BODY_MULTIPLIER)
+
     def _refused_while_draining(self, method: str) -> bool:
         """Answer a new request 503 with the `draining` bound while the broker drains.
 
@@ -19252,11 +20415,22 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         )
         if open_route or long_poll:
             self._leave_in_flight()
-        if open_route or (method, parts.path) in DRAIN_OPEN_REPLY_ROUTES or not self.draining.is_set():
+        lifecycle = self.lifecycle
+        standby = lifecycle is not None and lifecycle.enabled and lifecycle.state == BROKER_STATE_STANDBY
+        if standby:
+            if (method, parts.path) in STANDBY_DEFERRED_ROUTES:
+                return False
+        elif open_route or (method, parts.path) in DRAIN_OPEN_REPLY_ROUTES or not self.draining.is_set():
             return False
         if method == "POST":
-            # Read first, so the refusal is not lost to a connection reset.
-            drain_request_body(self, self.max_request_bytes)
+            # Read first so 503 answers reach the peer instead of TCP resets,
+            # covering larger VCS bundle uploads and Slack event payloads too.
+            post_limit = self.max_request_bytes
+            if parts.path.startswith(VCS_ROUTE_PREFIX):
+                post_limit = self._vcs_body_limit()
+            elif parts.path.startswith(SLACK_CHAT_ROUTE_PREFIX):
+                post_limit = max(post_limit, getattr(self, "slack_max_request_bytes", post_limit))
+            drain_request_body(self, post_limit)
         elif method == "PUT":
             # An audit-report write (#5619), under its own cap.
             drain_request_body(self, AUDIT_REPORT_MAX_BYTES)
@@ -19561,10 +20735,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         # `bound` names which limit refused it, so a caller can tell a
         # stopping broker (`draining`) from one at a cap.
-        self._json(
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound, **flag},
-        )
+        payload = {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc), BUSY_BOUND_KEY: bound, **flag}
+        if bound == ADMISSION_BOUND_DRAINING:
+            retry_after = (
+                HANDOFF_DRAINED_RETRY_AFTER_SECONDS
+                if self.lifecycle is not None and self.lifecycle.state == BROKER_STATE_DRAINED
+                else HANDOFF_DRAINING_RETRY_AFTER_SECONDS
+            )
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, payload, headers={RETRY_AFTER_HEADER: str(retry_after)})
+            return
+        self._json(HTTPStatus.SERVICE_UNAVAILABLE, payload)
 
 
 def start_agent_api_proxy(max_threads: int | None = None) -> ThreadingHTTPServer:
@@ -19860,6 +21040,15 @@ def install_shutdown_handler(
                 )
 
     def drain() -> None:
+        lifecycle = CredentialProxyHandler.lifecycle
+        if lifecycle is not None and lifecycle.state == BROKER_STATE_DRAINED:
+            released = sum(relay.release_unsettled() for relay in relays)
+            LOGGER.info(
+                "shutdown: handoff drain already complete; released=%d late unsettled receipt(s); stopping",
+                released,
+            )
+            server.shutdown()
+            return
         started = time.monotonic()
         time.sleep(settle_seconds)
         if drain_seconds > 0:
@@ -19875,6 +21064,9 @@ def install_shutdown_handler(
         if CredentialProxyHandler.shutting_down.is_set():
             return
         CredentialProxyHandler.shutting_down.set()
+        lifecycle = CredentialProxyHandler.lifecycle
+        if lifecycle is not None:
+            lifecycle.stop_watchdog()
         if drain_seconds > 0:
             CredentialProxyHandler.draining.set()
             LOGGER.info(
@@ -19915,6 +21107,10 @@ def serve(args: argparse.Namespace) -> None:
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
     CredentialProxyHandler.profile_gate = build_profile_gate(CredentialProxyHandler.authenticator)
+    if getattr(args, "unix_socket", "") and getattr(CredentialProxyHandler.authenticator, "pod_binding", None) is not None:
+        # Read once, before the listener exists: the socket's peer header is
+        # believed from this pid alone (EnvoyPeerCheck).
+        CredentialProxyHandler.envoy_peer = EnvoyPeerCheck.from_env()
     # The audit-report store (#5619): unset on an exec pod, or under an operator
     # that predates it.
     CredentialProxyHandler.report_store = report_store_from_env(role)
@@ -20030,8 +21226,6 @@ def serve(args: argparse.Namespace) -> None:
     if role == EXEC_ROLE:
         reclaimers.append(executor.reclaim_kubectl_cache)
     gate.set_reclaimers(reclaimers)
-    if role in BROKER_ROLES:
-        start_readings_sweep(executor, CredentialProxyHandler.vcs)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
@@ -20041,6 +21235,7 @@ def serve(args: argparse.Namespace) -> None:
     # credential-broker-exec-tier.md), so it starts none of the event relays:
     # no Pub/Sub, Google Chat, Slack or Teams consumer competes with the
     # stateful broker for their subscriptions and sockets.
+    start_slack_callback: Callable[[], None] | None = None
     if role != EXEC_ROLE:
         CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
         CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
@@ -20075,6 +21270,7 @@ def serve(args: argparse.Namespace) -> None:
                 while (
                     CredentialProxyHandler.slack_relay is None
                     and not CredentialProxyHandler.shutting_down.is_set()
+                    and not CredentialProxyHandler.handoff_draining.is_set()
                 ):
                     try:
                         relay = SlackRelay(
@@ -20105,7 +21301,9 @@ def serve(args: argparse.Namespace) -> None:
                             len(relay.bootstrap()),
                         )
 
-            threading.Thread(target=initialize_slack_relay, daemon=True).start()
+            start_slack_callback = lambda: threading.Thread(
+                target=initialize_slack_relay, daemon=True
+            ).start()
         teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
         teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
         teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
@@ -20120,6 +21318,27 @@ def serve(args: argparse.Namespace) -> None:
                 teams_app_id,
                 teams_tenant_id or "common",
             )
+    active_relays = [
+        relay
+        for relay in (CredentialProxyHandler.chat_relay, CredentialProxyHandler.a2a_chat_relay)
+        if relay is not None
+    ]
+    lifecycle = BrokerLifecycle(
+        enabled=(role == ROLE_BROKER and standby_mode_enabled()),
+        control_file=control_file_from_env(),
+        relays=active_relays,
+        executor=executor,
+        peer_health_url=peer_health_url_from_env(),
+        external_stop=CredentialProxyHandler.shutting_down,
+    )
+    CredentialProxyHandler.lifecycle = lifecycle
+
+    def _activate_background() -> None:
+        if role in BROKER_ROLES:
+            start_readings_sweep(executor, CredentialProxyHandler.vcs)
+        if start_slack_callback is not None:
+            start_slack_callback()
+
     if role == ROLE_COMBINED:
         api_server = start_agent_api_proxy(max_threads=door_thread_cap_from_env())
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
@@ -20143,6 +21362,8 @@ def serve(args: argparse.Namespace) -> None:
     else:
         server = ThreadingTCPHTTPServer((args.host, args.port), CredentialProxyHandler)
         LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
+    # Mark warm before opening metrics so /control/status reports warm:true immediately.
+    lifecycle.set_warm(on_activate=_activate_background)
     # Last, once the credentialed server holds its socket: a scrape never sees
     # a half-configured broker, and a port collision costs the metrics rather
     # than the commands, whatever the ports are. Exempt from the
