@@ -23355,6 +23355,50 @@ class TeamsRelayTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path=path, method=method, payload={})
 
+    def test_teams_relay_admits_put_and_delete_on_one_reaction_only(self):
+        """The gateway marks a person's message with the bot's own reaction:
+        a PUT adds it and a DELETE removes it, on the reactions path of one
+        activity and nowhere else, each with its method kept and no body."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        reaction = "v3/conversations/19:abc@thread.tacv2;messageid=1/activities/act-1/reactions/like"
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+            relay._get_access_token()
+            mock_resp.read.return_value = b""
+            mock_resp.status = 200
+            for method in ("put", "DELETE"):
+                with self.subTest(method=method):
+                    res = relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path=reaction, method=method)
+                    self.assertEqual(res, {"status": "ok", "statusCode": 200})
+                    sent = mock_open.call_args[0][0]
+                    self.assertEqual(sent.get_method(), method.upper())
+                    self.assertTrue(sent.full_url.endswith("/activities/act-1/reactions/like"))
+                    self.assertIsNone(sent.data)
+            calls = mock_open.call_count
+            for path, method in (
+                (reaction, "POST"),
+                (reaction, "PATCH"),
+                (reaction, "GET"),
+                ("v3/conversations/19:abc/activities/act-1", "DELETE"),
+                ("v3/conversations/19:abc/activities", "DELETE"),
+                ("v3/conversations/19:abc/activities/act-1/reactions", "PUT"),
+                ("v3/conversations/19:abc/activities/act-1/reactions/", "PUT"),
+                ("v3/conversations/19:abc/activities/act-1/reactions/like/more", "PUT"),
+                ("v3/conversations/19:abc/activities/act-1/reactions/li%6Be", "PUT"),
+                ("v3/conversations/19:abc/activities/act-1/reactions/..", "DELETE"),
+                ("v3/conversations/19:abc/activities/history/reactions/like", "PUT"),
+                ("v3/conversations/19:abc/activities/History/reactions/like", "DELETE"),
+                ("v3/conversations/19:abc/activities/act-1/members/like", "DELETE"),
+                ("v3/conversations/19:abc/reactions/like", "PUT"),
+            ):
+                with self.subTest(path=path, method=method):
+                    with self.assertRaises(ValueError):
+                        relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path=path, method=method)
+            self.assertEqual(mock_open.call_count, calls, "a refused call reached the network")
+
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):

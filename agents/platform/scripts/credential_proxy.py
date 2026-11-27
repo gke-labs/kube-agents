@@ -9304,14 +9304,23 @@ TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
     r"^v3/conversations/[^/?#%\\]+/activities(?:/(?!history$)[^/?#%\\]+)?$",
     re.IGNORECASE,
 )
-# The one path a PUT may take: an update of one activity the bot posted
-# (Bot Framework's updateActivity), never the activities collection. The
-# gateway's rolling status line edits its own message through it.
+# The one path a PUT may take on an activity itself: an update of one
+# activity the bot posted (Bot Framework's updateActivity), never the
+# activities collection. The gateway's rolling status line edits its own
+# message through it.
 TEAMS_UPDATE_ACTIVITY_PATH_RE = re.compile(
     r"^v3/conversations/[^/?#%\\]+/activities/(?!history$)[^/?#%\\]+$",
     re.IGNORECASE,
 )
-TEAMS_RELAY_METHODS = frozenset({"POST", "PUT"})
+# The one path a reaction may take: the bot's own reaction on one activity,
+# added with PUT and removed with DELETE, with no body. DELETE is admitted
+# nowhere else: on an activity's own path it would delete the message.
+TEAMS_REACTION_PATH_RE = re.compile(
+    r"^v3/conversations/[^/?#%\\]+/activities/(?!history/)[^/?#%\\]+/reactions/[A-Za-z0-9_-]+$",
+    re.IGNORECASE,
+)
+TEAMS_REACTION_METHODS = frozenset({"PUT", "DELETE"})
+TEAMS_RELAY_METHODS = frozenset({"POST", "PUT"}) | TEAMS_REACTION_METHODS
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -9607,9 +9616,16 @@ class TeamsRelay:
         if upper_method not in TEAMS_RELAY_METHODS:
             raise ValueError(f"Teams relay refuses HTTP method: {method}")
         clean_path = path.lstrip("/")
-        if ".." in clean_path.split("/") or not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
+        if ".." in clean_path.split("/"):
             raise ValueError(f"Teams relay refuses endpoint: {path}")
-        if upper_method == "PUT" and not TEAMS_UPDATE_ACTIVITY_PATH_RE.match(clean_path):
+        if TEAMS_REACTION_PATH_RE.match(clean_path):
+            if upper_method not in TEAMS_REACTION_METHODS:
+                raise ValueError(f"Teams relay refuses {upper_method} on: {path}")
+        elif not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
+            raise ValueError(f"Teams relay refuses endpoint: {path}")
+        elif upper_method == "DELETE":
+            raise ValueError(f"Teams relay refuses DELETE on: {path}")
+        elif upper_method == "PUT" and not TEAMS_UPDATE_ACTIVITY_PATH_RE.match(clean_path):
             raise ValueError(f"Teams relay refuses PUT on: {path}")
 
         token = self._get_access_token()

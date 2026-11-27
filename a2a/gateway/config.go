@@ -122,6 +122,11 @@ const (
 	envTeamsHomeChannel   = "A2A_TEAMS_HOME_CHANNEL"
 	envTeamsTenantID      = "A2A_TEAMS_TENANT_ID"
 	envTeamsAdaptiveCards = "A2A_TEAMS_ADAPTIVE_CARDS"
+	// envTeamsMessageMarks turns the marks on a person's message off when
+	// "false" (teams_reactions.go). No CRD field renders it yet, so the
+	// operator carries it from its own environment, as it does
+	// envTeamsAnswerFeedback.
+	envTeamsMessageMarks = "A2A_TEAMS_MESSAGE_MARKS"
 )
 
 // envSlackHomeChannel carries the Slack home channel's id the chat.notify
@@ -368,6 +373,10 @@ type Config struct {
 	// TeamsAdaptiveCards renders Teams replies as Adaptive Cards; off, they
 	// post as plain text. On unless the env says false.
 	TeamsAdaptiveCards bool
+	// TeamsMessageMarks draws the kind of ask, and a blocked or failed end,
+	// as the bot's reaction on the person's message. On unless the env says
+	// false.
+	TeamsMessageMarks bool
 	// SlackHomeChannel is the install's Slack home channel id ("C0123"),
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
@@ -1130,6 +1139,7 @@ func FromEnv() (*Config, error) {
 	cfg.TeamsHomeChannel = strings.TrimSpace(os.Getenv(envTeamsHomeChannel))
 	cfg.TeamsTenantID = strings.TrimSpace(os.Getenv(envTeamsTenantID))
 	cfg.TeamsAdaptiveCards = strings.TrimSpace(os.Getenv(envTeamsAdaptiveCards)) != strconv.FormatBool(false)
+	cfg.TeamsMessageMarks = strings.TrimSpace(os.Getenv(envTeamsMessageMarks)) != strconv.FormatBool(false)
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
 	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
 	cfg.GchatHomePolicy = strings.TrimSpace(os.Getenv(envGchatHomePolicy))
