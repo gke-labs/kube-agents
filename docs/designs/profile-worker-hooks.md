@@ -73,11 +73,13 @@ Nothing connects an AgentPlugin to an AgentProfile worker.
   `caller.kubectl-flag`), the adapter stops the harness. A refused version-control write does
   not stop it. A worker has no approval prompt: the harness runs headless.
 - The event stream. The adapter reads the harness's stream through a driver. For each tool call
-  it publishes one `activity` entry on the bus (the tool's name and input). The publish is
-  best-effort. The event for a tool result of the Claude Code driver and of the Antigravity
-  driver carries no field: no id, no error flag, no result, no duration. The event of the
-  core-agent driver carries the tool, the text and a failed flag, and not the call's id. The
-  adapter writes no log line and no file for a tool call.
+  it publishes one `activity` entry on the bus (the tool's name and input, and the call's id
+  where the driver reads one). The publish is best-effort. The event for a tool result of the
+  Antigravity driver carries no field: no id, no error flag, no result, no duration. The event of
+  the core-agent driver carries the tool, the text and a failed flag, and not the call's id.
+  Since row 2 was built, the event of the Claude Code driver carries the call's id and the error
+  flag, and the adapter writes the log lines of [The per-tool record](#the-per-tool-record) for
+  the tool calls of a profile task. The adapter writes no file for a tool call.
 - The broker's records. An `/v1/exec` call leaves a start record and an outcome record, each
   with the task id and the credential's id in its principal and with no argument. An MCP relay
   call leaves two lines. For a `/v1/vcs/` call that succeeds, only a metric and the HTTP request
@@ -89,7 +91,8 @@ Nothing connects an AgentPlugin to an AgentProfile worker.
   worker removes it, so the model reads it when the harness returns stderr. The profile role has
   no `proposal-claim` verb. The gateway renders a `notice` artifact ("a PR it opened"); nothing
   produces one.
-- Telemetry. A worker pod emits no trace, no metric and no structured per-tool log.
+- Telemetry. A worker pod emits no trace and no metric. Its one structured per-tool log is the
+  record of row 2.
 - The second harness. The AgentProfile accepts the harness type `claude-code` only, and the
   persona format has no Antigravity adapter. So a hook can be rendered for one harness of a
   profile worker today. [`spec-profiles-dispatch.md`](spec-profiles-dispatch.md) says that
@@ -148,7 +151,8 @@ The adapter's per-tool line is the one line for a tool call. The hooks design
 This line is the trail of the telemetry design, and the adapter copies no activity entry to
 stderr.
 
-What the drivers get, because they do not have it today:
+What the drivers get. The Claude Code driver and the adapter have it; the two other drivers do
+not have it today:
 
 - The Claude Code driver reads the call's id on the tool call, and the same id and the error
   flag on the tool result. The result event carries them to the adapter.
@@ -165,6 +169,11 @@ What the drivers get, because they do not have it today:
 
 Limits of the record:
 
+- As built, a call does not always leave both lines. A call with no result event (a stopped
+  harness, a cancel, a deadline) leaves its start line only. Events that the adapter drains
+  after an abandon, or after it stops the harness at a write refusal, leave no line. An end line
+  has no duration when its call id was cut for the line or when more than 1024 calls wait for a
+  result.
 - The harness reports it. The harness and each tool run as one user, so treat a line as one
   that a process in the worker can omit or forge. For a `/v1/exec` call and an MCP relay call,
   the broker's record is the one that counts. For a `/v1/vcs/` call the broker has no record
