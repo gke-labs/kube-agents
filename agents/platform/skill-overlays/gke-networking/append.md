@@ -94,12 +94,15 @@ each node) and NodeLocal DNSCache upgrades upstream queries to `kube-dns` over T
 `kube-dns` QPS and eliminating per-lookup UDP conntrack entries. With `CLOUD_DNS` + NodeLocal
 DNSCache, pods query `169.254.20.10` and cache misses forward to `169.254.169.254`.
 
-- Propose the declarative change as a pull request via `submit-suggestion`: set
-  `spec.addonsConfig.dnsCacheConfig.enabled: true` on `ContainerCluster` through
-  `gcp-config-connector`, or `addons_config.dns_cache_config.enabled = true` through
-  `gcp-terraform`.
-- Plan a maintenance window: enabling NodeLocal DNSCache on an existing Standard cluster recreates
-  nodes. Verify strict egress `NetworkPolicy` rules for the cluster's dataplane: on Dataplane V2
+- Treat enabling NodeLocal DNSCache on an existing Standard cluster as a **manual maintenance-window
+  change** (`kind: manual`, matching `gcp_networking_fabric_sop.md` §2.7) rather than opening a
+  `submit-suggestion` Config Connector or Terraform pull request — merging a Config Connector PR
+  applies immediately and recreates every node outside the maintenance window. Give the operator the
+  maintenance-window command (`gcloud container clusters update <cluster> --location <location> --update-addons=NodeLocalDNS=ENABLED`, never run by the agent), and update declarative IaC
+  (`spec.addonsConfig.dnsCacheConfig.enabled: true` in `gcp-config-connector` or
+  `addons_config.dns_cache_config.enabled = true` in `gcp-terraform`) only for new clusters or
+  timed with that maintenance window. Verify strict egress `NetworkPolicy` rules for the cluster's
+  dataplane: on Dataplane V2
   with `kube-dns`, `node-local-dns` runs on the pod network (`hostNetwork: false`, label
   `k8s-app: node-local-dns`), so egress policies must permit UDP/TCP 53 to `kube-system` DNS pods;
   on non-Dataplane-V2 clusters with legacy NetworkPolicy, `node-local-dns` runs with
