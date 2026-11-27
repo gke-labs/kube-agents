@@ -15,6 +15,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 import unittest.mock
 from contextlib import contextmanager, redirect_stderr
@@ -1094,6 +1096,307 @@ class DescribeFormatTest(unittest.TestCase):
                       "networkConfig.network", "networkConfig.subnetwork",
                       "masterAuthorizedNetworksConfig", "endpoint"):
             self.assertIn(field, fmt)
+
+
+class ConcurrencyAndLruCacheTest(unittest.TestCase):
+    """Thread-safe double-checked locking on cold discovery probes and LRU caches."""
+
+    def setUp(self):
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+
+    def test_concurrent_gcloud_supports_dns_endpoint_probes_once(self):
+        num_threads = 16
+        barrier = threading.Barrier(num_threads)
+        call_lock = threading.Lock()
+        help_calls: list[list[str]] = []
+        unset = object()
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            with call_lock:
+                help_calls.append(argv)
+            time.sleep(0.01)
+            return 0, HELP_WITH_FLAG
+
+        results: list[object] = [unset] * num_threads
+        errors: list[BaseException] = []
+
+        def worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                results[idx] = gke_endpoint.gcloud_supports_dns_endpoint(runner)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with redirect_stderr(io.StringIO()):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+                self.assertFalse(t.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [True] * num_threads)
+        self.assertEqual(len(help_calls), 1)
+        self.assertIs(gke_endpoint._support_cache, True)
+
+    def test_concurrent_own_cluster_describes_once(self):
+        num_threads = 16
+        barrier = threading.Barrier(num_threads)
+        call_lock = threading.Lock()
+        own_calls: list[list[str]] = []
+        unset = object()
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            with call_lock:
+                own_calls.append(argv)
+            time.sleep(0.01)
+            return 0, OWN_ROW + "\n"
+
+        results: list[object] = [unset] * num_threads
+        errors: list[BaseException] = []
+
+        def worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                results[idx] = gke_endpoint.own_cluster(runner)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+                self.assertFalse(t.is_alive())
+
+        self.assertEqual(errors, [])
+        expected = gke_endpoint.OwnCluster(
+            OWN_NETWORK, OWN_SUBNETWORK, OWN_POD_CIDR, "us-central1"
+        )
+        self.assertEqual(results, [expected] * num_threads)
+        self.assertEqual(len(own_calls), 1)
+        self.assertEqual(gke_endpoint._own_cluster_cache, expected)
+        self.assertIsNone(gke_endpoint._own_failure_at)
+
+    def test_concurrent_own_cluster_failure_backoff_describes_once(self):
+        num_threads = 16
+        barrier = threading.Barrier(num_threads)
+        call_lock = threading.Lock()
+        own_calls: list[list[str]] = []
+        unset = object()
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            with call_lock:
+                own_calls.append(argv)
+            time.sleep(0.01)
+            return 1, ""
+
+        results: list[object] = [unset] * num_threads
+        errors: list[BaseException] = []
+
+        def worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                results[idx] = gke_endpoint.own_cluster(runner)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+                self.assertFalse(t.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [None] * num_threads)
+        self.assertEqual(len(own_calls), 1)
+        self.assertIsNone(gke_endpoint._own_cluster_cache)
+        self.assertIsNotNone(gke_endpoint._own_failure_at)
+
+    def test_own_cluster_success_after_failure_clears_failure_timestamp(self):
+        attempts = 0
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return 1, ""
+            return 0, OWN_ROW + "\n"
+
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            self.assertIsNone(gke_endpoint.own_cluster(runner))
+            self.assertIsNotNone(gke_endpoint._own_failure_at)
+            recovered = gke_endpoint.own_cluster(runner, retry=True)
+        self.assertIsNotNone(recovered)
+        self.assertIsNone(gke_endpoint._own_failure_at)
+
+    def test_concurrent_endpoint_decisions_across_clusters_share_cold_probes(self):
+        num_threads = 16
+        barrier = threading.Barrier(num_threads)
+        call_lock = threading.Lock()
+        help_calls: list[list[str]] = []
+        own_calls: list[list[str]] = []
+        target_calls: list[list[str]] = []
+        unset = object()
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            if "--help" in argv:
+                with call_lock:
+                    help_calls.append(argv)
+                time.sleep(0.01)
+                return 0, HELP_WITH_FLAG
+            if OWN_NETWORK_FORMAT in argv:
+                with call_lock:
+                    own_calls.append(argv)
+                time.sleep(0.01)
+                return 0, OWN_ROW + "\n"
+            with call_lock:
+                target_calls.append(argv)
+            return 0, json.dumps(PRIVATE_SAME_VPC)
+
+        results: list[object] = [unset] * num_threads
+        errors: list[BaseException] = []
+
+        def worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                results[idx] = gke_endpoint.endpoint_decision(
+                    "p", f"cluster-{idx}", "us-central1-a", run=runner
+                )
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+                self.assertFalse(t.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(help_calls), 1)
+        self.assertEqual(len(own_calls), 1)
+        self.assertEqual(len(target_calls), num_threads)
+        for d in results:
+            self.assertIsInstance(d, gke_endpoint.EndpointDecision)
+            self.assertEqual(d.flags, (gke_endpoint.INTERNAL_IP_FLAG,))
+
+    def test_region_of_and_within_any_lru_cache_hits_and_reset_cache(self):
+        gke_endpoint.reset_cache()
+        self.assertEqual(gke_endpoint._region_of.cache_info().currsize, 0)
+        self.assertEqual(gke_endpoint._within_any.cache_info().currsize, 0)
+
+        self.assertEqual(gke_endpoint._region_of("us-central1-a"), "us-central1")
+        self.assertEqual(gke_endpoint._region_of("us-central1-a"), "us-central1")
+        self.assertEqual(gke_endpoint._region_of("europe-west1"), "europe-west1")
+        region_info = gke_endpoint._region_of.cache_info()
+        self.assertEqual(region_info.hits, 1)
+        self.assertEqual(region_info.misses, 2)
+        self.assertEqual(region_info.currsize, 2)
+
+        blocks = ("10.0.0.0/8", "172.16.0.0/12")
+        self.assertTrue(gke_endpoint._within_any("10.92.0.0/14", blocks))
+        self.assertTrue(gke_endpoint._within_any("10.92.0.0/14", blocks))
+        self.assertFalse(gke_endpoint._within_any("192.168.1.0/24", blocks))
+        within_info = gke_endpoint._within_any.cache_info()
+        self.assertEqual(within_info.hits, 1)
+        self.assertEqual(within_info.misses, 2)
+        self.assertEqual(within_info.currsize, 2)
+
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "c", "us-central1-a", run=runner)
+        self.assertIsNotNone(gke_endpoint._support_cache)
+        self.assertIsNotNone(gke_endpoint._own_cluster_cache)
+        self.assertTrue(gke_endpoint._endpoint_cache)
+
+        gke_endpoint.reset_cache()
+        self.assertIsNone(gke_endpoint._support_cache)
+        self.assertIsNone(gke_endpoint._own_cluster_cache)
+        self.assertIsNone(gke_endpoint._own_failure_at)
+        self.assertEqual(gke_endpoint._endpoint_cache, {})
+        self.assertEqual(gke_endpoint._region_of.cache_info().currsize, 0)
+        self.assertEqual(gke_endpoint._within_any.cache_info().currsize, 0)
+
+    def test_exception_in_probes_releases_locks_for_subsequent_callers(self):
+        help_attempts = 0
+
+        def flaky_help(argv: list[str]) -> tuple[int, str]:
+            nonlocal help_attempts
+            help_attempts += 1
+            if help_attempts == 1:
+                raise RuntimeError("boom")
+            return 0, HELP_WITH_FLAG
+
+        with self.assertRaises(RuntimeError):
+            gke_endpoint.gcloud_supports_dns_endpoint(flaky_help)
+        self.assertIsNone(gke_endpoint._support_cache)
+        self.assertTrue(gke_endpoint.gcloud_supports_dns_endpoint(flaky_help))
+        self.assertEqual(help_attempts, 2)
+
+        own_attempts = 0
+
+        def flaky_own(argv: list[str]) -> tuple[int, str]:
+            nonlocal own_attempts
+            own_attempts += 1
+            if own_attempts == 1:
+                raise RuntimeError("own-boom")
+            return 0, OWN_ROW + "\n"
+
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV):
+            with self.assertRaises(RuntimeError):
+                gke_endpoint.own_cluster(flaky_own)
+            self.assertIsNone(gke_endpoint._own_cluster_cache)
+            self.assertIsNone(gke_endpoint._own_failure_at)
+            recovered = gke_endpoint.own_cluster(flaky_own)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(own_attempts, 2)
+
+    def test_kube_proxy_skip_does_not_block_on_support_lock_or_populate_caches(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_help(argv: list[str]) -> tuple[int, str]:
+            entered.set()
+            release.wait(timeout=5.0)
+            return 0, HELP_WITH_FLAG
+
+        t = threading.Thread(
+            target=gke_endpoint.gcloud_supports_dns_endpoint,
+            args=(blocking_help,),
+        )
+        t.start()
+        self.assertTrue(entered.wait(timeout=5.0))
+        try:
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args(
+                    "p", "c", "us-central1",
+                    env={"KUBE_PROXY_URL": "https://kube-proxy:8443"},
+                    run=FakeRunner(DNS_EXTERNAL),
+                ),
+                [],
+            )
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args(
+                    "p", "c", "us-central1",
+                    env={"KUBE_PROXY_IN_USE_URL": "https://kube-proxy:8443"},
+                    run=FakeRunner(DNS_EXTERNAL),
+                ),
+                [],
+            )
+            self.assertEqual(gke_endpoint._endpoint_cache, {})
+            self.assertEqual(gke_endpoint._region_of.cache_info().currsize, 0)
+            self.assertEqual(gke_endpoint._within_any.cache_info().currsize, 0)
+        finally:
+            release.set()
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive())
 
 
 if __name__ == "__main__":

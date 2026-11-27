@@ -32,11 +32,13 @@ endpoint is closed. docs/designs/private-endpoint-selection.md argues the rule;
 from __future__ import annotations
 
 import dataclasses
+import functools
 import ipaddress
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -171,6 +173,7 @@ _ENDPOINT_TTL_SECONDS = 60.0
 # key -> (monotonic time the answer was read, decision)
 _endpoint_cache: dict[tuple[str, str, str], tuple[float, "EndpointDecision"]] = {}
 _support_cache: bool | None = None
+_support_lock = threading.Lock()
 # The agent's own cluster's network facts. The install's VPC cannot change
 # under a running pod, so this has no TTL; it is simply never set from a
 # failure. A failure is remembered only as a backoff: for _OWN_RETRY_SECONDS
@@ -179,6 +182,7 @@ _support_cache: bool | None = None
 # passed. Never as "no cluster".
 _own_cluster_cache: "OwnCluster | None" = None
 _own_failure_at: float | None = None
+_own_cluster_lock = threading.Lock()
 _OWN_RETRY_SECONDS = 60.0
 
 _DESCRIBE_TIMEOUT_SECONDS = 30
@@ -284,30 +288,35 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
     install stopped".
     """
     global _support_cache
-    if _support_cache is not None:
+    cached = _support_cache
+    if cached is not None:
+        return cached
+
+    with _support_lock:
+        if _support_cache is not None:
+            return _support_cache
+
+        probe = run or _default_runner(None, _HELP_TIMEOUT_SECONDS)
+        try:
+            exit_code, stdout = probe(
+                ["gcloud", "container", "clusters", "get-credentials", "--help"]
+            )
+        except (OSError, subprocess.SubprocessError,
+                sandbox_exec.SandboxUnavailable) as error:
+            # Not cached: this says the probe could not run, not that the flag is
+            # absent. A transient failure remembered here would disable the endpoint
+            # detection for the rest of a long-lived process.
+            _log(f"could not probe gcloud for {DNS_ENDPOINT_FLAG} support ({error}); assuming absent")
+            return False
+
+        if exit_code != 0:
+            _log(f"probing gcloud for {DNS_ENDPOINT_FLAG} support exited {exit_code}; assuming absent")
+            return False
+
+        _support_cache = DNS_ENDPOINT_FLAG in stdout
+        if not _support_cache:
+            _log(f"the installed gcloud does not offer {DNS_ENDPOINT_FLAG}; using the IP endpoint")
         return _support_cache
-
-    probe = run or _default_runner(None, _HELP_TIMEOUT_SECONDS)
-    try:
-        exit_code, stdout = probe(
-            ["gcloud", "container", "clusters", "get-credentials", "--help"]
-        )
-    except (OSError, subprocess.SubprocessError,
-            sandbox_exec.SandboxUnavailable) as error:
-        # Not cached: this says the probe could not run, not that the flag is
-        # absent. A transient failure remembered here would disable the endpoint
-        # detection for the rest of a long-lived process.
-        _log(f"could not probe gcloud for {DNS_ENDPOINT_FLAG} support ({error}); assuming absent")
-        return False
-
-    if exit_code != 0:
-        _log(f"probing gcloud for {DNS_ENDPOINT_FLAG} support exited {exit_code}; assuming absent")
-        return False
-
-    _support_cache = DNS_ENDPOINT_FLAG in stdout
-    if not _support_cache:
-        _log(f"the installed gcloud does not offer {DNS_ENDPOINT_FLAG}; using the IP endpoint")
-    return _support_cache
 
 
 def _describe(
@@ -336,6 +345,7 @@ def _describe(
     return document if isinstance(document, dict) else None
 
 
+@functools.lru_cache(maxsize=64)
 def _region_of(location: str) -> str:
     """A zone's region, or the location itself when it already is one."""
     parts = (location or "").split(_LOCATION_SEPARATOR)
@@ -367,44 +377,50 @@ def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
     ignores that backoff, for a caller that asks once and writes a record.
     """
     global _own_cluster_cache, _own_failure_at
-    if _own_cluster_cache is not None:
-        return _own_cluster_cache
+    cached = _own_cluster_cache
+    if cached is not None:
+        return cached
     identity = _own_identity()
     if identity is None:
         return None
-    if (not retry and _own_failure_at is not None
-            and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS):
-        return None
-    project, location, cluster = identity
-    argv = [
-        "gcloud", "container", "clusters", "describe", cluster,
-        f"--location={location}",
-        f"--project={project}",
-        f"--format={_OWN_NETWORK_FORMAT}",
-    ]
-    try:
-        exit_code, stdout = run(argv)
-    except (OSError, subprocess.SubprocessError,
-            sandbox_exec.SandboxUnavailable) as error:
-        _log(f"describing this pod's own cluster {cluster} failed ({error})")
-        _own_failure_at = time.monotonic()
-        return None
-    if exit_code != 0:
-        _log(f"describing this pod's own cluster {cluster} exited {exit_code}")
-        _own_failure_at = time.monotonic()
-        return None
-    # value() renders the fields tab-separated and an unset one empty; a row
-    # with fewer separators than fields is not the answer that was asked for.
-    fields = (stdout or "").strip("\r\n").split(_VALUE_SEPARATOR)
-    if len(fields) != _OWN_FIELD_COUNT or not fields[0].strip():
-        _log(f"this pod's own cluster {cluster} reports no network")
-        _own_failure_at = time.monotonic()
-        return None
-    network, subnetwork, pod_cidr = (field.strip() for field in fields)
-    _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
-    return _own_cluster_cache
+    with _own_cluster_lock:
+        if _own_cluster_cache is not None:
+            return _own_cluster_cache
+        if (not retry and _own_failure_at is not None
+                and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS):
+            return None
+        project, location, cluster = identity
+        argv = [
+            "gcloud", "container", "clusters", "describe", cluster,
+            f"--location={location}",
+            f"--project={project}",
+            f"--format={_OWN_NETWORK_FORMAT}",
+        ]
+        try:
+            exit_code, stdout = run(argv)
+        except (OSError, subprocess.SubprocessError,
+                sandbox_exec.SandboxUnavailable) as error:
+            _log(f"describing this pod's own cluster {cluster} failed ({error})")
+            _own_failure_at = time.monotonic()
+            return None
+        if exit_code != 0:
+            _log(f"describing this pod's own cluster {cluster} exited {exit_code}")
+            _own_failure_at = time.monotonic()
+            return None
+        # value() renders the fields tab-separated and an unset one empty; a row
+        # with fewer separators than fields is not the answer that was asked for.
+        fields = (stdout or "").strip("\r\n").split(_VALUE_SEPARATOR)
+        if len(fields) != _OWN_FIELD_COUNT or not fields[0].strip():
+            _log(f"this pod's own cluster {cluster} reports no network")
+            _own_failure_at = time.monotonic()
+            return None
+        network, subnetwork, pod_cidr = (field.strip() for field in fields)
+        _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
+        _own_failure_at = None
+        return _own_cluster_cache
 
 
+@functools.lru_cache(maxsize=64)
 def _within_any(cidr: str, blocks: tuple[str, ...]) -> bool:
     """Is `cidr` inside one of `blocks`? Unparseable input is a no."""
     try:
@@ -647,7 +663,10 @@ def dns_endpoint_args(
 def reset_cache() -> None:
     """Forget every memoised answer. For tests."""
     global _support_cache, _own_cluster_cache, _own_failure_at
-    _endpoint_cache.clear()
-    _support_cache = None
-    _own_cluster_cache = None
-    _own_failure_at = None
+    with _support_lock, _own_cluster_lock:
+        _endpoint_cache.clear()
+        _region_of.cache_clear()
+        _within_any.cache_clear()
+        _support_cache = None
+        _own_cluster_cache = None
+        _own_failure_at = None
