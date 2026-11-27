@@ -92,6 +92,17 @@ func TestTheProvisionJobsCredentialShapeWorksWithTheRealCLI(t *testing.T) {
 		}
 	}
 
+	// Provision stays create-only (#6397): `nats stream edit` is refused on
+	// TOPICS-STATE as well as TASKS.
+	for _, stream := range []string{"TASKS", "TOPICS-STATE"} {
+		if out, err := run("stream", "edit", stream,
+			"--subjects", "probe."+stream+".>",
+			"--force",
+		); err == nil {
+			t.Errorf("the provision credential edited %s, which must stay create-only:\n%s", stream, out)
+		}
+	}
+
 	// A provisioned topic, which the script writes starter entries to.
 	if out, err := run("pub", "a2a.topics.shared.blueprint", "hello"); err != nil {
 		t.Errorf("the provision credential could not publish a granted topic: %v\n%s", err, out)

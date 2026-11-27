@@ -183,6 +183,32 @@ func TestTheRestoreLegRestoresWhatTheSnapshotLegStaged(t *testing.T) {
 	if !strings.Contains(all, "stream TASKS: subject a2a.tasks-added-later is missing") {
 		t.Errorf("report warnings %v, want the missing rendered subject", report.Warnings)
 	}
+
+	// Going forward, RestoreVerifiedCounting appends the missing rendered
+	// subject before restoring the stream, so restoreAllDirected reports no
+	// MissingSubjects warning and the restored stream carries the subject.
+	fwdDst := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(fwdDst)
+	fwdNC, err := nats.Connect(fwdDst.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fwdNC.Close()
+	fwdWarnings, _, err := restoreAllDirected(context.Background(), fwdNC, []string{"TASKS", "KV_cap"}, dir, run, 1, true)
+	if err != nil {
+		t.Fatalf("forward restoreAllDirected: %v", err)
+	}
+	if strings.Contains(strings.Join(fwdWarnings, "\n"), "subject a2a.tasks-added-later is missing") {
+		t.Errorf("forward restore warnings %v unexpectedly report appended subject as missing", fwdWarnings)
+	}
+	fwdJS, _ := fwdNC.JetStream()
+	fwdSI, err := fwdJS.StreamInfo("TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(fwdSI.Config.Subjects, ","), "a2a.tasks-added-later") {
+		t.Errorf("forward-restored TASKS subjects = %v, want a2a.tasks-added-later appended", fwdSI.Config.Subjects)
+	}
 }
 
 // Metadata changed on the staging volume after the hashing pod read it is
