@@ -68,6 +68,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -189,14 +190,18 @@ AUDITS: dict[str, AuditSpec] = {
             "webhook-backend-unreachable",
             "serviceentry-host-collision",
             "webhook-ca-bundle-expired",
+            "wi-gsa-iam-binding-unverifiable",
         ),
-        # The two compliance checks that judge a posture an owner may choose:
+        # The three compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
         # (2.6, the zero-policy and partial-coverage shapes, which name the
         # namespace; the allow-all shape names the policy and is a fault),
-        # and a workload that needs the API token the default ServiceAccount
-        # mounts (2.7). Every other check is a fault no declaration excuses.
-        declarable=("netpol-missing", "default-sa-automount"),
+        # a workload that needs the API token the default ServiceAccount
+        # mounts (2.7), and a Workload Identity ServiceAccount annotation
+        # pointing into a central-IAM project outside this install's read
+        # scope (2.19, `ServiceAccount/<name>`). Every other check is a fault
+        # no declaration excuses.
+        declarable=("netpol-missing", "default-sa-automount", "wi-gsa-iam-binding-unverifiable"),
     ),
     "security-patch-orchestrator": AuditSpec(
         "Upgrade & Patch Readiness Audit",
@@ -378,6 +383,8 @@ AUDITS: dict[str, AuditSpec] = {
             # §4.15, voted by node pool. The roster is the SOP's `####`
             # heading order.
             "boot-disk",
+            # §4.16, the second facet voted by node pool.
+            "kubelet-config",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
@@ -414,6 +421,7 @@ AUDITS: dict[str, AuditSpec] = {
             "autoscaler-out-of-resources",
             "dangling-compute-class",
             "ccc-unbacked-manual-fallback",
+            "capacity-buffer-not-ready",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
         # project-scoped checks. `reservation-mismatch-risk` sits under both
@@ -435,6 +443,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "autoscaler-out-of-resources",
                     "dangling-compute-class",
                     "ccc-unbacked-manual-fallback",
+                    "capacity-buffer-not-ready",
                 ),
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
@@ -447,7 +456,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other twelve are capacity faults no
+        # other thirteen are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
@@ -995,6 +1004,12 @@ CHAT_REPORT_BASELINE_FILED_KEY = "run_baseline_filed"
 # are against that record (False with no open ledger).
 CHAT_REPORT_BASELINE_SCHEDULED_KEY = "run_baseline_scheduled"
 SCHEDULED_CONTEXT_IDS_KEY = "ids"
+# The noted baseline the run's first `finish` read (`scheduled_noted_baseline`),
+# saved with the rest of the context: a later `finish` of the same run reads
+# the envelope the earlier one just stored, whose `scheduled_noted_ids` is
+# this run's own set, so measuring against it loses `noted_changed`,
+# `noted_cleared` and the Visible-again line.
+SCHEDULED_CONTEXT_NOTED_KEY = "noted"
 SCHEDULED_CONTEXT_REPORTED_KEY = "reported"
 SCHEDULED_CONTEXT_KIND_KEY = "record_scheduled"
 SCHEDULED_CONTEXT_AGAINST_KEY = "against_record"
@@ -1263,6 +1278,7 @@ CHECK_PHRASES = {
     "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
     "webhook-ca-bundle-expired": "{object} has an expired or expiring webhook CA bundle",
+    "wi-gsa-iam-binding-unverifiable": "{object} names a Google service account this install cannot vouch for",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -1340,6 +1356,7 @@ CHECK_PHRASES = {
     "image-type": "node image type differs from its peers",
     "database-encryption": "secrets encryption differs from its peers",
     "boot-disk": "{object} node pool has a different boot disk from its peers",
+    "kubelet-config": "{object} node pool has a different kubelet configuration from its peers",
     "no-environment-label": "has no environment label",
     "uncohorted": "differs from its peers on too many settings to compare",
     # AI Workload Security Audit
@@ -1363,6 +1380,7 @@ CHECK_PHRASES = {
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
     "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
+    "capacity-buffer-not-ready": "{object} capacity buffer cannot provision warm headroom",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -1839,6 +1857,73 @@ MAX_COMMAND_CHARS = 2000
 MAX_TITLE_CHARS = 300
 MAX_TEXT_CHARS = 1500
 MAX_NOTE_CHARS = 2000
+# A target's `notes`: what the collector read but could not show, written for
+# the reader and never counted as a coverage gap (`scope_notes`). The GCE
+# collector's rotated serial consoles are the one producer
+# (docs/designs/fleet-audit-collector-manifest.md).
+SCOPE_NOTES_KEY = "notes"
+# The key on `finish`'s JSON line that holds the targets' notes as
+# `{target, note}` objects (`notes_payload`). It is on the line only when a
+# target has a note, so a run without one prints the line it printed before.
+NOTES_RESULT_KEY = "notes"
+NOTE_TARGET_FIELD = "target"
+NOTE_TEXT_FIELD = "note"
+# Beside `notes` on the JSON line of the two forge statuses: the same
+# entries as ready-made report lines, one per noted target. The worker
+# copies these lines into its report verbatim, directly before the closing
+# ledger line — the SOP told it to "relay each entry of `notes`" and on
+# the forge path, where the report is model-composed, two runs in five
+# dropped the relay. A line the worker copies is a rule it cannot
+# misremember. On `NO_FORGE` and `STORE_LEDGER` the report is `summary`
+# verbatim and `summary` already carries the notes, so those lines carry no
+# `report_notes` — a second copy would print each note twice. A `[SILENT]`
+# run posts no report, so it copies nothing; `notes` stays the structured
+# field on every status.
+REPORT_NOTES_KEY = "report_notes"
+# The lead of each `report_notes` line: what the note means for the reader.
+# The eval case gce-rotated-console-notes requires this lead in the report,
+# and bench/tests/test_gce_rotated_console_notes_patterns.py holds the two
+# equal; change them together.
+REPORT_NOTE_PREFIX = "Not visible, not clean:"
+# The stderr reminder beside a published, non-silent line that carries
+# `report_notes`, in the style of the NOT VISIBLE and HELD lines. Two
+# texts, because the anchor differs: a CLEAN run with no ledger has no
+# ledger line (`issue_url` is null), so there the lines close the report.
+REPORT_NOTES_REMINDER = (
+    "NOTES: the report must carry report_notes verbatim, directly before the closing ledger line."
+)
+REPORT_NOTES_REMINDER_NO_LEDGER = (
+    "NOTES: the report must carry report_notes verbatim, as its last lines: this run has no ledger line."
+)
+# On the JSON line of a scheduled run whose noted set changed, when objects
+# left the set since the last scheduled run: their ledger ids. The chat
+# report and the no-forge and store-ledger summaries name them under
+# `VISIBLE_AGAIN_LEAD`, so a run that speaks only because a noted object
+# cleared says which one; the forge-path worker can relay the line.
+NOTED_CLEARED_KEY = "noted_cleared"
+VISIBLE_AGAIN_LEAD = "Visible again, no longer in the noted set"
+# The lead of the notes list in a comment and in the no-forge summary.
+NOTES_LEAD = "Read but not visible, which is not a coverage gap"
+# Ceiling on every rendered notes list (`_capped_notes`): the ledger body's
+# list, the clean and held comments, `report_notes`, the chat report and
+# the no-forge and store-ledger summaries. The scope table's Notes cell is
+# clipped at MAX_CELL_CHARS, which ends before ROTATED_SERIAL_NOTE reaches
+# the instance names, so the body carries the full notes in a list of its
+# own — bounded, so sixty projects of MAX_NOTE_CHARS notes cannot squeeze
+# out the findings, overrun a comment, or flood chat.
+NOTES_SECTION_CAP = 6_000
+# The row that says what the cap left out, wherever the cap applied.
+MORE_NOTES_ROW = "…and {more} more; the stored report carries every full note"
+# A collected target's manifest entry may list the objects its `notes` names
+# as `{check, object}` (and `namespace` where the check has one, and an
+# optional `command`, the object's own read): each one an object a check read
+# but could not see. `finish` refuses a `resolved_because`
+# entry for one of them (`refuse_resolved_over_notes`), because the run did
+# not see the finding go away.
+NOTED_OBJECTS_KEY = "noted_objects"
+# The key a held entry carries when it is held because a note names its
+# object, not because the collector still flags it (`collector_held_entries`).
+NOTED_HELD_KEY = "noted"
 MAX_CELL_CHARS = 120
 # `cluster`, `namespace` and `object` are Kubernetes identifiers, and the API
 # bounds every one of them: a namespace is a 63-character DNS label, a resource
@@ -1949,6 +2034,21 @@ SCHEDULED_COVERAGE_GAPS_KEY = "scheduled_coverage_gaps"
 # first, new or resolved, still reaches the channel. None when no record
 # shows them; a scheduled run then speaks (`scheduled_published_baseline`).
 SCHEDULED_PUBLISHED_IDS_KEY = "scheduled_published_ids"
+# On the stored envelope only: the ledger ids (`published_id`) of the objects
+# that the last scheduled run's targets' notes named (`noted_ids`). Kept and
+# copied forward like `SCHEDULED_COVERAGE_GAPS_KEY`. A scheduled run whose
+# noted set is not this set speaks once (`noted_set_changed`): a new noted
+# object, and one whose note cleared, each reach the channel on one run,
+# and an unchanged noted object does not wake the channel every morning.
+# None when no record shows the set; a scheduled run with a noted object
+# then speaks (`scheduled_noted_baseline`).
+SCHEDULED_NOTED_IDS_KEY = "scheduled_noted_ids"
+# On the JSON line of a scheduled run only, like `SINCE_SCHEDULED_KEY`: the
+# run is not silent because its set of noted objects is not the set the last
+# scheduled run stored. An on-demand run reports everything anyway, so its
+# line never carries the key. The notes themselves are under `notes`
+# (`NOTES_RESULT_KEY`) on every run.
+NOTED_CHANGED_KEY = "noted_changed"
 # On the stored envelope only: the ids under `REPORTED_UNDER_GAP_KEY` that a
 # scheduled run reported. A scheduled run does not report these again; an id
 # that only an on-demand run reported is still news to the channel.
@@ -2123,6 +2223,12 @@ MTU_PEERING_CHECK = "mtu-packet-fragmentation"
 NETWORKING_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     MTU_PEERING_CHECK: frozenset({"networkpeering"}),
 }
+# Compliance 2.21 (`wi-gsa-iam-binding-unverifiable`) names the annotated
+# ServiceAccount and nothing else: a `Namespace/` or `Cluster/` declaration
+# cannot excuse an entire namespace or cluster of Workload Identity bindings.
+COMPLIANCE_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    "wi-gsa-iam-binding-unverifiable": frozenset({"serviceaccount"}),
+}
 # Every declarable check with fixed object kinds, across streams, for the one
 # lookup (`_rollup_scope_reason`) the validator, the join and the manifest
 # route share. The cost table stays its own name because `_is_cost_declarable`
@@ -2133,6 +2239,7 @@ DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     **STOCKOUT_DECLARABLE_OBJECT_KINDS,
     **COMPUTE_DECLARABLE_OBJECT_KINDS,
     **NETWORKING_DECLARABLE_OBJECT_KINDS,
+    **COMPLIANCE_DECLARABLE_OBJECT_KINDS,
 }
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
@@ -3174,6 +3281,18 @@ STORE_LOST_MEMORY_UNGUARDED_GAP = (
     "the report store holds no trusted record of the stored ledger, so nothing "
     "shows whether the findings it carries were fixed; no remediation fix is "
     "closed until a run that reports findings stores the ledger again"
+)
+# Why a noted object (`noted_ids`) is held, and when it is released. It is
+# not flagged: the collector could not see the result, so the run cannot see
+# the finding go away.
+NOTED_HOLD_CAUSE = (
+    "the collector ran its check on the object but could not see the result (for "
+    "a GCE instance, the serial console no longer shows the startup-script run), "
+    "so this run cannot see the finding go away"
+)
+NOTED_HOLD_END = (
+    "it stays until the collector can see the object again (for a GCE instance, "
+    "until the console shows a startup-script run again)"
 )
 LOST_MEMORY_GAPS = (
     LOST_MEMORY_GAP,
@@ -4349,6 +4468,25 @@ INFLIGHT_TTL_SECONDS = 2 * 60 * 60
 # The keys of the in-flight note that `start` writes.
 INFLIGHT_AUDIT_KEY = "audit"
 INFLIGHT_STARTED_KEY = "started_at"
+# The run id `start` made for a run in the shell, for `finish` to mark that
+# run's run-start record done (#6812). A profile worker's run id is its task
+# id, read from its own task credential instead.
+INFLIGHT_RUN_ID_KEY = "run_id"
+# A run id `start` makes when no task credential names one: this prefix and
+# RUN_ID_RANDOM_BYTES random bytes in hex, a DNS-1123 label.
+RUN_ID_LOCAL_PREFIX = "local-"
+RUN_ID_RANDOM_BYTES = 6
+# A Hermes-scheduled run in the shell has a per-run name of its own:
+# deploy/sandbox/session-command.sh exports it as HERMES_CRON_RUN, taken from
+# the run's working directory `<home>/cron/runs/<job>_<execution>`, and where
+# only the directory is there (the agent pod) it is read from the cwd the same
+# way, in the same grammar. The run id is this prefix and the first
+# RUN_ID_CRON_HEX hex digits of the name's sha256, a DNS-1123 label.
+CRON_RUN_ENV = "HERMES_CRON_RUN"
+CRON_RUNS_SEGMENT = "/cron/runs/"
+CRON_RUN_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+RUN_ID_CRON_PREFIX = "cron-"
+RUN_ID_CRON_HEX = 16
 
 
 def _in_flight_since(path: Path) -> float | None:
@@ -4390,7 +4528,7 @@ def _in_flight_since(path: Path) -> float | None:
         return None
 
 
-def claim_in_flight(audit_id: str) -> None:
+def claim_in_flight(audit_id: str, run_id: str | None = None) -> None:
     """Refuse a second `start` while a run of this stream is under way.
 
     Every path `start` scrubs — the run record, the declarations, the
@@ -4493,7 +4631,13 @@ def claim_in_flight(audit_id: str) -> None:
         staged = Path(f"{path}.tmp")
         try:
             staged.write_text(
-                json.dumps({INFLIGHT_AUDIT_KEY: audit_id, INFLIGHT_STARTED_KEY: time.time()}),
+                json.dumps(
+                    {
+                        INFLIGHT_AUDIT_KEY: audit_id,
+                        INFLIGHT_STARTED_KEY: time.time(),
+                        **({INFLIGHT_RUN_ID_KEY: run_id} if run_id else {}),
+                    }
+                ),
                 encoding="utf-8",
             )
             os.replace(staged, path)
@@ -4527,6 +4671,190 @@ def release_in_flight(audit_id: str) -> None:
     is a change to the SOP contract and not made here.
     """
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
+
+
+def cron_run_id() -> str | None:
+    """The run id of a Hermes-scheduled run in the shell, or None for any other run.
+
+    From HERMES_CRON_RUN when set, else from the cwd when it lies under
+    `<...>/cron/runs/<name>`, read as session-command.sh's
+    export_cron_run_var reads it; the name in that function's grammar alone.
+    The same for every command of one run, and for no other run, so `start`
+    and `finish` each compute it without the in-flight note.
+    """
+    name = os.environ.get(CRON_RUN_ENV, "")
+    if not name:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            return None
+        _, found, rest = cwd.partition(CRON_RUNS_SEGMENT)
+        name = rest.split("/", 1)[0] if found else ""
+    if not CRON_RUN_NAME_RE.match(name):
+        return None
+    return RUN_ID_CRON_PREFIX + hashlib.sha256(name.encode("utf-8")).hexdigest()[:RUN_ID_CRON_HEX]
+
+
+def new_run_id() -> str:
+    """The id of the run `start` is opening (#6812).
+
+    A profile worker's task id, from its own task credential: no other run
+    has it, so a late `finish` of an older task cannot mark this one done. A
+    Hermes-scheduled run in the shell: its cron run's id (`cron_run_id`),
+    which `finish` computes again for itself. A run started by hand in the
+    shell: a fresh random id, which `start` keeps in the in-flight note for
+    `finish`.
+    """
+    return (
+        _report_status().task_id_from_credential()
+        or cron_run_id()
+        or RUN_ID_LOCAL_PREFIX + secrets.token_hex(RUN_ID_RANDOM_BYTES)
+    )
+
+
+def run_is_scheduled(flag: bool = False) -> bool:
+    """Whether the run `start` is opening is a scheduled one (#6812).
+
+    `start` works this out itself, so no prompt has to remember a flag:
+
+    - a Hermes cron run: HERMES_CRON_RUN is set, or the cwd lies under
+      `<home>/cron/runs/<name>`, the detection `cron_run_id` makes for the run
+      id;
+    - a profile task whose task credential carries a builtin schedule's
+      trigger (`origin: builtin`, named `schedule/<name>`,
+      `report_status.task_trigger_is_schedule`).
+
+    `start --scheduled` (`flag`) is still taken as an override. Any other run,
+    one started by hand in the shell, is not scheduled.
+    """
+    return bool(flag) or cron_run_id() is not None or _report_status().task_trigger_is_schedule()
+
+
+def this_run_id(audit_id: str) -> str | None:
+    """The id of the run `finish` is closing, or None when it cannot be told.
+
+    The task credential's task id, or the cron run's id, each computed here
+    as `new_run_id` computed it, never read from the note. Only a run started
+    by hand in the shell falls back to the id `start` kept in the stream's
+    in-flight note. That note is the stream's, not the run's: such a run that
+    outlived its lease after a later `start` replaced the note reads the later
+    run's id, the known limit `release_in_flight` names. Read before `finish`
+    releases the note.
+    """
+    task = _report_status().task_id_from_credential() or cron_run_id()
+    if task:
+        return task
+    try:
+        note = json.loads(Path(inflight_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(note, dict) or note.get(INFLIGHT_AUDIT_KEY) != audit_id:
+        return None
+    run_id = note.get(INFLIGHT_RUN_ID_KEY)
+    status = _report_status()
+    return run_id if isinstance(run_id, str) and status.RUN_ID_RE.match(run_id) else None
+
+
+# One line per process for a run-start record the store would not take, so a
+# store that predates the records costs each run one line, not one per call.
+_RUN_START_LOGGED: set[str] = set()
+
+
+def _log_run_start_once(message: str) -> None:
+    if message not in _RUN_START_LOGGED:
+        _RUN_START_LOGGED.add(message)
+        log(message)
+
+
+def _run_start_store(audit_id: str, repo: str):
+    """The store root `report_status` reads run-start records from: the broker
+    client, or the file store's root."""
+    client = _report_store_client()
+    if client is not None:
+        return client
+    return str(Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR))
+
+
+def _run_start_refused(exc: BaseException) -> bool:
+    """Whether `exc` is a broker or listener that does not know the record's
+    name: a broker from before #6812 answers 404 for the route, a listener
+    400 for a run that is not a stamp."""
+    status = _report_status()
+    return isinstance(exc, status.ReportStoreError) and exc.status in (400, 404)
+
+
+def record_run_start(audit_id: str, repo: str, run_id: str, scheduled: bool, now: datetime) -> None:
+    """Write this run's run-start record (#6812). Best-effort: never stops the run.
+
+    A store that refuses it (an older broker or listener) or fails is logged
+    once, and the run goes on untracked: a reader then says nothing about it.
+    A stream with no store for `repo` yet (its first run there) is untracked
+    and says nothing: a record never creates a store.
+    """
+    status = _report_status()
+    try:
+        record = status.run_start_record(run_id, now.astimezone(timezone.utc).isoformat(), scheduled)
+        status.write_run_start(_run_start_store(audit_id, repo), audit_id, repo, record)
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 -- a record a store won't take must not stop the run
+        if _run_start_refused(exc):
+            _log_run_start_once(
+                f"NOTE: the report store does not take run-start records yet ({exc}); "
+                f"this run of {audit_id} goes on, and a reader will not see it if it does not finish."
+            )
+        else:
+            _log_run_start_once(
+                f"WARNING: the run-start record for {audit_id} was not written ({exc}); "
+                "this run goes on untracked."
+            )
+
+
+def mark_run_done(audit_id: str, run_id: str | None, repos: list, outcome: str, now: datetime) -> bool:
+    """Mark this run's run-start record done (#6812), matched by run id. Best-effort.
+
+    Reads the record named for `run_id` in the first of `repos` that holds one
+    and rewrites it with `done_at` and `outcome`, keeping its `started_at`. A
+    run with no record (its `start` was refused, or ran before records
+    existed) writes nothing: a done mark with no start would be no record. A
+    late `finish` of an older run marks that run's record alone, so a newer
+    run's stays unfinished. Returns whether a mark was written.
+    """
+    if not run_id:
+        return False
+    status = _report_status()
+    for repo in dict.fromkeys(repo for repo in repos if isinstance(repo, str) and repo):
+        try:
+            store = _run_start_store(audit_id, repo)
+            record = status.read_run_start(store, audit_id, repo, run_id)
+            if record is None:
+                continue
+            done = status.run_start_record(
+                run_id,
+                record["started_at"],
+                record.get("scheduled") is True,
+                done_at=now.astimezone(timezone.utc).isoformat(),
+                outcome=outcome,
+            )
+            status.write_run_start(store, audit_id, repo, done)
+            return True
+        except Exception as exc:  # noqa: BLE001 -- the run has published; the mark is for readers
+            if not _run_start_refused(exc):
+                _log_run_start_once(f"WARNING: the run-start record of {audit_id} was not marked done ({exc}).")
+    return False
+
+
+def _mark_finished(audit_id: str, run_id: str | None, stored: dict | None) -> None:
+    """`finish` published: mark its run done where `start` recorded it.
+
+    Where: the repository `start` recorded in the run record, then the one the
+    stored envelope names. The outcome is the envelope's `status`, or
+    `unstored` when the store did not keep it.
+    """
+    record = read_run_record(audit_id) or {}
+    repos = [record.get("repo"), (stored or {}).get("repo")]
+    outcome = str((stored or {}).get("status") or "unstored")
+    mark_run_done(audit_id, run_id, repos, outcome, datetime.now(timezone.utc))
 
 
 def inflight_started_at(audit_id: str, now: float) -> float | None:
@@ -4871,6 +5199,7 @@ def report_envelope(
     scheduled: bool = False,
     scheduled_coverage_gaps: list[str] | None = None,
     scheduled_published_ids: list[str] | None = None,
+    scheduled_noted_ids: list[str] | None = None,
     scheduled_reported_under_gap: list[str] | None = None,
     started_at: str | None | object = RUN_START_UNREAD,
     open_issue_number: int | None = None,
@@ -4922,8 +5251,10 @@ def report_envelope(
     --scheduled`). `scheduled_coverage_gaps` is the gap list of the last
     scheduled run (`next_scheduled_value`), or None when no record shows it.
     `scheduled_published_ids` is the id set the last scheduled run published
-    (`next_scheduled_value`), or None. `scheduled_reported_under_gap` is the
-    part of `reported_under_gap` that a scheduled run reported.
+    (`next_scheduled_value`), or None. `scheduled_noted_ids` is the noted set
+    of the last scheduled run (`next_scheduled_value` over `noted_ids`), or
+    None. `scheduled_reported_under_gap` is the part of `reported_under_gap`
+    that a scheduled run reported.
     """
     return {
         "audit_id": audit_id,
@@ -4951,6 +5282,9 @@ def report_envelope(
         ),
         SCHEDULED_PUBLISHED_IDS_KEY: (
             sorted(set(scheduled_published_ids)) if scheduled_published_ids is not None else None
+        ),
+        SCHEDULED_NOTED_IDS_KEY: (
+            sorted(set(scheduled_noted_ids)) if scheduled_noted_ids is not None else None
         ),
         SCHEDULED_REPORTED_UNDER_GAP_KEY: sorted(set(scheduled_reported_under_gap or [])),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
@@ -5285,6 +5619,7 @@ def scheduled_context(
         SCHEDULED_CONTEXT_REPORTED_KEY: sorted(scheduled_reported_baseline(memory)),
         SCHEDULED_CONTEXT_KIND_KEY: kind if isinstance(kind, bool) else None,
         SCHEDULED_CONTEXT_AGAINST_KEY: existing_issue is not None,
+        SCHEDULED_CONTEXT_NOTED_KEY: scheduled_noted_baseline(scheduled_memory),
     }
 
 
@@ -5295,12 +5630,16 @@ def _saved_scheduled_context(value: object) -> dict | None:
     ids = value.get(SCHEDULED_CONTEXT_IDS_KEY)
     reported = value.get(SCHEDULED_CONTEXT_REPORTED_KEY)
     kind = value.get(SCHEDULED_CONTEXT_KIND_KEY)
+    noted = value.get(SCHEDULED_CONTEXT_NOTED_KEY)
     if (
         (ids is None or (isinstance(ids, list) and all(isinstance(fid, str) for fid in ids)))
         and isinstance(reported, list)
         and all(isinstance(fid, str) for fid in reported)
         and (kind is None or isinstance(kind, bool))
         and isinstance(value.get(SCHEDULED_CONTEXT_AGAINST_KEY), bool)
+        # An entry saved without the noted key (an older image's first
+        # `finish`) stays valid; the reader falls back to its own read.
+        and (noted is None or (isinstance(noted, list) and all(isinstance(fid, str) for fid in noted)))
     ):
         return value
     return None
@@ -5586,6 +5925,30 @@ def render_chat_report(
     if dropped:
         lines.append(
             f"- The collector flagged {len(dropped)} candidate(s) this run's document does not carry."
+        )
+    # A noted object that cleared: the notes list below names only what is
+    # still noted, so the run that speaks for the clear says which object
+    # is visible again (`noted_cleared_ids`).
+    cleared = [str(fid) for fid in payload.get(NOTED_CLEARED_KEY) or []]
+    if cleared:
+        shown_cleared, left_cleared = _capped_notes(cleared)
+        lines.append(
+            f"- {VISIBLE_AGAIN_LEAD} ({len(cleared)}): "
+            + ", ".join(shown_cleared)
+            + (f", {MORE_NOTES_ROW.format(more=left_cleared)}" if left_cleared else "")
+        )
+    # The targets' notes, before the ledger line, which stays last for the
+    # Slack headline. A `[SILENT]` run posts no report, so its notes stay in
+    # the store — and a run whose noted set changed is not silent
+    # (`noted_set_changed`), so the change reaches the channel once. Capped
+    # (`_capped_notes`), so sixty long notes do not flood the channel.
+    notes = scope_notes(data)
+    if notes:
+        shown, left = _capped_notes(notes)
+        lines.append(
+            f"- {NOTES_LEAD}: "
+            + "; ".join(shown)
+            + (f"; {MORE_NOTES_ROW.format(more=left)}" if left else "")
         )
     if payload.get("issue_url"):
         lines.append(CHAT_REPORT_LEDGER_LINE.format(url=payload["issue_url"]))
@@ -6698,6 +7061,8 @@ def _validate_findings_document(data: object, audit_id: str, expiry_day: date | 
             f"scope.clusters[{i}].limitations",
             allow_empty=False,
         )
+        if SCOPE_NOTES_KEY in cluster:
+            _require_str_ok(cluster.get(SCOPE_NOTES_KEY), f"scope.clusters[{i}].{SCOPE_NOTES_KEY}")
         if CLUSTERS_LISTED_KEY in cluster:
             listed = cluster[CLUSTERS_LISTED_KEY]
             if not name.startswith(PROJECT_TARGET_PREFIX) or isinstance(listed, bool) or listed != 0:
@@ -8520,6 +8885,225 @@ def _candidates(manifest: dict | None):
                 yield entry, candidate
 
 
+def adopt_collector_notes(data: dict, manifest: dict | None) -> list[str]:
+    """Copy each collected target's `notes` from the manifest onto the
+    document's target of the same name. Returns the names changed.
+
+    A note is the collector's own sentence about what it read but could not
+    show, so it is taken from the collector, as the evidence is, rather than
+    left to the model to copy. It is information, not a gap: `coverage_gaps`
+    never reads it.
+
+    A collected target whose manifest entry has no note loses the note the
+    document carries: a precheck replays a stored document, and its note
+    can be from an earlier collection. A target with no collected entry
+    keeps its note.
+    """
+    if not isinstance(manifest, dict):
+        return []
+    by_name = {
+        str(entry.get("name")): str(entry.get(SCOPE_NOTES_KEY) or "").strip()
+        for entry in manifest.get("clusters") or []
+        if isinstance(entry, dict) and entry.get("outcome") == MANIFEST_OUTCOME_COLLECTED
+    }
+    changed = []
+    for cluster in (data.get("scope") or {}).get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        name = str(cluster.get("name"))
+        if name not in by_name:
+            continue
+        note = by_name[name]
+        if note:
+            cluster[SCOPE_NOTES_KEY] = note[:MAX_NOTE_CHARS]
+            changed.append(name)
+        elif SCOPE_NOTES_KEY in cluster:
+            del cluster[SCOPE_NOTES_KEY]
+            changed.append(name)
+    return changed
+
+
+def scope_note_entries(data: dict) -> list[dict]:
+    """`{target, note}` for every audited target that carries `notes`.
+
+    The JSON line of `finish` carries these on every status
+    (`notes_payload`), so the worker can relay them: on a clean run with no
+    open ledger, the line is the only place the note goes.
+    """
+    out = []
+    for cluster in (data.get("scope") or {}).get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        # Flattened to one line: a worker-written note can carry newlines, a
+        # Markdown heading or a line that reads as a verdict, and every
+        # reader of an entry — `report_notes`, the comments, the chat
+        # report — treats it as one line.
+        note = " ".join(publishable_text(str(cluster.get(SCOPE_NOTES_KEY) or "")).split())
+        if note:
+            name = str(cluster.get("name", "")).strip() or UNNAMED_EVIDENCE_TARGET
+            out.append({NOTE_TARGET_FIELD: name, NOTE_TEXT_FIELD: note[:MAX_NOTE_CHARS]})
+    return out
+
+
+def notes_payload(data: dict) -> dict:
+    """`{NOTES_RESULT_KEY: [...]}` for the JSON line, or nothing when no target has a note."""
+    entries = scope_note_entries(data)
+    return {NOTES_RESULT_KEY: entries} if entries else {}
+
+
+def log_report_notes_reminder(payload: dict) -> None:
+    """The worker-facing reminder (`REPORT_NOTES_REMINDER`), in the style of
+    the NOT VISIBLE and HELD lines, printed beside a published line whose
+    report the worker composes: it carries `report_notes` and is not silent.
+    A `[SILENT]` run, a dry run and a refused document get none, and the
+    `summary` statuses carry the notes inside `summary`. The text follows
+    the anchor: directly before the closing ledger line, or, on a run with
+    no ledger line, as the report's last lines."""
+    if payload.get(REPORT_NOTES_KEY) and not payload.get("silent_ok"):
+        log(REPORT_NOTES_REMINDER if payload.get("issue_url") else REPORT_NOTES_REMINDER_NO_LEDGER)
+
+
+def report_notes_payload(data: dict) -> dict:
+    """`report_notes` for the JSON line of the two forge statuses, or nothing.
+
+    The same entries as `notes`, as ready-made lines the worker copies into
+    its report verbatim, directly before the closing ledger line
+    (`REPORT_NOTES_KEY`): the relay is a copy, not a rule to remember. Only
+    the forge statuses carry it — on `NO_FORGE` and `STORE_LEDGER` the
+    report is `summary` verbatim, and `summary` already carries the notes.
+    Capped like every rendered notes list (`_capped_notes`).
+    """
+    entries = scope_note_entries(data)
+    if not entries:
+        return {}
+    lines = [
+        f"{REPORT_NOTE_PREFIX} {e[NOTE_TARGET_FIELD]}: {e[NOTE_TEXT_FIELD]}"
+        for e in entries
+    ]
+    shown, left = _capped_notes(lines)
+    if left:
+        shown = [*shown, MORE_NOTES_ROW.format(more=left)]
+    return {REPORT_NOTES_KEY: shown}
+
+
+def _capped_notes(notes: list[str]) -> tuple[list[str], int]:
+    """The notes that fit `NOTES_SECTION_CAP` (at most `MAX_SCOPE_ROWS` of
+    them), and how many were left out. Every rendered notes list uses it, so
+    sixty MAX_NOTE_CHARS notes cannot overrun a body section, a comment, a
+    summary, the chat report or the JSON line; `MORE_NOTES_ROW` says where
+    the rest is."""
+    shown: list[str] = []
+    total = 0
+    for note in notes[:MAX_SCOPE_ROWS]:
+        if total + len(note) > NOTES_SECTION_CAP:
+            break
+        shown.append(note)
+        total += len(note)
+    return shown, len(notes) - len(shown)
+
+
+def scope_notes(data: dict) -> list[str]:
+    """`<target>: <note>` for every audited target that carries `notes`.
+
+    Rendered on the ledger (the scope table, the clean comment and the held
+    comment) so a run never reads as having cleared what it could not see;
+    never a coverage gap, because what it describes is the ordinary state of
+    a healthy fleet.
+    """
+    return [f"{e[NOTE_TARGET_FIELD]}: {e[NOTE_TEXT_FIELD]}" for e in scope_note_entries(data)]
+
+
+def _comment_scope_notes(data: dict) -> list[str]:
+    """The comment lines that list the targets' notes, or none without a note."""
+    notes = scope_notes(data)
+    if not notes:
+        return []
+    shown, left = _capped_notes(notes)
+    out = ["", f"{NOTES_LEAD} ({len(notes)}):", ""]
+    out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in shown]
+    if left:
+        out.append(f"- _{MORE_NOTES_ROW.format(more=left)}_")
+    return out
+
+
+def _render_body_notes(data: dict) -> list[str]:
+    """The un-clipped notes list for the ledger body, under the scope table.
+
+    The table's Notes cell is clipped at MAX_CELL_CHARS, which ends before
+    ROTATED_SERIAL_NOTE reaches the instance names, so without this list a
+    findings run's ledger never names the noted objects; the clean and held
+    comments already carry the same list (`_comment_scope_notes`). Bounded
+    at NOTES_SECTION_CAP, so a fleet of MAX_NOTE_CHARS notes cannot squeeze
+    the findings out of the budget: the rows past the cap are counted, and
+    every full note stays in the stored report and on the JSON line.
+    """
+    return _comment_scope_notes(data)
+
+
+def _noted_objects(manifest: dict | None):
+    """`(entry, identity, command)` for every object a collected target lists
+    under `noted_objects`. `identity` has the four identity fields of a
+    finding; `command` is the object's own read, or "" when the entry has none."""
+    for entry in _manifest_clusters(manifest):
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            continue
+        for item in entry.get(NOTED_OBJECTS_KEY) or []:
+            if isinstance(item, dict) and item.get("check") and item.get("object"):
+                yield entry, {
+                    "check": str(item["check"]),
+                    "cluster": str(entry.get("name") or ""),
+                    "namespace": str(item.get("namespace") or ""),
+                    "object": str(item["object"]),
+                }, str(item.get("command") or "").strip()
+
+
+def noted_finding_ids(findings: list[dict], manifest: dict | None) -> set[str]:
+    """The ids of the document's findings on a noted object (`noted_ids`).
+
+    The sweep passes over them: the collector could not see their result.
+    """
+    noted = noted_ids(manifest)
+    return {str(f.get("id") or "") for f in findings if isinstance(f, dict) and published_id(f) in noted}
+
+
+def noted_ids(manifest: dict | None) -> set[str]:
+    """The ledger ids (`published_id`) of the objects the targets' notes name.
+
+    The collector ran the check on each one but could not see the result, so
+    a previous finding on one did not go away in this run's sight. A noted id
+    that the previous ledger carries is held as a candidate the collector
+    still emits is (`still_flagged_ids` with `carried`): it is not resolved,
+    and its pull request is not closed. A noted id that no previous finding
+    carries holds nothing, because there is no finding to keep.
+    """
+    return {published_id(identity) for _entry, identity, _command in _noted_objects(manifest)}
+
+
+def refuse_resolved_over_notes(data: dict, manifest: dict | None) -> None:
+    """Refuse a `resolved_because` entry for an object a target's note names.
+
+    The collector lists under `noted_objects` each object whose check it ran
+    but could not see: a GCE instance whose serial console rotated past its
+    last startup-script run. A previous finding on such an object did not go
+    away in this run's sight, so "resolved" closes a fault that can still be
+    there. The worker carries it forward: it reports the finding again from
+    the previous finding.
+    """
+    noted = noted_ids(manifest)
+    if not noted:
+        return
+    for i, entry in enumerate(data.get("resolved_because") or []):
+        if isinstance(entry, dict) and published_id(entry) in noted:
+            raise ValidationError(
+                f"resolved_because[{i}]: {entry.get('object')!r} on {entry.get('cluster')!r} "
+                f"is named in that target's `{SCOPE_NOTES_KEY}`: the collector ran "
+                f"{entry.get('check')!r} there but could not see the result, so this "
+                "run did not see the finding go away. Do not write it as resolved. "
+                "Carry it forward: report it again in `findings`, from the previous "
+                "finding that `start` listed under `carried`."
+            )
+
+
 def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> list[str]:
     """Replace each finding's `evidence` with what the collector recorded for
     the same identity. Returns the ids changed.
@@ -8908,7 +9492,7 @@ def _declared_ids(data: dict) -> set[str]:
     }
 
 
-def still_flagged_ids(manifest: dict | None, data: dict) -> set[str]:
+def still_flagged_ids(manifest: dict | None, data: dict, carried: Iterable[str] = ()) -> set[str]:
     """The finding ids the collector still flags that the document has not declared.
 
     The one set both `finish` branches subtract, built from the manifest and
@@ -8922,7 +9506,11 @@ def still_flagged_ids(manifest: dict | None, data: dict) -> set[str]:
     release a still-flagged finding: that entry claims the object is gone, and
     the collector says it is not.
     """
-    return collector_flagged_ids(manifest) - _declared_ids(data)
+    # A noted object that a previous finding carries (`carried`, the previous
+    # ledger ids) is held the same way: the collector could not see it, so
+    # the run cannot say that its finding went away (`noted_ids`).
+    noted = noted_ids(manifest) & set(carried)
+    return (collector_flagged_ids(manifest) | noted) - _declared_ids(data)
 
 
 def collector_held_entries(
@@ -8932,6 +9520,7 @@ def collector_held_entries(
     exclude: set[str],
     previous_body: str | None,
     preview_from_candidates: bool = False,
+    carried_ids: Iterable[str] = (),
 ) -> list[dict]:
     """The findings the collector still flags that this run must carry, sorted by id.
 
@@ -8971,7 +9560,11 @@ def collector_held_entries(
     purposes of the close whatever the document says. `data` is what releases
     one: an entry under `declared`, per `still_flagged_ids`.
     """
-    flagged = still_flagged_ids(manifest, data) - set(exclude)
+    # A noted id is held only where the previous ledger's marker carries it,
+    # which the intersection below checks. The dry run reads no ledger, so
+    # it previews no noted id.
+    carried = () if preview_from_candidates else noted_ids(manifest)
+    flagged = still_flagged_ids(manifest, data, carried) - set(exclude)
     if not flagged:
         return []
     if preview_from_candidates:
@@ -8983,6 +9576,10 @@ def collector_held_entries(
         clusters = {str(entry.get("name") or "") for entry in _manifest_clusters(manifest)}
         marker_ids, _ = previous_marker_ids(previous_body, flagged, clusters)
         held_ids = [fid for fid in marker_ids if fid in flagged]
+        # A noted id the ledger carried without a rendered row: the body cut
+        # it for space, and `carried_ids` (every id the ledger carried) still
+        # names it. Its identity comes from `noted_objects` below.
+        held_ids += sorted((set(carried_ids) & noted_ids(manifest) & flagged) - set(held_ids))
         respelled = _respelled_rows(previous_body, flagged, clusters)
         # Titles from the rows that recorded a location, not from every
         # heading. `held_row_from_id` renders a heading too -- "<id> (carried
@@ -9021,6 +9618,24 @@ def collector_held_entries(
             "object": str(candidate.get("object") or ""),
             "commands": [command or COLLECTOR_COMMAND_UNRECORDED],
         }
+    # A noted object has no candidate. Its identity is the note's, and its
+    # command is its own read; the check's joined record, which can be
+    # clipped before that read, only when the entry carries none.
+    for entry, identity, own_command in _noted_objects(manifest):
+        commands = [
+            str(command.get("command") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0 and command.get("check") == identity["check"]
+        ]
+        command = own_command or (commands[0] if commands else "").strip()
+        by_ledger_id.setdefault(
+            published_id(identity),
+            {
+                **identity,
+                "commands": [command or COLLECTOR_COMMAND_UNRECORDED],
+                NOTED_HELD_KEY: True,
+            },
+        )
     held: list[dict] = []
     for fid in held_ids:
         identity = by_ledger_id.get(fid)
@@ -9046,8 +9661,14 @@ def cap_held_entries(entries: list[dict]) -> tuple[list[dict], list[dict]]:
     return entries[:MAX_HELD_IDS], entries[MAX_HELD_IDS:]
 
 
-def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[str]:
+def uncorroborated_findings(
+    findings: list[dict], manifest: dict | None, carried: Iterable[str] = ()
+) -> set[str]:
     """Findings published under a slug the collector ran and did not flag them for.
+
+    `carried` is the ids the previous ledger carried (`published_id`
+    spelling): a noted object's finding is exempt only when it is one of
+    them — see the note at the bottom.
 
     The inverse of `unpublished_candidates`, and the direction nothing was
     watching. That one asks what the collector saw and the document did not
@@ -9093,11 +9714,25 @@ def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[
             if isinstance(command, dict) and command.get("rc") == 0
         )
     flagged = _flagged_identities(manifest)
+    # A noted object was read but not seen, so its check did not pass it: a
+    # finding CARRIED on one is not uncorroborated (`noted_ids`). Only a
+    # carried one — the previous ledger's ids, as the caller read them. A
+    # new finding the model wrote about a noted object is a verdict nothing
+    # observed, and it is disclosed as uncorroborated like any other; the
+    # sweep already passes over it through `not_visible`, so this changes
+    # what is said, not what is opened. With no carried ids (a dry run reads
+    # no ledger), no noted id is exempt.
+    carried_ids = {str(fid) for fid in carried}
+    noted = {
+        derive_finding_id(identity)
+        for _entry, identity, _command in _noted_objects(manifest)
+        if published_id(identity) in carried_ids
+    }
     return {
         str(finding.get("id") or "")
         for finding in findings
         if str(finding.get("check") or "") in ran.get(str(finding.get("cluster") or ""), set())
-        and derive_finding_id(finding) not in flagged
+        and derive_finding_id(finding) not in flagged | noted
     }
 
 
@@ -10172,8 +10807,9 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
     A check with fixed object kinds accepts only those
-    (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check and
-    the compute snapshot check and the networking peering check). The two
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks, the stockout pool check,
+    the compute snapshot check, the networking peering check, and the
+    compliance ServiceAccount check). The two
     controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
@@ -10682,6 +11318,81 @@ def scheduled_published_baseline(memory: dict | None) -> list[str] | None:
         return None
     stored = (memory or {}).get(SCHEDULED_PUBLISHED_IDS_KEY)
     return [str(fid) for fid in stored] if isinstance(stored, list) else None
+
+
+def scheduled_noted_baseline(memory: dict | None) -> list[str] | None:
+    """The noted ids of the last scheduled run, as `memory` shows them, or None.
+
+    `{}` is a store that holds no run of this stream: no scheduled run noted
+    anything, so the answer is the empty list. None is "not known": no
+    trusted record, or a record written before `finish` stored this key. A
+    record written under another `id_scheme` also gives None, because the
+    noted ids are ledger ids and a compare across schemes would call every
+    object new. The baseline is carried forward the way the published-ids
+    baseline is (`next_scheduled_value`), so an on-demand run between two
+    scheduled runs does not swallow the change.
+    """
+    if memory == {}:
+        return []
+    if (memory or {}).get("id_scheme") != ID_SCHEME:
+        return None
+    stored = (memory or {}).get(SCHEDULED_NOTED_IDS_KEY)
+    return [str(fid) for fid in stored] if isinstance(stored, list) else None
+
+
+def noted_set_changed(noted: set[str], memory: dict | None) -> bool:
+    """Whether this run's set of noted objects is news to the channel.
+
+    The channel hears a noted object once: on the run where its note first
+    names it, and once more on the run where it clears. Between those runs
+    the set is the last scheduled run's set, and the notes alone do not keep
+    a scheduled run from `[SILENT]` — a fleet with one long-lived noted VM
+    would otherwise wake the channel every morning. The comparison is on the
+    objects' ledger ids (`noted_ids`), never on the note text: a reworded
+    note about the same objects is not a change.
+
+    With no record of the last scheduled run's set (None — a lost store, or
+    a record from before the key), a run with a noted object speaks, and a
+    run with none stays quiet: it has no note to relay, and a cleared set it
+    cannot know about is not announced.
+    """
+    return noted_set_changed_against(noted, scheduled_noted_baseline(memory))
+
+
+def noted_set_changed_against(noted: set[str], baseline: list[str] | None) -> bool:
+    """`noted_set_changed` against a baseline list already in hand."""
+    if baseline is None:
+        return bool(noted)
+    return set(noted) != set(baseline)
+
+
+def run_noted_baseline(baseline: "RunBaseline", scheduled_memory: dict | None) -> list[str] | None:
+    """The noted baseline this `finish` measures against.
+
+    What the run's first `finish` read and saved (`scheduled_context`,
+    `SCHEDULED_CONTEXT_NOTED_KEY`), when this is a later `finish` of the
+    same run or its re-run after a death: the earlier `finish` already
+    stored this run's set as `scheduled_noted_ids`, so reading the store
+    again would call the set unchanged and drop `noted_changed`,
+    `noted_cleared` and the Visible-again line. Otherwise this `finish`'s
+    own read (`scheduled_noted_baseline`). An entry saved by an image from
+    before the key falls back the same way.
+    """
+    saved = baseline.scheduled or {}
+    if baseline.from_entry and SCHEDULED_CONTEXT_NOTED_KEY in saved:
+        stored = saved.get(SCHEDULED_CONTEXT_NOTED_KEY)
+        return [str(fid) for fid in stored] if isinstance(stored, list) else None
+    return scheduled_noted_baseline(scheduled_memory)
+
+
+def noted_cleared_ids(noted: set[str], memory: dict | None) -> list[str]:
+    """The ids that left the noted set since the last scheduled run: in the
+    baseline (`scheduled_noted_baseline`) and not noted now. A run that
+    speaks because a note cleared would otherwise say nothing about it —
+    the notes list names only what is still noted — so the chat report and
+    the summaries name these under `VISIBLE_AGAIN_LEAD`, and the JSON line
+    carries them under `NOTED_CLEARED_KEY`."""
+    return sorted(set(scheduled_noted_baseline(memory) or []) - set(noted))
 
 
 def first_stored_record(directory, trusted: Callable[[dict], bool]) -> dict | None:
@@ -12069,6 +12780,21 @@ def collector_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str
     )
 
 
+def noted_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
+    """Why a `/remediate` on a finding held over a noted object is neither refused nor acted on.
+
+    The sibling of `collector_hold_reason` for an id a target's notes name
+    (`noted_ids`): the collector does not flag it, but it could not see the
+    result either.
+    """
+    return (
+        f"`{target}` is not in this run's document, and the ledger keeps it: "
+        f"{NOTED_HOLD_CAUSE}, and {NOTED_HOLD_END}. There is no finding in the "
+        f"document to open a {noun} from. The request stands: the first run "
+        "whose document carries the finding acts on it"
+    )
+
+
 def unread_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a finding held over an unchecked target is neither refused nor acted on.
 
@@ -12164,6 +12890,7 @@ def parse_remediate_commands(
     collector_flagged: set[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
     unread_held: set[str] | None = None,
+    collector_noted: set[str] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -12215,6 +12942,8 @@ def parse_remediate_commands(
     covered = declared_by_id(declared)
     held_ids = set(collector_held or ())
     flagged_ids = set(collector_flagged or ()) - held_ids
+    # A noted id is held or still-flagged too; it gets its own reason.
+    noted_held = set(collector_noted or ()) & (held_ids | flagged_ids)
     # The collector's word first, as on the clean branch: an id the
     # collector still flags gets the collector's reason.
     unread_ids = set(unread_held or ()) - held_ids - flagged_ids
@@ -12315,6 +13044,9 @@ def parse_remediate_commands(
             target = raw.strip().strip("`")
             if target in withheld_ids:
                 deferred.append(deferral_reason(target))
+                continue
+            if target in noted_held:
+                deferred.append(noted_hold_reason(target, noun))
                 continue
             if target in held_ids:
                 deferred.append(collector_hold_reason(target, noun))
@@ -12475,7 +13207,19 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
     the full `parse_remediate_commands` gate against the real finding set.
     `all` is not expanded here — it names no specific file to write.
     """
-    targets: set[str] = set()
+    return sorted(remediate_request_times(comments))
+
+
+def remediate_request_times(comments: list[dict]) -> dict[str, str]:
+    """Each id an authorized `/remediate` names, to its newest request's `createdAt`.
+
+    The same reading as `pending_remediate_targets`, with the time kept:
+    `plan_generated_fixes` lets a request newer than a pull request's close
+    or merge set that pull request aside, as `promotion_candidates` does for
+    a human close. An id whose comments carry no time maps to `""`, which
+    never counts as newer than anything (`timestamp_strictly_after`).
+    """
+    times: dict[str, str] = {}
     for comment in comments or []:
         if is_machine_author(comment):
             continue
@@ -12485,11 +13229,14 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         body = strip_block_quotes(
             strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
         )
+        created_at = str(comment.get("createdAt", "") or "")
         for raw in REMEDIATE_RE.findall(body):
             target = raw.strip().strip("`")
-            if target and target != "all":
-                targets.add(target)
-    return sorted(targets)
+            if not target or target == "all":
+                continue
+            if target not in times or newer_timestamp(times[target], created_at):
+                times[target] = created_at
+    return times
 
 
 # --------------------------------------------------------------------------- #
@@ -12624,6 +13371,7 @@ def promotion_candidates(
     triage_marked: set[str] | None = None,
     vouched: set[str] | None = None,
     sweep_off: bool = False,
+    not_visible: set[str] | None = None,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
@@ -12725,6 +13473,21 @@ def promotion_candidates(
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
+            continue
+        # A finding on a noted object (`noted_finding_ids`) is carried from a
+        # previous run: the collector could not see its result, so nothing
+        # this run backs a fix opened unattended. A carried one is in no
+        # block; the ledger shows it, and `/remediate` still opens it. An
+        # INVENTED one — on a noted object no previous ledger carried
+        # (`uncorroborated_findings`) — is disclosed as uncorroborated
+        # first: this skip is the only exit before the uncorroborated
+        # block, and without the record here the dry run's warning, the
+        # per-finding stderr line and the ledger's uncorroborated block all
+        # stayed silent about it. The skip still keeps both out of the
+        # sweep.
+        if fid in (not_visible or set()):
+            if fid in uncorroborated_set:
+                unbacked.append(fid)
             continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
@@ -13670,6 +14433,7 @@ def _render_scope(
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
+    show_notes = any(str(c.get(SCOPE_NOTES_KEY, "")).strip() for c in clusters)
     roster = audit_checks(audit_id)
 
     out = ["", "## Scope", "", f"Audited {scope_phrase(audit_id, clusters)} on {stamp}."]
@@ -13681,6 +14445,9 @@ def _render_scope(
     if show_limitations:
         header += " Limitations |"
         rule += " ----------- |"
+    if show_notes:
+        header += " Notes |"
+        rule += " ----- |"
     out += ["", header, rule]
     for cluster in clusters[:MAX_SCOPE_ROWS]:
         row = (
@@ -13706,10 +14473,18 @@ def _render_scope(
             row += f"| {complete}/{applicable}{note}{flag} "
         if show_limitations:
             row += f"| {_cell(cluster.get('limitations', '')) or '—'} "
+        if show_notes:
+            # Not a gap, so not in the Limitations column: the row's checks
+            # ran, and this says what one of them could not see.
+            # Clipped as the Limitations cell is: 60 rows of full notes do
+            # not fit in the body. The full note is in the body's own list
+            # under this table (`_render_body_notes`), in the stored
+            # document and in the clean comment.
+            row += f"| {_cell(cluster.get(SCOPE_NOTES_KEY, '')) or '—'} "
         out.append(row + "|")
     if len(clusters) > MAX_SCOPE_ROWS:
         remaining = len(clusters) - MAX_SCOPE_ROWS
-        columns = 3 + bool(roster) + bool(show_limitations)
+        columns = 3 + bool(roster) + bool(show_limitations) + bool(show_notes)
         out.append(f"| _…and {remaining} more_ " + "|  " * (columns - 1) + "|")
 
     if skipped:
@@ -14152,6 +14927,22 @@ def _held_identity_lines(entry: dict) -> list[str]:
     )
 
 
+def _held_reasons(held: list[dict]) -> str:
+    """Why the collector-held entries are held, when some are noted objects:
+    one sentence for the flagged ones, if any, and one for the noted ones."""
+    noted = sum(1 for entry in held if entry.get(NOTED_HELD_KEY))
+    flagged = len(held) - noted
+    out = []
+    if flagged:
+        out.append(
+            f"For {flagged} of them the collector still emits a candidate: the condition "
+            "is still observed, and each stays until the collector stops emitting it or "
+            "a `declared` entry covers it."
+        )
+    out.append(f"For {noted} of them the collector does not flag the object: {NOTED_HOLD_CAUSE}, and {NOTED_HOLD_END}.")
+    return " ".join(out)
+
+
 def _render_flagged_held(
     held: list[dict],
     *,
@@ -14185,7 +14976,7 @@ def _render_flagged_held(
             "does not carry it. Shown from the manifest; the real run intersects with "
             "the marker it reads back."
         )
-    else:
+    elif not any(entry.get(NOTED_HELD_KEY) for entry in held):
         out.append(
             f"{len(held)} previous {count_word} this run's document did not carry, kept on "
             "the ledger because the collector still emits a candidate for each: the "
@@ -14195,11 +14986,27 @@ def _render_flagged_held(
             "over these; a `/remediate <finding-id>` on one is held, not refused, "
             "until a document carries the finding again."
         )
+    else:
+        out.append(
+            f"{len(held)} previous {count_word} this run's document did not carry, kept on "
+            f"the ledger. {_held_reasons(held)} A `resolved_because` entry does not release "
+            "one. The automatic sweep passes over these; a `/remediate <finding-id>` on "
+            "one is held, not refused, until a document carries the finding again."
+        )
     for index, entry in enumerate(held):
         fid = str(entry.get("id", ""))
         out.append("")
         out += _held_identity_lines(entry)
         if not detail or index >= MAX_HELD_DETAIL_ROWS:
+            continue
+        if entry.get(NOTED_HELD_KEY) and not carried:
+            commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
+            out.append(
+                f"- **Check:** `{_ident(str(entry.get('check', '')))}` — the collector ran "
+                f"`{_code_span(commands[0]) if commands else COLLECTOR_COMMAND_UNRECORDED}` "
+                "there this run but could not see the result; the target's notes say why."
+            )
+            out.append(f"- **Finding id:** `{fid}`")
             continue
         commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
         if carried:
@@ -14282,7 +15089,7 @@ def _render_held_note(
             "not carry it. The body had no room for their rows; they are shown from the "
             "manifest, and the real run intersects them with the marker it reads back."
         )
-    else:
+    elif not any(entry.get(NOTED_HELD_KEY) for entry in held):
         opening = (
             f"{len(held)} previous finding(s) this run's document did not carry are "
             "kept on this ledger because the collector still emits a candidate for "
@@ -14290,6 +15097,13 @@ def _render_held_note(
             "block below, which is what the next run reads them back from, and each "
             "stays held until the collector stops emitting it or a `declared` entry "
             "covers it."
+        )
+    else:
+        opening = (
+            f"{len(held)} previous finding(s) this run's document did not carry are "
+            f"kept on this ledger. {_held_reasons(held)} The body had no room for their "
+            "rows; their ids are in the hidden block below, which is what the next run "
+            "reads them back from."
         )
     return [
         "",
@@ -14774,6 +15588,9 @@ def render_issue_body(
 
     fixed: list[str] = _render_header(audit_id, noun)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id, extra_gaps=extra_gaps)
+    # The full notes, which the scope table's clipped Notes cell cannot
+    # carry; measured with the fixed sections and bounded by its own cap.
+    fixed += _render_body_notes(data)
     fixed += _render_declared_intent_search(data)
     withheld_section = _render_withheld(
         list(withheld or []),
@@ -15185,6 +16002,11 @@ def render_clean_comment(
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
 
+    # What the run read but could not see, which is not a gap. On the
+    # ledger, the clean comment is the place a clean run says so, because a
+    # clean run does not rewrite the body's scope table.
+    out += _comment_scope_notes(data)
+
     # The postures held back for want of a declared-intent search, one per
     # line. A clean run over a withheld posture is a clean run only because
     # the harness took the posture out, and on a stream whose ledger is not
@@ -15341,7 +16163,10 @@ def render_held_comment(
     held and the shortfall listed under it, rather than the coverage comment
     going out alone and naming no finding.
     """
-    collector_held = set(collector or [])
+    # A noted object is held, but the collector does not flag it: it gets its
+    # own sentence and mark (`noted_ids`).
+    noted_held = {str(entry.get("id", "")) for entry in held if entry.get(NOTED_HELD_KEY)}
+    collector_held = set(collector or []) - noted_held
     # `carried`: held from a previous run's manifest by a run that passed none
     # and so cannot release them — said apart from `collector`, whose sentence
     # claims this run's manifest carries the candidate.
@@ -15390,6 +16215,13 @@ def render_held_comment(
             "owner's choice.",
             "",
         ]
+    if noted_held:
+        out += [
+            f"{len(noted_held)} of these the collector does not flag: {NOTED_HOLD_CAUSE}. "
+            f"For each of these, {NOTED_HOLD_END}. A `resolved_because` entry for one "
+            "is refused; report it again from the previous finding.",
+            "",
+        ]
     for entry in held[:MAX_DELTA_ROWS]:
         namespace = str(entry.get("namespace", ""))
         place = f"`{_cell(str(entry.get('cluster', '')))}`"
@@ -15406,6 +16238,8 @@ def render_held_comment(
             line += f" _(and {others} more)_"
         if str(entry.get("id", "")) in collector_held:
             line += " — _still flagged by the collector_"
+        if str(entry.get("id", "")) in noted_held:
+            line += " — _not visible to the collector_"
         if str(entry.get("id", "")) in carried_held:
             line += " — _held from a previous manifest run_"
         out.append(line)
@@ -15416,6 +16250,9 @@ def render_held_comment(
         out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in gaps[:MAX_SCOPE_ROWS]]
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
+    # The notes say what the run could not see, so a reader does not take
+    # the instances they name as cleared.
+    out += _comment_scope_notes(data)
     out += _comment_resolved(data)
     out += _comment_declared(data)
     out += _comment_evidence(audit_id, clusters, out)
@@ -19619,6 +20456,7 @@ def plan_generated_fixes(
     probe: "_RepositoryProbe",
     audit_id: str = "",
     notes: dict[str, str] | None = None,
+    requested_at: dict[str, str] | None = None,
 ) -> tuple[dict[str, tuple[str, str]], set[str]]:
     """`(planned, answered)`: finding id to `(path, text)` for each fix
     `finish` can write itself, and the ids a pull request already answers.
@@ -19638,12 +20476,27 @@ def plan_generated_fixes(
     candidates with a script and this was the fix it kept leaving `manual`.
     Nothing is written here, so a run that is refused for another fix leaves
     nothing behind.
+
+    `requested_at` is each id a ledger `/remediate` names, to the time of its
+    newest request (`remediate_request_times`). A merged or closed pull
+    request does not answer a finding a person asked for after it closed: the
+    budget is planned again and `promotion_candidates` opens it. Without
+    this, a budget whose first pull request merged and was later removed from
+    the repository stayed `manual` for good, and every `/remediate` on it was
+    refused as not a `manifest` (#7013). A request older than the close
+    leaves the pull request answering, so an old comment never re-proposes
+    a budget a person merged and then removed.
     """
     candidates = {_candidate_identity(entry, candidate): (entry, candidate) for entry, candidate in _candidates(manifest)}
+    asked_at = requested_at or {}
     carried: dict[str, list[dict]] = {}
     for pr in prs:
         if not pr_closed_by_harness(pr):
             for fid in parse_delta_block(pr.get("body")):
+                if str(pr.get("state") or "").upper() != "OPEN" and timestamp_strictly_after(
+                    asked_at.get(fid), str(pr.get("closedAt") or "")
+                ):
+                    continue
                 carried.setdefault(fid, []).append(pr)
     planned: dict[str, tuple[str, str]] = {}
     answered: set[str] = set()
@@ -20339,7 +21192,13 @@ def unwritten_sweep_fixes(
     floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
     unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
     vouched = collector_vouched_findings(findings, manifest)
-    excluded = uncorroborated_findings(findings, manifest) | set(triage_markers(findings, manifest))
+    # The sweep passes over a finding on a noted object too
+    # (`promotion_candidates` `not_visible`), so no file is owed for one.
+    excluded = (
+        uncorroborated_findings(findings, manifest)
+        | set(triage_markers(findings, manifest))
+        | noted_finding_ids(findings, manifest)
+    )
     declared_at = {
         _candidate_identity(entry, candidate): str(
             (candidate.get("declaration") or {}).get("path") or ""
@@ -22751,9 +23610,10 @@ def handle_start(args: argparse.Namespace) -> None:
     shadow = shadow_mode(args, "start")
     if shadow and getattr(args, "repo", None):
         raise ValidationError(f"--repo: a shadow run ({STORE_ONLY_FLAG}) publishes to no repository.")
-    claim_in_flight(audit_id)
+    run_id = new_run_id()
+    claim_in_flight(audit_id, run_id)
     try:
-        _start(args, audit_id, shadow=shadow)
+        _start(args, audit_id, run_id, shadow=shadow)
     except BaseException:
         # A `start` that raised left no run in flight, so the retry must not
         # be refused for its own failure. The refusal above sits outside this
@@ -22763,7 +23623,7 @@ def handle_start(args: argparse.Namespace) -> None:
         raise
 
 
-def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> None:
+def _start(args: argparse.Namespace, audit_id: str, run_id: str | None = None, *, shadow: bool = False) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -22790,6 +23650,19 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
     else:
         decision = resolve_reachable_repo(audit_id, opt_repo)
     repo, unreachable = decision.publish_repo, decision.unreachable
+    # As soon as the stream's repository is known, before anything else here
+    # can fail: a run that dies from here on leaves a record with no done
+    # mark, which readers show as a run that did not finish (#6812). A shadow
+    # run records none: its report goes to its own stream, and a shadow run
+    # that died would otherwise read as an unfinished run of the live audit.
+    if run_id and not shadow:
+        record_run_start(
+            audit_id,
+            repo,
+            run_id,
+            run_is_scheduled(bool(getattr(args, "scheduled", False))),
+            datetime.now(timezone.utc),
+        )
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
     # report there.
@@ -23170,6 +24043,9 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
         limitations = "; ".join(part for part in (entry_limitations, unevaluated_note) if part)
         if limitations:
             cluster["limitations"] = limitations
+        note = str(entry.get(SCOPE_NOTES_KEY) or "").strip()
+        if note:
+            cluster[SCOPE_NOTES_KEY] = note
         clusters.append(cluster)
         for candidate in entry.get("candidates") or []:
             if not isinstance(candidate, dict):
@@ -23470,7 +24346,10 @@ def _handle_finish_dry_run(
         findings,
         {},
         sweep_off=not sweep_on,
+        # The dry run reads no ledger, so it cannot know that a noted
+        # object is carried; a finding on one previews as uncorroborated.
         uncorroborated=uncorroborated_findings(findings, manifest),
+        not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
     )
@@ -23883,6 +24762,29 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
     by_id = {str(f.get("id", "")): f for f in findings}
     still_flagged = still_flagged_ids(manifest, data) if manifest is not None else set()
+    noted = noted_ids(manifest)
+    # The noted hold protects a previous finding from being resolved unseen,
+    # so it applies only to an id the ledger carries (`noted_ids`: a noted
+    # id that no previous finding carries holds nothing). This command reads
+    # no ledger body; the store's newest record of it says what it carries.
+    # An id never filed falls through to the plain not-in-document error:
+    # "carry it forward" would tell the caller to carry a finding that does
+    # not exist.
+    store_repo = repo_hint or refusal_repo
+    carried_record = (
+        newest_stored_record(audit_id, store_repo) if noted and store_repo else {}
+    )
+    carried_ids = {str(fid) for fid in (carried_record or {}).get("current_ids") or []}
+    collector_noted = [
+        fid for fid in args.finding if fid not in by_id and fid in noted and fid in carried_ids
+    ]
+    if collector_noted:
+        raise ValidationError(
+            f"--finding: {', '.join(collector_noted)} not in {args.findings_file}: "
+            f"{NOTED_HOLD_CAUSE}, so finish does not resolve it, and {NOTED_HOLD_END}. "
+            "There is no finding here to open a pull request from: report it in the "
+            "document from the previous finding and run finish, then ask again"
+        )
     collector_held = [fid for fid in args.finding if fid not in by_id and fid in still_flagged]
     if collector_held:
         # This command reads no ledger body, so it cannot say whether the
@@ -24524,6 +25426,8 @@ def render_no_forge_summary(
     prs: dict | None = None,
     unaccounted: Iterable[str] = (),
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    noted: Iterable[str] = (),
+    cleared: Iterable[str] = (),
 ) -> str:
     """The chat summary of a run with no ledger issue, which is the only report its operator gets.
 
@@ -24547,8 +25451,19 @@ def render_no_forge_summary(
     opened, found waiting and closed, and the refusal of their listing
     (`REMEDIATION_REFUSED_KEY`), and `unaccounted`, the previous findings that
     keep its ledger open. `noun` is the forge's word for them.
+
+    `noted` is `noted_ids`: a held id in it gets its own line, because the
+    collector does not flag it. The targets' notes (`scope_notes`) come
+    before the coverage gaps, because the worker sends this text verbatim
+    and it is the only place they reach the operator; capped
+    (`_capped_notes`), so sixty long notes do not flood chat. `cleared` is
+    the JSON line's `noted_cleared`: the objects visible again, which the
+    notes list cannot name.
     """
     findings = list(data.get("findings") or [])
+    noted = set(noted)
+    noted_held = [fid for fid in held if fid in noted]
+    held = [fid for fid in held if fid not in noted]
     lines = [findings_headline(audit_name(audit_id), findings, len(new_ids), len(resolved_ids), delta_known)]
     ordered = sort_findings(findings)
     shown = _summary_shown(ordered) if stored else ordered[:NO_FORGE_SUMMARY_FINDINGS]
@@ -24572,6 +25487,14 @@ def render_no_forge_summary(
             "Still flagged by the collector but not in this run's document: "
             + shown_held
             + (SUMMARY_HELD_MORE.format(count=more_held) if more_held > 0 else "")
+        )
+    if noted_held:
+        shown_noted = ", ".join(noted_held[:NO_FORGE_SUMMARY_FINDINGS])
+        more_noted = len(noted_held) - NO_FORGE_SUMMARY_FINDINGS
+        lines.append(
+            f"Kept, because {NOTED_HOLD_CAUSE}; {NOTED_HOLD_END}: "
+            + shown_noted
+            + (SUMMARY_HELD_MORE.format(count=more_noted) if more_noted > 0 else "")
         )
     if unread:
         shown = ", ".join(unread[:NO_FORGE_SUMMARY_FINDINGS])
@@ -24612,6 +25535,22 @@ def render_no_forge_summary(
         lines.append(
             f"{len(retired)} finding(s) retired with the ledger, not confirmed fixed: their "
             "cluster is no longer in the fleet listing: " + ", ".join(retired)
+        )
+    cleared = [str(fid) for fid in cleared]
+    if cleared:
+        shown_cleared, left_cleared = _capped_notes(cleared)
+        lines.append(
+            f"{VISIBLE_AGAIN_LEAD} ({len(cleared)}): "
+            + ", ".join(shown_cleared)
+            + (f", {MORE_NOTES_ROW.format(more=left_cleared)}" if left_cleared else "")
+        )
+    notes = scope_notes(data)
+    if notes:
+        shown_notes, left_notes = _capped_notes(notes)
+        lines.append(
+            f"{NOTES_LEAD}: "
+            + "; ".join(shown_notes)
+            + (f"; {MORE_NOTES_ROW.format(more=left_notes)}" if left_notes else "")
         )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
@@ -24731,7 +25670,7 @@ def _finish_without_forge(
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
-        (set(previous_ids or []) & still_flagged_ids(manifest, data))
+        (set(previous_ids or []) & still_flagged_ids(manifest, data, previous_ids or []))
         - set(current_ids)
         - set(finding_ids(postures_withheld(data)))
     )
@@ -24784,6 +25723,12 @@ def _finish_without_forge(
     ids_moved = scheduled and (
         scheduled_ids is None or set(stored_ids) != set(scheduled_ids)
     )
+    # The set of noted objects speaks once when it changes, against the last
+    # scheduled run's set (`noted_set_changed`); an unchanged noted object
+    # does not wake the channel.
+    noted = noted_ids(manifest)
+    noted_moved = noted_set_changed(noted, record)
+    noted_cleared = noted_cleared_ids(noted, record) if noted_moved else []
     # An id that left under a gap is not resolved. An id that an on-demand
     # run with full coverage resolved is resolved, also when this run has a gap.
     since_scheduled = since_last_scheduled(
@@ -24801,6 +25746,7 @@ def _finish_without_forge(
         or new_ids
         or resolved_ids
         or ids_moved
+        or noted_moved
         or gaps
         or unpublished
         or wholly_dropped
@@ -24808,6 +25754,11 @@ def _finish_without_forge(
     payload = {
         "status": NO_FORGE_STATUS,
         **precheck_payload(),
+        # The targets' notes, on every status: the line is what the worker
+        # relays, and on a clean run with no ledger it is the only place.
+        # No `report_notes` here: the report is `summary` verbatim,
+        # and `summary` already carries the notes.
+        **notes_payload(data),
         "issue_url": None,
         "new": len(new_ids),
         "resolved": len(resolved_ids),
@@ -24824,7 +25775,9 @@ def _finish_without_forge(
             {
                 UNPUBLISHED_CANDIDATES_KEY: unpublished,
                 WHOLLY_UNPUBLISHED_CHECKS_KEY: wholly_dropped,
-                UNCORROBORATED_FINDINGS_KEY: sorted(uncorroborated_findings(findings, manifest)),
+                UNCORROBORATED_FINDINGS_KEY: sorted(
+                    uncorroborated_findings(findings, manifest, previous_ids or [])
+                ),
             }
             if manifest is not None
             else {}
@@ -24832,6 +25785,8 @@ def _finish_without_forge(
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
         **since_scheduled,
+        **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+        **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
         **timers(),
     }
     apply_earlier_finish(payload, earlier)
@@ -24860,6 +25815,7 @@ def _finish_without_forge(
         scheduled=scheduled,
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(record)),
         scheduled_published_ids=next_scheduled_value(scheduled, stored_ids, scheduled_ids),
+        scheduled_noted_ids=next_scheduled_value(scheduled, noted, scheduled_noted_baseline(record)),
         not_rechecked=unread_entries,
         started_at=run_started,
     )
@@ -24882,6 +25838,10 @@ def _finish_without_forge(
             since_scheduled=since_scheduled_line(payload, delta_known),
             unread=unread,
             stored=True,
+            # As the line's `summary` below: a noted hold has its own line,
+            # and an object that is visible again is named.
+            noted=noted,
+            cleared=payload.get(NOTED_CLEARED_KEY) or [],
         )
     # A diverted run wrote nothing to the ledger, so when its write fails the
     # stored record of the last published run is still correct.
@@ -24914,6 +25874,8 @@ def _finish_without_forge(
         since_scheduled=since_scheduled_line(payload, delta_known),
         unread=unread,
         stored=stored,
+        noted=noted,
+        cleared=payload.get(NOTED_CLEARED_KEY) or [],
     )
     if shadow:
         payload[SHADOW_KEY] = True
@@ -24955,6 +25917,7 @@ def _plan_remediation_files(
     unlisted: list[str],
     listing_may_refuse: bool = False,
     kcc_index: dict[KccKey, KccDeclaration] | None = None,
+    requested_at: dict[str, str] | None = None,
 ) -> _FixPlan:
     """`finish`'s last step before it publishes: refuse an unwritten fix, then write the fixes it derives.
 
@@ -24967,6 +25930,9 @@ def _plan_remediation_files(
     plan carries the refusal (`listing_refusal`), no proposal, the sweep off,
     and no unwritten-fix refusal, because no fix can be told to exist. The
     store ledger asks for this: its store write is the only record of the run.
+
+    `requested_at` is the ledger's `/remediate` requests with their times, for
+    `plan_generated_fixes`; the store ledger has no thread and passes none.
 
     Last, it adds the route notes to each `manual` remediation
     (`disclose_manual_routes_and_log`) and the Config Connector note to each
@@ -25014,7 +25980,8 @@ def _plan_remediation_files(
     skipped: dict[str, str] = {}
     try:
         planned, answered = plan_generated_fixes(
-            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped
+            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped,
+            requested_at=requested_at,
         )
         # A decline of a budget `finish` can write is not taken: the worker's
         # reason was the shortcut the refusal exists to stop.
@@ -25156,6 +26123,9 @@ def _finish_store_ledger(
     )
     previous_ids = [str(fid) for fid in (memory or {}).get("current_ids") or []]
     previous_body = str((memory or {}).get("ledger_body") or "")
+    # A noted object a previous finding carries is held as a still-flagged
+    # one is (`noted_ids`).
+    still_flagged = still_flagged | still_flagged_ids(manifest, data, previous_ids)
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
     finding_places = report_finding_places(memory, data)
     # The forge path's stale-scheme rule: ids stored under another identity
@@ -25193,7 +26163,7 @@ def _finish_store_ledger(
     if delta_known and manifest is not None:
         held_entries, held_dropped = cap_held_entries(
             collector_held_entries(
-                manifest, data, exclude=held_exclude, previous_body=previous_body
+                manifest, data, exclude=held_exclude, previous_body=previous_body, carried_ids=previous_ids
             )
         )
     elif delta_known:
@@ -25272,7 +26242,11 @@ def _finish_store_ledger(
             unaccounted + [e for e in held_entries if e["id"] not in already_held],
             key=lambda entry: entry["id"],
         )
+        noted_held = {e["id"] for e in held_entries if e.get(NOTED_HELD_KEY)}
         for fid in sorted(held_ids):
+            if fid in noted_held:
+                log(f"NOT VISIBLE: {fid} is on the stored ledger and {NOTED_HOLD_CAUSE}; no fix is closed over it.")
+                continue
             log(
                 f"STILL FLAGGED: {fid} is on the stored ledger and the collector still "
                 "flags it, so it is not resolved whatever the document says; no fix is "
@@ -25328,6 +26302,12 @@ def _finish_store_ledger(
     # a scheduled run speaks.
     scheduled_memory = memory if memory else ({} if delta_known else None)
     scheduled_ids = scheduled_published_baseline(scheduled_memory)
+    # The set of noted objects speaks once when it changes, against the last
+    # scheduled run's set (`noted_set_changed`); an unchanged noted object
+    # does not wake the channel.
+    noted = noted_ids(manifest)
+    noted_moved = noted_set_changed(noted, scheduled_memory)
+    noted_cleared = noted_cleared_ids(noted, scheduled_memory) if noted_moved else []
     # As on the forge path, an id stays under `reported_under_gap` until a run
     # publishes it again or a run with full coverage does not find it.
     if gaps or stale_scheme:
@@ -25402,7 +26382,8 @@ def _finish_store_ledger(
         cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at={},
         sweep_off=not sweep_on,
-        uncorroborated=uncorroborated_findings(findings, manifest),
+        uncorroborated=uncorroborated_findings(findings, manifest, previous_ids),
+        not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
     )
@@ -25563,6 +26544,7 @@ def _finish_store_ledger(
     quiet = not (
         not delta_known
         or ids_moved
+        or noted_moved
         or reported_new
         or reported_resolved
         or coverage_moved
@@ -25577,6 +26559,11 @@ def _finish_store_ledger(
     payload = {
         "status": STORE_LEDGER_STATUS,
         **precheck_payload(),
+        # The targets' notes, on every status: the line is what the worker
+        # relays, and on a clean run with no ledger it is the only place.
+        # No `report_notes` here: the report is `summary` verbatim,
+        # and `summary` already carries the notes.
+        **notes_payload(data),
         "issue_url": None,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -25593,6 +26580,8 @@ def _finish_store_ledger(
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **({RETIRED_UNLISTED_KEY: sorted(retired_ids)} if retired else {}),
         **since_scheduled,
+        **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+        **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
         "critical": severity_counts(findings)["critical"],
@@ -25626,6 +26615,9 @@ def _finish_store_ledger(
         scheduled=scheduled,
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
         scheduled_published_ids=next_scheduled_ids,
+        scheduled_noted_ids=next_scheduled_value(
+            scheduled, noted, scheduled_noted_baseline(scheduled_memory)
+        ),
         scheduled_reported_under_gap=next_scheduled_reported,
         not_rechecked=not_rechecked,
         started_at=run_started,
@@ -25655,6 +26647,8 @@ def _finish_store_ledger(
         prs=payload,
         unaccounted=unaccounted_ids,
         noun=noun,
+        noted=noted,
+        cleared=payload.get(NOTED_CLEARED_KEY) or [],
     )
     append_chat_report(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -25671,6 +26665,8 @@ def handle_finish(args: argparse.Namespace) -> None:
         # A preview taken mid-run: the run is still in flight and keeps its note.
         _finish(args, audit_id)
         return
+    # Before the note is released below: in the shell it holds the run id.
+    run_id = this_run_id(audit_id)
     try:
         stored = _finish(args, audit_id)
     except ValidationError:
@@ -25696,6 +26692,9 @@ def handle_finish(args: argparse.Namespace) -> None:
         # cannot tell whose it is; run identity decides this and is not here.
         release_in_flight(audit_id)
         raise
+    # Only a published run is marked done: a `finish` that raised leaves its
+    # record unfinished, and readers say the last run did not finish.
+    _mark_finished(audit_id, run_id, stored)
     release_in_flight(audit_id)
     if getattr(args, "store_only", False):
         # The gate's record is the live stream's; a shadow run leaves it alone.
@@ -26026,6 +27025,7 @@ def _close_from_stored_document(
     # and on every failure the run goes on (the SOP's next step is the same
     # `precheck` once more, then the rest of the SOP, whose own `finish`
     # releases it), so only a close that published releases it here.
+    run_id = this_run_id(audit_id)
     try:
         stored = _finish(close, audit_id)
     except BrokerUnavailable:
@@ -26045,6 +27045,7 @@ def _close_from_stored_document(
         raise
     else:
         # While the verdict is still set: the record keeps `last_full_run_at`.
+        _mark_finished(audit_id, run_id, stored)
         release_in_flight(audit_id)
         _record_scheduled_digest(close, audit_id, stored)
     finally:
@@ -26212,6 +27213,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Before anything reads `evidence` — the dry-run preview and the ledger
         # body both do — so what renders is what the collector observed.
         adopted = adopt_collector_evidence(data["findings"], manifest)
+        adopt_collector_notes(data, manifest)
+        # Before the dry-run split, so the preview refuses what the real run refuses.
+        refuse_resolved_over_notes(data, manifest)
         if adopted:
             shown = ", ".join(adopted[:MANIFEST_LOG_IDS])
             if len(adopted) > MANIFEST_LOG_IDS:
@@ -26651,6 +27655,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     ledger_ids_known = sorted(
         set(previous_ids) | set(_stored_finding_places(memory)) | filed_cut | body_filed_ids(previous_body)
     )
+    # A noted object a previous finding carries is held as a still-flagged one
+    # is (`noted_ids`). Every id the ledger carried, not only the body's
+    # block: a finding the body cut for space has a fix to keep open too.
+    still_flagged |= still_flagged_ids(manifest, data, ledger_ids_known)
     # Where the last scheduled run's ids are read from (see `scheduled_ids`
     # below). Read here, so the run's first `finish` saves what it read with
     # the baseline.
@@ -26716,7 +27724,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     if manifest is not None and not memory_lost:
         held_entries, held_dropped = cap_held_entries(
             collector_held_entries(
-                manifest, data, exclude=held_exclude, previous_body=previous_body
+                manifest, data, exclude=held_exclude, previous_body=previous_body, carried_ids=ledger_ids_known
             )
         )
     elif manifest is None and not memory_lost:
@@ -26800,6 +27808,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # The partial all-clear comment goes on the issue, which every run
     # writes to, so it compares with the last stored run of either kind.
     coverage_moved_on_issue = coverage_changed(gaps, memory)
+    # Whether the set of noted objects changed since the last scheduled run.
+    # Both silence verdicts below use it: the set speaks once when it changes
+    # (`noted_set_changed`) — a new noted object, or one whose note cleared —
+    # and an unchanged noted object does not wake the channel. The notes
+    # themselves stay on the JSON line, the ledger and the stored report on
+    # every run.
+    noted = noted_ids(manifest)
+    # Against the run's first read on a later `finish` of the same run or
+    # its re-run after a death (`run_noted_baseline`): the earlier `finish`
+    # stored this run's set, and reading it back would drop the change and
+    # the Visible-again line.
+    noted_baseline = run_noted_baseline(baseline, scheduled_memory)
+    noted_moved = noted_set_changed_against(noted, noted_baseline)
+    noted_cleared = sorted(set(noted_baseline or []) - noted) if noted_moved else []
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
@@ -26897,6 +27919,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 "unchanged. A hold is released only by a manifest run that no longer "
                 "emits the id, a `declared` entry, or the document carrying it."
             )
+        elif entry.get(NOTED_HELD_KEY):
+            # The noted wording, as the clean branch and the store path say
+            # it: the collector does not flag this object, it could not see
+            # it, so "still emits a candidate" would be false.
+            log(
+                f"NOT VISIBLE: {entry['id']} is on the ledger, absent from this "
+                f"document, and {NOTED_HOLD_CAUSE}; protected rather than resolved."
+            )
         else:
             log(
                 f"HELD: {entry['id']} is on the ledger, absent from this document, and "
@@ -26921,10 +27951,22 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     held_collector_ids = [] if carried_without_manifest else [e["id"] for e in held_entries]
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
+    # Read ahead of the plan, so a budget a person asked for is planned even
+    # when an earlier pull request for it merged or closed
+    # (`plan_generated_fixes`); the requests below parse the same comments.
+    # Only with a manifest, which every budget `finish` writes is built from:
+    # a run without one reads them where it always did. A clean run reads its
+    # own, so nothing is fetched for one.
+    early_comments = (
+        fetch_issue_comments(repo, existing_issue)
+        if findings and existing_issue and answers_remediate and manifest is not None
+        else None
+    )
     fix_plan = _plan_remediation_files(
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
         promised=promised, degraded=degraded, unlisted=unlisted, kcc_index=kcc_index,
+        requested_at=remediate_request_times(early_comments or []),
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     unlinked_paths, file_url, file_ref = fix_plan.unlinked_paths, fix_plan.file_url, fix_plan.file_ref
@@ -26959,6 +28001,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         collector_held = held_entries if existing_issue else []
         collector_held_ids = [entry["id"] for entry in collector_held]
         already_held = {entry["id"] for entry in unaccounted}
+        # The held comment marks a noted object as one: keep the mark on an
+        # entry the document's own check also left unaccounted.
+        noted_held = {e["id"] for e in collector_held if e.get(NOTED_HELD_KEY)}
+        unaccounted = [
+            {**entry, NOTED_HELD_KEY: True} if entry["id"] in noted_held else entry
+            for entry in unaccounted
+        ]
         unaccounted = sorted(
             unaccounted + [e for e in collector_held if e["id"] not in already_held],
             key=lambda entry: entry["id"],
@@ -26970,6 +28019,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                     "collector manifest and this run passed none, so it is not "
                     "resolved whatever the document says; the ledger stays open."
                 )
+            elif fid in noted_held:
+                log(f"NOT VISIBLE: {fid} is on the ledger and {NOTED_HOLD_CAUSE}; the ledger stays open.")
             else:
                 log(
                     f"STILL FLAGGED: {fid} is on the ledger and the collector still "
@@ -27106,7 +28157,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                                 "author": request.get("author", "someone"),
                                 "reasons": [deferral_reason(t) for t in held]
                                 + [
-                                    collector_hold_reason(t, noun)
+                                    noted_hold_reason(t, noun)
+                                    if t in noted_ids(manifest)
+                                    else collector_hold_reason(t, noun)
                                     if t in held_ids
                                     else collector_candidate_reason(t, noun)
                                     for t in flagged
@@ -27364,6 +28417,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             clean_resolved
             or retired
             or ids_moved
+            or noted_moved
             or coverage_moved
             or unreported_under_gap
             or prs_closed
@@ -27378,6 +28432,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # this line, and "clean" is the one thing it is not.
             "status": "HELD" if unaccounted or held_unread else "CLEAN",
             **precheck_payload(),
+            # The targets' notes, on every status: the line is what the worker
+            # relays, and on a clean run with no ledger it is the only place.
+            **notes_payload(data),
+            **report_notes_payload(data),
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,
@@ -27418,6 +28476,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # Only on a scheduled run that speaks because its ids moved
             # (`SINCE_SCHEDULED_KEY`).
             **since_scheduled,
+            # Only when the run speaks because the noted set changed.
+            **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+            **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
             # No findings, so no sweep and nothing for it to pass over.
             **collector_payload([]),
             **timer_payload(),
@@ -27515,6 +28576,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 if scheduled and body_untouched
                 else next_scheduled_ids
             ),
+            scheduled_noted_ids=next_scheduled_value(
+                scheduled, noted, scheduled_noted_baseline(scheduled_memory)
+            ),
             scheduled_reported_under_gap=next_scheduled_reported,
             open_issue_number=open_issue,
             not_rechecked=not_rechecked,
@@ -27541,6 +28605,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             refinish=bool(payload.get(REFINISH_KEY)),
             whole_run=whole_run,
         )
+        log_report_notes_reminder(payload)
         print(json.dumps(payload))
         return envelope if stored else None
 
@@ -27590,7 +28655,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         )
 
     ledger_comments = (
-        fetch_issue_comments(repo, existing_issue)
+        early_comments
+        if early_comments is not None
+        else fetch_issue_comments(repo, existing_issue)
         if existing_issue and answers_remediate
         else []
     )
@@ -27603,6 +28670,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         collector_flagged=candidate_only,
         noun=noun,
         unread_held=unchecked_ids,
+        collector_noted=noted_ids(manifest),
     )
     triage_reasons = triage_markers(findings, manifest)
     if not sweep_on:
@@ -27616,7 +28684,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at=requests.requested_at,
         sweep_off=not sweep_on,
-        uncorroborated=uncorroborated_findings(findings, manifest),
+        uncorroborated=uncorroborated_findings(findings, manifest, previous_ids),
+        not_visible=noted_finding_ids(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
     )
@@ -27957,6 +29026,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     quiet = not (
         not delta_known
         or ids_moved
+        or noted_moved
         or reported_new
         or reported_resolved
         or coverage_moved
@@ -27968,6 +29038,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     payload = {
         "status": status,
         **precheck_payload(),
+        # The targets' notes, on every status: the line is what the worker
+        # relays, and on a clean run with no ledger it is the only place.
+        **notes_payload(data),
+        **report_notes_payload(data),
         "issue_url": issue_url,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -28044,6 +29118,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Same key as the CLEAN branch; see the note there.
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
         **since_scheduled,
+        **({NOTED_CHANGED_KEY: True} if scheduled and noted_moved else {}),
+        **({NOTED_CLEARED_KEY: noted_cleared} if scheduled and noted_cleared else {}),
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }
@@ -28074,6 +29150,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         scheduled=scheduled,
         scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
         scheduled_published_ids=next_scheduled_ids,
+        scheduled_noted_ids=next_scheduled_value(
+            scheduled, noted, scheduled_noted_baseline(scheduled_memory)
+        ),
         scheduled_reported_under_gap=next_scheduled_reported,
         # Their places, which the note and id-only tiers do not render.
         not_rechecked=unread_entries,
@@ -28106,6 +29185,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         refinish=bool(payload.get(REFINISH_KEY)),
         whole_run=baseline.from_entry,
     )
+    log_report_notes_reminder(payload)
     print(json.dumps(payload))
     return envelope if stored else None
 
@@ -28176,6 +29256,15 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
+    )
+    start_parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help=(
+            "Mark the run's run-start record scheduled. Optional: start already marks a Hermes "
+            "cron run, or a profile task under a builtin schedule's trigger, scheduled by itself. "
+            "Do not pass it on a run a person asked for."
+        ),
     )
     start_parser.add_argument(
         STORE_ONLY_FLAG,

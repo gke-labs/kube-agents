@@ -35,6 +35,11 @@ const (
 	// the MCP server, which names them in the addressee description. The
 	// adapter writes it into the server's env per turn (withDelegateTargets).
 	EnvDelegateTargets = "A2A_DELEGATE_TARGETS"
+	// EnvScopeClusters carries the turn's scopeClusters part, as JSON, to
+	// the MCP server beside EnvDelegateTargets: one page of the clusters a
+	// cluster child may take, which the tool's description names. The
+	// adapter writes it per turn with the targets (withDelegateTargets).
+	EnvScopeClusters = "A2A_SCOPE_CLUSTERS"
 	// MCPConfigFlag, MCPServersKey and MCPEnvKey spell the harness's
 	// --mcp-config argument: the flag, its server map, and a server's env.
 	// cmd/worker-adapter writes the argument and withDelegateSocket edits it
@@ -108,7 +113,10 @@ const batchMinItems = 2
 // description built from the turn's targets (nil for none). A width over one
 // adds the tasks list; otherwise the schema is the single-child one, exactly,
 // so a pod talking to a gateway built before batches is unchanged.
-func delegateToolSchema(targets *lib.DelegateTargets) map[string]any {
+// The turn's scopeClusters page (nil for none) is named once, at the end of
+// the tool's own description (scopeClustersDescription), when an agent on the
+// turn's list takes a cluster (offersClusterTarget).
+func delegateToolSchema(targets *lib.DelegateTargets, scope *lib.ScopeClusters) map[string]any {
 	entry := func() map[string]any {
 		return map[string]any{
 			"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},
@@ -137,6 +145,9 @@ func delegateToolSchema(targets *lib.DelegateTargets) map[string]any {
 		required = []string{}
 		description += fmt.Sprintf(delegateToolBatchDescription, width)
 	}
+	if scope != nil && offersClusterTarget(targets) {
+		description += scopeClustersDescription(*scope)
+	}
 	return map[string]any{
 		"name":        DelegateToolName,
 		"description": description,
@@ -146,6 +157,25 @@ func delegateToolSchema(targets *lib.DelegateTargets) map[string]any {
 			"required":   required,
 		},
 	}
+}
+
+// offersClusterTarget reports whether an agent on the turn's list takes a
+// cluster: it declares project, location and cluster, as a profile that
+// works on any cluster does (a pinned one's are left off its entry).
+func offersClusterTarget(targets *lib.DelegateTargets) bool {
+	if targets == nil {
+		return false
+	}
+	for _, t := range targets.Targets {
+		have := map[string]bool{}
+		for _, p := range t.Parameters {
+			have[p.Name] = true
+		}
+		if have["project"] && have["location"] && have["cluster"] {
+			return true
+		}
+	}
+	return false
 }
 
 // delegateWidth is the batch width the turn's targets advertise: one for none.
@@ -195,6 +225,102 @@ func addresseeDescription(targets *lib.DelegateTargets) string {
 	return desc
 }
 
+// The scopeClusters page's wording (scopeClustersDescription). It states
+// what the gateway listed and nothing more: every value in it is a project,
+// location or cluster name, a count or a time, which the part's bounds hold
+// to their grammar, so none can read as words of its own. The count is what
+// the gateway can count, the clusters with a published listing that pass the
+// install's scope check, so the wording says that rather than "in scope".
+const (
+	scopeClustersLead           = " Clusters this task may delegate to that have a published listing: %d."
+	scopeClustersUnknownLead    = " Clusters this task may delegate to that have a published listing: unknown, as the gateway has no full listing; %d known."
+	scopeClustersUnboundedLead  = " Clusters this task may delegate to: unknown, as the install's scope draws no boundary; %d with a published listing are known."
+	scopeClustersParentScoped   = " This task is scoped to one cluster: %s."
+	scopeClustersParentNone     = " This task is scoped to one cluster, which the install's scope does not admit, or the gateway could not confirm that it does."
+	scopeClustersPageLead       = " On this page (project/location/cluster): %s."
+	scopeClustersNotOnPage      = " Not on this page: %d."
+	scopeClustersOldest         = " Oldest cluster listing read at %s."
+	scopeClustersAgeUnknown     = " The listing's age is unknown."
+	scopeClustersUnlistedLead   = " Projects in scope whose clusters are listed elsewhere: %s"
+	scopeClustersUnlistedMore   = ", and %d more"
+	scopeClustersChecked        = " These clusters pass the install's scope check; a profile's tiers and pins are checked when a task is delegated."
+	scopeClustersDescriptionMax = 6 * 1024
+)
+
+// scopeClustersDescription is the page as the tool's description names it:
+// for a parent scoped to one cluster, that cluster; otherwise the count (or
+// that it is unknown, and why), the page, how many are off it, the oldest
+// listing's time, and the projects listed elsewhere; then what the page was
+// checked against. The widest page the part allows renders under
+// scopeClustersDescriptionMax.
+func scopeClustersDescription(s lib.ScopeClusters) string {
+	var b strings.Builder
+	cluster := func(c lib.ScopeCluster) string { return c.Project + "/" + c.Location + "/" + c.Cluster }
+	if s.ParentScoped {
+		if len(s.Clusters) == 1 {
+			fmt.Fprintf(&b, scopeClustersParentScoped, cluster(s.Clusters[0]))
+			b.WriteString(scopeClustersChecked)
+		} else {
+			b.WriteString(scopeClustersParentNone)
+		}
+		return b.String()
+	}
+	switch {
+	case s.Unbounded:
+		fmt.Fprintf(&b, scopeClustersUnboundedLead, s.Count)
+	case s.Unknown:
+		fmt.Fprintf(&b, scopeClustersUnknownLead, s.Count)
+	default:
+		fmt.Fprintf(&b, scopeClustersLead, s.Count)
+	}
+	if len(s.Clusters) > 0 {
+		items := make([]string, 0, len(s.Clusters))
+		for _, c := range s.Clusters {
+			items = append(items, cluster(c))
+		}
+		fmt.Fprintf(&b, scopeClustersPageLead, strings.Join(items, ", "))
+	}
+	if more := s.Count - len(s.Clusters); more > 0 {
+		fmt.Fprintf(&b, scopeClustersNotOnPage, more)
+	}
+	switch {
+	case s.OldestListing != "":
+		fmt.Fprintf(&b, scopeClustersOldest, s.OldestListing)
+	case s.Count > 0:
+		// Clusters counted with no oldest listing: a stamp the gateway
+		// couldn't date.
+		b.WriteString(scopeClustersAgeUnknown)
+	}
+	if len(s.UnlistedProjects) > 0 {
+		fmt.Fprintf(&b, scopeClustersUnlistedLead, strings.Join(s.UnlistedProjects, ", "))
+		if more := s.UnlistedCount - len(s.UnlistedProjects); more > 0 {
+			fmt.Fprintf(&b, scopeClustersUnlistedMore, more)
+		}
+		b.WriteString(".")
+	}
+	if s.Count > 0 {
+		b.WriteString(scopeClustersChecked)
+	}
+	return b.String()
+}
+
+// ScopeClustersFromEnv is the turn's scopeClusters page as the adapter wrote
+// it into EnvScopeClusters, or nil when the variable is unset or doesn't
+// parse to a valid page, which reads as no page.
+func ScopeClustersFromEnv(log *slog.Logger) *lib.ScopeClusters {
+	raw := os.Getenv(EnvScopeClusters)
+	if raw == "" {
+		return nil
+	}
+	part := lib.Part{Kind: "data", Data: json.RawMessage(`{"scopeClusters":` + raw + `}`)}
+	s, ok, err := lib.ScopeClustersOf([]lib.Part{part})
+	if !ok || err != nil {
+		log.Warn("mcp: the scope clusters don't parse; naming none", "err", err)
+		return nil
+	}
+	return &s
+}
+
 // DelegateTargetsFromEnv is the turn's targets as the adapter wrote them into
 // EnvDelegateTargets, or nil when the variable is unset or doesn't parse to a
 // valid list, which reads as no list (addresseeFallbackDescription).
@@ -235,6 +361,12 @@ const mcpLineMaxBytes = 4 * 1024 * 1024
 // ServeDelegateMCP runs the MCP server until in is closed or ctx ends.
 // targets names the agents the addressee description offers; nil for none.
 func ServeDelegateMCP(ctx context.Context, in io.Reader, out io.Writer, socketPath string, targets *lib.DelegateTargets, log *slog.Logger) error {
+	return ServeDelegateMCPWith(ctx, in, out, socketPath, targets, nil, log)
+}
+
+// ServeDelegateMCPWith is ServeDelegateMCP with the turn's scopeClusters page
+// (nil for none), which the tool's description names.
+func ServeDelegateMCPWith(ctx context.Context, in io.Reader, out io.Writer, socketPath string, targets *lib.DelegateTargets, scope *lib.ScopeClusters, log *slog.Logger) error {
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, scannerInitialBytes), mcpLineMaxBytes)
 	enc := json.NewEncoder(out)
@@ -263,7 +395,7 @@ func ServeDelegateMCP(ctx context.Context, in io.Reader, out io.Writer, socketPa
 				"serverInfo":      map[string]any{"name": DelegateMCPServer, "version": "1"},
 			}
 		case "tools/list":
-			resp.Result = map[string]any{"tools": []any{delegateToolSchema(targets)}}
+			resp.Result = map[string]any{"tools": []any{delegateToolSchema(targets, scope)}}
 		case "tools/call":
 			resp.Result = callDelegate(req.Params, socketPath, log)
 		case "ping":

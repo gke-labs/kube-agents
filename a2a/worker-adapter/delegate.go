@@ -228,7 +228,10 @@ func withDelegateSocketFor(d Driver, argv, env []string, socket string) (out, ou
 // withDelegateTargets hands one turn's delegateTargets part to the delegate
 // MCP server, as JSON in its env inside --mcp-config. A submission with no
 // part, or one that doesn't parse, leaves argv as it is, and the server names
-// platform only. It reports whether the server's entry was found.
+// platform only. It reports whether the server's entry was found. A
+// scopeClusters part beside the targets goes to the server the same way
+// (EnvScopeClusters); one that doesn't parse is left off, and the targets
+// still go.
 func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
 	return withDelegateTargetsFor(claudeDriver{}, argv, origin)
 }
@@ -247,7 +250,16 @@ func withDelegateTargetsFor(d Driver, argv []string, origin *lib.Envelope) ([]st
 	if err != nil {
 		return argv, false
 	}
-	return d.WithDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+	out, rewrote := d.WithDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+	if !rewrote {
+		return out, false
+	}
+	if scope, ok, err := lib.ScopeClustersOf(m.Parts); ok && err == nil {
+		if raw, err := json.Marshal(scope); err == nil {
+			out, _ = d.WithDelegateServerEnv(out, EnvScopeClusters, string(raw))
+		}
+	}
+	return out, true
 }
 
 // delegateWidthOf is the batch width the submission's delegateTargets part

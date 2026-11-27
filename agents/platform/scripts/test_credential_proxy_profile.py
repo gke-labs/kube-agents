@@ -2735,6 +2735,65 @@ class ReportCredentialTest(unittest.TestCase):
         self.assertNotEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
 
 
+UNATTENDED = CASES["the unattended permit, a builtin schedule trigger with a stream"]
+UNATTENDED_REPORT = CASES["the unattended permit on a report credential"]
+
+
+class UnattendedPermitIsInertTest(unittest.TestCase):
+    """vcs:unattended-write, which the verifiers know before the broker's gate reads it.
+
+    Until the gate reads the permit (docs/designs/unattended-write-permit.md,
+    row 6), a credential that carries it reaches what the same credential
+    reaches without it: no version-control write, and for a report credential
+    the audit-report routes alone.
+    """
+
+    _restore = staticmethod(ProfileRouteTest._restore)
+    set_gate = ProfileRouteTest.set_gate
+    request = ReportCredentialTest.request
+    assert_report_refused = ReportCredentialTest.assert_report_refused
+
+    def setUp(self):
+        ProfileRouteTest.setUp(self)
+
+    def admit(self, case, tier):
+        self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", tier)}
+        self.set_gate()
+        return CredentialProxyHandler.profile_gate.admit(self.principal, case["token"])
+
+    def test_the_permit_alone_opens_no_gated_write(self):
+        unattended = self.admit(UNATTENDED, "read")
+        self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), unattended.task.permits)
+        confirmed = self.admit(PERMIT, "read")
+        for verb in sorted(credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.assertIsNotNone(credential_proxy.profile_vcs_refusal(unattended, verb))
+                self.assertIsNone(credential_proxy.profile_vcs_refusal(confirmed, verb))
+
+    def test_a_report_credential_with_the_permit_reaches_the_report_routes_alone(self):
+        principal = self.admit(UNATTENDED_REPORT, "unattended")
+        self.assertTrue(principal.task.report_only)
+        self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), principal.task.permits)
+
+        def verdict(case, method, path):
+            status, body = self.request(method, path, token=case["token"])
+            return status, body.get("rule"), body.get("code")
+
+        gated = [f"/v1/vcs/{verb}" for verb in sorted(credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS)]
+        for path in broker_route_paths() + gated:
+            for method in ("GET", "POST"):
+                with self.subTest(method=method, path=path):
+                    # The same answer as the report credential with no permit.
+                    got = verdict(UNATTENDED_REPORT, method, path)
+                    self.assertEqual(verdict(REPORT, method, path), got)
+                    if not credential_proxy.report_credential_permits(method, path):
+                        self.assertEqual(403, got[0])
+        for path in gated:
+            with self.subTest(path=path):
+                self.assert_report_refused(*self.request("POST", path, token=UNATTENDED_REPORT["token"]))
+        self.assertEqual([], self.executor.calls)
+
+
 class ReportCredentialRoutesTest(unittest.TestCase):
     """REPORT_CREDENTIAL_ROUTES, pinned: an entry added or widened fails here."""
 
@@ -2745,13 +2804,16 @@ class ReportCredentialRoutesTest(unittest.TestCase):
                 ("GET", "{stream}/latest"),
                 ("GET", "{stream}/runs"),
                 ("GET", "{stream}/runs/{run}"),
+                ("GET", "{stream}/runs/{start}"),
                 ("PUT", "{stream}/runs/{run}"),
+                ("PUT", "{stream}/runs/{start}"),
                 ("PUT", "{stream}/latest"),
                 ("DELETE", "{stream}/latest"),
             ],
             [
                 (method, pattern.pattern.replace(credential_proxy._REPORT_STREAM, "{stream}").replace(
-                    credential_proxy._REPORT_RUN_STAMP, "{run}"))
+                    credential_proxy._REPORT_RUN_STAMP, "{run}").replace(
+                    credential_proxy._REPORT_RUN_START, "{start}"))
                 for method, pattern in credential_proxy.REPORT_CREDENTIAL_ROUTES
             ],
         )

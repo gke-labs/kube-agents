@@ -52,16 +52,34 @@ func TestTheClaudeDecoderMapsEachLine(t *testing.T) {
 			`{"type":"tool_result","tool_use_id":"t3"},` +
 			`{"type":"tool_result","tool_use_id":"t4","content":"four"}]}}`,
 			[]Event{
-				{Kind: EventToolResult, ToolResult: json.RawMessage(`"one"`)},
-				{Kind: EventToolResult, ToolResult: json.RawMessage(`["a","b"]`)},
-				{Kind: EventToolResult},
-				{Kind: EventToolResult, ToolResult: json.RawMessage(`"four"`)},
+				{Kind: EventToolResult, CallID: "t1", ToolResult: json.RawMessage(`"one"`)},
+				{Kind: EventToolResult, CallID: "t2", ToolResult: json.RawMessage(`["a","b"]`)},
+				{Kind: EventToolResult, CallID: "t3"},
+				{Kind: EventToolResult, CallID: "t4", ToolResult: json.RawMessage(`"four"`)},
 			}},
 		{"user prompt echo", `{"type":"user","message":{"role":"user","content":"a prompt"}}`, nil},
 		{"one tool result", `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"exit status 77"}]}}`,
-			[]Event{{Kind: EventToolResult, ToolResult: json.RawMessage(`"exit status 77"`)}}},
+			[]Event{{Kind: EventToolResult, CallID: "t1", ToolResult: json.RawMessage(`"exit status 77"`)}}},
 		{"two parallel tool results", `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"text","text":"x"},{"type":"tool_result","tool_use_id":"t2"}]}}`,
-			[]Event{{Kind: EventToolResult}, {Kind: EventToolResult}}},
+			[]Event{{Kind: EventToolResult, CallID: "t1"}, {Kind: EventToolResult, CallID: "t2"}}},
+		{"tool calls with their ids, one of them a skill call", `{"type":"assistant","message":{"content":[` +
+			`{"type":"tool_use","id":"t1","name":"Bash","input":{"skill":"not-a-skill-call"}},` +
+			`{"type":"tool_use","id":"t2","name":"Skill","input":{"skill":"triage","args":"x"}},` +
+			`{"type":"tool_use","id":7,"name":"Skill","input":{"skill":7}}]}}`,
+			[]Event{
+				{Kind: EventActivity, Tool: "Bash", Input: json.RawMessage(`{"skill":"not-a-skill-call"}`), CallID: "t1"},
+				{Kind: EventActivity, Tool: "Skill", Input: json.RawMessage(`{"skill":"triage","args":"x"}`), CallID: "t2", SkillCall: true, Skill: "triage"},
+				{Kind: EventActivity, Tool: "Skill", Input: json.RawMessage(`{"skill":7}`), SkillCall: true},
+			}},
+		{"tool results with their error flags", `{"type":"user","message":{"content":[` +
+			`{"type":"tool_result","tool_use_id":"t1","content":"x","is_error":true},` +
+			`{"type":"tool_result","tool_use_id":"t2","content":"x","is_error":false},` +
+			`{"type":"tool_result","tool_use_id":["t3"],"content":"x","is_error":"true"}]}}`,
+			[]Event{
+				{Kind: EventToolResult, CallID: "t1", Failed: true, ToolResult: json.RawMessage(`"x"`)},
+				{Kind: EventToolResult, CallID: "t2", ToolResult: json.RawMessage(`"x"`)},
+				{Kind: EventToolResult, ToolResult: json.RawMessage(`"x"`)},
+			}},
 		{"a user line with no tool result", `{"type":"user","message":{"content":[{"type":"text","text":"steer"}]}}`, nil},
 		{"user with no message", `{"type":"user"}`, nil},
 		{"success", `{"type":"result","subtype":"success","result":"done"}`,
@@ -158,6 +176,10 @@ func TestTheClaudeDriverKeepsTheHarnessContract(t *testing.T) {
 // "A <tool>", "OK <text>" and "ERR <token> <text>".
 type toyDriver struct {
 	hold bool
+	// restart makes it a driver that takes one user turn per process
+	// (turnRestarter), and budget one with a wall-clock bound
+	// (turnBudgeter, as --left <duration>).
+	restart, budget bool
 	// prepare, if set, runs for each PrepareTurn call, numbered from 1.
 	prepare func(n int, dirs TurnDirs) error
 
@@ -200,6 +222,15 @@ func (d *toyDriver) PrepareTurn(_ context.Context, dirs TurnDirs) error {
 }
 
 func (d *toyDriver) HoldsSteers() bool { return d.hold }
+
+func (d *toyDriver) RestartsPerTurn() bool { return d.restart }
+
+func (d *toyDriver) WithTurnBudget(argv []string, left time.Duration) []string {
+	if !d.budget {
+		return argv
+	}
+	return append(append([]string(nil), argv...), "--left", left.Round(time.Second).String())
+}
 
 func (d *toyDriver) prepared() (int, []TurnDirs) {
 	d.mu.Lock()
@@ -650,7 +681,7 @@ sleep 30
 // the write-refusal stop, which runs on EventToolResult, applies to it, and
 // so does the answer's scrub, which reads the event's content. contents is,
 // step by step, a piece of text the step's event must carry for the scrub,
-// or "" for a step that reported no content; nil checks no content.
+// or "" for a step that reported no content.
 var productionDriverToolSteps = []struct {
 	name     string
 	driver   Driver
@@ -674,10 +705,10 @@ var productionDriverToolSteps = []struct {
 	// step that succeeds, one whose command exits nonzero, one the policy
 	// refuses, a call to a tool the turn wasn't offered, and a turn with
 	// no tool at all.
-	{"core-agent tool-step", newCoreAgentDriver(), fixtureLines("coreagent", "tool-step"), 1, nil},
-	{"core-agent tool-error", newCoreAgentDriver(), fixtureLines("coreagent", "tool-error"), 1, nil},
-	{"core-agent tool-refused", newCoreAgentDriver(), fixtureLines("coreagent", "tool-refused"), 1, nil},
-	{"core-agent unknown-tool", newCoreAgentDriver(), fixtureLines("coreagent", "unknown-tool"), 1, nil},
+	{"core-agent tool-step", newCoreAgentDriver(), fixtureLines("coreagent", "tool-step"), 1, []string{"hi"}},
+	{"core-agent tool-error", newCoreAgentDriver(), fixtureLines("coreagent", "tool-error"), 1, []string{"exit_code"}},
+	{"core-agent tool-refused", newCoreAgentDriver(), fixtureLines("coreagent", "tool-refused"), 1, []string{"allowlist entry"}},
+	{"core-agent unknown-tool", newCoreAgentDriver(), fixtureLines("coreagent", "unknown-tool"), 1, []string{"write_file"}},
 	{"core-agent text-only", newCoreAgentDriver(), fixtureLines("coreagent", "text-only"), 0, nil},
 }
 

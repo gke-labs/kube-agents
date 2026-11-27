@@ -49,6 +49,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
@@ -141,7 +142,8 @@ func main() {
 // at the socket the adapter named and with the delegate targets it wrote into
 // this process's env for the turn.
 func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
-	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+	return workeradapter.ServeDelegateMCPWith(ctx, in, out, workeradapter.DelegateSocketPath(),
+		workeradapter.DelegateTargetsFromEnv(log), workeradapter.ScopeClustersFromEnv(log), log)
 }
 
 func run() int {
@@ -170,6 +172,20 @@ func run() int {
 	// `worker-adapter warm-ready` is a warm session pod's readiness probe:
 	// exit 0 once the adapter's loopback status endpoint answers, which it
 	// does from when its task watcher's consumer exists (workeradapter.runWarm).
+	// `worker-adapter trajectory <task id>` prints a task's tool-call
+	// capture from this pod's loopback port (workeradapter.FetchTrajectory):
+	// what the evals read with kubectl exec.
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.TrajectoryCommand {
+		if len(os.Args) != 3 {
+			fmt.Fprintf(os.Stderr, "usage: worker-adapter %s <task id>\n", workeradapter.TrajectoryCommand)
+			return 2
+		}
+		if err := workeradapter.FetchTrajectory(context.Background(), workeradapter.TrajectoryAddr, os.Args[2], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if len(os.Args) > 1 && os.Args[1] == lib.SessionWarmReadyCommand {
 		return warmReady(warmStatusURL(), lib.SessionWarmReadyWaitSeconds*time.Second)
 	}
@@ -209,6 +225,19 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// A core-agent worker's model calls go through the adapter's loopback
+	// proxy, started once and closed when the worker exits
+	// (startHarnessGateway). A proxy that can't start refuses the worker:
+	// the harness never runs pointed at anything else.
+	gatewayProxy, err := applyHarnessGateway(&cfg, os.Getenv, gatewayProxyStarterFromEnv(os.Getenv, log), log)
+	if err != nil {
+		log.Error("worker refused", "err", err)
+		return 1
+	}
+	if gatewayProxy != nil {
+		defer func() { _ = gatewayProxy.Close() }()
+	}
+
 	if os.Getenv(lib.EnvProfileWorker) == "true" {
 		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
 		// The harness configFromEnv selected: its driver names it.
@@ -227,6 +256,7 @@ func run() int {
 			// Whether the persona must carry a build-time content manifest.
 			RequirePersonaIntegrity: requireIntegrity,
 			Harness:                 harness,
+			Workdir:                 workdir,
 			ConfigRoot:              envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
@@ -239,6 +269,13 @@ func run() int {
 			// What a script-run task's credential is verified against
 			// (#5622): rendered into Job templates only.
 			TaskSigningKeys: os.Getenv("A2A_TASK_SIGNING_PUBLIC_KEYS"),
+			// The pod's kube-proxy, when the operator names one: kubectl then
+			// goes through the worker's loopback rather than the broker.
+			KubeProxy: workeradapter.KubeProxyLoopbackConfig{
+				Upstream:     os.Getenv(workeradapter.EnvKubeProxyURL),
+				CAFile:       os.Getenv(workeradapter.EnvKubeProxyCAFile),
+				PodTokenFile: os.Getenv(workeradapter.EnvCredentialProxyTokenFile),
+			},
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -250,10 +287,28 @@ func run() int {
 	// The session's shipped persona and skills, checked against their
 	// build-time manifest before the harness first runs.
 	if dir := harnessConfigDir(); dir != "" {
-		if err := workeradapter.CheckSessionHome(dir, log); err != nil {
+		if err := checkSessionPersona(activeHarness, dir, log); err != nil {
 			log.Error("session worker failed", "err", err)
 			return 1
 		}
+	}
+
+	// The session's tool-call capture for the evals, on loopback only. A
+	// port that can't be bound costs the capture, never the session. The
+	// port stays open until Run returns, not just until a signal arrives, so
+	// the calls of a turn being stopped can still be read while it winds
+	// down. Not dumpable, so the agent's processes (same uid) can't reach
+	// the capture through this process's /proc entries.
+	if err := workeradapter.HideFromSameUID(); err != nil {
+		log.Warn("trajectory capture: couldn't mark the adapter not dumpable", "err", err)
+	}
+	trajCtx, trajStop := context.WithCancel(context.Background())
+	defer trajStop()
+	traj := workeradapter.NewTrajectoryStore()
+	if _, err := workeradapter.ServeTrajectory(trajCtx, traj, workeradapter.TrajectoryAddr, log); err != nil {
+		log.Warn("trajectory capture: the read port couldn't be bound; the session runs without it", "addr", workeradapter.TrajectoryAddr, "err", err)
+	} else {
+		cfg.Trajectory = traj
 	}
 
 	res, err := workeradapter.Run(ctx, cfg)
@@ -389,6 +444,20 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	// Chosen before anything below builds an argv or env from it.
 	activeHarness = builder
 	log.Info("harness selected", "harness", string(harness))
+	// Every harness runs its tools as the adapter's user, so the adapter is
+	// made non-dumpable before any turn: those processes then can't read its
+	// environment or memory, open its /proc fds (the harness's pipes, where a
+	// forged event line could be written), or attach to it. A harness
+	// process is unaffected: exec makes it dumpable again. Where it fails,
+	// a harness that depends on isolation (core-agent, Antigravity) is
+	// refused; Claude Code runs as it did before, with a warning.
+	if err := protectAdapter(); err != nil {
+		if harness == persona.CoreAgent || harness == persona.Antigravity {
+			log.Error("the adapter could not be made non-dumpable; refusing the harness", "harness", string(harness), "err", err)
+			return workeradapter.Config{}, false
+		}
+		log.Warn("the adapter could not be made non-dumpable", "harness", string(harness), "err", err)
+	}
 
 	originSeq, originSeqStated := originSeq(log)
 	// delegateSocket feeds Config.DelegateSocket (commented in adapter.go):
@@ -676,10 +745,16 @@ func harnessUserSettings() string {
 	return activeHarness.userSettings(os.Getenv)
 }
 
-// harnessConfigDir is the harness's config directory: $CLAUDE_CONFIG_DIR,
-// else ~/.claude. "" when neither is known.
+// checkSessionPersona checks the persona in dir against b's scope.
+func checkSessionPersona(b harnessBuilder, dir string, log *slog.Logger) error {
+	return workeradapter.CheckSessionHome(dir, b.personaCovers, log)
+}
+
+// harnessConfigDir is the directory holding the active harness's shipped
+// persona (for Claude Code, $CLAUDE_CONFIG_DIR, else ~/.claude), or "" when
+// it isn't known.
 func harnessConfigDir() string {
-	return claudeConfigDir(os.Getenv)
+	return activeHarness.configDir(os.Getenv)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare
@@ -803,6 +878,14 @@ func readPrimer(log *slog.Logger) string {
 	return string(b)
 }
 
+// envOrDefaultFrom is getenv(key), or def when that is empty.
+func envOrDefaultFrom(getenv func(string) string, key, def string) string {
+	if v := getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 // envOrDefault is the variable's value, or def when it's unset.
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -827,6 +910,9 @@ func selfPath() string {
 // the harness's stream driver and argv builder. A value the worker doesn't
 // know is an error, never a fall back to Claude Code: a typo would otherwise
 // run the wrong harness without a word.
+// protectAdapter is workeradapter.ProtectProcess, swapped in tests.
+var protectAdapter = workeradapter.ProtectProcess
+
 func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.Driver, harnessBuilder, error) {
 	h := persona.Harness(getenv(lib.EnvHarness))
 	if h == "" && getenv(lib.EnvProfileWorker) == "true" {
@@ -853,6 +939,22 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	builder, err := builderFor(driver.Harness())
 	if err != nil {
 		return "", nil, nil, err
+	}
+	// core-agent's tool grant travels in every turn's envelope, so the
+	// driver carries it. A session pod's is its allowlist; one that doesn't
+	// map or render stops the worker here rather than running with every
+	// tool refused. A profile worker's comes from its persona, not the
+	// session allowlist, so it starts with an empty grant (every tool
+	// refused) until the persona's is set.
+	if driver.Harness() == persona.CoreAgent {
+		var p coreagentwire.Policy
+		if getenv(lib.EnvProfileWorker) != "true" {
+			var err error
+			if p, err = coreAgentSessionGrant(getenv, envOrDefaultFrom(getenv, "A2A_WORKDIR", defaultWorkdir)); err != nil {
+				return "", nil, nil, fmt.Errorf("the tool grant for harness %q: %w", driver.Harness(), err)
+			}
+		}
+		driver = workeradapter.NewCoreAgentDriver(p, nil)
 	}
 	// A harness with no default path in the image needs one named, unless a
 	// test replaces the whole argv. Refused here, at startup, rather than at

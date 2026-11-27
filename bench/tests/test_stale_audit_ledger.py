@@ -71,7 +71,17 @@ class Forge:
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("FLEET_AUDIT_REPORTS_DIR", str(tmp_path / "reports"))
+    monkeypatch.delenv("FLEET_AUDIT_REPORT_STORE", raising=False)
+    monkeypatch.setattr(ledger, "BENCH_SCRATCH", str(tmp_path / "scratch"))
     return tmp_path / "reports"
+
+
+@pytest.fixture
+def broker(store, monkeypatch, memory_report_store):
+    """The broker store (#6110): audit_report writes through it, and the local store stays unmade."""
+    monkeypatch.setenv("FLEET_AUDIT_REPORT_STORE", "broker")
+    monkeypatch.setattr(audit_report, "_report_store_client", lambda: memory_report_store)
+    return memory_report_store
 
 
 def forge_with(monkeypatch, **replies):
@@ -257,3 +267,41 @@ def test_the_gap_that_cleared_is_not_news_to_the_clean_run(store, monkeypatch):
     assert memory[audit_report.RUN_SCHEDULED_KEY] is True
     assert audit_report.scheduled_published_baseline(memory) == []
     assert audit_report.scheduled_gaps_baseline(memory) == memory["coverage_gaps"]
+
+
+@pytest.mark.parametrize("value", ["", "file"])
+def test_the_file_store_keeps_the_seeded_number_in_the_store_directory(store, monkeypatch, value):
+    monkeypatch.setenv("FLEET_AUDIT_REPORT_STORE", value)
+    seeded_body(monkeypatch)
+    path = ledger.seeded_issue_path(audit_report, AUDIT, GITOPS)
+    assert path == audit_report.reports_dir_for(AUDIT, GITOPS) / ledger.SEEDED_ISSUE_FILE
+    assert ledger.seeded_issue(path) == 7
+
+
+def test_the_broker_store_seeds_through_the_broker_and_keeps_the_number_in_scratch(store, broker, monkeypatch):
+    _, body = seeded_body(monkeypatch)
+    assert (AUDIT, GITOPS) in broker.latest
+    memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
+    assert memory is not None and not memory.get(ledger.SEEDED_FROM_LEDGER_KEY)
+    assert not store.exists()
+    path = ledger.seeded_issue_path(audit_report, AUDIT, GITOPS)
+    assert path.is_relative_to(ledger.BENCH_SCRATCH)
+    assert ledger.seeded_issue(path) == 7
+    forge_with(monkeypatch, **{"issue-list": {"issues": [{"number": 7, "body": "rewritten"}]}})
+    assert ledger.teardown(audit_report, AUDIT, GITOPS) == [7]
+    assert not path.exists()
+
+
+def test_the_broker_seed_fails_when_the_broker_holds_no_latest(store, broker, monkeypatch):
+    monkeypatch.setattr(broker, "write_latest", lambda *args: None)
+    with pytest.raises(SystemExit, match="was not written"):
+        seeded_body(monkeypatch)
+
+
+def test_an_unknown_switch_stops_the_script_before_the_forge(store, monkeypatch):
+    monkeypatch.setenv("FLEET_AUDIT_REPORT_STORE", "Broker")
+    forge = forge_with(monkeypatch)
+    monkeypatch.setitem(sys.modules, "audit_report", audit_report)
+    with pytest.raises(SystemExit, match=re.escape("FLEET_AUDIT_REPORT_STORE='Broker'")):
+        ledger.main(["ledger.py", ledger.SEED_MODE, AUDIT, GITOPS])
+    assert forge.calls == []

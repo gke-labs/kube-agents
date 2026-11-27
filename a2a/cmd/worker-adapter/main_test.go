@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
@@ -746,8 +747,8 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 }
 
-// harnessConfigDir is where the session check and the settings lookup both
-// look: $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
+// For the default harness, Claude Code, harnessConfigDir is
+// $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
 func TestHarnessConfigDir(t *testing.T) {
 	t.Setenv(claudeConfigDirEnv, "/cfg")
 	t.Setenv("HOME", "/home/u")
@@ -781,6 +782,49 @@ func TestSessionWriteRefusalDir(t *testing.T) {
 				t.Fatalf("sessionWriteRefusalDir(%q) = %q, want %q", tc.session, got, tc.want)
 			}
 		})
+	}
+}
+
+// On a core-agent worker the session check reads the rendered persona the
+// harness reads, never Claude Code's config directory, whatever the Claude
+// variables say, and it checks only the names a rendering holds.
+func TestACoreAgentWorkerChecksItsOwnPersonaTree(t *testing.T) {
+	prev := activeHarness
+	t.Cleanup(func() { activeHarness = prev })
+	activeHarness = coreAgentBuilder{}
+	t.Setenv(claudeConfigDirEnv, "/cfg")
+	t.Setenv("HOME", "/home/u")
+	if got := harnessConfigDir(); got != coreAgentPersonaDir {
+		t.Errorf("harnessConfigDir() = %q, want %q", got, coreAgentPersonaDir)
+	}
+	for rel, want := range map[string]bool{
+		"instructions.md": true, "skills/triage/SKILL.md": true,
+		"CLAUDE.md": false, "GEMINI.md": false, "hooks.json": false,
+	} {
+		if got := activeHarness.personaCovers(rel); got != want {
+			t.Errorf("personaCovers(%q) = %v, want %v", rel, got, want)
+		}
+	}
+}
+
+// The session check takes its scope from the active harness: a core-agent
+// rendering with a manifest over instructions.md passes, where Claude Code's
+// scope would refuse instructions.md as outside the files it covers.
+func TestTheSessionCheckUsesTheActiveHarnessScope(t *testing.T) {
+	files := map[string][]byte{"instructions.md": []byte("persona\n")}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "instructions.md"), files["instructions.md"], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, persona.IntegrityManifestFile), persona.FormatIntegrityManifest(files), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := checkSessionPersona(coreAgentBuilder{}, dir, log); err != nil {
+		t.Errorf("core-agent's scope: %v", err)
+	}
+	if err := checkSessionPersona(claudeBuilder{}, dir, log); err == nil {
+		t.Error("Claude Code's scope passed a manifest naming instructions.md")
 	}
 }
 

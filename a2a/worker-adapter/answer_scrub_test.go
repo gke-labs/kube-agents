@@ -607,3 +607,82 @@ func TestAnAgyToolOutputFeedsTheSeenSet(t *testing.T) {
 		}
 	}
 }
+
+// A core-agent task through the adapter: a Secret a bash step printed reaches
+// the seen set through the driver's EventToolResult, so core-agent's streamed
+// text and its result echoing the value are redacted, and the step's output
+// itself is never published.
+func TestACoreAgentTaskRedactsWhatItsToolStepPrinted(t *testing.T) {
+	line := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	response := line(map[string]any{"exit_code": 0, "stderr": "", "stdout": secretManifest(t, synthSeenValue)})
+	lines := []string{
+		line(map[string]any{"type": "init", "session": "s-scrub-1", "model": "model-default"}),
+		line(map[string]any{"type": "tool_call", "id": "c1", "tool": "bash", "input": map[string]any{"command": "kubectl get secret app-db -o json"}}),
+		line(map[string]any{"type": "tool_result", "id": "c1", "tool": "bash", "text": response}),
+		line(map[string]any{"type": "text", "text": "the stored value is " + synthSeenValue}),
+		line(map[string]any{"type": "result", "text": "The database secret decodes to " + synthSeenValue + "."}),
+	}
+	path := filepath.Join(t.TempDir(), "out.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const session, taskID = "chat-coreagent-scrub-a1", "task-coreagent-scrub-1"
+	url := startServer(t)
+	c := testClient(t, url)
+	submit(t, c, session, taskID, "what is the database password")
+	cfg := adapterConfig(url, taskID, session, stub(t, fmt.Sprintf("read first || exit 1\ncat %q\n", path)))
+	// The driver's own turn gate (the adapter as the container's init) is
+	// skipped, as the canary's control leg skips it: what's under test is
+	// its decoder's EventToolResult reaching the scrub.
+	cfg.Driver = countingDriver{coreAgentDriver: newCoreAgentDriver(), onStart: func() {}}
+	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
+	task := foldTask(t, c, session, taskID)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("state=%q err=%v final=%+v", out.res.State, out.err, task.FinalMessage)
+	}
+	for _, artifact := range []string{lib.ArtifactResult, lib.ArtifactProgress} {
+		got := artifactText(task, artifact)
+		if strings.Contains(got, synthSeenValue) || !strings.Contains(got, answerscrub.Redacted) {
+			t.Errorf("%s artifact = %q, want the seen value redacted", artifact, got)
+		}
+	}
+	for _, env := range replayEvents(t, url, session, taskID) {
+		if b, _ := json.Marshal(env); strings.Contains(string(b), "exit_code") || strings.Contains(string(b), synthSeenValue) {
+			t.Errorf("the tool step's output or the value was published: %s", b)
+		}
+	}
+}
+
+// A core-agent tool result is the tool's function response, a JSON object: a
+// Secret a command printed on stdout reaches the seen set read whole, and an
+// answer echoing its value is redacted.
+func TestACoreAgentToolResultFeedsTheSeenSet(t *testing.T) {
+	stdout := secretManifest(t, synthSeenValue)
+	response, err := json.Marshal(map[string]any{"exit_code": 0, "stderr": "", "stdout": stdout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{"type": "tool_result", "id": "adk-1", "tool": "bash", "text": string(response)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := newCoreAgentDriver().NewDecoder()
+	if _, err := dec.Decode([]byte(`{"type":"init","session":"s-1","model":"m"}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := dec.Decode(line)
+	if err != nil || len(evs) != 1 || evs[0].Kind != EventToolResult {
+		t.Fatalf("decode: %v %+v", err, evs)
+	}
+	var seen answerscrub.Seen
+	seen.CollectToolResult(evs[0].ToolResult)
+	if got := answerscrub.Scrub("the stored value is "+synthSeenValue, &seen); strings.Contains(got, synthSeenValue) {
+		t.Fatalf("not redacted: %q", got)
+	}
+}

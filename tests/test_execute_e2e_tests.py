@@ -103,6 +103,33 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(captured.get("E2E_SUITE"), "audit")
         self.assertEqual(captured.get("E2E_ENV"), "audit")
 
+    def test_the_push_registry_is_never_the_registry_published_images_are_read_from(self) -> None:
+        """REGISTRY_PREFIX names where an environment reads published images, and
+        its identity may hold read alone there. The suites push what they build,
+        so the child's REGISTRY is the explicit one, else the project's own."""
+        suite = {"name": "agent-plugin", "tests": ["tests/e2e/x.py"]}
+        read_prefix = "us-docker.pkg.dev/some-project/published-images"
+        captured = self._run(suite, ambient={"REGISTRY": "", "REGISTRY_PREFIX": read_prefix})
+        self.assertEqual(captured.get("REGISTRY"), "us-east4-docker.pkg.dev/test-project/kube-agents")
+        captured = self._run(suite, ambient={"REGISTRY": "example.test/push-here", "REGISTRY_PREFIX": read_prefix})
+        self.assertEqual(captured.get("REGISTRY"), "example.test/push-here")
+
+    def test_the_manual_runner_forwards_the_push_registry_and_not_the_read_prefix(self) -> None:
+        import yaml
+
+        workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "e2e-manual-runner.yml").read_text())
+        steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+        (run_step,) = [step for step in steps if step.get("name") == "Execute E2E Tests"]
+        self.assertEqual(run_step["env"]["REGISTRY"], "${{ vars.REGISTRY }}")
+        inherited = [workflow.get("env") or {}] + [job.get("env") or {} for job in workflow["jobs"].values()]
+        for env in [run_step["env"], *inherited]:
+            self.assertNotIn("REGISTRY_PREFIX", env)
+
+    def test_the_plugin_suite_does_not_fall_back_to_the_read_prefix(self) -> None:
+        """The suite needs a live cluster, so its source is read."""
+        suite = (_REPO_ROOT / "tests" / "e2e" / "operator" / "agentplugins_e2e_test.py").read_text()
+        self.assertNotIn("REGISTRY_PREFIX", suite)
+
     def test_suite_specific_env_vars_still_reach_the_child(self) -> None:
         captured = self._run(
             {

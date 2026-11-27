@@ -1,0 +1,61 @@
+# The drift audit's `kubelet-config` facet (fleet_consistency_drift_sop.md
+# §4.16): node pools vote on five kubelet settings, and the pool that differs
+# from the cohort's pools is filed. The same full audit as
+# consistency-drift-outlier, graded on a different finding.
+#
+# Planted defect: seeded-c's default-pool sets kubeletConfig.podPidsLimit to
+# 4096 where every other pool in the stack sets none of the five keys
+# (bench/tf/fleet/main.tf, seeded_c_default). Eleven Linux pools vote, ten
+# agree: 0.91, so the ladder takes no step and the base-major finding stands.
+# A cluster-level vote could not grade this: three clusters of four is 0.75,
+# two steps, and only a base-critical facet survives that.
+#
+# Isolation class: cluster-read-only, GitOps-repo write (the ledger), as
+# consistency-drift-outlier documents.
+id: consistency-kubelet-config-pool-outlier
+name: Drift audit names the node pool whose kubelet configuration differs from its peers
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP.
+expected_output: >-
+  The ledger issue files a kubelet-config finding against the default node
+  pool of the outlier cluster, names the kubelet settings the cohort's pools
+  hold and the ones this pool holds, and says how many pools agree. The
+  closing response is the SOP's one line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: consistency
+
+# One role, by name, as bench-fleet-catalog.md requires. The role also asserts
+# the pool's boot disk, which the `boot-disk` facet reads
+# (consistency-boot-disk-pool-outlier); while that half reads drifted on a
+# project, the lanes record this case there as infrastructure.
+fixtures:
+  - drift-pool-outlier
+
+verification_spec:
+  # Graded against the ledger, not the chat reply: the SOP's closing line
+  # restates nothing. scope: finding_ids, because `kubelet-config` is a roster
+  # slug and the body's evidence table prints it on a run that filed nothing.
+  - name: a-kubelet-config-finding-was-filed
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      required_phrases: ["kubelet-config", "seeded-c"]
+  # The finding is on the pool, not on the cluster: the object the ledger
+  # renders for a `kubelet-config` finding is the planted pool.
+  - name: the-kubelet-config-finding-names-the-planted-pool
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding
+      finding_check: ["kubelet-config"]
+      required_phrases: ["NodePool/default-pool"]

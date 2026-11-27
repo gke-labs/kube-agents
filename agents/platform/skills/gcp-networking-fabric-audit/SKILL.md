@@ -28,6 +28,8 @@ Read the manifest and follow `/opt/data/profiles/platform/governance/gcp_network
 - `subnet-ip-exhaustion`, on each `<project>/<region>/<subnet>` target: Pod ranges from GKE's own utilization fields, primary ranges as a lower bound from VM NICs, internal addresses and forwarding rules.
 - `cloud-nat-exhaustion`, `psc-routing-deadlock`, `mtu-packet-fragmentation`, `cloud-armor-false-positive`, `firewall-world-open-ingress` and `missing-nodelocal-dnscache`, on each `project/<project>` target.
 
+Not in this audit: Istio ServiceEntry host collisions are in-cluster objects, checked by `compliance-audit` §2.19 (`serviceentry-host-collision`, in `/opt/data/profiles/platform/governance/compliance_audit_sop.md`).
+
 A manifest with a top-level `error` read no target: do not call `finish`, and report the error.
 
 ## 3. Hand Findings to Fleet Audit

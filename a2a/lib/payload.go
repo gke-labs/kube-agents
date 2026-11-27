@@ -7,6 +7,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -571,6 +572,165 @@ func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
 	return *found, true, nil
 }
 
+// ScopeClusters is the scopeClusters data part a delegating profile
+// parent's submission carries beside delegateTargets: one bounded page of
+// the install's in-scope clusters, each one a `cluster` child delegation
+// would be accepted for, in (project, location, cluster) order. Count is
+// how many clusters are in scope in all, so Truncated is Count past the
+// page. Cursor is reserved for a later paging contract and is always empty
+// for now; a reader ignores it.
+//
+// Three fields say what the page can't. Unknown is set when the gateway has
+// no full cluster list to count (the resolved scope carries none, or dropped
+// it for size): Count is then only the clusters it knows of, a lower bound,
+// and Truncated is always set. UnlistedProjects names projects in scope
+// whose clusters no list the gateway reads carries (an explicitly declared
+// project, the management project, a member not yet listed), sorted and cut
+// at ScopeClustersUnlistedMax, with UnlistedCount the total; their clusters
+// are listed elsewhere, and a delegation to one is still checked as it
+// arrives. OldestListing is when the oldest listing the counted clusters
+// came from was read (RFC 3339), so a reader can tell a stale one; it is
+// left out when that age is unknown (a stamp ahead of the gateway's clock),
+// so clusters counted with no OldestListing have an unknown age.
+//
+// ParentScoped says the parent is scoped to one cluster, so the page is that
+// cluster or nothing and Count is 0 or 1. Unbounded says the install's scope
+// declares no boundary, so any project not excluded is in scope: Unknown is
+// set and no project is named as listed elsewhere.
+//
+// Every one of these is left out when unset, so a part without them is the
+// shape first written.
+type ScopeClusters struct {
+	Count            int            `json:"count"`
+	Clusters         []ScopeCluster `json:"clusters"`
+	Truncated        bool           `json:"truncated"`
+	Cursor           string         `json:"cursor"`
+	Unknown          bool           `json:"unknown,omitempty"`
+	UnlistedProjects []string       `json:"unlistedProjects,omitempty"`
+	UnlistedCount    int            `json:"unlistedCount,omitempty"`
+	OldestListing    string         `json:"oldestListing,omitempty"`
+	ParentScoped     bool           `json:"parentScoped,omitempty"`
+	Unbounded        bool           `json:"unbounded,omitempty"`
+}
+
+// ScopeCluster is one cluster on a scopeClusters page: the target a
+// `cluster` delegation names it by.
+type ScopeCluster struct {
+	Project  string `json:"project"`
+	Location string `json:"location"`
+	Cluster  string `json:"cluster"`
+}
+
+// ScopeClustersPageMax is the most clusters one scopeClusters page carries:
+// the widest batch any gateway accepts (DelegateBatchMax). A gateway caps its
+// page at its own delegation width under this bound, so the page is one
+// batch's worth of targets. ScopeClustersUnlistedMax is the most projects
+// UnlistedProjects names. ScopeClustersMaxBytes bounds the encoded part,
+// which the session pod hands its tool server in one environment variable;
+// the widest page and unlisted list of the longest labels fit under it.
+const (
+	ScopeClustersPageMax     = DelegateBatchMax
+	ScopeClustersUnlistedMax = 16
+	ScopeClustersMaxBytes    = 8 * 1024
+)
+
+const scopeClustersKey = "scopeClusters"
+
+func validateScopeClusters(s ScopeClusters) error {
+	if len(s.Clusters) > ScopeClustersPageMax {
+		return fmt.Errorf("scope clusters: a page of %d, at most %d", len(s.Clusters), ScopeClustersPageMax)
+	}
+	if s.Count < len(s.Clusters) {
+		return fmt.Errorf("scope clusters: count %d is under the page's %d", s.Count, len(s.Clusters))
+	}
+	if s.Unknown && !s.Truncated {
+		return errors.New("scope clusters: an unknown count is always truncated")
+	}
+	if s.Unbounded && (!s.Unknown || len(s.UnlistedProjects) > 0 || s.UnlistedCount > 0) {
+		return errors.New("scope clusters: an unbounded scope is unknown and names no unlisted projects")
+	}
+	if s.ParentScoped && (s.Count > 1 || s.Unknown || s.Unbounded || s.UnlistedCount > 0) {
+		return errors.New("scope clusters: a parent scoped to one cluster has a known count of at most one and nothing unlisted")
+	}
+	if !s.Unknown && s.Truncated != (s.Count > len(s.Clusters)) {
+		return fmt.Errorf("scope clusters: truncated is %t with count %d and a page of %d", s.Truncated, s.Count, len(s.Clusters))
+	}
+	if s.Cursor != "" {
+		return errors.New("scope clusters: the cursor is reserved and must be empty")
+	}
+	for _, c := range s.Clusters {
+		if !validDNS1123Label(c.Project) || !validDNS1123Label(c.Location) || !validDNS1123Label(c.Cluster) {
+			return fmt.Errorf("scope clusters: %q/%q/%q is not a cluster target", c.Project, c.Location, c.Cluster)
+		}
+	}
+	if len(s.UnlistedProjects) > ScopeClustersUnlistedMax {
+		return fmt.Errorf("scope clusters: %d unlisted projects, at most %d", len(s.UnlistedProjects), ScopeClustersUnlistedMax)
+	}
+	if s.UnlistedCount < len(s.UnlistedProjects) {
+		return fmt.Errorf("scope clusters: unlisted count %d is under the %d named", s.UnlistedCount, len(s.UnlistedProjects))
+	}
+	for _, p := range s.UnlistedProjects {
+		if !validDNS1123Label(p) {
+			return fmt.Errorf("scope clusters: unlisted %q is not a project", p)
+		}
+	}
+	if s.OldestListing != "" {
+		if _, err := time.Parse(time.RFC3339, s.OldestListing); err != nil {
+			return fmt.Errorf("scope clusters: oldest listing %q is not a time", s.OldestListing)
+		}
+	}
+	if raw, err := json.Marshal(s); err != nil || len(raw) > ScopeClustersMaxBytes {
+		return fmt.Errorf("scope clusters: encoded past %d bytes", ScopeClustersMaxBytes)
+	}
+	return nil
+}
+
+// ScopeClustersPart is s as a data part, refused when s breaks the bounds.
+func ScopeClustersPart(s ScopeClusters) (Part, error) {
+	if s.Clusters == nil {
+		s.Clusters = []ScopeCluster{}
+	}
+	if err := validateScopeClusters(s); err != nil {
+		return Part{}, err
+	}
+	data, err := json.Marshal(map[string]ScopeClusters{scopeClustersKey: s})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ScopeClustersOf finds the scopeClusters part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader shows no
+// page.
+func ScopeClustersOf(parts []Part) (ScopeClusters, bool, error) {
+	var found *ScopeClusters
+	for _, p := range parts {
+		raw, ok := wrappedData(p, scopeClustersKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return ScopeClusters{}, true, errors.New("scope clusters: more than one scopeClusters part")
+		}
+		var s ScopeClusters
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return ScopeClusters{}, true, fmt.Errorf("scope clusters: %w", err)
+		}
+		if s.Clusters == nil {
+			return ScopeClusters{}, true, errors.New("scope clusters: the part carries no clusters list")
+		}
+		if err := validateScopeClusters(s); err != nil {
+			return ScopeClusters{}, true, err
+		}
+		found = &s
+	}
+	if found == nil {
+		return ScopeClusters{}, false, nil
+	}
+	return *found, true, nil
+}
+
 // ReplyTo is the replyTo data part: the task whose stored report this turn
 // answers (spec-a2a-payloads.md, "Task parameters and child results");
 // written by the gateway only.
@@ -842,10 +1002,13 @@ func wrappedData(p Part, key string) (json.RawMessage, bool) {
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
-// receives on a running task: one per follow-up envelope, either queued or
-// refused with a reason. The gateway's relay reads it to word its posts
-// and to count what it promised the room; a reader that does not know it
-// sees the text part beside it.
+// receives on a running task: one when the follow-up arrives, either queued
+// or refused with a reason, and a second, refused, for a queued follow-up
+// that does not get its turn. Neither is guaranteed: for example, a
+// follow-up that arrives after the terminal gets none, and an executor that
+// crashes sends none for its queue. The gateway's relay reads it to word
+// its posts and to count what it promised the room; a reader that does not
+// know it sees the text part beside it.
 type SteerNotice struct {
 	Steer      string `json:"steer"`
 	EnvelopeID string `json:"envelopeId"`

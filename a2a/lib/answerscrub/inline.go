@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -1020,12 +1021,18 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 }
 
 var (
-	// envNameValuePattern is a Kubernetes env entry, a name followed by a
-	// literal value sibling, in YAML (- name: X, then value: y on the next
-	// line), JSON or a flow mapping; envValueNamePattern is the same with
-	// the value first (JSON or a flow mapping). valueFrom is not a value.
-	envNameValuePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:,[ \t]*(?:\r?\n[ \t]*)?|\r?\n[ \t]*)["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
-	envValueNamePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
+	// envNameValueFlowPattern is a Kubernetes env entry, a name followed by
+	// a literal value sibling, in JSON or a flow mapping (a comma between),
+	// an unquoted value ending at , } or ]; envNameValueBlockPattern is the
+	// same in block YAML (- name: X, then value: y on the next line, a
+	// comment after the name allowed), an unquoted value running to its
+	// line's end, comment and all, for envUnquotedValue to cut;
+	// envValueNamePattern is the flow one with the value first. valueFrom
+	// is not a value. Each value match ends within its own line or at a
+	// flow separator, so a scan of one long line stays linear.
+	envNameValueFlowPattern  = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
+	envNameValueBlockPattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:[ \t]+#[^\r\n]*)?\r?\n[ \t]*["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\r\n]*[^\r\n \t])`)
+	envValueNamePattern      = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
 )
 
 // scrubEnvNameValuePairs redacts the literal value of a Kubernetes env
@@ -1040,26 +1047,148 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 	pair := func(re *regexp.Regexp, nameG, valueG int) {
 		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
 			name := s[m[2*nameG]:m[2*nameG+1]]
+			if !inlineSecretKey(name) {
+				continue
+			}
 			lo, hi := m[2*valueG], m[2*valueG+1]
+			var decoded string
+			// The value's candidate ends, the first that reads as a value
+			// taken: a quoted value's closing quote; an unquoted one's
+			// line end, then its first , } or ] (a note, a URL or another
+			// value after it on the line).
+			var ends []int
+			// segs[i] is where ends[i]'s line text stops, a comment after the
+			// value included: on a credential key's line a comment that
+			// reads as a value is redacted with it (commentReadsAsValue).
+			var segs []int
+			cutAt := -1 // an unquoted value's first , } or ]
+			unquoted := false
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
+				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
+				ends = []int{hi}
+				segs = []int{hi}
+			} else {
+				if strings.HasPrefix(s[lo:hi], "#") {
+					// YAML reads no value here, but a commented-out value on
+					// a credential key's line is still redacted, as a
+					// line-end read redacted it. It is not tracked as the
+					// value (it is not the value YAML reads), but a pair
+					// inside it is, as other rules would have found it.
+					if commentReadsAsValue(name, s[lo:hi]) {
+						spans = append(spans, [2]int{lo, hi})
+						if sink != nil {
+							scrubEnvRest("value: "+strings.TrimLeft(s[lo+1:hi], " \t"), sink)
+						}
+					}
+					continue
+				}
+				unquoted = true
+				ends = []int{lo + envUnquotedValue(s[lo:hi])}
+				segs = []int{lo + len(strings.TrimRight(s[lo:hi], " \t"))}
+				if cut := strings.IndexAny(s[lo:hi], ",}]"); cut >= 0 {
+					ends = append(ends, lo+envUnquotedValue(s[lo:lo+cut]))
+					segs = append(segs, lo+len(strings.TrimRight(s[lo:lo+cut], " \t")))
+					cutAt = lo + cut
+				}
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
 				lo += sloc[1] // the scheme word stays, as under a key
 			}
-			v := s[lo:hi]
-			if !inlineSecretKey(name) || strings.Contains(v, Redacted[:len(Redacted)-1]) || !classValueRedacted(secretKeyClassOf(name), v, false) {
+			var reads, readSegs []int // the candidate ends that read as a value, in order, and their line text's stops
+			for i, end := range ends {
+				if end > lo && !strings.Contains(s[lo:end], Redacted[:len(Redacted)-1]) && classValueRedacted(secretKeyClassOf(name), s[lo:end], false) {
+					reads = append(reads, end)
+					readSegs = append(readSegs, segs[i])
+				}
+			}
+			if len(reads) == 0 {
 				continue
 			}
-			spans = append(spans, [2]int{lo, hi})
+			hi = reads[0]
+			v := s[lo:hi]
+			redactHi := hi
+			if after := strings.TrimLeft(s[hi:readSegs[0]], " \t"); strings.HasPrefix(after, "#") && commentReadsAsValue(name, after) {
+				redactHi = readSegs[0]
+			}
+			spans = append(spans, [2]int{lo, redactHi})
 			if keyClearlyNamesSecret(name) {
 				sink.emit(v)
+				// The value cut at its first , } or ] is tracked too when
+				// it also reads as one: the line's whole text may hold a
+				// note after it, which an answer leaves off.
+				for _, end := range reads[1:] {
+					if end != hi {
+						sink.emit(s[lo:end])
+					}
+				}
+				// A quoted value is also tracked as its escapes read
+				// (a JSON or YAML "\"" is the value's own quote), past a
+				// scheme word as the value itself is.
+				if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(decoded); sloc != nil {
+					decoded = decoded[sloc[1]:]
+				}
+				if decoded != "" && decoded != v {
+					sink.emit(decoded)
+				}
+			}
+			if unquoted && (cutAt < 0 || redactHi > cutAt) && sink != nil {
+				// The whole line went as the value: what other rules would
+				// have found in it (", password: x", "Password=x" in a DSN,
+				// a URL's credential), before or after its first , } or ],
+				// is still tracked, as it is when the value ends at the cut
+				// or isn't read as an env value at all. In its line context
+				// ("value: ..."), so a key inside it is not read as starting
+				// a line of its own, which would read its value to the
+				// line's end. A comment redacted with the value
+				// (commentReadsAsValue) is read too.
+				scrubEnvRest("value: "+s[lo:redactHi], sink)
+			} else if !unquoted && sink != nil {
+				// A quoted value's content is read the same way: a pair
+				// inside it ("Password=x" in a quoted DSN) is tracked, as
+				// it is when the entry isn't read as an env value at all
+				// (#7372).
+				scrubEnvRest("value: "+s[lo:hi], sink)
 			}
 		}
 	}
-	pair(envNameValuePattern, 1, 2)
+	pair(envNameValueFlowPattern, 1, 2)
+	pair(envNameValueBlockPattern, 1, 2)
 	pair(envValueNamePattern, 2, 1)
 	return redactSpans(s, spans)
+}
+
+// scrubEnvRest is scrubInlineTo, run for what it tracks over env value text
+// the env rule redacted whole: an unquoted value read to its line's end, a
+// quoted value's content, or a commented-out value; set in init, since the
+// rules include scrubEnvNameValuePairs itself.
+var scrubEnvRest func(s string, sink secretSink) string
+
+func init() { scrubEnvRest = scrubInlineTo }
+
+// commentReadsAsValue reports whether comment, a YAML comment ("# ...") on
+// credential key name's value line, reads as a value under that key: its
+// text past the # is what the key's class redacts. A commented-out or
+// annotated value is then redacted, as it is when the line is read to its
+// end; a bare marker ("# none") is not.
+func commentReadsAsValue(name, comment string) bool {
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(comment), "#"))
+	return text != "" && classValueRedacted(secretKeyClassOf(name), text, false)
+}
+
+// envUnquotedValue is the length of an unquoted env value with a trailing
+// comment (a # after a blank, or one opening the value) and the blanks
+// before it taken off.
+func envUnquotedValue(v string) int {
+	if strings.HasPrefix(v, "#") {
+		return 0
+	}
+	for _, c := range []string{" #", "\t#"} {
+		if i := strings.Index(v, c); i >= 0 {
+			v = v[:i]
+		}
+	}
+	return len(strings.TrimRight(v, " \t"))
 }
 
 // scrubMarkdownTables redacts the value cells of a markdown table that
@@ -1074,10 +1203,40 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 // and redacted where it stands. Only a key whose class is strong counts
 // (tableSecretKeyClass); a bare credential noun heads a column of names as
 // often as of values, so under one a value must be token-shaped.
+//
+// Rows are split twice, once with a pipe inside a paired code span read as
+// cell content and once at every pipe, and the spans of both are redacted:
+// backticks that pair across cells can merge columns, so neither split
+// alone decides which cell is under which header.
 func scrubMarkdownTables(s string, sink secretSink) string {
 	if !strings.Contains(s, "|") {
 		return s
 	}
+	spans := append(markdownTableSpans(s, sink, true), markdownTableSpans(s, sink, false)...)
+	return redactSpans(s, mergeSpans(spans))
+}
+
+// mergeSpans is spans with every overlapping pair joined, so redactSpans
+// skips none of a span's bytes.
+func mergeSpans(spans [][2]int) [][2]int {
+	if len(spans) < 2 {
+		return spans
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	out := [][2]int{spans[0]}
+	for _, sp := range spans[1:] {
+		if last := &out[len(out)-1]; sp[0] < last[1] {
+			last[1] = max(last[1], sp[1])
+			continue
+		}
+		out = append(out, sp)
+	}
+	return out
+}
+
+// markdownTableSpans is the value-cell spans scrubMarkdownTables redacts,
+// with rows split as markdownTableCells does under codeAware.
+func markdownTableSpans(s string, sink secretSink, codeAware bool) [][2]int {
 	var spans [][2]int
 	type row struct{ cells [][2]int }
 	var block []row
@@ -1164,7 +1323,7 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 		} else {
 			lineEnd += lineStart
 		}
-		if cells := markdownTableCells(s, lineStart, lineEnd); cells != nil {
+		if cells := markdownTableCells(s, lineStart, lineEnd, codeAware); cells != nil {
 			block = append(block, row{cells})
 		} else {
 			flush()
@@ -1172,25 +1331,38 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 		lineStart = lineEnd + 1
 	}
 	flush()
-	return redactSpans(s, spans)
+	return spans
 }
 
 // markdownTableCells is the content span of each cell of a table row (a
 // line that opens with a pipe and holds another), trimmed of spaces, or nil
 // for a line that is not one. A pipe escaped with a backslash is content.
-func markdownTableCells(s string, lo, hi int) [][2]int {
+func markdownTableCells(s string, lo, hi int, codeAware bool) [][2]int {
 	line := strings.TrimRight(s[lo:hi], "\r")
 	trimmed := strings.TrimLeft(line, " \t")
 	if !strings.HasPrefix(trimmed, "|") || strings.Count(trimmed, "|") < 2 {
 		return nil
 	}
+	// Under codeAware, a pipe inside a paired code span is the cell's
+	// content: the answer is published as written, so a value it pushes
+	// past is still there.
+	var inSpan []bool
+	if codeAware {
+		inSpan = make([]bool, len(line))
+		for _, c := range markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil) {
+			for i := c[0]; i < c[1]; i++ {
+				inSpan[i] = true
+			}
+		}
+	}
+	inCode := func(i int) bool { return inSpan != nil && inSpan[i] }
 	var pipes []int
 	for i := 0; i < len(line); i++ {
 		if line[i] == '\\' {
 			i++
 			continue
 		}
-		if line[i] == '|' {
+		if line[i] == '|' && !inCode(i) {
 			pipes = append(pipes, lo+i)
 		}
 	}
@@ -1368,19 +1540,110 @@ func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 // normalised away for the test and kept around the marker, or none.
 func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sink secretSink) [][2]int {
 	text := s[cell[0]:cell[1]]
-	n, idx := normalizeMarkdown(text)
-	lo := len(n) - len(strings.TrimLeft(n, " \t"))
-	hi := len(strings.TrimRight(n, " \t"))
-	if hi <= lo || strings.Contains(n, Redacted) || !classValueRedacted(class, n[lo:hi], false) {
+	n, idx, code := normalizeMarkdownSpans(text)
+	cellLo := len(n) - len(strings.TrimLeft(n, " \t"))
+	cellHi := len(strings.TrimRight(n, " \t"))
+	if cellHi <= cellLo || strings.Contains(n, Redacted) {
 		return nil
 	}
+	// As under a key: an auth-scheme word stays, and a code-spanned value
+	// is bounded by its backticks. Both the span and the whole cell are
+	// candidates, and the first that reads as a value is redacted: the span
+	// first when a blank or the cell's end follows it (a note after it),
+	// the whole cell first when text runs on straight after it.
+	valueLo := cellLo
+	if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(n[cellLo:cellHi]); sloc != nil {
+		valueLo += sloc[1]
+	}
+	cands := [][2]int{{valueLo, cellHi}, {cellLo, cellHi}}
+	if end, ok := codeSpanEnd(code, valueLo); ok {
+		span := [2]int{valueLo, end}
+		// Another code span after it in the cell: the value is not the
+		// first span alone.
+		// The whole cell is read past the scheme word first, and with it
+		// only as a last resort, so a scheme word never joins the value.
+		// A note after it is left only when no word of it may be a value
+		// (tableNoteAfterSpan); else the rest of the cell goes with it.
+		// A span that ends at or past the cell's trimmed end (its content
+		// may end in a blank) has nothing after it: the slice is not taken.
+		if len(code) == 1 && (end >= cellHi || (n[end] == ' ' || n[end] == '\t') && tableNoteAfterSpan(class, n[end:cellHi])) {
+			cands = [][2]int{span, {valueLo, cellHi}, {cellLo, cellHi}}
+		} else {
+			cands = [][2]int{{valueLo, cellHi}, span, {cellLo, cellHi}}
+		}
+	}
+	lo, hi := 0, 0
+	for _, c := range cands {
+		if c[1] > c[0] && classValueRedacted(class, n[c[0]:c[1]], false) {
+			lo, hi = c[0], c[1]
+			break
+		}
+	}
+	if hi <= lo {
+		return nil
+	}
+	value := n[lo:hi]
+	// After an auth-scheme word, text plainly not a value, or a word that
+	// names the scheme's own use (Basic authentication), is prose: not
+	// tracked. Anything else there is.
+	track := named && (lo < valueLo || valueLo == cellLo || !schemeProse(value))
 	if idx != nil {
 		lo, hi = idx[lo], idx[hi-1]+1
 	}
-	if named {
+	if track {
+		// As written, and with its markdown taken out when that differs
+		// (a code span inside the value): an answer may echo either.
 		sink.emit(text[lo:hi])
+		if value != text[lo:hi] {
+			sink.emit(value)
+		}
 	}
 	return [][2]int{{cell[0] + lo, cell[0] + hi}}
+}
+
+// schemeUseWords are the words that follow an auth-scheme word in prose
+// about the scheme rather than in front of a credential ("Basic
+// authentication", "Bearer token").
+var schemeUseWords = map[string]bool{
+	"auth": true, "authentication": true, "authorization": true, "authorisation": true,
+	"credential": true, "credentials": true, "token": true, "tokens": true,
+	"scheme": true, "header": true, "headers": true, "login": true,
+}
+
+// schemeProse says whether v, the text after an auth-scheme word, is
+// plainly not a value (valueNotASecret) or one of schemeUseWords.
+func schemeProse(v string) bool {
+	v = trimValueEdges(v)
+	return valueNotASecret(v) || schemeUseWords[strings.ToLower(v)]
+}
+
+// tableNoteAfterSpan says whether rest, the text of a table cell after
+// the code span holding its value, is a note that may stay: no word of it
+// token-shaped and, under a key of the strong class (where every other
+// word reads as a value), every word plainly a note
+// (tableNoteWordUnderStrongKey: "(rotated)", "/"; not a short number or a
+// placeholder). Anything else may be a second value or the value itself
+// (`appuser` synthtoken0001abcd).
+func tableNoteAfterSpan(class secretKeyClass, rest string) bool {
+	for _, w := range strings.Fields(rest) {
+		w = trimValueEdges(strings.TrimLeft(trimValueEdges(w), "([{"))
+		if valueTokenShaped(w) || class == strongSecretKeyClass && !tableNoteWordUnderStrongKey(w) {
+			return false
+		}
+	}
+	return true
+}
+
+// tableNoteWordUnderStrongKey says whether a word after a code span, under a
+// strong key, is plainly a note: a state word ("rotated", "(none)") or one
+// with no letter or digit ("/", "-"). A short number or a placeholder, which
+// valueNotASecret lets pass elsewhere, may be the rest of the value here.
+func tableNoteWordUnderStrongKey(w string) bool {
+	lower := strings.ToLower(w)
+	if credentialStateWords[lower] || credentialWholeValueWords[lower] || plainHyphenatedStatePhrase(w) {
+		return true
+	}
+	return !strings.ContainsFunc(w, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) })
 }
 
 // tableKeyNamed says whether a table's key cell names a credential

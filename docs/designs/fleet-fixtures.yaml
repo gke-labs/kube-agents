@@ -43,13 +43,13 @@
 slots:
   - slot: a
     suffix: a
-    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the pool that names a missing reservation
+    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the two pools that name a missing reservation
   - slot: b
     suffix: b
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures over that pool
+    carries: The configuration outlier, on the control plane and its default pool, and the ComputeClass fixtures
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -269,6 +269,25 @@ fixtures:
       node it would add, so the pool can never grow. The stack plants no
       reservation: the missing one is the defect. Zero nodes cost nothing.
 
+  - role: missing-reservation-autoscaled
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/dev-reserved-pool
+      - deployment/reserved-batch
+    namespace: seeded-reservation
+    defect: >-
+      A single-zone pool that autoscales from 0 to 1 node, held behind the
+      taint seeded-role=missing-reservation-autoscaled, that consumes the
+      reservation that missing-reservation-pool names (SPECIFIC_RESERVATION),
+      which exists in no zone of the project; and a Deployment (one replica)
+      whose pod only that pool can hold. The autoscaler asks for a node, GKE
+      refuses it, and the pod stays Pending with the pool at zero nodes: the
+      autoscaler's visibility log repeats scale.up.error.reservation.not.found.
+      `dev` in the pool's name makes it non-production for the stockout
+      audit, so the reservation check (3.10) does not name it. Zero nodes
+      cost nothing.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0
@@ -428,9 +447,8 @@ fixtures:
     defect: >-
       Slot c's default pool on a 50 GB boot disk with kubeletConfig.podPidsLimit
       4096, where every other pool in the fleet runs a 20 GB disk and no
-      kubelet block. The drift SOP's boot-disk facet reads the disk; the
-      kubelet block is planted ahead of the kubelet-config facet, which the SOP
-      does not read yet. Day 1 as for drift-outlier,
+      kubelet block. The drift SOP's boot-disk facet reads the disk and its
+      kubelet-config facet reads the kubelet block. Day 1 as for drift-outlier,
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.
@@ -501,9 +519,10 @@ fixtures:
     defect: >-
       Slot c's default-pool labelled cloud.google.com/compute-class=general-ccc
       with no matching NoSchedule taint, so the scheduler fills it with
-      untargeted pods before the pre-filter drops them. The label is also what
-      leaves the cluster with no untainted pool without a class label, which
-      the obtainability audit's 3.24 needs before it files anything.
+      untargeted pods before the pre-filter (GKE 1.35.6 and later) drops them.
+      The label is also what leaves the cluster with no untainted pool without
+      a class label, which the obtainability audit's 3.24 needs before it
+      files anything.
 
   - role: manual-pools-compute-class
     slot: c
@@ -515,6 +534,22 @@ fixtures:
       rules across the nodepools rule default-pool backs and two machine
       families no pool backs, so a stockout on the first rule leaves pods with
       no fallback GKE can create.
+
+  - role: missing-reservation-compute-class
+    slot: c
+    available_from_day: 0
+    objects:
+      - computeclass/reserved-ccc
+    defect: >-
+      ComputeClass reserved-ccc, whose first rule asks for one named
+      reservation (affinity Specific, seeded-absent-reservation) that no
+      reservation of the project carries, and whose second rule is a machine
+      type that GKE can create. Node pool auto-creation is on and no workload
+      selects the class, so GKE makes no node pool for it. One NoSchedule
+      taint (dedicated=reserved-ccc) keeps the class out of the
+      general-purpose classes that the obtainability audit counts. GKE marks
+      the class misconfigured with the reason ReservationNotFound, and the
+      stockout audit files that status.
 
   - role: no-nodelocal-dnscache
     slot: c
@@ -752,6 +787,15 @@ fixtures:
     defect: >-
       cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
 
+  - role: state-sync-controller
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/state-sync-controller
+    namespace: seeded-shapes
+    defect: >-
+      state-sync-controller Deployment (one replica) in seeded-shapes whose container startup argument passes --kube-api-qps=-1 to an inert sleep process, planting a controller with a negative client QPS (client-side rate limit disabled) for control-plane-configmap-lease-write-storm without generating API server write load
+
   - role: scaled-zero-gateway
     slot: a
     available_from_day: 0
@@ -801,3 +845,20 @@ fixtures:
       second zone's e2-standard-2, so every replica that runs is in the second
       zone and the rest stay Pending on insufficient CPU. Its distribution looks like
       the scheduling case; only the Pending pods' events say otherwise.
+
+  - role: unaccepted-gateway-class
+    slot: a
+    available_from_day: 0
+    objects:
+      - gatewayclass/seeded-unaccepted-gw
+      - gateway/seeded-unaccepted-gateway
+      - httproute/seeded-unaccepted-route
+      - gatewayclass/seeded-envoy
+    namespace: seeded-shapes
+    defect: >-
+      Cluster-scoped GatewayClass seeded-unaccepted-gw referencing
+      example.com/unsupported-controller so no controller accepts it, with
+      Gateway seeded-unaccepted-gateway and HTTPRoute seeded-unaccepted-route
+      in seeded-shapes bound to it (zero Pods or Services provisioned).
+      GatewayClass seeded-envoy (Accepted=True via gateway_status.py) serves as
+      the accepted-class negative control on the same cluster.

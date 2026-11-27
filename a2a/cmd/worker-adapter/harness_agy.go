@@ -42,6 +42,12 @@ const (
 
 func (agyBuilder) defaultPath() string { return "" }
 
+// configDir: nothing renders a persona for agy, so the session check has no
+// directory to read.
+func (agyBuilder) configDir(func(string) string) string { return "" }
+
+func (agyBuilder) personaCovers(string) bool { return false }
+
 // command: `-p=` because agy's print switch takes a value, and the message
 // comes on stdin as stream-json.
 func (agyBuilder) command(spec harnessSpec) []string {

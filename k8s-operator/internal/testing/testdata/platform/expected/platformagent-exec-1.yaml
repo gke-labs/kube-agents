@@ -702,6 +702,57 @@ subjects:
     name: kubeagents-platform-agent
     namespace: kubeagents-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-credential-proxy-pod-read
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
 apiVersion: v1
 data:
   ca.crt: PFJFREFDVEVEX0ZPUl9URVNUUz4=
@@ -744,6 +795,57 @@ metadata:
       kind: PlatformAgent
       name: platformagent
       uid: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-kube-proxy-pod-read
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
 ---
 apiVersion: v1
 kind: Service
@@ -1469,6 +1571,7 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-template-hash: <SHA256_FOR_TESTS>
       labels:
         app: platformagent-credential-proxy
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -2379,6 +2482,8 @@ spec:
               value: owner
             - name: API_SERVER_MODEL_NAME
               value: model-default
+            - name: KUBE_AGENTS_BUILTIN_SCHEDULES
+              value: '{"suspendAll":false,"overrides":{}}'
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
@@ -2659,6 +2764,8 @@ spec:
               value: multiuser_memory
             - name: API_SERVER_MODEL_NAME
               value: model-default
+            - name: KUBE_AGENTS_BUILTIN_SCHEDULES
+              value: '{"suspendAll":false,"overrides":{}}'
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"

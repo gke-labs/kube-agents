@@ -10,9 +10,11 @@ commands that do touch the network are driven through a single recorded seam
 (audit_report.run_cmd) plus stubs for credential minting.
 """
 
+import base64
 import contextlib
 import copy
 import fnmatch
+import hashlib
 import importlib.util
 import io
 import argparse
@@ -49,6 +51,7 @@ import gitops_workspace  # noqa: E402
 import no_live_google_auth  # noqa: E402
 import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
+import report_status  # noqa: E402
 import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
 import workspace_paths  # noqa: E402
@@ -3366,6 +3369,8 @@ class TestAuditCatalogue(unittest.TestCase):
         for audit_id, spec in sorted(audit_report.AUDITS.items()):
             with self.subTest(audit=audit_id):
                 self.assertIn(audit_id, jobs, f"{audit_id} has no cron job")
+                # `start` works out "scheduled" for the run-start record by
+                # itself (#6812), so the prompt does not pass it there.
                 phrase = (
                     "pass --scheduled to precheck and finish"
                     if audit_id in PRECHECK_STREAMS
@@ -3785,7 +3790,7 @@ class TestAuditCatalogue(unittest.TestCase):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("twelve §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("thirteen §4 facets marked _Standard cohorts only_", text)
         self.assertIn("reads as complete at eight of eight", text)
         self.assertIn("logging-components", text)
         self.assertIn("monitoring-components", text)
@@ -3828,6 +3833,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "logging-components",
                 "monitoring-components",
                 "boot-disk",
+                "kubelet-config",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
@@ -6061,7 +6067,10 @@ class TestStart(HarnessTestCase):
         note = Path(audit_report.inflight_path_for(AUDIT))
         self.assertNotIn(str(note.parent), self.err)
         self.assertIn("a lease on the stream, not a process", self.err)
-        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
+        # The run id (#6812) names the run for its run-start record, not a
+        # process, and the refusal never prints it.
+        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at", "run_id"})
+        self.assertNotIn(json.loads(note.read_text())["run_id"], self.err)
         # Refused means refused: the other run's note is still there.
         self.assertTrue(note.is_file())
         # There is no flag past the guard. The CLI had `--takeover` until
@@ -6594,6 +6603,213 @@ class TestStart(HarnessTestCase):
 # --------------------------------------------------------------------------- #
 # --dry-run
 # --------------------------------------------------------------------------- #
+
+
+class TestRunStartRecord(HarnessTestCase):
+    """`start` writes a run-start record and `finish` marks its own run's done (#6812)."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("findings_path_for", lambda audit_id: str(self.tmp_path / f"findings_{audit_id}.json"))
+        self.patch_attr("run_record_path_for", lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"))
+        self.patch_attr("declarations_path_for", lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"))
+        audit_report._RUN_START_LOGGED.clear()
+        self.addCleanup(audit_report._RUN_START_LOGGED.clear)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        # No cron run unless a test names one, wherever the suite runs from.
+        env = patch.dict(os.environ, {"HERMES_CRON_RUN": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def as_cron_run(self, name):
+        """This process is one Hermes cron run's command, as session-command.sh exports it."""
+        env = patch.dict(os.environ, {"HERMES_CRON_RUN": name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def records(self, repo="acme/fleet"):
+        directory = self.store_dir(repo=repo) / report_status.RUN_STARTS_DIR
+        if not directory.is_dir():
+            return {}
+        return {path.stem: json.loads(path.read_text()) for path in directory.glob("*.json")}
+
+    def unfinished(self):
+        return report_status.unfinished_run_of(str(self.reports_dir), AUDIT, "acme/fleet")
+
+    def as_task(self, task_id, trigger=None):
+        """This process holds a task credential naming `task_id`, as a profile worker does,
+        with `trigger` as its `nats.trigger` claim when given."""
+        token = self.tmp_path / "task-token"
+        nats = {"task": task_id}
+        if trigger is not None:
+            nats["trigger"] = trigger
+        claims = base64.urlsafe_b64encode(json.dumps({"nats": nats}).encode()).decode().rstrip("=")
+        token.write_text(f"e30.{claims}.sig")
+        env = patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: str(token)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_start_records_the_run_and_finish_marks_it_done(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        note = json.loads(Path(audit_report.inflight_path_for(AUDIT)).read_text())
+        records = self.records()
+        self.assertEqual([note["run_id"]], list(records))
+        record = records[note["run_id"]]
+        self.assertTrue(note["run_id"].startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+        self.assertIs(record["scheduled"], True)
+        self.assertNotIn("done_at", record)
+        # Running: readers say the last run did not finish, beside the report.
+        self.assertEqual(note["run_id"], self.unfinished()["run_id"])
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        record = self.records()[note["run_id"]]
+        self.assertEqual(note["run_id"], record["run_id"])
+        self.assertIsInstance(record["done_at"], str)
+        self.assertTrue(record["outcome"])
+        self.assertIsNone(self.unfinished())
+
+    def test_a_run_started_by_hand_is_recorded_not_scheduled(self):
+        # The shell, no cron run, no task credential, no flag: a run a person asked for.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        (record,) = self.records().values()
+        self.assertTrue(record["run_id"].startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+        self.assertIs(record["scheduled"], False)
+
+    def test_a_hermes_cron_run_is_recorded_scheduled_without_the_flag(self):
+        # Rule (a): HERMES_CRON_RUN, or a cwd under <home>/cron/runs/<name>,
+        # the detection the run id uses. No prompt passes --scheduled.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        (record,) = self.records().values()
+        self.assertTrue(record["run_id"].startswith(audit_report.RUN_ID_CRON_PREFIX))
+        self.assertIs(record["scheduled"], True)
+        # Only the run directory, as in the agent pod.
+        self.as_cron_run("")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        directory = (self.tmp_path / "home/cron/runs/job_7c1e2a_e2").resolve()
+        directory.mkdir(parents=True)
+        os.chdir(directory)
+        self.assertTrue(audit_report.run_is_scheduled())
+        os.chdir(here)
+        self.assertFalse(audit_report.run_is_scheduled())
+
+    def test_a_profile_task_under_a_builtin_schedule_is_recorded_scheduled_without_the_flag(self):
+        # Rule (b): the task credential carries a builtin schedule's trigger.
+        self.as_task("task-sched", trigger={"name": f"schedule/{AUDIT}", "origin": "builtin", "stream": AUDIT})
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertIs(self.records()["task-sched"]["scheduled"], True)
+        # A task with no trigger, or one that is not a builtin schedule's, is not scheduled.
+        for trigger in (None, {"name": "slack", "origin": "builtin"}, {"name": f"schedule/{AUDIT}", "origin": "user"}):
+            with self.subTest(trigger=trigger):
+                self.as_task("task-other", trigger=trigger)
+                self.assertFalse(audit_report.run_is_scheduled())
+        # The flag is still taken as an override.
+        self.assertTrue(audit_report.run_is_scheduled(True))
+
+    def test_a_run_that_never_finished_reads_as_unfinished(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        # Its finish died on the forge: nothing was published, and the record
+        # keeps no done mark.
+        self.harness.failures = {"issue-update": 1, "issue-create": 1}
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 1, self.err)
+        unfinished = self.unfinished()
+        self.assertEqual("the last run did not finish", unfinished["note"])
+        self.assertTrue(unfinished["scheduled"])
+
+    def test_a_dry_run_marks_nothing(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.run_finish(make_doc(findings=[]), argv_extra=("--dry-run",)), 0, self.err)
+        (record,) = self.records().values()
+        self.assertNotIn("done_at", record)
+
+    def test_a_profile_task_is_its_own_run_and_a_late_finish_marks_only_its_own(self):
+        self.as_task("task-old")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.as_task("task-new")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.assertEqual({"task-old", "task-new"}, set(self.records()))
+        # The older task's finish lands after the newer one started.
+        self.as_task("task-old")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        records = self.records()
+        self.assertIn("done_at", records["task-old"])
+        self.assertNotIn("done_at", records["task-new"])
+        self.assertEqual("task-new", self.unfinished()["run_id"])
+
+    def test_a_cron_shell_run_marks_only_its_own_record_after_a_newer_start(self):
+        # Two Hermes cron runs of the stream in the shell: the older outlived
+        # its lease, and the newer run's `start` took the in-flight note over.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        older, newer = ("cron-" + hashlib.sha256(name.encode()).hexdigest()[:16]
+                        for name in ("job_7c1e2a_e1", "job_7c1e2a_e2"))
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        stale = json.loads(note.read_text())
+        self.assertEqual(older, stale["run_id"])
+        stale["started_at"] -= audit_report.INFLIGHT_TTL_SECONDS + 1
+        note.write_text(json.dumps(stale))
+        self.as_cron_run("job_7c1e2a_e2")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.assertEqual(newer, json.loads(note.read_text())["run_id"])
+        # The older run's `finish`, now: it marks its own record, not the
+        # note's, so the newer run still reads as running.
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        records = self.records()
+        self.assertEqual({older, newer}, set(records))
+        self.assertIn("done_at", records[older])
+        self.assertNotIn("done_at", records[newer])
+        self.assertEqual(newer, self.unfinished()["run_id"])
+
+    def test_a_cron_run_id_comes_from_the_variable_or_the_run_directory(self):
+        want = "cron-" + hashlib.sha256(b"job_7c1e2a_e1").hexdigest()[:16]
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(want, audit_report.cron_run_id())
+        self.assertRegex(want, report_status.RUN_ID_RE)
+        # In the agent pod only the directory is there: read as session-command.sh reads it.
+        self.as_cron_run("")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        for sub, expected in (
+            ("home/cron/runs/job_7c1e2a_e1", want),
+            ("home/cron/runs/job_7c1e2a_e1/sub/dir", want),
+            ("home/cron/other", None),
+            ("home/cron/runs/bad name", None),
+        ):
+            with self.subTest(cwd=sub):
+                directory = (self.tmp_path / sub).resolve()
+                directory.mkdir(parents=True, exist_ok=True)
+                os.chdir(directory)
+                self.assertEqual(expected, audit_report.cron_run_id())
+                os.chdir(here)
+        # A hand-started shell run has none, and `start` makes a random id.
+        self.assertTrue(audit_report.new_run_id().startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+
+    def test_a_first_run_makes_no_store_for_its_record(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertFalse(self.store_dir().exists())
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertFalse(self.store_dir().exists())
+        self.assertNotIn("run-start", self.err)
+
+    def test_a_store_that_refuses_the_record_never_stops_the_run(self):
+        # An older broker or listener refuses the name (404 or 400): `start`
+        # says so once and goes on, and `finish` marks nothing and says nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        refusal = report_status.ReportStoreUnavailable("the report store is unavailable: HTTP 404 (not_found)", 404)
+        with patch.object(report_status, "write_run_start", side_effect=refusal), patch.object(
+            report_status, "read_run_start", side_effect=refusal
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+            self.assertEqual(1, self.err.count("does not take run-start records yet"))
+            self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assertNotIn("not marked done", self.err)
 
 
 class TestDryRun(BaseTestCase):
@@ -7913,7 +8129,7 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         # Pinned as a literal: the catalogue test only checks the set is a
         # subset of the roster, and a fault slipping in would pass it.
         self.assertEqual(audit_report.audit_declarable_checks(self.STOCKOUT), frozenset({"single-zone-nodepool"}))
-        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk"):
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk", "capacity-buffer-not-ready"):
             self.assertNotIn(fault, audit_report.audit_declarable_checks(self.STOCKOUT))
 
     def test_a_declaration_moves_the_zone_locked_pool_and_not_one_at_its_ceiling(self):
@@ -13019,6 +13235,23 @@ class TestAMachineCannotAuthorizeItself(BaseTestCase):
             audit_report.pending_remediate_targets([collaborator_bot]), []
         )
 
+    def test_request_times_keep_each_ids_newest_authorized_request(self):
+        """What `plan_generated_fixes` weighs against a closed pull request: the
+        same requests `start` reports, each with its newest time."""
+        comments = [
+            comment("/remediate a", node_id="IC_1", created_at="2026-10-01T00:00:00Z"),
+            comment("/remediate a\n/remediate b", node_id="IC_2", created_at="2026-10-03T00:00:00Z"),
+            comment("/remediate a", node_id="IC_3", created_at="2026-10-02T00:00:00Z"),
+            comment("/remediate c", association="NONE", login="drive-by", node_id="IC_4"),
+            self.bot("/remediate d", association="MEMBER"),
+            comment("/remediate all", node_id="IC_5"),
+        ]
+        self.assertEqual(
+            audit_report.remediate_request_times(comments),
+            {"a": "2026-10-03T00:00:00Z", "b": "2026-10-03T00:00:00Z"},
+        )
+        self.assertEqual(audit_report.pending_remediate_targets(comments), ["a", "b"])
+
     def test_a_collaborator_bot_is_still_refused_promotion(self):
         collaborator_bot = self.bot("/remediate netpol-missing", association="MEMBER")
         targets, refusals, _, _ = self.parse([collaborator_bot])
@@ -15762,6 +15995,75 @@ class TestCoverageGaps(unittest.TestCase):
 
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
+
+    def test_a_note_is_never_a_gap(self):
+        """`notes` says what a check read but could not see on a target whose
+        checks all ran: the GCE collector's rotated serial consoles, the state
+        of every VM that has run for some weeks. Counted as a gap, it would
+        hold a healthy stream's ledger open for good."""
+        doc = make_doc(
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "notes": "startup-script status of 1 instance(s) is not visible: web-1",
+                }
+            ]
+        )
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+        self.assertEqual(
+            audit_report.scope_notes(doc),
+            ["prod-us-east: startup-script status of 1 instance(s) is not visible: web-1"],
+        )
+
+    def test_a_note_must_be_a_string(self):
+        doc = make_doc(clusters=[{"name": "prod-us-east", "location": "us-east1", "project": "acme-prod", "notes": ["x"]}])
+        with self.assertRaisesRegex(audit_report.ValidationError, "notes"):
+            audit_report.validate_findings(doc, AUDIT)
+
+    def test_notes_are_adopted_from_collected_manifest_targets_only(self):
+        doc = make_doc(
+            clusters=[
+                {"name": "a", "location": "l", "project": "p", "notes": "the model's draft"},
+                {"name": "b", "location": "l", "project": "p"},
+            ]
+        )
+        manifest = {
+            "clusters": [
+                {"name": "a", "outcome": audit_report.MANIFEST_OUTCOME_COLLECTED, "notes": "the collector's note"},
+                {"name": "b", "outcome": "gate-failed", "notes": "not adopted"},
+            ]
+        }
+        self.assertEqual(audit_report.adopt_collector_notes(doc, manifest), ["a"])
+        clusters = {c["name"]: c for c in doc["scope"]["clusters"]}
+        self.assertEqual(clusters["a"]["notes"], "the collector's note")
+        self.assertNotIn("notes", clusters["b"])
+        self.assertEqual(audit_report.adopt_collector_notes(doc, None), [])
+
+    def test_a_stale_note_is_cleared_when_the_collector_has_none(self):
+        """A precheck replays a stored document, so its note can be from an
+        earlier collection. A collected target with no note in this manifest
+        loses it; a target with no collected entry keeps its own."""
+        doc = make_doc(
+            clusters=[
+                {"name": "a", "location": "l", "project": "p", "notes": "an earlier collection's note"},
+                {"name": "b", "location": "l", "project": "p", "notes": "kept: gate-failed"},
+                {"name": "c", "location": "l", "project": "p", "notes": "kept: no entry"},
+            ]
+        )
+        manifest = {
+            "clusters": [
+                {"name": "a", "outcome": audit_report.MANIFEST_OUTCOME_COLLECTED},
+                {"name": "b", "outcome": "gate-failed"},
+            ]
+        }
+        self.assertEqual(audit_report.adopt_collector_notes(doc, manifest), ["a"])
+        clusters = {c["name"]: c for c in doc["scope"]["clusters"]}
+        self.assertNotIn("notes", clusters["a"])
+        self.assertEqual(clusters["b"]["notes"], "kept: gate-failed")
+        self.assertEqual(clusters["c"]["notes"], "kept: no entry")
+        self.assertEqual(audit_report.scope_notes(doc), ["b: kept: gate-failed", "c: kept: no entry"])
 
     def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
         """The gap prose cannot catch a run that never admits to one."""
@@ -23325,7 +23627,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     SELECTOR = {"matchLabels": {"app": "a"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}]}
 
-    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False):
+    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=(), prime=False, requested_at=None):
         manifest = self.manifest()
         manifest["clusters"][0]["candidates"][0].update(
             {"pod_selector": selector, "namespace": "web", "namespace_pdbs": list(namespace_pdbs)}
@@ -23341,7 +23643,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 # As the Config Connector scan does before planning.
                 probe.broker()
             planned, self.answered = audit_report.plan_generated_fixes(
-                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT
+                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT,
+                requested_at=requested_at,
             )
             probe.close()
             audit_report.write_generated_fixes(findings, planned, self.workspace)
@@ -23422,6 +23725,35 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertEqual(written, [])
                 # Answered, so `finish` does not refuse over it either.
                 self.assertEqual(self.answered, {"a"})
+
+    def test_a_request_after_the_carrying_pull_request_closed_plans_the_budget_again(self):
+        """#7013: a budget's pull request merged, a person later removed the file, and every
+        `/remediate` on the finding was refused as not a `manifest`. A request newer than the
+        merge or close sets that pull request aside; an older or untimed one leaves it answering,
+        so an old comment never re-proposes a budget a person removed."""
+        delta = audit_report.delta_block(["a"])
+        for state, fields in {
+            "merged": {"state": "MERGED", "mergedAt": "2026-10-01T00:00:00Z", "closedAt": "2026-10-01T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            carrying = {**fields, "headRefName": "x", "body": delta}
+            for asked, planned in {
+                "2026-10-02T00:00:00Z": ["a"],
+                "2026-09-30T00:00:00Z": [],
+                "": [],
+            }.items():
+                with self.subTest(state, asked=asked or "untimed"):
+                    self.unclone()
+                    self.workspace.mkdir(parents=True, exist_ok=True)
+                    written, finding = self.generate(prs=[carrying], requested_at={"a": asked})
+                    self.assertEqual(written, planned)
+                    self.assertEqual(self.answered, set() if planned else {"a"})
+                    self.assertEqual(finding["remediation"]["kind"], "manifest" if planned else "manual")
+        # An open pull request is live work, whenever the request came.
+        live = {"state": "OPEN", "headRefName": "x", "body": delta}
+        written, _ = self.generate(prs=[live], requested_at={"a": "2026-10-02T00:00:00Z"})
+        self.assertEqual(written, [])
+        self.assertEqual(self.answered, {"a"})
 
     def test_a_pull_request_carrying_a_fix_finish_cannot_build_answers_it(self):
         """No usable selector, so the worker wrote it by hand once; its pull
@@ -27423,6 +27755,758 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
 
 
+# A target's note, as the GCE collector writes one when a serial console
+# has rotated past the last startup-script run.
+ROTATED_NOTE = "netpol-missing: the status of 1 object is not visible: Namespace/a."
+# The noted object's own read, as the collector records it on the entry.
+NOTED_READ = "kubectl --context prod-us-east get networkpolicy -n payments -o json"
+
+
+class TestScopeNotesReachTheReader(HarnessTestCase):
+    """A collector's `notes` on a target reaches the worker on every status,
+    and a previous finding on a noted object cannot be written as resolved."""
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def noted_manifest(self, noted_objects=True):
+        manifest = _full_manifest()
+        manifest["clusters"][0]["notes"] = ROTATED_NOTE
+        if noted_objects:
+            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a", "command": NOTED_READ}
+            ]
+        return manifest
+
+    def previous_a(self):
+        """An open ledger whose last body carried finding `a`."""
+        previous_body = published_body(make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        return previous_body
+
+    def test_a_clean_run_with_no_ledger_carries_the_notes_on_its_line(self):
+        """No issue is opened, closed or commented on, so the JSON line is
+        the only place the note can reach anyone."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+        self.assertEqual(payload["coverage_gaps"], [])
+
+    def test_a_findings_run_carries_the_notes_on_its_line(self):
+        self.harness.replies = {"issue-list": issues_view([]), "issue-create": created("issue", "https://github.com/acme/fleet/issues/7")}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "OPENED")
+        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+
+    def test_the_short_held_note_does_not_claim_a_candidate_for_a_noted_entry(self):
+        entry = {"id": "x", "title": "t", "check": "c", "cluster": "k", "namespace": "", "object": "o", "commands": ["cmd"], audit_report.NOTED_HELD_KEY: True}
+        text = "\n".join(audit_report._render_held_note([entry]))
+        self.assertIn("For 1 of them the collector does not flag the object", text)
+        self.assertNotIn("still emits a candidate", text)
+
+    def test_a_dry_run_previews_no_noted_object_as_held(self):
+        """The dry run reads no ledger, so it cannot know that a noted object
+        is carried; it does not preview one as still flagged."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn(derived_id(fid="a"), self.out)
+
+    def test_a_run_without_notes_prints_no_notes_key(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("notes", self.stdout_json())
+        self.assertNotIn(audit_report.REPORT_NOTES_KEY, self.stdout_json())
+        self.assertNotIn("NOTES: the report must carry report_notes", self.err)
+
+    def test_the_line_carries_ready_made_report_lines(self):
+        """`report_notes` beside `notes` on the forge statuses: the worker
+        copies these lines into its report verbatim, directly before the
+        closing ledger line, so the relay is a copy rather than a rule to
+        remember — on the forge path, where the report is model-composed,
+        two runs in five dropped the relay. stderr carries the reminder in
+        the NOT VISIBLE style, on the published, non-silent line only."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(
+            payload[audit_report.REPORT_NOTES_KEY],
+            [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
+        )
+        # No ledger line on this run (`issue_url` is null), so the reminder
+        # anchors the lines at the end of the report instead.
+        self.assertIsNone(payload["issue_url"])
+        self.assertIn(audit_report.REPORT_NOTES_REMINDER_NO_LEDGER, self.err)
+        self.assertNotIn(audit_report.REPORT_NOTES_REMINDER, self.err)
+        # The findings run carries the same lines, and its reminder anchors
+        # them directly before the closing ledger line.
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(
+            self.stdout_json()[audit_report.REPORT_NOTES_KEY],
+            [f"{audit_report.REPORT_NOTE_PREFIX} prod-us-east: {ROTATED_NOTE}"],
+        )
+        self.assertIn(audit_report.REPORT_NOTES_REMINDER, self.err)
+
+    def test_an_invented_noted_finding_is_disclosed_and_not_swept(self):
+        """Through `_finish` and the dry run: a finding the model wrote
+        about a noted object no previous ledger carried reaches the
+        uncorroborated disclosure — the dry run's warning, the JSON line —
+        and still opens nothing, because the noted skip keeps it out of the
+        sweep (`promotion_candidates`)."""
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DID NOT FLAG THESE", self.err)
+        self.assertIn(derived_id(fid="a"), self.err)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertIn(derived_id(fid="a"), payload["uncorroborated_findings"])
+        self.assertEqual(payload["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_held_noted_entry_logs_not_visible_on_a_findings_run(self):
+        """The findings branch says the noted wording for a noted-only held
+        entry, as the clean branch and the store path do: the collector
+        does not flag the object, so "still emits a candidate" is false."""
+        self.previous_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "UPDATED")
+        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
+        self.assertNotIn("still emits a candidate for it", self.err)
+
+    def test_a_dry_run_prints_no_report_notes_reminder(self):
+        """A dry run publishes nothing, so there is no report to remind
+        about; the reminder rides the published, non-silent line only."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())],
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("NOTES: the report", self.err)
+
+    def test_a_note_with_newlines_is_flattened_to_one_line(self):
+        """A worker-written note can carry newlines, a Markdown heading or a
+        line that reads as a verdict; every entry comes out as one line, so
+        a `report_notes` line stays one line to copy."""
+        manifest = self.noted_manifest()
+        manifest["clusters"][0]["notes"] = "status not visible\n\n# Heading\n[SILENT]\n@channel"
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        note = payload["notes"][0]["note"]
+        self.assertNotIn("\n", note)
+        self.assertTrue(note.startswith("status not visible # Heading"), note)
+        (line,) = payload[audit_report.REPORT_NOTES_KEY]
+        self.assertNotIn("\n", line)
+
+    def test_the_ledger_body_names_the_noted_objects_in_full(self):
+        """The scope table's Notes cell is clipped at MAX_CELL_CHARS, which
+        ends before the rotated-serial note reaches the instance names. The
+        body's own notes list carries the whole note, so the ledger names
+        the noted objects too."""
+        long_note = (
+            "gce-startup-script-status: the startup-script status of 1 RUNNING "
+            "instance that runs a startup script is not visible. The serial "
+            "console was read, but the boot that ran the script has rotated out "
+            "of the serial buffer: serial-flood-eval (us-central1-a)."
+        )
+        self.assertGreater(len(long_note), audit_report.MAX_CELL_CHARS)
+        manifest = self.noted_manifest()
+        manifest["clusters"][0]["notes"] = long_note
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue-create")[-1]
+        self.assertIn(audit_report.NOTES_LEAD, body)
+        self.assertIn("serial-flood-eval (us-central1-a)", body)
+
+    def test_the_held_comment_does_not_call_a_noted_object_flagged(self):
+        self.previous_a()
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        comment = self.harness.bodies_for("issue-comment")[-1]
+        self.assertIn("_not visible to the collector_", comment)
+        self.assertIn("1 of these the collector does not flag", comment)
+        self.assertNotIn("still flagged by the collector", comment)
+        self.assertNotIn("the collector itself still flags", comment)
+        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
+        self.assertNotIn("STILL FLAGGED:", self.err)
+
+    def test_a_remediate_on_a_noted_object_gets_its_own_reason(self):
+        self.previous_a()
+        target = derived_id(fid="a")
+        self.harness.replies["*-view comments"] = comments_view({"comments": [comment(f"/remediate {target}")]})
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        answers = [b for b in self.harness.bodies_for("issue-comment") if target in b]
+        self.assertTrue(answers)
+        self.assertIn("could not see the result", answers[-1])
+        self.assertNotIn("still emits a candidate", answers[-1])
+
+    def test_the_held_comment_and_line_show_the_notes(self):
+        self.previous_a()
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=False))])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+        comment = self.harness.bodies_for("issue-comment")[-1]
+        self.assertIn("Read but not visible, which is not a coverage gap (1)", comment)
+        self.assertIn(f"prod-us-east: {ROTATED_NOTE}", comment)
+
+    def test_a_resolve_on_a_noted_object_is_refused(self):
+        """The collector could not see `a`, so the run did not see it go
+        away; the worker carries it forward instead."""
+        previous_body = self.previous_a()
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 2)
+        self.assertIn("resolved_because[0]", self.err)
+        self.assertIn("Carry it forward", self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        # The preview refuses it too.
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 2)
+        self.assertIn("Carry it forward", self.err)
+
+    def test_a_resolve_on_an_object_no_note_names_closes(self):
+        previous_body = self.previous_a()
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=False))])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+
+    def test_a_carried_finding_on_a_noted_object_publishes(self):
+        """Reported again, the finding stays on the ledger."""
+        self.previous_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual((payload["status"], payload["new"], payload["resolved"]), ("UPDATED", 0, 0))
+
+
+    def run_omitting_a(self, noted_objects):
+        """A run that reports `b` and omits the previous `a`, which a pull
+        request carries. Returns the JSON line."""
+        self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
+        self.patch_attr("run_cmd", self.harness)
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-list": proposals_view(
+                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+            ),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects))])
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json()
+
+    def test_an_invented_finding_on_a_noted_object_is_uncorroborated(self):
+        """The noted exemption covers only ids the previous ledger carried
+        (`uncorroborated_findings`). A new finding the model wrote about an
+        object the collector read but could not see is a verdict nothing
+        observed, so it reads as uncorroborated like any other; the sweep's
+        own exclusion (`not_visible` in `promotion_candidates`) still keeps
+        every noted finding out of the promotion blocks, so nothing opens
+        either way."""
+        manifest = self.noted_manifest()
+        finding = make_finding(fid="a", title="Alpha finding")
+        # Invented: no previous ledger carries the id.
+        self.assertEqual(
+            audit_report.uncorroborated_findings([finding], manifest),
+            {str(finding["id"])},
+        )
+        # Carried: the previous ledger lists it, so the exemption holds.
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [finding], manifest, [audit_report.published_id(finding)]
+            ),
+            set(),
+        )
+        # The exemption is the noted object's, not every carried id's: a
+        # carried finding on an object no note names stays uncorroborated.
+        other = make_finding(fid="z", title="Zulu finding", obj="Namespace/z")
+        self.assertEqual(
+            audit_report.uncorroborated_findings(
+                [other], manifest, [audit_report.published_id(other)]
+            ),
+            {str(other["id"])},
+        )
+
+    def test_a_carried_noted_finding_is_not_uncorroborated_and_not_swept(self):
+        """The collector read the object but could not see it, so it did not
+        pass it: the finding is not uncorroborated. Nothing this run backs an
+        unattended fix either, so the sweep opens none."""
+        self.previous_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotIn(derived_id(fid="a"), payload["uncorroborated_findings"])
+        self.assertEqual(payload["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def chat_report_text(self):
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        return "\n".join(str(part.get("text") or "") for part in record["parts"])
+
+    def test_the_chat_report_carries_the_notes_with_the_ledger_line_last(self):
+        """The relay posts this report on a scheduled run, not the model's
+        message, so the notes have to be in it."""
+        self.harness.replies = {"issue-list": issues_view([]), "issue-create": created("issue", "https://github.com/acme/fleet/issues/7")}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        lines = self.chat_report_text().splitlines()
+        self.assertIn(f"- {audit_report.NOTES_LEAD}: prod-us-east: {ROTATED_NOTE}", lines)
+        self.assertIn("issues/7", lines[-1])
+
+    def test_a_clean_chat_report_with_no_ledger_carries_the_notes(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"- {audit_report.NOTES_LEAD}: prod-us-east: {ROTATED_NOTE}", self.chat_report_text())
+
+    def test_a_carried_noted_finding_owes_no_remediation_file(self):
+        """The sweep will not open it, so `finish` does not demand its file."""
+        self.previous_a()
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+
+    def test_a_noted_finding_the_body_cut_for_space_keeps_its_fix_open(self):
+        """The previous body cut `a` for space: its id is in the complete
+        block, not the rendered one. A noted `a` is still carried, so its
+        pull request stays open."""
+        previous_body = published_body(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW)
+        previous_body += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), derived_id(fid="b")])} -->\n'
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-list": proposals_view(
+                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+            ),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        # The rewritten body keeps `a` in its block, so the next run still
+        # carries it.
+        body = self.harness.bodies_for("issue-update")[0]
+        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
+
+    def test_a_clean_run_does_not_close_over_a_noted_finding_the_body_cut(self):
+        previous_body = published_body(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW)
+        previous_body += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), derived_id(fid="b")])} -->\n'
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=True))])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+
+    def test_an_omitted_finding_on_a_noted_object_is_held_not_resolved(self):
+        """The collector could not see `a`, so a run with other findings does
+        not announce it as resolved, and its pull request stays open."""
+        payload = self.run_omitting_a(noted_objects=True)
+        self.assertEqual((payload["status"], payload["resolved"]), ("UPDATED", 0))
+        self.assertEqual(payload["prs_closed"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        body = self.harness.bodies_for("issue-update")[0]
+        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
+        # A noted object has its own wording: the collector does not flag it.
+        # Every held entry here is noted, so the opening does not claim a
+        # candidate for each.
+        self.assertIn("For 1 of them the collector does not flag the object", body)
+        self.assertNotIn("still emits a candidate for each", body)
+        self.assertNotIn("still emits a candidate:", body)
+        self.assertIn("could not see the result; the target's notes say why", body)
+        # The row shows the object's own read, not the check's joined record.
+        self.assertIn(f"`{NOTED_READ}`", body)
+        self.assertNotIn("there this run and still flags this object", body)
+        # The control: with no noted object, `a` is resolved and its pull
+        # request is closed.
+        payload = self.run_omitting_a(noted_objects=False)
+        self.assertEqual(payload["resolved"], 1)
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
+
+
+    def test_a_clean_run_keeps_the_pull_request_of_a_noted_object(self):
+        """The clean branch holds a noted finding the ledger carries, and its
+        stale-close pass reads the same held set."""
+        self.previous_a()
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+        )
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual((payload["status"], payload["prs_closed"]), ("HELD", []))
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+
+
+class TestScopeNotesFitTheBody(unittest.TestCase):
+    def test_sixty_projects_with_long_notes_fit_the_body(self):
+        """The Notes cell is clipped as the Limitations cell is, and the
+        body's own notes list (`_render_body_notes`) is capped at
+        NOTES_SECTION_CAP, so sixty full notes of MAX_NOTE_CHARS still fit
+        the body with room for the findings."""
+        clusters = [
+            {"name": f"project/p-{i:02d}", "notes": f"n{i:02d} " + "x" * audit_report.MAX_NOTE_CHARS}
+            for i in range(audit_report.MAX_SCOPE_ROWS)
+        ]
+        doc = make_doc(findings=[], audit="gce-compute-fleet-audit", clusters=clusters)
+        body = audit_report.render_issue_body(doc, generated_at=NOW, audit_id="gce-compute-fleet-audit").body
+        self.assertIn("| Notes |", body)
+        self.assertIn("n59 x", body)
+        # The un-clipped list is present, capped, and says where the rest is.
+        self.assertIn(audit_report.NOTES_LEAD, body)
+        self.assertIn("more; the stored report carries every full note", body)
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+
+
+class TestNotesAreCappedEverywhere(unittest.TestCase):
+    """Sixty MAX_NOTE_CHARS notes meet the same cap (`_capped_notes`) in
+    every rendering — the comments, the summaries, the chat report and
+    `report_notes` — each with the row that says where the rest is, so a
+    large fleet's notes cannot push out the text after them or flood chat."""
+
+    MARKER = "more; the stored report carries every full note"
+    # The capped note content, plus row chrome and the fixed text around it.
+    BOUND = audit_report.NOTES_SECTION_CAP + 4_000
+
+    def doc(self):
+        clusters = [
+            {"name": f"project/p-{i:02d}", "notes": f"n{i:02d} " + "x" * audit_report.MAX_NOTE_CHARS}
+            for i in range(audit_report.MAX_SCOPE_ROWS)
+        ]
+        return make_doc(findings=[], audit="gce-compute-fleet-audit", clusters=clusters)
+
+    def test_the_comment_list_is_capped(self):
+        # The clean and the held comment both render this list.
+        text = "\n".join(audit_report._comment_scope_notes(self.doc()))
+        self.assertIn(self.MARKER, text)
+        self.assertLessEqual(len(text), self.BOUND)
+
+    def test_the_clean_comment_is_capped(self):
+        # Against the same comment without notes: the notes may not add
+        # more than the cap, whatever the other sections cost.
+        doc = self.doc()
+        comment = audit_report.render_clean_comment("gce-compute-fleet-audit", doc, NOW)
+        for cluster in doc["scope"]["clusters"]:
+            del cluster["notes"]
+        bare = audit_report.render_clean_comment("gce-compute-fleet-audit", doc, NOW)
+        self.assertIn(self.MARKER, comment)
+        self.assertLessEqual(len(comment) - len(bare), self.BOUND)
+
+    def test_report_notes_is_capped(self):
+        lines = audit_report.report_notes_payload(self.doc())[audit_report.REPORT_NOTES_KEY]
+        self.assertEqual(lines[-1], audit_report.MORE_NOTES_ROW.format(more=60 - len(lines) + 1))
+        self.assertLessEqual(len("\n".join(lines)), self.BOUND)
+
+    def test_the_chat_report_is_capped(self):
+        text = audit_report.render_chat_report(
+            "gce-compute-fleet-audit", {"status": "CLEAN", "new": 0, "resolved": 0}, self.doc()
+        )
+        self.assertIn(self.MARKER, text)
+        self.assertLessEqual(len(text), self.BOUND)
+
+    def test_the_no_forge_summary_is_capped(self):
+        text = audit_report.render_no_forge_summary(
+            "gce-compute-fleet-audit", self.doc(), [], [], [], True, [], "stored."
+        )
+        self.assertIn(self.MARKER, text)
+        self.assertLessEqual(len(text), self.BOUND)
+
+
+class TestNotedSetSpeaksOnce(HarnessTestCase):
+    """A scheduled run speaks once when its set of noted objects changes.
+
+    The notes ride on every run's JSON line and stored report. This class is
+    about `silent_ok` alone: a fleet with one long-lived noted VM must not
+    wake the channel every morning, and a new noted object, or one whose note
+    cleared, must reach the channel on one run (`noted_set_changed`). The
+    baseline is the last scheduled run's set, stored on the envelope under
+    `SCHEDULED_NOTED_IDS_KEY` and carried forward by on-demand runs.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.harness.replies = {"issue-list": issues_view([])}
+
+    def manifest_path(self, noted):
+        manifest = _full_manifest()
+        if noted:
+            manifest["clusters"][0]["notes"] = ROTATED_NOTE
+            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                {
+                    "check": "netpol-missing",
+                    "namespace": "payments",
+                    "object": "Namespace/a",
+                    "command": NOTED_READ,
+                }
+            ]
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def finish(self, *, noted, scheduled=True):
+        rc = self.run_finish(
+            make_doc(findings=[]),
+            ["--manifest-file", self.manifest_path(noted)],
+            scheduled=scheduled,
+        )
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json()
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+
+    def test_a_first_noted_run_speaks_and_stores_the_set(self):
+        first = self.finish(noted=True)
+        self.assertEqual(first["status"], "CLEAN")
+        self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(first["silent_ok"])
+        self.assertEqual(
+            self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [derived_id(fid="a")]
+        )
+
+    def test_an_unchanged_noted_run_is_silent_and_keeps_the_notes_on_its_line(self):
+        self.finish(noted=True)
+        second = self.finish(noted=True)
+        self.assertTrue(second["silent_ok"])
+        self.assertNotIn(audit_report.NOTED_CHANGED_KEY, second)
+        # The note still rides the line and the stored report; only the
+        # channel stays quiet, and a silent run gets no reminder about a
+        # report it does not post.
+        self.assertEqual(second["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+        self.assertNotIn("NOTES: the report", self.err)
+
+    def test_a_cleared_noted_run_speaks_once(self):
+        self.finish(noted=True)
+        self.finish(noted=True)
+        cleared = self.finish(noted=False)
+        self.assertIs(cleared[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(cleared["silent_ok"])
+        # The run says which object is visible again: the notes list names
+        # only what is still noted, and this run notes nothing.
+        self.assertEqual(cleared[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        text = "\n".join(str(part.get("text") or "") for part in record["parts"])
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, text)
+        self.assertIn(derived_id(fid="a"), text)
+        self.assertTrue(self.finish(noted=False)["silent_ok"])
+        self.assertEqual(self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+
+    def test_a_never_noted_fleet_unchanged_stays_silent(self):
+        first = self.finish(noted=False)
+        self.assertTrue(first["silent_ok"])
+        self.assertNotIn(audit_report.NOTED_CHANGED_KEY, first)
+        self.assertEqual(self.stored()[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+        self.assertTrue(self.finish(noted=False)["silent_ok"])
+
+    def test_an_on_demand_run_does_not_take_the_news_from_the_channel(self):
+        on_demand = self.finish(noted=True, scheduled=False)
+        self.assertFalse(on_demand["silent_ok"])
+        # `noted_changed` is the scheduled verdict's term, like `ids_moved`:
+        # an on-demand run reports everything anyway, so its line does not
+        # carry the key.
+        self.assertNotIn(audit_report.NOTED_CHANGED_KEY, on_demand)
+        # The on-demand run copied the baseline forward, so the channel still
+        # hears the change on the next scheduled run, and only once.
+        first = self.finish(noted=True)
+        self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(first["silent_ok"])
+        self.assertTrue(self.finish(noted=True)["silent_ok"])
+
+    def chat_text(self):
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        return "\n".join(str(part.get("text") or "") for part in record["parts"])
+
+    def test_a_later_finish_of_the_run_still_names_the_cleared_objects(self):
+        """The run's first `finish` stores this run's set as the scheduled
+        baseline, so a later `finish` of the same run reading the store
+        back would call the set unchanged. It measures against the saved
+        context instead (`run_noted_baseline`), so its report keeps
+        `noted_changed`, `noted_cleared` and the Visible-again line."""
+        self.finish(noted=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        first = self.finish(noted=False)
+        self.assertEqual(first[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        second = self.finish(noted=False)
+        self.assertTrue(second[audit_report.REFINISH_KEY])
+        self.assertIs(second[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertEqual(second[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, self.chat_text())
+
+    def test_a_rerun_after_a_death_before_the_chat_append_keeps_the_clear(self):
+        """The first `finish` died after the store write and before its
+        chat append: the verdict and the saved baseline are on the record,
+        the store already holds this run's set. The re-run still reports
+        the clear."""
+        self.finish(noted=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        with patch.object(audit_report, "append_chat_report", lambda *a, **k: None):
+            died = self.finish(noted=False)
+        self.assertEqual(died[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        rerun = self.finish(noted=False)
+        self.assertIs(rerun[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertEqual(rerun[audit_report.NOTED_CLEARED_KEY], [derived_id(fid="a")])
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, self.chat_text())
+
+    def test_the_baseline_reads_like_the_published_ids_baseline(self):
+        # A record from before the key, or from another id scheme, gives no
+        # baseline, and a noted run then speaks; a store with no run gives
+        # the empty set, and a never-noted run stays quiet.
+        scheme = {"id_scheme": audit_report.ID_SCHEME}
+        self.assertIsNone(audit_report.scheduled_noted_baseline(None))
+        self.assertIsNone(audit_report.scheduled_noted_baseline(scheme))
+        self.assertIsNone(
+            audit_report.scheduled_noted_baseline(
+                {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: None}
+            )
+        )
+        self.assertIsNone(
+            audit_report.scheduled_noted_baseline(
+                {"id_scheme": "other", audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            )
+        )
+        self.assertEqual(audit_report.scheduled_noted_baseline({}), [])
+        self.assertEqual(
+            audit_report.scheduled_noted_baseline(
+                {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            ),
+            ["x"],
+        )
+        self.assertTrue(audit_report.noted_set_changed({"x"}, None))
+        self.assertFalse(audit_report.noted_set_changed(set(), None))
+        self.assertFalse(
+            audit_report.noted_set_changed(
+                {"x"}, {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            )
+        )
+        self.assertTrue(
+            audit_report.noted_set_changed(
+                set(), {**scheme, audit_report.SCHEDULED_NOTED_IDS_KEY: ["x"]}
+            )
+        )
+
+
+class TestNotedSetSpeaksOnceOnALedger(HarnessTestCase):
+    """The same rule on a findings run over an open ledger (the UPDATED
+    branch): an unchanged noted set does not wake the channel, and a noted
+    object that joins does, once."""
+
+    def setUp(self):
+        super().setUp()
+        self.a = make_finding(fid="a", severity="major")
+        self.zeta = derived_id(obj="Namespace/zeta")
+        self.harness.replies = {"issue-list": self.issue_list()}
+
+    def seed(self, noted_baseline):
+        body = published_body(make_doc(findings=[self.a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+                audit_report.SCHEDULED_NOTED_IDS_KEY: noted_baseline,
+            },
+        )
+
+    def finish(self):
+        manifest = _full_manifest()
+        manifest["clusters"][0]["notes"] = (
+            "netpol-missing: the status of 1 object is not visible: Namespace/zeta."
+        )
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/zeta"}
+        ]
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        rc = self.run_finish(
+            make_doc(findings=[self.a]), ["--manifest-file", str(path)], scheduled=True
+        )
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json()
+
+    def test_an_unchanged_noted_set_is_silent(self):
+        self.seed([self.zeta])
+        out = self.finish()
+        self.assertEqual((out["status"], out["new"], out["resolved"]), ("UPDATED", 0, 0))
+        self.assertTrue(out["silent_ok"])
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored[audit_report.SCHEDULED_NOTED_IDS_KEY], [self.zeta])
+
+    def test_a_noted_object_that_joins_speaks(self):
+        self.seed([])
+        out = self.finish()
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertIs(out[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(out["silent_ok"])
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
@@ -28709,6 +29793,45 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("collector still emits", deferrals[0])
         self.assertFalse([b for b in posted if "no longer reproduces" in b])
 
+    def test_remediate_refuses_a_noted_id_with_its_own_reason(self):
+        # The ledger carries `a` (the store is its record), so the noted
+        # hold protects a previous finding from being resolved unseen.
+        a_id = derived_id(fid="a")
+        self.seed_report(
+            published_body(make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW)
+        )
+        findings_file = self.write_findings(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]))
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", findings_file,
+             "--finding", a_id, "--manifest-file", self.manifest_file(manifest)]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("could not see the result", self.err)
+        self.assertNotIn("still emits", self.err)
+
+    def test_remediate_gives_the_plain_error_for_a_noted_id_never_filed(self):
+        """A noted object no previous finding covers holds nothing
+        (`noted_ids`): a `/remediate` on an id never filed is a typo, and
+        the answer lists the known ids rather than telling the caller to
+        carry forward a finding that does not exist."""
+        a_id = derived_id(fid="a")
+        findings_file = self.write_findings(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]))
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        rc = self.run_main(
+            ["remediate", "--audit", AUDIT, "--findings-file", findings_file,
+             "--finding", a_id, "--manifest-file", self.manifest_file(manifest)]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("known ids are", self.err)
+        self.assertNotIn("could not see the result", self.err)
+
     def test_remediate_refuses_a_held_id_as_held_not_as_unknown(self):
         """The CLI path: with the manifest it names the hold; without it the
         id is simply not in the file, as before."""
@@ -29090,6 +30213,22 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertEqual(payload["prs_closed"], [])
+
+    def test_a_noted_object_no_ledger_carries_is_not_a_flagged_lost_memory(self):
+        """No record shows that the ledger has a finding on the noted object,
+        so it holds nothing: the gap is the one with the way out, not one that
+        says the collector still flags something."""
+        self.replay_lost_store()
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_a_remediate_over_a_lost_store_is_told_the_record_was_lost(self):
         """The target is one the collector does not flag, but the lost record
@@ -33790,6 +34929,33 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(code, 0, self.err)
         return self.stdout_json()
 
+    def finish_with_manifest(self, doc, manifest):
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_the_summary_carries_the_scope_notes_and_a_noted_hold(self):
+        """The worker sends `summary` verbatim, so it carries the notes, and a
+        previous finding on a noted object is kept on its own line."""
+        self.finish(make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]))
+        manifest = _full_manifest()
+        manifest["clusters"][0]["notes"] = ROTATED_NOTE
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        out = self.finish_with_manifest(make_doc(findings=[make_finding(fid="b")]), manifest)
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertIn(f"Read but not visible, which is not a coverage gap: prod-us-east: {ROTATED_NOTE}", out["summary"])
+        self.assertIn(f"Kept, because {audit_report.NOTED_HOLD_CAUSE}", out["summary"])
+        self.assertIn(derived_id(fid="a"), out["summary"])
+        self.assertNotIn("Still flagged by the collector", out["summary"])
+        self.assertEqual(out["resolved"], 0)
+
     def test_start_hands_over_an_empty_workspace_and_says_no_forge(self):
         workspace = Path(audit_report.SCRATCH_DIR) / f"workspace_{AUDIT}"
         workspace.mkdir(parents=True)
@@ -34064,7 +35230,7 @@ class TestNoForge(BaseTestCase):
     def test_a_withheld_posture_is_not_reported_as_held(self):
         self.finish(make_doc())
         (fid,) = json.loads((self.store() / "latest.json").read_text())["current_ids"]
-        self.patch_attr("still_flagged_ids", lambda manifest, data: {fid})
+        self.patch_attr("still_flagged_ids", lambda manifest, data, carried=(): {fid})
         doc = make_doc()
         doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
         self.record_run(repo=audit_report.NO_FORGE_REPO, context=["acme/context"], audit=AUDIT)
@@ -34081,7 +35247,7 @@ class TestNoForge(BaseTestCase):
         kept = make_doc(findings=THREE_SEVERITIES[1:])
         kept_ids = set(audit_report.finding_ids(audit_report.load_findings(self.write_findings(kept), AUDIT)["findings"]))
         (left_out,) = previous - kept_ids
-        self.patch_attr("still_flagged_ids", lambda manifest, data: {left_out})
+        self.patch_attr("still_flagged_ids", lambda manifest, data, carried=(): {left_out})
 
         out = self.finish(kept)
 
@@ -35277,6 +36443,15 @@ class TestShadowRun(BaseTestCase):
         self.append_chat_report.assert_not_called()
         self.save_chat_verdict.assert_not_called()
 
+    def test_a_shadow_start_writes_no_run_start_record(self):
+        # A shadow run's report goes to its own stream, so a run-start record
+        # under the live audit would show a shadow run that died as an
+        # unfinished live run (#6812).
+        record = mock.MagicMock(name="record_run_start")
+        self.patch_attr("record_run_start", record)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        record.assert_not_called()
+
     def test_its_delta_is_against_its_own_previous_run(self):
         doc = make_doc(findings=THREE_SEVERITIES)
         self.finish(doc)
@@ -35485,6 +36660,123 @@ class TestShadowRun(BaseTestCase):
             code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, audit_report.STORE_ONLY_FLAG])
         self.assertNotEqual(code, 0)
         self.assertIn("shadow run", self.err)
+
+    def noted_finish(self, doc, noted=(), live=False):
+        """One scheduled `finish` with a manifest whose first target notes `noted`.
+
+        `noted` is the `fid` of each object the collector could not see.
+        `live` runs it as a live task; otherwise it is a shadow run.
+        """
+        manifest = _full_manifest()
+        if noted:
+            manifest["clusters"][0]["notes"] = ROTATED_NOTE
+            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                {"check": "netpol-missing", "namespace": "payments", "object": f"Namespace/{fid}"}
+                for fid in noted
+            ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        flag = [] if live else [audit_report.STORE_ONLY_FLAG]
+        with patch.dict(os.environ, {audit_report.SHADOW_TASK_ENV: "false" if live else "true"}):
+            self.start(*flag)
+            path = audit_report.findings_path_for(AUDIT)
+            Path(path).write_text(json.dumps(doc), encoding="utf-8")
+            code = self.run_main(
+                ["finish", "--audit", AUDIT, "--findings-file", path,
+                 "--manifest-file", str(manifest_path), "--scheduled", *flag]
+            )
+        return code
+
+    def shadow_latest(self, repo="acme/gitops"):
+        return json.loads((self.shadow_store(repo=repo) / "latest.json").read_text(encoding="utf-8"))
+
+    def test_a_noted_object_is_on_the_line_and_in_both_summaries(self):
+        self.assertEqual(self.noted_finish(make_doc(findings=[]), noted=["a"]), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(
+            [entry[audit_report.NOTE_TEXT_FIELD] for entry in out[audit_report.NOTES_RESULT_KEY]],
+            [ROTATED_NOTE],
+        )
+        self.assertIs(out[audit_report.NOTED_CHANGED_KEY], True)
+        latest = self.shadow_latest()
+        for summary in (out["summary"], latest[audit_report.SHADOW_SUMMARY_KEY]):
+            self.assertIn(f"{audit_report.NOTES_LEAD}: ", summary)
+            self.assertIn(ROTATED_NOTE, summary)
+        # The report is the summary, which carries the note. The line has no
+        # second copy, and the worker gets no reminder to copy one.
+        self.assertNotIn(audit_report.REPORT_NOTES_KEY, out)
+        self.assertNotIn(audit_report.REPORT_NOTES_REMINDER, self.err)
+        self.assertNotIn(audit_report.REPORT_NOTES_REMINDER_NO_LEDGER, self.err)
+        # The baseline of the shadow stream is its own.
+        self.assertEqual(latest[audit_report.SCHEDULED_NOTED_IDS_KEY], [derived_id(fid="a")])
+
+    def test_the_stored_summary_names_a_noted_hold_and_an_object_visible_again(self):
+        both = make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")])
+        only_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        a_id = derived_id(fid="a")
+        self.assertEqual(self.noted_finish(both), 0, self.err)
+        # The document leaves out `a`, and the collector could not see it.
+        self.assertEqual(self.noted_finish(only_b, noted=["a"]), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["resolved"], 0)
+        latest = self.shadow_latest()
+        self.assertIn(a_id, latest["current_ids"])
+        kept = f"Kept, because {audit_report.NOTED_HOLD_CAUSE}"
+        for summary in (out["summary"], latest[audit_report.SHADOW_SUMMARY_KEY]):
+            [line] = [row for row in summary.splitlines() if row.startswith(kept)]
+            self.assertIn(a_id, line)
+            self.assertNotIn("Still flagged by the collector", summary)
+        # The object is visible again, and the finding is not there.
+        self.assertEqual(self.noted_finish(only_b), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out[audit_report.NOTED_CLEARED_KEY], [a_id])
+        for summary in (out["summary"], self.shadow_latest()[audit_report.SHADOW_SUMMARY_KEY]):
+            [line] = [row for row in summary.splitlines() if row.startswith(audit_report.VISIBLE_AGAIN_LEAD)]
+            self.assertIn(a_id, line)
+
+    def test_a_noted_object_is_not_written_as_resolved(self):
+        both = make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")])
+        self.assertEqual(self.noted_finish(both), 0, self.err)
+        before = (self.shadow_store() / "latest.json").read_bytes()
+        only_b = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        only_b["resolved_because"] = [
+            {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a",
+             "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+        ]
+        self.assertEqual(self.noted_finish(only_b, noted=["a"]), 2, self.err)
+        self.assertIn("could not see the result", self.err)
+        self.assertEqual((self.shadow_store() / "latest.json").read_bytes(), before)
+
+    def test_a_shadow_run_leaves_the_live_noted_baseline(self):
+        """The two streams are under one store key here, which is the nearest
+        they come: the live run still speaks once about the noted object the
+        shadow run saw first, and the shadow run's baseline is its own."""
+        clean = make_doc(findings=[])
+        live_latest = Path(audit_report.reports_dir_for(AUDIT, audit_report.NO_FORGE_REPO)) / "latest.json"
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch(
+            "gitops_workspace._read_state_text", lambda key: ""
+        ):
+            self.assertEqual(self.noted_finish(clean, live=True), 0, self.err)
+            self.assertEqual(json.loads(live_latest.read_text())[audit_report.SCHEDULED_NOTED_IDS_KEY], [])
+            before = live_latest.read_bytes()
+            self.assertEqual(self.noted_finish(clean, noted=["a"]), 0, self.err)
+            self.assertIs(self.stdout_json()[audit_report.NOTED_CHANGED_KEY], True)
+            self.assertEqual(live_latest.read_bytes(), before)
+            self.assertEqual(
+                self.shadow_latest(repo=audit_report.NO_FORGE_REPO)[audit_report.SCHEDULED_NOTED_IDS_KEY],
+                [derived_id(fid="a")],
+            )
+            self.assertEqual(self.noted_finish(clean, noted=["a"], live=True), 0, self.err)
+            live = self.stdout_json()
+            self.assertNotIn(audit_report.SHADOW_KEY, live)
+            self.assertIs(live[audit_report.NOTED_CHANGED_KEY], True)
+            self.assertFalse(live["silent_ok"])
+            # The live baseline moved on the live run, so the next one is quiet.
+            self.assertEqual(self.noted_finish(clean, noted=["a"], live=True), 0, self.err)
+            self.assertTrue(self.stdout_json()["silent_ok"])
+            # The shadow run's own baseline is unchanged, so it has no news either.
+            self.assertEqual(self.noted_finish(clean, noted=["a"]), 0, self.err)
+            self.assertNotIn(audit_report.NOTED_CHANGED_KEY, self.stdout_json())
 
 
 class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
@@ -36967,6 +38259,55 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(latest[audit_report.SCHEDULED_COVERAGE_GAPS_KEY], [])
         self.assertEqual(latest[audit_report.SCHEDULED_REPORTED_UNDER_GAP_KEY], [])
 
+    def test_a_store_ledger_run_speaks_once_when_the_noted_set_changes(self):
+        """The store-ledger path applies the noted-set rule as the forge path
+        does: the set speaks when it changes, and an unchanged set is silent."""
+        def run(noted):
+            manifest = _full_manifest()
+            if noted:
+                manifest["clusters"][0]["notes"] = (
+                    "netpol-missing: the status of 1 object is not visible: Namespace/zeta."
+                )
+                manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                    {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/zeta"}
+                ]
+            manifest_path = self.tmp_path / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.start()
+            path = audit_report.findings_path_for(AUDIT)
+            Path(path).write_text(json.dumps(make_doc(findings=[])), encoding="utf-8")
+            self.new_process()
+            rc = self.run_main(
+                ["finish", "--audit", AUDIT, "--findings-file", path,
+                 "--manifest-file", str(manifest_path), "--scheduled"]
+            )
+            self.assertEqual(rc, 0, self.err)
+            return self.stdout_json()
+
+        first = run(noted=True)
+        self.assertEqual(first["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertIs(first[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(first["silent_ok"])
+        # The report here is `summary` verbatim, and `summary` carries the
+        # note, so the line has no `report_notes`: a second copy would
+        # print the note twice.
+        self.assertNotIn(audit_report.REPORT_NOTES_KEY, first)
+        self.assertIn("not visible", first["summary"])
+        self.assertEqual(
+            self.latest()[audit_report.SCHEDULED_NOTED_IDS_KEY],
+            [derived_id(obj="Namespace/zeta")],
+        )
+        self.assertTrue(run(noted=True)["silent_ok"])
+        cleared = run(noted=False)
+        self.assertIs(cleared[audit_report.NOTED_CHANGED_KEY], True)
+        self.assertFalse(cleared["silent_ok"])
+        # The summary names the object that is visible again.
+        self.assertEqual(
+            cleared[audit_report.NOTED_CLEARED_KEY], [derived_id(obj="Namespace/zeta")]
+        )
+        self.assertIn(audit_report.VISIBLE_AGAIN_LEAD, cleared["summary"])
+        self.assertTrue(run(noted=False)["silent_ok"])
+
     def test_a_store_ledger_run_speaks_on_a_change_an_on_demand_run_saw_first(self):
         """An on-demand run resolves the finding. The next scheduled run
         counts 0 resolved against it, but the channel did not hear the
@@ -37020,6 +38361,52 @@ class TestStoreLedger(HarnessTestCase):
         self.assertNotIn("labelsAdd", update)
         self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
         self.assertIn(proposal["url"], out["summary"])
+
+    def test_a_noted_finding_the_stored_ledger_carries_keeps_its_fix_open(self):
+        """The store-ledger path holds a noted object the stored ledger
+        carries, as the forge path does: its fix is not closed as stale."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]))
+        validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+        only_a = {**validated, "findings": [f for f in validated["findings"] if f["object"] == "Namespace/a"]}
+        proposal = self.open_proposal(8, only_a)
+        self.harness.replies["proposal-list"] = {"proposals": [proposal], "truncated": False}
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[make_finding(fid="b")])), encoding="utf-8")
+        self.new_process()
+        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertEqual(out["prs_closed"], [])
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+
+    def test_a_clean_run_logs_a_noted_finding_as_not_visible(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(fid="a")]))
+        manifest = _full_manifest()
+        manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+            {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+        ]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[])), encoding="utf-8")
+        self.new_process()
+        rc = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"NOT VISIBLE: {derived_id(fid='a')}", self.err)
+        self.assertNotIn("STILL FLAGGED:", self.err)
 
     def test_a_scoped_install_leaves_another_installs_unlabelled_fix_on_the_store_path(self):
         # The store ledger on a forge with proposals and labels but no issue
@@ -40067,6 +41454,50 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         self.assertEqual(self.stdout_json()["superseded"], [])
         self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
 
+    def finish_over_a_merged_budget(self, asked_at):
+        """`finish` on the finding whose budget merged on 2026-07-15 and is gone
+        again, with a ledger `/remediate` for it written at `asked_at` (#7013)."""
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        merged = {
+            **pr(8, branch, state="MERGED", body=audit_report.delta_block([self.fid()])),
+            "closedAt": "2026-07-15T00:00:00Z",
+            "mergedAt": "2026-07-15T00:00:00Z",
+            "labels": [],
+        }
+        request = comment(f"/remediate {self.fid()}", created_at=asked_at)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": proposals_view([merged]),
+            "*-view comments": comments_view({"comments": [request]}),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/11"),
+        }
+        self.record_run(context=["acme/fleet"], audit=self.STREAM)
+        return self.run_finish(
+            searched_doc(findings=[self.finding()]),
+            ["--manifest-file", self.manifest_file()],
+            audit=self.STREAM,
+        )
+
+    def test_a_ledger_request_after_the_budget_merged_opens_it_again(self):
+        """The budget's pull request merged, a person removed the file, and a
+        `/remediate` written after the merge was refused as not a `manifest`
+        on every run. Written after the merge, it now plans and opens the budget."""
+        self.assertEqual(self.finish_over_a_merged_budget("2026-07-20T00:00:00Z"), 0, self.err)
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1, self.err)
+        for body in self.harness.bodies_for("issue-comment"):
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+
+    def test_a_ledger_request_older_than_the_merge_leaves_it_answered(self):
+        """An old comment never re-proposes a budget a person merged and then removed."""
+        self.assertEqual(self.finish_over_a_merged_budget("2026-07-10T00:00:00Z"), 0, self.err)
+        self.assertNotIn("GENERATED: " + self.fid(), self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        refusals = [b for b in self.harness.bodies_for("issue-comment") if audit_report.refused_marker("IC_1") in b]
+        self.assertEqual(len(refusals), 1)
+
     def test_a_withheld_selector_is_not_planned(self):
         manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
         self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
@@ -40127,6 +41558,76 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
         manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
         self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
+
+
+class ComplianceWiGsaUnverifiableDeclarableTests(unittest.TestCase):
+    """§2.19 `wi-gsa-iam-binding-unverifiable` is declarable per ServiceAccount (§3a)."""
+
+    SLUG = "wi-gsa-iam-binding-unverifiable"
+    CLUSTER = "prod-us-east"
+
+    def _finding(self, obj="ServiceAccount/kms-signer-sa", ns="payments"):
+        return make_finding(
+            f"{self.SLUG}.{self.CLUSTER}.{ns}.{obj.lower().replace('/', '-')}",
+            check=self.SLUG,
+            cluster=self.CLUSTER,
+            namespace=ns,
+            obj=obj,
+            severity="minor",
+            excerpt="iam.gke.io/gcp-service-account=kms-signer@central-iam.iam.gserviceaccount.com",
+        )
+
+    def _doc(self, findings):
+        return audit_report.validate_findings(make_doc(findings=findings, audit=AUDIT), AUDIT)
+
+    def test_declarable_set_includes_wi_gsa_iam_binding_unverifiable(self):
+        self.assertEqual(
+            audit_report.audit_declarable_checks(AUDIT),
+            frozenset({"netpol-missing", "default-sa-automount", self.SLUG}),
+        )
+
+    def test_declaration_moves_annotated_serviceaccount_to_declared_intent(self):
+        declared_sa = self._finding("ServiceAccount/kms-signer-sa", "payments")
+        undeclared_sa = self._finding("ServiceAccount/other-sa", "payments")
+        doc = self._doc([declared_sa, undeclared_sa])
+        declarations = [
+            {
+                "check": self.SLUG,
+                "namespace": "payments",
+                "object": "ServiceAccount/kms-signer-sa",
+                "repo": "acme/fleet",
+                "path": "knowledge/central-iam.md",
+                "excerpt": "Central IAM project sits outside this install's read scope by design.",
+            }
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["ServiceAccount/kms-signer-sa"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["ServiceAccount/other-sa"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["ServiceAccount/kms-signer-sa"])
+
+    def test_validator_accepts_serviceaccount_and_rejects_other_kinds(self):
+        doc = self._doc([])
+        doc["declared"] = [
+            make_declared(
+                check=self.SLUG,
+                cluster=self.CLUSTER,
+                namespace="payments",
+                obj="ServiceAccount/kms-signer-sa",
+                title="kms-signer-sa uses central IAM project outside install scope",
+                repo="acme/fleet",
+                path="knowledge/central-iam.md",
+                excerpt="Central IAM project.",
+            )
+        ]
+        audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+        for obj in ("Namespace/payments", "Cluster/prod-us-east", "Deployment/kms-signer"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("serviceaccount", str(cm.exception))
 
 
 if __name__ == "__main__":

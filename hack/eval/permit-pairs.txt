@@ -1,0 +1,19 @@
+# The permit pairs: for each, two cases with the same ask and the same checks,
+# one for today's platform agent and one for an AgentProfile
+# (docs/designs/permit-pairs.md). scripts/eval_front_door_ab.py --pairs reads
+# this file and the two cases' hand-offs from one or more runs.
+#
+# One pair per line: the side A case id, then the side B case id. `#` starts a
+# comment, blank lines are skipped. A case is in the file once.
+#
+# Side A has no [bench:profile ...] directive, so it goes to the install's
+# default route and the platform agent does the work. Side B opens with the
+# directive. `make bench-case-check` (scripts/validate_bench_cases.py) holds
+# each line to the rule in docs/designs/permit-pairs.md: the same ask and the
+# same checks. A pull request that changes one side changes the other, or
+# removes the line.
+#
+# A pull request through the version-control verbs: the platform agent with
+# today's authority against the `cluster` profile under a permit minted for
+# one confirmed task.
+platform-agent-pdb-pull-request cluster-profile-confirmed-pdb-pull-request

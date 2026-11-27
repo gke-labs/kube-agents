@@ -179,12 +179,18 @@ func a2aGatewayScaleOutAllowed(observed *string, elected string, live *appsv1.De
 	return false
 }
 
-// minPositive is the smaller of two durations, ignoring a zero.
+// minPositive is the smaller positive duration, or zero when neither is positive.
 func minPositive(a, b time.Duration) time.Duration {
-	if a <= 0 || b < a {
+	if a <= 0 {
+		if b <= 0 {
+			return 0
+		}
 		return b
 	}
-	return a
+	if b <= 0 || a <= b {
+		return a
+	}
+	return b
 }
 
 // scaleOutA2AGateway renders the CR's replica count and a rolling update

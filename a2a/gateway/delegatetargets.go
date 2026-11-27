@@ -253,7 +253,9 @@ func (g *Gateway) profileDelegateTargets(rec *SessionRecord, parent TaskRef) lib
 // submission is unchanged. A part that can't be built is left off and
 // logged; the worker's delegate tool then falls back to platform. Both a
 // task started from a turn (startTaskWith) and a scheduled run
-// (publishTriggerRun) read it, so they carry the same list.
+// (publishTriggerRun) read it, so they carry the same list. Beside it goes
+// the scopeClusters part, one page of the clusters a `cluster` child would
+// be accepted for (profileScopeClusters), under the same gate.
 func (g *Gateway) profileTargetsParts(rec *SessionRecord, parent TaskRef, taskID string) []lib.Part {
 	if !g.profileDelegates(parent.Addressee) {
 		return nil
@@ -263,7 +265,7 @@ func (g *Gateway) profileTargetsParts(rec *SessionRecord, parent TaskRef, taskID
 		g.log.Warn("delegate targets not attached to a profile task; its delegate tool falls back to platform", "taskId", taskID, "err", err)
 		return nil
 	}
-	return []lib.Part{part}
+	return append([]lib.Part{part}, g.scopeClustersParts(parent, taskID)...)
 }
 
 // fits reports whether t with next added is still a valid part: inside the

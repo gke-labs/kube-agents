@@ -198,7 +198,8 @@ def _detail(answer: dict) -> str:
     text = json.dumps(bounded, sort_keys=True)
     if len(text) <= DETAIL_CHARS:
         return text
-    keep = {key: bounded[key] for key in ("action", "revert", "gaveUp") if isinstance(bounded.get(key), str)}
+    # stepDown is how the autonomy dial follows the deny rule (dial_state.step_downs).
+    keep = {key: bounded[key] for key in ("action", "revert", "stepDown", "gaveUp") if isinstance(bounded.get(key), str)}
     return json.dumps({**keep, "reason": _reason(answer)}, sort_keys=True)
 
 

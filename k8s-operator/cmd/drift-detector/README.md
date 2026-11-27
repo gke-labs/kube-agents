@@ -25,7 +25,7 @@ The inject is off unless `--daemon-url` is set, and off is the default. With it 
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
 local run against a real subscription wants. With it on, each surviving record opens a session and
 posts one payload into it — except one from a cluster outside the install's scope, which is held (the
-rule is a few paragraphs below), and most that arrived late, which go to the daemon's digest route
+rule is a few paragraphs below), and most that arrived late and the install's own release writes, which go to the daemon's digest route
 with no session when the daemon advertises one ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
@@ -40,7 +40,8 @@ and per-process, which leaves one case uncovered: a non-graceful exit leaves its
 the next instance starts with an empty set. Those records were published before its first pull, so
 they come back as backlog, and the daemon drops each one that already has a drift row. A late
 `kubectl` write is the exception: it is carded, not digested, so it is injected again, as every
-record is against a daemon without the digest route. A climbing `duplicate=`
+record is against a daemon without the digest route. (A late `kubectl` write to one of the
+product's CRDs is digested when `--own-release` is set: [The install's own release](#the-installs-own-release).) A climbing `duplicate=`
 count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
 Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
 failed inject is not retried on redelivery either.
@@ -56,7 +57,7 @@ of its own rather than to the event watcher's, because one `kubectl apply` over 
 human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
 the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
 split; what it does not fix is the fan-out itself, since the detector coalesces nothing live. Most records
-that arrive late are the exception: they are digested instead ([The backlog](#the-backlog)). A record
+that arrive late, and the install's own release writes, are the exception: they are digested instead ([The backlog](#the-backlog)). A record
 the ceiling refuses is lost rather than deferred: the daemon answers
 `suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
 ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
@@ -190,16 +191,18 @@ differently at each:
   being detected when nothing is wrong yet. The watcher needs no equivalent because it negotiates
   with the daemon per request rather than at startup.
 - The operator writes the `DRIFT_DETECTOR_*` environment into that sidecar and the entrypoint turns
-  it into the flags above. Three of the six come from `spec.harness.driftDetector` — the switch,
+  it into the flags above. Three of the seven come from `spec.harness.driftDetector` — the switch,
   the subscription and the GitOps manager list; the project, location and cluster name come from
   `spec.harness` itself, because this sidecar does not get the `GKE_*` triple the agent container
-  has. Only the switch is written on every reconcile. The other five appear when it is on, so that
+  has; the release (`DRIFT_DETECTOR_OWN_RELEASE`) comes from the Helm annotations on the
+  `PlatformAgent`, and is empty when the CR carries none. Only the switch is written on every
+  reconcile. The other six appear when it is on, so that
   an install that will never run the detector does not carry the harness triple twice under a
   second set of names.
 - `DRIFT_DETECTOR_LOG_DROPPED` is the one the operator does not write. The entrypoint reads it and
   turns it into `--log-dropped`; an install that wants it sets it under `spec.deployment.env`,
   which reaches this sidecar through `mergeCredentialProxyEnv` — a denylist, so a name the
-  operator reserves nowhere passes through. The six above are all reserved there, because the
+  operator reserves nowhere passes through. The seven above are all reserved there, because the
   operator appends each after that merge and a duplicate would stall the apply; adding this one
   beside them for symmetry is what would quietly cut the route.
 
@@ -227,8 +230,8 @@ the pod's credentials actually reach and a disagreement stops the process. A hal
 leaves the detector off rather than looping.
 
 Two flags reach `spec.harness.driftDetector`, `subscription` and `gitopsManagers`, and
-`--log-dropped` reaches the CR a layer out through `spec.deployment.env`; the rest are fixed by
-where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector
+`--log-dropped` reaches the CR a layer out through `spec.deployment.env`; `--own-release` is read
+from the CR's Helm annotations; the rest are fixed by where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector
 joins its own cluster and every Cluster Agent profile, whichever project it names, without being asked.
 
 Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
@@ -303,6 +306,7 @@ addressed and one that was and refused.
 | `--cluster-location`      | empty                            | That cluster's region or zone. Required with `--cluster-name`: a name is unique only within a project and location.                                                                                                                                                                                                                                                                                                |
 | `--profiles-dir`          | empty                            | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile becomes a joinable cluster, whichever project its cluster is in, and the set of profiles is the install's scope for the `unreachable` hold. Combines with the two above; a profile naming the cluster they already reach is dropped in favour of them.                                                                       |
 | `--gitops-managers`       | empty                            | Comma-separated `managedFields` managers that are the GitOps controller. Matched exactly, and only on writes to the object rather than through a subresource, in a second later than the audited change. Empty means no reconciliation claim is made.                                                                                                                                                              |
+| `--own-release`           | empty                            | The Helm release this install was made by, as `<namespace>/<name>`. Its own writes on the directly reached cluster go to the digest instead of a card ([The install's own release](#the-installs-own-release)). Requires `--in-cluster` or `--kubeconfig`. Empty turns the rule off.                                                                                                                               |
 | `--batch-join-budget`     | `30s`                            | Longest one batch may spend on lookups; 1ns to 5m. Startup warns if it exceeds half the subscription's real ack deadline.                                                                                                                                                                                                                                                                                          |
 | `--daemon-url`            | empty                            | Core-agent daemon to post the `gitops-drift` inject to, without a trailing slash, query or fragment. Probed at startup and refused if it does not understand the kind. Empty disables the inject: records are still classified, joined and logged, and nothing is escalated.                                                                                                                                       |
 | `--token-env`             | empty                            | **Name** of the environment variable holding the daemon's bearer token, not the token. Required with `--daemon-url`, and an error without it — a flag value is visible in the process table.                                                                                                                                                                                                                       |
@@ -686,7 +690,8 @@ indistinguishable in every later line but the backlog marker. The error names dr
 degraded mode deliberately.
 
 The same reply's `features` is read too, and does not gate the start: without `drift-backlog` on it,
-backlog records are sent as cards ([The backlog](#the-backlog)).
+backlog records are sent as cards ([The backlog](#the-backlog)), and without `drift-own-release`
+beside it no write is marked as the install's own ([The install's own release](#the-installs-own-release)).
 
 ## The backlog
 
@@ -707,7 +712,9 @@ startup line says so and every record is sent as a card, as before.
 A backlog record whose user agent starts with `kubectl/` is not sent to the digest: it is joined and
 injected as a live record is, with no `backlog=true` marker. An install's own writes come from Helm's
 Go client, so a late kubectl write is more likely a person's edit made just before a restart. The
-user agent is self-declared; the rule only routes such a record the way a live one goes.
+user agent is self-declared; the rule only routes such a record the way a live one goes. One
+exception, with `--own-release` set: a `kubectl` write to one of the product's CRDs, which the
+installer itself makes with `kubectl`, goes to the digest route under the next section's rule.
 
 An install's own Helm apply is the burst this exists for. It runs under the installer's account,
 so the classifier sees a person, and before this route each object it wrote became a triage card
@@ -716,17 +723,106 @@ and spent the day's drift budget.
 The cost: after every detector restart, records published before the new process's first pull are
 backlog. That includes records nacked at shutdown and changes made within the sink's export lag
 before the restart. Two rules keep a person's edit in that window carded: the kubectl rule above,
-and the daemon's, which cards every late row of a principal with fewer than three late rows in the
-digest. What is left without a card of its own is three or more late non-kubectl changes by one
-principal, which the digest names under that principal. On an install with no chat platform enabled
+and the daemon's, which cards every late row of a principal with fewer than three rows in the
+digest. What is left without a card of its own is the late non-kubectl changes of a principal
+with three or more rows in the digest, late `kubectl` writes to the product's CRDs under the
+next section's rule, and late writes to the release's objects made inside that principal's Helm
+upgrade; the digest names them under that principal. On an install with no chat platform enabled
 the digest is one card on the
 task board, unassigned and blocked, so no agent acts on it and it stays in view. The daily board
 health report names it while it stays blocked; that report reaches a person once the install
 has chat. One card per burst: the digest closes 60 seconds after its newest row or 10
 minutes after its oldest, so while the detector lags more than 30 minutes, each burst of three or
 more changes by one person, more than 60 seconds apart, files its own card. A Helm upgrade the old
-detector is still running for is not covered:
-its writes reach a running process and are triaged as live changes.
+detector is still running for is not late: its writes reach a running process, and the next section
+has the rule that takes them.
+
+### The install's own release
+
+An upgrade writes kube-agents' own objects under the installer's account while the old detector is
+still pulling, so those records are live, and a card each spent the day's drift budget on the
+product's own upgrade. With `--own-release` set, the detector marks a record from the directly
+reached cluster, late or not, when it is not a delete (of one object or of a collection) and names no subresource, and sends it to the
+digest route. It does so only against a daemon whose `/healthz` lists the `drift-own-release`
+feature beside `drift-backlog`: a daemon without it digests by count alone and words every row as
+late, so the detector marks nothing for it, says so at startup, and each such write is a card as
+before. The mark has two kinds.
+
+`own_release: crd` is a CRD whose name ends in `.kubeagents.x-k8s.io`, with any client. The
+installer applies those with `kubectl apply --server-side`, which is why this one does not test the
+client.
+
+`own_release: release` is a write by a client other than `kubectl` to one of these:
+
+- an object in the release namespace or in `<release namespace>-profiles`;
+- a cluster-scoped object in the `rbac.authorization.k8s.io` or `admissionregistration.k8s.io`
+  group named `<release name>-...`;
+- an object whose live copy carries the `meta.helm.sh/release-name` and
+  `meta.helm.sh/release-namespace` annotations of that release.
+
+Only the last test reads the live object, so it cannot match a late record, whose lookup is
+skipped. The join's ServiceAccount has no read on RBAC or admission policies, which are about
+half of what an upgrade writes, so the others read the record alone. The chart names its cluster roles, their bindings and its webhook
+configurations after the release, and its admission policies and their bindings `kube-agents-...`
+whatever the release is called. On a release named `kube-agents`, which is what the installer
+makes, the name test therefore matches all of them, and
+`tests/test_chart_cluster_scoped_names.py` holds every cluster-scoped RBAC and admission object
+the chart renders under that name to the prefix. On a release of another name the admission
+policies and their bindings do not match, and a write to one is carded as before.
+
+Where a write lands does not show that an upgrade made it: a person can change those objects by
+hand at any time. So the detector also marks the start and the end of an upgrade, and the daemon
+decides. Helm creates a Secret `sh.helm.release.v1.<name>.v<revision>` in the release namespace
+first in every upgrade and rollback, and updates it when the upgrade ends, deployed or failed. By a
+client other than `kubectl`, the create carries `own_release_revision` on its payload and the
+update `own_release_revision_end`.
+
+The daemon digests a live `release` row only when its change was made inside an upgrade of its
+own principal: from the time of that create to the time of that revision's first update after it,
+two seconds either way, or for fifteen minutes when no update has been seen. It reads the two from
+the same digest or from the ledger, and the digest names the principal, the release and the
+revision. Outside an upgrade it cards each live `release` row, whatever the principal's count,
+when the digest closes: about a minute later than a card sent straight away. So a hand fix after
+an upgrade ended, failed or not, is carded. A late `release` row with no upgrade follows the rule
+of three, as any late row does.
+
+A `crd` row needs no upgrade, because the installer applies the CRDs before Helm starts, by a gap
+with no bound; the rule of three decides for it as for a late row.
+
+The decision is the daemon's, and by the records' own times, because Pub/Sub delivers in no order:
+on a measured upgrade the detector handled 13 of the first 20 Helm records before the Secret's
+create. The window ends at the first update of the record after its create. Helm updates a
+revision's record a second time when the next upgrade supersedes it, and that update is not the
+end: taking it would stretch the window over what the principal did between the two upgrades.
+This chart has no upgrade hooks; if it gains one, check whether Helm updates the record while the
+hook runs, because the window would then end at that update and the rows made after it would be
+carded.
+
+An upgrade is seldom one digest. The installer applies the CRDs before Helm starts, and a digest
+closes 60 seconds after its newest row, so the CRD rows and the Helm rows usually make a digest
+each, and a long upgrade can make more.
+
+Everything else is carded as before. The `DRIFT` line carries `own_release=<kind>`, on the
+start of an upgrade `release_revision=<n>` and on its end `release_revision_end=<n>`; the join tally counts `own_release=`; the inject
+counts the post under `backlog=`. The operator sets the flag from the Helm annotations on the
+PlatformAgent, so a kustomize or hand install runs without the rule.
+
+What this takes from a person who edits by hand, on the cluster the install runs in. Nothing when
+they use `kubectl` on anything but the product's CRDs. Nothing when they use another client and no
+Helm upgrade of theirs is under way: each change is carded. Three or more `kubectl` writes to the
+product's CRDs in one burst get one digest line and no card each. A change they make by another
+client while their own Helm upgrade runs goes to the digest with the upgrade's rows. And a person
+who creates a Secret with the release record's name, by a client other than `kubectl`, opens a
+window for their own changes to the install's objects until they update it, or for fifteen
+minutes; the digest then names them as the one who started the upgrade. Inside a window, real or
+made that way, the annotation test also takes any object the join can read that the person
+stamps with the release's two annotations, whatever its namespace. The user agent, a name and
+the annotations are the writer's to choose, as the user agent in the kubectl rule above is.
+Certainty that a write is the installer's needs an installer identity of its own, which the
+install does not have.
+
+The rule runs in the detector that is pulling during the upgrade, which is the release being
+replaced. The upgrade that first installs a detector with this rule is therefore still carded.
 
 ## Before changing it
 

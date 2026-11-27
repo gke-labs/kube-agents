@@ -23,6 +23,7 @@ import io
 import json
 import types
 import re
+import tempfile
 import textwrap
 import unittest
 from unittest import mock
@@ -498,6 +499,16 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         principal = cp.Principal(workload="system:serviceaccount:ns:profile", role=cp.CALLER_ROLE_PROFILE)
         task = type("Task", (), {"permits": frozenset()})()
         permitted = type("Task", (), {"permits": frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT})})()
+        # Another permit is not the confirmed one. The verifiers also accept
+        # vcs:unattended-write (docs/designs/unattended-write-permit.md), which
+        # this gate does not read; the second name is in no verifier's list.
+        # A credential with either opens the reads and none of the writes.
+        # The suite does not import the verifier, so the first name is a
+        # literal; the source "task_credential_verifier" anchors it there.
+        other_permits = {
+            name: type("Task", (), {"permits": frozenset({name})})()
+            for name in ("vcs:unattended-write", "vcs:proposal-merge")
+        }
         writes = cp.PROFILE_PERMIT_GATED_VCS_VERBS
         self.assertEqual(frozenset({"publish", "proposal-create", "proposal-update"}), writes)
         for verb in sorted(cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE]):
@@ -506,8 +517,223 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                 with_task = dataclasses.replace(principal, task=task)
                 self.assertEqual(verb in writes, cp.profile_vcs_refusal(with_task, verb) is not None)
                 self.assertIsNone(cp.profile_vcs_refusal(dataclasses.replace(principal, task=permitted), verb))
+                for name, other in other_permits.items():
+                    with_other = dataclasses.replace(principal, task=other)
+                    self.assertEqual(
+                        verb in writes, cp.profile_vcs_refusal(with_other, verb) is not None,
+                        f"a credential with only the permit {name}",
+                    )
         others = cp.vcs_broker.WRITE_VERBS - writes
         self.assertEqual(frozenset(), others & cp.ROLE_VCS_VERBS[cp.CALLER_ROLE_PROFILE])
+
+    def test_A3_the_profile_role_reaches_these_vcs_verbs_and_no_other(self) -> None:
+        # The row above holds the writes. This one holds the whole set: a read
+        # added to it (proposal-reviews, for one) is a grant to every profile
+        # of the install, and it turns this row red rather than none.
+        cp = h.credential_proxy
+        profile = cp.CALLER_ROLE_PROFILE
+        reached = frozenset(
+            {
+                "clone", "proposal-view", "proposal-list", "proposal-commits", "branch-view", "identity",
+                "issue-list", "issue-view", "publish", "proposal-create", "proposal-update",
+            }
+        )
+        self.assertEqual(reached, cp.ROLE_VCS_VERBS[profile])
+        for verb in sorted(cp.vcs_broker.VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.assertEqual(verb in reached, cp.vcs_verb_permitted(profile, verb))
+        self.assertFalse(cp.vcs_verb_permitted(profile, "Proposal-View"), "a spelling that is no verb")
+
+    def test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller(self) -> None:
+        # The route row reads ROUTE_ROLES. This one drives the handler's own
+        # authentication step, so a handler that stops asking the table, or
+        # stops binding a profile caller's task credential, is red.
+        cp = h.credential_proxy
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        def authenticated(path: str, credential: str | None = None, gate: object = None) -> tuple[object, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.authenticator = types.SimpleNamespace(authenticate=lambda headers: principal)
+            handler.headers = email.message.Message()
+            if credential is not None:
+                handler.headers[cp.TASK_CREDENTIAL_HEADER] = credential
+            handler.command, handler.path, handler.profile_gate = "POST", path, gate
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            return handler._authenticated(), replies
+
+        for path in ("/v1/exec", "/v1/vcs/clone", h.mcp_policy.MCP_RELAY_PREFIX + "developer_knowledge"):
+            with self.subTest(reached=path):
+                admitted, replies = authenticated(path)
+                self.assertIs(principal, admitted, replies)
+        for path in (
+            "/v1/forge/refresh", "/v1/github/refresh", "/v1/feedback/submit", cp.ADMISSION_PATH,
+            cp.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/projects/p/timeSeries", cp.DIAL_PATH, "/v1/chat/api",
+        ):
+            with self.subTest(refused=path):
+                admitted, replies = authenticated(path)
+                self.assertIsNone(admitted)
+                self.assertEqual(403, replies[0][0], replies)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", replies[0][1]["code"])
+        # A credential the gate refuses is refused whole, not dropped; one it
+        # binds is the principal the routes see. The same holds for a broker
+        # that verifies none.
+        bound = dataclasses.replace(principal, task=types.SimpleNamespace(report_only=False))
+
+        def refuse(caller: object, token: object) -> object:
+            raise cp.TaskCredentialRefused("the signature does not verify")
+
+        for case, gate in (
+            ("a gate that refuses", types.SimpleNamespace(admit=refuse)),
+            ("a broker with no gate", None),
+        ):
+            with self.subTest(case=case):
+                admitted, replies = authenticated("/v1/exec", credential="not-a-credential", gate=gate)
+                self.assertIsNone(admitted)
+                self.assertEqual((403, cp.RULE_TASK_CREDENTIAL), (replies[0][0], replies[0][1]["rule"]))
+        admitted, replies = authenticated(
+            "/v1/exec", credential="a-credential", gate=types.SimpleNamespace(admit=lambda caller, token: bound)
+        )
+        self.assertIs(bound, admitted, replies)
+
+    def test_A3_only_the_chat_role_reports_the_dial(self) -> None:
+        # The handler row holds that the role table refuses a profile caller on
+        # the dial route. This row names the dial. The table gives the route to
+        # the chat role alone. The route's own handler refuses each other
+        # caller, also one with no role, which the table admits on every route.
+        # A refused report stores no level: a dial that a profile task or the
+        # shell could move is no dial.
+        cp = h.credential_proxy
+        broker = cp.vcs_broker
+        chat = cp.CALLER_ROLE_CHAT
+        self.assertIn((cp.DIAL_PATH, (chat,)), cp.ROUTE_ROLES)
+
+        def principal_of(role: str) -> object:
+            return cp.Principal(workload="w", uid="u", role=role, pod="p", pod_uid="u")
+
+        def authenticated(role: str) -> tuple[object, list]:
+            principal = principal_of(role)
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.authenticator = types.SimpleNamespace(authenticate=lambda headers: principal)
+            handler.headers = email.message.Message()
+            handler.command, handler.path, handler.profile_gate = "POST", cp.DIAL_PATH, None
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            return handler._authenticated(), replies
+
+        def reported(principal: object, level: str) -> tuple[int, dict]:
+            body = json.dumps({"level": level}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile, handler.path = io.BytesIO(body), cp.DIAL_PATH
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._handle_dial_post(principal)
+            return replies[0]
+
+        for role in cp.CALLER_ROLES:
+            with self.subTest(table=role):
+                admitted, replies = authenticated(role)
+                if role == chat:
+                    self.assertIsNotNone(admitted, replies)
+                    continue
+                self.assertIsNone(admitted)
+                self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (replies[0][0], replies[0][1]["code"]), replies)
+
+        # The handler's own check, with the dial on and its stored level in a
+        # folder of this test. The chat role's report is the control.
+        with contextlib.ExitStack() as stack:
+            stored = f"{stack.enter_context(tempfile.TemporaryDirectory())}/dial-level"
+            stack.enter_context(mock.patch.dict("os.environ", {broker.DIAL_ENV: "on", broker.WRITE_MODE_ENV: ""}))
+            stack.enter_context(mock.patch.object(broker, "DIAL_STATE_FILE", stored))
+            stack.enter_context(mock.patch.object(broker, "_dial_level", None))
+            stack.enter_context(mock.patch.object(broker, "_dial_reported", False))
+            status, answer = reported(principal_of(chat), broker.DIAL_PROPOSE)
+            self.assertEqual((200, broker.DIAL_PROPOSE), (status, answer.get("level")), answer)
+            others = [role for role in cp.CALLER_ROLES if role != chat]
+            self.assertIn(cp.CALLER_ROLE_PROFILE, others)
+            callers = [(role, principal_of(role)) for role in others]
+            callers += [("a caller with no role", principal_of("")), ("no principal", None)]
+            for case, principal in callers:
+                with self.subTest(handler=case), self.assertLogs(cp.LOGGER, level="WARNING"):
+                    status, answer = reported(principal, broker.DIAL_AUTOMERGE)
+                    self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, answer.get("code")), answer)
+                    self.assertEqual(broker.DIAL_PROPOSE, broker.dial_level())
+                    with open(stored, encoding="utf-8") as level:
+                        self.assertEqual(broker.DIAL_PROPOSE, level.read().strip())
+
+    def test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body(self) -> None:
+        # The permit row calls profile_vcs_refusal. This one drives the
+        # dispatch, so a dispatch that stops asking the verb set or the permit
+        # is red. No forge is behind the handler: a refusal is the only answer
+        # these requests may get.
+        cp = h.credential_proxy
+        bare = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+        unpermitted = dataclasses.replace(bare, task=types.SimpleNamespace(task="task-1", permits=frozenset()))
+        permitted = dataclasses.replace(
+            bare, task=types.SimpleNamespace(task="task-1", permits=frozenset({cp.VCS_PROPOSAL_CREATE_PERMIT}))
+        )
+
+        def dispatch(principal: object, verb: str) -> tuple[int, dict]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.principal, handler.vcs = principal, None
+            handler.headers = email.message.Message()
+            handler.rfile = io.BytesIO(b"")
+            handler.max_request_bytes = 1 << 20
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            # The install's write mode is another refusal, ahead of the permit's.
+            with mock.patch.dict("os.environ", {cp.vcs_broker.WRITE_MODE_ENV: "", cp.vcs_broker.DIAL_ENV: ""}):
+                handler._dispatch_vcs_post(verb)
+            return replies[0]
+
+        for verb in ("branch-delete", "issue-create", "proposal-comment", "snapshot", "capabilities"):
+            with self.subTest(outside_the_set=verb):
+                status, answer = dispatch(permitted, verb)
+                self.assertEqual((403, cp.RULE_CALLER_VCS_VERB), (status, answer.get("rule")), answer)
+        for principal, verb, case in (
+            (bare, "clone", "a read with no task credential"),
+            (bare, "publish", "a write with no task credential"),
+            (unpermitted, "publish", "a write on a credential with no permit"),
+            (unpermitted, "proposal-create", "a write on a credential with no permit"),
+        ):
+            with self.subTest(case=case, verb=verb):
+                status, answer = dispatch(principal, verb)
+                self.assertEqual((403, cp.RULE_CALLER_VCS_PERMIT), (status, answer.get("rule")), answer)
+                self.assertEqual(cp.CALLER_PERMIT_REQUIRED_CODE, answer.get("code"))
+
+    def test_A3_the_import_checks_refuse_a_table_that_widens_the_profile_role(self) -> None:
+        # Both tables are checked when the broker module loads. Each case is
+        # an edit that reads as policy: most widen the profile role, and two
+        # are a typo that a table must not accept as a verb or a role. The
+        # shipped tables pass.
+        cp = h.credential_proxy
+        profile = cp.CALLER_ROLE_PROFILE
+        table = dict(cp.ROLE_VCS_VERBS)
+        gated, owned = cp.PROFILE_PERMIT_GATED_VCS_VERBS, cp.PROFILE_OWNERSHIP_GATED_VCS_VERBS
+        cp._validate_role_vcs_verbs(table, gated, owned)
+
+        def widened(verb: str) -> dict:
+            return {**table, profile: table[profile] | {verb}}
+
+        for case, verbs, permit_set, owned_set in (
+            ("a write with no permit gate", widened("issue-create"), gated, owned | {"issue-create"}),
+            ("a write with no ownership bar", widened("issue-create"), gated | {"issue-create"}, owned),
+            ("a read of a repository nobody registered", widened("snapshot"), gated, owned),
+            ("a verb the managed list does not gate", widened("capabilities"), gated, owned),
+            ("a verb that is no verb", widened("proposal-vew"), gated, owned),
+        ):
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    cp._validate_role_vcs_verbs(verbs, permit_set, owned_set)
+        with self.assertRaisesRegex(TypeError, "must be a frozenset"):
+            cp._validate_role_vcs_verbs({**table, profile: "publish"}, gated, owned)
+
+        cp._validate_route_roles(cp.ROUTE_ROLES)
+        with self.assertRaisesRegex(TypeError, "must be a tuple"):
+            cp._validate_route_roles(cp.ROUTE_ROLES + (("/v1/new/", profile),))
+        with self.assertRaisesRegex(ValueError, "is not a caller role"):
+            cp._validate_route_roles(cp.ROUTE_ROLES + (("/v1/new/", ("profil",)),))
 
     def test_A3_a_permitted_profile_update_reaches_only_the_installs_own_proposals(self) -> None:
         # #3993, #6247: the permit says a requester asked for a change, not
@@ -1096,6 +1322,140 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         # And the relay itself sends the stamp it is given and nothing of the caller's.
         self.assertEqual("shell", cp.report_writer_for(cp.CALLER_ROLE_SHELL, profile.task, "compliance-audit"))
         self.assertIsNone(cp.report_writer_for(cp.CALLER_ROLE_A2A_REPORTS, profile.task, "compliance-audit"))
+
+    def test_A3_a_run_start_record_rides_the_run_write_rule_alone(self) -> None:
+        # The run-start record (#6812, fleet-audit-report-store.md §3) is the
+        # one run name that is not a stamp, `runs/started-<run>`. The broker
+        # relays it on the GET and PUT of one run alone, under exactly a run
+        # write's caller, stream and key rules, and unstamped: it is no report.
+        # The A2A report reader neither reads nor writes it, and no other route
+        # (latest, DELETE, the index) names it.
+        cp = h.credential_proxy
+        received: list = []
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                received.append((method, path, writer))
+                return 200, b"{}", None
+
+        publish = "acme%2Fgitops"
+        stream = f"/v1/audit-reports/compliance-audit/{publish}"
+        start = f"{stream}/runs/started-task-7f3a"
+        grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+        other_grant = types.SimpleNamespace(
+            name="schedule/obtainability-audit", origin="builtin", stream="obtainability-audit"
+        )
+        shell = cp.Principal(workload="shell", uid="u", role=cp.CALLER_ROLE_SHELL)
+
+        def worker(trigger: object) -> object:
+            return cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                                task=types.SimpleNamespace(task="task-7f3a", profile="fleet-audit", trigger=trigger))
+
+        reader = cp.Principal(workload="gateway", uid="u", role=cp.CALLER_ROLE_A2A_REPORTS)
+
+        def handle(method: str, path: str, principal) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.headers = email.message.Message()
+            handler.headers["X-Report-Writer"] = "shell"
+            handler.principal = principal
+            handler.report_store = Store()
+            handler.report_profiles = frozenset({"fleet-audit"})
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._read_audit_report_body = lambda: b"{}"
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        with mock.patch.object(cp, "report_install_store_keys", return_value=(publish, frozenset({publish}))), \
+                mock.patch.object(cp, "report_publish_store_key", return_value=publish):
+            # Admitted, as a run write is: the shell, and the matching schedule's task.
+            for principal in (shell, worker(grant)):
+                for method in ("PUT", "GET"):
+                    with self.subTest(admitted=principal.role, method=method):
+                        received.clear()
+                        self.assertEqual([200], handle(method, start, principal))
+                        self.assertEqual([(method, start, None)], received)
+            # Refused by the run write's own rules, each its own.
+            received.clear()
+            for name, method, path, principal, rule in (
+                ("another schedule's stream", "PUT", f"/v1/audit-reports/obtainability-audit/{publish}/runs/started-task-7f3a",
+                 worker(grant), cp.RULE_REPORT_TRIGGER_STREAM),
+                ("another schedule's grant", "PUT", start, worker(other_grant), cp.RULE_REPORT_TRIGGER_STREAM),
+                ("no trigger", "PUT", start, worker(None), cp.RULE_REPORT_NO_TRIGGER),
+                ("another repository", "PUT", "/v1/audit-reports/compliance-audit/acme%2Fterraform/runs/started-task-7f3a",
+                 worker(grant), cp.RULE_REPORT_REPOSITORY_KEY),
+                ("the A2A reader's read", "GET", start, reader, cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+                ("the A2A reader's read by the word", "GET", "/v1/audit-reports/compliance-audit/publish/runs/started-task-7f3a",
+                 reader, cp.RULE_REPORT_A2A_REPORTS_ROUTE),
+                ("the A2A reader's write", "PUT", start, reader, cp.RULE_REPORT_A2A_REPORTS_WRITE),
+            ):
+                with self.subTest(refused=name):
+                    self.assertEqual([(403, rule)], handle(method, path, principal))
+            # No other route names it.
+            for method, path in (("DELETE", start), ("GET", f"{start}/latest"), ("PUT", f"{stream}/started-task-7f3a"),
+                                 ("GET", f"{stream}/runs/started-Task-7f3a"), ("PUT", f"{stream}/runs/started-")):
+                with self.subTest(no_route=(method, path)):
+                    self.assertEqual([(404, None)], handle(method, path, shell))
+            self.assertEqual([], received)
+        self.assertEqual(cp.REPORT_ROUTE_RUN_START, cp.report_route_kind(start))
+        self.assertNotIn(cp.REPORT_ROUTE_RUN_START, cp.REPORT_A2A_READ_ROUTES)
+
+    def test_A3_a_profile_task_writes_only_its_own_run_start_record(self) -> None:
+        # A run-start record (#6812) names its run, and readers trust the
+        # newest record to say whether the stream's last run finished. So a
+        # profile task writes only the record named for its own task id, the
+        # verified credential's `task` claim: never another run's, which it
+        # could overwrite, mark done, or crowd out of the stream's few. The
+        # shell is unbound: it writes the ring itself.
+        cp = h.credential_proxy
+        received: list = []
+
+        class Store:
+            def relay(self, method, path, body, writer=None):
+                received.append((method, path))
+                return 200, b"{}", None
+
+        publish = "acme%2Fgitops"
+        stream = f"/v1/audit-reports/compliance-audit/{publish}"
+        grant = types.SimpleNamespace(name="schedule/compliance-audit", origin="builtin", stream="compliance-audit")
+        worker = cp.Principal(workload="worker", uid="u", role=cp.CALLER_ROLE_PROFILE,
+                              task=types.SimpleNamespace(task="task-7f3a", profile="fleet-audit", trigger=grant))
+        shell = cp.Principal(workload="shell", uid="u", role=cp.CALLER_ROLE_SHELL)
+
+        def handle(method: str, path: str, principal) -> list:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.command, handler.path = method, path
+            handler.headers = email.message.Message()
+            handler.principal = principal
+            handler.report_store = Store()
+            handler.report_profiles = frozenset({"fleet-audit"})
+            replies: list = []
+            handler._json = lambda status, body: replies.append(int(status))
+            handler._refuse_audit_report = lambda status, body: replies.append((int(status), body.get("rule")))
+            handler._read_audit_report_body = lambda: b"{}"
+            handler._write_audit_report_answer = lambda status, payload, writer=None: replies.append(int(status))
+            handler._handle_audit_reports()
+            return replies
+
+        with mock.patch.object(cp, "report_install_store_keys", return_value=(publish, frozenset({publish}))):
+            self.assertEqual([200], handle("PUT", f"{stream}/runs/started-task-7f3a", worker))
+            for other in ("task-7f3b", "task-7f3a0", "task-7f3", "local-0a1b2c3d4e5f", "cron-0123456789abcdef"):
+                with self.subTest(refused=other):
+                    path = f"{stream}/runs/started-{other}"
+                    received.clear()
+                    self.assertEqual([(403, cp.RULE_REPORT_RUN_START_TASK)], handle("PUT", path, worker))
+                    self.assertEqual([], received)
+                    # A read is a read, and the shell writes any run's record.
+                    self.assertEqual([200], handle("GET", path, worker))
+                    self.assertEqual([200], handle("PUT", path, shell))
+            # A ring entry is not bound to the task id: its stamp names the task already.
+            self.assertEqual([200], handle("PUT", f"{stream}/runs/20261201T000000.000000Z", worker))
+        self.assertEqual(
+            cp.RULE_REPORT_RUN_START_TASK, cp.report_run_start_permitted(cp.CALLER_ROLE_PROFILE, None, "started-task-7f3a")
+        )
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches

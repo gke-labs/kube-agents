@@ -1,7 +1,7 @@
 """Inbound chat messages, new sessions and failed turns by platform, the board's
 cards that gave up, the proposals ledger by origin, read from Session KV, and
-the profiles' on-demand skill loads by skill (skill_invocations.py), in the
-Prometheus text exposition.
+the profiles' on-demand skill loads by skill (skill_invocations.py) and cron
+runs by job (cron_runs.py), in the Prometheus text exposition.
 
 Hand-rolled, like the credential broker's registry: prometheus_client is not in
 the agent image, and four small counters do not justify a dependency
@@ -35,6 +35,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import quote
 
+from chat_metrics.cron_runs import (
+    CRON_RUNS_HELP,
+    CRON_RUNS_METRIC,
+    CRON_SKIPS_HELP,
+    CRON_SKIPS_METRIC,
+    JOB_LABEL,
+    OUTCOME_LABEL,
+    REASON_LABEL,
+    CronRunsCounter,
+)
 from chat_metrics.skill_invocations import (
     SKILL_INVOCATIONS_HELP,
     SKILL_INVOCATIONS_METRIC,
@@ -101,6 +111,10 @@ ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "is
 PROPOSALS_COUNTS_URL = "http://127.0.0.1:8699/v1/proposals/opened/counts"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 PROPOSALS_READ_TIMEOUT_SECONDS = 2
+# Session KV is on the pod's loopback: a proxy from the environment must not
+# get the read and its bearer token, and urllib does not leave out a loopback
+# host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # Beside the counts, rendered only with them: seconds since the last
 # successful ledger read, on a monotonic clock. 0 right after a good read; it
 # grows while failed reads keep serving the last counts, so a scraper can tell
@@ -317,7 +331,7 @@ class ProposalsOpenedGauge:
         if not key:
             raise ProposalsReadError(f"{SESSION_KV_KEY_ENV} is not set")
         request = urllib.request.Request(self._url, headers={"Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(request, timeout=PROPOSALS_READ_TIMEOUT_SECONDS) as response:  # nosec B310 -- a fixed loopback http URL
+        with _SESSION_KV_OPENER.open(request, timeout=PROPOSALS_READ_TIMEOUT_SECONDS) as response:
             if response.status != HTTPStatus.OK:
                 raise ProposalsReadError(f"status {response.status}")
             answer = json.loads(response.read())
@@ -387,9 +401,9 @@ def stuck_lock_wait_seconds() -> float:
 
 class ChatMetrics:
     """Four counters, by platform: inbound messages, new sessions, errored turns
-    and thumbs-downs; the board's gave_up cards, the proposals ledger and the
-    profiles' skill loads, read at scrape time; and the dispatcher's failed-tick
-    streak, by board."""
+    and thumbs-downs; the board's gave_up cards, the proposals ledger, the
+    profiles' skill loads and their cron runs, read at scrape time; and the
+    dispatcher's failed-tick streak, by board."""
 
     def __init__(
         self,
@@ -397,10 +411,12 @@ class ChatMetrics:
         proposals: Optional[ProposalsOpenedGauge] = None,
         clock: Callable[[], float] = time.monotonic,
         skills: Optional[SkillInvocationsCounter] = None,
+        cron: Optional[CronRunsCounter] = None,
     ) -> None:
         self._kanban = kanban or KanbanGaveUpCounter()
         self._proposals = proposals or ProposalsOpenedGauge()
         self._skills = skills or SkillInvocationsCounter()
+        self._cron = cron or CronRunsCounter()
         self._clock = clock
         self._lock_wait_seconds = stuck_lock_wait_seconds()
         self._lock = threading.Lock()
@@ -423,9 +439,10 @@ class ChatMetrics:
         self._dispatch_in_quarantine: set[str] = set()
 
     def prime(self) -> None:
-        """Take the board's and the audit files' baselines now rather than at the first scrape."""
+        """Take the board's, the audit files' and the cron ledgers' baselines now rather than at the first scrape."""
         self._kanban.count()
         self._skills.counts()
+        self._cron.counts()
 
     def record_inbound(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
@@ -630,6 +647,19 @@ class ChatMetrics:
         ]
         for skill, count in sorted(self._skills.counts().items()):
             lines.append(f'{SKILL_INVOCATIONS_METRIC}{{{SKILL_LABEL}="{_label_value(skill)}"}} {count}')
+        cron_runs, cron_skips = self._cron.counts()
+        lines += [
+            f"# HELP {CRON_RUNS_METRIC} {CRON_RUNS_HELP}",
+            f"# TYPE {CRON_RUNS_METRIC} counter",
+        ]
+        for (job, outcome), count in sorted(cron_runs.items()):
+            lines.append(f'{CRON_RUNS_METRIC}{{{JOB_LABEL}="{_label_value(job)}",{OUTCOME_LABEL}="{_label_value(outcome)}"}} {count}')
+        lines += [
+            f"# HELP {CRON_SKIPS_METRIC} {CRON_SKIPS_HELP}",
+            f"# TYPE {CRON_SKIPS_METRIC} counter",
+        ]
+        for (job, reason), count in sorted(cron_skips.items()):
+            lines.append(f'{CRON_SKIPS_METRIC}{{{JOB_LABEL}="{_label_value(job)}",{REASON_LABEL}="{_label_value(reason)}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",

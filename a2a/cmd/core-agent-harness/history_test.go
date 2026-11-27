@@ -9,6 +9,8 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -53,12 +55,18 @@ func (m *echoModel) GenerateContent(_ context.Context, req *llm.Request, _ bool)
 func withModel(t *testing.T, m llm.LLM) {
 	t.Helper()
 	prev := newModel
-	newModel = func(context.Context, string) (adkmodel.LLM, error) { return models.Adapt(m), nil }
+	newModel = func(context.Context, string, bool) (adkmodel.LLM, error) { return models.Adapt(m), nil }
 	t.Cleanup(func() { newModel = prev })
 }
 
 // runTurn runs one harness process's turn in dir and returns its lines.
 func runTurn(t *testing.T, dir string, env coreagentwire.Envelope) []coreagentwire.Event {
+	t.Helper()
+	return runTurnWith(t, dir, env)
+}
+
+// runTurnWith is runTurn with extra harness flags.
+func runTurnWith(t *testing.T, dir string, env coreagentwire.Envelope, flags ...string) []coreagentwire.Event {
 	t.Helper()
 	in, err := json.Marshal(env)
 	if err != nil {
@@ -70,7 +78,7 @@ func runTurn(t *testing.T, dir string, env coreagentwire.Envelope) []coreagentwi
 	}
 	defer os.Chdir(wd)
 	var out, errOut bytes.Buffer
-	if code := run(context.Background(), []string{"--model", "gemini-2.5-flash"}, bytes.NewReader(in), &out, &errOut); code != 0 {
+	if code := run(context.Background(), append([]string{"--model", "gemini-2.5-flash"}, flags...), bytes.NewReader(in), &out, &errOut); code != 0 {
 		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
 	}
 	var evs []coreagentwire.Event
@@ -180,5 +188,176 @@ func TestTheHarnessStartsWithStdinStillOpen(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("the harness waited for stdin to close before running the turn")
+	}
+}
+
+// callModel calls one tool, then answers.
+type callModel struct {
+	mu    sync.Mutex
+	call  *genai.FunctionCall
+	calls int
+}
+
+func (m *callModel) Name() string { return "gemini-2.5-flash" }
+
+func (m *callModel) GenerateContent(_ context.Context, _ *llm.Request, _ bool) iter.Seq2[*llm.Response, error] {
+	m.mu.Lock()
+	m.calls++
+	first := m.calls == 1
+	m.mu.Unlock()
+	return func(yield func(*llm.Response, error) bool) {
+		if first {
+			yield(&llm.Response{Content: &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{{FunctionCall: m.call}}}, TurnComplete: true}, nil)
+			return
+		}
+		yield(&llm.Response{Content: genai.NewContentFromText("done", genai.RoleModel), TurnComplete: true}, nil)
+	}
+}
+
+// TestARefusedCallReachesTheHarnesssStderr: end to end through the
+// harness's own turn, a shell command the gate refuses writes one
+// "tool refused:" line to the process's stderr, without the command.
+func TestARefusedCallReachesTheHarnesssStderr(t *testing.T) {
+	withModel(t, &callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": "gcloud secrets-xyz list"}}})
+	in, err := json.Marshal(coreagentwire.Envelope{Message: "go", Policy: coreagentwire.Policy{
+		Tools: []string{"bash"}, Allow: []string{"bash:kubectl", "bash:kubectl *"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"--model", "gemini-2.5-flash"}, bytes.NewReader(in), &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
+	}
+	var lines []string
+	for _, l := range strings.Split(errOut.String(), "\n") {
+		if strings.HasPrefix(l, RefusalLogPrefix) {
+			lines = append(lines, l)
+		}
+	}
+	// The line names the call by the id the turn's tool_call event carries.
+	var callID string
+	for _, l := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev coreagentwire.Event
+		if json.Unmarshal([]byte(l), &ev) == nil && ev.Type == coreagentwire.TypeToolCall {
+			callID = ev.ID
+		}
+	}
+	if callID == "" {
+		t.Fatalf("no tool_call event: %s", out.String())
+	}
+	if want := `tool refused: "bash" (no allow rule matches) call ` + strconv.Quote(callID); len(lines) != 1 || lines[0] != want {
+		t.Errorf("stderr refusal lines %q, want [%q]: %s", lines, want, errOut.String())
+	}
+	if strings.Contains(errOut.String(), "secrets-xyz") {
+		t.Errorf("stderr carries the command: %s", errOut.String())
+	}
+}
+
+// replyModel calls one tool, then records the tool's response it is sent.
+type replyModel struct {
+	callModel
+	responses []map[string]any
+	// offered are the function declarations of the first request.
+	offered []string
+}
+
+func (m *replyModel) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
+	m.mu.Lock()
+	if m.offered == nil && req.Config != nil {
+		m.offered = []string{}
+		for _, tl := range req.Config.Tools {
+			for _, fd := range tl.FunctionDeclarations {
+				m.offered = append(m.offered, fd.Name)
+			}
+		}
+	}
+	for _, c := range req.Contents {
+		for _, p := range c.Parts {
+			if p.FunctionResponse != nil {
+				m.responses = append(m.responses, p.FunctionResponse.Response)
+			}
+		}
+	}
+	m.mu.Unlock()
+	return m.callModel.GenerateContent(ctx, req, stream)
+}
+
+// TestARefusedShellCommandTellsTheModelWhatToDo: through the harness's own
+// turn, the tool result the model reads for a refused shell command says
+// why and what to do instead: for a granted command in a pipe, that the
+// shell runs one plain command and to shape output with the command's own
+// flags; for a command the grant doesn't name, which commands may run.
+func TestARefusedShellCommandTellsTheModelWhatToDo(t *testing.T) {
+	for _, c := range []struct {
+		name, command, want string
+	}{
+		{"a granted command in a pipe", "kubectl get pods -A | grep -v Running", "one plain command at a time"},
+		{"a granted command with a redirect", "kubectl get pods 2>&1", "-o jsonpath"},
+		{"a command not granted", "gcloud info", "Only these commands may run here, each as one plain command: kubectl"},
+		{"a pipe against the prefix", "kubectl|grep Running", "one plain command at a time"},
+		{"a chain against the prefix", "kubectl;id", "one plain command at a time"},
+		{"an environment prefix", "FOO=1 kubectl get pods", "environment prefixes"},
+		{"a command not granted, in a pipe", "gcloud info | jq .", "Only these commands may run here"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": c.command}}}}
+			withModel(t, m)
+			runTurn(t, t.TempDir(), coreagentwire.Envelope{Message: "go", Policy: coreagentwire.Policy{
+				Tools: []string{"bash"}, Allow: []string{"bash:kubectl", "bash:kubectl *"},
+			}})
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if len(m.responses) != 1 {
+				t.Fatalf("the model was sent %d tool responses, want 1: %v", len(m.responses), m.responses)
+			}
+			got, _ := m.responses[0]["error"].(string)
+			if !strings.Contains(got, c.want) || !strings.Contains(got, "requires an allowlist entry") {
+				t.Errorf("the model read %q, want the gate's refusal and %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestAPersonaTurnRunsACompoundCommand: through the harness's own turn, a
+// persona's shell runs a compound command, where a prefix grant refuses it.
+func TestAPersonaTurnRunsACompoundCommand(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		policy coreagentwire.Policy
+		want   string
+	}{
+		{"persona shell", coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:*"}, AnyShellCommand: true}, "stdout"},
+		{"prefix grant", coreagentwire.Policy{Tools: []string{"bash"}, Allow: []string{"bash:echo", "bash:echo *"}}, "error"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := &replyModel{callModel: callModel{call: &genai.FunctionCall{Name: "bash", Args: map[string]any{"command": "echo a | tr a b && echo $((1+1))"}}}}
+			withModel(t, m)
+			runTurn(t, t.TempDir(), coreagentwire.Envelope{Message: "go", Policy: c.policy})
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if len(m.responses) != 1 {
+				t.Fatalf("responses %v", m.responses)
+			}
+			if _, ok := m.responses[0][c.want]; !ok {
+				t.Errorf("the model read %v, want a %s", m.responses[0], c.want)
+			}
+			// The mode changes only the gate's decisions: the model is
+			// offered the policy's tools and nothing the mode could add
+			// (spawn, background agents, other built-ins).
+			slices.Sort(m.offered)
+			if !slices.Equal(m.offered, []string{"bash"}) {
+				t.Errorf("the model was offered %q, want only bash", m.offered)
+			}
+			if c.want == "stdout" && m.responses[0]["stdout"] != "b\n2\n" {
+				t.Errorf("stdout %q, want the compound's output", m.responses[0]["stdout"])
+			}
+		})
 	}
 }
