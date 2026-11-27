@@ -96,6 +96,11 @@ API_KEY_ENV = "SESSION_KV_API_KEY"
 #: failure. session_kv_server sizes its posts budget at half of this.
 RELAY_TIMEOUT_SECONDS = 360.0
 
+#: Session KV is on the pod's loopback address: a proxy from the environment
+#: must not get the report and its bearer token, and urllib does not leave
+#: out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 #: Markdown a model wraps around a bare token: emphasis, code spans, and the
 #: whitespace either side. Stripped from both ends of a report before it is
 #: tested for silence — see :func:`is_silent_report`.
@@ -421,7 +426,7 @@ def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], dict]:
     """
     try:
         # Building the Request is inside the try: a malformed CRON_REPORT_RELAY_URL
-        # raises here, not at urlopen, and that is a delivery failure like any
+        # raises here, not at the open, and that is a delivery failure like any
         # other rather than an exception for the scheduler to catch.
         request = urllib.request.Request(
             url,
@@ -432,7 +437,7 @@ def _post(url: str, payload: dict, api_key: str) -> Tuple[Optional[str], dict]:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT_SECONDS) as response:
+        with _SESSION_KV_OPENER.open(request, timeout=RELAY_TIMEOUT_SECONDS) as response:
             status = getattr(response, "status", None) or response.getcode()
             if status >= 300:
                 return f"chat relay answered HTTP {status}", {}

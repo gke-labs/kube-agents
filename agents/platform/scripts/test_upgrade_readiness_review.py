@@ -582,7 +582,7 @@ class Registration(unittest.TestCase):
         def refuse(req, timeout):
             raise urllib.error.HTTPError(req.full_url, 503, "Service Unavailable", {}, CutShort())
 
-        with mock.patch.object(review.urllib.request, "urlopen", refuse):
+        with mock.patch.object(review.urllib.request.OpenerDirector, "open", side_effect=refuse):
             with self.assertRaises(OSError) as caught:
                 review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
         self.assertEqual(str(caught.exception), "HTTP 503 Service Unavailable")
@@ -592,7 +592,7 @@ class Registration(unittest.TestCase):
         def bad_request(req, timeout):
             raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, CutShort())
 
-        with mock.patch.object(review.urllib.request, "urlopen", bad_request):
+        with mock.patch.object(review.urllib.request.OpenerDirector, "open", side_effect=bad_request):
             with self.assertRaises(OSError) as caught:
                 review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
         self.assertNotIsInstance(caught.exception, review.QueueBusy)
@@ -607,7 +607,7 @@ class Registration(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        with mock.patch.object(review.urllib.request, "urlopen", lambda req, timeout: Answer(b"[]")):
+        with mock.patch.object(review.urllib.request.OpenerDirector, "open", side_effect=lambda req, timeout: Answer(b"[]")):
             with self.assertRaises(OSError) as caught:
                 review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
         self.assertIn("not an object", str(caught.exception))
@@ -661,7 +661,7 @@ class Registration(unittest.TestCase):
         def cut_short(req, timeout):
             raise http.client.IncompleteRead(b"{")
 
-        with mock.patch.object(review.urllib.request, "urlopen", cut_short):
+        with mock.patch.object(review.urllib.request.OpenerDirector, "open", side_effect=cut_short):
             with self.assertRaises(OSError) as caught:
                 review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
         self.assertIn("IncompleteRead", str(caught.exception))
@@ -685,7 +685,7 @@ class Registration(unittest.TestCase):
         def refuse(req, timeout):
             raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"error": "findings[0]: object is required"}'))
 
-        with mock.patch.object(review.urllib.request, "urlopen", refuse):
+        with mock.patch.object(review.urllib.request.OpenerDirector, "open", side_effect=refuse):
             with self.assertRaises(OSError) as caught:
                 review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
         self.assertIn("400", str(caught.exception))

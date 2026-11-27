@@ -512,7 +512,8 @@ normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positi
 # matches the binary's own default, because the value is the kind of thing an
 # operator tunes per install — a cluster with slow-starting workloads wants it
 # higher — and threading it through an env var means doing so does not require
-# rebuilding the image. Set to 1 to restore firing on the first event.
+# rebuilding the image. Set to 1, with WATCHER_SETTLE at 0, to restore firing
+# on the first event: the settle gate below runs after this count.
 readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
 WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
 normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}" positive

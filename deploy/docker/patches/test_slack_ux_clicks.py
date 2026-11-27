@@ -475,6 +475,55 @@ class BoardActionTest(unittest.TestCase):
                                    ("kage_board.delete", False), ("kage.choice.0", False)):
             with self.subTest(action_id=action_id):
                 self.assertEqual(bool(runtime.BOARD_ACTION_ID_PATTERN.match(action_id)), matched)
+class BoardRequestProxyTest(unittest.TestCase):
+    """Session KV is on the pod's loopback address. With a proxy variable and no NO_PROXY
+    entry for it, urllib hands the request to the proxy."""
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        import http.server
+        import socket
+        import threading
+        import urllib.request
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - the stdlib's name
+                sent = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                seen.append((self.path, self.headers.get("Authorization"), sent))
+                answer = json.dumps({"results": [{"id": "t_1", "outcome": "done"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.object(runtime, "SESSION_KV_URL", url), \
+                mock.patch.dict(os.environ, {runtime.SESSION_KV_KEY_ENV: "k", "http_proxy": proxy, "HTTP_PROXY": proxy}), \
+                mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            results = runtime._board_request("retry", ["t_1"], "U1")
+        self.assertEqual(results, [{"id": "t_1", "outcome": "done"}])
+        self.assertEqual(
+            seen,
+            [(runtime.BOARD_ACTIONS_PATH, "Bearer k", {"action": "retry", "tasks": ["t_1"], "by": "U1"})],
+        )
+
+
 class ActionIdTest(unittest.TestCase):
     def test_choice_pattern_matches_the_presenters_choice_buttons_only(self):
         ids = [

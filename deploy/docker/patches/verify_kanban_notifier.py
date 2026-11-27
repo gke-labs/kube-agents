@@ -837,7 +837,7 @@ check(
 # reads the row back, and nothing in the delivery notices it is missing, so
 # every failure here presents as a user replying "apply" — with or without an
 # option letter — and getting an agent that has never seen the report they are
-# answering. Drive it with urlopen stubbed: there is
+# answering. Drive it with the opener's `open` stubbed: there is
 # no session-KV server inside the build, and what is being verified is the
 # request this code makes, not the server's answer to it.
 print("incident row:")
@@ -1006,11 +1006,14 @@ class _UnreadableResult:
 # logs a warning, the delivery survives) and it is exactly the shape the check
 # below is meant to catch, so the value has to be supplied here or the check
 # only ever measures the build sandbox.
-_real_urlopen = _urllib_request.urlopen
+#
+# `_post_incident` posts through its own opener, so the stand-ins replace
+# `OpenerDirector.open`. `staticmethod` keeps the opener out of their arguments.
+_real_open = _urllib_request.OpenerDirector.open
 _real_key = os.environ.get("SESSION_KV_API_KEY")
 try:
     os.environ["SESSION_KV_API_KEY"] = "verify-token"
-    _urllib_request.urlopen = _capture
+    _urllib_request.OpenerDirector.open = staticmethod(_capture)
     _stored = store_incident_report(Event("completed"), _Reported(), SUB_THREADED)
     check("a completed triage report is posted", _stored is True)
     check(
@@ -1083,7 +1086,7 @@ try:
         and not _posted,
     )
 
-    _urllib_request.urlopen = _raise
+    _urllib_request.OpenerDirector.open = staticmethod(_raise)
     check(
         "a session-KV server that is down does not break the delivery",
         store_incident_report(Event("completed"), _Reported(), SUB_THREADED) is False,
@@ -1091,7 +1094,7 @@ try:
         "user has already read",
     )
 finally:
-    _urllib_request.urlopen = _real_urlopen
+    _urllib_request.OpenerDirector.open = _real_open
     if _real_key is None:
         os.environ.pop("SESSION_KV_API_KEY", None)
     else:

@@ -145,7 +145,7 @@ opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/262
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY`, `A2A_ACTIVITY_SECRET` and `SESSION_KV_API_KEY` (without the last,
-every chat turn ends saying a card's answer cannot be posted back). The one thing the operator adds is the
+every chat answer carries a note that background work's result won't be posted back). The one thing the operator adds is the
 bus CA: `NATS_CA_FILE` and the bundle mount at `/etc/a2a-nats-ca`, overriding any value of the entry's own,
 since the bus requires TLS and a bridge that cannot verify it never connects. The operator reads `BRIDGE_CONCURRENCY`
 back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
@@ -423,8 +423,8 @@ user and disable personal memory in group conversations) in the pod's session-kv
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
-turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A refused connection is retried every second for up to two minutes, the window the
+turn runs either way, and when it fails the answer carries a note that the result of work still
+running won't be posted back on its own. A refused connection is retried every second for up to two minutes, the window the
 turn's own call to the API server uses, since session-kv runs in the agent container and is not listening yet when the bridge takes a task
 queued while the pod rolled, or one taken while that container restarts; the session's origin
 record (`PUT /v1/sessions/{id}/origin`, [`proposal-origin.md`](../../docs/designs/proposal-origin.md)

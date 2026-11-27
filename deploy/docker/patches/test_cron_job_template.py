@@ -7,12 +7,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
 import threading
 import types
 import unittest
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Self
@@ -198,6 +200,24 @@ class RunOriginTest(unittest.TestCase):
             self.assertEqual(cron_job_template.run_origin(job), ("other", ""))
             self.assertFalse(self._record_as("a1b2c3", ("chat", "slack")))
 
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        # Session KV is on the pod's loopback address. With a proxy variable and no
+        # NO_PROXY entry for it, urllib hands the request and its bearer token to the proxy.
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}), \
+                mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            self.assertTrue(self._record_as("a1b2c3", ("chat", "slack")))
+            self.kv.records["d4e5f6"] = {"origin": "api", "platform": ""}
+            self.assertEqual(cron_job_template.recorded_origin("d4e5f6"), ("api", ""))
+        self.assertEqual(self.kv.records["a1b2c3"], {"origin": "chat", "platform": "slack"})
+        self.assertEqual(self.kv.unauthorised, 0)
 
     def test_a_job_a_kanban_worker_creates_records_its_cards_origin(self):
         # A chat ask routed through a card: the worker's turn has no session

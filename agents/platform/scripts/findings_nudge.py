@@ -84,6 +84,10 @@ JOB_ID = nudge_card.JOB_ID
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
 TIMEOUT_SECONDS = 30
+# The Session KV server is on the pod's loopback: a proxy from the environment
+# must not get the request and its bearer token, and urllib does not leave out
+# a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 PUBLISHER = "nudge"
 BACKLOG_PUBLICATION_PATH = "/v1/findings/publication/backlog"
@@ -340,7 +344,7 @@ def _request(endpoint: str, path: str, body: dict | None = None, method: str = "
     req = urllib.request.Request(
         f"{endpoint}{path}", data=data, headers=headers, method=method or ("POST" if data else "GET")
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+    with _SESSION_KV_OPENER.open(req, timeout=TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
