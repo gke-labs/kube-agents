@@ -5828,10 +5828,22 @@
       }
 
       function renderScopeRosterHtml(scopeData) {
-        const projects = Array.isArray(scopeData && scopeData.projects)
+        if (!scopeData) {
+          return `<div class="roster-card">
+            <div class="roster-card-head">
+              <span class="roster-handle">Fleet scope</span>
+              ${scopeOutcomeBadgeHtml("loading")}
+            </div>
+            <div class="roster-status">Loading fleet scope and cluster connectivity…</div>
+          </div>`;
+        }
+        const projects = Array.isArray(scopeData.projects)
           ? scopeData.projects
           : [];
-        if (projects.length === 0) {
+        const failedContainers = (
+          Array.isArray(scopeData.containers) ? scopeData.containers : []
+        ).filter((c) => c && c.id && String(c.outcome || "").toLowerCase() !== "ok");
+        if (projects.length === 0 && failedContainers.length === 0) {
           const fallbackCluster =
             lastInsights && lastInsights.cluster && lastInsights.cluster.name
               ? lastInsights.cluster
@@ -5842,16 +5854,20 @@
           const loc = [fallbackCluster.location, fallbackCluster.project]
             .filter(Boolean)
             .join(" · ");
+          const fallbackOutcome =
+            scopeData.event_watcher && scopeData.event_watcher.healthy
+              ? "ok"
+              : "unknown";
           return `<div class="roster-card">
             <div class="roster-card-head">
               <span class="roster-handle">${escapeHtml(fallbackCluster.name)}</span>
-              ${scopeOutcomeBadgeHtml("ok")}
+              ${scopeOutcomeBadgeHtml(fallbackOutcome)}
             </div>
             <div class="roster-role">${escapeHtml(loc || "Install cluster")}</div>
             <div class="roster-status">Discovery: install-cluster</div>
           </div>`;
         }
-        return projects
+        const projectCardsHtml = projects
           .map((p) => {
             const projID = p.id || "unknown";
             const projVia =
@@ -5905,6 +5921,23 @@
             </div>`;
           })
           .join("");
+        const containerCardsHtml = failedContainers
+          .map((c) => {
+            const memberCount = typeof c.projects === "number" ? c.projects : 0;
+            const rem = c.remediation
+              ? `<div class="roster-status" style="margin-top:6px;color:var(--warn-fg, #b45309);">Onboarding hint: ${escapeHtml(c.remediation)}</div>`
+              : "";
+            return `<div class="roster-card">
+              <div class="roster-card-head">
+                <span class="roster-handle">Container: ${escapeHtml(c.id)}</span>
+                ${scopeOutcomeBadgeHtml(c.outcome)}
+              </div>
+              <div class="roster-role">Scope container · ${memberCount} ${memberCount === 1 ? "project" : "projects"} resolved</div>
+              ${rem}
+            </div>`;
+          })
+          .join("");
+        return projectCardsHtml + containerCardsHtml;
       }
 
       function renderScopeSection() {
@@ -5954,16 +5987,16 @@
           : ew.detail ||
             "Kubernetes Event Watcher streams Warning events into # alerts as they occur.";
         const alertsLeadText = !hasWatcher
-          ? "Checking Kubernetes Event Watcher status. Scheduled daily fleet audits post anomaly reports here automatically."
+          ? "Checking Kubernetes Event Watcher status. Scheduled daily fleet audits run on their UTC schedule below."
           : isWatching
-            ? "Proactive fleet monitoring is active. New Kubernetes warning incidents and anomaly reports appear here automatically."
+            ? "Proactive fleet monitoring is active. New Kubernetes warning incidents appear here automatically, and scheduled daily fleet audits run on their UTC schedule below."
             : !ew.enabled
-              ? "Kubernetes Event Watcher is disabled for this install, so live warning events are not streamed here. Scheduled daily fleet audits still post anomaly reports automatically."
+              ? "Kubernetes Event Watcher is disabled for this install, so live warning incidents are not streamed here. Scheduled daily fleet audits still run on their UTC schedule below."
               : isStarting
-                ? "Kubernetes Event Watcher is starting up and assembling its cluster watch set. Scheduled daily fleet audits still post anomaly reports automatically."
+                ? "Kubernetes Event Watcher is starting up and assembling its cluster watch set. Scheduled daily fleet audits still run on their UTC schedule below."
                 : isDegraded
-                  ? "Kubernetes Event Watcher is degraded and watching no clusters right now. Scheduled daily fleet audits still post anomaly reports automatically."
-                  : "Kubernetes Event Watcher is unreachable, so live warning incidents may not appear until it recovers. Scheduled daily fleet audits still post anomaly reports automatically.";
+                  ? "Kubernetes Event Watcher is degraded and watching no clusters right now. Scheduled daily fleet audits still run on their UTC schedule below."
+                  : "Kubernetes Event Watcher is unreachable, so live warning incidents may not appear until it recovers. Scheduled daily fleet audits still run on their UTC schedule below.";
         const nextName = sch.next_audit_name || "Daily fleet audit";
         const nextAt = sch.next_audit_at || "";
         const windowUtc = sch.window_utc || "";

@@ -1768,7 +1768,10 @@ AGENT_API_METRIC_PROJECT_LABEL = "project"
 AGENT_API_METRIC_LOCATION_LABEL = "location"
 AGENT_API_METRIC_PROFILE_LABEL = "profile"
 AGENT_API_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
+AGENT_API_IDENTITY_CACHE_MAX_ENTRIES = 1024
 _PROMETHEUS_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+_PROFILE_IDENTITY_CACHE_LOCK = threading.Lock()
+_PROFILE_IDENTITY_CACHE: dict[tuple[str, int, int], dict[str, str] | None] = {}
 
 
 def probe_gce_universe_domain_answer(
@@ -7856,11 +7859,17 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
 
         profile_identities = cls._read_profile_identities(root)
         event_watcher = cls._read_event_watcher_status()
+        raw_max_projects = snapshot.get("maxProjects")
+        max_projects = (
+            raw_max_projects
+            if isinstance(raw_max_projects, int) and not isinstance(raw_max_projects, bool)
+            else 0
+        )
         return {
             "resolved_at": snapshot.get("resolvedAt", "") if isinstance(snapshot.get("resolvedAt"), str) else "",
             "present": bool(snapshot.get("present")),
             "boundary": bool(snapshot.get("boundary")),
-            "max_projects": snapshot.get("maxProjects") if isinstance(snapshot.get("maxProjects"), int) else 0,
+            "max_projects": max_projects,
             "resolver": snapshot.get("resolver", "") if isinstance(snapshot.get("resolver"), str) else "",
             "projects": snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else [],
             "containers": snapshot.get("containers") if isinstance(snapshot.get("containers"), list) else [],
@@ -7873,30 +7882,39 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     @classmethod
     def _read_profile_identities(cls, root: Path) -> list[dict[str, Any]]:
         profiles_dir = root / AGENT_API_PROFILES_DIR
-        if not profiles_dir.is_dir():
+        try:
+            if not profiles_dir.is_dir():
+                return []
+            dir_entries = sorted(profiles_dir.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            LOGGER.debug("could not list %s: %s", profiles_dir, exc)
             return []
         try:
             import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
         except ImportError:
             yaml = None
         entries: list[dict[str, Any]] = []
-        for entry in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
-            if (
-                not entry.is_dir()
-                or entry.name.startswith(".")
-                or entry.name in AGENT_API_RESERVED_PROFILES
-            ):
+        for entry in dir_entries:
+            try:
+                if (
+                    not entry.is_dir()
+                    or entry.name.startswith(".")
+                    or entry.name in AGENT_API_RESERVED_PROFILES
+                ):
+                    continue
+                config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
+                if not config_path.is_file():
+                    continue
+                identity = cls._parse_cluster_identity(config_path, yaml)
+                if not identity:
+                    continue
+                is_ready = (
+                    (entry / AGENT_API_PROFILE_SCAFFOLD_FILE).is_file()
+                    and (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file()
+                )
+            except OSError as exc:
+                LOGGER.debug("could not inspect profile %s: %s", entry, exc)
                 continue
-            config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
-            if not config_path.is_file():
-                continue
-            identity = cls._parse_cluster_identity(config_path, yaml)
-            if not identity:
-                continue
-            is_ready = (
-                (entry / AGENT_API_PROFILE_SCAFFOLD_FILE).is_file()
-                and (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file()
-            )
             entries.append(
                 {
                     "profile": entry.name,
@@ -7910,28 +7928,44 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
 
     @staticmethod
     def _parse_cluster_identity(config_path: Path, yaml_mod: Any) -> dict[str, str] | None:
+        if yaml_mod is None:
+            return None
+        try:
+            stat_res = config_path.stat()
+        except OSError:
+            return None
+        cache_key = (str(config_path), stat_res.st_mtime_ns, stat_res.st_size)
+        with _PROFILE_IDENTITY_CACHE_LOCK:
+            if cache_key in _PROFILE_IDENTITY_CACHE:
+                cached = _PROFILE_IDENTITY_CACHE[cache_key]
+                return dict(cached) if cached is not None else None
         try:
             text = config_path.read_text(encoding="utf-8")
         except OSError:
             return None
-        if yaml_mod is not None:
-            try:
-                data = yaml_mod.safe_load(text) or {}
-            except Exception:
-                data = {}
-            if isinstance(data, dict):
-                ident = data.get(AGENT_API_CLUSTER_IDENTITY_KEY)
-                if isinstance(ident, dict):
-                    project = str(ident.get(AGENT_API_METRIC_PROJECT_LABEL) or "").strip()
-                    cluster = str(ident.get(AGENT_API_METRIC_CLUSTER_LABEL) or "").strip()
-                    location = str(ident.get(AGENT_API_METRIC_LOCATION_LABEL) or "").strip()
-                    if project and cluster and location:
-                        return {
-                            AGENT_API_METRIC_PROJECT_LABEL: project,
-                            AGENT_API_METRIC_CLUSTER_LABEL: cluster,
-                            AGENT_API_METRIC_LOCATION_LABEL: location,
-                        }
-        return None
+        result: dict[str, str] | None = None
+        loader = getattr(yaml_mod, "CSafeLoader", yaml_mod.SafeLoader)
+        try:
+            data = yaml_mod.load(text, Loader=loader) or {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            ident = data.get(AGENT_API_CLUSTER_IDENTITY_KEY)
+            if isinstance(ident, dict):
+                project = str(ident.get(AGENT_API_METRIC_PROJECT_LABEL) or "").strip()
+                cluster = str(ident.get(AGENT_API_METRIC_CLUSTER_LABEL) or "").strip()
+                location = str(ident.get(AGENT_API_METRIC_LOCATION_LABEL) or "").strip()
+                if project and cluster and location:
+                    result = {
+                        AGENT_API_METRIC_PROJECT_LABEL: project,
+                        AGENT_API_METRIC_CLUSTER_LABEL: cluster,
+                        AGENT_API_METRIC_LOCATION_LABEL: location,
+                    }
+        with _PROFILE_IDENTITY_CACHE_LOCK:
+            if len(_PROFILE_IDENTITY_CACHE) >= AGENT_API_IDENTITY_CACHE_MAX_ENTRIES:
+                _PROFILE_IDENTITY_CACHE.clear()
+            _PROFILE_IDENTITY_CACHE[cache_key] = dict(result) if result is not None else None
+        return result
 
     @classmethod
     def _read_event_watcher_status(cls) -> dict[str, Any]:

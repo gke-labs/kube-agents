@@ -59,6 +59,23 @@ const (
 	remediationUnknownSuffix     = "."
 	remediationProfileIncomplete = "Cluster Agent profile scaffold is incomplete (profile.yaml, kubeconfig.yaml, or USER.md missing); the next cluster_agent_reconcile.py tick will retry get-credentials."
 
+	containerPrefixFolders       = "folders/"
+	containerPrefixOrganizations = "organizations/"
+	containerPrefixMetricsScopes = "metricsScopes/"
+	containerPrefixSharedVPCHost = "sharedVpcHosts/"
+
+	remediationAssetContainerDenied      = "Grant roles/cloudasset.viewer to the Platform Agent's Google Cloud service account on this folder or organisation so cluster_agent_reconcile.py can list its member projects."
+	remediationAssetContainerAPIDisabled = "Enable the Cloud Asset API (cloudasset.googleapis.com) in the management project so cluster_agent_reconcile.py can resolve folder and organisation members."
+	remediationAssetContainerUnreachable = "The Cloud Asset API did not answer within the reconcile budget. Check VPC egress, firewall rules, or Private Google Access."
+
+	remediationMetricsScopeDenied      = "Grant roles/monitoring.metricsScopesViewer to the Platform Agent's Google Cloud service account on this Metrics Scope so cluster_agent_reconcile.py can list its monitored projects."
+	remediationMetricsScopeAPIDisabled = "Enable the Cloud Monitoring API (monitoring.googleapis.com) in the management project so cluster_agent_reconcile.py can resolve Metrics Scope members."
+	remediationMetricsScopeUnreachable = "The Cloud Monitoring API did not answer within the reconcile budget. Check VPC egress, firewall rules, or Private Google Access."
+
+	remediationSharedVPCDenied      = "Grant roles/compute.viewer to the Platform Agent's Google Cloud service account on this Shared VPC host project so cluster_agent_reconcile.py can list its service projects."
+	remediationSharedVPCAPIDisabled = "Enable the Compute Engine API (compute.googleapis.com) on this Shared VPC host project so cluster_agent_reconcile.py can list its service projects."
+	remediationSharedVPCUnreachable = "The Compute Engine API did not answer within the reconcile budget. Check VPC egress, firewall rules, or Private Google Access."
+
 	viaManagement = "management"
 	viaProfile    = "profile"
 
@@ -324,6 +341,44 @@ func outcomeRemediation(outcome string) string {
 	}
 }
 
+// containerOutcomeRemediation returns remediation guidance tailored to the
+// scope container or selector prefix (folders/, organizations/, metricsScopes/,
+// sharedVpcHosts/) rather than per-project GKE permissions.
+func containerOutcomeRemediation(containerID, outcome string) string {
+	switch outcome {
+	case outcomeOK, "":
+		return ""
+	case outcomeDenied:
+		switch {
+		case strings.HasPrefix(containerID, containerPrefixFolders), strings.HasPrefix(containerID, containerPrefixOrganizations):
+			return remediationAssetContainerDenied
+		case strings.HasPrefix(containerID, containerPrefixMetricsScopes):
+			return remediationMetricsScopeDenied
+		case strings.HasPrefix(containerID, containerPrefixSharedVPCHost):
+			return remediationSharedVPCDenied
+		}
+	case outcomeAPIDisabled:
+		switch {
+		case strings.HasPrefix(containerID, containerPrefixFolders), strings.HasPrefix(containerID, containerPrefixOrganizations):
+			return remediationAssetContainerAPIDisabled
+		case strings.HasPrefix(containerID, containerPrefixMetricsScopes):
+			return remediationMetricsScopeAPIDisabled
+		case strings.HasPrefix(containerID, containerPrefixSharedVPCHost):
+			return remediationSharedVPCAPIDisabled
+		}
+	case outcomeUnreachable:
+		switch {
+		case strings.HasPrefix(containerID, containerPrefixFolders), strings.HasPrefix(containerID, containerPrefixOrganizations):
+			return remediationAssetContainerUnreachable
+		case strings.HasPrefix(containerID, containerPrefixMetricsScopes):
+			return remediationMetricsScopeUnreachable
+		case strings.HasPrefix(containerID, containerPrefixSharedVPCHost):
+			return remediationSharedVPCUnreachable
+		}
+	}
+	return outcomeRemediation(outcome)
+}
+
 // nextDailyAudit computes the next UTC fire time across dailyAuditRoster at or
 // after now.
 func nextDailyAudit(now time.Time) scopeScheduleInfo {
@@ -389,7 +444,9 @@ func (s *server) readScope(ctx context.Context, now time.Time) scopeResponse {
 	resp, err := s.hermes(ctx, http.MethodGet, scopePath, nil)
 	if err == nil {
 		if resp.StatusCode == http.StatusOK {
-			if decErr := json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBodyBytes)).Decode(&raw); decErr == nil {
+			var decoded upstreamScopePayload
+			if decErr := json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBodyBytes)).Decode(&decoded); decErr == nil {
+				raw = decoded
 				scopeFetched = true
 			}
 		}
@@ -617,7 +674,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 			ID:          c.ID,
 			Outcome:     c.Outcome,
 			Projects:    c.Projects,
-			Remediation: outcomeRemediation(c.Outcome),
+			Remediation: containerOutcomeRemediation(c.ID, c.Outcome),
 		})
 	}
 

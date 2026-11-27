@@ -567,3 +567,78 @@ func TestHandleScopeFallsBackToGatewayHealthWhenScopeRouteIsAbsent(t *testing.T)
 		t.Errorf("fallback EventWatcher = %+v, want watching", got.EventWatcher)
 	}
 }
+
+func TestContainerOutcomeRemediationMatchesScopeContainerKind(t *testing.T) {
+	raw := upstreamScopePayload{
+		Present: true,
+		Containers: []upstreamScopeContainer{
+			{ID: "folders/12345", Outcome: outcomeDenied, Projects: 0},
+			{ID: "organizations/999", Outcome: outcomeAPIDisabled, Projects: 0},
+			{ID: "metricsScopes/456", Outcome: outcomeDenied, Projects: 0},
+			{ID: "sharedVpcHosts/net-host", Outcome: outcomeAPIDisabled, Projects: 0},
+			{ID: "folders/ok-folder", Outcome: outcomeOK, Projects: 3},
+		},
+	}
+	got := buildScopeResponse(config{}, raw, true, true, "", time.Date(2026, 11, 26, 5, 0, 0, 0, time.UTC))
+	if len(got.Containers) != 5 {
+		t.Fatalf("len(Containers) = %d, want 5", len(got.Containers))
+	}
+	wantSubs := []string{
+		"roles/cloudasset.viewer",
+		"cloudasset.googleapis.com",
+		"roles/monitoring.metricsScopesViewer",
+		"compute.googleapis.com",
+		"",
+	}
+	for i, want := range wantSubs {
+		c := got.Containers[i]
+		if want == "" {
+			if c.Remediation != "" {
+				t.Errorf("container[%d] (%s) Remediation = %q, want empty", i, c.ID, c.Remediation)
+			}
+		} else {
+			if !strings.Contains(c.Remediation, want) {
+				t.Errorf("container[%d] (%s) Remediation = %q, want substring %q", i, c.ID, c.Remediation, want)
+			}
+			if strings.Contains(c.Remediation, "roles/container.viewer") || strings.Contains(c.Remediation, "container.googleapis.com") {
+				t.Errorf("container[%d] (%s) emitted project-level GKE remediation: %q", i, c.ID, c.Remediation)
+			}
+		}
+	}
+}
+
+func TestReadScopeDiscardsPartialPayloadOnDecodeError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/scope":
+			// Valid JSON syntax with a type mismatch on max_projects after projects/event_watcher:
+			// json.Decoder mutates its target struct before failing unless decoded into a staging var.
+			_, _ = w.Write([]byte(`{"projects":[{"id":"partial-proj","outcome":"denied","state":"in-scope"}],"event_watcher":{"enabled":false},"max_projects":"bad-type"}`))
+		case "/health":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := newServer(config{
+		HermesURL:    upstream.URL,
+		APIServerKey: testKey,
+		ProjectID:    "host-proj",
+		Location:     "us-central1",
+		ClusterName:  "host-c1",
+	})
+	rec := serve(s.routes(), httptest.NewRequest(http.MethodGet, "http://localhost:8080/api/scope", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	got := decode[scopeResponse](t, rec)
+	if len(got.Projects) != 1 || got.Projects[0].ID != "host-proj" {
+		t.Errorf("projects after decode error = %+v, want clean host-proj fallback (no partial-proj leak)", got.Projects)
+	}
+	if !got.EventWatcher.Enabled || !got.EventWatcher.Healthy || got.EventWatcher.Status != watcherStatusWatching {
+		t.Errorf("EventWatcher after decode error = %+v, want clean /health fallback watching", got.EventWatcher)
+	}
+}

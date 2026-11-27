@@ -1229,6 +1229,83 @@ class AgentAPIProxyTest(unittest.TestCase):
         multi = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(multi_profile_text)
         self.assertEqual(2, multi["discovery_errors"])
 
+    def test_scope_route_skips_unreadable_profile_and_coerces_bool_max_projects(self):
+        root = Path(self.workspace_dir.name)
+        (root / "fleet_scope.json").write_text(
+            json.dumps(
+                {
+                    "resolvedAt": "2026-11-26T06:00:00Z",
+                    "present": True,
+                    "boundary": True,
+                    "maxProjects": True,
+                    "projects": [{"id": "proj-host", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        good = root / "profiles" / "cluster-proj-host-good-us-central1"
+        good.mkdir(parents=True)
+        (good / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: good\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (good / "profile.yaml").write_text("name: cluster-proj-host-good-us-central1\n", encoding="utf-8")
+        (good / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        blocked = root / "profiles" / "cluster-proj-host-blocked-us-east1"
+        blocked.mkdir(parents=True)
+        blocked_cfg = blocked / "config.yaml"
+        blocked_cfg.write_text("cluster_identity:\n  project: proj-host\n", encoding="utf-8")
+
+        orig_is_file = Path.is_file
+
+        def flaky_is_file(self_path):
+            if self_path == blocked_cfg:
+                raise PermissionError("simulated EACCES on profile directory")
+            return orig_is_file(self_path)
+
+        with (
+            mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False),
+            mock.patch.object(Path, "is_file", flaky_is_file),
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+
+        self.assertEqual(0, data["max_projects"])
+        self.assertEqual(["cluster-proj-host-good-us-central1"], [p["profile"] for p in data["profile_identities"]])
+
+    def test_parse_cluster_identity_caches_by_stat_and_invalidates_on_change(self):
+        import yaml
+
+        root = Path(self.workspace_dir.name)
+        cfg = root / "cached-config.yaml"
+        cfg.write_text(
+            "cluster_identity:\n  project: proj-cache\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        with credential_proxy._PROFILE_IDENTITY_CACHE_LOCK:
+            credential_proxy._PROFILE_IDENTITY_CACHE.clear()
+
+        with mock.patch.object(yaml, "load", wraps=yaml.load) as spy_load:
+            first = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            second = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            self.assertEqual({"project": "proj-cache", "cluster": "c1", "location": "us-central1"}, first)
+            self.assertEqual(first, second)
+            self.assertEqual(1, spy_load.call_count)
+
+            # Mutating content (size/mtime change) must invalidate the cache entry.
+            cfg.write_text(
+                "cluster_identity:\n  project: proj-cache\n  cluster: c1-updated\n  location: europe-west1\n",
+                encoding="utf-8",
+            )
+            third = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            self.assertEqual({"project": "proj-cache", "cluster": "c1-updated", "location": "europe-west1"}, third)
+            self.assertEqual(2, spy_load.call_count)
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):

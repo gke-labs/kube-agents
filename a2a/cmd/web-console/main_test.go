@@ -2174,6 +2174,10 @@ func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) 
 				{ID: "proj-e", Via: []string{"explicit"}, Outcome: "over-cap", State: "in-scope", Clusters: &zeroCount},
 				{ID: "proj-pending", Via: []string{"explicit"}, Outcome: "ok", State: "in-scope", Clusters: &pendingCount},
 			},
+			Containers: []upstreamScopeContainer{
+				{ID: "folders/123", Outcome: "denied", Projects: 0},
+				{ID: "folders/999", Outcome: "ok", Projects: 2},
+			},
 			Profiles: map[string]string{
 				"cluster-proj-a-prod-a-us-central1": "proj-a",
 			},
@@ -2225,7 +2229,7 @@ func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) 
 		"lastScope",
 		"scopeOutcomeBadgeHtml",
 		"renderScopeRosterHtml",
-	) + "\nconst payload = " + string(wireJSON) + ";\nconst html = renderScopeRosterHtml(payload);\nconst fallbackHtml = renderScopeRosterHtml(" + string(fallbackJSON) + ");\n" + `
+	) + "\nlastInsights = {cluster: {name: 'prod-a', project: 'proj-a', location: 'us-central1'}};\nconst payload = " + string(wireJSON) + ";\nconst html = renderScopeRosterHtml(payload);\nconst fallbackHtml = renderScopeRosterHtml(" + string(fallbackJSON) + ");\nconst loadingHtml = renderScopeRosterHtml(null);\n" + `
 console.log(JSON.stringify({
   hasProjA: html.includes("Project: proj-a"),
   hasClusterProdA: html.includes("proj-a / us-central1 / prod-a"),
@@ -2235,13 +2239,15 @@ console.log(JSON.stringify({
   hasDeniedHint: html.includes("roles/container.viewer"),
   hasApiDisabledHint: html.includes("container.googleapis.com"),
   hasUnreachableHint: html.includes("VPC egress"),
+  hasFailedContainer: html.includes("Container: folders/123") && html.includes("roles/cloudasset.viewer") && !html.includes("Container: folders/999"),
   hasEmptyProjectStatus: html.includes("No clusters active in this project (denied)."),
   hasPendingClustersStatus: html.includes("2 clusters discovered, profiles pending (ok)."),
   hasNoneYetProfile: fallbackHtml.includes("Profile: none yet · via management") && !fallbackHtml.includes("cluster-prod-a"),
+  loadingNotGreenOK: loadingHtml.includes("loading") && loadingHtml.includes("badge-grey") && !loadingHtml.includes("badge-green"),
   noBogusPlaceholderProfile: !html.includes("cluster-("),
 }));
 `
-	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true,"hasEmptyProjectStatus":true,"hasPendingClustersStatus":true,"hasNoneYetProfile":true,"noBogusPlaceholderProfile":true}`
+	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true,"hasFailedContainer":true,"hasEmptyProjectStatus":true,"hasPendingClustersStatus":true,"hasNoneYetProfile":true,"loadingNotGreenOK":true,"noBogusPlaceholderProfile":true}`
 	if got := runPageJS(t, script); got != want {
 		t.Errorf("renderScopeRosterHtml output checks = %s, want %s", got, want)
 	}
@@ -2349,26 +2355,28 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 		"renderAlertsEmptyStateHtml",
 	) + "\nconst htmlWatching = renderAlertsEmptyStateHtml(" + string(watchingJSON) + ");\nconst htmlStarting = renderAlertsEmptyStateHtml(" + string(startingJSON) + ");\nconst htmlDegraded = renderAlertsEmptyStateHtml(" + string(degradedJSON) + ");\nconst htmlUnreachable = renderAlertsEmptyStateHtml(" + string(unreachableJSON) + ");\nconst htmlDisabled = renderAlertsEmptyStateHtml(" + string(disabledJSON) + ");\nconst htmlNull = renderAlertsEmptyStateHtml(null);\n" + `
 const activeClaim = "Proactive fleet monitoring is active.";
+const allHtmls = [htmlWatching, htmlStarting, htmlDegraded, htmlUnreachable, htmlDisabled, htmlNull];
 console.log(JSON.stringify({
   hasEmptyHeadline: htmlWatching.includes(CHANNELS.alerts.empty),
   hasWatcherDetail: htmlWatching.includes("Watching 2 of 2 clusters for Kubernetes Warning events"),
   hasWatchingBadge: htmlWatching.includes("Watching") && htmlWatching.includes("badge-green"),
   hasWatchingLead: htmlWatching.includes(activeClaim),
   hasStartingBadge: htmlStarting.includes("Starting") && htmlStarting.includes("badge-amber"),
-  hasStartingLead: !htmlStarting.includes(activeClaim) && htmlStarting.includes("starting up") && htmlStarting.includes("Scheduled daily fleet audits"),
+  hasStartingLead: !htmlStarting.includes(activeClaim) && htmlStarting.includes("starting up") && htmlStarting.includes("UTC schedule"),
   hasDegradedBadge: htmlDegraded.includes("Degraded") && htmlDegraded.includes("badge-amber") && !htmlDegraded.includes("badge-green"),
-  hasDegradedLead: !htmlDegraded.includes(activeClaim) && htmlDegraded.includes("degraded") && htmlDegraded.includes("Scheduled daily fleet audits"),
+  hasDegradedLead: !htmlDegraded.includes(activeClaim) && htmlDegraded.includes("degraded") && htmlDegraded.includes("UTC schedule"),
   hasUnreachableBadge: htmlUnreachable.includes("Unreachable") && htmlUnreachable.includes("badge-amber"),
-  hasUnreachableLead: !htmlUnreachable.includes(activeClaim) && htmlUnreachable.includes("unreachable") && htmlUnreachable.includes("Scheduled daily fleet audits"),
+  hasUnreachableLead: !htmlUnreachable.includes(activeClaim) && htmlUnreachable.includes("unreachable") && htmlUnreachable.includes("UTC schedule"),
   hasDisabledBadge: htmlDisabled.includes("Disabled") && htmlDisabled.includes("badge-grey"),
-  hasDisabledLead: !htmlDisabled.includes(activeClaim) && htmlDisabled.includes("disabled") && htmlDisabled.includes("Scheduled daily fleet audits"),
+  hasDisabledLead: !htmlDisabled.includes(activeClaim) && htmlDisabled.includes("disabled") && htmlDisabled.includes("UTC schedule"),
   hasLoadingBadge: htmlNull.includes("Loading") && htmlNull.includes("badge-grey") && !htmlNull.includes("Disabled"),
-  hasLoadingLead: !htmlNull.includes(activeClaim) && htmlNull.includes("Checking Kubernetes Event Watcher status") && htmlNull.includes("Scheduled daily fleet audits"),
+  hasLoadingLead: !htmlNull.includes(activeClaim) && htmlNull.includes("Checking Kubernetes Event Watcher status") && htmlNull.includes("UTC schedule"),
+  noFalseAuditPostHereClaim: allHtmls.every((h) => !h.includes("post anomaly reports")),
   hasNextAudit: htmlWatching.includes("Security &amp; RBAC Posture Audit at 2099-03-15T06:20:00Z"),
   hasStarterPrompt: htmlWatching.includes("data-starter-prompt="),
 }));
 `
-	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasWatchingLead":true,"hasStartingBadge":true,"hasStartingLead":true,"hasDegradedBadge":true,"hasDegradedLead":true,"hasUnreachableBadge":true,"hasUnreachableLead":true,"hasDisabledBadge":true,"hasDisabledLead":true,"hasLoadingBadge":true,"hasLoadingLead":true,"hasNextAudit":true,"hasStarterPrompt":true}`
+	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasWatchingLead":true,"hasStartingBadge":true,"hasStartingLead":true,"hasDegradedBadge":true,"hasDegradedLead":true,"hasUnreachableBadge":true,"hasUnreachableLead":true,"hasDisabledBadge":true,"hasDisabledLead":true,"hasLoadingBadge":true,"hasLoadingLead":true,"noFalseAuditPostHereClaim":true,"hasNextAudit":true,"hasStarterPrompt":true}`
 	if got := runPageJS(t, script); got != want {
 		t.Errorf("renderAlertsEmptyStateHtml output checks = %s, want %s", got, want)
 	}
