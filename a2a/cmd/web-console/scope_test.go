@@ -576,18 +576,20 @@ func TestContainerOutcomeRemediationMatchesScopeContainerKind(t *testing.T) {
 			{ID: "organizations/999", Outcome: outcomeAPIDisabled, Projects: 0},
 			{ID: "metricsScopes/456", Outcome: outcomeDenied, Projects: 0},
 			{ID: "sharedVpcHosts/net-host", Outcome: outcomeAPIDisabled, Projects: 0},
+			{ID: "folders/big-folder", Outcome: outcomeOverCap, Projects: 140},
 			{ID: "folders/ok-folder", Outcome: outcomeOK, Projects: 3},
 		},
 	}
 	got := buildScopeResponse(config{}, raw, true, true, "", time.Date(2026, 11, 26, 5, 0, 0, 0, time.UTC))
-	if len(got.Containers) != 5 {
-		t.Fatalf("len(Containers) = %d, want 5", len(got.Containers))
+	if len(got.Containers) != 6 {
+		t.Fatalf("len(Containers) = %d, want 6", len(got.Containers))
 	}
 	wantSubs := []string{
 		"roles/cloudasset.viewer",
 		"cloudasset.googleapis.com",
 		"roles/monitoring.metricsScopesViewer",
 		"compute.googleapis.com",
+		"This container resolves more projects than spec.scope.maxProjects",
 		"",
 	}
 	for i, want := range wantSubs {
@@ -600,8 +602,8 @@ func TestContainerOutcomeRemediationMatchesScopeContainerKind(t *testing.T) {
 			if !strings.Contains(c.Remediation, want) {
 				t.Errorf("container[%d] (%s) Remediation = %q, want substring %q", i, c.ID, c.Remediation, want)
 			}
-			if strings.Contains(c.Remediation, "roles/container.viewer") || strings.Contains(c.Remediation, "container.googleapis.com") {
-				t.Errorf("container[%d] (%s) emitted project-level GKE remediation: %q", i, c.ID, c.Remediation)
+			if strings.Contains(c.Remediation, "roles/container.viewer") || strings.Contains(c.Remediation, "container.googleapis.com") || strings.Contains(c.Remediation, "This project") {
+				t.Errorf("container[%d] (%s) emitted project-level remediation: %q", i, c.ID, c.Remediation)
 			}
 		}
 	}

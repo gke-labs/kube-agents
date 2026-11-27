@@ -75,6 +75,7 @@ const (
 	remediationSharedVPCDenied      = "Grant roles/compute.viewer to the Platform Agent's Google Cloud service account on this Shared VPC host project so cluster_agent_reconcile.py can list its service projects."
 	remediationSharedVPCAPIDisabled = "Enable the Compute Engine API (compute.googleapis.com) on this Shared VPC host project so cluster_agent_reconcile.py can list its service projects."
 	remediationSharedVPCUnreachable = "The Compute Engine API did not answer within the reconcile budget. Check VPC egress, firewall rules, or Private Google Access."
+	remediationContainerOverCap     = "This container resolves more projects than spec.scope.maxProjects (default 100) allows. Raise spec.scope.maxProjects on the PlatformAgent, declare narrower sub-folders, or exclude projects via spec.scope.exclude.projects."
 
 	viaManagement = "management"
 	viaProfile    = "profile"
@@ -375,6 +376,8 @@ func containerOutcomeRemediation(containerID, outcome string) string {
 		case strings.HasPrefix(containerID, containerPrefixSharedVPCHost):
 			return remediationSharedVPCUnreachable
 		}
+	case outcomeOverCap:
+		return remediationContainerOverCap
 	}
 	return outcomeRemediation(outcome)
 }
