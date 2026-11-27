@@ -50,8 +50,9 @@ type Policy struct {
 	// unmatched call (CoreAgentGrant.AnyShellCommand), keeping deny rules,
 	// core-agent's built-in denylist and its best-effort write-target and
 	// search checks.
-	// That mode also drops the read tools' workspace scope, so the harness
-	// refuses a grant that pairs Shell with a file write. Its boundary is
+	// That mode also drops the read tools' workspace scope. No persona
+	// grants a file write, and the harness refuses a grant that pairs Shell
+	// with one. Its boundary is
 	// the sandbox and the credential broker, as on Claude Code. A session's
 	// shell is ShellPrefixes, never this.
 	Shell bool

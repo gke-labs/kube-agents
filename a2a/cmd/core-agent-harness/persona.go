@@ -34,8 +34,8 @@ func loadPersona(ctx context.Context, dir string, required bool) (string, []adkt
 	if dir == "" {
 		return "", nil, nil
 	}
-	// The skills' directories are named to the model and granted to the
-	// shell by absolute path.
+	// The skills' directories and scripts are named to the model by absolute
+	// path, which is where the shell finds them.
 	if !filepath.IsAbs(dir) {
 		return "", nil, fmt.Errorf("the persona directory %q is not absolute", dir)
 	}

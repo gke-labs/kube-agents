@@ -69,9 +69,9 @@ type Policy struct {
 	// the turn in core-agent's mode that refuses no unmatched call, which
 	// keeps the deny rules, the built-in shell denylist and the gate's
 	// best-effort write-target and search checks, and drops the read tools'
-	// workspace scope,
-	// so the policy may not carry a file write. Only a persona's shell
-	// grant sets it; a session's shell is its command prefixes.
+	// workspace scope. The policy may not carry a file write, which no
+	// persona's shell grant does. Only a persona's shell grant sets it; a
+	// session's shell is its command prefixes.
 	AnyShellCommand bool `json:"any_shell_command,omitempty"`
 }
 

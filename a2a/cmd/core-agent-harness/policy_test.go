@@ -638,8 +638,8 @@ func TestAPersonaShellRunsAnyCommand(t *testing.T) {
 }
 
 // TestAnyShellCommandNeedsTheShellAndNoWrite: a policy that runs any shell
-// command must grant the shell, and may not grant a file write, which that
-// mode's path scope wouldn't confine.
+// command must grant the shell, and may not grant a file write, which no
+// persona's shell grant carries.
 func TestAnyShellCommandNeedsTheShellAndNoWrite(t *testing.T) {
 	for name, p := range map[string]coreagentwire.Policy{
 		"no shell": {Tools: []string{"read_file"}, AnyShellCommand: true},
