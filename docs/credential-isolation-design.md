@@ -278,6 +278,19 @@ allowlist itself keeps other workloads out rather than telling those callers apa
 crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
+Each request is also held to the Pod its token was issued to. The `TokenReview` names that
+Pod and its UID; the runtime reads the Pod (a `Role` named `<agent>-credential-proxy-pod-read`
+grants `get` on pods in the agent's namespace and the profile namespace) and refuses the
+request with the same 401 unless the connection's peer address is one of the Pod's
+`status.podIPs`. Envoy passes that address to the runtime in `X-Kube-Agents-Peer-Address`,
+set on every listener from the downstream connection itself and overwriting any value a
+caller sends, and the runtime believes it only on a Unix-socket connection whose kernel-reported
+peer is that Envoy process. A token used from anywhere but its own Pod is refused, and so is
+`kubectl port-forward` to the broker Pod or its Service: the kubelet connects from inside
+the broker Pod, so the peer is loopback, which is no caller's address. To call the broker by
+hand, do it from a Pod whose token it is, for example `kubectl exec` into the shell sandbox
+or a profile worker and run the command there.
+
 Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
 the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
 The credentialed listener sends every credentialed path through the `credential_runtime` cluster, and

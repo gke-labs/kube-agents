@@ -1474,6 +1474,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
+	// And the pod read that holds each caller to its own pod, before the
+	// broker that refuses every pod-token request without it.
+	if err := r.reconcileCredentialBrokerPodReadRBAC(ctx, renderAgent); err != nil {
+		return ctrl.Result{}, err
+	}
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, renderAgent)
 	otlpDisabled := otlpSource == otlpSourceNone
 	if err := r.reconcileKubeProxy(ctx, renderAgent, otlpEndpoint, otlpDisabled); err != nil {
@@ -1981,6 +1986,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// holds the finalizer, under the profile-namespace rule.
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
+		}
+		// The broker's pod-read Role and binding there, for the same reason.
+		if err := r.deleteCredentialBrokerProfilePodRead(ctx, agent); err != nil {
+			r.profileNamespaceFailure(ctx, agent, "delete the credential broker's pod-read Role on deletion", err)
 		}
 		// The profile tiers' inference gateway keys there go too: nothing
 		// else reclaims them. The ones in the agent's namespace go with
@@ -4541,10 +4550,11 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	for i := range existingRoleBindings.Items {
 		rb := &existingRoleBindings.Items[i]
 		// Preserve local and leader bindings during reconciliation.
-		// kube-proxy's pod-read binding is bound to saName too, and an agent
-		// named with the kubeagents prefix would give it the prefix this
-		// sweep reaps; reconcileKubeProxy applies it every pass.
-		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName || rb.Name == kubeProxyPodReadName(agent)) {
+		// The broker's and kube-proxy's pod-read bindings are bound to saName too,
+		// and an agent named with the kubeagents prefix would give them the prefix
+		// this sweep reaps; reconcileCredentialBrokerPodReadRBAC and
+		// reconcileKubeProxy apply them every pass.
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName || rb.Name == credentialBrokerPodReadName(agent) || rb.Name == kubeProxyPodReadName(agent)) {
 			continue
 		}
 		isTargetSA := false

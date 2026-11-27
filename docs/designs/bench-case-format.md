@@ -419,7 +419,11 @@ optionally followed by its recorded location, bounded on both sides by the expan
 name looks like; a placeholder naming a slot the runner recorded no cluster for returns
 `status: "error"`, like an unreached `fixture_roles` slot, and because an unreached slot is absent
 from `{cluster:any}` rather than forbidden, a case that forbids through it lists a `fixture_roles`
-entry for every slot it means; its `fixture_roles` names the seeded-fleet
+entry for every slot it means; `{model}` in any of the three lists stands for the backing model the runner
+recorded in its environment (`MODEL_DEFAULT_NAME`, `AGENT_MODEL`, or `AGENT_MODEL_NAME`), returning
+`status: "error"` when none is recorded or when only a router alias (`model-default`, `hermes-agent`,
+`model-fast`, `model-reasoning`, `custom`) is set, and is refused outside `report_contains`'s three pattern
+lists by `validate_bench_cases.py`; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns
@@ -777,13 +781,15 @@ in the presubmit or nightly files
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
 indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
-comment, and the validator rejects a case path inside one. The one case that does not go
-in a roster file is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
+comment, and the validator rejects a case path inside one. A case that waits outside
+every lane is one whose fixture is not on the pool: it is a `FIXTURE_NOT_READY`
 entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture. The
 pull request that lands the fixture leaves it there, because merging puts nothing on a
 cluster; the reconcile's postsubmit does (`docs/ci-pool-projects.md` 6.2). A later pull
 request moves it to the nightly file, citing a reconcile report that visited every pool
-project and a scan that reads the role healthy on all of them.
+project and a scan that reads the role healthy on all of them. A parked case of the
+Validated Capabilities suite returns by its `suite:` line instead, with its `suite_part:`
+line for a section other than 1: a suite case is never in a roster file.
 
 Who approves follows the split: an edit to the presubmit file or to
 `hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly

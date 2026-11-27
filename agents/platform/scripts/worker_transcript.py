@@ -440,8 +440,9 @@ COMMAND_ARG_KEYS = ("command", "cmd")
 # enumerable, so that rule names the well-known mounts and the directory
 # names that announce one.
 # A credential read from the metadata server is a list too
-# (`METADATA_CREDENTIAL_PATH_RE`): it reads the whole text of the command,
-# not each simple command.
+# (`METADATA_CREDENTIAL_PATH_RE`, and `METADATA_CREDENTIAL_PATH_VARIABLE_RE`
+# for a last path part that is one shell variable): it reads the whole text
+# of the command, not each simple command.
 #
 # The shell's escape and the separators `split_shell_commands` reads; the
 # quotes are `SHELL_QUOTE_CHARS` above.
@@ -664,6 +665,24 @@ SECRET_READ_COMMAND_RE = re.compile(
 # `/` or blank, and the sign pattern is fixed text, so a run of either costs
 # linear time.
 METADATA_CREDENTIAL_PATH_RE = re.compile(r"(?i)instance/service-accounts/[^/\s]+/[^/\s]*\b(?:token|identity)\b")
+# The same path with one shell variable as its whole last part
+# (`default/$T`, `default/${FIELD}`, `default/$1`, `default/$@`): the value
+# can be `token`, and the text cannot tell, so the rule decides closed. A
+# brace form counts with text in it that holds no blank and no brace
+# (`${T:-email}`, `${!T}`), and so do quotes and backslashes between the `/`
+# and the `$` (`default/"$T"`, `"…/default/"$T`, `default/\$T` in a script in
+# double quotes). The variable must end the path: the end of the text, a
+# blank, a quote, a backtick, a backslash or one of `? # ; | & ) < > } ]`
+# follows it. A variable with more text in its part (`$NAME.txt`, `x$T`), one
+# that is not the last part (`$DIR/`), and a variable for the account alone
+# (`service-accounts/$SA`) do not count. The account part holds no `>`, so a
+# redirect behind a list of the accounts (`service-accounts/>$DIR/$OUT`) does
+# not count. The pattern starts from fixed text, and neither the account part
+# nor the brace form can read past the next start (a `/` and a `{` stop
+# them), so a run of them costs linear time.
+METADATA_CREDENTIAL_PATH_VARIABLE_RE = re.compile(
+    r"(?i)instance/service-accounts/[^/\s>]+/[\"'\\]*\$(?:\{[^{}\s]*\}|[a-z0-9_]+|[@*])(?=$|[\s\"'`?#;|&)<>\\}\]])"
+)
 METADATA_FLAVOR_HEADER = "metadata-flavor"
 METADATA_SERVER_HOSTS = ("metadata.google.internal", "metadata.goog", "169.254.169.254", "169.254.169.252", "fd20:ce::254")
 # `metadata.goog` also matches the longer host name, which is in the list for the reader. The short
@@ -2805,7 +2824,8 @@ def _command_reads_a_secret(command: str, depth: int) -> bool:
     folded = fold_shell_continuations(command)
     if SECRET_READ_COMMAND_RE.search(folded):
         return True
-    if METADATA_CREDENTIAL_PATH_RE.search(folded) and METADATA_SERVER_SIGN_RE.search(folded):
+    names_a_credential_path = METADATA_CREDENTIAL_PATH_RE.search(folded) or METADATA_CREDENTIAL_PATH_VARIABLE_RE.search(folded)
+    if names_a_credential_path and METADATA_SERVER_SIGN_RE.search(folded):
         return True
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))
 

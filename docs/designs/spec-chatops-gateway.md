@@ -2872,8 +2872,8 @@ nothing out. A result recovered by replaying the stream after a restart arrives 
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
-them posts exactly what it posted before chat messages existed; Slack and Google Chat lay the
-message out ("Chat messages on Google Chat" under the Google Chat adapter). The relay never hands the
+them posts exactly what it posted before chat messages existed; Slack, Google Chat and Teams lay the
+message out ("Chat messages on Google Chat" under the Google Chat adapter, "Chat messages on Teams" under the Teams adapter), and Teams with its cards off answers `ErrTextOnly` too. The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
 refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
 the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
@@ -3284,6 +3284,33 @@ The form's kept-for line is drawn before any press, so it always names the quest
 recorded without the answer's text and without the redraw, and a re-rating that carries no
 answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
 names a post (`postKindOf`), so an alert its triage edits stays as it was.
+
+**Chat messages on Teams.** With cards on, a `kube-agents.chat/v1` message is laid out as the
+same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the
+schema's order as the markdown the card builder reads (headline in bold with the note, detail,
+the plan with a status mark per item and a tick or an open mark per step, or the rows as
+bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
+the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
+carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
+line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn, and the adapter has no `PostNotifyMessage`, so an unkeyed home post stays text. A
+layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
+(`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
+`ErrTextOnly` as before. The shared cases lay out as the golden files in
+`a2a/gateway/testdata/teams-chat/` say (`TestTeamsChatGolden`).
+
+A press of a choice (`teams_clicks.go`) arrives as the Stop press does and becomes the turn its
+reply spells, marked a click, from the presser, so the allowlist decides as for a typed
+message. Teams acknowledges a Submit with nothing and leaves the buttons pressable, so the
+adapter keeps the Google Chat adapter's bookkeeping: one press waits on the gateway's verdict
+at a time, the first verified answer stands (`InboundVerified`), and the card is edited to its
+text with `✓ name: choice` under it, its choices gone and its other buttons kept. A typed reply
+in the conversation of an open question answers it the same way, unless it is a command; a
+next step takes no typed reply. The line stays through a later edit that lays out no choices,
+and an edit that lays choices out asks anew. An update replaces the whole card and a press
+carries none of it, so a question the adapter no longer remembers (posted before a restart, or
+past its `uxCap` remembered cards) is answered by a post of the line in the conversation, named by
+the label the button carried, unless the button is a next step's, which answered no question; the same post follows an edit that fails or a card the line
+would push past the budget.
 
 While card work is open in a conversation with nothing on screen that shows it, the adapter
 keeps Teams's typing indicator on there (`teams_typing.go`): a `typing` activity posted through

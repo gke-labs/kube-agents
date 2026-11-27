@@ -198,7 +198,7 @@ func TestWarmPoolsFollowTheProfilesInteractiveTiers(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: profilePoolName("auditor", "read")}, read); err != nil {
 		t.Fatalf("no warm pool for the read tier: %v", err)
 	}
-	if *read.Spec.Replicas != int32(resolveProfileWarmReplicas(agent)) || read.Spec.Template.Spec.ServiceAccountName != "agentprofile-auditor-read" {
+	if *read.Spec.Replicas != int32(resolveProfileWarmReplicas(agent, &profile)) || read.Spec.Template.Spec.ServiceAccountName != "agentprofile-auditor-read" {
 		t.Errorf("the read pool: replicas %d, serviceAccount %q", *read.Spec.Replicas, read.Spec.Template.Spec.ServiceAccountName)
 	}
 	if err := pool("unattended"); !apierrors.IsNotFound(err) {

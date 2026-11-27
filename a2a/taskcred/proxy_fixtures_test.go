@@ -43,7 +43,7 @@ import (
 //	cd agents/platform/scripts && python3 -m unittest test_task_credential
 //
 // Every hand-signed token is deterministic (Ed25519 signatures are, and the
-// times are fixed), so regenerating changes nothing but the one case minted
+// times are fixed), so regenerating changes nothing but the cases minted
 // through Mint, whose iat and nonce are the wall clock's and crypto/rand's.
 var updateProxyFixtures = flag.Bool("update-proxy-fixtures", false, "rewrite testdata/credential_proxy_fixtures.json")
 
@@ -312,6 +312,82 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("a null permits", edited(permitted, `"cluster":"cluster-a"},"permits":null`)))
 	add(refused("a duplicate permits key", edited(permitted, `"cluster":"cluster-a"},"permits":["x"],"permits":["vcs:proposal-create"]`)))
 	add(refused("a case-variant Permits", edited(permitted, `"cluster":"cluster-a"},"Permits":["vcs:proposal-create"]`)))
+
+	// The unattended write permit (docs/designs/unattended-write-permit.md,
+	// rows 1 and 2): only beside a builtin schedule trigger that binds its
+	// stream, never beside the confirmed permit. Nothing mints it yet.
+	const (
+		unattendedOnly  = `["vcs:unattended-write"]`
+		scheduleTrigger = `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`
+	)
+	// withPermits puts a permits claim, and a trigger when one is given, on
+	// the credential with a cluster target.
+	withPermits := func(permits, trigger string) string {
+		tail := `"cluster":"cluster-a"},"permits":` + permits
+		if trigger != "" {
+			tail += `,"trigger":` + trigger
+		}
+		return edited(permitted, tail)
+	}
+	// reportWithPermits is the same on a report credential: no target.
+	reportWithPermits := func(permits, trigger string) string {
+		return edited(`"tier":"read"`, `"tier":"unattended"`, trig, `,"permits":`+permits+`,"trigger":`+trigger)
+	}
+	unattendedClaims := func(c proxyFixtureClaims) *proxyFixtureClaims {
+		c.Permits = []Permit{PermitVCSUnattendedWrite}
+		return &c
+	}
+	add(proxyFixture{Name: "the unattended permit, a builtin schedule trigger with a stream", Token: withPermits(unattendedOnly, scheduleTrigger),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: unattendedClaims(builtinClaims)})
+	add(proxyFixture{Name: "the unattended permit on a report credential", Token: reportWithPermits(unattendedOnly, scheduleTrigger),
+		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: unattendedClaims(*reportClaims(builtin))})
+	add(proxyFixture{Name: "the unattended permit, a schedule trigger with a stream and a script",
+		Token: withPermits(unattendedOnly, `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit","script":"compliance-audit"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: unattendedClaims(scriptedClaims)})
+	mintedUnattended, err := Mint(kp, Claims{
+		Task: "task-1", Profile: "auditor", Tier: "read", Pod: "auditor-read-x7k2p",
+		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy,
+		Expires: mintNow.Add(10 * time.Minute), Target: &fixtureTarget, Trigger: &builtin,
+		Permits: []Permit{PermitVCSUnattendedWrite},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	add(proxyFixture{Name: "minted by taskcred.Mint with the unattended permit", Token: mintedUnattended, Now: mintNow.Unix(),
+		GoOK: true, ProxyOK: true, Claims: unattendedClaims(mintedTriggerClaims)})
+	// As before this permit existed: no verifier rule joins the confirmed
+	// permit and a trigger. The design's "a task whose grant binds a trigger
+	// never gets vcs:proposal-create" is a rule for the mint (row 1 names
+	// a2a/dispatch/admission.go), which a later change adds; today the
+	// trigger ingress's fixed changeRequested=false holds it.
+	confirmedWithTrigger := builtinClaims
+	confirmedWithTrigger.Permits = []Permit{PermitVCSProposalCreate}
+	add(proxyFixture{Name: "the confirmed permit beside a builtin schedule trigger with a stream",
+		Token: withPermits(`["vcs:proposal-create"]`, scheduleTrigger), Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &confirmedWithTrigger})
+	add(refused("the unattended permit and no trigger", withPermits(unattendedOnly, "")))
+	add(refused("the unattended permit, a collector trigger", withPermits(unattendedOnly, `{"name":"stall-watch","origin":"builtin"}`)))
+	add(refused("the unattended permit, a schedule trigger with no stream",
+		withPermits(unattendedOnly, `{"name":"schedule/compliance-audit","origin":"builtin"}`)))
+	add(refused("the unattended permit, a schedule trigger with an explicit empty stream",
+		withPermits(unattendedOnly, `{"name":"schedule/compliance-audit","origin":"builtin","stream":""}`)))
+	add(refused("the unattended permit, a schedule trigger with a script and no stream",
+		withPermits(unattendedOnly, `{"name":"schedule/compliance-audit","origin":"builtin","script":"compliance-audit"}`)))
+	add(refused("the unattended permit on a report credential with a collector trigger",
+		reportWithPermits(unattendedOnly, `{"name":"stall-watch","origin":"builtin"}`)))
+	add(refused("both permits, the unattended one first", withPermits(`["vcs:unattended-write","vcs:proposal-create"]`, scheduleTrigger)))
+	add(refused("both permits, the confirmed one first", withPermits(`["vcs:proposal-create","vcs:unattended-write"]`, scheduleTrigger)))
+	add(refused("the unattended permit twice", withPermits(`["vcs:unattended-write","vcs:unattended-write"]`, scheduleTrigger)))
+	add(refused("a case variant of the unattended permit", withPermits(`["VCS:unattended-write"]`, scheduleTrigger)))
+	add(refused("the unattended permit on the nats audience",
+		edited(`"aud":"credential-proxy"`, `"aud":"nats"`, permitted, `"cluster":"cluster-a"},"permits":`+unattendedOnly+`,"trigger":`+scheduleTrigger)))
+	add(refused("the unattended permit, a trigger with a user origin",
+		withPermits(unattendedOnly, `{"name":"schedule/compliance-audit","origin":"user","stream":"compliance-audit"}`)))
+	// Without the permit Go reads a null trigger, or a null stream, as none
+	// and accepts the credential (above); with the permit it must refuse,
+	// as the proxy does.
+	add(refused("the unattended permit and a null trigger", withPermits(unattendedOnly, `null`)))
+	add(refused("the unattended permit and a null trigger stream",
+		withPermits(unattendedOnly, `{"name":"schedule/compliance-audit","origin":"builtin","stream":null}`)))
 
 	// Types.
 	add(refused("version 1", edited(`"version":2`, `"version":1`)))

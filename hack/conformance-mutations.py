@@ -152,6 +152,16 @@ MUTATIONS: list[Mutation] = [
         "persona rule to keep it from opening an unrequested pull request",
     ),
     Mutation(
+        "A3-profile-write-under-any-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in getattr(task, "permits", ()):\n',
+         '    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and not getattr(task, "permits", ()):\n'),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "read any permit on the task credential as the write permit, since the "
+        "dispatcher mints only one -- while the verifiers accept a second name "
+        "that this gate does not read",
+    ),
+    Mutation(
         "A3-profile-vcs-without-credential",
         "agents/platform/scripts/credential_proxy.py",
         ('    if task is None:\n        return "a profile caller needs a task credential for version control"\n',
@@ -3122,7 +3132,7 @@ Mutation(
     ),
     Mutation(
         "C1-session-audience-env-renamed-in-kube-proxy",
-        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        "k8s-api-proxy/pkg/proxyserver/server.go",
         ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
          'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
         "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",

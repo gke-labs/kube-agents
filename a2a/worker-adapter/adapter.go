@@ -213,7 +213,18 @@ type Config struct {
 	// Empty for every other run.
 	TaskStem string
 
+	// ToolLines, when set, writes the per-tool log line for the task
+	// (toollog.go). A profile worker sets it for each task it runs; nil
+	// writes none.
+	ToolLines *ToolLines
+
 	Logger *slog.Logger
+
+	// Trajectory, when set, is the session's tool-call capture for the
+	// evals (trajectory.go): every activity the harness emits is recorded
+	// in it, scrubbed and capped, and served only on the pod's loopback.
+	// nil records nothing.
+	Trajectory *TrajectoryStore
 }
 
 // Addressee is the executor's token on the task subjects.
@@ -417,6 +428,9 @@ type adapter struct {
 	finalized bool
 	finalErr  error
 	appended  map[string]bool // artifact name -> first chunk already out
+	// tools writes the task's per-tool log lines (Config.ToolLines), or is
+	// nil and writes none.
+	tools *toolLog
 	// askKind is the mark.ask token for the task's prompt (lib/askkind),
 	// carried on every progress line as the hermes-bridge carries it, so the
 	// gateway's reaction follows a profile task as it follows a platform one
@@ -693,6 +707,7 @@ func newTaskAdapter(cfg Config, b *busConns) *adapter {
 		js:       b.js,
 		from:     lib.Party{Session: cfg.Addressee(), AgentType: string(cfg.driver().Harness()), Profile: cfg.Profile},
 		appended: map[string]bool{},
+		tools:    newToolLog(cfg.Logger, cfg.TaskID, cfg.ToolLines),
 	}
 }
 
@@ -972,6 +987,8 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return broken(Result{State: state}, ferr)
 	}
 
+	// The harness's own log lines (stdout chatter, refused tool calls) name
+	// the task.
 	// A harness with its own wall-clock bound gets it from the task's
 	// deadline less the kill grace, so it ends the turn with a result
 	// before the adapter stops it.
@@ -979,7 +996,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	if b, ok := drv.(turnBudgeter); ok {
 		firstArgv = b.WithTurnBudget(argv, cfg.TaskDeadline-cfg.KillGrace)
 	}
-	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log)
+	proc, err := startHarnessWith(drv, firstArgv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
@@ -1012,7 +1029,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 			if b, ok := drv.(turnBudgeter); ok {
 				rargv = b.WithTurnBudget(rargv, left-cfg.KillGrace)
 			}
-			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log)
+			return startHarnessWith(drv, rargv, env, prompt, cfg.KillGrace, log.With("task", cfg.TaskID))
 		}
 	}
 
@@ -1257,6 +1274,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					}
 					switch ev.Kind {
 					case EventToolResult:
+						a.tools.ended(ev)
 						// A tool step's result is in: the call that wrote a
 						// record has exited. Only the record is read, never the
 						// result.
@@ -1291,6 +1309,8 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					case EventProgress:
 						a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
 					case EventActivity:
+						a.tools.started(ev)
+						a.cfg.Trajectory.Record(a.taskID, ev.Tool, ev.Input, nil, time.Now())
 						a.publishActivity(ctx, ev)
 					case EventResult:
 						// What the turn cost goes out first, whatever the turn
@@ -1692,12 +1712,19 @@ func (a *adapter) publishUsage(ctx context.Context, t resultTelemetry) {
 // artifacts, the milestone stream the gateway's rolling line renders at zero
 // model cost. (The spec's explicit progress tool is the stage 3 shape;
 // mapping the narration is the playground stand-in, recorded in the
-// findings.) An input that does not marshal publishes nothing.
+// findings.) An input that does not marshal publishes nothing. A call id,
+// when the harness gives one, goes beside the input as callId, never in it,
+// so it joins the call to a refused-call log record without changing what
+// the input matches.
 func (a *adapter) publishActivity(ctx context.Context, ev Event) {
-	entry, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"tool":  ev.Tool,
 		"input": ev.Input,
-	})
+	}
+	if ev.CallID != "" {
+		fields["callId"] = ev.CallID
+	}
+	entry, err := json.Marshal(fields)
 	if err != nil {
 		return
 	}

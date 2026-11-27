@@ -212,6 +212,7 @@ var tseRedLineMap = map[string]string{
 	"Grounded, Current Knowledge (No Guessing from Memory)": "the persona's §4, which keeps never answer_query (TestTheTsePersonaStatesItsRedLines)",
 	"Read-Only Boundary":                                    "persona: Read-only",
 	"Never Wildcard the Project":                            "persona: Never wildcard the project",
+	"Model & Provider Truth":                                "reads the [RUNTIME MODEL IDENTITY] block injected by Hermes's model_identity pre_llm_call plugin; standalone AgentProfile workers do not load Hermes plugins",
 }
 
 // The persona's §2 bullets with no Hermes counterpart, and why.
