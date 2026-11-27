@@ -327,6 +327,8 @@ Three workflows run this suite. [`.github/workflows/e2e-gchat-test.yml`](../../.
 
 Each caller splits its suites into a gate and tolerated coverage. `blocking_suite` fails the run; `optional_suites`, a comma-separated list run by `scripts/release/run_optional_e2e_suites.sh`, reports and does not. The split is evidence rather than preference: a suite gates a promotion once it has passed on a real cluster, and runs as optional coverage until then. The RC pipeline gates on `gchat` and tolerates `rc` and `slack`; the staging promotion pipeline gates on `rc` — the subset the RC pipeline exercises every three hours — and tolerates `gchat`, `agent-plugin` and `stockout-full`, which between them cover every file the `nightly` suite adds. Per-suite filters such as `STOCKOUT_SCENARIOS` are declared in the suite's `env_vars` in `e2e_config.yaml`, not passed from the workflow, because one workflow input cannot carry a different value for each suite in a list.
 
+The `agent-plugin` suite pushes an example plugin image, and the operator image on a `rebuild_operator` run. Under `e2e-run.yml` and the manual runner the push goes to `<GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/kube-agents` in the environment's project; the manual runner sends it to the environment's `REGISTRY` variable instead when that is set. It never goes to `REGISTRY_PREFIX`, where the environment reads published images.
+
 Both pipelines' gating jobs install and test the A2A stack, which every install runs; the chat test's reply wait is 300 seconds wherever it runs. [`scripts/release/README.md`](../../scripts/release/README.md#what-happens-to-the-rc-cluster) owns what the RC pipeline does to the cluster and the run.
 
 ### Triggering Workflow via GitHub CLI (`gh`):
