@@ -27,7 +27,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
+	"regexp"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
@@ -100,7 +100,14 @@ type layout struct {
 	// toolNames rewrites the source's tool references (written for Claude
 	// Code) to this harness's names, in the persona and every skill. Empty
 	// for Claude Code, whose tree is the source as it is.
-	toolNames *strings.Replacer
+	toolNames []toolRename
+}
+
+// toolRename is one tool reference and this harness's name for it. The
+// pattern matches across the source's hard line wraps.
+type toolRename struct {
+	from *regexp.Regexp
+	to   string
 }
 
 var (
@@ -113,16 +120,16 @@ var (
 		skillsDir:   coreagent.SkillsDir,
 		// core-agent surfaces skills through list_skills, load_skill and
 		// load_skill_resource (toolgrant.CoreAgentSkillTools).
-		toolNames: strings.NewReplacer("with the Skill tool", "with `load_skill`"),
+		toolNames: []toolRename{{regexp.MustCompile(`with\s+the\s+Skill\s+tool`), "with `load_skill`"}},
 	}
 )
 
 // rename applies the layout's tool-name rewrites to text.
 func (l layout) rename(text []byte) []byte {
-	if l.toolNames == nil {
-		return text
+	for _, r := range l.toolNames {
+		text = r.from.ReplaceAll(text, []byte(r.to))
 	}
-	return []byte(l.toolNames.Replace(string(text)))
+	return text
 }
 
 // build writes the persona and every session skill under out, then the

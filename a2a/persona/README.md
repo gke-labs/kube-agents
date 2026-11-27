@@ -94,7 +94,9 @@ state in that directory is not checked (see
 [Content manifest](../lib/persona/README.md#content-manifest)).
 
 The same tool also writes the persona and skills in the core-agent harness's
-layout (`instructions.md` and `skills/`, with their own manifest), and the
+layout (`instructions.md` and `skills/`, with their own manifest; tool
+references written for Claude Code become core-agent's, so "the Skill tool"
+reads `load_skill`), and the
 Dockerfile copies that tree to `/usr/share/kube-agents/persona/session`,
 owned by root with every write bit cleared. A session pod running the
 core-agent harness reads it there (`--persona-dir`) and always requires it,

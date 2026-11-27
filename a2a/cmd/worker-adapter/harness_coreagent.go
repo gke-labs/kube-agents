@@ -32,7 +32,7 @@ var (
 	// coreAgentSessionPersonaDir is a session pod's persona, built into the
 	// worker image root-owned with no write bit (a2a/Dockerfile.worker,
 	// cmd/session-persona -core-agent-out): the same persona and skills a
-	// Claude Code session pod ships.
+	// Claude Code session pod ships, with core-agent's tool names.
 	coreAgentSessionPersonaDir = "/usr/share/kube-agents/persona/session"
 )
 

@@ -205,7 +205,7 @@ func TestBothLayoutsShipTheSameSkills(t *testing.T) {
 // claudeOnlyToolNames are Claude Code's tool names as the session text could
 // refer to them; none may reach the core-agent tree, whose tools are named
 // otherwise (the skills come through load_skill, the shell is the harness's).
-var claudeOnlyToolNames = regexp.MustCompile(`\b(Skill|Bash|Read|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch|Edit|Write) tool\b|\bBash\b`)
+var claudeOnlyToolNames = regexp.MustCompile(`\b(Skill|Bash|BashOutput|KillShell|Read|Glob|Grep|LS|Task|Agent|TodoWrite|WebFetch|WebSearch|Edit|MultiEdit|Write|NotebookEdit|NotebookRead)` + "`?" + `\s+tool\b|\bBash\b|\b(Skill|Read|Write|Edit|WebFetch|Glob|Grep)\(`)
 
 // The core-agent tree names core-agent's tools, and the Claude Code tree is
 // the source as it was: the persona's skill instruction is rewritten only in
@@ -248,5 +248,16 @@ func TestTheCoreAgentTreeCarriesNoClaudeToolNames(t *testing.T) {
 	}
 	if string(shipped) != string(source) {
 		t.Error("the Claude Code persona differs from its source")
+	}
+}
+
+// The rewrite matches across the source's hard line wraps.
+func TestTheCoreAgentRewriteSurvivesALineWrap(t *testing.T) {
+	got := string(coreAgentLayout.rename([]byte("load it with the\nSkill tool and follow it")))
+	if got != "load it with `load_skill` and follow it" {
+		t.Errorf("rewrite across a wrap gave %q", got)
+	}
+	if string(claudeLayout.rename([]byte("with the Skill tool"))) != "with the Skill tool" {
+		t.Error("the Claude Code layout rewrote its source")
 	}
 }
