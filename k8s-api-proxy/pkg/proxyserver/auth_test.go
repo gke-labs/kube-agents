@@ -69,6 +69,9 @@ var proxyEnvVars = []string{
 	jwtIssuerEnv, jwtKeySetURLEnv, jwtAudiencesEnv, jwtUsernameClaimEnv, jwtUIDClaimEnv,
 	jwtGroupsClaimEnv, jwtPartitionClaimEnv, jwtRequiredSubPrefixEnv, jwtAllowedPartitionsEnv,
 	jwtCAFileEnv, partitionByCallerEnv, maxInFlightPerCallerEnv, maxLongRunningPerCallerEnv,
+	mtlsClientCAFileEnv, mtlsIdentitySourceEnv, mtlsAllowedIdentitiesEnv, mtlsRequiredURIPrefixEnv,
+	headerClientCAFileEnv, headerNameSourceEnv, headerAllowedNamesEnv, headerUsernameHeadersEnv,
+	headerUIDHeadersEnv, headerGroupHeadersEnv, headerPartitionHeadersEnv, headerAllowedPartitionsEnv,
 }
 
 func clearProxyEnv(t *testing.T) {
@@ -241,11 +244,15 @@ func TestSplitList(t *testing.T) {
 
 func TestParseAuthModes(t *testing.T) {
 	for raw, want := range map[string][]string{
-		"token-review":        {authModeTokenReview},
-		"jwt":                 {authModeJWT},
-		"none":                {authModeNone},
-		"token-review,jwt":    {authModeTokenReview, authModeJWT},
-		" jwt , token-review": {authModeJWT, authModeTokenReview},
+		"token-review":                        {authModeTokenReview},
+		"jwt":                                 {authModeJWT},
+		"none":                                {authModeNone},
+		"token-review,jwt":                    {authModeTokenReview, authModeJWT},
+		" jwt , token-review":                 {authModeJWT, authModeTokenReview},
+		"mtls":                                {authModeMTLS},
+		"requestheader":                       {authModeRequestHeader},
+		"jwt,mtls":                            {authModeJWT, authModeMTLS},
+		"mtls,requestheader,token-review,jwt": {authModeMTLS, authModeRequestHeader, authModeTokenReview, authModeJWT},
 	} {
 		got, err := parseAuthModes(raw)
 		if err != nil || !slices.Equal(got, want) {
@@ -256,8 +263,11 @@ func TestParseAuthModes(t *testing.T) {
 		"":                              "invalid --auth-mode",
 		",":                             "invalid --auth-mode",
 		"NONE":                          "invalid --auth-mode",
-		"mtls":                          "invalid --auth-mode",
-		"jwt,mtls":                      "invalid --auth-mode",
+		"mTLS":                          "invalid --auth-mode",
+		"jwt,request-header":            "invalid --auth-mode",
+		"none,mtls":                     "cannot be combined with another mode",
+		"requestheader,none":            "cannot be combined with another mode",
+		"requestheader,requestheader":   "listed twice",
 		"none,jwt":                      "cannot be combined with another mode",
 		"token-review,none":             "cannot be combined with another mode",
 		"none,none":                     "cannot be combined with another mode",
