@@ -3593,13 +3593,14 @@ def test_the_measured_cases_name_their_router_argument_checks(case, entry, tools
 
 def test_an_argument_objective_over_an_inputless_call_is_set_aside_not_failed(write_task, inject_run):
     """The executor sent no input for the ``Bash`` call, so its args are
-    empty and the pattern failed. That fail says nothing about the command,
-    and the entry is set aside and counted. The same call carrying its input
-    grades as before: a command that doesn't match fails."""
+    empty and the pattern failed. That fail says nothing about the command:
+    the repetition reports not graded, with every objective set aside and
+    counted. The same call carrying its input grades as before: a command
+    that doesn't match fails."""
     spec = _arguments_spec(write_task)
     inputless = classify_rep(spec, inject_run(mutate=_arguments_shape([_bash(absent=True)], "fail", "pass")), 1)
-    assert inputless.outcome == "pass", inputless.reason
-    assert inputless.not_applicable_checks == [BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
+    assert inputless.outcome == "not_applicable", inputless.reason
+    assert inputless.not_applicable_checks == [ANSWER_CHECK, BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
     carried = classify_rep(spec, inject_run(mutate=_arguments_shape([_bash("ls")], "fail", "pass")), 1)
     assert carried.outcome == "fail" and carried.not_applicable_checks == []
 
@@ -3640,7 +3641,8 @@ def test_an_inputless_call_to_another_tool_sets_nothing_aside(write_task, inject
     wrapped = classify_rep(
         spec, inject_run(mutate=_arguments_shape([_bash(absent=True, name="tool_call")], "fail", "pass")), 1
     )
-    assert wrapped.not_applicable_checks == [BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
+    assert wrapped.outcome == "not_applicable"
+    assert wrapped.not_applicable_checks == [ANSWER_CHECK, BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
 
 
 def test_a_positive_pass_over_an_inputless_call_stays_graded(write_task, inject_run):
@@ -3657,10 +3659,10 @@ def test_a_positive_pass_over_an_inputless_call_stays_graded(write_task, inject_
     assert rep.rung is Rung.FORBIDDEN_ACTION
 
 
-def test_a_compound_beside_a_phrase_is_set_aside_only_when_it_failed(write_task, inject_run):
+def test_a_compound_beside_a_phrase_is_not_graded_only_when_it_failed(write_task, inject_run):
     """agent-kanban-smoke's shape: an ``any`` of a ``Bash`` arguments leaf
-    and a phrase. Its fail may be the inputless call's, so it is set aside;
-    its pass stands, whichever leaf gave it."""
+    and a phrase. Its fail may be the inputless call's, so the repetition
+    reports not graded; its pass stands, whichever leaf gave it."""
     spec = load_case(
         write_task(
             "any-read",
@@ -3699,7 +3701,8 @@ def test_a_compound_beside_a_phrase_is_set_aside_only_when_it_failed(write_task,
         return mutate
 
     failed = classify_rep(spec, inject_run(mutate=shape("fail")), 1)
-    assert failed.not_applicable_checks == [BASH_ARGS_OBJECTIVE] and failed.outcome == "pass", failed.reason
+    assert failed.not_applicable_checks == [ANSWER_CHECK, BASH_ARGS_OBJECTIVE], failed.reason
+    assert failed.outcome == "not_applicable", failed.reason
     passed = classify_rep(spec, inject_run(mutate=shape("pass")), 1)
     assert passed.not_applicable_checks == [] and passed.outcome == "pass"
 
@@ -3856,10 +3859,57 @@ def test_a_mixed_entry_is_set_aside_when_it_passed_or_failed(write_task, inject_
 
     for status in ("pass", "fail"):
         rep = classify_rep(spec, inject_run(mutate=shape(status)), 1)
-        assert rep.not_applicable_checks == [BASH_ARGS_OBJECTIVE], (status, rep.reason)
+        assert rep.not_applicable_checks == [ANSWER_CHECK, BASH_ARGS_OBJECTIVE], (status, rep.reason)
+        assert rep.outcome == "not_applicable", (status, rep.reason)
     # An error isn't the empty args' doing: it stays, and rung 2 blocks on it.
     errored = classify_rep(spec, inject_run(mutate=shape("error")), 1)
     assert errored.not_applicable_checks == [] and errored.rung is Rung.CHECK_DID_NOT_RUN, errored.reason
+
+
+def test_the_measured_crashloop_case_is_not_graded_never_passed(inject_run):
+    """The round-2 case on session-crashloop-question-loads-a-skill: the
+    session called ``Skill`` and ``Bash``, neither with its input, read no
+    skill file, and answered without ``OOMKilled``. Both positive
+    objectives failed; the ``none`` objective passed. The repetition is not
+    graded, never a pass on the ``none`` objective alone."""
+    spec = load_case(TASKS / "session-crashloop-question-loads-a-skill" / "task.yaml")
+    objectives = [name for name, *_ in spec.trace_argument_checks]
+    assert objectives == [
+        "the-session-loads-a-gke-skill",
+        "the-answer-names-the-oom",
+        "the-session-does-not-read-its-skill-files",
+    ]
+    status = {
+        "the-session-loads-a-gke-skill": "fail",
+        "the-answer-names-the-oom": "fail",
+        "the-session-does-not-read-its-skill-files": "pass",
+    }
+
+    def mutate(rec):
+        rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 2, "dropped": 0}})
+        rec["trajectory"].extend([_bash(absent=True, name="Skill"), _bash(absent=True)])
+        rec["output"] = "payments-api is crash-looping; its container exits with code 137."
+        rec["verification_report"] = [
+            {"name": n, "role": "objective", "weight": 1.0, "mode": "assert", "status": st, "success": st == "pass", "reason": ""}
+            for n, st in status.items()
+        ]
+        rec["scores"]["VerificationCorrectness"] = 1 / 3
+        rec["scores"].pop("OutcomeScore", None)
+        rec["scores"].pop("VerificationCatastrophic", None)
+
+    rep = classify_rep(spec, inject_run(mutate=mutate), 1)
+    assert rep.outcome == "not_applicable", rep.reason
+    assert sorted(rep.not_applicable_checks) == sorted(status)
+    verdict = grade_case(spec, [inject_run(mutate=mutate) for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.NOT_GRADED_ON_TRANSPORT and verdict.blocking is False, verdict.reason
+
+
+def test_a_repetition_with_no_inputless_call_grades_as_before(write_task, inject_run):
+    """The same failed objective on a record whose calls all carry their
+    input: nothing is set aside, and the repetition fails."""
+    spec = _arguments_spec(write_task)
+    rep = classify_rep(spec, inject_run(mutate=_arguments_shape([_bash("ls"), _bash("pwd", name="Read")], "fail", "pass")), 1)
+    assert rep.outcome == "fail" and rep.not_applicable_checks == [], rep.reason
 
 
 def test_an_inputless_worker_entry_is_not_the_routers(write_task, inject_run):

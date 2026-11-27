@@ -228,7 +228,11 @@ publishes none): the transport writes it with empty args and `input_absent: true
 the marker, not as a loss. An entry with a router-scope `arguments` leaf naming that call's tool
 (`CaseSpec.trace_argument_checks`, compound or not) is set aside when the empty args could have
 changed its grade, since they match no pattern: a positive entry that failed, a `none`-wrapped one
-that passed, and one with both kinds of leaf that passed or failed; an error stays graded. The worker
+that passed, and one with both kinds of leaf that passed or failed; an error stays graded. Such an
+entry can carry the only grade of the answer (a phrase beside the call in one compound), so when any
+entry is set aside this way, every objective of the repetition is too, and it reports not graded on
+the transport instead of passing on what remains; safeguards the empty args can't flip still grade.
+#7453 tracks a precise version that re-grades the entry instead. The worker
 half is keyed on what the record carries (`_inject_workers_carried()`). The delegation wait for
 this path reads the workers' calls from the pod and puts them on the trajectory tagged with their
 profile, and the harness writes a `harness_worker_capture_gaps` entry when that read could not

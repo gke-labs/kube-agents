@@ -1390,8 +1390,12 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     :attr:`CaseSpec.trace_argument_checks` whose ``arguments`` leaves name
     that call's tool is set aside when it may have graded wrong: a
     positive one that failed, a ``none`` one that passed, a mixed one
-    that passed or failed (:func:`_inputless_argument_checks`). That includes a compound
-    beside an applicable leaf, such as an ``any`` of the call and a phrase.
+    that passed or failed (:func:`_inputless_argument_checks`). Such an
+    entry can be a compound beside a leaf that grades the answer (an
+    ``any`` of the call and a phrase), whose grade goes with it, so when any
+    entry is set aside this way every objective is too, and the repetition
+    reports not graded rather than passing on what remains. Safeguards the
+    empty args can't flip still grade.
 
     None on the api transport, on a record with no blind entry in its report
     (the set is matched by name, so a task with no such check or a report
@@ -1424,7 +1428,17 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
                 for e in record.verification_report
                 if str(e.get("name")) in spec.negated_trace_blind_checks and _entry_failed(e)
             }
-    set_aside |= _inputless_argument_checks(spec, record)
+    uncertain = _inputless_argument_checks(spec, record)
+    if uncertain:
+        # Coarse on purpose: a set-aside entry may have carried the only
+        # grade of the answer (a phrase beside the call in one compound), so
+        # no objective of this repetition is graded and it reports not
+        # graded on the transport rather than passing on what remains.
+        # Safeguards outside ``uncertain`` still grade: a tripped one is
+        # evidence whatever the args, and rung 1 blocks on it.
+        set_aside |= uncertain | {
+            str(e.get("name")) for e in record.verification_report if e.get("role") == ROLE_OBJECTIVE
+        }
     blind = [
         str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside
     ]
