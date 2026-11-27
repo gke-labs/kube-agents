@@ -1731,6 +1731,44 @@ EXIT_STARTUP_FAILURE = 1
 # format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
 LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 LOG_MSEC_FORMAT = "%s.%03dZ"
+# GET /api/scope on the agent API proxy door: reads the reconcile's scope
+# snapshot and cluster profile identities from the data volume, plus local
+# k8s-event-watcher readiness from its metrics port on loopback.
+AGENT_API_SCOPE_PATH = "/api/scope"
+AGENT_API_FLEET_SCOPE_FILE = "fleet_scope.json"
+AGENT_API_WORKSPACE_ROOT_ENV = "CREDENTIAL_PROXY_WORKSPACE_ROOT"
+AGENT_API_HERMES_HOME_ENV = "HERMES_HOME"
+AGENT_API_DEFAULT_WORKSPACE_ROOT = "/opt/data"
+AGENT_API_PROFILES_DIR = "profiles"
+AGENT_API_RESERVED_PROFILES = frozenset({"default", "platform", "tse"})
+AGENT_API_PROFILE_CONFIG_FILE = "config.yaml"
+AGENT_API_PROFILE_SCAFFOLD_FILE = "profile.yaml"
+AGENT_API_PROFILE_USER_MD_FILE = "USER.md"
+AGENT_API_CLUSTER_IDENTITY_KEY = "cluster_identity"
+AGENT_API_EVENT_WATCHER_ENABLED_ENV = "EVENT_WATCHER_ENABLED"
+AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT = "true"
+AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV = "EVENT_WATCHER_METRICS_PORT"
+AGENT_API_EVENT_WATCHER_DEFAULT_METRICS_PORT = 9095
+AGENT_API_EVENT_WATCHER_METRICS_HOST = "127.0.0.1"
+AGENT_API_EVENT_WATCHER_METRICS_PATH = "/metrics"
+AGENT_API_EVENT_WATCHER_SCRAPE_TIMEOUT_SECONDS = 1.5
+AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES = 1024 * 1024
+AGENT_API_EVENT_WATCHER_READ_CHUNK_BYTES = 64 * 1024
+AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES = 64 * 1024
+AGENT_API_WATCH_SET_READY_METRIC = "k8s_event_watcher_watch_set_ready"
+AGENT_API_CLUSTER_UP_METRIC = "k8s_event_watcher_cluster_up"
+AGENT_API_DISCOVERY_ERRORS_METRIC = "k8s_event_watcher_cluster_discovery_errors_total"
+AGENT_API_EVENT_WATCHER_TRACKED_METRICS = (
+    AGENT_API_WATCH_SET_READY_METRIC,
+    AGENT_API_CLUSTER_UP_METRIC,
+    AGENT_API_DISCOVERY_ERRORS_METRIC,
+)
+AGENT_API_METRIC_CLUSTER_LABEL = "cluster"
+AGENT_API_METRIC_PROJECT_LABEL = "project"
+AGENT_API_METRIC_LOCATION_LABEL = "location"
+AGENT_API_METRIC_PROFILE_LABEL = "profile"
+AGENT_API_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
+_PROMETHEUS_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 
 
 def probe_gce_universe_domain_answer(
@@ -7670,6 +7708,10 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
+        if self.command == "GET" and urllib.parse.urlsplit(self.path).path == AGENT_API_SCOPE_PATH:
+            self._drain_request_body()
+            self._handle_scope()
+            return
         # The bridge-session refusal runs in two halves. What the request line
         # and headers say on their own (a literal `a2a-*`) is answered before the
         # body is read; what they, and the body, name in a state.db is looked up
@@ -7778,6 +7820,306 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _drain_request_body(self) -> None:
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
+
+    def _handle_scope(self) -> None:
+        """Answer GET /api/scope with the reconcile snapshot, profile identities, and watcher status."""
+        payload = self._read_scope_snapshot(self.workspace_root)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8", errors="replace")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        with contextlib.suppress(OSError):
+            self.wfile.write(body)
+            self.wfile.flush()
+
+    @classmethod
+    def _read_scope_snapshot(cls, workspace_root: str | Path | None = None) -> dict[str, Any]:
+        root = Path(
+            workspace_root
+            or getattr(cls, "workspace_root", "")
+            or os.getenv(AGENT_API_WORKSPACE_ROOT_ENV)
+            or os.getenv(AGENT_API_HERMES_HOME_ENV)
+            or AGENT_API_DEFAULT_WORKSPACE_ROOT
+        )
+        snapshot: dict[str, Any] = {}
+        snapshot_path = root / AGENT_API_FLEET_SCOPE_FILE
+        try:
+            if snapshot_path.is_file():
+                parsed = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict) and isinstance(parsed.get("projects"), list):
+                    snapshot = parsed
+        except Exception as exc:
+            LOGGER.debug("could not read %s: %s", snapshot_path, exc)
+
+        profile_identities = cls._read_profile_identities(root)
+        event_watcher = cls._read_event_watcher_status()
+        return {
+            "resolved_at": snapshot.get("resolvedAt", "") if isinstance(snapshot.get("resolvedAt"), str) else "",
+            "present": bool(snapshot.get("present")),
+            "boundary": bool(snapshot.get("boundary")),
+            "max_projects": snapshot.get("maxProjects") if isinstance(snapshot.get("maxProjects"), int) else 0,
+            "resolver": snapshot.get("resolver", "") if isinstance(snapshot.get("resolver"), str) else "",
+            "projects": snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else [],
+            "containers": snapshot.get("containers") if isinstance(snapshot.get("containers"), list) else [],
+            "profiles": snapshot.get("profiles") if isinstance(snapshot.get("profiles"), dict) else {},
+            "unmanaged": snapshot.get("unmanaged") if isinstance(snapshot.get("unmanaged"), list) else [],
+            "profile_identities": profile_identities,
+            "event_watcher": event_watcher,
+        }
+
+    @classmethod
+    def _read_profile_identities(cls, root: Path) -> list[dict[str, Any]]:
+        profiles_dir = root / AGENT_API_PROFILES_DIR
+        if not profiles_dir.is_dir():
+            return []
+        try:
+            import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+        except ImportError:
+            yaml = None
+        entries: list[dict[str, Any]] = []
+        for entry in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
+            if (
+                not entry.is_dir()
+                or entry.name.startswith(".")
+                or entry.name in AGENT_API_RESERVED_PROFILES
+            ):
+                continue
+            config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
+            if not config_path.is_file():
+                continue
+            identity = cls._parse_cluster_identity(config_path, yaml)
+            if not identity:
+                continue
+            is_ready = (
+                (entry / AGENT_API_PROFILE_SCAFFOLD_FILE).is_file()
+                and (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file()
+            )
+            entries.append(
+                {
+                    "profile": entry.name,
+                    "project": identity[AGENT_API_METRIC_PROJECT_LABEL],
+                    "cluster": identity[AGENT_API_METRIC_CLUSTER_LABEL],
+                    "location": identity[AGENT_API_METRIC_LOCATION_LABEL],
+                    "ready": is_ready,
+                }
+            )
+        return entries
+
+    @staticmethod
+    def _parse_cluster_identity(config_path: Path, yaml_mod: Any) -> dict[str, str] | None:
+        try:
+            text = config_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if yaml_mod is not None:
+            try:
+                data = yaml_mod.safe_load(text) or {}
+            except Exception:
+                data = {}
+            if isinstance(data, dict):
+                ident = data.get(AGENT_API_CLUSTER_IDENTITY_KEY)
+                if isinstance(ident, dict):
+                    project = str(ident.get(AGENT_API_METRIC_PROJECT_LABEL) or "").strip()
+                    cluster = str(ident.get(AGENT_API_METRIC_CLUSTER_LABEL) or "").strip()
+                    location = str(ident.get(AGENT_API_METRIC_LOCATION_LABEL) or "").strip()
+                    if project and cluster and location:
+                        return {
+                            AGENT_API_METRIC_PROJECT_LABEL: project,
+                            AGENT_API_METRIC_CLUSTER_LABEL: cluster,
+                            AGENT_API_METRIC_LOCATION_LABEL: location,
+                        }
+        return None
+
+    @classmethod
+    def _read_event_watcher_status(cls) -> dict[str, Any]:
+        raw_enabled = os.getenv(
+            AGENT_API_EVENT_WATCHER_ENABLED_ENV,
+            AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT,
+        ).strip().lower()
+        enabled = raw_enabled not in AGENT_API_FALSEY_ENV_VALUES
+        if not enabled:
+            return {
+                "enabled": False,
+                "reachable": False,
+                "watch_set_ready": False,
+                "clusters_up": 0,
+                "clusters_total": 0,
+                "discovery_errors": 0,
+                "clusters": [],
+            }
+        raw_port = os.getenv(
+            AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV,
+            str(AGENT_API_EVENT_WATCHER_DEFAULT_METRICS_PORT),
+        ).strip()
+        try:
+            port = int(raw_port)
+        except ValueError:
+            port = 0
+        if not METRICS_PORT_MIN <= port <= METRICS_PORT_MAX:
+            return {
+                "enabled": True,
+                "reachable": False,
+                "watch_set_ready": False,
+                "clusters_up": 0,
+                "clusters_total": 0,
+                "discovery_errors": 0,
+                "clusters": [],
+                "error": f"{AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV} is not configured",
+            }
+        conn = http.client.HTTPConnection(
+            AGENT_API_EVENT_WATCHER_METRICS_HOST,
+            port,
+            timeout=AGENT_API_EVENT_WATCHER_SCRAPE_TIMEOUT_SECONDS,
+        )
+        try:
+            conn.request("GET", AGENT_API_EVENT_WATCHER_METRICS_PATH)
+            resp = conn.getresponse()
+            if resp.status != HTTPStatus.OK:
+                return {
+                    "enabled": True,
+                    "reachable": False,
+                    "watch_set_ready": False,
+                    "clusters_up": 0,
+                    "clusters_total": 0,
+                    "discovery_errors": 0,
+                    "clusters": [],
+                    "error": f"k8s-event-watcher metrics answered HTTP {resp.status}",
+                }
+            raw_metrics = cls._read_tracked_event_watcher_metrics(resp)
+        except (OSError, http.client.HTTPException) as exc:
+            return {
+                "enabled": True,
+                "reachable": False,
+                "watch_set_ready": False,
+                "clusters_up": 0,
+                "clusters_total": 0,
+                "discovery_errors": 0,
+                "clusters": [],
+                "error": f"k8s-event-watcher metrics unreachable: {type(exc).__name__}",
+            }
+        finally:
+            conn.close()
+        return cls._parse_event_watcher_metrics(raw_metrics)
+
+    @classmethod
+    def _read_tracked_event_watcher_metrics(cls, resp: Any) -> str:
+        """Stream `/metrics` line by line and keep only the three tracked metric families.
+
+        Prometheus `Registry.Gather` sorts families alphabetically, placing
+        unbounded event counters (`events_seen_total`, `events_deduped_total`,
+        etc.) between `k8s_event_watcher_cluster_up` and
+        `k8s_event_watcher_watch_set_ready`. Filtering lines as they arrive
+        reaches `watch_set_ready` at the end of the body without buffering
+        untracked counter series in memory.
+        """
+        kept_lines: list[str] = []
+        kept_bytes = 0
+        pending = b""
+        skipping_overlong = False
+        tracked_prefixes = tuple(m.encode("ascii") for m in AGENT_API_EVENT_WATCHER_TRACKED_METRICS)
+        while True:
+            chunk = resp.read(AGENT_API_EVENT_WATCHER_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            data = pending + chunk
+            parts = data.split(b"\n")
+            pending = parts.pop()
+            for raw_line in parts:
+                if skipping_overlong:
+                    skipping_overlong = False
+                    continue
+                line = raw_line.strip()
+                if line.startswith(tracked_prefixes) and len(line) <= AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                    if kept_bytes + len(line) <= AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES:
+                        kept_lines.append(line.decode("utf-8", errors="replace"))
+                        kept_bytes += len(line)
+            if len(pending) > AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                pending = b""
+                skipping_overlong = True
+        if pending and not skipping_overlong:
+            line = pending.strip()
+            if line.startswith(tracked_prefixes) and len(line) <= AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                if kept_bytes + len(line) <= AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES:
+                    kept_lines.append(line.decode("utf-8", errors="replace"))
+        return "\n".join(kept_lines)
+
+    @classmethod
+    def _parse_event_watcher_metrics(cls, text: str) -> dict[str, Any]:
+        watch_set_ready = False
+        clusters: list[dict[str, Any]] = []
+        clusters_up = 0
+        failed_profiles: set[str] = set()
+        unlabeled_discovery_errors = 0
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            brace = line.find("{")
+            if brace >= 0:
+                end_brace = line.rfind("}")
+                if end_brace < brace:
+                    continue
+                name = line[:brace].strip()
+                label_text = line[brace + 1 : end_brace]
+                value_part = line[end_brace + 1 :].strip()
+            else:
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                name, value_part = parts[0], parts[1].strip()
+                label_text = ""
+            value_fields = value_part.split()
+            if not value_fields:
+                continue
+            try:
+                val = float(value_fields[0])
+            except ValueError:
+                continue
+            if math.isnan(val) or math.isinf(val):
+                continue
+            if name == AGENT_API_WATCH_SET_READY_METRIC:
+                watch_set_ready = val >= 1.0
+            elif name == AGENT_API_CLUSTER_UP_METRIC:
+                labels = {m.group(1): m.group(2) for m in _PROMETHEUS_LABEL_RE.finditer(label_text)}
+                up = val >= 1.0
+                if up:
+                    clusters_up += 1
+                clusters.append(
+                    {
+                        AGENT_API_METRIC_CLUSTER_LABEL: labels.get(AGENT_API_METRIC_CLUSTER_LABEL, ""),
+                        AGENT_API_METRIC_PROJECT_LABEL: labels.get(AGENT_API_METRIC_PROJECT_LABEL, ""),
+                        AGENT_API_METRIC_LOCATION_LABEL: labels.get(AGENT_API_METRIC_LOCATION_LABEL, ""),
+                        "up": up,
+                    }
+                )
+            elif name == AGENT_API_DISCOVERY_ERRORS_METRIC:
+                if val > 0:
+                    labels = {m.group(1): m.group(2) for m in _PROMETHEUS_LABEL_RE.finditer(label_text)}
+                    profile_label = labels.get(AGENT_API_METRIC_PROFILE_LABEL, "")
+                    if profile_label:
+                        failed_profiles.add(profile_label)
+                    else:
+                        unlabeled_discovery_errors += 1
+        discovery_errors = len(failed_profiles) + unlabeled_discovery_errors
+        clusters.sort(
+            key=lambda c: (
+                c[AGENT_API_METRIC_PROJECT_LABEL],
+                c[AGENT_API_METRIC_LOCATION_LABEL],
+                c[AGENT_API_METRIC_CLUSTER_LABEL],
+            )
+        )
+        return {
+            "enabled": True,
+            "reachable": True,
+            "watch_set_ready": watch_set_ready,
+            "clusters_up": clusters_up,
+            "clusters_total": len(clusters),
+            "discovery_errors": discovery_errors,
+            "clusters": clusters,
+        }
 
     @classmethod
     def _collect_session_id(cls, raw_session_id: Any, candidates: set[str]) -> bool:

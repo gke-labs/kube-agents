@@ -27,10 +27,13 @@ It does two things:
   `API_SERVER_KEY` entry of the `apiServerSecretRef` Secret (PM:4321-4338). That Secret entry is
   the real key; the `API_SERVER_KEY` the agent container itself sees is the non-secret sentinel. Every holder of that key is the same caller
   to the door.
-- **It forwards everything else.** GET, POST, PUT, PATCH and DELETE on any path go to the Hermes
-  API server on `127.0.0.1:8642`, re-signed with the in-pod non-secret sentinel (CP:2666-2679,
-  CP:2716-2736). The one exception is a request that names an `a2a-*` session, or a child of one,
-  in a header, a path segment or a top-level body key (CP:2770-2882). Those get 403.
+- **It serves `GET /api/scope` and forwards everything else.** Authenticated `GET /api/scope`
+  requests are answered directly by the door from `fleet_scope.json`, `profiles/*`, and
+  `k8s-event-watcher`'s loopback `/metrics` listener. All other GET, POST, PUT, PATCH and DELETE
+  requests go to the Hermes API server on `127.0.0.1:8642`, re-signed with the in-pod non-secret
+  sentinel (CP:2666-2679, CP:2716-2736). The one exception is a request that names an `a2a-*`
+  session, or a child of one, in a header, a path segment or a top-level body key (CP:2770-2882).
+  Those get 403.
 
 So what a key holder can do is whatever Hermes' API server exposes. At the pinned Hermes, that
 includes:
@@ -118,6 +121,7 @@ the pod.
 | Route                                 | Method | console | eval | ops | Kind                    |
 | ------------------------------------- | ------ | :-----: | :--: | :-: | ----------------------- |
 | `/health`, `/health/detailed`         | GET    |    ✓    |      |     | health                  |
+| `/api/scope`                          | GET    |    ✓    |      |     | scope (door-handled)    |
 | `/v1/models`                          | GET    |         |      |  ✓  | health                  |
 | `/api/sessions` (list)                | GET    |    ✓    |      |  ✓  | session admin: list     |
 | `/api/sessions/{id}`                  | GET    |    ✓    |  ✓   |     | session admin: read     |
@@ -174,6 +178,7 @@ named independently of any harness. The first set covers today's use and nothing
 | Operation        | What it means                                                              |
 | ---------------- | -------------------------------------------------------------------------- |
 | `health`         | liveness and readiness of the agent API                                    |
+| `scope`          | read-only fleet scope snapshot, profile identities, and watcher readiness  |
 | `models`         | list the models the agent offers                                           |
 | `turn.respond`   | run a turn with a stateless or chained request (`/v1/responses` on Hermes) |
 | `session.create` | start a named session the caller will hold turns in                        |
@@ -219,6 +224,8 @@ operations:
   health:
     - { method: GET, path: /health }
     - { method: GET, path: /health/detailed }
+  scope:
+    - { method: GET, path: /api/scope }
   models:
     - { method: GET, path: /v1/models }
   turn.respond:

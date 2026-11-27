@@ -2156,3 +2156,194 @@ const rowSlots = arr => arr.map(c => c.dataset && c.dataset.localRow === "1"
 		t.Errorf("local slash command busy-guard result = %s, want %s", got, want)
 	}
 }
+
+func TestPageScopeRosterRendersConnectivityOutcomesAndRemediation(t *testing.T) {
+	cCount := 1
+	pendingCount := 2
+	zeroCount := 0
+	resp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			Present:  true,
+			Boundary: true,
+			Projects: []upstreamScopeProject{
+				{ID: "proj-a", Via: []string{"management"}, Outcome: "ok", State: "in-scope", Clusters: &cCount},
+				{ID: "proj-b", Via: []string{"explicit"}, Outcome: "denied", State: "in-scope"},
+				{ID: "proj-c", Via: []string{"folders/123"}, Outcome: "api-disabled", State: "in-scope"},
+				{ID: "proj-d", Via: []string{"explicit"}, Outcome: "unreachable", State: "in-scope"},
+				{ID: "proj-e", Via: []string{"explicit"}, Outcome: "over-cap", State: "in-scope", Clusters: &zeroCount},
+				{ID: "proj-pending", Via: []string{"explicit"}, Outcome: "ok", State: "in-scope", Clusters: &pendingCount},
+			},
+			Profiles: map[string]string{
+				"cluster-proj-a-prod-a-us-central1": "proj-a",
+			},
+			ProfileIdentities: []upstreamProfileIdentity{
+				{
+					Profile:  "cluster-proj-a-prod-a-us-central1",
+					Project:  "proj-a",
+					Cluster:  "prod-a",
+					Location: "us-central1",
+					Ready:    true,
+				},
+			},
+			EventWatcher: &upstreamEventWatcher{
+				Enabled:       true,
+				Reachable:     true,
+				WatchSetReady: true,
+				ClustersUp:    1,
+				ClustersTotal: 1,
+				Clusters: []upstreamEventWatcherTarget{
+					{Cluster: "prod-a", Project: "proj-a", Location: "us-central1", Up: true},
+				},
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2026, 11, 26, 5, 20, 0, 0, time.UTC),
+	)
+	fallbackResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{},
+		false,
+		true,
+		"",
+		time.Date(2026, 11, 26, 5, 20, 0, 0, time.UTC),
+	)
+	wireJSON, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal scopeResponse: %v", err)
+	}
+	fallbackJSON, err := json.Marshal(fallbackResp)
+	if err != nil {
+		t.Fatalf("marshal fallbackResp: %v", err)
+	}
+
+	script := pageJS(t,
+		"escapeHtml",
+		"lastInsights",
+		"lastScope",
+		"scopeOutcomeBadgeHtml",
+		"renderScopeRosterHtml",
+	) + "\nconst payload = " + string(wireJSON) + ";\nconst html = renderScopeRosterHtml(payload);\nconst fallbackHtml = renderScopeRosterHtml(" + string(fallbackJSON) + ");\n" + `
+console.log(JSON.stringify({
+  hasProjA: html.includes("Project: proj-a"),
+  hasClusterProdA: html.includes("proj-a / us-central1 / prod-a"),
+  hasProfileSlug: html.includes("Profile: cluster-proj-a-prod-a-us-central1 · via management"),
+  hasWatcherActive: html.includes("Event watcher active"),
+  hasOverCapBadge: html.includes("over-cap") && html.includes("spec.scope.maxProjects"),
+  hasDeniedHint: html.includes("roles/container.viewer"),
+  hasApiDisabledHint: html.includes("container.googleapis.com"),
+  hasUnreachableHint: html.includes("VPC egress"),
+  hasEmptyProjectStatus: html.includes("No clusters active in this project (denied)."),
+  hasPendingClustersStatus: html.includes("2 clusters discovered, profiles pending (ok)."),
+  hasNoneYetProfile: fallbackHtml.includes("Profile: none yet · via management") && !fallbackHtml.includes("cluster-prod-a"),
+  noBogusPlaceholderProfile: !html.includes("cluster-("),
+}));
+`
+	want := `{"hasProjA":true,"hasClusterProdA":true,"hasProfileSlug":true,"hasWatcherActive":true,"hasOverCapBadge":true,"hasDeniedHint":true,"hasApiDisabledHint":true,"hasUnreachableHint":true,"hasEmptyProjectStatus":true,"hasPendingClustersStatus":true,"hasNoneYetProfile":true,"noBogusPlaceholderProfile":true}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("renderScopeRosterHtml output checks = %s, want %s", got, want)
+	}
+}
+
+func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
+	watchingResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled:       true,
+				Reachable:     true,
+				WatchSetReady: true,
+				ClustersUp:    2,
+				ClustersTotal: 2,
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
+	startingResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled:       true,
+				Reachable:     true,
+				WatchSetReady: false,
+				ClustersUp:    0,
+				ClustersTotal: 2,
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
+	degradedResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled:       true,
+				Reachable:     true,
+				WatchSetReady: true,
+				ClustersUp:    0,
+				ClustersTotal: 2,
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
+	disabledResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled: false,
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
+	watchingJSON, err := json.Marshal(watchingResp)
+	if err != nil {
+		t.Fatalf("marshal watchingResp: %v", err)
+	}
+	startingJSON, err := json.Marshal(startingResp)
+	if err != nil {
+		t.Fatalf("marshal startingResp: %v", err)
+	}
+	degradedJSON, err := json.Marshal(degradedResp)
+	if err != nil {
+		t.Fatalf("marshal degradedResp: %v", err)
+	}
+	disabledJSON, err := json.Marshal(disabledResp)
+	if err != nil {
+		t.Fatalf("marshal disabledResp: %v", err)
+	}
+
+	script := pageJS(t,
+		"escapeHtml",
+		"CHANNELS",
+		"renderAlertsEmptyStateHtml",
+	) + "\nconst htmlWatching = renderAlertsEmptyStateHtml(" + string(watchingJSON) + ");\nconst htmlStarting = renderAlertsEmptyStateHtml(" + string(startingJSON) + ");\nconst htmlDegraded = renderAlertsEmptyStateHtml(" + string(degradedJSON) + ");\nconst htmlDisabled = renderAlertsEmptyStateHtml(" + string(disabledJSON) + ");\nconst htmlNull = renderAlertsEmptyStateHtml(null);\n" + `
+console.log(JSON.stringify({
+  hasEmptyHeadline: htmlWatching.includes(CHANNELS.alerts.empty),
+  hasWatcherDetail: htmlWatching.includes("Watching 2 of 2 clusters for Kubernetes Warning events"),
+  hasWatchingBadge: htmlWatching.includes("Watching") && htmlWatching.includes("badge-green") && htmlWatching.includes("Proactive fleet monitoring is active."),
+  hasStartingBadge: htmlStarting.includes("Starting") && htmlStarting.includes("badge-amber") && htmlStarting.includes("Kubernetes Event Watcher is starting up.") && !htmlStarting.includes("Proactive fleet monitoring is active"),
+  hasDegradedBadge: htmlDegraded.includes("Degraded") && htmlDegraded.includes("badge-amber") && !htmlDegraded.includes("badge-green") && htmlDegraded.includes("Kubernetes Event Watcher is degraded") && !htmlDegraded.includes("Proactive fleet monitoring is active"),
+  hasDisabledBadge: htmlDisabled.includes("Disabled") && htmlDisabled.includes("badge-grey") && htmlDisabled.includes("Kubernetes Event Watcher is disabled.") && !htmlDisabled.includes("Proactive fleet monitoring is active"),
+  hasLoadingBadge: htmlNull.includes("Loading") && htmlNull.includes("badge-grey") && !htmlNull.includes("Disabled") && htmlNull.includes("Checking proactive fleet monitoring status.") && !htmlNull.includes("Proactive fleet monitoring is active"),
+  hasNextAudit: htmlWatching.includes("Security &amp; RBAC Posture Audit at 2099-03-15T06:20:00Z"),
+  hasStarterPrompt: htmlWatching.includes("data-starter-prompt="),
+}));
+`
+	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasStartingBadge":true,"hasDegradedBadge":true,"hasDisabledBadge":true,"hasLoadingBadge":true,"hasNextAudit":true,"hasStarterPrompt":true}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("renderAlertsEmptyStateHtml output checks = %s, want %s", got, want)
+	}
+}

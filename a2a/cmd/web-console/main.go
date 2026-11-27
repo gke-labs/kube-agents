@@ -580,6 +580,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /api/sessions/{id}/transcript", s.requireLocalHost(http.HandlerFunc(s.handleTranscript)))
 	mux.Handle("GET /api/channels/{name}/posts", s.requireLocalHost(http.HandlerFunc(s.handleChannelPosts)))
 	mux.Handle("GET /api/insights", s.requireLocalHost(http.HandlerFunc(s.handleInsights)))
+	mux.Handle("GET /api/scope", s.requireLocalHost(http.HandlerFunc(s.handleScope)))
 	mux.Handle("GET /api/repositories", s.requireLocalHost(http.HandlerFunc(s.handleRepositoriesGet)))
 	mux.Handle("POST /api/repositories", s.requireLocalHost(s.requireConsoleRequest(http.HandlerFunc(s.handleRepositoriesSet))))
 	mux.Handle("POST /api/repositories/connect", s.requireLocalHost(s.requireConsoleRequest(http.HandlerFunc(s.handleRepositoriesConnect))))

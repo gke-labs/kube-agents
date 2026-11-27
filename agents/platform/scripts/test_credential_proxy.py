@@ -1036,6 +1036,177 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertTrue(self.second_chunk_released)
         self.assertIn(b"event: done\n", rest)
 
+    def test_scope_route_requires_external_api_key(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(401, raised.exception.code)
+        self.assertEqual("", self.received_authorization)
+
+    def test_scope_route_returns_empty_defaults_when_snapshot_is_missing_or_corrupt(self):
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+        self.assertEqual("", self.received_authorization)
+        self.assertEqual("", data["resolved_at"])
+        self.assertEqual([], data["projects"])
+        self.assertEqual([], data["profile_identities"])
+        self.assertFalse(data["event_watcher"]["enabled"])
+
+        snapshot_path = Path(self.workspace_dir.name) / "fleet_scope.json"
+        snapshot_path.write_text("{not valid json", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            with urllib.request.urlopen(request) as response:
+                corrupt_data = json.loads(response.read())
+        self.assertEqual([], corrupt_data["projects"])
+
+    def test_scope_route_reads_snapshot_profiles_and_event_watcher_metrics(self):
+        root = Path(self.workspace_dir.name)
+        (root / "fleet_scope.json").write_text(
+            json.dumps(
+                {
+                    "resolvedAt": "2026-11-26T06:00:00Z",
+                    "present": True,
+                    "boundary": True,
+                    "maxProjects": 100,
+                    "resolver": "explicit",
+                    "projects": [
+                        {
+                            "id": "proj-host",
+                            "via": ["management"],
+                            "outcome": "ok",
+                            "state": "in-scope",
+                            "clusters": 1,
+                        },
+                        {
+                            "id": "proj-denied",
+                            "via": ["explicit"],
+                            "outcome": "denied",
+                            "state": "in-scope",
+                            "clusters": None,
+                        },
+                    ],
+                    "containers": [],
+                    "profiles": {"cluster-proj-host-c1-us-central1": "proj-host"},
+                    "unmanaged": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prof_ready = root / "profiles" / "cluster-proj-host-c1-us-central1"
+        prof_ready.mkdir(parents=True)
+        (prof_ready / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_ready / "profile.yaml").write_text("name: cluster-proj-host-c1-us-central1\n", encoding="utf-8")
+        (prof_ready / "USER.md").write_text("# Cluster Agent Context\n", encoding="utf-8")
+
+        # Profile with USER.md but missing profile.yaml (not registered with Hermes) must report ready=False.
+        prof_unready = root / "profiles" / "cluster-proj-host-c2-us-east1"
+        prof_unready.mkdir(parents=True)
+        (prof_unready / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c2\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        (prof_unready / "USER.md").write_text("# Unregistered skeleton\n", encoding="utf-8")
+
+        # Reserved profiles (platform, default, tse) are ignored even if they have config.yaml.
+        prof_reserved = root / "profiles" / "platform"
+        prof_reserved.mkdir(parents=True)
+        (prof_reserved / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_reserved / "profile.yaml").write_text("name: platform\n", encoding="utf-8")
+        (prof_reserved / "USER.md").write_text("# Platform\n", encoding="utf-8")
+
+        filler_series = "".join(
+            f'k8s_event_watcher_events_seen_total{{cluster="c1",reason="BackOff_{i:05d}"}} 1\n'
+            for i in range(18000)
+        )
+        metrics_body = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c1-us-central1"} 0\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 5\n'
+            'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
+            'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
+            + filler_series
+            + "# HELP k8s_event_watcher_watch_set_ready ready\n"
+            + "# TYPE k8s_event_watcher_watch_set_ready gauge\n"
+            + "k8s_event_watcher_watch_set_ready 1\n"
+        ).encode("utf-8")
+        self.assertGreater(len(metrics_body), credential_proxy.AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES)
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(metrics_body)))
+                self.end_headers()
+                self.wfile.write(metrics_body)
+
+            def log_message(self, _message, *_args):
+                return
+
+        metrics_srv = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        threading.Thread(target=metrics_srv.serve_forever, daemon=True).start()
+        self.addCleanup(metrics_srv.server_close)
+        self.addCleanup(metrics_srv.shutdown)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "EVENT_WATCHER_ENABLED": "true",
+                "EVENT_WATCHER_METRICS_PORT": str(metrics_srv.server_port),
+            },
+            clear=False,
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+
+        self.assertEqual("", self.received_authorization)
+        self.assertEqual("2026-11-26T06:00:00Z", data["resolved_at"])
+        self.assertTrue(data["present"])
+        self.assertTrue(data["boundary"])
+        self.assertEqual(2, len(data["projects"]))
+        self.assertEqual(
+            [
+                {
+                    "profile": "cluster-proj-host-c1-us-central1",
+                    "project": "proj-host",
+                    "cluster": "c1",
+                    "location": "us-central1",
+                    "ready": True,
+                },
+                {
+                    "profile": "cluster-proj-host-c2-us-east1",
+                    "project": "proj-host",
+                    "cluster": "c2",
+                    "location": "us-east1",
+                    "ready": False,
+                },
+            ],
+            data["profile_identities"],
+        )
+        watcher = data["event_watcher"]
+        self.assertTrue(watcher["enabled"])
+        self.assertTrue(watcher["reachable"])
+        self.assertTrue(watcher["watch_set_ready"])
+        self.assertEqual(1, watcher["clusters_up"])
+        self.assertEqual(2, watcher["clusters_total"])
+        self.assertEqual(1, watcher["discovery_errors"])
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):
