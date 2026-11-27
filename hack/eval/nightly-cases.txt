@@ -1960,7 +1960,7 @@
 # plants it: seeded-b's seeded-fail-closed-gate (role readiness-failclosed-webhook),
 # graded on one declared line plus the route check. `expected_fail: true`: the
 # collector's webhook shape skips a hook whose rules do not reach pod creation,
-# and the gate's one rule is on ConfigMaps, so no reading names it today (#2717);
+# and the gate's one rule is on ConfigMaps, so no reading names it today (#4545);
 # the nightly records EXPECTED_FAIL until the shape or the fixture changes.
 # deployer: noop; holds the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-failclosed-webhook/task.yaml
@@ -1978,7 +1978,7 @@
 # plants it: seeded-a's multi-process-worker Deployment (role
 # multi-process-container), graded on one declared line plus the route check.
 # `expected_fail: true`: the collector has no entry-15 shape ("not visible from
-# the spec") and the fixture never OOM-kills (#2717); the nightly records
+# the spec") and the fixture never OOM-kills (#4545); the nightly records
 # EXPECTED_FAIL until the shape lands. deployer: noop; holds the
 # `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-multi-process-container/task.yaml
@@ -1988,7 +1988,7 @@
 # policies nothing enforces, the cluster itself as the object (role
 # no-pdb-workload standing for the slot), graded on one declared line plus the
 # route check. `expected_fail: true`: the collector reads no NetworkPolicies and
-# has no entry-16 shape (#2717); the nightly records EXPECTED_FAIL until the
+# has no entry-16 shape (#4545); the nightly records EXPECTED_FAIL until the
 # shape lands. deployer: noop; holds the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-network-policy-enforcement/task.yaml
 
@@ -2003,7 +2003,7 @@
 # The retrospective's verdict on catalogue entry 10 in the shape the seeded fleet
 # plants it: seeded-a's stale-kubectl-client CronJob (role stale-client-skew),
 # graded on one declared line plus the route check. `expected_fail: true`: the
-# collector has no entry-10 shape or signature and the Job never fails (#2717);
+# collector has no entry-10 shape or signature and the Job never fails (#4545);
 # the nightly records EXPECTED_FAIL until the shape lands. deployer: noop; holds
 # the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-stale-client-skew/task.yaml
