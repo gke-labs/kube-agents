@@ -3643,6 +3643,9 @@ reservation.
   leased shared checkout this replaces for repository reads.
 - [`docs/designs/memory.md`](memory.md) — the document structure and the
   experiment format this follows.
+- [`docs/designs/pluggable-knowledge-backend.md`](pluggable-knowledge-backend.md) —
+  proposed broker and provider design for operational knowledge and agent output
+  stores, modeled on this seam.
 - [`docs/designs/live-test-lease.md`](live-test-lease.md) — how to take the
   install before validating any of this against it.
 - Issue #1154 — the GitLab/Bitbucket tracking issue.
