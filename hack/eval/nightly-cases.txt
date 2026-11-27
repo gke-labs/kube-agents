@@ -1506,8 +1506,8 @@
 # whose image pull the registry refuses, one through the node identity and one
 # through a named pull secret, graded on one finding of the check on each
 # reaching the ledger. The stack waits eleven minutes after the plant, since
-# the check names a pull only once it has failed for ten; priced at the 900s
-# audit band plus that wait. Not on the scored suite for the same wait.
+# the check names a pull only once it has failed for ten; priced at its
+# measured cost (unit_cost_hint). Not on the scored suite for the same wait.
 ./tasks/obtainability-image-pull-failing/task.yaml
 
 # The obtainability audit's sweep opens a pull request for a major finding
