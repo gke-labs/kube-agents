@@ -707,6 +707,80 @@ users:
                 with self.assertRaises(ValueError):
                     kubeconfig_with_token(broken, "POOL-TOKEN")
 
+    def test_kubeconfig_with_token_caches_identical_pairs_and_reuses_parsed_template_on_rotation(self):
+        import unittest.mock as mock
+        import yaml
+
+        scoped_sa_pool._parsed_kubeconfig_template.cache_clear()
+        scoped_sa_pool.kubeconfig_with_token.cache_clear()
+
+        with (
+            mock.patch.object(yaml, "safe_load", wraps=yaml.safe_load) as load_spy,
+            mock.patch.object(yaml, "safe_dump", wraps=yaml.safe_dump) as dump_spy,
+        ):
+            first = kubeconfig_with_token(self.GCLOUD_AUTHORED, "TOKEN-A")
+            second = kubeconfig_with_token(self.GCLOUD_AUTHORED, "TOKEN-A")
+            self.assertEqual(first, second)
+            self.assertEqual(1, load_spy.call_count)
+            self.assertEqual(1, dump_spy.call_count)
+
+            # Rotating the token reuses the parsed template without re-running yaml.safe_load
+            rotated = kubeconfig_with_token(self.GCLOUD_AUTHORED, "TOKEN-B")
+            self.assertNotEqual(first, rotated)
+            self.assertEqual(1, load_spy.call_count)
+            self.assertEqual(2, dump_spy.call_count)
+            self.assertEqual(
+                "TOKEN-B",
+                yaml.safe_load(rotated)["users"][0]["user"]["token"],
+            )
+
+    def test_kubeconfig_with_token_preserves_custom_keys_and_protects_cached_template(self):
+        import threading
+        import yaml
+
+        scoped_sa_pool._parsed_kubeconfig_template.cache_clear()
+        scoped_sa_pool.kubeconfig_with_token.cache_clear()
+
+        custom_template = (
+            self.GCLOUD_AUTHORED
+            + "preferences:\n  colors: true\nextensions:\n- name: custom-ext\n  extension:\n    nested: value\n"
+        )
+        out_a = yaml.safe_load(kubeconfig_with_token(custom_template, "TOKEN-1"))
+        out_b = yaml.safe_load(kubeconfig_with_token(custom_template, "TOKEN-2"))
+        self.assertEqual({"colors": True}, out_a["preferences"])
+        self.assertEqual([{"name": "custom-ext", "extension": {"nested": "value"}}], out_a["extensions"])
+        self.assertEqual(out_a["preferences"], out_b["preferences"])
+        self.assertEqual(out_a["extensions"], out_b["extensions"])
+        self.assertEqual("TOKEN-1", out_a["users"][0]["user"]["token"])
+        self.assertEqual("TOKEN-2", out_b["users"][0]["user"]["token"])
+        # The cached template document must still have empty users (no token leaked into the template)
+        cached_template, cached_names = scoped_sa_pool._parsed_kubeconfig_template(custom_template)
+        self.assertEqual([], cached_template["users"])
+        self.assertEqual(("gke_p_l_c",), cached_names)
+
+        # Concurrent calls with distinct tokens on the same template must never cross-contaminate
+        barrier = threading.Barrier(8)
+        results: dict[int, str] = {}
+        errors: list[Exception] = []
+
+        def render_worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                tok = f"CONCURRENT-TOKEN-{idx}"
+                doc = yaml.safe_load(kubeconfig_with_token(custom_template, tok))
+                results[idx] = doc["users"][0]["user"]["token"]
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=render_worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertEqual([], errors)
+        for i in range(8):
+            self.assertEqual(f"CONCURRENT-TOKEN-{i}", results[i])
+
 
 if __name__ == "__main__":
     unittest.main()

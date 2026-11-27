@@ -6331,26 +6331,28 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertLess(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, executor.kubectl_timeout_seconds)
 
     def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
-        # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
-        # A scaffold's fetch must not queue behind it to file a credential it
-        # already has; only the marker step is serialised, on its own lock.
+        # The broker's cold read holds the per-cluster kubeconfig lock across its
+        # gcloud runs. A scaffold's fetch must not queue behind either that
+        # cluster's lock or the guard lock to file a credential it already has;
+        # only the marker step is serialised, on its own lock.
         executor = self.fake_gcloud(self.executor())
-        executor._kubeconfig_lock.acquire()
-        try:
-            done = threading.Event()
+        with executor._hold_cluster_kubeconfig_lock(self.CONTEXT):
+            executor._kubeconfig_lock.acquire()
+            try:
+                done = threading.Event()
 
-            def run():
-                with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])):
-                    executor.execute(
-                        ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
-                         "--location=us-central1", "--project=demo-project"],
-                    )
-                done.set()
+                def run():
+                    with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])):
+                        executor.execute(
+                            ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                             "--location=us-central1", "--project=demo-project"],
+                        )
+                    done.set()
 
-            threading.Thread(target=run, daemon=True).start()
-            self.assertTrue(done.wait(timeout=10), "the caller's fetch waited on the kubeconfig lock")
-        finally:
-            executor._kubeconfig_lock.release()
+                threading.Thread(target=run, daemon=True).start()
+                self.assertTrue(done.wait(timeout=10), "the caller's fetch waited on the kubeconfig lock")
+            finally:
+                executor._kubeconfig_lock.release()
 
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the
@@ -24558,6 +24560,795 @@ class TeamsInboundCallerBindingTest(unittest.TestCase):
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
                 authenticator = credential_proxy.build_authenticator()
         self.assertNotIn(credential_proxy.CALLER_ROLE_TEAMS_INBOUND, authenticator.audience_roles.values())
+
+
+class ScopedKubeconfigAndClusterLockCacheTest(unittest.TestCase):
+    """Tests for stat-invalidated scoped kubeconfig caching, ambient target caching, and per-cluster locks."""
+
+    CONTEXT = CommandExecutorTest.CONTEXT
+    SECOND_CONTEXT = "gke_demo-project_us-central1_cluster-b"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def executor(self):
+        return CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=1024,
+            state_dir=self.temp_dir.name,
+            scoped_pool=None,
+        )
+
+    def fake_gcloud(self, executor):
+        return CommandExecutorTest.fake_gcloud(self, executor)
+
+    @staticmethod
+    def a_decision(flags, provisional=False):
+        return CommandExecutorTest.a_decision(flags, provisional=provisional)
+
+    def _scoped_executor(self, tokens_by_call=None, exclusions=None):
+        import scoped_sa_pool
+
+        pool_calls = []
+        tokens = list(tokens_by_call or ["SCOPED-TOKEN-1"])
+
+        def minter(account, lifetime):
+            idx = min(len(pool_calls), len(tokens) - 1)
+            tok = tokens[idx]
+            pool_calls.append((account, lifetime, tok))
+            return tok, 1_000_000_000.0
+
+        pool = scoped_sa_pool.ScopedServiceAccountPool(
+            {
+                "demo-project": scoped_sa_pool.PoolMember(
+                    project_id="demo-project",
+                    service_account="pool-sa@demo-project.iam.gserviceaccount.com",
+                )
+            },
+            minter=minter,
+            clock=lambda: 0.0,
+        )
+        kwargs = {
+            "timeout_seconds": 5,
+            "max_output_bytes": 1024,
+            "state_dir": self.temp_dir.name,
+            "scoped_pool": pool,
+        }
+        if exclusions is not None:
+            kwargs["exclusions"] = exclusions
+        executor = CommandExecutor(**kwargs)
+        return executor, pool, pool_calls
+
+    def _seed_full_managed(self, executor, context=None, server="https://10.0.0.1"):
+        context = context or self.CONTEXT
+        managed = executor.kubeconfig_dir / f"{context}.yaml"
+        prev_mtime_ns = managed.stat().st_mtime_ns if managed.exists() else None
+        managed.write_text(
+            f"apiVersion: v1\n"
+            f"kind: Config\n"
+            f"current-context: {context}\n"
+            f"clusters:\n"
+            f"- name: {context}\n"
+            f"  cluster:\n"
+            f"    server: {server}\n"
+            f"contexts:\n"
+            f"- name: {context}\n"
+            f"  context:\n"
+            f"    cluster: {context}\n"
+            f"    user: {context}\n"
+            f"users:\n"
+            f"- name: {context}\n"
+            f"  user:\n"
+            f"    exec:\n"
+            f"      command: gke-gcloud-auth-plugin\n",
+            encoding="utf-8",
+        )
+        if prev_mtime_ns is not None:
+            st = managed.stat()
+            if st.st_mtime_ns == prev_mtime_ns:
+                os.utime(managed, ns=(st.st_atime_ns, prev_mtime_ns + 1_000_000))
+        return managed
+
+    @staticmethod
+    def _overwrite_inplace_preserving_mtime(path: Path, payload: bytes) -> None:
+        orig = path.lstat()
+        deadline = time.monotonic() + 1.0
+        while True:
+            with path.open("r+b") as stream:
+                stream.write(payload)
+            os.utime(path, ns=(orig.st_atime_ns, orig.st_mtime_ns))
+            if path.lstat().st_ctime_ns != orig.st_ctime_ns:
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"st_ctime_ns did not advance for {path} after in-place rewrite"
+                )
+            time.sleep(0.002)
+
+    def test_kubeconfig_for_reuses_scoped_file_and_rewrites_on_token_or_base_or_file_change(self):
+        executor, pool, _ = self._scoped_executor(["TOKEN-1", "TOKEN-2"])
+        self._seed_full_managed(executor)
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+            scoped_path_1 = executor._kubeconfig_for(target)
+            self.assertEqual(1, replace_spy.call_count)
+            self.assertIn("TOKEN-1", scoped_path_1.read_text(encoding="utf-8"))
+
+            # Second call with unchanged managed kubeconfig and unchanged token skips disk rewrite
+            scoped_path_2 = executor._kubeconfig_for(target)
+            self.assertEqual(scoped_path_1, scoped_path_2)
+            self.assertEqual(1, replace_spy.call_count)
+
+            # Token rotation invalidates the cache and rewrites the scoped file
+            pool._tokens.clear()
+            scoped_path_3 = executor._kubeconfig_for(target)
+            self.assertEqual(2, replace_spy.call_count)
+            self.assertIn("TOKEN-2", scoped_path_3.read_text(encoding="utf-8"))
+
+            # Updating the managed kubeconfig invalidates the cache and rewrites the scoped file
+            self._seed_full_managed(executor, server="https://10.0.0.99")
+            scoped_path_4 = executor._kubeconfig_for(target)
+            self.assertEqual(3, replace_spy.call_count)
+            self.assertIn("https://10.0.0.99", scoped_path_4.read_text(encoding="utf-8"))
+
+            # Deleting the scoped file on disk forces regeneration and rewrite
+            scoped_path_4.unlink()
+            scoped_path_5 = executor._kubeconfig_for(target)
+            self.assertEqual(4, replace_spy.call_count)
+            self.assertTrue(scoped_path_5.is_file())
+            self.assertEqual(0o600, scoped_path_5.stat().st_mode & 0o777)
+
+            # Weakened permissions on the scoped file force a fresh 0600 rewrite
+            scoped_path_5.chmod(0o644)
+            scoped_path_6 = executor._kubeconfig_for(target)
+            self.assertEqual(5, replace_spy.call_count)
+            self.assertEqual(0o600, scoped_path_6.stat().st_mode & 0o777)
+
+    def test_kubeconfig_for_refuses_excluded_or_held_cluster_even_when_scoped_cache_is_warm(self):
+        import scope_exclude
+
+        scope_file = Path(self.temp_dir.name) / "scope.json"
+        hold_file = Path(self.temp_dir.name) / "hold.json"
+        empty_scope = {"present": True, "projects": [], "exclude": {"projects": [], "clusters": []}}
+        scope_file.write_text(json.dumps(empty_scope), encoding="utf-8")
+        hold_file.write_text(json.dumps({}), encoding="utf-8")
+
+        exclusions = scope_exclude.Exclusions(
+            path=lambda: str(scope_file),
+            holds=scope_exclude.Holds(path=lambda: str(hold_file)),
+        )
+        executor, _, _ = self._scoped_executor(["TOKEN-1"], exclusions=exclusions)
+        self._seed_full_managed(executor)
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        # Warm the scoped kubeconfig cache while the cluster is permitted
+        scoped_path = executor._kubeconfig_for(target)
+        self.assertIn(self.CONTEXT, executor._scoped_kubeconfig_cache)
+
+        # Excluding the cluster must refuse immediately even with a warm cache
+        excluded_doc = {
+            "present": True,
+            "projects": [],
+            "exclude": {
+                "projects": [],
+                "clusters": [
+                    {
+                        "projectId": target.project,
+                        "location": target.location,
+                        "clusterName": target.cluster,
+                    }
+                ],
+            },
+        }
+        scope_file.write_text(json.dumps(excluded_doc), encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000
+        os.utime(scope_file, ns=(stamp, stamp))
+        with self.assertRaises(scope_exclude.ExcludedCluster):
+            executor._kubeconfig_for(target)
+
+        # Lifting the exclusion resumes serving the cached scoped file without rewriting
+        scope_file.write_text(json.dumps(empty_scope), encoding="utf-8")
+        stamp += 1_000_000
+        os.utime(scope_file, ns=(stamp, stamp))
+        with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+            self.assertEqual(scoped_path, executor._kubeconfig_for(target))
+            self.assertEqual(0, replace_spy.call_count)
+
+        # Placing a spec.hold on the cluster must refuse immediately even with a warm cache
+        held_doc = {
+            "clusters": [
+                {
+                    "projectId": target.project,
+                    "location": target.location,
+                    "clusterName": target.cluster,
+                }
+            ],
+            "reason": "INC-99",
+        }
+        hold_file.write_text(json.dumps(held_doc), encoding="utf-8")
+        stamp += 1_000_000
+        os.utime(hold_file, ns=(stamp, stamp))
+        with self.assertRaises(scope_exclude.HeldCluster):
+            executor._kubeconfig_for(target)
+
+    def test_ambient_target_caches_by_stat_and_invalidates_when_kubeconfig_changes(self):
+        executor = self.executor()
+        executor.host_context = ""
+        ambient_kc = Path(executor.environment["KUBECONFIG"])
+        ambient_kc.parent.mkdir(parents=True, exist_ok=True)
+        ambient_kc.write_text(
+            f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            credential_proxy,
+            "read_current_context",
+            wraps=credential_proxy.read_current_context,
+        ) as read_ctx_spy:
+            t1 = executor._ambient_target()
+            t2 = executor._ambient_target()
+            self.assertIsNotNone(t1)
+            self.assertEqual(self.CONTEXT, t1.context_name)
+            self.assertEqual(t1, t2)
+            self.assertEqual(1, read_ctx_spy.call_count)
+
+            # Updating the ambient KUBECONFIG invalidates the cache
+            prev_mtime_ns = ambient_kc.stat().st_mtime_ns
+            ambient_kc.write_text(
+                f"apiVersion: v1\nkind: Config\ncurrent-context: {self.SECOND_CONTEXT}\n",
+                encoding="utf-8",
+            )
+            st = ambient_kc.stat()
+            if st.st_mtime_ns == prev_mtime_ns:
+                os.utime(ambient_kc, ns=(st.st_atime_ns, prev_mtime_ns + 1_000_000))
+            t3 = executor._ambient_target()
+            self.assertIsNotNone(t3)
+            self.assertEqual(self.SECOND_CONTEXT, t3.context_name)
+            self.assertEqual(2, read_ctx_spy.call_count)
+
+            # Revoking read permissions clears the cached target and returns None
+            ambient_kc.chmod(0o000)
+            try:
+                self.assertIsNone(executor._ambient_target())
+                self.assertIsNone(executor._ambient_target_cache)
+            finally:
+                ambient_kc.chmod(0o600)
+
+            # Deleting the ambient KUBECONFIG clears the cached target and returns None
+            self.assertIsNotNone(executor._ambient_target())
+            ambient_kc.unlink()
+            self.assertIsNone(executor._ambient_target())
+            self.assertIsNone(executor._ambient_target_cache)
+
+    def test_kubeconfig_for_concurrent_token_rotation_never_leaves_stale_token_on_disk(self):
+        executor, pool, _ = self._scoped_executor(["OLD-TOKEN", "NEW-TOKEN"])
+        self._seed_full_managed(executor)
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        # Ordering 1: Thread A fetches OLD-TOKEN on the fast path and pauses before
+        # acquiring the per-cluster scoped lock while Thread B rotates to NEW-TOKEN
+        # and completes _kubeconfig_for.
+        real_hold_scoped_lock = executor._hold_cluster_scoped_lock
+        thread_a_paused = threading.Event()
+        thread_b_finished = threading.Event()
+        paused_once = False
+
+        @contextlib.contextmanager
+        def paused_hold_scoped_lock(context_name):
+            nonlocal paused_once
+            if not paused_once:
+                paused_once = True
+                thread_a_paused.set()
+                thread_b_finished.wait(timeout=5)
+            with real_hold_scoped_lock(context_name):
+                yield
+
+        errors = []
+
+        def run_thread_a():
+            try:
+                executor._kubeconfig_for(target)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with mock.patch.object(
+            executor, "_hold_cluster_scoped_lock", side_effect=paused_hold_scoped_lock
+        ):
+            t_a = threading.Thread(target=run_thread_a)
+            t_a.start()
+            self.assertTrue(thread_a_paused.wait(timeout=5))
+
+            # Rotate token in the pool and let Thread B complete _kubeconfig_for
+            pool._tokens.clear()
+            scoped_path = executor._kubeconfig_for(target)
+            self.assertIn("NEW-TOKEN", scoped_path.read_text(encoding="utf-8"))
+            thread_b_finished.set()
+            t_a.join(timeout=5)
+
+        self.assertEqual([], errors)
+        final_text = scoped_path.read_text(encoding="utf-8")
+        self.assertIn("NEW-TOKEN", final_text)
+        self.assertNotIn("OLD-TOKEN", final_text)
+        self.assertEqual("NEW-TOKEN", executor._scoped_kubeconfig_cache[self.CONTEXT][0][-1])
+
+        # Ordering 2: Thread A fetches a token, then pauses inside _ensure_managed_kubeconfig
+        # (both when the cache is cold and when it is already warm) while Thread B rotates
+        # the token and completes _kubeconfig_for. Thread A must never overwrite the newer token.
+        for warm_first, token_seq in (
+            (False, ["COLD-OLD-TOKEN", "COLD-NEW-TOKEN"]),
+            (True, ["WARM-BASE-TOKEN", "WARM-OLD-TOKEN", "WARM-NEW-TOKEN"]),
+        ):
+            with self.subTest(warm_first=warm_first):
+                ex2, pool2, _ = self._scoped_executor(token_seq)
+                self._seed_full_managed(ex2)
+                if warm_first:
+                    ex2._kubeconfig_for(target)
+                    pool2._tokens.clear()
+                real_ensure = ex2._ensure_managed_kubeconfig
+                paused = threading.Event()
+                b_done = threading.Event()
+                first_call = True
+                sub_errors = []
+
+                def paused_ensure(t):
+                    nonlocal first_call
+                    res = real_ensure(t)
+                    if first_call:
+                        first_call = False
+                        paused.set()
+                        b_done.wait(timeout=5)
+                    return res
+
+                def run_slow_a():
+                    try:
+                        ex2._kubeconfig_for(target)
+                    except Exception as exc:  # pragma: no cover
+                        sub_errors.append(exc)
+
+                expected_new = token_seq[-1]
+                expected_old = token_seq[-2]
+                with mock.patch.object(
+                    ex2, "_ensure_managed_kubeconfig", side_effect=paused_ensure
+                ):
+                    t_slow = threading.Thread(target=run_slow_a)
+                    t_slow.start()
+                    self.assertTrue(paused.wait(timeout=5))
+                    pool2._tokens.clear()
+                    scoped_b = ex2._kubeconfig_for(target)
+                    self.assertIn(expected_new, scoped_b.read_text(encoding="utf-8"))
+                    b_done.set()
+                    t_slow.join(timeout=5)
+
+                self.assertEqual([], sub_errors)
+                disk_text = scoped_b.read_text(encoding="utf-8")
+                self.assertIn(expected_new, disk_text)
+                self.assertNotIn(expected_old, disk_text)
+                self.assertEqual(expected_new, ex2._scoped_kubeconfig_cache[self.CONTEXT][0][-1])
+
+    def test_usable_managed_kubeconfig_stat_returns_none_mtime_for_empty_file(self):
+        executor = self.executor()
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        marker = executor._provisional_marker(target)
+        managed.write_text("", encoding="utf-8")
+        usable, seen_mtime_ns = executor._usable_managed_kubeconfig_stat(managed, marker)
+        self.assertFalse(usable)
+        self.assertIsNone(seen_mtime_ns)
+
+    def test_kubeconfig_for_invalidates_on_inplace_preserved_mtime_symlink_special_mode_truncate_and_chmod(self):
+        import stat as stat_mod
+
+        executor, _, _ = self._scoped_executor(["TOKEN-1"])
+        managed = self._seed_full_managed(executor)
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        scoped_path = executor._kubeconfig_for(target)
+        original_text = scoped_path.read_text(encoding="utf-8")
+        self.assertIn("TOKEN-1", original_text)
+
+        # (a) In-place same-size edit with preserved mtime_ns must invalidate via st_ctime_ns
+        orig_stat = scoped_path.lstat()
+        tampered_text = original_text.replace("TOKEN-1", "HACKED1")
+        self.assertEqual(len(original_text), len(tampered_text))
+        self._overwrite_inplace_preserving_mtime(scoped_path, tampered_text.encode("utf-8"))
+        after_stat = scoped_path.lstat()
+        self.assertEqual(orig_stat.st_ino, after_stat.st_ino)
+        self.assertEqual(orig_stat.st_size, after_stat.st_size)
+        self.assertEqual(orig_stat.st_mtime_ns, after_stat.st_mtime_ns)
+        self.assertNotEqual(orig_stat.st_ctime_ns, after_stat.st_ctime_ns)
+        with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+            executor._kubeconfig_for(target)
+            self.assertEqual(1, replace_spy.call_count)
+        self.assertIn("TOKEN-1", scoped_path.read_text(encoding="utf-8"))
+        self.assertNotIn("HACKED1", scoped_path.read_text(encoding="utf-8"))
+
+        # (b) Replacing .scoped.yaml with a symlink to a 0600 file must be rejected by lstat()
+        decoy = Path(self.temp_dir.name) / "decoy.yaml"
+        os.replace(scoped_path, decoy)
+        decoy.chmod(0o600)
+        scoped_path.symlink_to(decoy)
+        self.assertTrue(scoped_path.is_symlink())
+        with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+            executor._kubeconfig_for(target)
+            self.assertEqual(1, replace_spy.call_count)
+        self.assertFalse(scoped_path.is_symlink())
+        self.assertEqual(0o600, stat_mod.S_IMODE(scoped_path.lstat().st_mode))
+
+        # (c) Special mode bits (sticky 0o1600), truncation to 0 bytes, and 0o000 force rewrite
+        scoped_path.chmod(0o1600)
+        with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+            executor._kubeconfig_for(target)
+            self.assertEqual(1, replace_spy.call_count)
+        self.assertEqual(0o600, stat_mod.S_IMODE(scoped_path.lstat().st_mode))
+
+        scoped_path.write_text("", encoding="utf-8")
+        with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+            executor._kubeconfig_for(target)
+            self.assertEqual(1, replace_spy.call_count)
+        self.assertIn("TOKEN-1", scoped_path.read_text(encoding="utf-8"))
+
+        scoped_path.chmod(0o000)
+        try:
+            with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+                executor._kubeconfig_for(target)
+                self.assertEqual(1, replace_spy.call_count)
+            self.assertEqual(0o600, stat_mod.S_IMODE(scoped_path.lstat().st_mode))
+        finally:
+            if scoped_path.exists():
+                scoped_path.chmod(0o600)
+
+        # (d) Making the managed kubeconfig unreadable must bypass the warm cache
+        # and (for non-root callers) fail closed with PermissionError
+        managed.chmod(0o000)
+        try:
+            if os.geteuid() != 0:
+                with self.assertRaises(PermissionError):
+                    executor._kubeconfig_for(target)
+            else:
+                with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+                    executor._kubeconfig_for(target)
+                    self.assertEqual(1, replace_spy.call_count)
+            self.assertNotIn(self.CONTEXT, executor._scoped_kubeconfig_cache)
+        finally:
+            managed.chmod(0o600)
+
+    def test_kubeconfig_for_slow_token_mint_does_not_block_unrelated_warm_cluster_and_mints_once(self):
+        import scoped_sa_pool
+
+        mint_counts = {"proj-a": 0, "proj-b": 0}
+        count_lock = threading.Lock()
+
+        def minter(account, lifetime):
+            if "proj-a" in account:
+                with count_lock:
+                    mint_counts["proj-a"] += 1
+                # Return expiry inside REFRESH_MARGIN_SECONDS to prove miss does not double-mint
+                return "TOKEN-A", 10.0
+            with count_lock:
+                mint_counts["proj-b"] += 1
+            return "TOKEN-B", 1_000_000_000.0
+
+        pool = scoped_sa_pool.ScopedServiceAccountPool(
+            {
+                "proj-a": scoped_sa_pool.PoolMember(
+                    project_id="proj-a",
+                    service_account="sa@proj-a.iam.gserviceaccount.com",
+                ),
+                "proj-b": scoped_sa_pool.PoolMember(
+                    project_id="proj-b",
+                    service_account="sa@proj-b.iam.gserviceaccount.com",
+                ),
+            },
+            minter=minter,
+            clock=lambda: 0.0,
+        )
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=1024,
+            state_dir=self.temp_dir.name,
+            scoped_pool=pool,
+        )
+        ctx_a = "gke_proj-a_us-central1_cluster-a"
+        ctx_b = "gke_proj-b_us-central1_cluster-b"
+        self._seed_full_managed(executor, context=ctx_a)
+        self._seed_full_managed(executor, context=ctx_b)
+        target_a = credential_proxy.parse_gke_context(ctx_a)
+        target_b = credential_proxy.parse_gke_context(ctx_b)
+
+        # Warm cluster B first
+        executor._kubeconfig_for(target_b)
+        self.assertEqual(1, mint_counts["proj-b"])
+
+        # Phase 1: block inside token_for() for proj-a (outside pool._lock so proj-b stays fast)
+        # Phase 2: block inside kubeconfig_with_token() for proj-a (inside _hold_cluster_scoped_lock)
+        rpc_started = threading.Event()
+        release_rpc = threading.Event()
+        render_started = threading.Event()
+        release_render = threading.Event()
+        real_token_for = pool.token_for
+        real_render = scoped_sa_pool.kubeconfig_with_token
+
+        def slow_token_for(project, location, cluster):
+            if project == "proj-a":
+                rpc_started.set()
+                release_rpc.wait(timeout=5)
+            return real_token_for(project, location, cluster)
+
+        def slow_render(text, token):
+            if token == "TOKEN-A":
+                render_started.set()
+                release_render.wait(timeout=5)
+            return real_render(text, token)
+
+        errors = []
+
+        def run_a():
+            try:
+                executor._kubeconfig_for(target_a)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        with (
+            mock.patch.object(pool, "token_for", side_effect=slow_token_for),
+            mock.patch.object(scoped_sa_pool, "kubeconfig_with_token", side_effect=slow_render),
+        ):
+            thread_a = threading.Thread(target=run_a)
+            thread_a.start()
+            self.assertTrue(rpc_started.wait(timeout=5))
+
+            # Cluster B warm hit must complete immediately while Cluster A is blocked in token_for()
+            start = time.monotonic()
+            with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+                scoped_b = executor._kubeconfig_for(target_b)
+                self.assertEqual(0, replace_spy.call_count)
+            self.assertTrue(scoped_b.is_file())
+            self.assertLess(time.monotonic() - start, 1.0)
+
+            release_rpc.set()
+            self.assertTrue(render_started.wait(timeout=5))
+
+            # Cluster B warm hit must also complete immediately while Cluster A holds its scoped lock
+            start = time.monotonic()
+            with mock.patch.object(os, "replace", wraps=os.replace) as replace_spy:
+                scoped_b2 = executor._kubeconfig_for(target_b)
+                self.assertEqual(0, replace_spy.call_count)
+            self.assertEqual(scoped_b, scoped_b2)
+            self.assertLess(time.monotonic() - start, 1.0)
+
+            release_render.set()
+            thread_a.join(timeout=5)
+
+        self.assertEqual([], errors)
+        # Single-threaded miss on proj-a minted only once despite expiry inside REFRESH_MARGIN_SECONDS
+        self.assertEqual(1, mint_counts["proj-a"])
+
+    def test_scoped_cache_and_cluster_locks_evict_bounded_without_breaking_mutual_exclusion(self):
+        executor, _, _ = self._scoped_executor(["TOKEN-1"])
+        limit = credential_proxy._MAX_KUBECONFIG_CACHE_ENTRIES
+
+        # Fill scoped cache past limit and verify size remains bounded
+        for idx in range(limit + 10):
+            ctx = f"gke_demo-project_us-central1_c-{idx}"
+            self._seed_full_managed(executor, context=ctx)
+            executor._kubeconfig_for(credential_proxy.parse_gke_context(ctx))
+        self.assertLessEqual(len(executor._scoped_kubeconfig_cache), limit)
+
+        # Verify refcounted per-cluster lock eviction never breaks mutual exclusion
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        waiter_entered = threading.Event()
+        concurrent_violation = False
+
+        def holder():
+            with executor._hold_cluster_kubeconfig_lock("ctx-hot"):
+                holder_entered.set()
+                release_holder.wait(timeout=5)
+
+        def waiter():
+            nonlocal concurrent_violation
+            with executor._hold_cluster_kubeconfig_lock("ctx-hot"):
+                if not release_holder.is_set():
+                    concurrent_violation = True
+                waiter_entered.set()
+
+        t_holder = threading.Thread(target=holder)
+        t_holder.start()
+        self.assertTrue(holder_entered.wait(timeout=5))
+
+        # Populate > limit idle locks while ctx-hot is actively held
+        for idx in range(limit + 15):
+            with executor._hold_cluster_kubeconfig_lock(f"ctx-idle-{idx}"):
+                pass
+        self.assertIn("ctx-hot", executor._cluster_kubeconfig_locks)
+
+        # Start a waiter on ctx-hot; it must wait until holder releases
+        t_waiter = threading.Thread(target=waiter)
+        t_waiter.start()
+        time.sleep(0.05)
+        self.assertFalse(waiter_entered.is_set())
+
+        release_holder.set()
+        t_holder.join(timeout=5)
+        t_waiter.join(timeout=5)
+        self.assertTrue(waiter_entered.is_set())
+        self.assertFalse(concurrent_violation)
+        self.assertLessEqual(len(executor._cluster_kubeconfig_locks), limit)
+
+    def test_warm_ambient_target_cache_still_enforces_exclusions_and_hold_on_no_pool_execute(self):
+        import scope_exclude
+
+        scope_file = Path(self.temp_dir.name) / "scope.json"
+        hold_file = Path(self.temp_dir.name) / "hold.json"
+        empty_scope = {"present": True, "projects": [], "exclude": {"projects": [], "clusters": []}}
+        scope_file.write_text(json.dumps(empty_scope), encoding="utf-8")
+        hold_file.write_text(json.dumps({}), encoding="utf-8")
+
+        exclusions = scope_exclude.Exclusions(
+            path=lambda: str(scope_file),
+            holds=scope_exclude.Holds(path=lambda: str(hold_file)),
+        )
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=1024,
+            state_dir=self.temp_dir.name,
+            scoped_pool=None,
+            exclusions=exclusions,
+        )
+        executor.host_context = ""
+        stub_kubectl = Path(self.temp_dir.name) / "kubectl"
+        stub_kubectl.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+        stub_kubectl.chmod(0o755)
+        executor.executables["kubectl"] = str(stub_kubectl)
+
+        ambient_kc = Path(executor.environment["KUBECONFIG"])
+        ambient_kc.parent.mkdir(parents=True, exist_ok=True)
+        ambient_kc.write_text(
+            f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n",
+            encoding="utf-8",
+        )
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        # Warm the ambient target cache with a permitted no-pool execute()
+        res = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, res.exit_code)
+        self.assertIsNotNone(executor._ambient_target_cache)
+
+        # Excluding the cluster must refuse even with a warm _ambient_target_cache
+        excluded_doc = {
+            "present": True,
+            "projects": [],
+            "exclude": {
+                "projects": [],
+                "clusters": [
+                    {
+                        "projectId": target.project,
+                        "location": target.location,
+                        "clusterName": target.cluster,
+                    }
+                ],
+            },
+        }
+        scope_file.write_text(json.dumps(excluded_doc), encoding="utf-8")
+        stamp = time.time_ns() + 1_000_000
+        os.utime(scope_file, ns=(stamp, stamp))
+        with self.assertRaises(scope_exclude.ExcludedCluster):
+            executor.execute(["kubectl", "get", "pods"])
+
+        # Lifting exclusion and placing a spec.hold must refuse with HeldCluster
+        scope_file.write_text(json.dumps(empty_scope), encoding="utf-8")
+        stamp += 1_000_000
+        os.utime(scope_file, ns=(stamp, stamp))
+        hold_file.write_text(
+            json.dumps(
+                {
+                    "clusters": [
+                        {
+                            "projectId": target.project,
+                            "location": target.location,
+                            "clusterName": target.cluster,
+                        }
+                    ],
+                    "reason": "INC-101",
+                }
+            ),
+            encoding="utf-8",
+        )
+        stamp += 1_000_000
+        os.utime(hold_file, ns=(stamp, stamp))
+        with self.assertRaises(scope_exclude.HeldCluster):
+            executor.execute(["kubectl", "get", "pods"])
+
+    def test_lazy_attr_initialization_on_uninitialized_executor_is_thread_safe(self):
+        bare = CommandExecutor.__new__(CommandExecutor)
+        barrier = threading.Barrier(8)
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            barrier.wait(timeout=5)
+            lock = bare._ensure_lazy_attr("_kubeconfig_lock", threading.Lock)
+            with results_lock:
+                results.append(id(lock))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertEqual(8, len(results))
+        self.assertEqual(1, len(set(results)))
+
+    def test_ensure_managed_kubeconfig_per_cluster_locks_coalesce_same_cluster_and_parallelize_distinct_clusters(self):
+        executor = self.fake_gcloud(self.executor())
+        target_a = credential_proxy.parse_gke_context(self.CONTEXT)
+        target_b = credential_proxy.parse_gke_context(self.SECOND_CONTEXT)
+        original_execute = executor._execute
+
+        active_fetches = 0
+        max_concurrent_fetches = 0
+        fetches_by_cluster: dict[str, int] = {"cluster-a": 0, "cluster-b": 0}
+        state_lock = threading.Lock()
+        both_clusters_entered = threading.Barrier(2, timeout=5)
+
+        def slow_execute(argv, **kwargs):
+            nonlocal active_fetches, max_concurrent_fetches
+            if "get-credentials" in argv and "--help" not in argv:
+                cluster_name = "cluster-a" if "cluster-a" in argv else "cluster-b"
+                with state_lock:
+                    fetches_by_cluster[cluster_name] += 1
+                    active_fetches += 1
+                    if active_fetches > max_concurrent_fetches:
+                        max_concurrent_fetches = active_fetches
+                try:
+                    # Wait briefly on barrier so cluster-a and cluster-b prove parallel execution
+                    try:
+                        both_clusters_entered.wait(timeout=1.0)
+                    except threading.BrokenBarrierError:
+                        pass
+                    time.sleep(0.05)
+                    return original_execute(argv, **kwargs)
+                finally:
+                    with state_lock:
+                        active_fetches -= 1
+            return original_execute(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])),
+            mock.patch.object(executor, "_execute", slow_execute),
+        ):
+            results = []
+            errors = []
+
+            def worker(target):
+                try:
+                    results.append(executor._ensure_managed_kubeconfig(target))
+                except Exception as exc:  # pragma: no cover
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=worker, args=(target_a,)),
+                threading.Thread(target=worker, args=(target_a,)),
+                threading.Thread(target=worker, args=(target_b,)),
+                threading.Thread(target=worker, args=(target_b,)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual(4, len(results))
+        # Same-cluster requests coalesced (1 fetch for cluster-a, 1 fetch for cluster-b)
+        self.assertEqual({"cluster-a": 1, "cluster-b": 1}, fetches_by_cluster)
+        # Distinct clusters ran in parallel without a single global lock serializing them
+        self.assertGreaterEqual(max_concurrent_fetches, 2)
 
 
 if __name__ == "__main__":
