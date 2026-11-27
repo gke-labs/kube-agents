@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"iter"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
 	"google.golang.org/genai"
 
+	"github.com/go-steer/core-agent/v3/pkg/models"
 	"github.com/go-steer/core-models/llm"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
@@ -86,6 +88,52 @@ func TestALongConversationStaysUnderTheCap(t *testing.T) {
 	}
 	if largest > 4*over {
 		t.Errorf("the envelope reached %d bytes; with compaction past %d it should stay within a few turns of it", largest, over)
+	}
+}
+
+// sideCallRecorder is bigModel that records the side-call name of each
+// request's context ("" for the turn's own requests).
+type sideCallRecorder struct {
+	bigModel
+	names []string
+}
+
+func (m *sideCallRecorder) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
+	m.mu.Lock()
+	m.names = append(m.names, models.SideCallName(ctx))
+	m.mu.Unlock()
+	return m.bigModel.GenerateContent(ctx, req, stream)
+}
+
+// The request that compacts the history goes out as a side call, the mark
+// buildModel's sideCallsWithoutBuiltins keys on to send it with no
+// server-side tools (TestASideCallCarriesNoServerSideTool).
+func TestTheCompactionRequestIsASideCall(t *testing.T) {
+	m := &sideCallRecorder{}
+	withModel(t, m)
+	history := make([]json.RawMessage, 0, 64)
+	for i := 0; i < 64; i++ {
+		ev, _ := json.Marshal(map[string]any{"author": "user", "content": map[string]any{"role": "user", "parts": []map[string]string{{"text": strings.Repeat("words ", 400)}}}})
+		history = append(history, ev)
+	}
+	in, _ := json.Marshal(coreagentwire.Envelope{History: history, Message: "go on"})
+	var out, errOut bytes.Buffer
+	if code := run(context.Background(), []string{"--model", "m", "--compact-over-bytes", "16384"}, bytes.NewReader(in), &out, &errOut); code != 0 {
+		t.Fatalf("exit %d: %s %s", code, out.String(), errOut.String())
+	}
+	compacted := false
+	for _, l := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev coreagentwire.Event
+		if err := json.Unmarshal([]byte(l), &ev); err != nil {
+			t.Fatal(err)
+		}
+		compacted = compacted || (ev.Type == coreagentwire.TypeEvent && coreagentwire.IsHistoryBoundary(ev.Event))
+	}
+	if !compacted {
+		t.Fatalf("the turn did not compact: %s", out.String())
+	}
+	if !slices.Contains(m.names, "summarizer") {
+		t.Errorf("no request went out as the summarizer side call; side-call names %q", m.names)
 	}
 }
 
