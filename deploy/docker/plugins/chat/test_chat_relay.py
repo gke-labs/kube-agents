@@ -768,6 +768,53 @@ class TestRelayRefusesProxy(unittest.TestCase):
         )
 
 
+class TestRelayRefusesRedirect(unittest.TestCase):
+    """The request carries the Session KV key. urllib sends a POST again as a GET
+    for a 301, 302 or 303 answer, with the same `Authorization` header."""
+
+    def _serve(self, handler) -> str:
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/v1/cron-reports"
+
+    def test_a_redirect_answer_is_a_failure_and_the_key_goes_nowhere_else(self):
+        seen_elsewhere = []
+
+        class Elsewhere(BaseHTTPRequestHandler):
+            def _answer(self):
+                seen_elsewhere.append((self.command, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815 - the stdlib's names
+
+            def log_message(self, *args):
+                pass
+
+        elsewhere = self._serve(Elsewhere)
+        for status in (301, 302, 303):
+            with self.subTest(status=status):
+
+                class Redirect(BaseHTTPRequestHandler):
+                    def do_POST(self):  # noqa: N802 - the stdlib's name
+                        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                        self.send_response(status)
+                        self.send_header("Location", elsewhere)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+
+                    def log_message(self, *args):
+                        pass
+
+                answer = mod._post(self._serve(Redirect), {"report": "r"}, "k")
+                self.assertEqual(seen_elsewhere, [])
+                self.assertEqual(answer, (f"chat relay answered HTTP {status}", {}))
+
+
 class TestSiblingDeliveryTargets(unittest.TestCase):
     """Which platforms the scheduler is posting this same report to itself.
 
