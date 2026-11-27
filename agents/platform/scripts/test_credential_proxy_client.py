@@ -4417,6 +4417,167 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
 
 
+class LoopbackKubeProxyKubeconfigTest(unittest.TestCase):
+    """A profile worker's `KUBE_PROXY_URL` is its adapter's loopback proxy, plain http on
+    127.0.0.1, which attaches the credentials itself. The kubeconfig for it names no CA and
+    no token file; every other URL, plain http to another host included, gets both."""
+
+    LOOPBACK_URL = "http://127.0.0.1:41873"
+    HTTPS_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+    NOT_LOOPBACK = (
+        HTTPS_URL,
+        "https://127.0.0.1:8443",
+        "http://kube-proxy.kubeagents-system.svc:8443",
+        "http://127.0.0.2:8443",
+        "http://localhost:8443",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8443/prefix",
+        "http://127.0.0.1:8443@elsewhere",
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.kubeconfig = self.root / ".kubeconfig"
+
+    def build(self, proxy_url, context=None):
+        import yaml
+
+        return yaml.safe_load(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                context or self.HOST_CTX, proxy_url=proxy_url, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            )
+        )
+
+    def merge(self, proxy_url):
+        import yaml
+
+        credential_proxy_client._merge_context_into_kubeconfig_file(
+            self.kubeconfig, self.TARGET_CTX, proxy_url, self.CA_FILE, self.TOKEN_FILE
+        )
+        return yaml.safe_load(self.kubeconfig.read_text(encoding="utf-8"))
+
+    def test_the_loopback_kubeconfig_names_no_ca_and_no_token_file(self):
+        doc = self.build(self.LOOPBACK_URL)
+        self.assertEqual(
+            [{"name": self.HOST_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.HOST_CTX}"}}],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+
+    def test_everything_else_in_the_loopback_kubeconfig_is_as_for_any_proxy(self):
+        loopback, https = self.build(self.LOOPBACK_URL), self.build(self.HTTPS_URL)
+        for key in ("apiVersion", "kind", "contexts", "current-context"):
+            self.assertEqual(https[key], loopback[key], key)
+        self.assertEqual(self.HOST_CTX, loopback["current-context"])
+
+    def test_a_trailing_slash_on_the_loopback_url_changes_nothing(self):
+        with patch.dict(os.environ, {"KUBE_PROXY_URL": self.LOOPBACK_URL + "/"}):
+            import yaml
+
+            doc = yaml.safe_load(credential_proxy_client.build_kube_proxy_kubeconfig(self.HOST_CTX))
+        self.assertEqual({"server": f"{self.LOOPBACK_URL}/clusters/{self.HOST_CTX}"}, doc["clusters"][0]["cluster"])
+        self.assertEqual({}, doc["users"][0]["user"])
+
+    def test_any_other_url_keeps_the_ca_and_the_token_file(self):
+        for proxy_url in self.NOT_LOOPBACK:
+            with self.subTest(proxy_url=proxy_url):
+                self.assertFalse(credential_proxy_client._is_kube_proxy_loopback(proxy_url))
+                doc = self.build(proxy_url)
+                self.assertEqual(self.CA_FILE, doc["clusters"][0]["cluster"]["certificate-authority"])
+                self.assertEqual({"tokenFile": self.TOKEN_FILE}, doc["users"][0]["user"])
+
+    def test_a_merge_for_the_loopback_writes_no_ca_and_no_token_file(self):
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.LOOPBACK_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        doc = self.merge(self.LOOPBACK_URL)
+        self.assertEqual(
+            [
+                {"name": self.HOST_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.HOST_CTX}"}},
+                {"name": self.TARGET_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.TARGET_CTX}"}},
+            ],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+        self.assertEqual(self.HOST_CTX, doc["current-context"], "a merge never moves the current context")
+        self.assertEqual([self.HOST_CTX, self.TARGET_CTX], [c["name"] for c in doc["contexts"]])
+
+    def test_a_second_merge_for_the_loopback_finds_the_context_current(self):
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.LOOPBACK_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        self.merge(self.LOOPBACK_URL)
+        before = self.kubeconfig.read_bytes()
+        self.merge(self.LOOPBACK_URL)
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_a_merge_for_the_loopback_replaces_an_entry_that_named_a_ca_and_a_token_file(self):
+        """A kubeconfig written for an https proxy, then merged for the loopback: the context's
+        cluster loses its CA and the shared user its token file."""
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.TARGET_CTX, proxy_url=self.HTTPS_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        doc = self.merge(self.LOOPBACK_URL)
+        self.assertEqual(
+            [{"name": self.TARGET_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.TARGET_CTX}"}}],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+
+    def test_a_merge_for_any_other_url_keeps_the_ca_and_the_token_file(self):
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.HTTPS_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        doc = self.merge(self.HTTPS_URL)
+        for cluster in doc["clusters"]:
+            self.assertEqual(self.CA_FILE, cluster["cluster"]["certificate-authority"])
+        self.assertEqual(
+            [{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {"tokenFile": self.TOKEN_FILE}}],
+            doc["users"],
+        )
+
+    def test_a_bare_kubectl_in_a_task_reads_the_host_context_the_adapter_names(self):
+        """The wrapper has the client make the default kubeconfig when there is none; its current
+        context is `KUBE_PROXY_HOST_CONTEXT`, which the worker adapter sets to the task's target."""
+        home_config = self.root / "home" / ".kube" / "config"
+        home_config.parent.parent.mkdir()
+        environ = {
+            "KUBE_PROXY_URL": self.LOOPBACK_URL,
+            "KUBE_PROXY_HOST_CONTEXT": self.TARGET_CTX,
+            "CREDENTIAL_PROXY_TOKEN_FILE": self.TOKEN_FILE,
+        }
+        with patch.dict(os.environ, environ), \
+                patch.object(credential_proxy_client, "_caller_default_kubeconfig_path", return_value=home_config), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.root / "absent" / "config"):
+            os.environ.pop("KUBE_PROXY_CA_FILE", None)
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(["get", "pods"])
+        import yaml
+
+        doc = yaml.safe_load(home_config.read_text(encoding="utf-8"))
+        self.assertEqual(self.TARGET_CTX, doc["current-context"])
+        self.assertEqual(
+            {"server": f"{self.LOOPBACK_URL}/clusters/{self.TARGET_CTX}"}, doc["clusters"][0]["cluster"]
+        )
+        self.assertEqual({}, doc["users"][0]["user"])
+
+
 class KubeconfigLockOwnerTest(unittest.TestCase):
     """Only the kubeconfig's owner makes the lock beside it. A caller that does
     not own the file cannot change it, and a lock that root made is one the
