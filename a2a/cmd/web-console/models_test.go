@@ -407,6 +407,23 @@ func TestParseServedModels(t *testing.T) {
 		}
 	}
 
+	// A target with more than one path segment keeps them all in the ID: it
+	// is the modelDefaultName that selects the model. An entry with no model
+	// after the provider is not a model.
+	nested, err := parseServedModels([]byte(`{"data":[
+		{"model_name":"model-default","litellm_params":{"model":"openrouter/anthropic/claude-3-5-sonnet"},"model_info":{"litellm_provider":"openrouter"}},
+		{"model_name":"broken","litellm_params":{"model":"vertex_ai/"},"model_info":{}}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(modelIDs(nested.options), ","); got != "anthropic/claude-3-5-sonnet" {
+		t.Errorf("nested target: got models %q, want anthropic/claude-3-5-sonnet alone", got)
+	}
+	if o := nested.inUse; o.ID != "anthropic/claude-3-5-sonnet" || o.Provider != "openrouter" || o.ModelTarget != "openrouter/anthropic/claude-3-5-sonnet" {
+		t.Errorf("nested target in use: got %+v", o)
+	}
+
 	for _, body := range []string{`{"data":[]}`, `not json`} {
 		if _, err := parseServedModels([]byte(body)); err == nil {
 			t.Errorf("parseServedModels(%q): want an error", body)
@@ -553,6 +570,94 @@ func TestModelsListComesFromTheGateway(t *testing.T) {
 	}
 	if res.ActiveModel != "gemini-4-hydrogen" {
 		t.Errorf("active model: got %q, want the gateway's default gemini-4-hydrogen", res.ActiveModel)
+	}
+}
+
+// A model whose target has more than one path segment is listed, in use and
+// turned into Helm values under one ID: the chart joins modelProvider and
+// modelDefaultName into the route, so a shortened name would switch the
+// agent to another model.
+func TestNestedModelTargetKeepsItsWholeName(t *testing.T) {
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/model/info" {
+			_, _ = w.Write([]byte(`{"data":[
+				{"model_name":"model-default","litellm_params":{"model":"openrouter/anthropic/claude-3-5-sonnet"},"model_info":{"litellm_provider":"openrouter"}},
+				{"model_name":"other","litellm_params":{"model":"openrouter/meta-llama/llama-3-70b"},"model_info":{"litellm_provider":"openrouter"}}
+			]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	}))
+	defer gw.Close()
+	s := modelsServer(gw.URL, nil)
+
+	res := getModels(t, s)
+	if res.ActiveModel != "anthropic/claude-3-5-sonnet" || res.ModelInUse != "anthropic/claude-3-5-sonnet" {
+		t.Errorf("nothing recorded: got active %q, in use %q; want anthropic/claude-3-5-sonnet for both", res.ActiveModel, res.ModelInUse)
+	}
+	if res.ActiveTarget != "openrouter/anthropic/claude-3-5-sonnet" || res.ActiveProvider != "openrouter" {
+		t.Errorf("got target %q, provider %q; want openrouter/anthropic/claude-3-5-sonnet, openrouter", res.ActiveTarget, res.ActiveProvider)
+	}
+
+	// The page sends a listed model's id, provider and target as they are.
+	rec := httptest.NewRecorder()
+	s.handleModelsPost(rec, httptest.NewRequest(http.MethodPost, "/api/models",
+		strings.NewReader(`{"model":"meta-llama/llama-3-70b","provider":"openrouter","model_target":"openrouter/meta-llama/llama-3-70b"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var picked ModelsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&picked); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"modelProvider: openrouter\n", "modelDefaultName: meta-llama/llama-3-70b\n"} {
+		if !strings.Contains(picked.HelmValuesYAML, want) {
+			t.Errorf("Helm values missing %q:\n%s", want, picked.HelmValuesYAML)
+		}
+	}
+	if picked.ActiveModel != "meta-llama/llama-3-70b" || picked.ModelInUse != "anthropic/claude-3-5-sonnet" {
+		t.Errorf("got active %q, in use %q; want meta-llama/llama-3-70b, anthropic/claude-3-5-sonnet", picked.ActiveModel, picked.ModelInUse)
+	}
+
+	// A custom pick typed as the full target records the same name.
+	rec = httptest.NewRecorder()
+	s.handleModelsPost(rec, httptest.NewRequest(http.MethodPost, "/api/models",
+		strings.NewReader(`{"model":"openrouter/anthropic/claude-3-5-sonnet"}`)))
+	var custom ModelsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&custom); err != nil {
+		t.Fatal(err)
+	}
+	if custom.ActiveModel != custom.ModelInUse {
+		t.Errorf("a custom pick of the model in use: got active %q, in use %q; want them equal", custom.ActiveModel, custom.ModelInUse)
+	}
+}
+
+// With a cluster to record on and nothing recorded, the preferred model is
+// the model in use even after an Insights read has cached that model under
+// its shorter display name, which here is also another served model's ID.
+func TestInsightsDisplayNameIsNotTakenForARecord(t *testing.T) {
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"model_name":"model-default","litellm_params":{"model":"openrouter/anthropic/claude-3-5-sonnet"},"model_info":{"litellm_provider":"openrouter"}},
+			{"model_name":"vx","litellm_params":{"model":"vertex_ai/claude-3-5-sonnet"},"model_info":{"litellm_provider":"vertex_ai"}}
+		]}`))
+	}))
+	defer gw.Close()
+	kube, _ := recordedAgent(t, nil)
+	s := modelsServer(gw.URL, kube)
+
+	insights := decode[insightsResponse](t, serve(s.routes(), insightsReq()))
+	if insights.Model.Name != "claude-3-5-sonnet" {
+		t.Fatalf("insights model: got %q, want the display name claude-3-5-sonnet", insights.Model.Name)
+	}
+	res := getModels(t, s)
+	if res.ActiveModel != "anthropic/claude-3-5-sonnet" || res.ModelInUse != "anthropic/claude-3-5-sonnet" {
+		t.Errorf("got active %q, in use %q; want anthropic/claude-3-5-sonnet for both", res.ActiveModel, res.ModelInUse)
+	}
+	if res.ActiveTarget != "openrouter/anthropic/claude-3-5-sonnet" {
+		t.Errorf("active target: got %q, want openrouter/anthropic/claude-3-5-sonnet", res.ActiveTarget)
 	}
 }
 

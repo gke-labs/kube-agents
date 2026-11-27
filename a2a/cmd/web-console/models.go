@@ -405,8 +405,11 @@ func generateModelHelmValuesYAML(modelID, provider, target, reasoningLevel strin
 	return sb.String()
 }
 
-// parseServedModels reads LiteLLM's /model/info into the models it serves,
-// naming each as parseLiteLLMModelInfo does.
+// parseServedModels reads LiteLLM's /model/info into the models it names.
+// A model's ID is its target without the provider, whole: the chart routes
+// the default alias to modelProvider/modelDefaultName, so the ID of
+// openrouter/anthropic/claude is anthropic/claude, the modelDefaultName
+// that selects it.
 func parseServedModels(body []byte) (servedModels, error) {
 	var payload struct {
 		Data []struct {
@@ -451,8 +454,8 @@ func parseServedModels(body []byte) (servedModels, error) {
 			}
 			id = m
 		}
-		if lastSlash := strings.LastIndex(id, "/"); lastSlash != -1 {
-			id = id[lastSlash+1:]
+		if id == "" {
+			continue
 		}
 		target := raw
 		if !strings.Contains(raw, "/") && provider != "" {
@@ -596,6 +599,16 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 	s.model.mu.Unlock()
 	if servedOK && !served.serves(cachedModel.Name, "") {
 		cachedModel = modelInfo{}
+	}
+	if activeModel == "" && (s.kube != nil || cachedModel.Name == "") && servedOK && served.inUse.ID != "" {
+		// Nothing recorded: the preferred model is the model in use, under
+		// the same ID the selector lists it by. With a cluster to record
+		// on, the name held in memory is no record: the Insights read
+		// refreshes it under its display name, which for a nested target
+		// is shorter than the ID.
+		activeModel = served.inUse.ID
+		activeTarget = served.inUse.ModelTarget
+		activeProvider = served.inUse.Provider
 	}
 	if activeModel == "" && cachedModel.Name != "" {
 		activeModel = cachedModel.Name
