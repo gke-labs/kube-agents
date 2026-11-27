@@ -12,6 +12,7 @@ import unittest
 
 from tests.testing.common import create_minimal_tools_bin, create_mock_git_repo, get_isolated_test_env
 from tests.testing.release import (
+    MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
     INVALID_GA_RELEASE_TAGS,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
@@ -158,6 +159,79 @@ class SignReleaseImagesScriptTest(unittest.TestCase):
                 self.assertIn(f"Signed ghcr.io/gke-labs/kube-agents/{img}:{MOCK_TARGET_RELEASE_TAG}", proc.stdout)
         finally:
             temp_dir.cleanup()
+
+
+class SignInEachReleaseRegistryTest(unittest.TestCase):
+    """ADDITIONAL_RELEASE_REGISTRY_PREFIX names a second registry the release is
+    published to; each image is signed in both, the registry prefix first."""
+
+    def _sign(self, additional):
+        # A repository of its own, as above: this checkout carries real tags.
+        repo_temp_dir, repo_dir, _ = create_mock_git_repo()
+        self.addCleanup(repo_temp_dir.cleanup)
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        _, log_path = create_mock_cosign_binary(bin_dir)
+        env = {"CI": "true"}
+        if additional is not None:
+            env["ADDITIONAL_RELEASE_REGISTRY_PREFIX"] = additional
+        proc = subprocess.run(
+            ["bash", str(_SIGN_RELEASE_IMAGES_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)),
+            cwd=repo_dir,
+        )
+        signed = [line.split()[-1] for line in pathlib.Path(log_path).read_text().splitlines() if " sign " in line]
+        return proc, signed
+
+    def _refs(self, registry):
+        return [f"{registry}/{img}:{MOCK_TARGET_RELEASE_TAG}" for img in MOCK_REQUIRED_RELEASE_IMAGES]
+
+    def test_both_registries_are_signed(self):
+        proc, signed = self._sign(MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(signed, self._refs("ghcr.io/gke-labs/kube-agents") + self._refs(MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX))
+
+    def test_a_signing_failure_in_the_additional_registry_fails_the_run(self):
+        """After the registry prefix's images are all signed."""
+        repo_temp_dir, repo_dir, _ = create_mock_git_repo()
+        self.addCleanup(repo_temp_dir.cleanup)
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        bin_dir.mkdir()
+        log_path = bin_dir / "cosign.log"
+        cosign = bin_dir / "cosign"
+        cosign.write_text(
+            "#!/bin/sh\n"
+            f'echo "mock cosign: $@" >> "{log_path}"\n'
+            f'case "$*" in *"{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}"*) exit 1 ;; esac\n'
+            "exit 0\n"
+        )
+        cosign.chmod(0o755)
+        proc = subprocess.run(
+            ["bash", str(_SIGN_RELEASE_IMAGES_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"CI": "true", "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX},
+                bin_dir=str(bin_dir),
+            ),
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"Failed to sign {MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/", proc.stderr)
+        self.assertNotIn("Successfully signed all", proc.stdout)
+        self.assertEqual(len(log_path.read_text().splitlines()), len(MOCK_REQUIRED_RELEASE_IMAGES) + 1)
+
+    def test_unset_signs_the_registry_prefix_alone(self):
+        for additional in (None, ""):
+            with self.subTest(additional=additional):
+                proc, signed = self._sign(additional)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(signed, self._refs("ghcr.io/gke-labs/kube-agents"))
 
 
 if __name__ == "__main__":

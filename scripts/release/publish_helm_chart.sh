@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Packages, publishes, and signs the official kube-agents Helm chart to GHCR as an OCI artifact.
+# Packages, publishes, and signs the official kube-agents Helm chart as an OCI artifact, in each
+# registry the release is published to (release_registry_prefixes in common.sh): one package,
+# pushed to each.
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 set -euo pipefail
+
+# The user name Artifact Registry takes with an OAuth access token as the password.
+readonly ACCESS_TOKEN_REGISTRY_USER="oauth2accesstoken"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -71,7 +76,6 @@ if [ ! -f "${local_package}" ]; then
 fi
 
 REGISTRY_PREFIX="$(get_registry_prefix)"
-REGISTRY_HOST="${REGISTRY_PREFIX%%/*}"
 CHART_OCI_DEST="oci://${REGISTRY_PREFIX}/charts"
 
 # Safety Guard: Remote chart push and cosign signing executes exclusively inside CI
@@ -80,57 +84,82 @@ if ! is_ci_pipeline; then
   exit 0
 fi
 
-CHART_TAG_REF="${REGISTRY_PREFIX}/charts/kube-agents:${RELEASE_VERSION}"
-CHART_DIGEST=""
+# Pushes the packaged chart to one registry and signs it there. A chart already
+# under the version is not pushed again and is still signed. The login is
+# skipped when no credential is given, for a registry the caller is already
+# logged in to.
+publish_chart_to_registry() {
+  local registry_prefix="$1" login_user="$2" login_token="$3"
+  local registry_host="${registry_prefix%%/*}"
+  local chart_oci_dest="oci://${registry_prefix}/charts"
+  local chart_tag_ref="${registry_prefix}/charts/kube-agents:${RELEASE_VERSION}"
+  local chart_digest="" push_output="" sign_target=""
 
-# Safety Guard: Check if target chart OCI package already exists in registry to prevent duplicate push
-if CHART_DIGEST="$(get_image_manifest_digest "${CHART_TAG_REF}" 2>/dev/null)" && [ -n "${CHART_DIGEST}" ]; then
-  echo "    ℹ️ Helm chart '${CHART_TAG_REF}' already exists in registry (digest: ${CHART_DIGEST}). Skipping duplicate push."
-elif command -v docker >/dev/null 2>&1 && docker manifest inspect "${CHART_TAG_REF}" >/dev/null 2>&1; then
-  echo "    ℹ️ Helm chart '${CHART_TAG_REF}' already exists in registry. Skipping duplicate push."
-else
-  # Securely authenticate with registry if credentials are provided in the environment
-  if [ -n "${GH_TOKEN:-}" ]; then
-    AUTH_ACTOR="${GH_USER:-${GITHUB_ACTOR:-oauth2}}"
-    echo "🔑 Logging in to ${REGISTRY_HOST} via Helm..."
-    if ! printf '%s' "${GH_TOKEN}" | helm registry login "${REGISTRY_HOST}" -u "${AUTH_ACTOR}" --password-stdin >/dev/null 2>&1; then
-      echo "❌ ERROR: Failed to authenticate to ${REGISTRY_HOST} with Helm!" >&2
-      exit 1
+  # Safety Guard: Check if target chart OCI package already exists in registry to prevent duplicate push
+  if chart_digest="$(get_image_manifest_digest "${chart_tag_ref}" 2>/dev/null)" && [ -n "${chart_digest}" ]; then
+    echo "    ℹ️ Helm chart '${chart_tag_ref}' already exists in registry (digest: ${chart_digest}). Skipping duplicate push."
+  elif command -v docker >/dev/null 2>&1 && docker manifest inspect "${chart_tag_ref}" >/dev/null 2>&1; then
+    echo "    ℹ️ Helm chart '${chart_tag_ref}' already exists in registry. Skipping duplicate push."
+  else
+    # Securely authenticate with registry if credentials are provided in the environment
+    if [ -n "${login_token}" ]; then
+      echo "🔑 Logging in to ${registry_host} via Helm..."
+      if ! printf '%s' "${login_token}" | helm registry login "${registry_host}" -u "${login_user}" --password-stdin >/dev/null 2>&1; then
+        echo "❌ ERROR: Failed to authenticate to ${registry_host} with Helm!" >&2
+        return 1
+      fi
+      echo "✅ Successfully logged in to ${registry_host} via Helm."
     fi
-    echo "✅ Successfully logged in to ${REGISTRY_HOST} via Helm."
+
+    echo "======================================================================"
+    echo "📦 PUBLISHING AND SIGNING HELM CHART (OCI)"
+    echo "Release Version: ${RELEASE_VERSION}"
+    echo "OCI Destination: ${chart_oci_dest}"
+    echo "======================================================================"
+
+    if ! push_output=$(helm push "${local_package}" "${chart_oci_dest}" 2>&1); then
+      echo "${push_output}" >&2
+      echo "❌ ERROR: Failed to push Helm chart to ${chart_oci_dest}!" >&2
+      return 1
+    fi
+    echo "${push_output}"
+
+    chart_digest=$(echo "${push_output}" | awk '/^Digest:/ {print $2}')
+    if [ -z "${chart_digest}" ]; then
+      echo "❌ ERROR: Could not extract chart digest from helm push output!" >&2
+      return 1
+    fi
   fi
 
-  echo "======================================================================"
-  echo "📦 PUBLISHING AND SIGNING HELM CHART (OCI)"
-  echo "Release Version: ${RELEASE_VERSION}"
-  echo "OCI Destination: ${CHART_OCI_DEST}"
-  echo "======================================================================"
-
-  if ! PUSH_OUTPUT=$(helm push "${local_package}" "${CHART_OCI_DEST}" 2>&1); then
-    echo "${PUSH_OUTPUT}" >&2
-    echo "❌ ERROR: Failed to push Helm chart to ${CHART_OCI_DEST}!" >&2
-    exit 1
+  if command -v cosign >/dev/null 2>&1; then
+    sign_target="${registry_prefix}/charts/kube-agents${chart_digest:+@${chart_digest}}"
+    if [ -z "${chart_digest}" ]; then
+      sign_target="${chart_tag_ref}"
+    fi
+    echo "🛡️ Signing Helm chart with Cosign (${sign_target})..."
+    if ! cosign sign --yes "${sign_target}"; then
+      echo "❌ ERROR: Failed to sign Helm chart ${sign_target} with cosign!" >&2
+      return 1
+    fi
+    echo "✅ Successfully signed Helm chart digest ${chart_digest:-${sign_target}}."
   fi
-  echo "${PUSH_OUTPUT}"
 
-  CHART_DIGEST=$(echo "${PUSH_OUTPUT}" | awk '/^Digest:/ {print $2}')
-  if [ -z "${CHART_DIGEST}" ]; then
-    echo "❌ ERROR: Could not extract chart digest from helm push output!" >&2
-    exit 1
-  fi
-fi
+  echo "✅ Successfully published Helm chart ${RELEASE_VERSION} to ${chart_oci_dest}."
+}
 
-if command -v cosign >/dev/null 2>&1; then
-  SIGN_TARGET="${REGISTRY_PREFIX}/charts/kube-agents${CHART_DIGEST:+@${CHART_DIGEST}}"
-  if [ -z "${CHART_DIGEST}" ]; then
-    SIGN_TARGET="${CHART_TAG_REF}"
+# The registry prefix takes GH_TOKEN. An additional release registry takes
+# ADDITIONAL_RELEASE_REGISTRY_TOKEN, a Google access token, and only when it
+# is an Artifact Registry host: the token goes to no other. Each call is a
+# plain statement, so errexit holds inside the function.
+release_registries=()
+release_registry_lines="$(release_registry_prefixes)"
+while IFS= read -r release_registry; do release_registries+=("${release_registry}"); done <<<"${release_registry_lines}"
+for release_registry in "${release_registries[@]}"; do
+  if [ "${release_registry}" = "${REGISTRY_PREFIX}" ]; then
+    publish_chart_to_registry "${release_registry}" "${GH_USER:-${GITHUB_ACTOR:-oauth2}}" "${GH_TOKEN:-}"
+  elif is_artifact_registry_host "${release_registry%%/*}"; then
+    publish_chart_to_registry "${release_registry}" "${ACCESS_TOKEN_REGISTRY_USER}" "${ADDITIONAL_RELEASE_REGISTRY_TOKEN:-}"
+  else
+    publish_chart_to_registry "${release_registry}" "" ""
   fi
-  echo "🛡️ Signing Helm chart with Cosign (${SIGN_TARGET})..."
-  if ! cosign sign --yes "${SIGN_TARGET}"; then
-    echo "❌ ERROR: Failed to sign Helm chart ${SIGN_TARGET} with cosign!" >&2
-    exit 1
-  fi
-  echo "✅ Successfully signed Helm chart digest ${CHART_DIGEST:-${SIGN_TARGET}}."
-fi
-
-echo "✅ Successfully published Helm chart ${RELEASE_VERSION} to ${CHART_OCI_DEST}."
+done
