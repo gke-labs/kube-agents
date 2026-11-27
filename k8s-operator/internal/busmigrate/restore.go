@@ -27,7 +27,9 @@ const (
 	// The forward restore's settle wait reads, never changes, consumers.
 	consumerNamesSubject = "$JS.API.CONSUMER.NAMES.%s"
 	consumerInfoSubject  = "$JS.API.CONSUMER.INFO.%s.%s"
-	streamDeleteSubject   = "$JS.API.STREAM.DELETE.%s"
+	streamDeleteSubject  = "$JS.API.STREAM.DELETE.%s"
+
+	restoreOutsidePolicyWrapFmt = "stream %s: %w: %w"
 )
 
 // snapshotChunkSize is the chunk the server is asked to send a snapshot in.
@@ -233,6 +235,11 @@ func RestoreVerifiedCounting(ctx context.Context, nc *nats.Conn, cfg nats.Stream
 	policy.MaxConsumers = cfg.MaxConsumers
 	if d := policy.Check(cfg); len(d) != 0 {
 		return 0, fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
+	}
+	var err error
+	cfg, _, err = policy.AppendMissingSubjects(cfg)
+	if err != nil {
+		return 0, fmt.Errorf(restoreOutsidePolicyWrapFmt, cfg.Name, ErrOutsidePolicy, err)
 	}
 	at := takenAt
 	if at.IsZero() {

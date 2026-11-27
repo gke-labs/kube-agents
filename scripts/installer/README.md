@@ -27,6 +27,7 @@ their own copies:
 | `DEFAULT_PLATFORM_AGENT_SIZING_PROFILE`                                   | The runtime sizing preset (`auto`), wired to `spec.deployment.sizingProfile`                                                                           |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                                                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)                                                                            |
+| `DEFAULT_CHAT_MANAGE_PROJECT`                                             | Enable the Chat/Workspace Add-ons/Pub/Sub APIs and provision the Pub/Sub topic, subscription, and Chat service account in the Chat project (`true`)    |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                                                                                              |
 | `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `_helpers.tpl` mirrors them                                                                     |
 | `DEFAULT_MODEL_MAX_TOKENS`                                                | Output tokens the gateway asks for on a request that names none (`0`: no `max_tokens`)                                                                 |
@@ -38,6 +39,7 @@ their own copies:
 | `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below                                                                              |
 | `DEFAULT_GITHUB_MINTER_KSA_NAME`                                          | Existing installs' minter KSA (`kubeagents-github-minter`); see below                                                                                  |
 | `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project                                                                 |
+| `DEFAULT_CHAT_GSA_NAME`                                                   | The cross-project Google Chat service account id (`kubeagents-chat-gsa`); one per Chat project                                                         |
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)                                                                              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                                                                                |
 | `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`; interactive `install.sh` prompts for the stockout investigator and defaults `y` with an enabled chat home channel) |
@@ -279,9 +281,9 @@ them: `write_tfvars_from_state` has to resolve the key against `install.defaults
 than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR` is
 outside the rule: it reads the live install instead of any default (above). `ENABLE_GKE_BACKUP_PLAN`,
 `ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
-second (`install.sh` still warns when a run passes `--enable-stockout-investigator` or answers the interactive prompt with `ENABLE_STOCKOUT_INVESTIGATOR=true` over an `install.env` that omits or disagrees with it). `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
+second (`install.sh` still warns when a run passes `--enable-stockout-investigator` or answers the interactive prompt with `ENABLE_STOCKOUT_INVESTIGATOR=true` over an `install.env` that omits or disagrees with it). `VERTEX_MANAGE_SERVING_PROJECT` and `CHAT_MANAGE_PROJECT` are the only other keys where both hold: absent, `VERTEX_MANAGE_SERVING_PROJECT`
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
-project. A full
+project, and `CHAT_MANAGE_PROJECT` (when `GOOGLE_CHAT_ENABLED` is `true`) enables the Chat, Workspace Add-ons and Pub/Sub APIs and provisions the Pub/Sub topic, subscription and (when `CHAT_PROJECT_ID` differs from `PROJECT_ID`) the dedicated Chat service account in the Chat project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
 Pub/Sub topic and subscription that carry the project's, and each scoped project's, GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it
@@ -327,7 +329,7 @@ describe` and `KMS_LOCATION` from `derive_kms_location`. `create_cluster` and th
 **effective** `CLUSTER_MODE` come from `write_tfvars_from_state`'s own probe of the live
 cluster. `NO_CONFIRM` describes an invocation, not an install, and comes from
 `-y`/`--non-interactive`. The identity keys (`PLATFORM_AGENT_GSA_NAME`,
-`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME`, `GKE_DB_KMS_KEYRING`, `GKE_DB_KMS_KEY`) are
+`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME`, `CHAT_GSA_NAME`, `GKE_DB_KMS_KEYRING`, `GKE_DB_KMS_KEY`) are
 written into a new `install.env` only when the run set them — a default copied in
 would freeze at that release, and a custom name that went missing would replace the
 account — and `NAMESPACE` is never copied in from the environment.

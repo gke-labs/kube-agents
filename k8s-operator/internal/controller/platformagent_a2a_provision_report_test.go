@@ -35,10 +35,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -496,6 +498,87 @@ func TestTheMissingTopologySkewSubjectIsAnEventOnTheCR(t *testing.T) {
 	}
 	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
 		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+	}
+}
+
+func TestTheOperatorAppendsTheMissingTopologySkewSubjectThroughReconcile(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	op, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("operatorIdentity() not configured")
+	}
+	creds := a2aFullCreds("p", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	const operatorPW = "pw-operator-stand-in"
+	conf = a2aWithStaticTrustedUser(t, conf, op, operatorPW)
+
+	s, _ := a2aStartRenderedServer(t, conf)
+	ctx := context.Background()
+
+	preUpgradeSubjects := []string{
+		a2aUpgradeReadinessSubject,
+		a2aSharedBlueprintSubject,
+		a2aSharedProbeSubject,
+	}
+	_, seedJS := a2aConnectAs(t, s.ClientURL(), "seed", string(creds.Data["seed-password"]))
+	for _, cfg := range a2aSeedStreamConfigs() {
+		if cfg.Name == a2aTopicsStateStream {
+			cfg.Subjects = slices.Clone(preUpgradeSubjects)
+		}
+		if _, err := seedJS.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("seed CreateStream(%s): %v", cfg.Name, err)
+		}
+	}
+
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
+	r.busTopicsStateConn = func(_ context.Context, _ *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
+		return nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo(a2aOperatorBusUser, operatorPW), nats.CustomInboxPrefix(operatorInboxPrefix))
+	}
+	jobName := provisionedInstall(t, ctx, cl, r, agent, `{"topics_state_subject":{"missing":1}}`)
+
+	reconcileTwice(t, ctx, r, req)
+	events := drainEvents(rec)
+	if len(events) != 1 {
+		t.Fatalf("got %d Events, want 1: %q", len(events), events)
+	}
+	for _, want := range []string{
+		corev1.EventTypeNormal, reasonTopicsStateSubjectsAppended, jobName, a2aTopologySkewSubject,
+	} {
+		if !strings.Contains(events[0], want) {
+			t.Errorf("the Event does not carry %q:\n%s", want, events[0])
+		}
+	}
+	st, err := seedJS.Stream(ctx, a2aTopicsStateStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSubjects := append(slices.Clone(preUpgradeSubjects), a2aTopologySkewSubject)
+	if !slices.Equal(st.CachedInfo().Config.Subjects, wantSubjects) {
+		t.Errorf("TOPICS-STATE subjects after Reconcile = %v, want %v", st.CachedInfo().Config.Subjects, wantSubjects)
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeReported {
+		t.Errorf("Job stamp = %q, want %q", got, a2aProvisionReportOutcomeReported)
+	}
+
+	// When TOPICS-STATE already carries every rendered subject (added empty,
+	// no error), a provision report naming topics_state_subject is treated as
+	// clean rather than emitting a TopicsStateSubjectMissing Warning Event.
+	job := provisionJobOf(t, ctx, cl, agent)
+	delete(job.Annotations, a2aProvisionReportAnnotation)
+	if err := cl.Update(ctx, job); err != nil {
+		t.Fatalf("clearing report annotation: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile on already-converged TOPICS-STATE: %v", err)
+	}
+	if events := drainEvents(rec); len(events) != 0 {
+		t.Errorf("expected no Events when TOPICS-STATE already carries all subjects, got %q", events)
+	}
+	if got := reportedJob(t, ctx, cl, agent); got != a2aProvisionReportOutcomeClean {
+		t.Errorf("Job stamp when TOPICS-STATE already converged = %q, want %q", got, a2aProvisionReportOutcomeClean)
 	}
 }
 

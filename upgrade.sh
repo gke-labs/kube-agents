@@ -2655,6 +2655,46 @@ main() {
     fi
   fi
 
+  verify_post_upgrade_health "$target_namespace" "$restarted_agent" "$repo_dir"
+
+  write_report "SUCCESS"
+
+  print_step "🎉 Upgrade Complete!"
+  # A full apply renders the chat keys from install.env, so a key edited since
+  # the last apply turns a chat platform on, or moves it between the agent and
+  # the A2A gateway, with nothing after it to say what the chat app still
+  # needs. The retag arms reuse the recorded values and change neither.
+  # Guarded: an older target's installer_common.sh lacks the helper. The DM
+  # link in the Google Chat checklist is the project's number, which
+  # install.env never records. The topic is the one the generator rendered: a
+  # file that names none renders the default, which the helper must be handed,
+  # since the generator keeps it local.
+  if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
+    local project_number="${PROJECT_NUMBER:-}"
+    local chat_project_number="${CHAT_PROJECT_NUMBER:-}"
+    if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+      if [ -n "${CHAT_PROJECT_ID:-}" ] && [ "${CHAT_PROJECT_ID}" != "${PROJECT_ID:-}" ]; then
+        if [ -z "$chat_project_number" ]; then
+          chat_project_number="$(gcloud projects describe "$CHAT_PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+        fi
+      elif [ -z "$project_number" ]; then
+        project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+      fi
+    fi
+    CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
+      PROJECT_NUMBER="$project_number" CHAT_PROJECT_NUMBER="$chat_project_number" INSTALL_ENV_FILE="$install_env_file" \
+      print_chat_setup_checklists
+  fi
+  if declare -F print_gateway_home_channel_unset_summary >/dev/null; then
+    print_gateway_home_channel_unset_summary
+  fi
+}
+
+verify_post_upgrade_health() {
+  local target_namespace="$1"
+  local restarted_agent="${2:-false}"
+  local repo_dir="${3:-}"
+
   print_step "5. Post-Upgrade Health Verification"
   kubectl get ns "$target_namespace" >/dev/null
   if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
@@ -2674,41 +2714,23 @@ main() {
   # every credentialed one through the proxy. Verifying only the gateway
   # reported an upgrade that succeeded while the agent could not run kubectl.
   #
-  # Guarded on the object existing, because the operator creates both and an
-  # operator-mode upgrade can reach here before its PlatformAgent has
-  # reconciled. A missing object is that, not a failed rollout.
-  if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET" -n "$target_namespace" >/dev/null 2>&1; then
-    kubectl rollout status "statefulset/${PLATFORM_AGENT_SHELL_STATEFULSET}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+  # Scoped to harness and full modes: an operator-only upgrade leaves workload
+  # images on the previous revision, so a newer operator can render a probe or
+  # spec an older broker or sandbox image cannot answer until --upgrade-mode=harness
+  # rolls them. Guarded on the object existing, because the operator creates both
+  # and a fresh install can reach here before its PlatformAgent has reconciled.
+  if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET" -n "$target_namespace" >/dev/null 2>&1; then
+      kubectl rollout status "statefulset/${PLATFORM_AGENT_SHELL_STATEFULSET}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+    fi
+    if kubectl get deployment "$PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
+      kubectl rollout status "deployment/${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+    fi
   fi
-  if kubectl get deployment "$PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
-    kubectl rollout status "deployment/${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
+    print_info "Skipping ${PLATFORM_AGENT_SHELL_STATEFULSET} and ${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT} rollout waits in operator mode; their images stay on the previous revision until --upgrade-mode=harness verifies them."
   fi
   print_success "Upgraded deployments verified healthy."
-
-  write_report "SUCCESS"
-
-  print_step "🎉 Upgrade Complete!"
-  # A full apply renders the chat keys from install.env, so a key edited since
-  # the last apply turns a chat platform on, or moves it between the agent and
-  # the A2A gateway, with nothing after it to say what the chat app still
-  # needs. The retag arms reuse the recorded values and change neither.
-  # Guarded: an older target's installer_common.sh lacks the helper. The DM
-  # link in the Google Chat checklist is the project's number, which
-  # install.env never records. The topic is the one the generator rendered: a
-  # file that names none renders the default, which the helper must be handed,
-  # since the generator keeps it local.
-  if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
-    local project_number="${PROJECT_NUMBER:-}"
-    if [ -z "$project_number" ] && is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
-      project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
-    fi
-    CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
-      PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
-      print_chat_setup_checklists
-  fi
-  if declare -F print_gateway_home_channel_unset_summary >/dev/null; then
-    print_gateway_home_channel_unset_summary
-  fi
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

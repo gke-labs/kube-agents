@@ -1,0 +1,193 @@
+{
+  "name": "findings-nudge-upgrade-blockers",
+  "source": "agents/platform/scripts/test_findings_nudge.py::DetectorWordingTests.test_the_two_findings_of_issue_6256_read_as_sentences",
+  "notes": "findings_nudge_card.chat_from_card: the daily nudge on the upgrade readiness review's own titles and actions (a budget, and a cluster-wide finding whose remedy names a command, so the neutral line stands in), with the next issues and the cluster breakdown table in the fold, and the fix button.",
+  "input": {
+    "findings_nudge": {
+      "now": "2026-10-06T12:00:00Z",
+      "added": {
+        "critical": 2,
+        "noncritical": 0
+      },
+      "open_count": 4,
+      "daily": true,
+      "backlog_url": "https://github.com/acme/gitops/issues/42",
+      "rows": [
+        {
+          "id": "upgrade-drain-blocking-budget.kube-agents-gkedemos.prod-central.kube-system.istiod",
+          "check_slug": "upgrade-drain-blocking-budget",
+          "severity": "critical",
+          "rank_score": 150,
+          "rubric": {
+            "B": 8,
+            "L": 6,
+            "detect": 3,
+            "recover": 3,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-central",
+          "namespace": "kube-system",
+          "object": "istiod",
+          "title": "1. A PodDisruptionBudget forbids the eviction: kube-system/istiod (minAvailable: 1 (>= 1 expected pods)) holds the node drain",
+          "recommendation": {
+            "action": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replicas) so the budget can be honoured.",
+            "rationale": "drain",
+            "risk": "upgrade stalled"
+          },
+          "state": "surfaced",
+          "first_shown_at": "2026-10-05 12:00:00",
+          "provider_managed": false,
+          "actionable": true
+        },
+        {
+          "id": "upgrade-orphan-node-objects.kube-agents-gkedemos.prod-central._.cluster",
+          "check_slug": "upgrade-orphan-node-objects",
+          "severity": "critical",
+          "rank_score": 150,
+          "rubric": {
+            "B": 8,
+            "L": 6,
+            "detect": 3,
+            "recover": 3,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-central",
+          "namespace": "",
+          "object": "Cluster",
+          "title": "22. A Node object outlives its virtual machine: this cluster blocks the upgrade",
+          "recommendation": {
+            "action": "Delete the orphan Node object (kubectl delete node <name>); nothing runs on it.",
+            "rationale": "precheck",
+            "risk": "upgrade blocked"
+          },
+          "state": "surfaced",
+          "first_shown_at": "2026-10-05 12:00:00",
+          "provider_managed": false,
+          "actionable": true
+        },
+        {
+          "id": "q1",
+          "check_slug": "static-sa-key",
+          "severity": "critical",
+          "rank_score": 140,
+          "rubric": {
+            "B": 8,
+            "L": 6,
+            "detect": 3,
+            "recover": 3,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-central",
+          "namespace": "billing",
+          "object": "invoice-worker",
+          "title": "invoice-worker mounts a static GCP key",
+          "recommendation": {
+            "action": "Move to Workload Identity.",
+            "rationale": "iam",
+            "risk": "editor key"
+          },
+          "state": "queued",
+          "first_shown_at": null,
+          "provider_managed": false,
+          "actionable": true
+        },
+        {
+          "id": "upgrade-fail-closed-webhook.kube-agents-gkedemos.prod-europe._.validatingwebhookconfiguration/authz/gate.authz.example",
+          "check_slug": "upgrade-fail-closed-webhook",
+          "severity": "major",
+          "rank_score": 110,
+          "rubric": {
+            "B": 6,
+            "L": 5,
+            "detect": 2,
+            "recover": 2,
+            "C": 1.0
+          },
+          "project": "kube-agents-gkedemos",
+          "cluster": "prod-europe",
+          "namespace": "",
+          "object": "validatingwebhookconfiguration/authz/gate.authz.example",
+          "title": "7. A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes",
+          "recommendation": {
+            "action": "Restore the backend Service authz/authz-webhook or set failurePolicy Ignore on authz/gate.authz.example.",
+            "rationale": "api",
+            "risk": "outage"
+          },
+          "state": "queued",
+          "first_shown_at": null,
+          "provider_managed": false,
+          "actionable": true
+        }
+      ]
+    }
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "2 critical issues will delay or block cluster upgrades",
+        "note": "· 4 open issues covering 4 objects on 2 clusters",
+        "tone": "critical",
+        "rows": [
+          {
+            "text": "**kube-system/istiod** on `prod-central` — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
+            "severity": "critical",
+            "detail": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured."
+          },
+          {
+            "text": "**prod-central** — A Node object outlives its virtual machine: this cluster blocks the upgrade",
+            "severity": "critical",
+            "detail": "The recommendation names a command, which is not shown here."
+          }
+        ],
+        "after": ["2 more issues are open (1 critical, 1 lower priority)."],
+        "fold": {
+          "title": "Queue breakdown (2 more open)",
+          "text": "**Next 2 open issues by rank**\n- critical · billing/invoice-worker on prod-central — mounts a static GCP key\n- major · validatingwebhookconfiguration/authz/gate.authz.example on prod-europe — A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes\n\nThese are all the open issues the message does not show.",
+          "table": {
+            "columns": [
+              "Cluster",
+              "Critical",
+              "Major",
+              "Minor",
+              "Next open issue"
+            ],
+            "rows": [
+              [
+                "prod-central",
+                "1",
+                "0",
+                "0",
+                "billing/invoice-worker: mounts a static GCP key"
+              ],
+              [
+                "prod-europe",
+                "0",
+                "1",
+                "0",
+                "validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook…"
+              ]
+            ]
+          }
+        },
+        "choices": [
+          {
+            "text": "Fix first issue",
+            "reply": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
+            "primary": true
+          }
+        ],
+        "links": [
+          {
+            "text": "Open backlog",
+            "url": "https://github.com/acme/gitops/issues/42"
+          }
+        ]
+      }
+    }
+  ]
+}

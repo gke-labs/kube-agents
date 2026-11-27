@@ -1267,6 +1267,7 @@ def blocks_report(
     after_rows: str = "",
     fold_title: str = "",
     fold_rows: Sequence[Any] = (),
+    replies: Mapping[str, str] | None = None,
 ) -> list[dict]:
     """Block Kit for a report: headline, the top rows between dividers, buttons.
 
@@ -1284,6 +1285,11 @@ def blocks_report(
     header above them. The first choice is the primary button and the links
     follow the choices. A choice is clipped to the button label before it
     becomes the value too, so a click posts only what the button showed.
+    ``replies`` gives a choice, by its label, the value its button carries
+    instead: the label and a line the report shows, as
+    :func:`chat_message.report_message` takes them. The click handler posts
+    that line with the label only when the message shows it whole
+    (``slack_ux_clicks._turn``), so the value cannot bring in other text.
     Any part left empty, a row with no text and no severity included, is
     omitted.
     """
@@ -1318,8 +1324,10 @@ def blocks_report(
             "default_collapsed": True,
             "child_blocks": [{"type": "rich_text", "elements": [_rich_row(row) for row in folded]}],
         })
+    # Keyed as the labels are spelled below, by the same function, so a lookup by a label finds its reply.
+    reply_of = {spelled: reply for label, reply in (replies or {}).items() for spelled in _choice_labels([label])}
     choice_buttons = [
-        _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
+        _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=reply_of.get(label) or label)
         for i, label in enumerate(_choice_labels(choices))
     ]
     if choice_buttons:

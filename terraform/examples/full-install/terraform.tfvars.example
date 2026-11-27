@@ -71,7 +71,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # unselected; the plan is refused instead (variables.tf has the detail).
 # The installer front doors regenerate this file on every run, so through
 # install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME,
-# GITHUB_MINTER_KSA_NAME and LITELLM_GSA_NAME in install.env instead of editing
+# GITHUB_MINTER_KSA_NAME, LITELLM_GSA_NAME and CHAT_GSA_NAME in install.env instead of editing
 # here (install.sh names and records a new install's minter KSA itself). The KSA name has no
 # install.env key of its own yet, so it goes in the same file as
 # TF_VAR_agent_ksa_name=... — the generator never writes agent_ksa_name, so
@@ -79,6 +79,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # agent_service_account_id         = "kubeagents-platform-gsa-2"
 # github_minter_service_account_id = "kubeagents-github-minter-gsa-2"
 # litellm_service_account_id       = "kubeagents-litellm-gsa-2"
+# chat_service_account_id          = "kubeagents-chat-gsa-2"
 # agent_ksa_name                   = "kubeagents-platform-2-agent"
 # github_minter_ksa_name           = "<cluster>-github-minter"
 
@@ -124,6 +125,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_google_chat        = true
 # google_chat_allowed_users = ["you@example.com"]
 # google_chat_home_channel_policy = "auto"   # or "manual": with no google_chat_home_channel, "auto" learns it from the first mention in a named space
+# Separate GCP project (or organization) hosting the Google Workspace Chat app
+# and its Pub/Sub topic and subscription. Empty uses project_id.
+# chat_project_id           = ""
+# false when chat_project_id is a project you cannot administer: an admin in
+# that project enables the APIs, creates kubeagents-chat-gsa and the Pub/Sub
+# topic/subscription, and grants roles/iam.serviceAccountTokenCreator by hand.
+# chat_manage_project       = true
 
 # Model routing for the bundled LiteLLM gateway (defaults: gemini and the
 # provider's default model; set the matching *_api_key above).

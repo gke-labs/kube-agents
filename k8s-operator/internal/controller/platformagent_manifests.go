@@ -189,10 +189,12 @@ const (
 	dataVolumeBaseSize       = "8Gi"
 	perClusterProfileStorage = "400Mi"
 	credentialProxyPort      = 8765
-	// The Chat consumers' broker env: the project id both carry, the legacy
-	// consumer's subscription name, and the fully qualified subscription
-	// form both consumers' env carries.
+	// The Chat consumers' broker env: the project id both carry, the optional
+	// service account email the broker impersonates for cross-project Chat,
+	// the legacy consumer's subscription name, and the fully qualified
+	// subscription form both consumers' env carries.
 	googleChatProjectIDEnvVar          = "GOOGLE_CHAT_PROJECT_ID"
+	googleChatServiceAccountEnvVar     = "GOOGLE_CHAT_SERVICE_ACCOUNT"
 	legacyGoogleChatSubscriptionEnvVar = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
 	googleChatSubscriptionFormat       = "projects/%s/subscriptions/%s"
 	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
@@ -5131,6 +5133,9 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		if gchat := integration.GoogleChat; googleChatEnabled(agent) {
 			subscription := fmt.Sprintf(googleChatSubscriptionFormat, gchat.ProjectID, gchat.SubscriptionName)
 			envVars = append(envVars, corev1.EnvVar{Name: googleChatProjectIDEnvVar, Value: gchat.ProjectID})
+			if sa := strings.TrimSpace(gchat.ServiceAccountEmail); sa != "" {
+				envVars = append(envVars, corev1.EnvVar{Name: googleChatServiceAccountEnvVar, Value: sa})
+			}
 			if a2aChatArmed(agent) {
 				// The next stack takes Chat: the install's one subscription
 				// goes to the A2A relay instance and the legacy instance is
@@ -5358,6 +5363,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// that set it would open the relay to whatever the broker's
 		// credential can pull.
 		platformPubsubSubscriptionsEnvVar,
+		googleChatProjectIDEnvVar,
+		googleChatServiceAccountEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a

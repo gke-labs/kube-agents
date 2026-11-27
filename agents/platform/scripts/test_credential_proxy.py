@@ -4723,6 +4723,240 @@ class ExecRouteTruncationReplyTest(unittest.TestCase):
         self.assertEqual((len("pods\n"), 4096), (body["bytesWritten"], body["limit"]))
 
 
+# Synthetic tokens of shapes credential_shapes redacts, for the exec output tests.
+_REDACT_GITHUB_TOKEN = "ghp_SyntheticExecOutput0123456789abcdefGH"
+_REDACT_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMtZXhlYyJ9.c3ludGhldGljLWV4ZWMtc2ln"
+# The fragment length no part of a redacted token may survive at.
+_REDACT_FRAGMENT_CHARS = 8
+# The cap the exec output tests run under, small enough to cut cheaply.
+_REDACT_OUTPUT_CAP = 4096
+
+
+def _fragments(token):
+    return {token[start:start + _REDACT_FRAGMENT_CHARS] for start in range(len(token) - _REDACT_FRAGMENT_CHARS + 1)}
+
+
+class ExecOutputRedactionTest(unittest.TestCase):
+    """A session caller's exec output loses its credential shapes; the shell's is as captured.
+
+    A real CommandExecutor runs a stub kubectl, so the capture, the cap and the
+    decoding are the broker's own and only the redaction is under test.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=_REDACT_OUTPUT_CAP,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        # Both roles run kubectl here, so one stub serves the comparison.
+        roles = mock.patch.dict(
+            credential_proxy.ROLE_EXECUTABLES,
+            {
+                credential_proxy.CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+                credential_proxy.CALLER_ROLE_SHELL: frozenset({"kubectl", "gcloud"}),
+            },
+        )
+        roles.start()
+        self.addCleanup(roles.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def kubectl_that(self, body):
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+
+    def post_as(self, role):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-a2a-session", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps({"argv": ["kubectl", "get", "configmap", "app"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+
+    def test_a_session_callers_stdout_and_stderr_are_redacted(self):
+        self.kubectl_that(
+            f"printf 'data:\\n  token: {_REDACT_GITHUB_TOKEN}\\n  id: {_REDACT_JWT}\\n'; "
+            f"printf 'warning: {_REDACT_GITHUB_TOKEN}\\n' >&2"
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(200, status, body)
+        self.assertEqual("data:\n  token: [REDACTED]\n  id: [REDACTED]\n", body["stdout"])
+        self.assertEqual("warning: [REDACTED]\n", body["stderr"])
+        # The log says how many, never what.
+        self.assertTrue(any("command output redacted" in line and "shapes=3" in line for line in logs.output), logs.output)
+        for token in (_REDACT_GITHUB_TOKEN, _REDACT_JWT):
+            self.assertFalse(any(token in line for line in logs.output), logs.output)
+
+    def test_the_shells_output_is_returned_as_captured(self):
+        self.kubectl_that(f"printf 'token: {_REDACT_GITHUB_TOKEN}\\n'; printf '{_REDACT_JWT}' >&2")
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        self.assertEqual(200, status, body)
+        self.assertEqual(f"token: {_REDACT_GITHUB_TOKEN}\n", body["stdout"])
+        self.assertEqual(_REDACT_JWT, body["stderr"])
+
+    def test_the_exit_code_and_the_reply_shape_are_kept(self):
+        self.kubectl_that(f"printf '{_REDACT_GITHUB_TOKEN}\\n'; exit 3")
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        _, session = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((3, 3), (shell["exitCode"], session["exitCode"]))
+        self.assertEqual(sorted(shell), sorted(session))
+        # bytesWritten counts the command's own bytes, not the redacted text.
+        self.assertEqual(shell["bytesWritten"], session["bytesWritten"])
+        self.assertEqual("[REDACTED]\n", session["stdout"])
+
+    def test_a_token_the_cap_cuts_leaves_no_prefix_behind(self):
+        # The cap is applied as the command writes, so the bytes past it are
+        # never held and the redaction is carried across the cut instead: at
+        # every length the cap can leave of a token, nothing of it as long as
+        # a fragment survives.
+        for token in (_REDACT_GITHUB_TOKEN, _REDACT_JWT):
+            for kept in (_REDACT_FRAGMENT_CHARS, 12, 19, 30, len(token) - 1):
+                filler = _REDACT_OUTPUT_CAP - kept - 1
+                with self.subTest(token=token[:4], kept=kept):
+                    self.kubectl_that(
+                        f"head -c {filler} /dev/zero | tr '\\0' a; printf ' {token}\\n'; "
+                        f"head -c {filler} /dev/zero | tr '\\0' e >&2; printf ' {token}\\n' >&2"
+                    )
+                    _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+                    self.assertTrue(shell["stdout"].endswith(" " + token[:kept]), shell["stdout"][-40:])
+                    _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+                    self.assertEqual((True, True), (body["truncated"], body["stdoutTruncated"]))
+                    self.assertEqual(_REDACT_OUTPUT_CAP, body["bytesWritten"])
+                    for stream in ("stdout", "stderr"):
+                        self.assertTrue(body[stream].endswith(" [REDACTED]"), body[stream][-40:])
+                        self.assertEqual([], sorted(f for f in _fragments(token) if f in body[stream]))
+
+    def assert_cut_tokens_redacted(self, body, kept):
+        # A command killed mid-write ends mid-token, as a capped one does: the
+        # prefix left is shorter than the shape and must not pass.
+        prefix = _REDACT_GITHUB_TOKEN[:kept]
+        for stream in ("stdout", "stderr"):
+            self.assertNotIn(prefix, body[stream], body[stream][-120:])
+        self.assertTrue(body["stdout"].endswith("token: [REDACTED]"), body["stdout"][-40:])
+        self.assertTrue(body["stderr"].startswith("warning: [REDACTED]"), body["stderr"][:80])
+
+    def test_a_token_a_timeout_cuts_leaves_no_prefix_behind(self):
+        kept = 12
+        CredentialProxyHandler.executor.timeout_seconds = 1
+        self.kubectl_that(
+            f"printf 'token: {_REDACT_GITHUB_TOKEN[:kept]}'; printf 'warning: {_REDACT_GITHUB_TOKEN[:kept]}' >&2; "
+            "exec sleep 30"
+        )
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        self.assertTrue(shell["timedOut"], shell)
+        self.assertTrue(shell["stdout"].endswith(_REDACT_GITHUB_TOKEN[:kept]), shell["stdout"][-40:])
+        _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((True, 124), (body["timedOut"], body["exitCode"]), body)
+        self.assert_cut_tokens_redacted(body, kept)
+        # The broker's timeout note comes after the cut and is kept whole.
+        self.assertIn("[credential-proxy] kubectl command timed out", body["stderr"])
+
+    def test_a_token_a_drain_stop_cuts_leaves_no_prefix_behind(self):
+        kept = 12
+        executor = CredentialProxyHandler.executor
+        self.kubectl_that(
+            f"printf 'token: {_REDACT_GITHUB_TOKEN[:kept]}'; printf 'warning: {_REDACT_GITHUB_TOKEN[:kept]}' >&2; "
+            "exec sleep 30"
+        )
+        timer = threading.Timer(1.0, executor.end_commands.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, body["exitCode"], body)
+        self.assert_cut_tokens_redacted(body, kept)
+        self.assertIn(credential_proxy.DRAINED_COMMAND_NOTE, body["stderr"])
+
+    def test_output_that_is_not_utf8_keeps_its_decoding_and_is_redacted(self):
+        self.kubectl_that(f"printf '\\xff\\xfe token {_REDACT_GITHUB_TOKEN}\\n'")
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        _, session = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(f"\ufffd\ufffd token {_REDACT_GITHUB_TOKEN}\n", shell["stdout"])
+        self.assertEqual("\ufffd\ufffd token [REDACTED]\n", session["stdout"])
+        self.assertEqual(0, session["exitCode"])
+
+
+class ExecResponseRedactionTest(unittest.TestCase):
+    """`exec_response` and `redact_tool_output`, without a command behind them."""
+
+    def result(self, **fields):
+        values = dict(exit_code=0, stdout="", stderr="", duration_ms=1, truncated=False, timed_out=False)
+        values.update(fields)
+        return credential_proxy.ExecutionResult(**values)
+
+    def test_the_redacted_roles_are_the_profile_and_the_session(self):
+        self.assertEqual(
+            frozenset({credential_proxy.CALLER_ROLE_PROFILE, credential_proxy.CALLER_ROLE_SESSION}),
+            credential_proxy.REDACTED_OUTPUT_ROLES,
+        )
+
+    def test_a_stderr_cut_is_redacted_across_before_the_brokers_note(self):
+        # A kubectl timeout appends its note after the bound, so the cut sits
+        # inside stderr, not at its end.
+        cut = "error from server: " + _REDACT_GITHUB_TOKEN[:15]
+        note = "\n[credential-proxy] kubectl command timed out after 5s (ambient cluster target)\n"
+        result = self.result(exit_code=124, stderr=cut + note, truncated=True, stderr_cut_at=len(cut), timed_out=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertEqual("error from server: [REDACTED]" + note, response["stderr"])
+        self.assertEqual((1, 124, True), (redacted, response["exitCode"], response["timedOut"]))
+        shell, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_SHELL)
+        self.assertEqual((cut + note, 0), (shell["stderr"], redacted))
+
+    def test_a_timed_out_stdout_is_redacted_across_its_end(self):
+        # A timeout kills the command mid-write: its stdout's end is a cut even
+        # when the cap was not reached and no explicit offset was recorded.
+        cut = "token: " + _REDACT_GITHUB_TOKEN[:12]
+        result = self.result(exit_code=124, stdout=cut, timed_out=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(("token: [REDACTED]", 1), (response["stdout"], redacted))
+        explicit = self.result(exit_code=124, stdout=cut, timed_out=True, stdout_cut_at=len(cut))
+        self.assertEqual("token: [REDACTED]", credential_proxy.exec_response(explicit, credential_proxy.CALLER_ROLE_SESSION)[0]["stdout"])
+
+    def test_a_private_key_the_cap_cut_goes_from_its_begin_line_to_the_cut(self):
+        # The cut took its END line; the key body past the 16 KiB span goes too.
+        cut = "tls.key: -----BEGIN PRIVATE KEY-----\n" + "MIIEsyntheticCutKeyBody0123\n" * 1000
+        result = self.result(stdout=cut, truncated=True, stdout_truncated=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertEqual(("tls.key: [REDACTED]", 1), (response["stdout"], redacted))
+
+    def test_an_uncut_stream_keeps_a_short_shape_lookalike_at_its_end(self):
+        # The cut-tail pass runs only where the cap cut: a whole output ending
+        # in `sk-short` is not a token cut short.
+        text = "flag: sk-short"
+        response, redacted = credential_proxy.exec_response(self.result(stdout=text), credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((text, 0), (response["stdout"], redacted))
+
+    def test_the_reply_keys_are_the_same_for_every_role(self):
+        result = self.result(stdout="ok", kubeconfig="apiVersion: v1\n")
+        keys = {
+            role: sorted(credential_proxy.exec_response(result, role)[0])
+            for role in (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE,
+                         credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_SCOPE)
+        }
+        self.assertEqual(1, len({tuple(value) for value in keys.values()}), keys)
+
+
 class ExecRouteCapacityTest(unittest.TestCase):
     """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
 
@@ -11279,6 +11513,109 @@ class GoogleChatRelayTest(unittest.TestCase):
         )
         self.assertIn("type=RuntimeError status=none", "\n".join(captured["logs"]))
 
+    def _init_relay_with_mock_google_modules(self, service_account_email: str = ""):
+        ambient_creds = object()
+        impersonated_creds = object()
+        impersonate_calls = []
+        subscriber_calls = []
+        build_calls = []
+
+        class FakeSubscriberClient:
+            def __init__(self, credentials=None):
+                subscriber_calls.append(credentials)
+
+            def subscription_path(self, project_id, subscription_name):
+                return f"projects/{project_id}/subscriptions/{subscription_name}"
+
+        def fake_impersonated_credentials(**kwargs):
+            impersonate_calls.append(kwargs)
+            return impersonated_creds
+
+        def fake_build(service, version, credentials=None, cache_discovery=None):
+            build_calls.append((service, version, credentials, cache_discovery))
+            return "chat-discovery-client"
+
+        google_pkg = types.ModuleType("google")
+        google_auth = types.ModuleType("google.auth")
+        google_auth.default = lambda scopes=None: (ambient_creds, "ambient-proj")
+        google_impersonated = types.ModuleType("google.auth.impersonated_credentials")
+        google_impersonated.Credentials = fake_impersonated_credentials
+        google_auth.impersonated_credentials = google_impersonated
+        google_cloud = types.ModuleType("google.cloud")
+        google_pubsub = types.ModuleType("google.cloud.pubsub_v1")
+        google_pubsub.SubscriberClient = FakeSubscriberClient
+        google_cloud.pubsub_v1 = google_pubsub
+        google_pkg.auth = google_auth
+        google_pkg.cloud = google_cloud
+        googleapiclient_pkg = types.ModuleType("googleapiclient")
+        googleapiclient_discovery = types.ModuleType("googleapiclient.discovery")
+        googleapiclient_discovery.build = fake_build
+        googleapiclient_pkg.discovery = googleapiclient_discovery
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "google": google_pkg,
+                "google.auth": google_auth,
+                "google.auth.impersonated_credentials": google_impersonated,
+                "google.cloud": google_cloud,
+                "google.cloud.pubsub_v1": google_pubsub,
+                "googleapiclient": googleapiclient_pkg,
+                "googleapiclient.discovery": googleapiclient_discovery,
+            },
+        ):
+            relay = GoogleChatRelay(
+                "workspace-chat-proj",
+                "platform-agent-chat-events-sub",
+                service_account_email=service_account_email,
+            )
+        return (
+            relay,
+            ambient_creds,
+            impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        )
+
+    def test_init_without_service_account_uses_ambient_credentials(self):
+        (
+            relay,
+            ambient_creds,
+            _impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        ) = self._init_relay_with_mock_google_modules()
+        self.assertEqual([], impersonate_calls)
+        self.assertEqual([ambient_creds], subscriber_calls)
+        self.assertEqual([("chat", "v1", ambient_creds, False)], build_calls)
+        self.assertIs(ambient_creds, relay._credentials)
+
+    def test_init_with_service_account_wraps_ambient_credentials_in_impersonated_credentials(self):
+        target_sa = "kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"
+        (
+            relay,
+            ambient_creds,
+            impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        ) = self._init_relay_with_mock_google_modules(service_account_email=f"  {target_sa}  ")
+        self.assertEqual(
+            [
+                {
+                    "source_credentials": ambient_creds,
+                    "target_principal": target_sa,
+                    "target_scopes": list(GoogleChatRelay.SCOPES),
+                }
+            ],
+            impersonate_calls,
+        )
+        self.assertEqual([impersonated_creds], subscriber_calls)
+        self.assertEqual([("chat", "v1", impersonated_creds, False)], build_calls)
+        self.assertIs(impersonated_creds, relay._credentials)
+
 
 class ChatEventPullLegibilityTest(unittest.TestCase):
     """A Chat event pull says which subscription it reads and what refused it.
@@ -16733,6 +17070,19 @@ class MCPVcsVerbGateTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.FORBIDDEN, status)
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
         route.assert_not_called()
+
+    def test_proposal_view_for_mcp_is_redacted(self):
+        # The A2A MCP server answers clients outside the cluster, whose model
+        # reads the proposal's text as the install's forge credential fetched it.
+        token_shape = "ghp_SyntheticMcpProposalView0123456789ab"
+        route = mock.Mock(return_value={"body": f"rotated {token_shape}", "number": 7})
+        handler = self._handler("proposal-view", credential_proxy.CALLER_ROLE_MCP)
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"proposal-view": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            handler._handle_vcs_post()
+        self.assertEqual((HTTPStatus.OK, {"body": "rotated [REDACTED]", "number": 7}), handler.replies[0])
+        self.assertIn(credential_proxy.CALLER_ROLE_MCP, credential_proxy.REDACTED_VCS_READ_ROLES)
 
     def test_curator_reaches_snapshot_only_on_a_managed_repository(self):
         route = mock.Mock(return_value={"archiveBase64": ""})
@@ -23987,6 +24337,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
             "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
             "WATCHER_PUBSUB_SUBSCRIPTION": "projects/p/subscriptions/drift",
             "GOOGLE_CHAT_PROJECT_ID": "p",
+            "GOOGLE_CHAT_SERVICE_ACCOUNT": "kubeagents-chat-gsa@p.iam.gserviceaccount.com",
             "GOOGLE_CHAT_SUBSCRIPTION_NAME": "chat",
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "a2a-chat",
             "SLACK_BOT_TOKEN": "xoxb-test",
@@ -24031,6 +24382,20 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
     def test_the_stateful_broker_starts_them(self):
         relays, pubsub, metrics_listener, thread_targets = self._serve("broker")
         self.assertEqual(2, relays["GoogleChatRelay"].call_count)
+        relays["GoogleChatRelay"].assert_has_calls(
+            [
+                mock.call(
+                    "p",
+                    "chat",
+                    service_account_email="kubeagents-chat-gsa@p.iam.gserviceaccount.com",
+                ),
+                mock.call(
+                    "p",
+                    "a2a-chat",
+                    service_account_email="kubeagents-chat-gsa@p.iam.gserviceaccount.com",
+                ),
+            ]
+        )
         relays["TeamsRelay"].assert_called_once()
         pubsub.assert_called_once()
         self.assertIn("initialize_slack_relay", thread_targets)

@@ -1,0 +1,25 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "**2 critical issues will delay or block cluster upgrades** · 4 open issues covering 4 objects on 2 clusters\n\n- **critical** **kube-system/istiod** on `prod-central` — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected) · Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured.\n- **critical** **prod-central** — A Node object outlives its virtual machine: this cluster blocks the upgrade · The recommendation names a command, which is not shown here.\n\n2 more issues are open (1 critical, 1 lower priority).\n\n**Queue breakdown (2 more open)**\n**Next 2 open issues by rank**\n- critical · billing/invoice-worker on prod-central — mounts a static GCP key\n- major · validatingwebhookconfiguration/authz/gate.authz.example on prod-europe — A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes\n\nThese are all the open issues the message does not show.\n\n| Cluster | Critical | Major | Minor | Next open issue |\n| --- | --- | --- | --- | --- |\n| prod-central | 1 | 0 | 0 | billing/invoice-worker: mounts a static GCP key |\n| prod-europe | 0 | 1 | 0 | validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook… |",
+    "actions": [
+      {
+        "data": {
+          "choice": 0,
+          "kageAction": "choice",
+          "label": "Fix first issue",
+          "reply": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)"
+        },
+        "style": "positive",
+        "title": "Fix first issue",
+        "type": "Action.Submit"
+      },
+      {
+        "title": "Open backlog",
+        "type": "Action.OpenUrl",
+        "url": "https://github.com/acme/gitops/issues/42"
+      }
+    ]
+  }
+]

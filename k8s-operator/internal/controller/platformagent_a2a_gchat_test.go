@@ -686,3 +686,36 @@ func TestGchatAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
 		})
 	}
 }
+
+func TestGoogleChatServiceAccountReachesBrokerOnlyWhenSet(t *testing.T) {
+	const chatSA = "kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		sa      string
+		want    string
+		present bool
+	}{
+		{"same-project unset", true, "", "", false},
+		{"whitespace only", true, "   ", "", false},
+		{"cross-project set", true, chatSA, chatSA, true},
+		{"cross-project padded", true, " " + chatSA + " ", chatSA, true},
+		{"chat disabled with sa set", false, chatSA, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := gchatTestAgent("next", tc.enabled)
+			agent.Spec.Integration.GoogleChat.ServiceAccountEmail = tc.sa
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: googleChatServiceAccountEnvVar, Value: "spoofed@evil.iam.gserviceaccount.com"}},
+			}
+			env := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
+			got, ok := brokerEnvValue(env, googleChatServiceAccountEnvVar)
+			if ok != tc.present || got != tc.want {
+				t.Errorf("%s = %q (present=%v), want %q (present=%v)", googleChatServiceAccountEnvVar, got, ok, tc.want, tc.present)
+			}
+		})
+	}
+	if !credentialProxyExecTierEnvDropped[googleChatServiceAccountEnvVar] {
+		t.Errorf("%s must be dropped from the exec tier env", googleChatServiceAccountEnvVar)
+	}
+}

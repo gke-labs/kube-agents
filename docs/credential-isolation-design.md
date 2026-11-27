@@ -980,7 +980,72 @@ Consequences:
   marker, so a cut `-o json` dump reads as a failure to the model's own
   `kubectl` and to a script alike, never as an exit 0 with a partial payload; a
   cut on stderr alone keeps the command's exit code, and the marker says stdout
-  is complete. At most
+  is complete.
+- For a profile worker or a session pod (`REDACTED_OUTPUT_ROLES`), the broker
+  replaces every credential shape in stdout and stderr with `[REDACTED]`
+  before it answers (`exec_response`). The shapes are `credential_shapes.py`'s,
+  the list `redact_credentials` applies to the broker's own log lines, in a
+  tool-output form (`TOOL_OUTPUT_SHAPES`): a token right after a JSON escape
+  (`\n`, `\"`, `\u0041`) in `-o json` output is matched, and no match opens
+  on an escape's letter, so the escape stays whole and the JSON still parses;
+  a password in a URL may hold JSON escapes (Go's encoder writes `&` as
+  `\u0026`); an authorization header value needs a header's context
+  (`Authorization:`, `authorization=`, with the `[`, `map[` or quote a
+  printed header map puts after it, or a curl `-H`) or a `bearer` or `basic`
+  in any case whose value holds a digit, one of `+/=_-` or an inner `.`, so
+  prose about basic or bearer auth reaches the model as written; and a
+  private key is its PEM block, failing closed: through its END line when one
+  starts within 16 KiB of the BEGIN line, else to the first unescaped `"`,
+  16 KiB, or the end of the text, with nothing between checked against a
+  key's grammar, so up to 16 KiB of other text after a key header may go with
+  it, and a BEGIN line inside such a block extends it by its own block
+  (`_PrivateKeyBlocks`); a key the cap cut goes from its BEGIN line to the
+  cut (`redact_cut_private_key`). The output cap is applied while the command runs,
+  so the bytes past a cut are never held; the redaction is carried across the
+  cut instead: the characters just before it also get the shapes' leading
+  literals matched, with their leading boundary and at least four characters
+  of a body (`redact_cut_tail`), so a token the cap left shorter than its
+  shape's minimum length is replaced too, and a word ending in `ghs_` or
+  `ASIA` is not. A command killed mid-write, for a timeout or a stop (the
+  drain, a caller's ceiling), is cut the same way, on both streams. On stderr
+  the cut is where the output ended, before any `[credential-proxy]` line the
+  broker appends. The exit code,
+  the flags and `bytesWritten` (the command's own stdout bytes the cap kept)
+  are the same as for any caller; the log records how many shapes were
+  replaced and nothing of what they were. The shell's output is returned as
+  captured: the Hermes runtime behind it redacts tool results on its side.
+  The same redaction, on every string value and object key of the JSON
+  answer, applies to these roles' MCP relay replies, their audit-report reads
+  and the `a2a-reports` role's (the A2A gateway's relay, which posts a report
+  to chat; `REDACTED_REPORT_READ_ROLES`), and the version-control reads whose answer is a forge's text
+  (`REDACTED_VCS_READ_VERBS`: proposal and issue views and lists, proposal
+  commits, branch view), and to the A2A MCP server's one verb,
+  `proposal-view`, which it answers to MCP clients outside the cluster
+  (`REDACTED_VCS_READ_ROLES`). A JSON answer is redacted on its parsed
+  strings; when that replaces nothing, its bytes are redacted as text too,
+  since a parser keeps only the last of two equal keys and the first one's
+  value would otherwise pass. A redacted object key that comes out equal to
+  another key of the object takes an ordinal (`#2`, `#3`), so no value is
+  dropped. A `clone` answer is not redacted: it is a git bundle in base64,
+  which redaction would corrupt, and the files it carries reach the model
+  through the worker's own file tools, which the broker does not see.
+  Not redacted either: the `kubeconfig` field of a `get-credentials` answer,
+  which is the file gcloud wrote (the cluster's endpoint, its public CA
+  certificate and a `gke-gcloud-auth-plugin` exec stanza, with no token or
+  client key). `audit_report.py finish` redacts a report's strings on the way
+  into the store, but a profile worker's raw store `PUT` does not go through
+  `finish`, so the read is redacted as well
+  ([`fleet-audit-report-store.md`](designs/fleet-audit-report-store.md)). The
+  listener checks the writer stamp's sha256 against the stored bytes before
+  it answers; the broker redacts after that, passes `X-Report-Writer` on
+  unchanged, and passes a report with nothing to replace byte for byte.
+  What the redaction is: a guard against a credential the model reads by
+  accident in output. It is not an exfiltration control against a model that
+  reshapes output on purpose; the broker's read-only gates and the
+  absence of secret reads are the controls there. As in the log form, it
+  does not match a token glued to a word character before it
+  (`AWS_AKIA...`), PGP armour, or a value wrapped in base64.
+- At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
   flight at once (`8` on fixed/default profiles, stepping `8` small, `12` `medium`, and `16` `fleet` under `spec.deployment.sizingProfile: auto`; the operator sets it, as it sets the output cap, and
   reserves the name; the fixed-`2Gi` exec tier stays at 8). A slot is held from admission until the response is on

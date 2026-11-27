@@ -37,6 +37,21 @@ def test_the_three_fields_parse():
     )
 
 
+def test_a_report_of_several_lines_writes_its_line_breaks_as_backslash_n():
+    replay = pushed_report.parse(f"{DIRECTIVE}\nopening: a\nreport: first line\\n\\n- a row\\n[a block]\nreply: c \\n d")
+    assert replay.report == "first line\n\n- a row\n[a block]"
+    # Only the report: a reply is what a person typed, on one line.
+    assert replay.reply == "c \\n d"
+
+
+@pytest.mark.parametrize("report", ["\\n", "\\n\\n", " \\n \\n "])
+def test_a_report_of_only_line_breaks_is_a_missing_report(report):
+    """The empty check runs on the report as it will be stored: written as
+    escapes, a report of nothing but line breaks got past it and was planted."""
+    with pytest.raises(ValueError, match="missing report"):
+        pushed_report.parse(f"{DIRECTIVE}\nopening: a\nreport: {report}\nreply: c")
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -202,6 +217,52 @@ def test_merge_keeps_a_no_worker_calls_entry_only_when_both_turns_carry_one(open
     merged = pushed_report.merge(turn(opening_marked, "t_1"), turn(reply_marked, "t_2"), entry)
     kept = [e for e in merged.trajectory if e["name"] == worker_trajectory.NO_WORKER_CALLS_ENTRY]
     assert len(kept) == (2 if opening_marked and reply_marked else 0)
+
+
+def test_merge_leads_with_a_reply_the_card_wait_marked_as_infrastructure():
+    """The card wait runs on the reply before the merge and can mark it in place (a
+    worker's card that died on a rate limit). Behind the opening turn's warning the
+    marker would not be the first error."""
+    entry = pushed_report.plant_entry("a2a-ctx-1", "inject:c", {"stored": True, "status": 200})
+
+    def turns():
+        opening = AgentResult(output="OK", trajectory=[], tokens={}, errors=["skipped an item"], metadata={})
+        reply = AgentResult(output="x", trajectory=[], tokens={}, errors=["a reply warning"], metadata={"final_message": "x"})
+        return opening, reply
+
+    opening, reply = turns()
+    harness._mark_result_infra_failure(reply, "a worker's card ended on a rate limit")
+    marked = pushed_report.merge(opening, reply, entry, reply_wait_covered_session=True)
+    assert marked.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert marked.errors[1:] == ["a reply warning", "skipped an item"]
+    assert reply.metadata[pushed_report.INFRA_FAILURE_KEY] == "a worker's card ended on a rate limit"
+    # A reply with no such mark keeps the opening's errors first.
+    opening, reply = turns()
+    assert pushed_report.merge(opening, reply, entry).errors == ["skipped an item", "a reply warning"]
+
+
+def test_merge_keeps_the_replys_no_worker_calls_entry_when_its_wait_covered_the_session():
+    """The reply turn's card wait reads the whole session's cards, the opening
+    turn's with them, and the opening turn never waits. So the reply's entry
+    speaks for both turns when that wait ran, and a `workers` check grades
+    zero worker calls rather than setting the record aside."""
+    from kube_agents_bench import worker_trajectory
+
+    opening = AgentResult(output="OK", trajectory=[{"name": "a2a.status-update"}], tokens={}, errors=[], metadata={})
+    reply = AgentResult(
+        output="x",
+        trajectory=[{"name": "kanban_create"}, worker_trajectory.no_worker_calls_entry(["t_1"])],
+        tokens={},
+        errors=[],
+        metadata={"final_message": "x"},
+    )
+    entry = pushed_report.plant_entry("a2a-ctx-1", "inject:c", {"stored": True, "status": 200})
+
+    covered = pushed_report.merge(opening, reply, entry, reply_wait_covered_session=True)
+    assert [e["name"] for e in covered.trajectory].count(worker_trajectory.NO_WORKER_CALLS_ENTRY) == 1
+    # Without that wait the entry speaks for the reply's cards only, and is dropped as before.
+    uncovered = pushed_report.merge(opening, reply, entry)
+    assert worker_trajectory.NO_WORKER_CALLS_ENTRY not in [e["name"] for e in uncovered.trajectory]
 
 
 def test_merge_sums_both_turns_tokens_bucket_by_bucket():
@@ -471,6 +532,101 @@ def test_an_infra_failed_reply_is_the_runs_infra_failure_not_a_merge(monkeypatch
     assert got.output == "" and got.trajectory == []
     assert "task_id" not in got.metadata and "pushed_report" not in got.metadata
     assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+
+
+DELEGATION_BUDGET = 600.0
+DELEGATION_POLL = 5.0
+CARD_RESULT_ENTRY = {"name": "kanban_show", "args": {"task_id": "t_1"}, "result": "dismissed three rows"}
+CARD_RESULT_TEXT = "\n\nResult of delegated task t_1: dismissed three rows"
+
+
+def _delegating_reply() -> AgentResult:
+    return AgentResult(
+        output="dismissing it.", trajectory=[{"name": "a2a.status-update", "args": {"state": "completed"}}],
+        tokens={}, errors=[], metadata={"final_message": "dismissing it.", "task_id": "task-2"},
+    )
+
+
+def test_a_reply_that_files_cards_is_waited_out_before_the_merge(monkeypatch):
+    """A follow-up turn returns before the card wait, so the replay runs the wait for its
+    reply: a case that grades what the cards did must not read it while they still run."""
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+    reply = _delegating_reply()
+    waits: list = []
+
+    def fake_wait(self, result, session_id, *, delegation_timeout, poll_interval):
+        waits.append((result, session_id, delegation_timeout, poll_interval))
+        result.trajectory.append(CARD_RESULT_ENTRY)
+        result.output += CARD_RESULT_TEXT
+        return True
+
+    merges: list = []
+    real_merge = pushed_report.merge
+
+    def recording_merge(opening, reply, entry, *, reply_wait_covered_session=False):
+        merges.append(reply_wait_covered_session)
+        return real_merge(opening, reply, entry, reply_wait_covered_session=reply_wait_covered_session)
+
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: reply)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_await_delegated_cards", fake_wait)
+    monkeypatch.setattr(harness.pushed_report, "merge", recording_merge)
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT),
+        delegation_timeout=DELEGATION_BUDGET, poll_interval=DELEGATION_POLL,
+    )
+
+    # The session the report was stored under is the one whose cards are awaited.
+    assert waits == [(reply, "a2a-ctx-77", DELEGATION_BUDGET, DELEGATION_POLL)]
+    assert got.output == "dismissing it." + CARD_RESULT_TEXT
+    assert got.trajectory[-1] == CARD_RESULT_ENTRY
+    assert got.trajectory[1]["name"] == pushed_report.PLANT_ENTRY
+
+    # The wait ran and covered the session, so the merge is told so.
+    assert merges == [True]
+
+    # A replay driven with no delegation budget waits for nothing.
+    unbudgeted = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT)
+    )
+    assert len(waits) == 1
+    assert merges == [True, False]
+    assert unbudgeted.metadata["pushed_report"]["opening_final_message"] == "OK"
+
+
+def test_an_infra_failed_reply_waits_for_no_card(monkeypatch):
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+    infra = harness._infra_failure("the inject exchange failed: tunnel died")
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: infra)
+    monkeypatch.setattr(
+        harness.KubeAgentsHarness, "_await_delegated_cards", lambda self, *a, **kw: pytest.fail("the reply waited")
+    )
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT),
+        delegation_timeout=DELEGATION_BUDGET, poll_interval=DELEGATION_POLL,
+    )
+    assert got is infra
+
+
+def test_a_board_lost_during_the_replys_card_wait_is_infrastructure(monkeypatch):
+    """The board went away after the wait began: nothing the cards did can be graded, so the
+    run is infrastructure, as a first turn's wait makes it, and not a merged record."""
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+
+    def lost(self, result, session_id, *, delegation_timeout, poll_interval):
+        raise harness._DelegationTransportExhausted("the kanban board could not be read 3 times running")
+
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: _delegating_reply())
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_await_delegated_cards", lost)
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT),
+        delegation_timeout=DELEGATION_BUDGET, poll_interval=DELEGATION_POLL,
+    )
+    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "the kanban board could not be read" in got.errors[0]
+    assert "pushed_report" not in got.metadata
 
 
 def test_every_activity_marker_must_vouch_on_a_two_turn_record():
