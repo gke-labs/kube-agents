@@ -20,13 +20,13 @@ Anthropic tool input sent as a string) are decoded, walked as a document and
 re-encoded only if a rule changed them, so they stay valid JSON. A tool's
 output that is a whole JSON object or array (a chat tool message's string
 content, an Anthropic tool result's string or text parts, a Responses function
-call output, a top-level string in a Gemini function response's response, up
-to 64 of them) is
-decoded the same way, up to 256 KiB and 64 levels deep, and so is whole JSON
-inside it, two levels in at most. It still gets the text rules over its string
+call output, up to 64 top-level strings of a Gemini function response's
+response) is decoded the same way, up to 256 KiB and 64 levels deep, and so is
+whole JSON inside it, two levels in and 32 strings at most. It still gets the text rules over its string
 too, and a string the structure rules mask whole where it sits is not opened,
-so decoding only adds to what is masked. One with a repeated key, past the
-bounds, or not whole JSON is matched as text. A changed one keeps its indent
+so decoding only adds to what is masked. One with a repeated key, with a `\\u`
+escape for whitespace or a value-ending character, past the bounds, or not
+whole JSON is matched as text. A changed one keeps its indent
 width and compact or spaced separators; numbers, escapes and other spacing are
 normalised.
 
@@ -190,6 +190,12 @@ TOOL_OUTPUT_MAX_FIELDS = 64
 # Stands in for a string while asking whether the structure rules would mask
 # it whole where it sits (a credential key, a Secret's data, an env value).
 MASK_PROBE = "kube-agents-redaction-probe"
+# A \u escape in raw JSON text: one that decodes to whitespace or to a
+# character that ends a value (a quote, a comma, a bracket) keeps the output
+# text, since the text rules mask a bare value through the escape and would
+# stop at the decoded character.
+UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+VALUE_ENDING_CHARACTERS = frozenset("\"',;:=(){}[]\\")
 TOOL_ROLE = "tool"
 TEXT_TYPE = "text"
 TEXT_KEY = "text"
@@ -701,6 +707,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
         body = value.strip()
         if not body or body[0] not in "{[" or len(value.encode("utf-8", "replace")) > TOOL_OUTPUT_MAX_BYTES:
             return
+        for match in UNICODE_ESCAPE.finditer(value):
+            character = chr(int(match.group(1), 16))
+            if character.isspace() or character in VALUE_ENDING_CHARACTERS:
+                return
         repeated = False
 
         def pairs(items: List[tuple]) -> Dict[str, Any]:

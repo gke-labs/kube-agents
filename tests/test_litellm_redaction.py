@@ -703,6 +703,20 @@ class TestCallback(unittest.TestCase):
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": secret}]})["messages"][0]["content"]
         self.assertNotIn("opaque-zz", out)
 
+    def test_a_tool_output_whose_escapes_end_a_value_stays_text(self) -> None:
+        # The text rules mask a bare value through a \\u escape; decoded, the
+        # escape would end it. Such output keeps the text rules' result.
+        for escape in ("\\u0020", "\\u0022", "\\u002c", "\\u007d", "\\u00a0", "\\u2028"):
+            with self.subTest(escape=escape):
+                text = '{"cmd":"mysql --password=abc' + escape + 'opaqueBBB"}'
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertNotIn("opaqueBBB", out)
+        # An escape for an ordinary character (Go writes < > & this way) still
+        # lets the output be decoded.
+        text = '{"auth":"opaque-value-xyz","html":"\\u003cb\\u003e"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+
     def test_a_tool_output_with_a_repeated_key_gets_the_text_rules_only(self) -> None:
         # The decoder would keep one value; what the text says is what counts.
         text = '{"kind":"Secret","kind":"Other","data":{"k":"opaque-value-xyz"}}'
