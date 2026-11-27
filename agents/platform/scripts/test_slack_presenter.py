@@ -713,6 +713,22 @@ class ButtonsTest(unittest.TestCase):
         self.assertEqual([(b["text"]["text"], b["value"]) for b in buttons], [("Fix it", "Fix it"), ("See all 3", "See all 3")])
         self.assertEqual(buttons[0]["style"], "primary")
 
+    def test_a_reports_choice_with_a_reply_carries_it_as_the_buttons_value(self):
+        # The click handler posts the named line only when the message shows it whole, so
+        # the value brings in no text the reader did not see; a choice with no reply keeps its label.
+        blocks = sp.blocks_report(
+            "h",
+            rows=[{"severity": "critical", "text": "**api** on `prod` — no readiness probe"}],
+            choices=["Fix first issue", "Later"],
+            action_id_prefix="kage",
+            replies={"Fix first issue": "Fix first issue: api on prod — no readiness probe"},
+        )
+        buttons = next(b for b in blocks if b["type"] == "actions")["elements"]
+        self.assertEqual(
+            [(b["text"]["text"], b["value"]) for b in buttons],
+            [("Fix first issue", "Fix first issue: api on prod — no readiness probe"), ("Later", "Later")],
+        )
+
     def test_buttons_wrap_at_five(self):
         rows = sp._actions([sp._button(str(i), f"kage.choice.{i}", value=str(i)) for i in range(7)])
         self.assertEqual([len(b["elements"]) for b in rows], [5, 2])

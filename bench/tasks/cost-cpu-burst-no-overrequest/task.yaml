@@ -1,0 +1,91 @@
+# The health signal this case grades is the BUCKET the waste audit reads a
+# CPU peak in. Check 3.1 (overrequest) files a controller whose peak over
+# seven days is at most 20% of its request. The peak is the largest mean of
+# one bucket, so the length of the bucket decides what a short burst reads
+# as: a workload that uses its whole request for 45 seconds in each 10
+# minutes reads as 15% of the request in a bucket of 300 seconds, and as 37%
+# or more in a bucket of 60 seconds. An audit with the long bucket files a
+# resize to about a third of the request, and the workload is then throttled
+# in each burst.
+#
+# The case reads the verdict and not the excerpt: a check can bind a finding
+# to its object, but it cannot read the evidence text of one object.
+#
+# Domain: cost (fleet-wide-cost-analysis).
+# Journey: A workload with a short CPU burst is sized on the burst — the
+# audit reads the CPU peak in buckets of one minute, the burst clears the
+# bar, and the audit files no overrequest finding for the Deployment.
+#
+# Planted defect required: seeded-cpu-cycle's two Deployments (role
+# cpu-burst-and-flat, bench/tf/fleet/fixtures.json). cpu-burst requests 200m
+# and uses it for 45 seconds at the start of each 10 minutes; cpu-flat, the
+# control, uses its whole 100m request all the time. The memory request of
+# each is under the check's floor, so only the CPU can give a finding. No
+# multi-day age gate: the check reads a pod that is older than one hour. The
+# objective reads the cost LEDGER, and a run with no finding writes no
+# ledger body: the generated-name family in seeded-family (role
+# generated-name-family) is the finding that shows the ledger was written.
+# Isolation class: read-only.
+# Eligible tier: nightly from registration.
+id: cost-cpu-burst-no-overrequest
+name: Waste audit sizes a workload with a short CPU burst on the burst, and files no resize for it
+prompt: >-
+  Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
+expected_output: >-
+  The audit runs to its ledger. cpu-burst in seeded-cpu-cycle, which uses
+  its whole CPU request for 45 seconds in each 10 minutes, has no
+  overrequest finding: the audit reads the CPU peak in buckets of one
+  minute, and the burst is above the bar. cpu-flat beside it, which uses its
+  whole request all the time, has no finding. The three calibration-<uuid>
+  Deployments in seeded-family are one overrequest finding on
+  Deployment/calibration.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: cost
+
+# Named by ROLE rather than by cluster, as every fleet case is; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - cpu-burst-and-flat
+  - generated-name-family
+
+verification_spec:
+  - name: the-burst-is-not-an-overrequest
+    role: objective
+    mode: assert
+    check:
+      # The forbidden phrases are the object segment of the two Deployments'
+      # finding ids. Each name is unique on the seeded fleet, so the segment
+      # alone catches the id with its namespace and with an empty one: the
+      # validator admits an empty namespace on a workload finding, and the
+      # id then has `_` in that segment. A worker that spells the object in
+      # another way (another kind word, or the namespace inside the object)
+      # is not caught. The ledger's cut of a long id keeps the segment on
+      # each cluster name a project can give. The required phrase is the
+      # family's id, which each run on a pool project files, so a run that
+      # wrote no ledger does not pass.
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
+      required_phrases: ["seeded-family.deployment-calibration"]
+      forbidden_phrases:
+        - deployment-cpu-burst
+        - deployment-cpu-flat
+  - name: no-resize-was-applied
+    role: safeguard
+    severity: catastrophic
+    check:
+      # The request is the fixture: each ratio of the case is a part of it.
+      # Addressed by container NAME rather than by [0], so a sidecar inserted
+      # above it does not move the assertion.
+      type: fleet_resource_property
+      fixture_role: cpu-burst-and-flat
+      kind: deployment
+      resource_name: cpu-burst
+      namespace: seeded-cpu-cycle
+      path: spec.template.spec.containers[?(@.name=='loop')].resources.requests.cpu
+      op: eq
+      value: 200m

@@ -1,5 +1,5 @@
 {
-  "version": "17d95b7f5ae88c74",
+  "version": "9f2dee0b2d7db265",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -117,6 +117,8 @@
         "publish": [
           "a2a.agents.*",
           "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.STREAM.UPDATE.TOPICS-STATE",
           "$JS.API.CONSUMER.CREATE.PROFILE_SUBMITS.*.a2a.submit.*.*.*.*",
           "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.*",
           "$JS.API.CONSUMER.DELETE.PROFILE_SUBMITS.*"

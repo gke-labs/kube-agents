@@ -4,9 +4,10 @@ Installed into the image as ``hermes_cli/unstructured_reasoning.py``. The two
 statements ``apply_unstructured_reasoning_replay.py`` inserts into Hermes, one
 in each place the main loop builds a model call's messages, call
 ``replace_unstructured_reasoning`` on every outgoing message. This file is
-the one place the rule is written down on the Python side. The Hermes bridge's copy
-of the same rule is ``opensWithUnstructuredReasoning`` in
-``a2a/hermes-bridge/reasoning_leak.go``; the two must agree.
+the one place the rule is written down on the Python side. The Go copy of the
+same rule, shared by the Hermes bridge and the session path, is
+``OpensWithUnstructuredReasoning`` in ``a2a/lib/answerscrub/reasoning.go``; the
+two must agree.
 
 Gemini through LiteLLM sometimes writes its reasoning as plain assistant
 content instead of a thought part, so ``reasoning_content`` is empty and

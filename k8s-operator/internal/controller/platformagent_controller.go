@@ -34,6 +34,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-logr/logr"
+	"github.com/nats-io/nats.go"
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -790,6 +791,12 @@ type PlatformAgentReconciler struct {
 	// busServerViews stands in for reading each bus server's /jsz
 	// (readA2ABusServerViews) in tests.
 	busServerViews func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) ([]a2aBusServerView, error)
+	// busTopicsStateConn opens the bus connection used to append missing
+	// rendered subjects to TOPICS-STATE when the provision Job reports them
+	// missing (appendTopicsStateSubjects). Nil defaults to
+	// operatorTopicsStateConn, which dials the bus as the operator principal
+	// when operatorBusPrincipal() is configured.
+	busTopicsStateConn func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error)
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -5545,6 +5552,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
+	} else if slackFailed := slackConnectionFailedCondition(agent); slackFailed != nil {
+		// Degraded only, as A2ABusStreamsMissing and A2AGatewayWaitingForTasks
+		// above: Ready and the phase keep what the workloads say so an
+		// external Slack outage does not drop the console, A2A doors, or
+		// gateway PodDisruptionBudget, while broken Slack auth.test / Socket
+		// Mode connectivity surfaces clearly on Degraded.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonSlackConnectionFailed
+		degradedMsg = slackFailed.Message
 	} else if reason, msg := specResourceDegraded(agent); reason != "" {
 		// The spec's resource, exec-tier, and admission refusals, last: the
 		// resource and exec checks leave workloads at the operator's defaults,
@@ -6934,8 +6950,9 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
-	// Degraded following BusStreamsPresent on a park (#5707): read from the
-	// agent itself, so the live re-check below judges the live object.
+	// Degraded following poller-owned conditions (BusStreamsPresent and
+	// SlackConnected) on a park (#5707): read from the agent itself, so the
+	// live re-check below judges the live object.
 	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
 		return false
 	}
@@ -7069,8 +7086,9 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	// Degraded is updateStatusReady's to rank, and a park returns before it
-	// runs; the bus streams' reason alone follows the poller here, which keeps
-	// writing BusStreamsPresent through a park (parkBusStreamsDegraded).
+	// runs; the poller-owned reasons (BusStreamsPresent / A2ABusStreamsMissing
+	// and SlackConnected / SlackConnectionFailed) follow their pollers here
+	// through a park (parkBusStreamsDegraded).
 	edit, busStreams := parkBusStreamsDegraded(agent)
 	applyParkBusStreamsDegraded(agent, edit, busStreams, now)
 	return r.Status().Update(ctx, agent)
@@ -7131,6 +7149,9 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	if r.APIReader == nil && mgr != nil {
 		r.APIReader = mgr.GetAPIReader()
+	}
+	if r.busTopicsStateConn == nil {
+		r.busTopicsStateConn = r.operatorTopicsStateConn
 	}
 
 	bld := ctrl.NewControllerManagedBy(mgr).

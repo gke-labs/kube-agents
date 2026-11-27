@@ -11,7 +11,7 @@
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
 # on a cluster at all (`orphan-disks`, `startup-fail-vm`, `rotated-console-vm`,
-# `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and
+# `world-open-ingress`, `health-check-shadowed`, `declared-mtu-peering`, `declared-orphan-snapshot` and
 # `orphan-snapshot` are
 # project-scoped, so they have no cluster slot). fixtures.json carries all but
 # `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
@@ -371,6 +371,19 @@ fixtures:
       A firewall rule opening tcp:2379 to the internet on the one VM that
       carries its tag, which holds an external IP. Nothing listens on 2379.
       A deny rule blocks tcp:22 and tcp:3389 on that VM.
+
+  - role: health-check-shadowed
+    slot: null # Project-scoped, on default; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - firewall/hc-shadow-allow-<prefix>
+      - firewall/hc-shadow-deny-<prefix>
+      - instance/world-open-<prefix>
+    defect: >-
+      A DENY of tcp:80 from the whole internet at priority 900, above an
+      allow of tcp:80 from the load-balancer health-check ranges at 1000,
+      both on the world-open VM's tag. The VM is the live instance the check
+      needs; nothing on it listens on 80 or sits behind a load balancer.
 
   - role: declared-mtu-peering
     slot: null # Project-scoped, global; not attached to any cluster.

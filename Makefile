@@ -541,7 +541,7 @@ test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 GOSEC_PIN_MODULE := k8s-operator
 GOSEC_BIN := $(CURDIR)/$(GOSEC_PIN_MODULE)/bin/gosec
 GOSEC_OPERATOR_EXCLUDE := G703,G706
-GOSEC_UNEXCLUDED_MODULES := a2a hack/ghes-proxy k8s-api-proxy
+GOSEC_UNEXCLUDED_MODULES := a2a hack/ghes-proxy k8s-api-proxy kube-proxy
 
 gosec: ## Run gosec from k8s-operator/go.mod's pin over every Go module, the scan CI runs on each.
 	@echo "==> build gosec"; cd "$(GOSEC_PIN_MODULE)" && go build -o "$(GOSEC_BIN)" github.com/securego/gosec/v2/cmd/gosec
@@ -569,6 +569,9 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> go build (k8s-api-proxy)"; cd k8s-api-proxy && go build ./...
 	@echo "==> go vet (k8s-api-proxy)";   cd k8s-api-proxy && go vet ./...
 	@echo "==> go test (k8s-api-proxy)";  cd k8s-api-proxy && go test ./...
+	@echo "==> go build (kube-proxy)"; cd kube-proxy && go build ./...
+	@echo "==> go vet (kube-proxy)";   cd kube-proxy && go vet ./...
+	@echo "==> go test (kube-proxy)";  cd kube-proxy && go test ./...
 	@echo "==> go vet (ghes-proxy)";  cd hack/ghes-proxy && go vet ./...
 	@echo "==> go test (ghes-proxy)"; cd hack/ghes-proxy && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
@@ -1024,8 +1027,9 @@ docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.
 chart-sync: ## Sync the chart's CRD, RBAC-rule and admission-policy copies from k8s-operator/config, write config/profiles/role.yaml (the Role document's copy for the profile namespace), and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies and config/profiles/role.yaml match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies and config/profiles/role.yaml match k8s-operator/config, its hand-written webhook template matches config/webhook, files/footprint.yaml matches the operator goldens, and rendered manifests contain no duplicate YAML keys (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
+	@python3 -m unittest discover -s tests -p 'test_chart_no_duplicate_keys.py' -v
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
 	@python3 -c "import yaml" 2>/dev/null || { \

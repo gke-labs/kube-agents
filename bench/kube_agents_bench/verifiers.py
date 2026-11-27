@@ -9360,6 +9360,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
         "autoscaler-out-of-resources", "dangling-compute-class", "ccc-unbacked-manual-fallback",
+        "capacity-buffer-not-ready",
     ),
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",

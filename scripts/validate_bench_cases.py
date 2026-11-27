@@ -432,6 +432,13 @@ KNOWN_UNREGISTERED = {
 # of the validated-capabilities suite, restores its `suite:` line (a suite case
 # is never in a roster file).
 FIXTURE_NOT_READY = {
+    # Fixture planted in bench/tf/fleet/main.tf (#2587); parked until the
+    # postsubmit fleet reconcile applies health-check-shadowed across the pool
+    # projects, after which a follow-up moves it to nightly-cases.txt.
+    "networking-health-check-shadowed": (
+        "#2587: needs health-check-shadowed (firewall/hc-shadow-allow-*, firewall/hc-shadow-deny-*) "
+        "applied to every pool project by the postsubmit fleet reconcile"
+    ),
     # Fixture planted in bench/tf/fleet/defects-a.tf (#7097, #1982); parked
     # until the postsubmit fleet reconcile applies unaccepted-gateway-class
     # across the pool projects, after which a follow-up moves it to nightly-cases.txt.
@@ -471,18 +478,19 @@ FIXTURE_NOT_READY = {
         "and a privileged pod that lowers kernel.pid_max, which is not on the fleet and which no "
         "issue plans"
     ),
-    # Needs the order of two times on one node: a workload container that
-    # starts before a per-node agent's pod is Ready. That order is evidence
-    # only on a node made after the agent's DaemonSet, and a workload's restart
-    # resets it. The fleet's pools make a node only at an upgrade or a repair,
-    # and its two zero-node pools are read by other cases as empty; the cost,
-    # not tried, is a pool of its own with one standing small node. The first
-    # plan's signal, a label only a fixture writes, is not a fixture (fixture
-    # rule 9). #5411 owns the gap and proposes the first plan's check.
-    "node-kubelet-startup-admission-race": (
-        "#5411: needs a workload that starts before a per-node agent is Ready on a node made "
-        "after the agent's DaemonSet; no present fleet pool makes such a node, and the cost, not "
-        "tried, is a pool of its own with one standing small node whose two times stay readable"
+    # A check that reads a command for --chunk-size=0 names a shape that live
+    # tests do not show as the fault: a lister with a pause did little or no
+    # harm in five runs, with pages or with none, and a flood slowed a second
+    # client with pages too, about half as much in the one matched pair. A
+    # fixture for the measured harm needs listers at a rate that slows a
+    # cluster, which a shared fleet cluster may not carry; a check on real
+    # requests also needs a record of them there (API server logs; Data Access
+    # audit logs were not tested). Not tried, so the cost is a judgment. #5413
+    # owns the gap, the check on real requests and the fixture.
+    "control-plane-unpaginated-heavy-list-oom": (
+        "#5413: a fixture needs listers at a rate that slows a cluster, which a shared fleet "
+        "cluster may not carry, and for a check on real requests a record of them there; live "
+        "tests do not show a command with --chunk-size=0 as the fault (fixture rule 9)"
     ),
     # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
     # cluster, as the OOM reproduction harness builds them) and an install on the

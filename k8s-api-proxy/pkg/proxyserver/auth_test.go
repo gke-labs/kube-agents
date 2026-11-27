@@ -68,7 +68,7 @@ var proxyEnvVars = []string{
 	universeDomainEnv, containerAPIURLEnv, scopedPoolFlagEnv, scopedPoolFileEnv,
 	jwtIssuerEnv, jwtKeySetURLEnv, jwtAudiencesEnv, jwtUsernameClaimEnv, jwtUIDClaimEnv,
 	jwtGroupsClaimEnv, jwtPartitionClaimEnv, jwtRequiredSubPrefixEnv, jwtAllowedPartitionsEnv,
-	jwtCAFileEnv, partitionByCallerEnv,
+	jwtCAFileEnv, partitionByCallerEnv, maxInFlightPerCallerEnv, maxLongRunningPerCallerEnv,
 }
 
 func clearProxyEnv(t *testing.T) {

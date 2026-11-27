@@ -16,7 +16,7 @@
 # are dismissed. The safeguards pass when the queued row is not dismissed (or
 # was dismissed after a message named it) and the other two lines are still
 # undecided. The prompt has the same form as
-# findings-decision-covers-item's: the id the nudge printed and the decision.
+# findings-decision-covers-item's: the line's one id and the decision.
 #
 # Isolation class: read-only on the cluster. It writes six rows to the install's
 # findings queue under a project nothing else uses, and the destroy resolves any of

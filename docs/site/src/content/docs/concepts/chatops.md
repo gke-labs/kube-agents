@@ -139,7 +139,7 @@ A scheduled brief posts flat in that channel, never inside a thread. A job that 
 
 ### Reactions
 
-The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report and fleet-audit reports into cards, and changes how the harness's own messages read on Slack (below).
+The `KAGE_SLACK_UX` flag is on by default. It changes how reactions work, turns on the [buttons](#buttons) below, turns the first inventory report, fleet-audit reports and the findings nudge into cards, and changes how the harness's own messages read on Slack (below).
 
 To turn the flag off, add `KAGE_SLACK_UX=false` to the chart value `platformAgent.deployment.env`; [Breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases) shows the `install.env` line. A hand edit of the CR's `spec.deployment.env` can be lost at the next chart apply. An install that never set the flag has it on, and any value other than `1`, `true`, `yes` or `on` turns it off. With it off the agent follows the Hermes Slack adapter, adding 👀 to your message when it starts and ✅ or ❌ when the turn ends, and nothing else on this page that the flag gates changes.
 
@@ -363,7 +363,7 @@ A task that fails posts `❌ failed — <why>`, in plain words, or `❌ failed: 
 
 On Google Chat, the agent's answer is one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask, and each alert or report the agent posts on its own, ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)).
 
-A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
+A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report, the findings nudge and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
 
 A first sentence longer than 150 characters is cut at a clause, as on Slack, or at a word when no clause fits. The bold line then ends in "…" and the detail opens on one, so no word of it is lost. The same cut holds on Slack.
 
@@ -373,7 +373,7 @@ A reply you type in the conversation answers the question the same way, with you
 
 On Microsoft Teams, with the gateway's Teams backend armed, the same messages arrive as one card: the bold first sentence, the detail, a plan's steps or a report's rows, the "why" section drawn open, and the buttons under it. A choice button and a typed reply answer as on Google Chat, and the card then shows `✓ <your name>: <the button, or your reply's first words>` by your Teams display name. When the card cannot be edited, as for one posted before a gateway restart, that line is posted as a new message.
 
-An install with `adaptiveCards: false` gets the text with no buttons; type the answer there. The stuck-task report's Retry and Drop are not drawn on Teams, and a report the agent posts to the home channel on its own stays text.
+An install with `adaptiveCards: false` gets the text with no buttons; type the answer there. The stuck-task report's Retry and Drop are not drawn on Teams.
 
 ### Follow-ups while a task runs
 
@@ -466,7 +466,7 @@ If a task is already running on the `platform` route when you send `/session`, t
 
 On Slack, Google Chat and Microsoft Teams, the final answer to each ask ends with 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. In a conversation, plan rows, progress, questions waiting on you and notices have none. A tap from someone the gateway would not answer changes nothing.
 
-On Slack and Google Chat, the agent's own home-channel posts carry the same buttons, labelled Useful and Not useful: an alert, kept through the triage that rewrites it, and a scheduled or audit report. They come after the post's own buttons, such as a drift alert's two, which stay first. Replies in an alert's thread, such as the triage card's progress, have none. A rating there counts as a rating of that alert or report, not of an answer, so a 👎 on an alert you found noisy does not read as a wrong answer. Its box says only the post is kept, since nobody asked a question, and its export names the alert's trigger rather than a question.
+On Slack, Google Chat and Microsoft Teams, the agent's own home-channel posts carry the same buttons, labelled Useful and Not useful: an alert, kept through the triage that rewrites it, and a scheduled or audit report. They come after the post's own buttons, such as a drift alert's two, which stay first. Replies in an alert's thread, such as the triage card's progress, have none. A rating there counts as a rating of that alert or report, not of an answer, so a 👎 on an alert you found noisy does not read as a wrong answer. Its box says only the post is kept, since nobody asked a question, and its export names the alert's trigger rather than a question.
 
 Each rating is counted. What follows is Slack and Google Chat; Teams differs, below. The button you tapped fills in. The gateway keeps your question and the answer with it, and nothing else from the thread, so an operator can turn the exchange into an evaluation case: a 👎 as a case to fix, a 👍 as a good answer to keep. A 👍 shows nothing more. A 👎 opens a box asking what was wrong (optional, one line), kept with it. The box says how long your question and the answer are kept, or only the answer when the question is no longer on record. Cancel keeps the 👎 without a note.
 
@@ -478,9 +478,9 @@ On Google Chat, Send or Cancel collapses the card to the same thanks line and th
 
 In a Google Chat space, the filled button shows the latest tap by anyone, while each person's rating is kept separately.
 
-Microsoft Teams draws the buttons while the gateway's Teams backend is armed. They are on the answer's card, so an install with `adaptiveCards: false` has none, and neither has an answer too large for a card. A 👍 is one tap. A 👎 unfolds a form inside the card, on your screen alone, with the same optional question, a line on how long your question and the answer are kept, and a Send button. That line always names the question, even when only the answer is on record. The 👎 is kept when you press Send, with a note or without one; there is no Cancel, and a 👎 you do not send keeps nothing.
+Microsoft Teams draws the buttons while the gateway's Teams backend is armed. They are on the card, so an install with `adaptiveCards: false` has none, and neither has a message too large for a card. A 👍 is one tap. A 👎 unfolds a form inside the card, on your screen alone, with the same optional question, a line on how long your question and the answer are kept, and a Send button. On an answer that line always names the question; on an alert or a report it names only the post. The 👎 is kept when you press Send, with a note or without one; there is no Cancel, and a 👎 you do not send keeps nothing.
 
-After the first rating, the Teams card gains the line "Feedback recorded. Thank you." Everyone in the conversation sees it, and it names neither the rater nor the rating; no button fills in. A rating on an answer from before the gateway last restarted, or an old one it no longer remembers, is still counted, but the card does not change and the answer's text is not kept with it. A card that the added line would make too large is left as it is too. Alerts and reports on Teams carry no buttons.
+After the first rating, the Teams card gains the line "Feedback recorded. Thank you." Everyone in the conversation sees it, and it names neither the rater nor the rating; no button fills in. A rating on a message from before the gateway last restarted, or an old one it no longer remembers, is still counted, but the card does not change and its text is not kept with the rating. An alert that is rewritten after a rating is drawn without the line until the next rating. A card that the added line would make too large is left as it is too.
 
 You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. The last seven days' count of answer ratings, such as "This week: 4 👍, 1 👎", is on the Slack Home tab only, refreshed every five minutes; Google Chat has no Home tab. On Slack, no scope beyond the ones [Slack](#slack) lists is needed.
 
@@ -696,7 +696,23 @@ Each cluster-event alert and each drift alert spends one unit of a daily budget.
 
 Most drift changes that reach the drift detector late do not spend the `GitOpsDrift` budget. A change is late when its audit record was published before the detector started to read, for example most changes that an install or a restart of the agent pod makes, or when the record waited more than 30 minutes. The agent posts one "Drift backlog" message for each group of late changes. The message counts the changes by principal and names some of them. On an install with no chat platform enabled, the message is one card on the task board instead. The card has no assignee and waits on a person; no agent acts on it.
 
-Late changes in the message get no triage turn, and the feed `GET /v1/intercepted-events` lists them with the status `backlog`. Some late changes get a triage card and spend the budget instead: a change made with `kubectl`, and every late change of a principal with fewer than three late changes in the group. When the budget is spent, a late change of such a principal is counted in the message instead. A late `kubectl` change is handled as a live change is, so it is lost from chat and the feed lists it as `suppressed`.
+Late changes in the message get no triage turn, and the feed `GET /v1/intercepted-events` lists them with the status `backlog`. Some late changes get a triage card and spend the budget instead: a change made with `kubectl`, and every late change of a principal with fewer than three changes in the group. When the budget is spent, a late change of such a principal is counted in the message instead. A late `kubectl` change is handled as a live change is, so it is lost from chat and the feed lists it as `suppressed`.
+
+One `kubectl` change is not in that rule: a change to a kube-agents CRD on an install that Helm made, as the installer does. The paragraphs below describe it.
+
+An upgrade of kube-agents changes its own objects while the drift detector reads, so those changes are not late. On an install that Helm made, they go to "Drift backlog" messages too and do not spend the budget. One upgrade usually makes two messages: one for the CRDs, which the installer applies first, and one for the other objects. A long upgrade can make more.
+
+This applies only while the same person has a Helm upgrade of kube-agents under way, and only to a change that is not made with `kubectl`. The change must be to one of these objects:
+
+- an object in the two kube-agents namespaces
+- a cluster-wide access object or admission object named after the kube-agents Helm release
+- an object elsewhere that Helm marks as part of the release
+
+The message names that person, the Helm release and its revision.
+
+Without a Helm upgrade, each such change gets a triage card, about one minute later than other changes. When the budget is spent, the message names the change on a "Review:" line.
+
+A change to a kube-agents CRD needs no Helm upgrade: it goes to the message when its person has three or more changes in the group, and it gets a triage card when the person has fewer. A change to the other kube-agents objects that is made without a Helm upgrade is not in that count. A delete gets a triage card. The detector of the release that is in service reads the upgrade, so the first upgrade to a release with this rule still gets a drift alert for each change.
 
 Set a ceiling in one of these places:
 

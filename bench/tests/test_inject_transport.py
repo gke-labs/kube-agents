@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from kube_agents_bench import board, harness, transcript, worker_trajectory
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import scoring, stop_hook
+from kube_agents_bench import pushed_report, scoring, stop_hook
 from kube_agents_bench.harness import KubeAgentsHarness
 
 # The gateway's own placeholder, which the relay then edits in place. Spelled
@@ -3197,6 +3197,32 @@ def api_executor(
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
     monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "30")
     return stub_gateway
+
+
+PUSHED_REPORT_PROMPT = f"""{pushed_report.DIRECTIVE}
+opening: Say OK and nothing else.
+report: Capacity watch: node pool np-quartz-7 is at 92% allocatable CPU.
+reply: Move the workloads off that pool.
+"""
+
+
+def test_a_pushed_report_replay_is_handed_the_runs_delegation_budget(
+    api_executor: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replay's reply is a follow-up turn, and a follow-up returns before the
+    card wait. So the inject path hands the replay the run's budget and poll
+    interval, and the replay waits out the cards its reply filed itself."""
+    handed: dict[str, Any] = {}
+
+    def fake_replay(self: KubeAgentsHarness, opening: Any, exchange: Any, replay: Any, **kwargs: Any) -> Any:
+        handed.update(kwargs)
+        return opening
+
+    monkeypatch.setattr(KubeAgentsHarness, "_reply_under_pushed_report", fake_replay)
+
+    KubeAgentsHarness().run(PUSHED_REPORT_PROMPT)
+
+    assert handed == {"delegation_timeout": 30.0, "poll_interval": 0.0}
 
 
 def test_a_delegated_card_is_graded_on_its_result_not_the_acknowledgement(

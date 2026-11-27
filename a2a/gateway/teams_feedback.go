@@ -6,8 +6,9 @@ import (
 )
 
 // Answer feedback on Teams (spec-chatops-gateway.md, "Answer feedback"): the
-// two rating controls on the card of an answer the relay marked
-// (OutMessage.Feedback), drawn once the gateway has handed the adapter its
+// two rating controls on the card of a message marked for feedback
+// (OutMessage.Feedback), an answer the relay marked or a post the agent
+// made on its own, drawn once the gateway has handed the adapter its
 // recorder, as on Google Chat and Slack.
 //
 // 👍 is an Action.Submit, a press like the Stop button's (teams_press.go).
@@ -75,19 +76,19 @@ func (a *TeamsAdapter) feedbackRecorder() FeedbackRecorder {
 	return a.recorder
 }
 
-// rates reports whether m is posted with rating controls: an answer the
-// relay marked, as text, on an adapter that holds the recorder. A mark that
-// names a post the agent made on its own (an alert its triage edits, a
-// report) draws none: Teams rates answers only.
+// rates reports whether m is posted with rating controls: a message marked
+// for feedback, as text, on an adapter that holds the recorder. The mark is
+// an answer's task, or the id of a post the agent made on its own (an alert
+// its triage edits, a report), as on Slack and Google Chat.
 func (a *TeamsAdapter) rates(m OutMessage) bool {
 	return m.Chat == nil && a.ratesTask(m.Feedback)
 }
 
 // ratesTask reports whether a message marked for feedback under task
-// carries the rating controls: an answer's task, with the recorder handed
-// over. A laid-out answer carries them too (teams_chat.go).
+// carries the rating controls: an answer's task or a post's id, with the
+// recorder handed over. A laid-out message carries them too (teams_chat.go).
 func (a *TeamsAdapter) ratesTask(task string) bool {
-	return task != "" && postKindOf(task) == "" && a.feedbackRecorder() != nil
+	return task != "" && a.feedbackRecorder() != nil
 }
 
 // teamsRatingActions is the rating controls for the message rated under
@@ -118,7 +119,8 @@ func teamsRatingActions(task string, days int) []map[string]any {
 	}
 }
 
-// postRated posts an answer with its rating controls and remembers it.
+// postRated posts a message marked for feedback with its rating controls
+// and remembers it.
 func (a *TeamsAdapter) postRated(conversation string, m OutMessage) (string, error) {
 	id, err := a.post(conversation, m.Text, teamsRatingActions(m.Feedback, a.feedbackRecorder().KeptDays()))
 	if err == nil {
@@ -165,9 +167,6 @@ func (a *TeamsAdapter) feedbackPress(act *teamsActivity, press teamsPress, conve
 	}
 	if press.Task == "" {
 		return "rating press names no task"
-	}
-	if postKindOf(press.Task) != "" {
-		return "rating press names a post, which Teams does not rate"
 	}
 	if press.Rating != FeedbackUp && press.Rating != FeedbackDown {
 		return "rating press carries no rating this adapter draws"

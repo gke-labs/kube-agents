@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Plant and remove the findings-queue rows of bench/tasks/findings-decision-covers-item
-and bench/tasks/findings-decision-leaves-unnamed-open (the stack's findings_file).
+"""Plant and remove the findings-queue rows of bench/tasks/findings-decision-covers-item,
+bench/tasks/findings-decision-reply-names-no-id and
+bench/tasks/findings-decision-leaves-unnamed-open (the stack's findings_file).
 
 main.tf runs this in the agent container as `python3 - <mode> <base url> <rows, base64>`:
 the Session KV server answers there on loopback, and the container's environment
@@ -35,7 +36,7 @@ every row in its planted state.
 
 teardown: records every open row of the rows' projects as resolved, which takes it
 off the open list. A dismissed row stays dismissed, which is closed too. The projects
-are invented names only this case uses, so every row under them is this case's.
+are invented names only these cases use, so every row under them is one of theirs.
 Exits 1 if the read-back still finds an open row.
 """
 

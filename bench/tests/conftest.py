@@ -86,6 +86,44 @@ def _no_cluster_from_the_shell(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+class MemoryReportStore:
+    """The broker store client's calls (report_status.BrokerReportStore), answered from memory.
+
+    For a plant test of the broker store (FLEET_AUDIT_REPORT_STORE=broker, #6110):
+    patched in as `audit_report._report_store_client`, it takes every read and
+    write `report_store_dir` makes, so a test can tell that nothing went to the
+    file store's directory.
+    """
+
+    def __init__(self):
+        self.latest: dict[tuple[str, str], bytes] = {}
+        self.runs: dict[tuple[str, str], dict[str, bytes]] = {}
+
+    def read_latest(self, audit_id, repo):
+        return self.latest.get((audit_id, repo))
+
+    def list_runs(self, audit_id, repo):
+        return sorted(self.runs.get((audit_id, repo), {}))
+
+    def read_run(self, audit_id, repo, name):
+        return self.runs.get((audit_id, repo), {}).get(name)
+
+    def write_run(self, audit_id, repo, name, data):
+        self.runs.setdefault((audit_id, repo), {})[name] = data
+
+    def write_latest(self, audit_id, repo, data):
+        self.latest[(audit_id, repo)] = data
+
+    def delete_latest(self, audit_id, repo):
+        self.latest.pop((audit_id, repo), None)
+
+
+@pytest.fixture
+def memory_report_store() -> MemoryReportStore:
+    """An empty MemoryReportStore."""
+    return MemoryReportStore()
+
+
 #: The harness's one way into the agent's pod, `kubectl exec`, as the module has it.
 _REAL_AGENT_SHELL = harness._agent_shell
 

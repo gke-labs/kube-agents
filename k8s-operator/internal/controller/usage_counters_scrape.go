@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -149,6 +150,11 @@ const (
 	a2aPeopleWindowLabel = "window"
 	a2aPeopleWindowShort = "7d"
 	a2aPeopleWindowLong  = "30d"
+	// a2aSlackConnectedSeries is the A2A gateway's gauge of the Slack Socket
+	// Mode connection: 1 while connected, 0 while disconnected or failing
+	// auth.test, and absent on standby replicas or when Slack is not running.
+	a2aSlackConnectedSeries = "kubeagents_a2a_gateway_slack_connected"
+	a2aSlackConnectedUp     = 1
 	// proposalsOpenedSeries is the chat plugin's count of the pull requests
 	// the agent opened, by the origin of the work and, for chat, its platform:
 	// a gauge it reads from the pod's proposals ledger at scrape time, served
@@ -191,6 +197,34 @@ const (
 	vcsTouchesPerProposalSeries = "kubeagents_vcs_proposal_touches_per_proposal"
 	vcsProposalsIgnoredSeries   = "kubeagents_vcs_proposals_ignored"
 	vcsReadingsAgeSeries        = "kubeagents_vcs_readings_age_seconds"
+	// The same sweep's report of the forges the managed repositories live on,
+	// by provider: whether every repository answered, the repositories by
+	// connection state, and the seconds since the provider was last attempted.
+	// The value series are absent before the first sweep, on an install with no
+	// managed repository, and once a provider's check is an hour old, where its
+	// age series alone stays. They set the ForgeConnected condition
+	// (usage_forge_connection.go) and project to no status.usage field.
+	vcsForgeConnectedSeries    = "kubeagents_vcs_forge_connected"
+	vcsForgeRepositoriesSeries = "kubeagents_vcs_forge_repositories"
+	vcsForgeCheckedAgeSeries   = "kubeagents_vcs_forge_checked_age_seconds"
+	// vcsProviderLabel names the forge on those three and on vcsRequestsSeries.
+	vcsProviderLabel = "provider"
+	// The connection states of vcsForgeRepositoriesSeries's state label
+	// (vcs_readings.CONNECTION_STATES), worst first as the broker orders them.
+	vcsConnectionUnauthorized = "unauthorized"
+	vcsConnectionNotFound     = "not_found"
+	vcsConnectionUnreachable  = "unreachable"
+	vcsConnectionIdentity     = "identity"
+	vcsConnectionRateLimited  = "rate_limited"
+	vcsConnectionOther        = "other"
+	vcsConnectionOk           = "ok"
+	// vcsForgeConnectedValue is the connected gauge's value for a provider
+	// whose repositories all answered; any other value is not connected.
+	vcsForgeConnectedValue = 1
+	// usageForgeProviderCeiling bounds the providers one body may name. The
+	// broker renders one per forge class it ships, and other; a body past the
+	// ceiling is refused, not clamped.
+	usageForgeProviderCeiling = 32
 	// The readings' labels and the values the specs select.
 	vcsReadingsStateLabel   = "state"
 	vcsReadingsActorLabel   = "actor"
@@ -672,6 +706,46 @@ type usageReading struct {
 	// nil for any other. Not folded: the poll sums it across the broker pods
 	// read and projects the top rows as they stand (usageTopToolsForPoll).
 	ToolPairs map[usageToolPair]usageToolCounts
+	// Forges is the stateful broker's forge connection reading, nil for any
+	// body but that broker's; an empty one when the body names no provider
+	// (no managed repository, no sweep yet, or a broker that predates the
+	// series).
+	Forges *usageForgeReading
+	// SlackConnected is the A2A gateway's kubeagents_a2a_gateway_slack_connected
+	// gauge reading (true when >= a2aSlackConnectedUp, false when 0); nil when
+	// the body is not an A2A gateway's or does not export the series.
+	SlackConnected *bool
+}
+
+// usageForgeReading is the providers one broker body reports, in provider order.
+type usageForgeReading struct {
+	Forges []usageForge
+}
+
+// usageForge is one provider's connection as the broker's readings sweep left
+// it. HasState is false for a provider whose check is over an hour old, for
+// which the body serves the age alone.
+type usageForge struct {
+	Provider string
+	// Connected and Repositories are the value series; read only with HasState.
+	Connected bool
+	HasState  bool
+	// Repositories is the managed repositories by connection state, the states
+	// with none left out.
+	Repositories map[string]int64
+}
+
+// vcsConnectionStates is the closed vocabulary of the repositories series's
+// state label, worst first: the order the condition names a failing provider's
+// state in. A state outside it is a newer broker's and is not read.
+var vcsConnectionStates = []string{
+	vcsConnectionUnauthorized,
+	vcsConnectionNotFound,
+	vcsConnectionUnreachable,
+	vcsConnectionIdentity,
+	vcsConnectionRateLimited,
+	vcsConnectionOther,
+	vcsConnectionOk,
 }
 
 // usageDispatcherReading is the kanban dispatcher's failing boards in one
@@ -894,6 +968,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	var dispatcher *usageDispatcherReading
 	// dispatcherAges is each board's streak age, joined to its ticks after the body.
 	var dispatcherAges map[string]int64
+	// forges collects the forge connection series by provider, for the
+	// stateful broker's body alone.
+	var forges map[string]*usageForge
+	// slackConnected is the A2A gateway's Slack Socket Mode gauge when exported.
+	var slackConnected *bool
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -922,6 +1001,16 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			dispatcherAges = map[string]int64{}
 			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries, kanbanDispatcherStuckSecondsSeries)
 		}
+		// The version-control counter is the stateful broker's alone (an exec
+		// pod serves no /v1/vcs), and so is the readings sweep that reports
+		// the forges.
+		if family == vcsRequestsSeries && forges == nil {
+			forges = map[string]*usageForge{}
+			wanted = append(wanted, vcsForgeConnectedSeries, vcsForgeRepositoriesSeries, vcsForgeCheckedAgeSeries)
+		}
+		if family == a2aAnswerFeedbackSeries && !slices.Contains(wanted, a2aSlackConnectedSeries) {
+			wanted = append(wanted, a2aSlackConnectedSeries)
+		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
 	// of the kinds asked for, whether a sample resolved it, and the readings
@@ -943,6 +1032,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				wanted = append(wanted, family)
 			}
 		}
+	}
+	if slices.Contains(kinds, usageReadingPeople) && !slices.Contains(wanted, a2aSlackConnectedSeries) {
+		wanted = append(wanted, a2aSlackConnectedSeries)
 	}
 	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
 	for {
@@ -1001,10 +1093,48 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						start = &captured
 						continue
 					}
+					if name == a2aSlackConnectedSeries {
+						up := value >= a2aSlackConnectedUp
+						if slackConnected == nil || up {
+							slackConnected = &up
+						}
+						continue
+					}
 					if name == dataVolumeSeries {
 						if kind := usageLabelValue(metric, dataVolumeKindLabel); kind == dataVolumeKindTotal || kind == dataVolumeKindFree {
 							volume[kind] = value
 						}
+						continue
+					}
+					if name == vcsForgeConnectedSeries || name == vcsForgeRepositoriesSeries || name == vcsForgeCheckedAgeSeries {
+						provider := usageLabelValue(metric, vcsProviderLabel)
+						forge := forges[provider]
+						if forge == nil {
+							if len(forges) >= usageForgeProviderCeiling {
+								return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+							}
+							forge = &usageForge{Provider: provider}
+							forges[provider] = forge
+						}
+						// Bounded to what a time.Duration holds, as the dispatcher's ages are.
+						if value >= float64(math.MaxInt64/int64(time.Second)) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						switch name {
+						case vcsForgeConnectedSeries:
+							forge.HasState = true
+							forge.Connected = value == vcsForgeConnectedValue
+						case vcsForgeRepositoriesSeries:
+							state := usageLabelValue(metric, vcsReadingsStateLabel)
+							if count := int64(value); count > 0 && slices.Contains(vcsConnectionStates, state) {
+								if forge.Repositories == nil {
+									forge.Repositories = map[string]int64{}
+								}
+								forge.Repositories[state] = count
+							}
+						}
+						// The age series only names the provider: one whose
+						// check is over an hour old has no other series.
 						continue
 					}
 					if name == kanbanDispatcherFailedTicksSeries {
@@ -1102,7 +1232,13 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		clusters = nil
 		volume = nil
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher, SlackConnected: slackConnected}
+	if forges != nil {
+		out.Forges = &usageForgeReading{}
+		for _, provider := range slices.Sorted(maps.Keys(forges)) {
+			out.Forges.Forges = append(out.Forges.Forges, *forges[provider])
+		}
+	}
 	if readings != nil {
 		var ok bool
 		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {
