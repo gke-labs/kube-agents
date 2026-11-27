@@ -270,7 +270,11 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
             [b["rule"] for b in rw_eval["blockers"]],
         )
 
-        # 3. Non-`/var/log` path or `..` traversal mounted read-only is blocked.
+        # 3. Non-`/var/log` path, `/var/logfoo` prefix without trailing slash, or `..` traversal mounted read-only is blocked.
+        self.assertTrue(scan._is_var_log_path("/var/log"))
+        self.assertTrue(scan._is_var_log_path("/var/log/pods"))
+        self.assertFalse(scan._is_var_log_path("/var/logfoo"))
+        self.assertFalse(scan._is_var_log_path("/var/logfoo/bar"))
         non_var_log_ro = _make_deployment(
             "etc-reader",
             containers=[
@@ -278,6 +282,11 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
                     "name": "reader",
                     "volumeMounts": [
                         {"name": "etcconf", "mountPath": "/etc", "readOnly": True},
+                        {
+                            "name": "logprefix",
+                            "mountPath": "/var/logfoo",
+                            "readOnly": True,
+                        },
                         {
                             "name": "traversal",
                             "mountPath": "/var/log",
@@ -289,6 +298,7 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
             pod_spec_extra={
                 "volumes": [
                     {"name": "etcconf", "hostPath": {"path": "/etc/cni/net.d"}},
+                    {"name": "logprefix", "hostPath": {"path": "/var/logfoo"}},
                     {
                         "name": "traversal",
                         "hostPath": {"path": "/var/log/../etc/passwd"},
@@ -302,10 +312,30 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
             b["rule"]: b["detail"] for b in non_var_log_eval["blockers"]
         }[scan.RULE_HOST_PATH]
         self.assertIn("etcconf (/etc/cni/net.d)", host_path_detail)
+        self.assertIn("logprefix (/var/logfoo)", host_path_detail)
         self.assertIn("traversal (/var/log/../etc/passwd)", host_path_detail)
 
     def test_safe_sysctls_allowed_and_unsafe_sysctls_blocked(self) -> None:
-        # 1. Kubernetes safe sysctls schedule on Autopilot without blocking.
+        # 1. Pin the exact Kubernetes safe sysctl allowlist so adding an unsafe sysctl fails.
+        expected_safe_sysctls = frozenset(
+            {
+                "kernel.shm_rmid_forced",
+                "net.ipv4.ip_local_port_range",
+                "net.ipv4.ip_local_reserved_ports",
+                "net.ipv4.ip_unprivileged_port_start",
+                "net.ipv4.ping_group_range",
+                "net.ipv4.tcp_fin_timeout",
+                "net.ipv4.tcp_keepalive_intvl",
+                "net.ipv4.tcp_keepalive_probes",
+                "net.ipv4.tcp_keepalive_time",
+                "net.ipv4.tcp_rmem",
+                "net.ipv4.tcp_syncookies",
+                "net.ipv4.tcp_wmem",
+            }
+        )
+        self.assertEqual(scan.SAFE_SYSCTLS, expected_safe_sysctls)
+
+        # 2. Kubernetes safe sysctls schedule on Autopilot without blocking.
         safe_dep = _make_deployment(
             "safe-sysctl-app",
             pod_spec_extra={
@@ -326,7 +356,7 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
         self.assertEqual(safe_eval["status"], scan.WORKLOAD_STATUS_READY)
         self.assertEqual(safe_eval["blockers"], [])
 
-        # 2. Mixed safe and unsafe sysctls block only on the unsafe sysctl.
+        # 3. Mixed safe and unsafe sysctls block only on the unsafe sysctls.
         mixed_dep = _make_deployment(
             "unsafe-sysctl-app",
             pod_spec_extra={
@@ -338,6 +368,7 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
                         },
                         {"name": "net.core.somaxconn", "value": "4096"},
                         {"name": "kernel.shmmax", "value": "65536"},
+                        {"name": "kernel.msgmax", "value": "65536"},
                     ]
                 }
             },
@@ -348,6 +379,7 @@ class WorkloadBlockerRuleTests(unittest.TestCase):
         self.assertIn(scan.RULE_SYSCTLS, rules)
         self.assertIn("net.core.somaxconn=4096", rules[scan.RULE_SYSCTLS])
         self.assertIn("kernel.shmmax=65536", rules[scan.RULE_SYSCTLS])
+        self.assertIn("kernel.msgmax=65536", rules[scan.RULE_SYSCTLS])
         self.assertNotIn(
             "net.ipv4.ip_unprivileged_port_start", rules[scan.RULE_SYSCTLS]
         )
