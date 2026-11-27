@@ -152,11 +152,13 @@ unless the kind's CustomResourceDefinition went away after the discovery.
 
 The compliance collector writes `kcc_unready` on each cluster it reads that serves a Config
 Connector kind, and `kcc_unread` on each cluster whose read fails, also when the discovery fails,
-from the read its own `kcc-object-wedged` check makes
-([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12), and
+from the read its `kcc-object-wedged` (§2.12) and `kcc-kubelet-cfs-quota-drift` (§2.22) checks share
+([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md)), and
 takes the namespace annotations from its NetworkPolicy read. Its `kcc-object-wedged` record names
 `kubectl get gcp -A -o json`, a command a reader can run that returns the same objects, and carries
-no `output_sha256`, because no single command produced the parallel read's output. The drift, patch
+no `output_sha256`, because no single command produced the parallel read's output; its
+`kcc-kubelet-cfs-quota-drift` record names the paged `kubectl get --raw` path for
+`ContainerNodePool` joined with the GKE node-pool read. The drift, patch
 readiness and stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool`
 declaration, read each collected cluster once after their sweep, in a new worker pool of the sweep's
 size, but only with `--config-connector` or while an audit run of their stream is in flight (the
@@ -165,8 +167,9 @@ in-flight note that `audit_report.py start` writes exists and is inside its TTL;
 note makes the read independent of the model copying the flag. A chat fleet question with no run in
 flight does not read. The top-level `config_connector_read` field records why the read ran: `flag`,
 `in-flight`, or `false`. All three mark a cluster whose `clusters list` record shows the Config Connector
-add-on enabled with `config_connector_addon`, and those clusters are read first. Drift and patch
-readiness fetch credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
+add-on enabled with `config_connector_addon`, and those clusters are read first. Drift reuses any
+kubeconfig §4.17 fetched and fetches credentials for the remaining clusters; patch
+readiness fetches credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
 unready object has no project annotation, one `kubectl get namespaces` on that cluster gives the
 namespace annotations; when it fails, the project stays unknown. These reads end
 `kcc_health.RUN_DEADLINE_S` (540 s) after the collector starts, so the manifest prints inside the

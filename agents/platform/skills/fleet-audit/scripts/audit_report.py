@@ -191,6 +191,7 @@ AUDITS: dict[str, AuditSpec] = {
             "serviceentry-host-collision",
             "webhook-ca-bundle-expired",
             "wi-gsa-iam-binding-unverifiable",
+            "kcc-kubelet-cfs-quota-drift",
         ),
         # The three compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -385,6 +386,9 @@ AUDITS: dict[str, AuditSpec] = {
             "boot-disk",
             # §4.16, the second facet voted by node pool.
             "kubelet-config",
+            # §4.17, cohort-independent check for Standard pools with
+            # cpuCfsQuota=false hosting pods that declare CPU limits.
+            "kubelet-cpu-cfs-quota",
         ),
         # §3 step 6's split-cluster guard: a cluster that is an outlier on six
         # or more facets is a different kind of cluster, not a drifting one, so
@@ -1282,6 +1286,7 @@ CHECK_PHRASES = {
     "serviceentry-host-collision": "{object} is routed by Istio's pick in namespaces that declare none of its entries",
     "webhook-ca-bundle-expired": "{object} has an expired or expiring webhook CA bundle",
     "wi-gsa-iam-binding-unverifiable": "{object} names a Google service account this install cannot vouch for",
+    "kcc-kubelet-cfs-quota-drift": "{object} disagrees with GKE's disabled CPU quota enforcement",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -1360,6 +1365,7 @@ CHECK_PHRASES = {
     "database-encryption": "secrets encryption differs from its peers",
     "boot-disk": "{object} node pool has a different boot disk from its peers",
     "kubelet-config": "{object} node pool has a different kubelet configuration from its peers",
+    "kubelet-cpu-cfs-quota": "{object} node pool disables CPU quota enforcement while pods set CPU limits",
     "no-environment-label": "has no environment label",
     "uncohorted": "differs from its peers on too many settings to compare",
     # AI Workload Security Audit
@@ -2621,6 +2627,8 @@ KCC_NAMESPACE_KIND = "Namespace"
 # cluster or a node pool as their own. A Kubernetes `Service/billing` is not
 # the Config Connector `Service` (serviceusage) of the same name.
 KCC_OBJECT_CHECK = "kcc-object-wedged"
+KCC_KUBELET_CFS_QUOTA_DRIFT_CHECK = "kcc-kubelet-cfs-quota-drift"
+KCC_OBJECT_CHECKS = frozenset({KCC_OBJECT_CHECK, KCC_KUBELET_CFS_QUOTA_DRIFT_CHECK})
 # How many segments a `project/location/name` cluster target has.
 CLUSTER_TARGET_SEGMENTS = 3
 # What an entry of a collector that reads Config Connector needs to be a
@@ -22424,9 +22432,9 @@ def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dic
             if key[0] in kinds and key[1] == name and (key[0] not in pool_kinds or key[2] == cluster)
         }
     # Only a finding about a Config Connector object has one of another kind
-    # (`KCC_OBJECT_CHECK`): a kind name alone can be a core Kubernetes kind
+    # (`KCC_OBJECT_CHECKS`): a kind name alone can be a core Kubernetes kind
     # that a Config Connector kind shares (`Service`).
-    if str(finding.get("check") or "") != KCC_OBJECT_CHECK:
+    if str(finding.get("check") or "") not in KCC_OBJECT_CHECKS:
         return {}
     return {key: declaration for key, declaration in index.items() if key[0] == prefix and declaration.name == name}
 
@@ -22493,9 +22501,10 @@ def _remediation_file_stalls(
     # nothing about the project or the location its object manages: only the
     # declaration can give those.
     about_managed_cluster = str(finding.get("object") or "").partition("/")[0] in _KCC_OBJECT_KINDS
-    # A `kcc-object-wedged` finding is raised on the cluster that holds the
+    # A Config Connector object finding (`kcc-object-wedged` or
+    # `kcc-kubelet-cfs-quota-drift`) is raised on the cluster that holds the
     # object, so only a stall read there is its object (`_on_finding_cluster`).
-    on_host = str(finding.get("cluster") or "") if str(finding.get("check") or "") == KCC_OBJECT_CHECK else None
+    on_host = str(finding.get("cluster") or "") if str(finding.get("check") or "") in KCC_OBJECT_CHECKS else None
     for (kind, _, cluster_ref, file_location, _, _), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
@@ -22586,7 +22595,7 @@ def _generic_object_stalls(
 ) -> list[KccStall]:
     """The unready objects that are the own object of a `<Kind>/<n>` finding.
 
-    Only a finding about a Config Connector object (`KCC_OBJECT_CHECK`) has
+    Only a finding about a Config Connector object (`KCC_OBJECT_CHECKS`) has
     one, and it is raised on the cluster that holds the object, so the stall
     must be on that host: a kind name alone can be a core Kubernetes kind
     (`Service`) that a Config Connector kind shares. The finding gives no
@@ -22597,7 +22606,7 @@ def _generic_object_stalls(
     matches only that namespace. Because the stall is on the finding's
     cluster, the number of hosts does not matter.
     """
-    if str(finding.get("check") or "") != KCC_OBJECT_CHECK:
+    if str(finding.get("check") or "") not in KCC_OBJECT_CHECKS:
         return []
     cluster = str(finding.get("cluster") or "")
     namespace = str(finding.get("namespace") or "")
@@ -22642,8 +22651,8 @@ def kcc_index_needed(findings: list[dict], manifest: dict | None) -> bool:
     """Whether a finding's own object can be one that the manifest records as
     not ready, so the Config Connector paragraph can need the declaration
     index: a `Cluster/` or `NodePool/` finding whose object matches a stall
-    (`_object_stalls`), or a `kcc-object-wedged` finding with a stall of its
-    kind and name on its cluster. A superset of the findings that get the
+    (`_object_stalls`), or a `kcc-object-wedged` / `kcc-kubelet-cfs-quota-drift`
+    finding with a stall of its kind and name on its cluster. A superset of the findings that get the
     paragraph, decided before the index exists, so a run with no such
     finding builds no index and makes no broker search for it."""
     health = kcc_health(manifest)
@@ -22656,7 +22665,7 @@ def kcc_index_needed(findings: list[dict], manifest: dict | None) -> bool:
         if prefix in _KCC_OBJECT_KINDS:
             if _object_stalls(finding, health.stalled, health.hosts, health.targets):
                 return True
-        elif str(finding.get("check") or "") == KCC_OBJECT_CHECK:
+        elif str(finding.get("check") or "") in KCC_OBJECT_CHECKS:
             cluster = str(finding.get("cluster") or "")
             if any(
                 _on_finding_cluster(stall, cluster) and stall.kind == prefix and stall.name == name

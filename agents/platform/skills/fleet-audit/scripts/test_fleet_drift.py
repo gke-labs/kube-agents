@@ -1760,7 +1760,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         "secure-boot", "integrity-monitoring", "node-autoprovisioning", "pool-autoscaling",
         "image-type", "shielded-nodes", "datapath-provider", "intra-node-visibility",
         "managed-prometheus", "logging-components", "monitoring-components",
-        "boot-disk", "kubelet-config",
+        "boot-disk", "kubelet-config", "kubelet-cpu-cfs-quota",
     )
 
     def manifest(self, clusters):
@@ -1856,7 +1856,7 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         entry = self.manifest(self.autopilot_cohort())["clusters"][0]
         ran = {c["check"] for c in entry["commands"]}
         declared = {n["check"] for n in entry["checks_not_applicable"]}
-        roster = {f.slug for f in fd.FACETS} | {fd.UNLABELLED_SLUG}
+        roster = {f.slug for f in fd.FACETS} | {fd.UNLABELLED_SLUG, fd.KUBELET_CFS_QUOTA_SLUG}
         self.assertEqual(roster - ran - declared, set())
         self.assertEqual(ran & declared, set())
 
@@ -1872,7 +1872,10 @@ class UnvotedFacetsTest(unittest.TestCase):
     out of twenty-one fell between the two.
     """
 
-    POOL_FACETS = ["boot-disk", "image-type", "integrity-monitoring", "kubelet-config", "pool-autoscaling", "secure-boot"]
+    POOL_FACETS = [
+        "boot-disk", "image-type", "integrity-monitoring", "kubelet-config",
+        "kubelet-cpu-cfs-quota", "pool-autoscaling", "secure-boot",
+    ]
 
     def manifest(self, clusters):
         clusters_json = json.dumps(clusters)
@@ -2511,7 +2514,8 @@ class NoEnvironmentLabelTest(unittest.TestCase):
 
         spec = audit_report.AUDITS["fleet-consistency-drift"]
         self.assertIn(fd.UNLABELLED_SLUG, spec.checks)
-        self.assertEqual(len(spec.checks), len(fd.FACETS) + 1)
+        self.assertIn(fd.KUBELET_CFS_QUOTA_SLUG, spec.checks)
+        self.assertEqual(len(spec.checks), len(fd.FACETS) + 2)
 
 
 class BootDiskPoolVoteTest(unittest.TestCase):
@@ -3416,6 +3420,275 @@ class DefaultRunTimeoutTest(unittest.TestCase):
             discovery = fd.discover_fleet(None, run=run)
         self.assertEqual(discovery.projects, ["acme"])
         self.assertIn(f"`gcloud projects list` rc={fd.TIMEOUT_RC}: WARNING: zone did not respond. The scope", discovery.partial)
+
+
+class KubeletCpuCfsQuotaTest(unittest.TestCase):
+    """§4.17: cohort-independent `kubelet-cpu-cfs-quota` check for Standard Linux
+    pools with `cpuCfsQuota=false` hosting live pods declaring `resources.limits.cpu`."""
+
+    @staticmethod
+    def _node(name, pool_name):
+        return {
+            "kind": "Node",
+            "metadata": {"name": name, "labels": {fd.GKE_NODEPOOL_LABEL: pool_name}},
+        }
+
+    @staticmethod
+    def _pod(
+        name,
+        node_name,
+        *,
+        ns="payments",
+        phase="Running",
+        cpu_limit="2",
+        image="gcr.io/acme/svc:1.0",
+        command=None,
+        args=None,
+        env=None,
+        ctr_name="app",
+    ):
+        ctr = {"name": ctr_name, "image": image}
+        if cpu_limit is not None:
+            ctr["resources"] = {"limits": {"cpu": cpu_limit}}
+        if command is not None:
+            ctr["command"] = command
+        if args is not None:
+            ctr["args"] = args
+        if env is not None:
+            ctr["env"] = env
+        return {
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": ns},
+            "spec": {"nodeName": node_name, "containers": [ctr]},
+            "status": {"phase": phase},
+        }
+
+    @staticmethod
+    def _run_fleet(clusters, *, nodes=None, pods=None, cred_rc=0, kubectl_rc=0):
+        clusters_json = json.dumps(clusters)
+        nodes_json = json.dumps({"items": nodes or []})
+        pods_json = json.dumps({"items": pods or []})
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                return run_of(cred_rc, "", "auth denied" if cred_rc else "")
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                if kubectl_rc:
+                    return run_of(kubectl_rc, "", "forbidden")
+                if "/api/v1/nodes" in argv[3]:
+                    return run_of(0, nodes_json)
+                if "/api/v1/pods" in argv[3]:
+                    return run_of(0, pods_json)
+            return run_of(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import collect as collect_mod
+            with mock.patch.object(collect_mod, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = collected(run, now=NOW)
+        return manifest, issued
+
+    def test_fast_path_issues_zero_kubectl_calls_when_no_pool_disables_cfs_quota(self):
+        fleet = [cluster(f"c{i}", nodePools=[pool("app-pool", kubelet={"cpuCfsQuota": True})]) for i in range(3)]
+        manifest, issued = self._run_fleet(fleet)
+        self.assertEqual([a for a in issued if a[0] == "kubectl"], [])
+        self.assertEqual([a for a in issued if "get-credentials" in a], [])
+        for entry in manifest["clusters"]:
+            self.assertIn(fd.KUBELET_CFS_QUOTA_SLUG, {c["check"] for c in entry["commands"]})
+            self.assertEqual(
+                [c for c in entry["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG], []
+            )
+
+    def test_flags_pool_with_cpu_cfs_quota_false_and_pods_declaring_cpu_limits(self):
+        fleet = [
+            cluster("c0", nodePools=[pool("hyperdisk-pool", kubelet={"cpuCfsQuota": False})]),
+        ]
+        nodes = [self._node("gke-c0-hyperdisk-1", "hyperdisk-pool")]
+        pods = [
+            self._pod("pay-1", "gke-c0-hyperdisk-1", ns="payments", cpu_limit="2", image="eclipse-temurin:21-jre"),
+            self._pod("pay-2", "gke-c0-hyperdisk-1", ns="payments", cpu_limit="500m", image="nginx:1.27"),
+        ]
+        manifest, _ = self._run_fleet(fleet, nodes=nodes, pods=pods)
+        entry = manifest["clusters"][0]
+        hits = [c for c in entry["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG]
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual(hit["object"], "NodePool/hyperdisk-pool")
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("cpuCfsQuota=false", hit["excerpt"])
+        self.assertIn("2 live pod(s) on NodePool/hyperdisk-pool declare resources.limits.cpu", hit["excerpt"])
+        self.assertIn("payments/pay-1", hit["excerpt"])
+        self.assertIn("jvm_note: 1 JVM container(s)", hit["excerpt"])
+        self.assertIn("-XX:ActiveProcessorCount", hit["excerpt"])
+        self.assertIn("-XX:MaxRAMPercentage", hit["excerpt"])
+        self.assertIn("kubectl get --raw", hit["command"])
+        self.assertIn("gcloud container clusters list", hit["command"])
+
+    def test_cohort_wide_cpu_cfs_quota_false_fires_even_when_kubelet_config_agrees(self):
+        fleet = [
+            cluster(f"c{i}", nodePools=[pool("app-pool", kubelet={"cpuCfsQuota": False})])
+            for i in range(3)
+        ]
+        nodes = [self._node("n0", "app-pool")]
+        pods = [self._pod("worker-0", "n0", cpu_limit="1")]
+        manifest, _ = self._run_fleet(fleet, nodes=nodes, pods=pods)
+        for entry in manifest["clusters"]:
+            self.assertEqual([c for c in entry["candidates"] if c["check"] == fd.KUBELET_CONFIG_SLUG], [])
+            cfs_hits = [c for c in entry["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG]
+            self.assertEqual(len(cfs_hits), 1)
+            self.assertEqual(cfs_hits[0]["object"], "NodePool/app-pool")
+
+    def test_jvm_note_suppressed_when_both_ergonomic_flags_are_explicitly_set(self):
+        fleet = [cluster("c0", nodePools=[pool("jvm-pool", kubelet={"cpuCfsQuota": False})])]
+        nodes = [self._node("n0", "jvm-pool")]
+        pods = [
+            self._pod(
+                "bounded-java",
+                "n0",
+                cpu_limit="2",
+                image="openjdk:21-slim",
+                env=[{"name": "JAVA_TOOL_OPTIONS", "value": "-XX:ActiveProcessorCount=2 -XX:MaxRAMPercentage=75.0"}],
+            ),
+            self._pod(
+                "js-service",
+                "n0",
+                cpu_limit="1",
+                image="gcr.io/acme/javascript-worker:1.2",
+            ),
+        ]
+        manifest, _ = self._run_fleet(fleet, nodes=nodes, pods=pods)
+        hit = [c for c in manifest["clusters"][0]["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG][0]
+        self.assertIn("2 live pod(s)", hit["excerpt"])
+        self.assertNotIn("jvm_note:", hit["excerpt"])
+
+    def test_jvm_entrypoint_heuristic_catches_custom_image_running_java(self):
+        fleet = [cluster("c0", nodePools=[pool("jvm-pool", kubelet={"cpuCfsQuota": False})])]
+        nodes = [self._node("n0", "jvm-pool")]
+        pods = [
+            self._pod(
+                "ledger-svc",
+                "n0",
+                cpu_limit="2",
+                image="gcr.io/acme/distroless-base:latest",
+                command=["/usr/bin/java"],
+                args=["-jar", "/app/ledger.jar", "-XX:MaxRAMPercentage=75.0"],
+            ),
+        ]
+        manifest, _ = self._run_fleet(fleet, nodes=nodes, pods=pods)
+        hit = [c for c in manifest["clusters"][0]["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG][0]
+        self.assertIn("jvm_note: 1 JVM container(s)", hit["excerpt"])
+        self.assertIn("missing -XX:ActiveProcessorCount)", hit["excerpt"])
+
+    def test_silent_when_disabled_pool_has_no_live_pods_with_cpu_limits(self):
+        fleet = [cluster("c0", nodePools=[pool("idle-pool", kubelet={"cpuCfsQuota": False})])]
+        nodes = [self._node("n0", "idle-pool")]
+        pods = [
+            self._pod("finished-job", "n0", phase="Succeeded", cpu_limit="2"),
+            self._pod("failed-job", "n0", phase="Failed", cpu_limit="2"),
+            self._pod("unbounded-app", "n0", phase="Running", cpu_limit=None),
+            self._pod("zero-limit-m", "n0", phase="Running", cpu_limit="0m"),
+            self._pod("zero-limit-dec", "n0", phase="Running", cpu_limit="0.00"),
+            self._pod("zero-limit-pad", "n0", phase="Running", cpu_limit="000m"),
+            self._pod("zero-limit-nano", "n0", phase="Running", cpu_limit="0n"),
+        ]
+        manifest, _ = self._run_fleet(fleet, nodes=nodes, pods=pods)
+        entry = manifest["clusters"][0]
+        self.assertIn(fd.KUBELET_CFS_QUOTA_SLUG, {c["check"] for c in entry["commands"]})
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG], [])
+
+    def test_shell_wrapped_jvm_command_triggers_jvm_note(self):
+        fleet = [cluster("c0", nodePools=[pool("jvm-pool", kubelet={"cpuCfsQuota": False})])]
+        nodes = [self._node("n0", "jvm-pool")]
+        pods = [
+            self._pod(
+                "wrapped-svc",
+                "n0",
+                cpu_limit="2",
+                image="gcr.io/acme/custom-base:1.0",
+                command=["/bin/sh", "-c"],
+                args=["exec java -Xmx2g -jar /app/svc.jar"],
+            ),
+        ]
+        manifest, _ = self._run_fleet(fleet, nodes=nodes, pods=pods)
+        hit = [c for c in manifest["clusters"][0]["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG][0]
+        self.assertIn("jvm_note: 1 JVM container(s)", hit["excerpt"])
+        self.assertIn("-XX:ActiveProcessorCount", hit["excerpt"])
+        self.assertIn("-XX:MaxRAMPercentage", hit["excerpt"])
+
+    def test_kubectl_failure_records_plain_limitation_and_omits_check_from_commands(self):
+        fleet = [cluster("c0", nodePools=[pool("bad-pool", kubelet={"cpuCfsQuota": False})])]
+        manifest, _ = self._run_fleet(fleet, kubectl_rc=1)
+        entry = manifest["clusters"][0]
+        self.assertNotIn(fd.KUBELET_CFS_QUOTA_SLUG, {c["check"] for c in entry["commands"]})
+        self.assertIn("kubelet-cpu-cfs-quota", entry["limitations"])
+        self.assertIn("bad-pool", entry["limitations"])
+        self.assertNotIn("rc=", entry["limitations"])
+        self.assertNotIn("get-credentials", entry["limitations"])
+        self.assertNotIn("resources.limits.cpu", entry["limitations"])
+
+    def test_config_connector_reuses_kubeconfig_fetched_for_cfs_quota_read(self):
+        fleet = [cluster("c0", nodePools=[pool("app-pool", kubelet={"cpuCfsQuota": False})])]
+        clusters_json = json.dumps(fleet)
+        nodes_json = json.dumps({"items": [self._node("n0", "app-pool")]})
+        pods_json = json.dumps({"items": [self._pod("pay-1", "n0", cpu_limit="1")]})
+        get_creds_calls = []
+
+        def run(argv, **kwargs):
+            if "list" in argv and "clusters" in argv:
+                return run_of(0, clusters_json)
+            if "get-credentials" in argv:
+                get_creds_calls.append(list(argv))
+                kc_path = (kwargs.get("env") or {}).get("KUBECONFIG")
+                if kc_path:
+                    Path(kc_path).write_text("apiVersion: v1\nkind: Config\n")
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                if "/api/v1/nodes" in argv[3]:
+                    return run_of(0, nodes_json)
+                if "/api/v1/pods" in argv[3]:
+                    return run_of(0, pods_json)
+            if argv[:2] == ["kubectl", "api-resources"]:
+                return run_of(0, "")
+            return run_of(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import collect as collect_mod
+            fetched = {}
+            with mock.patch.object(collect_mod, "KUBECONFIG_DIR", Path(tmp)):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    manifest = fd.collect_fleet("acme", run=run, now=NOW, kubeconfigs=fetched)
+                    fd.kcc_health.annotate_manifest(
+                        manifest,
+                        deadline=fd.kcc_health.run_deadline(fd.time.monotonic()),
+                        run=run,
+                        kubeconfig_for=lambda e: fetched.get(str(e.get("name") or "")),
+                        kinds=fd.kcc_health.CONTAINER_KINDS,
+                    )
+        self.assertEqual(len(get_creds_calls), 1)
+        self.assertIn("acme/us-central1/c0", fetched)
+        hits = [c for c in manifest["clusters"][0]["candidates"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG]
+        self.assertEqual(len(hits), 1)
+
+    def test_windows_only_standard_cluster_declares_check_not_applicable(self):
+        fleet = [cluster("c0", nodePools=[pool("win-pool", image="WINDOWS_LTSC_CONTAINERD")])]
+        manifest, issued = self._run_fleet(fleet)
+        entry = manifest["clusters"][0]
+        self.assertEqual([a for a in issued if a[0] == "kubectl"], [])
+        declared = {n["check"]: n["reason"] for n in entry["checks_not_applicable"]}
+        self.assertIn(fd.KUBELET_CFS_QUOTA_SLUG, declared)
+        self.assertIn("Windows", declared[fd.KUBELET_CFS_QUOTA_SLUG])
+
+    def test_output_digest_changes_when_pods_on_disabled_pool_change(self):
+        fleet = [cluster("c0", nodePools=[pool("p0", kubelet={"cpuCfsQuota": False})])]
+        nodes = [self._node("n0", "p0")]
+        m1, _ = self._run_fleet(fleet, nodes=nodes, pods=[self._pod("a", "n0", cpu_limit="1")])
+        m2, _ = self._run_fleet(fleet, nodes=nodes, pods=[self._pod("a", "n0", cpu_limit="1"), self._pod("b", "n0", cpu_limit="2")])
+        d1 = next(c["output_sha256"] for c in m1["clusters"][0]["commands"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG)
+        d2 = next(c["output_sha256"] for c in m2["clusters"][0]["commands"] if c["check"] == fd.KUBELET_CFS_QUOTA_SLUG)
+        self.assertNotEqual(d1, d2)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,11 @@ The common request: grow a pool, turn on autoscaling, change its bounds.
   `nodeConfig.imageType`, `nodeConfig.taint`, `nodeConfig.tags`,
   `nodeConfig.workloadMetadataConfig`, `nodeConfig.kubeletConfig`,
   `nodeConfig.linuxNodeConfig`, `maxPodsPerNode` (check with `explain`).
+- **`kubeletConfig.cpuCfsQuota`:** whenever `spec.nodeConfig.kubeletConfig` is
+  set, specify `cpuCfsQuota: true` explicitly (unless intentionally disabling
+  CFS quota enforcement). Older Config Connector releases sent `false` when the
+  key was omitted, leaving live pools with CPU limits unenforced until
+  `cpuCfsQuota: true` is set explicitly.
 
 ### `describe` output to spec
 

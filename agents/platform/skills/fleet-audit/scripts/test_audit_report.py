@@ -3834,6 +3834,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "monitoring-components",
                 "boot-disk",
                 "kubelet-config",
+                "kubelet-cpu-cfs-quota",
             ],
         }
         for audit_id, checks in expected_na_checks.items():
@@ -41628,6 +41629,99 @@ class ComplianceWiGsaUnverifiableDeclarableTests(unittest.TestCase):
                     audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
                 self.assertIn("declared[0].object", str(cm.exception))
                 self.assertIn("serviceaccount", str(cm.exception))
+
+
+class TestKubeletCfsQuotaAuditReportIntegration(unittest.TestCase):
+    """Roster, chat phrases, and stalled-KCC disclosure for `kubelet-cpu-cfs-quota`
+    and `kcc-kubelet-cfs-quota-drift`."""
+
+    def test_both_checks_have_roster_entries_and_chat_phrases(self):
+        self.assertIn("kubelet-cpu-cfs-quota", audit_report.AUDITS["fleet-consistency-drift"].checks)
+        self.assertIn("kcc-kubelet-cfs-quota-drift", audit_report.AUDITS["compliance-audit"].checks)
+        self.assertIn("kubelet-cpu-cfs-quota", audit_report.CHECK_PHRASES)
+        self.assertIn("kcc-kubelet-cfs-quota-drift", audit_report.CHECK_PHRASES)
+        drift_row = audit_report.summary_row(
+            {"check": "kubelet-cpu-cfs-quota", "severity": "major", "cluster": "prod-a", "object": "NodePool/app-pool"}
+        )
+        self.assertIn("app-pool", drift_row)
+        self.assertIn("CPU quota", drift_row)
+        kcc_row = audit_report.summary_row(
+            {
+                "check": "kcc-kubelet-cfs-quota-drift",
+                "severity": "major",
+                "cluster": "hub",
+                "namespace": "infra",
+                "object": "ContainerNodePool/hyperdisk-pool",
+            }
+        )
+        self.assertIn("hyperdisk-pool", kcc_row)
+        self.assertIn("CPU quota", kcc_row)
+        self.assertNotIn("cpuCfsQuota", kcc_row)
+
+    def test_kcc_kubelet_cfs_quota_drift_triggers_kcc_index_and_in_file_disclosure(self):
+        manifest = {
+            "clusters": [
+                {
+                    "name": "acme/us-central1/hub-other",
+                    "outcome": "collected",
+                    "kcc_unready": [],
+                },
+                {
+                    "name": "acme/us-central1/hub",
+                    "outcome": "collected",
+                    "kcc_unready": [
+                        {
+                            "kind": "ContainerNodePool",
+                            "namespace": "infra",
+                            "name": "hyperdisk-pool",
+                            "why": "UpdateFailed: quota exceeded",
+                            "cluster": "spoke-a",
+                            "location": "us-central1-a",
+                            "project": "spoke-proj",
+                        }
+                    ],
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            decl_path = root / "clusters/spoke-a/hyperdisk-pool.yaml"
+            decl_path.parent.mkdir(parents=True, exist_ok=True)
+            decl_path.write_text(
+                "apiVersion: container.cnrm.cloud.google.com/v1beta1\n"
+                "kind: ContainerNodePool\n"
+                "metadata:\n"
+                "  name: hyperdisk-pool\n"
+                "  namespace: infra\n"
+                "  annotations:\n"
+                "    cnrm.cloud.google.com/project-id: spoke-proj\n"
+                "spec:\n"
+                "  location: us-central1-a\n"
+                "  clusterRef:\n"
+                "    name: spoke-a\n"
+                "  nodeConfig:\n"
+                "    kubeletConfig:\n"
+                "      cpuCfsQuota: true\n"
+            )
+            finding = make_finding(
+                fid="kcc-cfs",
+                check="kcc-kubelet-cfs-quota-drift",
+                cluster="acme/us-central1/hub",
+                namespace="infra",
+                obj="ContainerNodePool/hyperdisk-pool",
+                remediation={
+                    "kind": "manifest",
+                    "path": "clusters/spoke-a/hyperdisk-pool.yaml",
+                    "note": "Set cpuCfsQuota: true explicitly.",
+                },
+            )
+            self.assertTrue(audit_report.kcc_index_needed([finding], manifest))
+            changed = audit_report.disclose_stalled_kcc_remediations(
+                [finding], manifest, root, audit_report.kcc_declarations(root)
+            )
+            self.assertEqual(changed, ["kcc-cfs"])
+            self.assertIn("**Config Connector is not applying this file.**", finding["remediation"]["note"])
+            self.assertIn("UpdateFailed: quota exceeded", finding["remediation"]["note"])
 
 
 if __name__ == "__main__":

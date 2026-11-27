@@ -892,7 +892,8 @@ for a cluster or a node pool, the location of the finding's cluster.
 Only the finding's own object in the file counts, also when the file declares one Config Connector
 object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for
 `Cluster/<n>`, the `ContainerCluster` `<n>`; for `<Kind>/<n>` of a Config Connector kind, the object
-of that kind and that name. This last rule applies only to a `kcc-object-wedged` finding, which is
+of that kind and that name. This last rule applies only to a `kcc-object-wedged` or
+`kcc-kubelet-cfs-quota-drift` finding, which is
 about a Config Connector object, and only to an object on the finding's cluster, in the fix's file
 and outside it. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
 has no Config Connector object of its own, even when the file declares one of the same name: a
@@ -919,8 +920,8 @@ unknown.
 
 A ready object is not in the list, so with more than one possible host the same name can be ready
 on one host and not ready on another. Then the `project` must also be known, for a `Cluster/` or
-`NodePool/` finding. A `kcc-object-wedged` finding's object is on the finding's own cluster, so the
-number of hosts does not apply to it. In the fix's file, a known `project` that differs from the
+`NodePool/` finding. A `kcc-object-wedged` or `kcc-kubelet-cfs-quota-drift` finding's object is on
+the finding's own cluster, so the number of hosts does not apply to it. In the fix's file, a known `project` that differs from the
 file's still blocks the match. Outside it, the files that declare the object in the stall's
 namespace, the fix's file included, are the evidence: when each of them gives a known project or
 location that differs from the stall's, the match is not certain. A possible host is an
@@ -950,8 +951,8 @@ Config Connector declaration index the `gcloud` check reads: the clone, or in co
 files that name any Config Connector group (`every_kind`), so every kind is indexed. Both read
 `.yaml`, `.yml` and `.json` files. `finish` and `remediate` build this index the same way
 (`kcc_paragraph_index`), and only when a finding needs it (`kcc_index_needed`): a
-`Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
-with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
+`Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` or
+`kcc-kubelet-cfs-quota-drift` finding with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
 index, so the snapshot and each clone are read once. The fix's file is not the declaration, so the
 paragraph does not say "this file": when exactly one file declares the object, its first sentence
 names that file ("**Config Connector is not applying `<path>`.**", `KCC_STALLED_DECLARED_MARK`, or
@@ -1008,7 +1009,7 @@ The same match makes the `pr-merged-persists` row and the comment on the merged 
 the stall in place of "the remediation was incomplete, or something outside this repository
 reverted it", with the same advice as the note; the comment is posted once and never updated. So
 does any finding whose own object is not ready (a `Cluster/` or `NodePool/` finding, or a
-`kcc-object-wedged` finding of a Config Connector kind, `<Kind>/<n>`), whatever the fix's kind.
+`kcc-object-wedged` or `kcc-kubelet-cfs-quota-drift` finding of a Config Connector kind, `<Kind>/<n>`), whatever the fix's kind.
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 

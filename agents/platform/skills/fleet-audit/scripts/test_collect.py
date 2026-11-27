@@ -6941,11 +6941,29 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # rightly rejected for naming checks that examined nothing.
                 return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
             if is_kcc_read(argv):
-                # One healthy Config Connector object. An empty list here is
-                # not the same thing: it declares `kcc-object-wedged`
-                # inapplicable, and the full roster this test asserts against
-                # would then rightly be rejected for naming a check nothing ran.
-                return serve_kcc(argv, [kcc_object("ComputeFirewall", "allow-ssh")])
+                # One healthy Config Connector ContainerNodePool so both
+                # `kcc-object-wedged` and `kcc-kubelet-cfs-quota-drift` run
+                # rather than being declared inapplicable.
+                return serve_kcc(
+                    argv,
+                    [
+                        kcc_object("ComputeFirewall", "allow-ssh"),
+                        {
+                            "apiVersion": "container.cnrm.cloud.google.com/v1beta1",
+                            "kind": "ContainerNodePool",
+                            "metadata": {
+                                "name": "default-pool",
+                                "namespace": "infra",
+                                "annotations": {"cnrm.cloud.google.com/project-id": "acme"},
+                            },
+                            "spec": {
+                                "location": "us-central1",
+                                "clusterRef": {"external": "projects/acme/locations/us-central1/clusters/c1"},
+                            },
+                            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                        },
+                    ],
+                )
             if argv[:2] == ["kubectl", "get"] and argv[2] in collect.CONFIGSYNC_SYNC_KINDS:
                 # One healthy RootSync, for the reason the `gcp` read above
                 # answers with one healthy object: served and empty would
@@ -10615,18 +10633,27 @@ class TestComplianceCollectCluster(unittest.TestCase):
         not_applicable_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(
             not_applicable_slugs,
-            # `kcc-object-wedged` rides along on every cluster in this fixture:
-            # the fake answers `kubectl get gcp` the way a cluster without
-            # Config Connector does. It is declared by the collector rather
-            # than by the Autopilot table, so it is not part of what this test
-            # is about -- see `test_a_cluster_without_config_connector_...`.
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
+            # `kcc-object-wedged` and `kcc-kubelet-cfs-quota-drift` ride along
+            # on every cluster in this fixture: the fake answers `kubectl get
+            # gcp` the way a cluster without Config Connector does. They are
+            # declared by the collector rather than by the Autopilot table, so
+            # they are not part of what this test is about.
+            {
+                "privileged-container", "host-namespace", "hostpath-mount",
+                "kcc-object-wedged", "kcc-kubelet-cfs-quota-drift",
+                "configsync-reconciler-stalled", "serviceentry-host-collision",
+            },
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
-            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"):
+            if entry["check"] in (
+                "kcc-object-wedged",
+                "kcc-kubelet-cfs-quota-drift",
+                "configsync-reconciler-stalled",
+                "serviceentry-host-collision",
+            ):
                 continue
             self.assertIn("Autopilot", entry["reason"])
 
@@ -10644,7 +10671,12 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # wrote it: an unfalsifiable claim is the defect, not Autopilot's
             # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
-            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"):
+            if entry["check"] in (
+                "kcc-object-wedged",
+                "kcc-kubelet-cfs-quota-drift",
+                "configsync-reconciler-stalled",
+                "serviceentry-host-collision",
+            ):
                 continue
             # Scoped to the workloads the audit can see, and to the admission
             # policy holding -- both halves, on every Autopilot reason.
@@ -10662,7 +10694,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"}
+            {e["check"] for e in result["checks_not_applicable"]},
+            {"kcc-object-wedged", "kcc-kubelet-cfs-quota-drift", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
@@ -10681,7 +10714,11 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
+            {
+                "privileged-container", "host-namespace", "hostpath-mount",
+                "kcc-object-wedged", "kcc-kubelet-cfs-quota-drift",
+                "configsync-reconciler-stalled", "serviceentry-host-collision",
+            },
         )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
@@ -10702,7 +10739,10 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"})
+        self.assertEqual(
+            {e["check"] for e in result["checks_not_applicable"]},
+            {"kcc-object-wedged", "kcc-kubelet-cfs-quota-drift", "configsync-reconciler-stalled", "serviceentry-host-collision"},
+        )
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"},
             {c["check"] for c in result["commands"]},
@@ -10720,21 +10760,22 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"},
+            {
+                "privileged-container", "host-namespace", "hostpath-mount",
+                "kcc-object-wedged", "kcc-kubelet-cfs-quota-drift",
+                "configsync-reconciler-stalled", "serviceentry-host-collision",
+            },
         )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
         """A Standard cluster with in-scope workloads rules out nothing the
         Autopilot table or the empty-scope rule would rule out. What it does
-        rule out is `kcc-object-wedged`: the API server there does not serve
-        the `gcp` category at all. Without that entry the check would count
-        against the cluster's coverage denominator on every cluster in the
-        fleet but the one hosting Config Connector -- a permanent 11/12 on
-        fifteen clusters, which is the reverse failure of a false all-clear
-        and just as good at teaching a reader to ignore the column."""
+        rule out is `kcc-object-wedged` and `kcc-kubelet-cfs-quota-drift`: the
+        API server there does not serve the `gcp` category at all."""
         result = self.run_with()
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"}
+            {e["check"] for e in result["checks_not_applicable"]},
+            {"kcc-object-wedged", "kcc-kubelet-cfs-quota-drift", "configsync-reconciler-stalled", "serviceentry-host-collision"},
         )
 
     def kcc_reason(self, result):
@@ -10940,7 +10981,10 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # Nor are the other two, though they found nothing: all three rest on
         # one admission rule, and a privileged pod says it is not holding on
         # this cluster, so a hostPath or host-namespace pod could be there too.
-        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled", "serviceentry-host-collision"})
+        self.assertEqual(
+            not_applicable,
+            {"kcc-object-wedged", "kcc-kubelet-cfs-quota-drift", "configsync-reconciler-stalled", "serviceentry-host-collision"},
+        )
         self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
@@ -10988,15 +11032,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Twenty-one checks minus the three Autopilot rules out and the three no
+        Twenty-two checks minus the three Autopilot rules out and the four no
         cluster without Config Connector, Config Sync or Istio can run is fifteen,
-        each with a command behind it, and the six dispositioned rather than silently
+        each with a command behind it, and the seven dispositioned rather than silently
         absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 15)
-        self.assertEqual(len(na_slugs), 6)
+        self.assertEqual(len(na_slugs), 7)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
@@ -17120,6 +17164,392 @@ class TestOnlyCluster(unittest.TestCase):
         self.assertEqual(collect.cluster_arg("us-east1/c2"), ("us-east1", "c2"))
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             collect.main(["compliance-audit", "--cluster", "us-east1/c2"])
+
+
+class TestKccKubeletCfsQuotaDrift(unittest.TestCase):
+    """§2.22 `kcc-kubelet-cfs-quota-drift`: declared Config Connector
+    ContainerNodePool specs compared against effective GKE kubeletConfig.cpuCfsQuota."""
+
+    @staticmethod
+    def _kcc_node_pool(
+        name,
+        *,
+        ns="infra",
+        project="acme",
+        location="us-central1",
+        cluster_ref=None,
+        resource_id=None,
+        kubelet_config="OMIT_KEY",
+    ):
+        node_config = {"machineType": "n2-standard-8"}
+        if kubelet_config != "OMIT_KEY":
+            node_config["kubeletConfig"] = kubelet_config
+        spec = {
+            "location": location,
+            "clusterRef": cluster_ref or {"external": f"projects/{project}/locations/{location}/clusters/prod-a"},
+            "nodeConfig": node_config,
+        }
+        if resource_id:
+            spec["resourceID"] = resource_id
+        meta = {"name": name, "namespace": ns}
+        if project:
+            meta["annotations"] = {"cnrm.cloud.google.com/project-id": project}
+        return {
+            "apiVersion": "container.cnrm.cloud.google.com/v1beta1",
+            "kind": "ContainerNodePool",
+            "metadata": meta,
+            "spec": spec,
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+
+    @staticmethod
+    def _kcc_cluster(name, *, ns="infra", project="acme", location="us-central1", resource_id=None):
+        spec = {"location": location}
+        if resource_id:
+            spec["resourceID"] = resource_id
+        return {
+            "apiVersion": "container.cnrm.cloud.google.com/v1beta1",
+            "kind": "ContainerCluster",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "annotations": {"cnrm.cloud.google.com/project-id": project},
+            },
+            "spec": spec,
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+
+    def test_flags_spec_omitting_cpu_cfs_quota_when_effective_gke_is_false(self):
+        item = self._kcc_node_pool("hyperdisk-pool", kubelet_config={"podPidsLimit": 4096})
+        ctx = {
+            "kcc_node_pool_effective": [
+                {
+                    "item": item,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "hyperdisk-pool",
+                    "gke_pool": {"name": "hyperdisk-pool", "config": {"kubeletConfig": {"cpuCfsQuota": False}}},
+                    "command": "KUBECONFIG=/tmp/kc kubectl get containernodepools.container.cnrm.cloud.google.com -A -o json; gcloud container clusters list --project acme --format json",
+                }
+            ]
+        }
+        hits = collect.check_kcc_kubelet_cfs_quota_drift(ctx)
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual(hit["namespace"], "infra")
+        self.assertEqual(hit["object"], "ContainerNodePool/hyperdisk-pool")
+        self.assertIn("spec.nodeConfig.kubeletConfig omits cpuCfsQuota", hit["excerpt"])
+        self.assertIn("effective GKE config.kubeletConfig.cpuCfsQuota is false", hit["excerpt"])
+        self.assertIn("spec.nodeConfig.kubeletConfig.cpuCfsQuota: true", hit["excerpt"])
+        self.assertIn("acme/us-central1/prod-a NodePool/hyperdisk-pool", hit["excerpt"])
+
+    def test_flags_spec_omitting_kubelet_config_or_declaring_true_when_effective_is_false(self):
+        omitted = self._kcc_node_pool("pool-omitted")
+        explicit_true = self._kcc_node_pool("pool-true", kubelet_config={"cpuCfsQuota": True})
+        ctx = {
+            "kcc_node_pool_effective": [
+                {
+                    "item": omitted,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "pool-omitted",
+                    "gke_pool": {"name": "pool-omitted", "config": {"kubeletConfig": {"cpuCfsQuota": False}}},
+                },
+                {
+                    "item": explicit_true,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "pool-true",
+                    "gke_pool": {"name": "pool-true", "config": {"kubeletConfig": {"cpuCfsQuota": False}}},
+                },
+            ]
+        }
+        hits = collect.check_kcc_kubelet_cfs_quota_drift(ctx)
+        self.assertEqual([h["object"] for h in hits], ["ContainerNodePool/pool-omitted", "ContainerNodePool/pool-true"])
+        self.assertIn("spec.nodeConfig omits kubeletConfig", hits[0]["excerpt"])
+        self.assertIn("spec.nodeConfig.kubeletConfig.cpuCfsQuota is true", hits[1]["excerpt"])
+
+    def test_silent_when_spec_explicitly_declares_false_or_effective_is_true_or_unset(self):
+        explicit_false = self._kcc_node_pool("pool-false", kubelet_config={"cpuCfsQuota": False})
+        healthy_true = self._kcc_node_pool("pool-ok-true", kubelet_config={"podPidsLimit": 4096})
+        healthy_unset = self._kcc_node_pool("pool-ok-unset", kubelet_config={"podPidsLimit": 4096})
+        ctx = {
+            "kcc_node_pool_effective": [
+                {
+                    "item": explicit_false,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "pool-false",
+                    "gke_pool": {"name": "pool-false", "config": {"kubeletConfig": {"cpuCfsQuota": False}}},
+                },
+                {
+                    "item": healthy_true,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "pool-ok-true",
+                    "gke_pool": {"name": "pool-ok-true", "config": {"kubeletConfig": {"cpuCfsQuota": True}}},
+                },
+                {
+                    "item": healthy_unset,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "pool-ok-unset",
+                    "gke_pool": {"name": "pool-ok-unset", "config": {"kubeletConfig": {"maxParallelImagePulls": 2}}},
+                },
+            ]
+        }
+        self.assertEqual(collect.check_kcc_kubelet_cfs_quota_drift(ctx), [])
+
+    def test_hub_cluster_uses_fleet_node_pool_index_with_zero_extra_describes(self):
+        clusters_json = json.dumps(
+            [
+                {
+                    "name": "hub",
+                    "location": "us-central1",
+                    "status": "RUNNING",
+                    "autopilot": {"enabled": True},
+                },
+                {
+                    "name": "spoke-prod",
+                    "location": "us-central1-a",
+                    "status": "RUNNING",
+                    "nodePools": [
+                        {
+                            "name": "hyperdisk-pool",
+                            "config": {
+                                "workloadMetadataConfig": {"mode": "GKE_METADATA"},
+                                "kubeletConfig": {"cpuCfsQuota": False, "podPidsLimit": "4096"},
+                            },
+                        }
+                    ],
+                },
+            ]
+        )
+        kcc_items = [
+            self._kcc_cluster("spoke-prod-ref", ns="infra", project="acme", location="us-central1-a", resource_id="spoke-prod"),
+            self._kcc_node_pool(
+                "spoke-hyperdisk",
+                ns="infra",
+                project="",
+                location="us-central1-a",
+                cluster_ref={"name": "spoke-prod-ref"},
+                resource_id="hyperdisk-pool",
+                kubelet_config={"podPidsLimit": 4096},
+            ),
+        ]
+        node_pool_describes = []
+
+        def run(argv, **kwargs):
+            if discovered := discovery_of_acme(argv):
+                return discovered
+            if argv[:4] == ["gcloud", "container", "clusters", "list"]:
+                return Run(argv, 0, clusters_json, "", 0.05)
+            if argv[:4] == ["gcloud", "container", "node-pools", "describe"]:
+                node_pool_describes.append(argv)
+                return Run(argv, 1, "", "unexpected describe", 0.01)
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.02)
+            if is_kcc_read(argv):
+                kc = (kwargs.get("env") or {}).get("KUBECONFIG", "")
+                if "hub" in kc:
+                    return serve_kcc(argv, kcc_items)
+                return Run(argv, 0, "", "", 0.01)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.COMPLIANCE_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] == collect.NETPOL_DUMP_KINDS:
+                return Run(argv, 0, json.dumps(dump_of({"kind": "Namespace", "metadata": {"name": "infra", "annotations": {"cnrm.cloud.google.com/project-id": "acme"}}})), "", 0.05)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in (*collect.CONFIGSYNC_SYNC_KINDS, collect.SERVICEENTRY_KIND, "ccnp", *collect.AUTOPILOT_ALLOWLIST_KINDS):
+                return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of()), "", 0.02)
+            if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.05)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = collect.collect_fleet("compliance-audit", run=run, max_workers=1)
+
+        self.assertEqual(node_pool_describes, [])
+        hub_entry = next(e for e in manifest["clusters"] if e["name"].endswith("/hub"))
+        hits = [c for c in hub_entry["candidates"] if c["check"] == collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "ContainerNodePool/spoke-hyperdisk")
+        self.assertEqual(hits[0]["namespace"], "infra")
+        self.assertIn("acme/us-central1-a/spoke-prod NodePool/hyperdisk-pool", hits[0]["excerpt"])
+        self.assertIn("spec.nodeConfig.kubeletConfig.cpuCfsQuota: true", hits[0]["excerpt"])
+
+    def test_out_of_fleet_fallback_describe_handles_drift_not_found_and_error(self):
+        item = self._kcc_node_pool(
+            "ext-pool",
+            ns="infra",
+            project="other-proj",
+            location="us-east1",
+            cluster_ref={"external": "projects/other-proj/locations/us-east1/clusters/ext-cluster"},
+            kubelet_config={"podPidsLimit": 4096},
+        )
+        cluster_obj = {"name": "hub", "project": "acme", "location": "us-central1", "autopilot": False}
+
+        def make_run(desc_run):
+            def run(argv, **kwargs):
+                if "get-credentials" in argv:
+                    return Run(argv, 0, "", "", 0.01)
+                if is_kcc_read(argv):
+                    return serve_kcc(argv, [item])
+                if argv[:4] == ["gcloud", "container", "node-pools", "describe"]:
+                    return desc_run(argv)
+                if argv[:4] == ["gcloud", "container", "node-pools", "list"]:
+                    return Run(argv, 0, "[]", "", 0.01)
+                if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                    return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.01)
+                if argv[:2] == ["kubectl", "get"] and argv[2] in (*collect.CONFIGSYNC_SYNC_KINDS, collect.SERVICEENTRY_KIND, "ccnp"):
+                    return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.01)
+                if argv[:2] == ["kubectl", "get"]:
+                    return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.01)
+                return Run(argv, 0, "", "", 0.01)
+            return run
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+                # 1. Fallback describe returns cpuCfsQuota: false -> candidate filed with bounded --raw command.
+                res_hit = collect.collect_cluster(
+                    cluster_obj,
+                    "compliance-audit",
+                    collect.COMPLIANCE_CHECKS,
+                    run=make_run(lambda a: Run(a, 0, json.dumps({"name": "ext-pool", "config": {"kubeletConfig": {"cpuCfsQuota": False}}}), "", 0.05)),
+                )
+                hits = [c for c in res_hit["candidates"] if c["check"] == collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG]
+                self.assertEqual(len(hits), 1)
+                self.assertIn("gcloud container node-pools describe ext-pool", hits[0]["command"])
+                self.assertIn("kubectl get --raw", hits[0]["command"])
+                self.assertIn("limit=500", hits[0]["command"])
+
+                # 2. Fallback describe returns NOT_FOUND -> skipped cleanly, check ran.
+                res_404 = collect.collect_cluster(
+                    cluster_obj,
+                    "compliance-audit",
+                    collect.COMPLIANCE_CHECKS,
+                    run=make_run(lambda a: Run(a, 1, "", "ERROR: NOT_FOUND: node pool ext-pool was not found", 0.05)),
+                )
+                self.assertEqual([c for c in res_404["candidates"] if c["check"] == collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG], [])
+                self.assertIn(collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG, {c["check"] for c in res_404["commands"]})
+
+                # 3. Fallback describe fails with 403 -> unevaluated (plain English, Undetermined: prefix).
+                res_err = collect.collect_cluster(
+                    cluster_obj,
+                    "compliance-audit",
+                    collect.COMPLIANCE_CHECKS,
+                    run=make_run(lambda a: Run(a, 1, "", "ERROR: PERMISSION_DENIED", 0.05)),
+                )
+                self.assertNotIn(collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG, {c["check"] for c in res_err["commands"]})
+                uneval = {e["check"]: e["reason"] for e in res_err.get("checks_unevaluated") or []}
+                self.assertIn(collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG, uneval)
+                self.assertTrue(uneval[collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG].startswith("Undetermined:"))
+                self.assertNotIn("rc=", uneval[collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG])
+                self.assertNotIn("--format", uneval[collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG])
+
+    def test_cluster_ref_external_supports_zones_and_full_gke_url(self):
+        for ext in (
+            "projects/p1/zones/us-central1-a/clusters/c1",
+            "https://container.googleapis.com/v1/projects/p1/locations/us-central1/clusters/c1",
+            "https://container.googleapis.com/v1beta1/projects/p1/zones/europe-west1-b/clusters/c2",
+        ):
+            with self.subTest(ext):
+                item = self._kcc_node_pool("pool-a", project="", location="", cluster_ref={"external": ext})
+                proj, loc, cl, pool = collect._resolve_kcc_node_pool_target(item, {}, {})
+                self.assertEqual(proj, "p1")
+                self.assertTrue(loc)
+                self.assertTrue(cl in ("c1", "c2"))
+                self.assertEqual(pool, "pool-a")
+
+    def test_unresolvable_kcc_node_pool_marks_unevaluated_unless_dependency_not_found(self):
+        cluster_obj = {"name": "hub", "project": "acme", "location": "us-central1", "autopilot": False}
+        unresolvable = self._kcc_node_pool("orphan-pool", ns="infra", project="", location="", cluster_ref={"name": "missing-cluster"})
+        dep_not_found = self._kcc_node_pool("broken-ref", ns="infra", project="", location="", cluster_ref={"name": "missing-cluster"})
+        dep_not_found["status"] = {
+            "conditions": [{"type": "Ready", "status": "False", "reason": "DependencyNotFound", "message": "not found"}]
+        }
+
+        def make_run(items):
+            def run(argv, **kwargs):
+                if "get-credentials" in argv:
+                    return Run(argv, 0, "", "", 0.01)
+                if is_kcc_read(argv):
+                    return serve_kcc(argv, items)
+                if argv[:4] == ["gcloud", "container", "node-pools", "list"]:
+                    return Run(argv, 0, "[]", "", 0.01)
+                if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                    return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.01)
+                if argv[:2] == ["kubectl", "get"] and argv[2] in (*collect.CONFIGSYNC_SYNC_KINDS, collect.SERVICEENTRY_KIND, "ccnp"):
+                    return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.01)
+                if argv[:2] == ["kubectl", "get"]:
+                    return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.01)
+                return Run(argv, 0, "", "", 0.01)
+            return run
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+                res_unres = collect.collect_cluster(cluster_obj, "compliance-audit", collect.COMPLIANCE_CHECKS, run=make_run([unresolvable]))
+                uneval = {e["check"]: e["reason"] for e in res_unres.get("checks_unevaluated") or []}
+                self.assertIn(collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG, uneval)
+                self.assertTrue(uneval[collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG].startswith("Undetermined:"))
+
+                res_dnf = collect.collect_cluster(cluster_obj, "compliance-audit", collect.COMPLIANCE_CHECKS, run=make_run([dep_not_found]))
+                self.assertIn(collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG, {c["check"] for c in res_dnf["commands"]})
+
+    def test_emitted_hit_attaches_reconciler_and_release_metadata(self):
+        item = self._kcc_node_pool("managed-pool", kubelet_config={"podPidsLimit": 4096})
+        item["metadata"]["annotations"]["argocd.argoproj.io/tracking-id"] = (
+            "fleet-infra:container.cnrm.cloud.google.com/ContainerNodePool:infra/managed-pool"
+        )
+        ctx = {
+            "kcc_node_pool_effective": [
+                {
+                    "item": item,
+                    "project": "acme",
+                    "location": "us-central1",
+                    "cluster": "prod-a",
+                    "pool": "managed-pool",
+                    "gke_pool": {"name": "managed-pool", "config": {"kubeletConfig": {"cpuCfsQuota": False}}},
+                }
+            ]
+        }
+        hits = collect.check_kcc_kubelet_cfs_quota_drift(ctx)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["reconciler"], "the Argo CD Application `fleet-infra`")
+        self.assertEqual(hits[0]["release"], {"namespace": "", "name": "", "application": "fleet-infra"})
+
+    def test_kcc_without_container_node_pools_declares_check_not_applicable(self):
+        cluster_obj = {"name": "hub", "project": "acme", "location": "us-central1", "autopilot": False}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.01)
+            if is_kcc_read(argv):
+                return serve_kcc(argv, [kcc_object("ComputeFirewall", "allow-ssh")])
+            if argv[:4] == ["gcloud", "container", "node-pools", "list"]:
+                return Run(argv, 0, "[]", "", 0.01)
+            if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in (*collect.CONFIGSYNC_SYNC_KINDS, collect.SERVICEENTRY_KIND, "ccnp"):
+                return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.01)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+                res = collect.collect_cluster(cluster_obj, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+        self.assertIn("kcc-object-wedged", {c["check"] for c in res["commands"]})
+        na = {e["check"]: e["reason"] for e in res.get("checks_not_applicable") or []}
+        self.assertIn(collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG, na)
+        self.assertIn("ContainerNodePool", na[collect.KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG])
 
 
 if __name__ == "__main__":
