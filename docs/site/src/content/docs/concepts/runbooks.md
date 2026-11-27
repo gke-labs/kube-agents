@@ -36,11 +36,11 @@ paths:
   - knowledge/
 ```
 
-Include `knowledge/` in `paths:` whenever you also keep `decision` or `lesson` records there, because a non-empty `paths:` list replaces Curator's default `knowledge` root rather than appending to it. Runbook indexing ignores `intent.yaml` and always scans the fixed runbook directories listed below. Without `.kube-agents/intent.yaml`, or when a listed path does not exist at the audited commit, declaring audits fall back to scanning the whole repository under their content-mode file and byte caps.
+Include `knowledge/` in `paths:` whenever you also keep `decision` or `lesson` records there, because a non-empty `paths:` list replaces Curator's default `knowledge` root rather than appending to it. Scheduled `repo_memory` broker snapshots only unpack `knowledge/` and the fixed external-doc prefixes below, so custom non-`knowledge/` roots in `intent.yaml` are not unpacked by scheduled indexing. Runbook indexing ignores `intent.yaml` and always scans the fixed runbook directories below. Without `.kube-agents/intent.yaml`, or when a listed path does not exist at the audited commit, declaring audits fall back to scanning the whole repository under their content-mode file and byte caps.
 
 ### Using a separate read-only runbook repository
 
-If your runbooks already live in a dedicated repository in the same GitHub organization (or on another configured forge such as GitLab, Bitbucket, or Gitea), attach it with `role: context` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#adding-repositories-to-a-githubcom-install). The credential broker serves read-only snapshots of `context` repositories and refuses every write verb against them.
+If your runbooks already live in a dedicated repository in the same GitHub organization (or on another configured forge such as GitLab, Bitbucket, or Gitea), attach it with `role: context` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegrationrepositories). The credential broker serves read-only snapshots of `context` repositories and refuses every write verb against them. Private GitLab and Bitbucket `context` repositories require a `read-token` key in the forge Secret, whereas Gitea `context` snapshots run unauthenticated and cover public repositories only.
 
 Both the `decision-memory` skill and the Curator indexer scan these runbook directories across `gitops`, `managed`, and `context` repositories:
 
