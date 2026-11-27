@@ -3270,7 +3270,9 @@ press is (`isChatTypedStop`), so a line never keeps a live button beside a poste
 
 An answer the relay marked for feedback carries its rating controls on the same card
 (`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
-`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. A post the agent made on
+its own (an alert, kept through the triage that edits it, or a report) carries them under the
+id the notifier marked it with, and a press on one is recorded under that id. 👍 is an `Action.Submit`
 like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
 alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
 the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
@@ -3280,11 +3282,12 @@ gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the 
 redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
 rating because the card is the conversation's; a card the line would push past the activity
 budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
-The form's kept-for line is drawn before any press, so it always names the question. It remembers a bounded number of rated messages
+The form's kept-for line is drawn before any press, so on an answer it always names the
+question; on an alert or a report it says only the post is kept. It remembers a bounded number of rated messages
 (`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
 recorded without the answer's text and without the redraw, and a re-rating that carries no
-answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
-names a post (`postKindOf`), so an alert its triage edits stays as it was.
+answer keeps the answer already kept. A triage edit of a rated alert draws it without the
+recorded line, which the next rating adds again.
 
 **Chat messages on Teams.** With cards on, a `kube-agents.chat/v1` message is laid out as the
 same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the
@@ -3293,7 +3296,9 @@ the plan with a status mark per item and a tick or an open mark per step, or the
 bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
 the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
 carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
-line's Stop button and an answer's rating controls. A row's Retry and Drop are not drawn, and the adapter has no `PostNotifyMessage`, so an unkeyed home post stays text. A
+line's Stop button and the rating controls. A row's Retry and Drop are not drawn. A home post
+goes through `PostNotifyMessage`, laid out the same way. A card that fits one activity only
+without the rating controls is posted without them. A
 layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
 (`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
 `ErrTextOnly` as before. The shared cases lay out as the golden files in
