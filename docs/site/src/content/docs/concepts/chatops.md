@@ -340,7 +340,7 @@ The daily stuck-task report shows a **Retry** and a **Drop** button under each t
 
 On Google Chat, the report shows the same buttons. Google Chat draws every button under the message, so the report numbers its tasks and labels each button with the task's number: "Retry 1" and "Drop 1". The task's line then ends with "✓ Retrying." or "Dropped.", who pressed, and the time in UTC. A press that did not land keeps the buttons and says so on the line.
 
-On Microsoft Teams, with the gateway's Teams backend armed, the report shows **Retry** and **Drop** under each task, as on Slack. The task's line then ends as on Google Chat, and the buttons go. A press that did not land keeps the buttons and says so. After a gateway restart, a press on an older report still acts, and its result is posted as a new message.
+On Microsoft Teams, with the gateway's Teams backend armed, the report shows **Retry** and **Drop** under each task, as on Slack. The result then shows on a line under the task, worded as on Google Chat, and the buttons go. A press that did not land keeps the buttons and says so. After a gateway restart, a press on an older report still acts, and its result is posted as a new message.
 
 ### Files a card produced
 
@@ -720,7 +720,7 @@ A scheduled report has no such constraint. The default jobs' `deliver: chat` rel
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
-With `KAGE_SLACK_UX` on, Slack gets a card built from the open ledger issue, and so does Google Chat. Its headline carries one number, how many findings of the most severe level the issue lists ("Security & RBAC Posture Audit: 2 critical findings"). Up to ten critical findings are listed under it, each led by its severity and tagged "new" when it was not there on the last run. With none critical listed, the headline counts the most severe level listed and lists the top two.
+With `KAGE_SLACK_UX` on, Slack gets a card built from the open ledger issue, and so do Google Chat and Microsoft Teams. Its headline carries one number, how many findings of the most severe level the issue lists ("Security & RBAC Posture Audit: 2 critical findings"). Up to ten critical findings are listed under it, each led by its severity and tagged "new" when it was not there on the last run. With none critical listed, the headline counts the most severe level listed and lists the top two.
 
 A line under them counts the rest by severity ("5 more (1 major, 4 minor) are in the ledger issue."), and another names any clusters the run could not check, since a silent gap reads as clean. Then come a "Look at the first one" button and a button that opens the issue.
 

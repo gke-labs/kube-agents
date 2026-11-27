@@ -5361,7 +5361,7 @@ def trigger_agent_troubleshooter(
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
-    Chat through the gateway, with ``alert_kind`` beside it.
+    Chat or Microsoft Teams through the gateway, with ``alert_kind`` beside it.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
@@ -5931,7 +5931,7 @@ def _slack_audit_headline(
     platform: str, message: str, chat_id: str, profile: str, job_id: str, deadline: float
 ) -> AuditHeadline | None:
     """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with on a
-    card platform: Slack, or Google Chat through the gateway.
+    card platform: Slack, or Google Chat or Microsoft Teams through the gateway.
 
     None, and the leg posts `message` as it always has, unless every condition
     holds: the flag is on, the leg is a card platform with a channel known

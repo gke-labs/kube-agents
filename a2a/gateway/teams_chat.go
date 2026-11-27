@@ -343,8 +343,8 @@ func teamsLinkActions(links []chatmsg.Link) []map[string]any {
 }
 
 // teamsChatCard is what one laid-out message shows: its text, its choice
-// buttons, and the buttons a rewrite keeps (links, Stop, the rating
-// controls).
+// buttons, and the buttons a rewrite keeps (links, a board row's Retry and
+// Drop, Stop, the rating controls).
 type teamsChatCard struct {
 	text    string
 	choices []map[string]any

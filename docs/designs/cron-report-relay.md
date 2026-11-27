@@ -91,7 +91,7 @@ up), and frames the report ahead of the user's words with the hook's
 notice and token list.
 
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report, and the Google Chat
-leg, sends a
+and Microsoft Teams legs, send a
 headline in place of the report (`slack_audit_report.py`, called from
 `relay_cron_report`), provided a chat id or a Slack
 home channel is known (or the leg is one the gateway routes, which holds its home channel), the job's `skills` (a list or one string, or the legacy `skill`) include
@@ -184,7 +184,7 @@ which leaves the other half for the sends to every platform: the Block Kit post
 stops short of it with room left for the text send, and when too little is left to
 read the ledger the report goes out as text in one send.
 
-The gateway holds the chat platforms (Google Chat and Slack, either or both) and the
+The gateway holds the chat platforms (Google Chat, Slack and Microsoft Teams, any of them) and the
 broker's relay is gone, so the same card goes to the gateway, for whichever leg it routes,
 as a `kube-agents.chat/v1` message instead
 (`slack_audit_report.chat_from_issue`, posted with `a2a notify --chat-file`), and the
@@ -206,12 +206,12 @@ of the ledger card.
 says: the script leaves its rows, each with the ids of the cards it stands for, in a file
 beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
 only when its text is the report being relayed, with the flag on and a channel known (or the
-leg routed through the gateway), on Slack and on Google Chat.
+leg routed through the gateway), on Slack, on Google Chat and on Microsoft Teams.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
 through the gateway as a chat message whose rows carry `tasks` and `actions`
 (`chat_from_card`), with Retry and Drop under each row on Slack and, on Google Chat, under
-the message and labelled by the row's number (`a2a/gateway/slack_board.go`,
-`a2a/gateway/gchat_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
+the message and labelled by the row's number; on Microsoft Teams they sit under each row
+(`a2a/gateway/slack_board.go`, `a2a/gateway/gchat_board.go`, `a2a/gateway/teams_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
 card's. A tap on either is no turn:
 it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
 edits the row

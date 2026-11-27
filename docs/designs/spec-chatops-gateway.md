@@ -3304,10 +3304,11 @@ buttons" under the Slack adapter) gets its Retry and Drop under the row itself, 
 never a turn: the adapter admits the presser by the inbound allowlist (`BoardAdmits`), sends the
 action over the board route off the pull loop, and redraws the row from the card it remembers:
 the buttons give way to Google Chat's settled line, with who pressed and the time in UTC, and a
-press that did not land keeps the buttons under a line saying so. One press per row at a time.
+press that did not land keeps the buttons under a line saying so. One press per row at a time,
+and a press on a row the remembered card has settled acts on nothing.
 A press carries no card content, so on a card the adapter no longer remembers, one posted before a
 restart included, the press still acts and its line is posted in the conversation as a new
-message. The session-kv relay hands its cron cards to the gateway for Teams as for Google Chat
+message that opens with the row's text, which the buttons carry. The session-kv relay hands its cron cards to the gateway for Teams as for Google Chat
 (`CARD_PLATFORMS`): the board-health card, the fleet-audit cards and the alert title that heads
 the plan.
 
