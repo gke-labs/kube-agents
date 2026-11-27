@@ -39,9 +39,10 @@ import slack_status as _status
 
 #: The schema every message carries.
 SCHEMA = "kube-agents.chat/v1"
-#: ``tone`` values: green for done and yours to act on, yellow for waiting on you.
+#: ``tone`` values: green for done and yours to act on, yellow for waiting on you, red for critical.
 TONE_SUCCESS = "success"
 TONE_ATTENTION = "attention"
+TONE_CRITICAL = "critical"
 #: ``mark.settle`` values, spelled as ``slack_presenter`` names the settles.
 SETTLE_DONE = _presenter.SETTLE_DONE
 SETTLE_BLOCKED = _presenter.SETTLE_BLOCKED
