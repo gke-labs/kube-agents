@@ -107,3 +107,4 @@ The audit jobs preload the skill through their cron entry (`"skills": ["fleet-au
 - [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) — the schedules that invoke SOPs.
 - [Skill catalog](/kube-agents/skills/) — the capabilities SOPs compose.
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how SOP-generated remediations become PRs.
+- [Team runbooks](/kube-agents/concepts/runbooks/) — how to lay out, version, and review your team's own OKF runbooks in Git.
