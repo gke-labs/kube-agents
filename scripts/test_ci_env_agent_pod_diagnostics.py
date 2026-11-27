@@ -27,6 +27,14 @@ FUNCTION = "collect_agent_pod_diagnostics"
 
 REQUEST_TIMEOUT_PREFIX = "--request-timeout="
 WATCH_FILES = ("agent-pods-watch.txt", "agent-events-watch.txt")
+# How long a test waits for the opens it asked for before it gives up on a
+# watch that never opens: far above the time the opens need on an idle machine
+# (about 6 s at the most), so a loaded runner that starts each process late does
+# not end the wait early. A pause that a test must see unapplied is longer than
+# this, so the wait ends first if the pause is applied.
+WATCH_OPENS_DEADLINE_SECONDS = 30
+WATCH_OPENS_POLL_SECONDS = 0.2
+
 # How long a loop gets to notice its kubectl or its parent is gone; generous
 # so a loaded runner does not flake, far below the stub's 60 s block.
 EXIT_DEADLINE_SECONDS = 10
@@ -172,7 +180,7 @@ def run_collect(
     watch: bool = False,
     restart_seconds: str | None = None,
     healthy_seconds: str | None = None,
-    watch_for: float = 1.0,
+    opens: int = 1,
     collect_times: int = 1,
     **stub_env: str,
 ) -> tuple[subprocess.CompletedProcess, pathlib.Path, list[str]]:
@@ -184,7 +192,18 @@ def run_collect(
     watch_pids = tmp / "watch-pids"
     watch_pids.touch()
     loops = tmp / "loop-pids"
-    start = f'start_agent_pod_watch\necho "$AGENT_DIAG_WATCH_PIDS" > {loops}\nsleep {watch_for}\n' if watch else ""
+    # With `watch`, the test starts the loops and waits until each of them has opened `opens`
+    # times, or for WATCH_OPENS_DEADLINE_SECONDS: a runner that starts each process late
+    # moves an open past a fixed window, and the test would then count the window and not
+    # the loop. `opens` is read only with `watch`.
+    count = 'n=$(grep -c "^WATCH: " "$1" 2>/dev/null || true); echo "${n:-0}"'
+    wait = (
+        f'opens_of() {{ {count}; }}\n'
+        f'until {{ [ "$(opens_of "$AGENT_DIAG_WATCH_DIR/pods")" -ge {opens} ] '
+        f'&& [ "$(opens_of "$AGENT_DIAG_WATCH_DIR/events")" -ge {opens} ]; }} '
+        f'|| [ "$SECONDS" -ge {WATCH_OPENS_DEADLINE_SECONDS} ]; do sleep {WATCH_OPENS_POLL_SECONDS}; done\n'
+    )
+    start = f'start_agent_pod_watch\necho "$AGENT_DIAG_WATCH_PIDS" > {loops}\n{wait}' if watch else ""
     collect = f"{FUNCTION}\n" * collect_times
     script = f'set -euo pipefail\n{lifted(restart_seconds, healthy_seconds)}\n{start}{collect}echo "STATUS AFTER: $?"\n'
     env = {k: v for k, v in os.environ.items() if k != "AGENT_CLUSTER_CONTEXT"}
@@ -337,7 +356,7 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
     def test_a_watch_that_failed_to_open_is_retried_with_its_list(self):
         """Until an open has held, nothing has recorded the list, so a retry
         must not drop it."""
-        _, artifacts, _ = run_collect(watch=True, restart_seconds="0", watch_for=1.5, STUB_WATCH_EXITS="1")
+        _, artifacts, _ = run_collect(watch=True, restart_seconds="0", opens=2, STUB_WATCH_EXITS="1")
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
         opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
         self.assertGreater(len(opens), 1, pods)
@@ -348,8 +367,9 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         """A fast exit after a held open is a gap of unknown length; the next
         open must put the list back on record."""
         _, artifacts, _ = run_collect(
-            # SECONDS is whole seconds: 3 s against 2 holds and 0 s fails on every alignment.
-            watch=True, restart_seconds="0", healthy_seconds="2", watch_for=5.5, STUB_WATCH_PLAN="3,0"
+            # SECONDS is whole seconds: 5 s against 3 holds on every alignment, and a 0 s open
+            # fails on every alignment unless starting its process takes more than 2 s.
+            watch=True, restart_seconds="0", healthy_seconds="3", opens=3, STUB_WATCH_PLAN="5,0"
         )
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
         opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
@@ -362,7 +382,7 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
         """A dial timeout or a hang that errors can outlast the threshold; the
         exit status, not the duration alone, says it never watched."""
         _, artifacts, _ = run_collect(
-            watch=True, restart_seconds="0", healthy_seconds="2", watch_for=7.5, STUB_WATCH_PLAN="3,3:1"
+            watch=True, restart_seconds="0", healthy_seconds="2", opens=3, STUB_WATCH_PLAN="3,3:1"
         )
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
         opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
@@ -373,9 +393,14 @@ class AgentPodDiagnosticsTest(unittest.TestCase):
     def test_a_watch_that_held_is_reopened_at_once_without_relisting(self):
         """A cut watch reopens with no pause, so no event falls in a gap, and
         with --watch-only, so the held open's list stays inside the byte cap.
-        The 30 s pause here would leave one open in the window if applied."""
+        A pause longer than the wait's limit would leave one open at the limit if
+        applied."""
         _, artifacts, _ = run_collect(
-            watch=True, restart_seconds="30", healthy_seconds="1", watch_for=5, STUB_WATCH_SECONDS="2"
+            watch=True,
+            restart_seconds=str(2 * WATCH_OPENS_DEADLINE_SECONDS),
+            healthy_seconds="1",
+            opens=3,
+            STUB_WATCH_SECONDS="2",
         )
         pods = (artifacts / "agent-pods-watch.txt").read_text(encoding="utf-8")
         opens = [line for line in pods.splitlines() if line.startswith("WATCH: ")]
