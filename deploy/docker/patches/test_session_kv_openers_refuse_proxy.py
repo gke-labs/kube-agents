@@ -22,7 +22,7 @@ from pathlib import Path
 PATCHES = Path(__file__).resolve().parent
 PROXY = "http://egress.invalid:3128"
 OPENER = "_SESSION_KV_OPENER"
-MODULES = ("cron_job_template", "kanban_notifier", "kanban_origin", "slack_ux_clicks")
+MODULES = ("cron_job_template", "eval_run_tag", "kanban_notifier", "kanban_origin", "slack_ux_clicks")
 # Prints the http proxy of the module's opener, then that of a default opener
 # of the same process, which shows that the variable reached the process.
 PROBE = (

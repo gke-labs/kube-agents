@@ -120,6 +120,11 @@ ALERT_HISTORY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 FINDINGS_SUBJECT = "the findings queue"
 ALERT_HISTORY_SUBJECT = "the alert ledger"
 
+# Session KV is on the pod's loopback address: a proxy from the environment must
+# not get a request and its bearer token, and urllib does not leave out a
+# loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # Initialize the MCP server
 mcp = MCPServer("GKE Platform Control Plane")
 
@@ -993,7 +998,7 @@ def send_notification(message: str, session_id: str = "") -> str:
             # Query the local metadata server for thread info
             url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
             req = urllib.request.Request(url, headers=_session_kv_headers(), method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
+            with _SESSION_KV_OPENER.open(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     meta = json.loads(resp.read().decode("utf-8"))
                     thread_id = meta.get("thread_id")
@@ -1067,7 +1072,7 @@ def send_notification(message: str, session_id: str = "") -> str:
                 data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
                 headers=_session_kv_headers({"Content-Type": "application/json"}), method="POST",
             )
-            with urllib.request.urlopen(req, timeout=2):
+            with _SESSION_KV_OPENER.open(req, timeout=2):
                 pass
         except Exception as exc:
             print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
@@ -1129,7 +1134,7 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
             headers=_session_kv_headers({"Content-Type": "application/json"}),
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=CRON_REPORT_TIMEOUT_SECONDS) as resp:
+        with _SESSION_KV_OPENER.open(req, timeout=CRON_REPORT_TIMEOUT_SECONDS) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         return f"ERROR: Failed to hand the report to the chat relay: {exc}"
@@ -1201,7 +1206,7 @@ def _findings_request(method: str, path: str, body: dict | None = None) -> Any:
     req = urllib.request.Request(
         f"http://127.0.0.1:8699{path}", data=data, headers=headers, method=method
     )
-    with urllib.request.urlopen(req, timeout=FINDINGS_TIMEOUT_SECONDS) as resp:
+    with _SESSION_KV_OPENER.open(req, timeout=FINDINGS_TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 

@@ -11,7 +11,9 @@ without it has the proxy of the environment, and the request, with its bearer
 token, goes to that proxy.
 
 The second class holds that each call goes through that opener: with the proxy
-variables at a closed port, the call must still reach a live local server.
+variables at a closed port, the call must still reach a live local server. For
+`platform_mcp_server` and `session_kv_server`, that test is in the test file of
+the module.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.request
@@ -45,8 +48,12 @@ OPENERS = (
     ("stall_watch", "_SESSION_KV_OPENER"),
     ("upgrade_readiness_review", "_SESSION_KV_OPENER"),
 )
-# This module imports `mcp`, which a bare checkout does not have.
-MCP_OPENERS = (("agent_common_server", "_AGENT_OPENER"),)
+# These modules import `mcp` or `fastapi`, which a bare checkout does not have.
+MCP_OPENERS = (
+    ("agent_common_server", "_AGENT_OPENER"),
+    ("platform_mcp_server", "_SESSION_KV_OPENER"),
+    ("session_kv_server", "_GATEWAY_OPENER"),
+)
 # Prints the http proxy of the module's opener, then that of a default opener
 # of the same process, which shows that the variable reached the process.
 PROBE = (
@@ -62,6 +69,11 @@ class SessionKvOpenersTest(unittest.TestCase):
     def _holds_no_proxy(self, openers):
         environment = {key: value for key, value in os.environ.items() if key.lower() not in ("no_proxy", "http_proxy")}
         environment["http_proxy"] = PROXY
+        # `session_kv_server` makes its database when it is loaded, and the
+        # default path is in the pod only.
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        environment["SESSION_KV_DB_PATH"] = str(Path(scratch.name) / "session_kv.db")
         for module, opener in openers:
             with self.subTest(module=module):
                 done = subprocess.run(
@@ -75,7 +87,7 @@ class SessionKvOpenersTest(unittest.TestCase):
         self._holds_no_proxy(OPENERS)
 
     @requires_mcp
-    def test_the_agent_opener_takes_no_proxy_of_the_environment(self):
+    def test_no_opener_of_a_server_module_takes_the_proxy_of_the_environment(self):
         self._holds_no_proxy(MCP_OPENERS)
 
 

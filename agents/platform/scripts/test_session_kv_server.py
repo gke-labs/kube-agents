@@ -65,6 +65,7 @@ except Exception:  # pragma: no cover
 import chat_notify
 import no_live_kubectl
 import session_kv_server
+from test_session_kv_openers_refuse_proxy import _LiveServer
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
 
 
@@ -3494,7 +3495,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self._inject("aborted-api-6cfdb6b98b-aaaaa")
             pool = self._queue_real_start("sess-aborted", self._rows("aborted-api")[0][0])
             # What the pool does when the gateway refuses the key on the create.
-            with patch("session_kv_server.urllib.request.urlopen", side_effect=[_http_error(401)]):
+            with patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=[_http_error(401)]):
                 pool.run()
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
@@ -3508,16 +3509,16 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             (307, S.START_FATAL), (400, S.START_FATAL), (404, S.START_RETRY),
             (500, S.START_UNKNOWN), (502, S.START_UNKNOWN), (503, S.START_RETRY),
         ):
-            with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
+            with patch("urllib.request.OpenerDirector.open", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
                 self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, outcome, code)
-        with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
+        with patch("urllib.request.OpenerDirector.open", side_effect=TimeoutError("read timed out")):
             self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, S.START_UNKNOWN)
         # An error while connecting or sending: the gateway never had the request.
         for exc in (
             urllib.error.URLError(ConnectionRefusedError(111, "refused")),
             urllib.error.URLError(TimeoutError("connect timed out")),
         ):
-            with patch("urllib.request.urlopen", side_effect=exc):
+            with patch("urllib.request.OpenerDirector.open", side_effect=exc):
                 self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, S.START_RETRY)
 
     def test_a_retry_that_never_starts_releases_the_anchor(self):
@@ -3528,7 +3529,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             # Queued and not yet started: a start is on its way, so a sibling folds.
             self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "folded")
             # The gateway drains for longer than the retry budget.
-            with patch("session_kv_server.urllib.request.urlopen", side_effect=[_answered()] + [_http_error(503)] * 50):
+            with patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=[_answered()] + [_http_error(503)] * 50):
                 pool.run()
             self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-ccccc")["status"], "injected")
             self.send.assert_called_once()
@@ -4594,7 +4595,7 @@ class TestGatewaySessionBody(unittest.TestCase):
         # only when `gateway.multiplex_profiles` is on. A `profile` key in this
         # body is accepted with a 201 and dropped -- which read as success for
         # a whole release while every triage ran on the default profile.
-        with patch("session_kv_server.urllib.request.urlopen") as urlopen:
+        with patch("session_kv_server.urllib.request.OpenerDirector.open") as urlopen:
             urlopen.return_value.__enter__.return_value = MagicMock(status=200)
             ok = session_kv_server._create_gateway_session(
                 "http://127.0.0.1:8642", "k8s-evt-abc123", {"Content-Type": "application/json"}
@@ -4602,6 +4603,25 @@ class TestGatewaySessionBody(unittest.TestCase):
         self.assertTrue(ok)
         body = json.loads(urlopen.call_args[0][0].data.decode("utf-8"))
         self.assertEqual(set(body), {"session_id", "title"})
+
+
+class TestGatewayCallsRefuseAProxy(unittest.TestCase):
+    """The gateway API is on the pod's loopback. With a proxy variable and no
+    NO_PROXY entry for 127.0.0.1, urllib hands a turn's prompt to the proxy."""
+
+    HEADERS = {"Authorization": "Bearer gateway-key"}
+
+    def test_the_session_create_reaches_the_gateway(self):
+        server = _LiveServer(self)
+        attempt = session_kv_server._create_gateway_session(server.url, "k8s-evt-1", self.HEADERS)
+        self.assertEqual(attempt.outcome, session_kv_server.START_OK)
+        self.assertEqual([("POST", "/api/sessions", "Bearer gateway-key")], server.seen)
+
+    def test_the_turn_start_reaches_the_gateway(self):
+        server = _LiveServer(self)
+        attempt = session_kv_server._start_agent_turn(server.url, "k8s-evt-1", "q", self.HEADERS)
+        self.assertEqual(attempt.outcome, session_kv_server.START_OK)
+        self.assertEqual([("POST", "/api/sessions/k8s-evt-1/chat", "Bearer gateway-key")], server.seen)
 
 
 class TestGatewayApiToken(unittest.TestCase):
@@ -4823,7 +4843,7 @@ class TestCronReportRelay(unittest.TestCase):
         report = "**Fleet audit:** 2 findings\n\n- seeded-a: cluster-admin bound to default"
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session") as create, \
-             patch.object(session_kv_server.urllib.request, "urlopen") as urlopen, \
+             patch.object(session_kv_server.urllib.request.OpenerDirector, "open") as urlopen, \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
             response = self.client.post(
                 "/v1/cron-reports",
@@ -13979,7 +13999,7 @@ class TestTriageStartRetry(unittest.TestCase):
         )
 
     def _run(self, urlopen_effects, **start):
-        with patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects) as urlopen, \
+        with patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=urlopen_effects) as urlopen, \
                 self.assertLogs("session_kv_server", level="INFO") as logs:
             session_kv_server._run_triage_start(self._start(**start))
         return urlopen, "\n".join(logs.output)
@@ -14335,16 +14355,17 @@ class TestTriageStartBurst(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-        real_urlopen = session_kv_server.urllib.request.urlopen
+        # A bound method, read before the patch, still calls the real `open`.
+        real_urlopen = session_kv_server._GATEWAY_OPENER.open
         # The probe below must not go through `scaled`, which the patch applies
-        # to every `urllib.request.urlopen` in the process.
+        # to every opener in the process.
         self.real_urlopen = real_urlopen
 
         def scaled(req, timeout=None):
             return real_urlopen(req, timeout=timeout * self.TIMEOUT_SCALE)
 
         patches = [
-            patch.object(session_kv_server.urllib.request, "urlopen", side_effect=scaled),
+            patch.object(session_kv_server.urllib.request.OpenerDirector, "open", side_effect=scaled),
             patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
             patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
             patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
@@ -14882,7 +14903,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
 
     def _run_start(self, start, urlopen_effects):
         with patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"), \
-                patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects), \
+                patch("session_kv_server.urllib.request.OpenerDirector.open", side_effect=urlopen_effects), \
                 patch.object(session_kv_server, "_triage_sleep", lambda _s: None), \
                 patch.object(session_kv_server, "_send_to_chat", return_value="thread") as send, \
                 patch.object(session_kv_server, "_start_agent_turn", wraps=session_kv_server._start_agent_turn) as turn:
