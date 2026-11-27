@@ -1291,6 +1291,32 @@ guard_pubsub_subscription() {
     enabled=$(tfvar "$flag")
     [[ "$enabled" == "true" ]] || continue
 
+    if [[ "$addr" == "$CHAT_SUBSCRIPTION_ADDRESS" || "$addr" == "$CHAT_SUBSCRIPTION_LEGACY_ADDRESS" ]]; then
+      local chat_manage chat_project desired_project recorded_project
+      chat_manage=$(tfvar chat_manage_project)
+      if [[ "$chat_manage" == "false" ]]; then
+        warn "chat_manage_project resolved to 'false', but this state manages the Google Chat Pub/Sub subscription ($addr)."
+        warn "Applying now would plan the topic, subscription, and service account's DESTRUCTION under -auto-approve,"
+        warn "dropping $loses."
+        warn "To keep Terraform managing the Chat project resources, set CHAT_MANAGE_PROJECT=\"true\" in install.env"
+        warn "(or chat_manage_project = true in terraform.tfvars). To hand the existing resources off to a project"
+        warn "administrator without destroying them, remove them from Terraform state first:"
+        warn "  terraform state rm 'module.chat_pubsub[0]' 'google_project_service.chat_project'"
+        exit 1
+      fi
+      desired_project=$(tfvar project_id)
+      chat_project=$(tfvar chat_project_id)
+      [[ -n "$chat_project" ]] && desired_project="$chat_project"
+      recorded_project=$(state_attr "$addr" project)
+      if [[ -n "$recorded_project" && -n "$desired_project" && "$recorded_project" != "$desired_project" ]]; then
+        warn "Google Chat project resolved to '$desired_project', but this state's Pub/Sub subscription lives in project '$recorded_project' ($addr)."
+        warn "Applying now would plan the topic, subscription, and service account's DESTRUCTION in '$recorded_project' and recreation in '$desired_project' under -auto-approve,"
+        warn "dropping $loses."
+        subscription_name_advice "Google Chat project ID" "chat_project_id" "CHAT_PROJECT_ID" "$recorded_project"
+        exit 1
+      fi
+    fi
+
     local recorded_name recorded_topic desired_name desired_topic stripped_topic
     recorded_name=$(state_attr "$addr" name)
     recorded_topic=$(state_attr "$addr" topic)

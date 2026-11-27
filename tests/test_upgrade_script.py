@@ -4023,7 +4023,13 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, out)
         self.assertEqual(calls, "projects describe workspace-chat-proj --format=value(projectNumber)\n")
         self.assertIn("service-<CHAT_PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
-        self.assertIn("service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertNotIn("service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn("CHAT_PROJECT_NUMBER is unavailable;", out)
+        self.assertIn(
+            "have an administrator of 'workspace-chat-proj' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above",
+            out,
+        )
+        self.assertNotIn("re-run install.sh (it re-applies the Chat Pub/Sub resources)", out)
         self.assertNotIn("111111", out)
         self.assertNotIn("https://chat.google.com/dm/", out)
 

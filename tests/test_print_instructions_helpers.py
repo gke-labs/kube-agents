@@ -386,7 +386,18 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
         )
         self.assertIn("https://chat.google.com/dm/222222222222", out)
         self.assertIn("service-222222222222@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn(
+            "have an administrator of 'workspace-chat-proj' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above",
+            out,
+        )
+        self.assertNotIn("re-run install.sh (it re-applies the Chat Pub/Sub resources)", out)
         self.assertNotIn("111111111111", out)
+
+        out_unreadable = self._run(env, {"PROJECT_NUMBER": "111111111111"})
+        self.assertIn("service-<CHAT_PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out_unreadable)
+        self.assertNotIn("service-<PROJECT_NUMBER>@", out_unreadable)
+        self.assertIn("CHAT_PROJECT_NUMBER is unavailable;", out_unreadable)
+        self.assertNotIn("111111111111", out_unreadable)
 
 
 class ChatSetupChecklistsTest(unittest.TestCase):

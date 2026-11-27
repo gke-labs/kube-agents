@@ -131,6 +131,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    gcloud_kms_error="ERROR: permission denied",
                    gcloud_kms_notice="",
                    tfvar_enable_google_chat="true",
+                   tfvar_chat_project_id='""',
+                   tfvar_chat_manage_project="true",
                    tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
                    tfvar_chat_topic_name='"platform-agent-chat-events"',
                    tfvar_enable_drift_pubsub="false",
@@ -336,6 +338,12 @@ EOF
         exit 0
     elif [[ "$expr" == *"github_minter_kms_key"* ]]; then
         echo '"github-token-minter-key"'
+        exit 0
+    elif [[ "$expr" == *"chat_project_id"* ]]; then
+        echo '{tfvar_chat_project_id}'
+        exit 0
+    elif [[ "$expr" == *"chat_manage_project"* ]]; then
+        echo '{tfvar_chat_manage_project}'
         exit 0
     elif [[ "$expr" == *"project_id"* ]]; then
         echo '"test-project"'
@@ -1325,6 +1333,50 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("chat_topic_name resolved to 'renamed-chat-topic', but this state's Pub/Sub subscription is attached to topic 'platform-agent-chat-events'", proc.stderr)
         self.assertIn('CHAT_TOPIC_NAME="platform-agent-chat-events"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_chat_project_or_manage_differs_from_state(self):
+        for addr in (
+            "module.chat_pubsub[0].google_pubsub_subscription.chat_events[0]",
+            "module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+        ):
+            with self.subTest(addr=addr, case="project"):
+                proc = self._run_guard(
+                    "guard_pubsub_subscription",
+                    state_list=addr,
+                    state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n    project = "workspace-chat-proj"\n    topic = "projects/workspace-chat-proj/topics/platform-agent-chat-events"\n}',
+                    tfvar_chat_project_id='""',
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn(
+                    "Google Chat project resolved to 'test-project', but this state's Pub/Sub subscription lives in project 'workspace-chat-proj'",
+                    proc.stderr,
+                )
+                self.assertIn('CHAT_PROJECT_ID="workspace-chat-proj"', proc.stderr)
+
+            with self.subTest(addr=addr, case="manage_false"):
+                proc = self._run_guard(
+                    "guard_pubsub_subscription",
+                    state_list=addr,
+                    state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n    project = "workspace-chat-proj"\n    topic = "projects/workspace-chat-proj/topics/platform-agent-chat-events"\n}',
+                    tfvar_chat_project_id='"workspace-chat-proj"',
+                    tfvar_chat_manage_project="false",
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn(
+                    "chat_manage_project resolved to 'false', but this state manages the Google Chat Pub/Sub subscription",
+                    proc.stderr,
+                )
+                self.assertIn("terraform state rm 'module.chat_pubsub[0]' 'google_project_service.chat_project'", proc.stderr)
+
+            with self.subTest(addr=addr, case="matches_custom_chat_project"):
+                proc = self._run_guard(
+                    "guard_pubsub_subscription",
+                    state_list=addr,
+                    state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n    project = "workspace-chat-proj"\n    topic = "projects/workspace-chat-proj/topics/platform-agent-chat-events"\n}',
+                    tfvar_chat_project_id='"workspace-chat-proj"',
+                    tfvar_chat_manage_project="true",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
 
     # The drift and stockout subscriptions are the same resource type with the
     # same ForceNew name and topic, so the guard covers them too. A drift

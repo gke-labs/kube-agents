@@ -149,11 +149,15 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   echo -e "       - Connection Settings: Select ${C_BOLD}Cloud Pub/Sub${C_RESET}"
   echo -e "       - Pub/Sub Topic Name: ${C_GREEN}projects/${chat_project}/topics/${CHAT_TOPIC_NAME}${C_RESET}"
   echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
-  sa_display_format="service-${chat_project_number:-<PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
+  sa_display_format="service-${chat_project_number:-<CHAT_PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
   echo -e "       - After saving, refresh the page and verify the Workspace Add-ons ${C_BOLD}Service account email${C_RESET} appears under Connection settings"
   echo -e "         ${C_CYAN}(format: ${C_GREEN}${sa_display_format}${C_CYAN}; it is not the agent's ${C_YELLOW}${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}${C_CYAN}).${C_RESET}"
   echo -e "         ${C_CYAN}(This field only exists when \"Build this Chat app as a Workspace add-on\" is checked — the default, locked-on state for new apps).${C_RESET}"
-  echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
+  if is_truthy "$chat_manage"; then
+    echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
+  else
+    echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — have an administrator of '${chat_project:-<CHAT_PROJECT_ID>}' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above, then re-save this config.${C_RESET}"
+  fi
   echo -e ""
   next_step=2
   if [ -n "${chat_project_number:-}" ]; then
@@ -163,7 +167,7 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
     echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
     echo -e ""
   else
-    print_warning "PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."
+    print_warning "CHAT_PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."
   fi
   print_a2a_gateway_steps "$next_step"
 else
