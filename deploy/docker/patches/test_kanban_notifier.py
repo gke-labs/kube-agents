@@ -1335,7 +1335,7 @@ def captured_post(fail=None):
             raise fail
         return contextlib.nullcontext()
 
-    with mock.patch("kanban_notifier.urllib.request.urlopen", _urlopen):
+    with mock.patch("kanban_notifier.urllib.request.OpenerDirector.open", side_effect=_urlopen):
         yield posted
 
 

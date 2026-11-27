@@ -148,7 +148,7 @@ class TheQueueView(unittest.TestCase):
             seen.update(method=req.get_method(), data=req.data, auth=req.get_header("Authorization"), url=req.full_url)
             return Answer(b'{"findings": []}')
 
-        with mock.patch.dict(os.environ, {review.KV_AUTH_VARIABLE: "t0ken"}), mock.patch.object(review.urllib.request, "urlopen", answer):
+        with mock.patch.dict(os.environ, {review.KV_AUTH_VARIABLE: "t0ken"}), mock.patch.object(review.urllib.request.OpenerDirector, "open", side_effect=answer):
             self.assertEqual(review.kv_request(brief_queue.RANKED_PATH), {"findings": []})
         self.assertEqual((seen["method"], seen["data"], seen["auth"]), ("GET", None, "Bearer t0ken"))
         self.assertTrue(seen["url"].endswith("/v1/findings/ranked"))

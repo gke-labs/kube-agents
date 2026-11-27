@@ -270,6 +270,10 @@ SESSION_KV_URL = "http://127.0.0.1:8699"
 BOARD_ACTIONS_PATH = "/v1/board/actions"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 BOARD_ACTION_TIMEOUT_SECONDS = 30.0
+#: Session KV is on the pod's loopback address: a proxy from the environment
+#: must not get the request and its bearer token, and urllib does not leave
+#: out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 #: The route's outcomes for a card: acted on; no longer blocked; no such card.
 BOARD_DONE = "done"
 BOARD_SETTLED_OUTCOMES = frozenset({"moved", "gone"})
@@ -886,7 +890,7 @@ def _board_request(verb: str, tasks: list[str], by: str) -> list[dict]:
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=BOARD_ACTION_TIMEOUT_SECONDS) as response:  # noqa: S310 - loopback
+    with _SESSION_KV_OPENER.open(request, timeout=BOARD_ACTION_TIMEOUT_SECONDS) as response:
         body = json.loads(response.read() or b"{}")
     results = body.get("results") if isinstance(body, dict) else None
     if not isinstance(results, list):

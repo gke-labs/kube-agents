@@ -148,8 +148,14 @@ func TestALoadedSkillNamesItsBaseDirectory(t *testing.T) {
 		if !strings.HasPrefix(text, skillBaseDirPrefix+base+"\n") {
 			t.Errorf("%s: instructions don't open with its base directory", s.Name)
 		}
-		// A skill with scripts lists each by its absolute path, the form the
-		// shell runs.
+		// A skill with scripts lists each by its absolute path. A persona
+		// that ships scripts grants the shell, which runs any command, so
+		// the note tells the model nothing is refused that the shell would
+		// in fact run (an interpreter in front of a script, for one).
+		header, _, _ := strings.Cut(text, "\n\n")
+		if strings.Contains(header, "refused") || strings.Contains(header, "python3") {
+			t.Errorf("%s: the skill's header tells the model a command is refused: %q", s.Name, header)
+		}
 		for _, f := range s.Files {
 			if f.Executable && !strings.Contains(text, "- "+filepath.Join(base, f.Path)+"\n") {
 				t.Errorf("%s: script %s isn't listed by its absolute path", s.Name, f.Path)
@@ -270,7 +276,10 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(linked, "instructions.md")); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, err := loadPersona(context.Background(), linked, true); err == nil {
+	// Not required, so the sealed-rendering check (which refuses this
+	// writable temp dir first) stays out of it and the reader's own
+	// confinement is what refuses the link.
+	if got, _, err := loadPersona(context.Background(), linked, false); err == nil {
 		t.Errorf("read instructions through a link outside the dir: %q", got)
 	}
 }

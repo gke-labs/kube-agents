@@ -4238,7 +4238,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         with (
             mock.patch.object(chat_notify, "home_file_value",
                               side_effect=lambda key=chat_notify.HOME_FILE_KEY: (homes or {chat_notify.HOME_FILE_KEY: home}).get(key, "")),
-            mock.patch.object(urllib.request, "urlopen", urlopen),
+            mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=urlopen),
             mock.patch.dict(os.environ, env),
         ):
             bootstrap_delivery.resend_lost_summaries(self.d, time.time() if now is None else now)

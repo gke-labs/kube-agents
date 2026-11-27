@@ -76,6 +76,19 @@ func TestTheModelRequestCarriesOnlyTheGrantedServerSideTool(t *testing.T) {
 // bodies it received.
 func modelRequestBodies(t *testing.T, model string, webSearch bool) []string {
 	t.Helper()
+	req := &adkmodel.LLMRequest{
+		Model:    model,
+		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
+		Config:   &genai.GenerateContentConfig{Tools: []*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{{Name: "read_file", Description: "read"}}}}},
+	}
+	return requestBodies(t, context.Background(), model, webSearch, req)
+}
+
+// requestBodies sends req through the harness's real Gemini client, built
+// for model and webSearch, to a fake endpoint and returns the bodies it
+// received.
+func requestBodies(t *testing.T, ctx context.Context, model string, webSearch bool, req *adkmodel.LLMRequest) []string {
+	t.Helper()
 	var mu sync.Mutex
 	var bodies []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,12 +106,7 @@ func modelRequestBodies(t *testing.T, model string, webSearch bool) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := &adkmodel.LLMRequest{
-		Model:    model,
-		Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}},
-		Config:   &genai.GenerateContentConfig{Tools: []*genai.Tool{{FunctionDeclarations: []*genai.FunctionDeclaration{{Name: "read_file", Description: "read"}}}}},
-	}
-	for _, err := range llm.GenerateContent(context.Background(), req, false) {
+	for _, err := range llm.GenerateContent(ctx, req, false) {
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
@@ -109,6 +117,45 @@ func modelRequestBodies(t *testing.T, model string, webSearch bool) []string {
 		t.Fatal("no request reached the fake endpoint")
 	}
 	return slices.Clone(bodies)
+}
+
+// TestASideCallCarriesNoServerSideTool: a side call, such as the
+// summarizer that compacts the history, reaches the endpoint with no tools,
+// even when the turn's policy grants web search and on any model name.
+// core-agent sends the summarizer's request with no function declarations,
+// and core-agent's name check, which drops search for a model that isn't
+// Gemini 3 or later, applies only to a request that has them; so without
+// the harness's marker the compaction request would carry Google Search to
+// an endpoint that may refuse it.
+func TestASideCallCarriesNoServerSideTool(t *testing.T) {
+	for _, model := range []string{"gemini-3-flash", "model-default"} {
+		t.Run(model, func(t *testing.T) {
+			req := &adkmodel.LLMRequest{
+				Model:    model,
+				Contents: []*genai.Content{{Role: "user", Parts: []*genai.Part{{Text: "summarise this"}}}},
+				Config:   &genai.GenerateContentConfig{SystemInstruction: genai.NewContentFromText("summarise", genai.RoleUser)},
+			}
+			ctx := models.AsSideCall(context.Background(), "summarizer")
+			m, err := buildModel(context.Background(), model, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := m.(interface{ WithoutBuiltins() adkmodel.LLM }); !ok {
+				t.Error("the model no longer offers core-agent's WithoutBuiltins unwrap, which a subtask uses")
+			}
+			for _, b := range requestBodies(t, ctx, model, true, req) {
+				var body struct {
+					Tools []json.RawMessage `json:"tools"`
+				}
+				if err := json.Unmarshal([]byte(b), &body); err != nil {
+					t.Fatalf("request body %q: %v", b, err)
+				}
+				if len(body.Tools) != 0 {
+					t.Errorf("a side call's request carries tools: %s", b)
+				}
+			}
+		})
+	}
 }
 
 // TestATurnBuildsItsModelWithThePolicysWebSearch: the harness builds each

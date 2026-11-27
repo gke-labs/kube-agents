@@ -50,6 +50,9 @@ on:
       # agentprofile_model_key_test.go reads the AI workload audit's patterns
       # from this file.
       - "agents/platform/skills/fleet-audit/scripts/collect.py"
+      # platformagent_image_cron_test.go holds the operator's list of roster
+      # job ids to this file.
+      - "agents/platform/cron/jobs.json"
       # Several operator tests read the chart through a relative path (the
       # bus migration, flagged pods, minter size and scope publisher quota
       # tests), so a chart-only change must run this job too, or it breaks
@@ -110,6 +113,9 @@ jobs:
               - "k8s-operator/**"
               - "a2a/authcallout/testdata/**"
               - "agents/platform/skills/fleet-audit/scripts/collect.py"
+              # platformagent_image_cron_test.go holds the operator's list of roster
+              # job ids to this file.
+              - "agents/platform/cron/jobs.json"
               - "charts/kube-agents/**"
               - "a2a/lib/testdata/**"
               - "a2a/dispatch/testdata/**"

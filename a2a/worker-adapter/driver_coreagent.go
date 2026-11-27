@@ -214,7 +214,21 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	case coreagentwire.TypeToolCall:
 		return []Event{{Kind: EventActivity, Tool: ln.Tool, Input: ln.Input, CallID: ln.ID}}, nil
 	case coreagentwire.TypeToolResult:
-		return []Event{{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}}, nil
+		ev := Event{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}
+		if ln.Text != "" {
+			// The tool's function response for the answer's scrub, never
+			// published. As core-agent returns it, a JSON object, it goes in
+			// raw: CollectToolResult reads each string value (stdout, stderr)
+			// as a text of its own, so a Secret a command printed reads
+			// whole. Anything else goes in as one JSON string. Uncapped: the
+			// harness caps a tool's output, and the scrub caps what it reads.
+			if json.Valid([]byte(ln.Text)) {
+				ev.ToolResult = json.RawMessage(ln.Text)
+			} else {
+				ev.ToolResult, _ = json.Marshal(ln.Text)
+			}
+		}
+		return []Event{ev}, nil
 	case coreagentwire.TypeResult:
 		d.ended = true
 		if !ln.Failed && d.conv != nil && d.session != "" {

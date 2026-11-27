@@ -685,12 +685,12 @@ class SessionRecordTest(unittest.TestCase):
 
         if status != 200:
             return mock.patch.object(
-                kanban_origin.urllib.request, "urlopen",
+                kanban_origin.urllib.request.OpenerDirector, "open",
                 side_effect=urllib.error.HTTPError("u", status, "x", {}, io.BytesIO(b"")),
             )
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = body
-        return mock.patch.object(kanban_origin.urllib.request, "urlopen", return_value=response)
+        return mock.patch.object(kanban_origin.urllib.request.OpenerDirector, "open", return_value=response)
 
     def test_the_record_is_read_with_the_pods_key(self):
         with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._answer(
@@ -710,7 +710,7 @@ class SessionRecordTest(unittest.TestCase):
             with self.subTest(failure=failure), mock.patch.object(
                 kanban_origin, "_session_id", return_value=session
             ), mock.patch.object(kanban_origin, "_cron_origin", return_value=None), mock.patch.object(
-                kanban_origin.urllib.request, "urlopen", side_effect=failure
+                kanban_origin.urllib.request.OpenerDirector, "open", side_effect=failure
             ):
                 self.assertIsNone(kanban_origin._fetch_session_origin(session))
                 self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
@@ -778,12 +778,59 @@ class SessionRecordTest(unittest.TestCase):
             [("/v1/sessions/child-1/origin", "Bearer k"), ("/v1/sessions/nobody/origin", "Bearer k")],
         )
 
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        # Session KV is on the pod's loopback address. With a proxy variable and no
+        # NO_PROXY entry for it, urllib hands the request and its bearer token to the proxy.
+        import http.server
+        import socket
+        import threading
+        import urllib.request
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815 - the stdlib's names
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.object(kanban_origin, "SESSION_KV_URL", url), \
+                mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", "http_proxy": proxy, "HTTP_PROXY": proxy}), \
+                mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            self.assertEqual(kanban_origin._fetch_session_origin("s"), {})
+            self.assertEqual(kanban_origin._session_kv(kanban_origin.STAMP_TICKETS_PATH), {})
+        self.assertEqual(
+            seen,
+            [("GET", "/v1/sessions/s/origin", "Bearer k"), ("POST", "/v1/board/stamp-tickets", "Bearer k")],
+        )
+
     def test_a_stale_process_env_session_is_no_turn(self):
         # Hermes writes HERMES_SESSION_ID process-wide for every root agent;
         # outside a bound turn it names the last turn, so it is never read.
         with mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "20261103_090000_lastturn"}), \
                 mock.patch.object(kanban_origin, "_cron_origin", return_value=None), \
-                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+                mock.patch.object(kanban_origin.urllib.request.OpenerDirector, "open") as urlopen:
             self.assertEqual(kanban_origin._session_id(), "")
             self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
         urlopen.assert_not_called()
@@ -805,25 +852,25 @@ class SessionRecordTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._ticket("ab"):
             with self._answer(status=404):
                 self.assertIsNone(kanban_origin.ticket_origin())
-            with mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("down")):
+            with mock.patch.object(kanban_origin.urllib.request.OpenerDirector, "open", side_effect=OSError("down")):
                 self.assertIsNone(kanban_origin.ticket_origin())
             with self._answer(body=b'{"origin": "other"}'):
                 self.assertIsNone(kanban_origin.ticket_origin())
         with mock.patch.dict(os.environ), self._ticket("ab"), \
-                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+                mock.patch.object(kanban_origin.urllib.request.OpenerDirector, "open") as urlopen:
             os.environ.pop(kanban_origin.SESSION_KV_KEY_ENV, None)
             self.assertIsNone(kanban_origin.ticket_origin(), "no key, no redemption")
         urlopen.assert_not_called()
 
     def test_a_ticket_in_the_process_environment_is_not_read(self):
         with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", "KUBE_AGENTS_CARD_STAMP_TICKET": "ab"}), \
-                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+                mock.patch.object(kanban_origin.urllib.request.OpenerDirector, "open") as urlopen:
             self.assertIsNone(kanban_origin.ticket_origin())
         urlopen.assert_not_called()
 
     def test_minting_never_raises(self):
         with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), \
-                mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("refused")):
+                mock.patch.object(kanban_origin.urllib.request.OpenerDirector, "open", side_effect=OSError("refused")):
             self.assertIsNone(kanban_origin.mint_ticket("issue"))
 
 
