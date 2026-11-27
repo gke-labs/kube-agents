@@ -145,7 +145,7 @@ opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/262
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY`, `A2A_ACTIVITY_SECRET` and `SESSION_KV_API_KEY` (without the last,
-every chat turn ends saying a card's answer cannot be posted back). The one thing the operator adds is the
+every chat answer carries a note that background work's result won't be posted back). The one thing the operator adds is the
 bus CA: `NATS_CA_FILE` and the bundle mount at `/etc/a2a-nats-ca`, overriding any value of the entry's own,
 since the bus requires TLS and a bridge that cannot verify it never connects. The operator reads `BRIDGE_CONCURRENCY`
 back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
@@ -423,8 +423,16 @@ user and disable personal memory in group conversations) in the pod's session-kv
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
-turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
-be posted back. A Google Chat, Slack, Teams or console conversation is posted back. A console
+turn runs either way, and when it fails the answer carries a note that the result of work still
+running won't be posted back on its own. A refused connection is retried every second for up to two minutes, the window the
+turn's own call to the API server uses, since session-kv runs in the agent container and is not listening yet when the bridge takes a task
+queued while the pod rolled, or one taken while that container restarts; the session's origin
+record (`PUT /v1/sessions/{id}/origin`, [`proposal-origin.md`](../../docs/designs/proposal-origin.md)
+§2.1) and the pushed-report lookup below retry the same way. Any other failure, a timeout included,
+is not retried. A store refused for a whole window while the API server answers is taken as down: later requests try once, without
+the wait, until one reaches it, so a session-kv process that has died costs one window rather than one
+per task. While the API server refuses as well, the agent container is restarting rather than
+session-kv being gone, and the full retry applies again. A Google Chat, Slack, Teams or console conversation is posted back. A console
 conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google- or Entra-token A2A door, or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
@@ -524,7 +532,10 @@ it contained unstructured model reasoning instead of an answer; anything the age
 turn has already happened, so check that before asking again[; session: <id>][; turn: N]`, and the
 bridge logs a warning with the task, session and answer size, never the text. That holds when a
 cancel raced the end of the turn too: a withheld answer ends `failed`, not `completed`. The rule is
-`opensWithUnstructuredReasoning` in `reasoning_leak.go`. The image patch
+`OpensWithUnstructuredReasoning` in `a2a/lib/answerscrub` (`reasoning.go`), one shared
+implementation for the bridge and session paths: the session front door's worker-adapter withholds
+such an answer with the same reason and the harness session, publishes no assistant text block
+that opens that way as progress, and attaches none as a failure's partial output. The image patch
 `apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
 model on later calls. On the API executor one more guard follows the answer: a reply that names a card
 or task id (`t_` and eight hex characters) when the turn's prompt, the user's words, names no task,
@@ -715,7 +726,9 @@ The answer stays on `TASKS`, because the gateway delivers it from there, so the 
 shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
 published (`scrubAnswer` in `answer_scrub.go`, over `answerscrub.Scrub` in `a2a/lib/answerscrub`,
 #5280). That covers the `result` artifact and the chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
-answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
+answer. The scrub is one shared implementation for the bridge and session paths: the session front
+door's worker-adapter keeps the same per-task set, fed from the tool results the harness reports,
+and scrubs its `result` artifact, its `progress` text and a failed terminal's partial output. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
 a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
 scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
 (`failureScrubWindowBytes`), scrubs that, then keeps 2 KiB, so a private key whose header is
@@ -951,7 +964,7 @@ task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. 
 unmatched deliveries are answered 204 and dropped.
 
 What goes on the bus, one `data` part per invocation at `post_tool_call`, a superset of the
-worker adapter's `{"tool","input"}` so one fold reads both executors:
+worker adapter's `{"tool","title"}` so one fold reads both executors:
 
 ```json
 {
@@ -1115,11 +1128,16 @@ spec names, not one this sweep fills. Three failure classes:
   still answered 204. Each recovery is logged at Error with the message
   `recovered a panic`, the panic's type or runtime error, and the stack. The count of
   recoveries is kept in the process with no endpoint, so alert on the log message or the
-  reason. The door's routing (`routeDelivery`, before a delivery is matched to a task) has
-  no guard of its own: `net/http` recovers a panic in a handler, as it always has, by
-  closing the connection with no answer and logging the panic value to stderr. No task is
-  marked, and hermes retries the delivery, as it retries any connection error. A panic
-  anywhere else (the durable's consumer goroutine
+  reason. A panic in the door's routing, before a delivery is matched to a task, can't say
+  which task the delivery was for, and a dropped tool result can carry a secret value a
+  task's answer needed scrubbed. So every run it could still have been for fails closed:
+  the runs on its hermes session once routing has read one that some run holds, and
+  otherwise every run in flight (a card worker's delivery is on the worker's own session).
+  The door answers 204, so hermes doesn't retry it, and logs the count of runs marked,
+  never their ids. One bad delivery can so fail several concurrent tasks; that's the
+  intended side, since a missed secret is worse than a failed task. Anything `net/http`
+  itself still recovers is logged without the panic's value or stack. A panic anywhere
+  else (the durable's consumer goroutine
   and the finalizes it runs, the deadline and kill timers, and the `recordOrigin`,
   synthesis-watcher, board-action and session-card-abort goroutines) still ends the
   process, and the sweep above finalizes its tasks.

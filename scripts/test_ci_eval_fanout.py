@@ -245,6 +245,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "gce-startup-script-failure",
             "gce-rotated-console-notes",
             "networking-world-open-ingress",
+            "networking-health-check-shadowed",
             "obtainability-pdb-kustomize-overlay",
             "fleet-audit-manifest-fix-names-stalled-config-connector",
         ):

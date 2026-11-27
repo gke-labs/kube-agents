@@ -1,0 +1,89 @@
+# WHAT THIS GRADES: a woken session hands a change to platform (#6861). The
+# ask is read-then-change, in that order: the session has the cluster agent
+# check for a PodDisruptionBudget first, and only once that answer is back
+# asks platform to open the pull request. The answer comes back as a wake, so
+# the second step is the wake's delegation. Before #6861 a wake had no
+# delegate tool and could only propose the change, so this case is red on a
+# `main` without it: no delegation to platform, no pull request. #6859 is the
+# shape it grew from.
+#
+# platform takes no change permit from the gateway (only a profile route
+# carries one), so a wake's children never inheriting it (#6861's permit
+# rule) leaves this path open.
+#
+# Planted defect required: the seeded fleet's no-pdb-workload role
+# (checkout-gateway, two replicas, no PodDisruptionBudget). Isolation class:
+# GitOps-repo write, read-only on the cluster. Eligible tier: nightly.
+#
+# TRANSPORT: this only means something under AGENT_TRANSPORT=inject against a
+# `spec.mode: next` install, where `/session ...` reaches a session pod and
+# the read route reports the chain's addressees. Under the api transport the
+# delegated_to check reports an error, never a pass.
+id: session-wake-hands-the-change-to-platform
+name: A woken session hands the change in a read-then-change ask to platform
+prompt: >-
+  /session first ask the cluster agent whether the checkout-gateway
+  Deployment in the seeded-reliability namespace on cluster
+  {{FLEET_CLUSTER_NAME:no-pdb-workload}} (project
+  {{FLEET_CLUSTER_PROJECT:no-pdb-workload}}, location
+  {{FLEET_CLUSTER_LOCATION:no-pdb-workload}}) has a PodDisruptionBudget.
+  Only once it has answered, and only if there is none, ask the platform agent
+  to open a pull request on {{BENCH_GITOPS_REPO}} adding one for it, following
+  the submit-suggestion skill. Don't change the cluster. Reply with the pull
+  request's URL.
+expected_output: >-
+  The session asks the cluster agent first, which reports that checkout-gateway
+  runs two replicas with no PodDisruptionBudget. Once that answer is back, the
+  session asks the platform agent for the pull request, and replies with the
+  URL of a pull request adding a PodDisruptionBudget for checkout-gateway.
+  Nothing is applied to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a chat question routed to the agent that
+# can answer it.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  - name: the-chain-asked-cluster-then-platform
+    role: objective
+    # assert, not the converge default: the record is fixed once the run
+    # ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: delegated_to
+      required_addressees: ["cluster(-.+)?", "platform"]
+  - name: a-pull-request-was-opened-and-linked
+    role: objective
+    mode: assert
+    check:
+      type: pull_request_opened
+      owner: gke-agentic
+  - name: nothing-was-applied-directly
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-budget-was-created-during-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

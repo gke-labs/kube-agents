@@ -324,7 +324,9 @@ func restoreAllDirected(ctx context.Context, nc *nats.Conn, streams []string, di
 		if err := json.Unmarshal(metaBytes, &meta); err != nil {
 			return warnings, 0, fmt.Errorf("stream %s: %w", name, err)
 		}
-		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
+		if !forward {
+			warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
+		}
 		// Going forward, a policy that renders max_consumers decides it, as
 		// it does max_bytes: the restore sends at least the CR's width
 		// (withRenderedLimits) and the read-back holds the stream to what it

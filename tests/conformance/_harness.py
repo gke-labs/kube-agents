@@ -132,7 +132,17 @@ SOURCES: dict[str, Source] = {
             "DESTRUCTIVE_SLACK_VERBS",
             "SLACK_REMOVE_ALLOWLIST",
             "SLACK_METHOD_SHAPE",
+            "REDACTED_OUTPUT_ROLES",
+            "def exec_response(",
+            "def redact_reply_body(",
         ),
+    ),
+    # C1 runs every tool-output case of this file through the broker's exec
+    # and MCP relay replies. The answer scrubber's tests read the same file,
+    # so a case is added here once for both.
+    "credential_shapes_fixture": Source(
+        "tests/conformance/fixtures/credential-shapes.json",
+        ('"version": 1', '"cases"', '"tool-output"'),
     ),
     # B1 imports this module: the per-tool allowlist the broker applies to
     # every remote MCP call.
@@ -465,6 +475,13 @@ SOURCES: dict[str, Source] = {
     "audit_report_store_listener": Source(
         "agents/platform/scripts/audit_report_store.py",
         ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
+    ),
+    # The task-credential verifier, read as text for the same reason
+    # (cryptography). The A3 permit row spells this permit as a literal; a
+    # rename in the verifier turns the anchor check red.
+    "task_credential_verifier": Source(
+        "agents/platform/scripts/task_credential.py",
+        ('PERMIT_VCS_UNATTENDED_WRITE = "vcs:unattended-write"',),
     ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",

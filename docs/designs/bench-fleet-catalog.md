@@ -9,7 +9,7 @@ case when one is not.
 
 **The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
 Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
-against at run time, the project-scoped `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`,
+against at run time, the project-scoped `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `health-check-shadowed`, `declared-mtu-peering`,
 `declared-orphan-snapshot` and `orphan-snapshot` included (`cluster_slot: null`). `docs/designs/fleet-fixtures.yaml` is the
 machine-readable form of the rest of this document — the day-N gates below, and
 `orphan-disks`, the one project-scoped fixture the catalog does not probe — and it may not
@@ -96,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Sixty-one fixtures: fifty-four across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Sixty-two fixtures: fifty-four across the four cluster slots and eight project-scoped. Seven of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `health-check-shadowed`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the seventeen seeded namespaces `seeded-debug`,
@@ -145,6 +145,7 @@ its roles are never published.
 | `startup-fail-vm`                   | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                                                                                                                                       |
 | `rotated-console-vm`                | project | 0   | `serial-flood-<prefix>`, a standalone e2-micro in `var.zone` whose startup script fails at boot and whose systemd timer then writes about 2 MiB of counted filler lines to serial port 1, two minutes after boot and daily after, so the boot's failure lines rotate out of the 1 MiB buffer within minutes; the reconcile does not reset it  |
 | `world-open-ingress`                | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                                                                                                                               |
+| `health-check-shadowed`             | project | 0   | `hc-shadow-deny-<prefix>`, a DENY of tcp:80 from the internet at priority 900 above `hc-shadow-allow-<prefix>`, an allow of tcp:80 from the health-check ranges at 1000, both on `world-open-<prefix>`'s tag                                                                                                                                  |
 | `declared-mtu-peering`              | project | 0   | `mtu-peer-declared`, a custom-mode VPC at MTU 8896, no subnet, peered both ways with `default` (MTU 1460); not a defect, the networking SOP's 2.4 peered-MTU posture, declared in `knowledge/`, listed under Declared intent                                                                                                                  |
 | `declared-orphan-snapshot`          | project | 91  | `declared-orphan-snap-<prefix>`, a snapshot of a throwaway disk the planter deleted, taken by no schedule: the GCE compute audit's orphaned-snapshots posture once it is more than 90 full days old, declared on purpose in the GitOps repository's `knowledge/` note and so listed under Declared intent; not ready, not drifted, until then |
 | `orphan-snapshot`                   | project | 91  | `orphan-snap-<prefix>`, the second snapshot of the same disk, undeclared: the control the compute audit keeps filing beside the declared one                                                                                                                                                                                                  |

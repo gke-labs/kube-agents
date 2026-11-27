@@ -27,10 +27,13 @@ It does two things:
   `API_SERVER_KEY` entry of the `apiServerSecretRef` Secret (PM:4321-4338). That Secret entry is
   the real key; the `API_SERVER_KEY` the agent container itself sees is the non-secret sentinel. Every holder of that key is the same caller
   to the door.
-- **It forwards everything else.** GET, POST, PUT, PATCH and DELETE on any path go to the Hermes
-  API server on `127.0.0.1:8642`, re-signed with the in-pod non-secret sentinel (CP:2666-2679,
-  CP:2716-2736). The one exception is a request that names an `a2a-*` session, or a child of one,
-  in a header, a path segment or a top-level body key (CP:2770-2882). Those get 403.
+- **It serves `GET /api/scope` and forwards everything else.** Authenticated `GET /api/scope`
+  requests are answered directly by the door from `fleet_scope.json`, `profiles/*`, and
+  `k8s-event-watcher`'s loopback `/metrics` listener. All other GET, POST, PUT, PATCH and DELETE
+  requests go to the Hermes API server on `127.0.0.1:8642`, re-signed with the in-pod non-secret
+  sentinel (CP:2666-2679, CP:2716-2736). The one exception is a request that names an `a2a-*`
+  session, or a child of one, in a header, a path segment or a top-level body key (CP:2770-2882).
+  Those get 403.
 
 So what a key holder can do is whatever Hermes' API server exposes. At the pinned Hermes, that
 includes:
@@ -118,6 +121,7 @@ the pod.
 | Route                                 | Method | console | eval | ops | Kind                    |
 | ------------------------------------- | ------ | :-----: | :--: | :-: | ----------------------- |
 | `/health`, `/health/detailed`         | GET    |    ✓    |      |     | health                  |
+| `/api/scope`                          | GET    |    ✓    |      |     | scope (door-handled)    |
 | `/v1/models`                          | GET    |         |      |  ✓  | health                  |
 | `/api/sessions` (list)                | GET    |    ✓    |      |  ✓  | session admin: list     |
 | `/api/sessions/{id}`                  | GET    |    ✓    |  ✓   |     | session admin: read     |
@@ -129,9 +133,9 @@ the pod.
 Sources:
 
 - **console:** `web-console/main.go:603,640,649-650,801,925,947,1072,1126,1145,1149`,
-  `channels.go:54`, `activity.go:256,279,442,591`, `stream.go:263`, `environment.go:422`. The
-  console already confines itself to its own `web-console-*` sessions plus event-triage and
-  scheduled sessions (`main.go:41-46`).
+  `channels.go:54`, `activity.go:256,279,442,591`, `stream.go:263`, `environment.go:422`,
+  `scope.go:444,459`. The console already confines itself to its own `web-console-*` sessions plus
+  event-triage and scheduled sessions (`main.go:41-46`).
 - **eval:** `harness.py:775-777` (token counts from the session row) and
   `harness.py:1826,1879-1890,1977` (turns, and status polls with `conversation` = the run id).
 - **ops:** `ci-deploy.sh:2600`, `kind-up.sh:161`,
@@ -174,6 +178,7 @@ named independently of any harness. The first set covers today's use and nothing
 | Operation        | What it means                                                              |
 | ---------------- | -------------------------------------------------------------------------- |
 | `health`         | liveness and readiness of the agent API                                    |
+| `scope`          | read-only fleet scope snapshot, profile identities, and watcher readiness  |
 | `models`         | list the models the agent offers                                           |
 | `turn.respond`   | run a turn with a stateless or chained request (`/v1/responses` on Hermes) |
 | `session.create` | start a named session the caller will hold turns in                        |
@@ -210,7 +215,7 @@ A field named under `session`, `chain` or `name` is also listed in `body` or `qu
 descriptor states every accepted field once in the lists, and the other keys only say what the door
 does with some of them.
 
-For Hermes, for example:
+For Hermes, for example (door-handled operations such as `scope` on `GET /api/scope` are answered directly by the door rather than declared by a harness):
 
 ```yaml
 apiVersion: harnessapi.kube-agents.x-k8s.io/v1alpha1
@@ -302,6 +307,7 @@ own key:
 | Operation        | console | eval | ops |
 | ---------------- | :-----: | :--: | :-: |
 | `health`         |    ✓    |  ✓   |  ✓  |
+| `scope`          |    ✓    |      |     |
 | `models`         |         |      |  ✓  |
 | `turn.respond`   |         |  ✓   |  ✓  |
 | `session.create` |    ✓    |      |     |
@@ -382,7 +388,7 @@ session:
 - **When the record can't be read.** The door caches origins it has found (they never change once
   written), never caches a miss, and refuses an origin-scoped request if the Session KV server
   can't answer for an uncached session.
-  `health`, `models` and `turn.respond` on a new chain don't need a lookup.
+  `health`, `scope`, `models` and `turn.respond` on a new chain don't need a lookup.
 
 The door's read rules then become:
 
@@ -497,8 +503,7 @@ tells an operator whether anything of theirs would be refused.
 **Per class, at the door** (unit tests against a fake upstream, in `test_credential_proxy.py`):
 
 - For each class, iterate every route and method in §3.4, including the `/p/{profile}` mirrors.
-- Assert that exactly the routes the class's operations map to reach the upstream, and every other
-  request gets the door's refusal, never the upstream's answer.
+- Assert that exactly the harness routes the class's operations map to reach the upstream, door-handled routes such as `GET /api/scope` are answered locally only for classes granted `scope` (never forwarded upstream), and every other request gets the door's refusal, never the upstream's answer.
 - Run the same table for a request with no key, a wrong key, and the legacy key in phase 3.
 - For each allowed route, a request with an extra header, body key or query parameter, or a
   non-canonical path (double-encoded, `..`, trailing slash), is refused.

@@ -41,11 +41,19 @@ import (
 // (a2a/authcallout/profile_narrowing.go). The map therefore holds no subject a
 // profile pod can reach, exactly as for the session entry.
 //
-// The operator's entry IS static, and it is the narrowest principal in the map:
-// publish on the directory, read the directory, its own inbox. It exists to
-// publish profile cards and their tombstones, which the spec gives to the
-// operator because a card is presence derived from desired state, and the
-// operator is the one component that holds the desired state.
+// The operator's entry IS static: publish on the directory, read the
+// directory, append missing rendered subjects to TOPICS-STATE on upgrade
+// (STREAM.INFO and STREAM.UPDATE on TOPICS-STATE), and its own inbox. It
+// exists to publish profile cards and their tombstones, which the spec gives
+// to the operator because a card is presence derived from desired state, and
+// the operator is the one component that holds the desired state, and to
+// converge TOPICS-STATE's rendered subject list while provision remains
+// create-only. At the NATS layer, STREAM.UPDATE.TOPICS-STATE is not narrow: it
+// permits changing any TOPICS-STATE config field (including limits, retention,
+// subject removal, and RePublish onto a2a.tasks.>), and only
+// StreamPolicy.CheckSubjectAppend in our code holds the update to added
+// subjects (accepted on the operator because it already renders the callout
+// identity map).
 
 const (
 	// a2aNarrowingProfile is the callout's NarrowingProfile, duplicated here

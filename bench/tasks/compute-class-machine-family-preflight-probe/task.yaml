@@ -1,0 +1,121 @@
+# Skill-guidance and pre-flight validator probe for gke-compute-classes (#5733):
+# before proposing a machine-family migration (such as migrating a legacy N1
+# node pool to N4), the worker runs /opt/data/scripts/machine_family_preflight.py
+# against the source pool configuration and target family (`n4`) and surfaces
+# the validator's verdict (`VERDICT: INCOMPATIBLE`), exact blocker rule IDs
+# (`disk-type-pd-on-hyperdisk-only` and `local-ssd-unsupported-on-n4`), and
+# Shielded VM security policy warning rule IDs (`shielded-vtpm-disabled` and
+# `shielded-secure-boot-disabled`) before generating any ComputeClass or
+# NodePool YAML.
+#
+# `the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers` uses
+# `fold_decoration: true` with line-anchored `forbidden_patterns` so prose that
+# contrasts the two verdicts ("VERDICT: INCOMPATIBLE rather than VERDICT:
+# COMPATIBLE") or explains why ComputeClass/NodePool YAML was withheld passes,
+# while a standalone `VERDICT: COMPATIBLE` line or a generated `kind:
+# ComputeClass`, `kind: ContainerNodePool`, or Terraform
+# `resource "google_container_node_pool"` block fails.
+# bench/tests/test_compute_class_machine_family_preflight_verdict.py pins both
+# sides.
+#
+# On main, `machine_family_preflight.py` is neither staged in the sandbox image
+# nor referenced in `gke-compute-classes/SKILL.md`, so both the `worker_commands`
+# objective (`the-machine-family-preflight-validator-ran`) and the rule-ID
+# report check (`the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers`,
+# whose required rule IDs appear in neither the prompt nor main's skill text)
+# fail red by construction.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: compute-class-machine-family-preflight-probe
+name: A machine-family migration proposal runs the pre-flight validator and rejects N1-to-N4 security, disk, and Local SSD incompatibilities before YAML generation
+
+owner: fkc1e100
+domain: capacity
+
+prompt: >-
+  We want to migrate our existing Standard GKE node pool `legacy-n1-pool` on
+  cluster `prod-cluster` (control-plane and node version `1.35.3-gke.1290000`)
+  from `n1-standard-8` to the `n4` machine family using a ComputeClass. Here is
+  the source pool's `gcloud container node-pools describe` JSON:
+  `{"name":"legacy-n1-pool","version":"1.35.3-gke.1290000","config":{"machineType":"n1-standard-8","diskType":"pd-standard","imageType":"COS_CONTAINERD","localSsdCount":2,"shieldedInstanceConfig":{"enableSecureBoot":false,"enableVtpm":false,"enableIntegrityMonitoring":true}}}`.
+  Load the installed `gke-compute-classes` skill and run its pre-flight
+  machine-family migration validator script against this source node pool JSON
+  for target family `n4` before generating any YAML. If you delegate this task
+  to another agent, pass the JSON and instructions verbatim. Include the
+  validator's exact verdict line, every blocker and warning rule ID it emitted,
+  and the remediation required before migrating to `n4`. Do not apply anything.
+expected_output: >-
+  The Platform Agent loads `gke-compute-classes`, runs
+  `/opt/data/scripts/machine_family_preflight.py` against `legacy-n1-pool`'s
+  JSON with `--target-family n4`, and reports `VERDICT: INCOMPATIBLE` with two
+  platform-limit blockers and two Shielded VM security policy warnings before
+  proposing any YAML:
+  (1) blocker `disk-type-pd-on-hyperdisk-only` (`pd-standard` is rejected on
+  Hyperdisk-only `n4`; switch the boot disk to `hyperdisk-balanced` and use
+  `dynamic-rwo` for cross-generation stateful PVs),
+  (2) blocker `local-ssd-unsupported-on-n4` (`localSsdCount=2` is rejected
+  because `n4` does not support Local SSD attachments; remove Local SSDs or use
+  `c3`/`c4` `-lssd` shapes or `n2`/`n2d`),
+  (3) warning `shielded-vtpm-disabled` (`shieldedInstanceConfig.enableVtpm=false`
+  violates baseline node security policy; remove `enableVtpm: false` and keep
+  `shieldedNodes.enabled: true` and `enableIntegrityMonitoring: true`), and
+  (4) warning `shielded-secure-boot-disabled`
+  (`shieldedInstanceConfig.enableSecureBoot=false` is recommended by baseline
+  node security policy; verify no unsigned kernel modules and enable Secure
+  Boot).
+infrastructure:
+  deployer: noop
+validated: true
+
+verification_spec:
+  - name: the-machine-family-preflight-validator-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      # Read each tagged `terminal` call as typed alongside the card log;
+      # `(?! )` never opens a post-call window so a single-command worker turn
+      # is graded directly by `required_runs`.
+      after_result_pattern: "(?!)"
+      required_runs:
+        - script: machine_family_preflight.py
+  - name: the-report-flags-n1-to-n4-security-disk-and-local-ssd-blockers
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_phrases:
+        - "VERDICT: INCOMPATIBLE"
+        - "shielded-vtpm-disabled"
+        - "shielded-secure-boot-disabled"
+        - "disk-type-pd-on-hyperdisk-only"
+        - "local-ssd-unsupported-on-n4"
+        - "hyperdisk-balanced"
+      forbidden_patterns:
+        - '(?m)^\s*verdict:\s*compatible\s*$'
+        - '(?m)^\s*kind:\s*(?:computeclass|containernodepool)(?:\s*#.*)?$'
+        - '(?m)^\s*resource\s+"google-container-node-pool"(?:\s+"[^"\n]+")?\s*\{'
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

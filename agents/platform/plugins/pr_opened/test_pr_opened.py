@@ -4,15 +4,19 @@ Run: python3 -m unittest agents/platform/plugins/pr_opened/test_pr_opened.py
 """
 
 import contextlib
+import http.server
 import importlib.util
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -34,6 +38,19 @@ REPO_NAME = "acme/fleet-config"
 TASK = "t_9f2a"
 TITLE = "Raise the checkout memory limit"
 TARGET = {"finding_id": "no-pdb.prod.shop.Deployment/checkout", "cluster": "prod", "namespace": "shop", "object": "Deployment/checkout"}
+PROXY = "http://egress.invalid:3128"
+# Loads the plugin by its path, as the gateway does. Prints the http proxy of
+# its opener, then that of a default opener of the same process, which shows
+# that the variable reached the process.
+OPENER_PROBE = (
+    "import importlib.util, sys, urllib.request\n"
+    "spec = importlib.util.spec_from_file_location('plugin', sys.argv[1])\n"
+    "module = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(module)\n"
+    "def http_proxies(opener):\n"
+    "    return [h.proxies.get('http') for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]\n"
+    "print(http_proxies(module._SESSION_KV_OPENER), http_proxies(urllib.request.build_opener()))\n"
+)
 
 
 def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None, target=None):
@@ -1017,6 +1034,72 @@ class RealBoardTest(unittest.TestCase):
             )
         self.assertEqual(out, stdout)
         self.assertEqual([event[1] for event in kanban.events], ["pr_opened"])
+
+
+class _LiveSessionKv:
+    """A local HTTP server that records the method, the path and the `Authorization`
+    header of each request and answers `{}`; and a proxy environment whose proxy is
+    a closed port, for a test that the call does not take the proxy."""
+
+    def __init__(self, case):
+        seen = self.seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        case.addCleanup(server.server_close)
+        case.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_port}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        for patcher in (
+            mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy, "SESSION_KV_API_KEY": "kv-token"}),
+            mock.patch.object(urllib.request, "_opener", None),
+        ):
+            patcher.start()
+            case.addCleanup(patcher.stop)
+        for name in ("no_proxy", "NO_PROXY"):
+            os.environ.pop(name, None)
+
+
+class ProxyTest(unittest.TestCase):
+    """Session KV is on the pod's loopback. With a proxy variable and no NO_PROXY
+    entry for 127.0.0.1, urllib hands a request and its bearer token to the proxy."""
+
+    def test_the_opener_takes_no_proxy_when_the_plugin_is_loaded_under_a_proxy_variable(self):
+        # The plugin builds its opener when it is loaded. A pod that has a proxy
+        # variable has it at that time, so the plugin is loaded in a new process.
+        environment = {key: value for key, value in os.environ.items() if key.lower() not in ("no_proxy", "http_proxy")}
+        environment["http_proxy"] = PROXY
+        done = subprocess.run(
+            [sys.executable, "-c", OPENER_PROBE, str(HERE / "__init__.py")],
+            env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(f"[] [{PROXY!r}]", done.stdout.strip())
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        server = _LiveSessionKv(self)
+        with mock.patch.object(plugin, "SESSION_KV_URL", server.url):
+            plugin._session_kv_post(plugin.LEDGER_PATH, {})
+        self.assertEqual([("POST", plugin.LEDGER_PATH, "Bearer kv-token")], server.seen)
 
 
 if __name__ == "__main__":

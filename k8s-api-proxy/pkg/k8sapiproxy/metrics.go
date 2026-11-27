@@ -182,6 +182,11 @@ var (
 		ReasonHeldCluster:              {},
 		ReasonHoldUnreadable:           {},
 		ReasonAuthorizeRefused:         {},
+		ReasonCallerInFlightLimit:      {},
+		ReasonCallerLongRunningLimit:   {},
+
+		ReasonCallerGroupInFlightLimit:    {},
+		ReasonCallerGroupLongRunningLimit: {},
 	}
 
 	knownOutcomes = map[string]struct{}{

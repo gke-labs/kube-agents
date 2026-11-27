@@ -1,0 +1,302 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "2 critical issues will delay or block cluster upgrades",
+                "type": "text"
+              },
+              {
+                "text": " · 4 open issues covering 4 objects on 2 clusters",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "kube-system/istiod",
+                "type": "text"
+              },
+              {
+                "text": " on ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "prod-central",
+                "type": "text"
+              },
+              {
+                "text": " — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget kube-system/istiod, and run two replicas of Deployment kube-system/istiod (1 replica) so the budget can be honoured.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "prod-central",
+                "type": "text"
+              },
+              {
+                "text": " — A Node object outlives its virtual machine: this cluster blocks the upgrade",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "The recommendation names a command, which is not shown here.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "2 more issues are open (1 critical, 1 lower priority).",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Next 2 open issues by rank",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "text": "critical · billing/invoice-worker on prod-central — mounts a static GCP key",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "text": "major · validatingwebhookconfiguration/authz/gate.authz.example on prod-europe — A fail-closed webhook whose backend is not up: authz/gate.authz.example fails closed with no backend and refuses writes the upgrade makes",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "These are all the open issues the message does not show.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          },
+          {
+            "rows": [
+              [
+                {
+                  "text": "Cluster",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Critical",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Major",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Minor",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "Next open issue",
+                  "type": "raw_text"
+                }
+              ],
+              [
+                {
+                  "text": "prod-central",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "1",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "billing/invoice-worker: mounts a static GCP key",
+                  "type": "raw_text"
+                }
+              ],
+              [
+                {
+                  "text": "prod-europe",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "1",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "0",
+                  "type": "raw_text"
+                },
+                {
+                  "text": "validatingwebhookconfiguration/authz/gate.authz.example: A fail-closed webhook…",
+                  "type": "raw_text"
+                }
+              ]
+            ],
+            "type": "table"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "Queue breakdown (2 more open)",
+          "type": "plain_text"
+        },
+        "type": "container"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "action_id": "kage.choice.0",
+                "style": "primary",
+                "text": {
+                  "emoji": true,
+                  "text": "Fix first issue",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "Fix first issue: kube-system/istiod on prod-central — A PodDisruptionBudget forbids the eviction: holds the node drain (minAvailable: 1, 1 pod expected)"
+              },
+              {
+                "action_id": "kage.link.0",
+                "text": {
+                  "emoji": true,
+                  "text": "Open backlog",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "url": "https://github.com/acme/gitops/issues/42"
+              }
+            ],
+            "type": "actions"
+          }
+        ],
+        "color": "#E01E5A",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

@@ -284,6 +284,10 @@ Before LiteLLM calls the provider, the hook rewrites every top-level field of th
 
 Each field is walked whole, so a value is redacted wherever it sits: a tool's input, what a tool returned, or an assistant message's other fields. A tool call's arguments held as JSON in a string are decoded first. A key name such as `password` then counts as it does in a mapping, and the arguments stay valid JSON.
 
+A tool's output that is a whole JSON object or array is decoded the same way, so the structure rules apply to it too: key names, a Secret's `data`, and env pairs. That covers a chat tool message's string content, an Anthropic tool result, a Responses function call output and the top-level strings in a Gemini function response (up to 64), plus whole JSON nested up to two levels inside one. The text rules run first, over the output as it came, and what is decoded is their result, so decoding only adds to what is masked.
+
+Output over 256 KiB, more than 64 levels deep, with a repeated key or that isn't whole JSON is matched as text only. At most 32 nested strings of one output are decoded. Output no rule changed goes on as it came. A changed one keeps its indent width and separators; numbers, escapes and other spacing are normalised.
+
 A few fields are left as they came. They are kept only where the provider APIs put them: content parts, a tool result's own content list, the system blocks and Gemini parts. That includes the parts of a Responses `input` item or function call output, and the parts inside a Gemini function response. Beyond those parts, nothing inside a tool's input or output is kept. The kept fields are:
 
 - in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
@@ -291,7 +295,7 @@ A few fields are left as they came. They are kept only where the provider APIs p
 - provider-encrypted content, which the provider checks byte for byte. That is a Responses reasoning item's `encrypted_content`, and in the assistant's turn a web search result's `encrypted_content`, the `reasoning_details` data and signature, and the `thought_signature` LiteLLM carries on the message and its tool calls;
 - binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
 
-A request the hook cannot walk is refused with 400, since the same request is refused every time and a caller shouldn't retry it. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64.
+A request the hook cannot walk is refused with 400, since the same request is refused every time and a caller shouldn't retry it. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64. JSON nested too deeply for the hook to follow is refused the same way: tool-call arguments too deep to decode, or any value too deep to walk.
 
 Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 

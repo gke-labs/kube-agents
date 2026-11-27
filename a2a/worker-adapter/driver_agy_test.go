@@ -476,6 +476,20 @@ func TestAnAgyDeniedActionWithNoNameIsStillCounted(t *testing.T) {
 	}
 }
 
+// A tool step's terminal state hands its output to the adapter, once, as an
+// EventToolResult: the whole output, and what the command printed on its own
+// so a Secret it printed reads as a whole text. The step's start carries none.
+func TestAnAgyToolStepsOutputIsOneToolResult(t *testing.T) {
+	results := eventsOf(decodeAll(t, "tool"), EventToolResult)
+	if len(results) != 1 {
+		t.Fatalf("%d tool results, want 1", len(results))
+	}
+	var texts []string
+	if err := json.Unmarshal(results[0].ToolResult, &texts); err != nil || len(texts) != 2 || texts[1] != "slept" {
+		t.Errorf("tool result %s (%v), want the whole output and what the command printed", results[0].ToolResult, err)
+	}
+}
+
 // TestAnAgyToolStepsResultIsReportedOnce: a tool step's terminal state is
 // one EventToolResult however often agy repeats it, and each step index gets
 // its own.

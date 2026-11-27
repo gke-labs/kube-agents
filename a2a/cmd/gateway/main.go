@@ -28,7 +28,6 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/gateway"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 const (
@@ -405,7 +404,7 @@ func standbyListens(cfg *gateway.Config) []string {
 // gatewayElection is the campaign for the gateway's Lease, through the pod's
 // own ServiceAccount.
 func gatewayElection(cfg *gateway.Config, log *slog.Logger) (gateway.Election, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := gateway.InClusterRESTConfig()
 	if err != nil {
 		return gateway.Election{}, fmt.Errorf("the election is configured (lease %s) but there is no in-cluster config: %w", cfg.GatewayLease, err)
 	}
@@ -530,7 +529,7 @@ func armResolvedScope(cfg *gateway.Config, gw *gateway.Gateway, log *slog.Logger
 	if cfg.ResolvedScopeConfigMap == "" {
 		return
 	}
-	rc, err := rest.InClusterConfig()
+	rc, err := gateway.InClusterRESTConfig()
 	if err != nil {
 		log.Error("resolved scope not armed: no in-cluster config", "err", err)
 		return
@@ -556,7 +555,7 @@ func armHomeLearn(cfg *gateway.Config, name string, backend gateway.Adapter, not
 	if !ok || !cfg.HomeLearnArmedFor(name) {
 		return
 	}
-	rc, err := rest.InClusterConfig()
+	rc, err := gateway.InClusterRESTConfig()
 	if err != nil {
 		log.Error("home channel learn not armed: no in-cluster config", "backend", name, "err", err)
 		return

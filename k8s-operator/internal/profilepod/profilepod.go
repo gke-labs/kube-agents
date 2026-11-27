@@ -185,3 +185,25 @@ done
 		VolumeMounts: []corev1.VolumeMount{{Name: volume, MountPath: mountPath}},
 	}
 }
+
+// HelperResources are the fixed requests and limits for a short-lived init
+// container beside the staging ones (the persona render, say), with the logs
+// allowance as its ephemeral storage, for the same quota and billing reasons.
+func HelperResources() corev1.ResourceRequirements {
+	resources := *stagingResources.DeepCopy()
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(stagingLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(stagingLogsAllowance)
+	return resources
+}
+
+// PersonaMount is the harness container's persona mount in r, for another
+// container that reads the persona the same way (the same subPath when the
+// image is mounted as a volume).
+func (r Rendered) PersonaMount() (corev1.VolumeMount, bool) {
+	for _, m := range r.Mounts {
+		if m.Name == personaVolumeName {
+			return m, true
+		}
+	}
+	return corev1.VolumeMount{}, false
+}
