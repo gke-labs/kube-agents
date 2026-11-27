@@ -33,4 +33,4 @@ _Declared intent_ instead of reporting (`../README.md`, "Declared intent"). Prop
 
 - [Standard GKE cluster blueprint](cluster-blueprint/standard-gke.md) — `cluster-blueprint`
 
-_Markdown links between entries form the knowledge graph. An optional `log.md` may record history._
+_Markdown links between entries form the knowledge graph. An optional `log.md` may record history. For how to lay out, version, and review team runbooks, see [Team runbooks](../../../docs/site/src/content/docs/concepts/runbooks.md)._

@@ -29,24 +29,26 @@ The [reference GitOps repository layout](https://github.com/gke-labs/kube-agents
 
 ### Configuring knowledge paths with `.kube-agents/intent.yaml`
 
-`.kube-agents/intent.yaml` at the repository root holds a single `paths:` list that bounds where fleet audits scan for declared-intent frontmatter and adds roots for Decision Memory record loading:
+`.kube-agents/intent.yaml` at the repository root holds a single `paths:` list that bounds where fleet audits scan for `declares:` frontmatter and sets the root directories Curator loads `decision` and `lesson` records from:
 
 ```yaml
 paths:
   - knowledge/
 ```
 
-Without `.kube-agents/intent.yaml`, or when a listed path does not exist at the audited commit, declaring audits fall back to scanning the whole repository under their content-mode file and byte caps. Keeping `.kube-agents/intent.yaml` in place keeps large repositories searchable.
+Include `knowledge/` in `paths:` whenever you also keep `decision` or `lesson` records there, because a non-empty `paths:` list replaces Curator's default `knowledge` root rather than appending to it. Runbook indexing ignores `intent.yaml` and always scans the fixed runbook directories listed below. Without `.kube-agents/intent.yaml`, or when a listed path does not exist at the audited commit, declaring audits fall back to scanning the whole repository under their content-mode file and byte caps.
 
 ### Using a separate read-only runbook repository
 
-If your runbooks already live in a dedicated repository in the same GitHub organization (or on a configured GitLab forge), attach it with `role: context` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#adding-repositories-to-a-githubcom-install). The credential broker serves read-only snapshots of `context` repositories and refuses every write verb against them.
+If your runbooks already live in a dedicated repository in the same GitHub organization (or on another configured forge such as GitLab, Bitbucket, or Gitea), attach it with `role: context` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#adding-repositories-to-a-githubcom-install). The credential broker serves read-only snapshots of `context` repositories and refuses every write verb against them.
 
-Both the `decision-memory` skill and the Curator indexer scan these runbook directories across `managed` and `context` repositories:
+Both the `decision-memory` skill and the Curator indexer scan these runbook directories across `gitops`, `managed`, and `context` repositories:
 
 - `knowledge/runbook/` (canonical singular) and `knowledge/runbooks/`
 - `docs/runbooks/` and `docs/playbooks/`
 - `runbooks/` and `playbooks/`
+
+Keep runbook Markdown files directly inside these directories rather than in nested subdirectories. The Curator indexer reads top-level `.md` files in each directory and skips subdirectories during the scheduled `repo_memory` sweep.
 
 ### Reserved filenames
 
@@ -87,14 +89,14 @@ Confirm the node is cordoned and identify which pods hold the eviction back.
 
 The recommended OKF v0.2 provenance and lifecycle fields are optional, and the OKF validator checks their shape whenever they appear:
 
-| Field         | Expected shape                                                                   | Purpose                                                   |
-| ------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| `type`        | Required non-empty string (never `index` or `log`)                               | Entry category (`runbook` for operational procedures).    |
-| `sources`     | Non-empty list of non-empty strings or mappings                                  | Upstream docs, tickets, or wikis the procedure came from. |
-| `generated`   | Mapping with non-empty `by` and ISO-8601 date (`YYYY-MM-DD`) or timestamp `at`   | Who authored or exported the file and when.               |
-| `verified`    | Mapping (or non-empty list of mappings) with `by` and ISO-8601 date/timestamp    | Who reviewed or tested the runbook and when.              |
-| `status`      | `draft`, `stable`, or `deprecated` for `runbook` and other non-decision OKF docs | Lifecycle state used by reviewers and semantic indexing.  |
-| `stale_after` | ISO-8601 date (`YYYY-MM-DD`) or timezone-qualified timestamp                     | Scheduled review-by date for freshness checks.            |
+| Field         | Expected shape                                                                                           | Purpose                                                   |
+| ------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `type`        | Required non-empty string (never `index` or `log`)                                                       | Entry category (`runbook` for operational procedures).    |
+| `sources`     | Non-empty list of non-empty strings or mappings                                                          | Upstream docs, tickets, or wikis the procedure came from. |
+| `generated`   | Mapping with non-empty `by` and ISO-8601 date (`YYYY-MM-DD`) or timezone-qualified timestamp `at`        | Who authored or exported the file and when.               |
+| `verified`    | Mapping (or non-empty list of mappings) with `by` and ISO-8601 date or timezone-qualified timestamp `at` | Who reviewed or tested the runbook and when.              |
+| `status`      | `draft`, `stable`, or `deprecated` for `runbook` and other non-decision/lesson OKF docs                  | Lifecycle state used by reviewers and semantic indexing.  |
+| `stale_after` | ISO-8601 date (`YYYY-MM-DD`) or timezone-qualified timestamp                                             | Scheduled review-by date for freshness checks.            |
 
 `decision` and `lesson` notes under `knowledge/decision/` and `knowledge/lesson/` use a separate lifecycle vocabulary (`proposed`, `active`, `rejected`, `superseded`, `retired`) for Decision Memory. All other OKF types, including `runbook`, use `draft`, `stable`, and `deprecated`.
 
@@ -102,9 +104,9 @@ The recommended OKF v0.2 provenance and lifecycle fields are optional, and the O
 
 Three distinct mechanisms share `knowledge/`, and keeping them separate prevents unexpected audit suppressions or blocked pushes.
 
-The Markdown body of a runbook holds human-readable procedures, diagnostic commands, and escalation steps for engineers and semantic recall. Fleet audits never parse Markdown prose to suppress findings, and narrative instructions never grant permissions.
+The Markdown body of a runbook holds human-readable procedures, diagnostic commands, and escalation steps for engineers and semantic recall. Fleet audits never parse prose to suppress findings, and narrative instructions never grant permissions.
 
-An entry under `.kube-agents/intent.yaml` paths may also carry a `declares:` list in frontmatter for intentional cluster postures. Each item names `check`, `namespace` (`""` for cluster-scoped objects), and `object` (`Kind/name`), plus optional `cluster` (`<project>/<location>/<name>` or `project/<id>`) and optional `expires` (`YYYY-MM-DD` UTC). Seven declaring fleet audits (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`, `stockout-prevention`, `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit`) read `declares:` and move matching postures under _Declared intent_ with the file path. After `expires` passes, the posture returns as a finding with a _Declared intent expired_ line naming the note and date.
+An entry under `.kube-agents/intent.yaml` paths may also carry a `declares:` list in frontmatter for intentional cluster postures. Each item names `check`, `namespace` (`""` for cluster-scoped objects), and `object` (`Kind/name`), plus optional `cluster` (`<project>/<location>/<name>` or `project/<id>`) and optional `expires` (`YYYY-MM-DD` UTC). The declaring fleet audits (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`, `stockout-prevention`, `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit`) read `declares:` and move matching postures under _Declared intent_ with the file path. After `expires` passes, the posture returns as a finding with a _Declared intent expired_ line naming the note and date.
 
 Pre-push manifest assertions (`scope` and `guard.expect`) belong in `knowledge/decision/` (`DEC-YYYY-NNN`) and `knowledge/lesson/` (`LES-YYYY-NNN`), where the credential broker evaluates them deterministically on `/v1/vcs/publish`. Keep machine-checked manifest guards in decision and lesson records rather than inside narrative runbooks.
 
@@ -120,9 +122,9 @@ Set `stale_after` to the next scheduled review date so your team can audit aging
 
 ## Validating `knowledge/` in your GitOps CI
 
-`kube-agents` does not install a CI workflow into your GitOps repository automatically. To catch malformed frontmatter and broken links before merge, run [`scripts/check_okf_knowledge.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/check_okf_knowledge.py) (standard library plus `PyYAML`) against your `knowledge/` directory in pull-request CI, for example `python3 check_okf_knowledge.py knowledge`.
+`kube-agents` does not install a CI workflow into your GitOps repository automatically. To catch malformed frontmatter and broken links before merge, run [`scripts/check_okf_knowledge.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/check_okf_knowledge.py) against your `knowledge/` directory in pull-request CI, keeping its sibling helper [`scripts/check_docs_links.py`](https://github.com/gke-labs/kube-agents/blob/main/scripts/check_docs_links.py) in the same directory (standard library plus `PyYAML`): `python3 scripts/check_okf_knowledge.py knowledge`.
 
-The validator enforces five checks across every file under `knowledge/`:
+The validator enforces these checks across every file under `knowledge/`:
 
 - no symbolic links inside `knowledge/`;
 - no `type` key on reserved files (`index.md`, `log.md`, and root `README.md` or `STATE_OF_BEING.md`);
@@ -134,11 +136,11 @@ The validator enforces five checks across every file under `knowledge/`:
 
 ### Shipped behaviour
 
-The seven declaring fleet-audit streams read `declares:` frontmatter from `.md` files under `.kube-agents/intent.yaml` paths across `managed` and `context` repositories and cite the matching file path under _Declared intent_.
+The declaring fleet-audit streams read `declares:` frontmatter from `.md` files under `.kube-agents/intent.yaml` paths in the GitOps repository (or `--repo` on a one-off run) and any GitHub `context` repositories, citing the matching file path under _Declared intent_.
 
-On installs running with `--memory=hindsight`, the 10-minute `github-repo-watcher` runs the `repo_memory` sweep (`DECISION_MEMORY_REPO_SCAN` defaults to `true`; see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/)). When the Curator binary is available alongside `NATS_URL` or `HINDSIGHT_API_URL`, it snapshots `managed` and `context` repositories and indexes runbooks verbatim into the `kube-agents-decisions` bank. Active (`stable`) runbooks then surface in `decision-memory` semantic checks (`check --semantic`) and Curator recall.
+On installs running with `--memory=hindsight`, the 10-minute `github-repo-watcher` runs the `repo_memory` sweep (`DECISION_MEMORY_REPO_SCAN` defaults to `true`; see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/)). When the Curator binary is available alongside `NATS_URL` or `HINDSIGHT_API_URL`, it snapshots `gitops`, `managed`, and `context` repositories and indexes top-level runbooks verbatim into the `kube-agents-decisions` bank. Active (`stable`) runbooks then surface in `decision-memory` semantic checks (`check --semantic`) and Curator recall.
 
-When asked about a documented procedure or repository path in chat, the Platform Agent reads files from registered `managed` or `context` repositories through the `inspect-repository` skill and cites the repository, branch or ref, and commit SHA.
+When asked about a documented procedure or repository path in chat, the Platform Agent reads files from registered `gitops`, `managed`, or `context` repositories through the `inspect-repository` skill and cites the repository, branch or ref, and commit SHA.
 
 ### Not shipped yet
 
@@ -155,7 +157,7 @@ Records indexed from `role: context` repositories stay read-only and untrusted. 
 Because direct connectors do not ship today, bring existing runbooks from Google Docs, Confluence, or Drive into Git through a manual export and pull-request review:
 
 1. Export each procedure to plain Markdown (in Google Docs, use **File → Download → Markdown**; in Confluence or Drive, export or copy as Markdown).
-2. Put one operational procedure per file under `knowledge/runbook/<slug>.md` (or under `docs/runbooks/` in a `role: context` repository), replacing terminal screenshots with plain text commands and expected output.
+2. Put one operational procedure per file directly under `knowledge/runbook/<slug>.md` (or under `docs/runbooks/` in a `role: context` repository), replacing terminal screenshots with plain text commands and expected output.
 3. Strip pasted tokens, credentials, or one-off cluster secrets, then add OKF frontmatter with `type: runbook`, `title`, `status: draft`, `sources` pointing back to the original document URL, `generated`, and an initial `stale_after` date.
 4. Open a pull request so the owning team reviews the converted procedure under `CODEOWNERS`, adds `verified`, and switches `status` to `stable` before merging.
 
