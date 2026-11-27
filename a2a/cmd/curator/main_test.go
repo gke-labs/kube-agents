@@ -1386,3 +1386,141 @@ func TestRunRecallFramesUntrustedDirectHindsightAndRunIndexBrokerTriggerAndMaxPa
 		t.Fatalf("expected okf:acme/huge-handbook:ADR-0077 retained via direct Hindsight fallback, got %+v", directRetained)
 	}
 }
+
+func TestRunDreamViaNATSAndNoRespondersAndLocalFallback(t *testing.T) {
+	natsURL := startCLIJetStream(t)
+	t.Setenv("NATS_URL", natsURL)
+	t.Setenv(lib.EnvBusUser, "curator")
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+
+	// 1. With no daemon listening, --nats-only exits with exitCodeNoResponders (2).
+	_, err := captureStdout(t, func() error {
+		return run([]string{"dream", "--repo-id", "acme/gitops", "--nats-only"})
+	})
+	exitErr, ok := err.(*exitCodeError)
+	if !ok || exitErr.code != exitCodeNoResponders {
+		t.Fatalf("expected exitCodeError(%d) on --nats-only with no responders, got %v", exitCodeNoResponders, err)
+	}
+
+	// 2. Without --nats-only, no responders falls back cleanly to local RepoDir.
+	localRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(localRepo, "apps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRepo, "apps", "web.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localRec := memory.Record{
+		Meta: memory.RecordMeta{
+			ID:     "DEC-2026-070",
+			Type:   memory.RecordTypeDecision,
+			Status: memory.StatusActive,
+			Title:  "Local fallback replica floor",
+			Date:   "2026-11-26",
+			Scope:  memory.RecordScope{Clusters: []string{"*"}, Paths: []string{"apps/**"}},
+			Guard: &memory.RecordGuard{
+				Rule:     "Keep replicas >= 2",
+				Severity: memory.SeverityBlock,
+				Expect:   &memory.GuardExpect{File: "apps/*.yaml", Path: "spec.replicas", Op: ">=", Value: 2},
+			},
+		},
+		Body: "Local fallback body.",
+	}
+	if err := memory.SaveRecord(localRepo, &localRec); err != nil {
+		t.Fatal(err)
+	}
+	fbOut, err := captureStdout(t, func() error {
+		return run([]string{"dream", "--repo", localRepo, "--repo-id", "acme/gitops"})
+	})
+	if err != nil {
+		t.Fatalf("expected local fallback when no daemon responds, got %v", err)
+	}
+	var fbRep memory.DreamReport
+	if err := json.Unmarshal([]byte(fbOut), &fbRep); err != nil {
+		t.Fatalf("decode local fallback dream output: %v", err)
+	}
+	if !fbRep.Silent || len(fbRep.VerifiedActive) != 1 || fbRep.VerifiedActive[0] != "DEC-2026-070" {
+		t.Fatalf("unexpected local fallback DreamReport: %+v", fbRep)
+	}
+
+	// 3. Start daemon with broker snapshot and run `curator dream --repo-id acme/gitops --nats-only`.
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		files := map[string]string{
+			"clusters/prod/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  replicas: 4\n",
+			"knowledge/decision/DEC-2026-071.md": "---\ntype: decision\nid: DEC-2026-071\ntitle: Daemon broker replica guard\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/**\nguard:\n  rule: Keep replicas >= 2\n  severity: block\n  expect:\n    file: clusters/**/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 2\n---\n\nBroker verified.\n",
+		}
+		for name, content := range files {
+			_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(content)), Typeflag: tar.TypeReg})
+			_, _ = tw.Write([]byte(content))
+		}
+		_ = tw.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"revision":      "dream-rev-071",
+			"archiveBase64": base64.StdEncoding.EncodeToString(buf.Bytes()),
+		})
+	}))
+	defer brokerSrv.Close()
+	t.Setenv("CREDENTIAL_PROXY_URL", brokerSrv.URL)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonContext(ctx, []string{"--repo", t.TempDir(), "--repo-id", "acme/gitops", "--status-listen", addr})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, rErr := httpClient.Get("http://" + addr + "/readyz"); rErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	natsOut, err := captureStdout(t, func() error {
+		return run([]string{"dream", "--repo-id", "acme/gitops", "--nats-only"})
+	})
+	if err != nil {
+		t.Fatalf("curator dream --nats-only failed: %v", err)
+	}
+	var natsRep memory.DreamReport
+	if err := json.Unmarshal([]byte(natsOut), &natsRep); err != nil {
+		t.Fatalf("decode --nats-only dream output: %v", err)
+	}
+	if !natsRep.Silent || natsRep.Revision != "dream-rev-071" || len(natsRep.VerifiedActive) != 1 || natsRep.VerifiedActive[0] != "DEC-2026-071" {
+		t.Fatalf("unexpected --nats-only DreamReport: %+v", natsRep)
+	}
+
+	// 4. --local runs against localRepo even while the daemon is listening on NATS.
+	localOut, err := captureStdout(t, func() error {
+		return run([]string{"dream", "--local", "--repo", localRepo, "--repo-id", "acme/gitops"})
+	})
+	if err != nil {
+		t.Fatalf("curator dream --local failed: %v", err)
+	}
+	var localRep memory.DreamReport
+	if err := json.Unmarshal([]byte(localOut), &localRep); err != nil {
+		t.Fatalf("decode --local dream output: %v", err)
+	}
+	if len(localRep.VerifiedActive) != 1 || localRep.VerifiedActive[0] != "DEC-2026-070" {
+		t.Fatalf("expected --local to audit localRepo (DEC-2026-070), got %+v", localRep)
+	}
+}

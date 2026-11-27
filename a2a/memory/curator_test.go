@@ -4825,3 +4825,672 @@ func TestBackfillUntrustedProvenanceAndRepoSlugDreamAndProposalIsolation(t *test
 		t.Fatalf("expected backfill record %q to be untrusted with PR #88, got untrusted=%v evidence=%+v", backfillFuzzyRes.RecordID, backfillAfter.IsUntrusted(), backfillAfter.Meta.Evidence)
 	}
 }
+
+func TestDreamActionRestrictedToOutcomesSubject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	natsURL := startEmbeddedJetStream(t)
+	client, err := lib.Connect(ctx, natsURL, lib.WithName("dream-subj-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	storeDir := t.TempDir()
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:         storeDir,
+		VerifiedRepoDir: storeDir,
+		RepoID:          "acme/gitops",
+		Client:          client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cur.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer cur.Stop()
+
+	// Action "dream" must be rejected on SubjectMemoryQuery and HandleQuery.
+	directResp := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Action: "dream",
+		Repo:   "acme/gitops",
+	})
+	if !strings.Contains(directResp.Error, "restricted to "+SubjectCuratorOutcomes) {
+		t.Fatalf("expected HandleQuery(dream) restriction error, got %+v", directResp)
+	}
+	_, qErr := QueryViaNATS(ctx, client, MemoryQueryRequest{
+		Action: "dream",
+		Repo:   "acme/gitops",
+	})
+	if qErr == nil || !strings.Contains(qErr.Error(), "restricted to "+SubjectCuratorOutcomes) {
+		t.Fatalf("expected QueryViaNATS(dream) restriction error, got %v", qErr)
+	}
+
+	// Action "dream" must succeed on SubjectCuratorOutcomes via DreamViaNATS.
+	dreamResp, dErr := DreamViaNATS(ctx, client, MemoryQueryRequest{
+		Repo: "acme/gitops",
+	})
+	if dErr != nil {
+		t.Fatalf("DreamViaNATS failed: %v", dErr)
+	}
+	if !dreamResp.OK || dreamResp.Dream == nil || !dreamResp.Dream.Silent {
+		t.Fatalf("expected OK silent DreamReport over outcomes subject, got %+v", dreamResp)
+	}
+}
+
+func TestBrokerBackedDreamCleanDriftedObsoleteSupersessionConflictsAndGraduation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+	mockHS, hsSrv := newMockHindsightServer(t)
+
+	var mu sync.Mutex
+	currentTar := ""
+	currentRev := "rev-clean"
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		tarB64 := currentTar
+		rev := currentRev
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"revision":      rev,
+			"archiveBase64": tarB64,
+		})
+	}))
+	defer brokerSrv.Close()
+
+	storeDir := t.TempDir()
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   storeDir,
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/gitops",
+		Hindsight: NewHindsightClient(hsSrv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Clean repo -> Silent: true, VerifiedActive populated, Hindsight synced, non-doc manifest not on disk.
+	mu.Lock()
+	currentTar = makeSnapshotTarBase64(t, map[string]string{
+		"clusters/prod/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n",
+		"knowledge/decision/DEC-2026-001.md": "---\ntype: decision\nid: DEC-2026-001\ntitle: Keep web replicas >= 2\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/**\nguard:\n  rule: Keep replicas >= 2\n  severity: block\n  expect:\n    file: clusters/**/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 2\n---\n\nClean guard.\n",
+	})
+	currentRev = "rev-clean-1"
+	mu.Unlock()
+
+	cleanResp := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/gitops"})
+	if !cleanResp.OK || cleanResp.Dream == nil {
+		t.Fatalf("clean HandleDream failed: %+v", cleanResp)
+	}
+	if !cleanResp.Dream.Silent || cleanResp.Dream.Revision != "rev-clean-1" {
+		t.Fatalf("expected silent dream at rev-clean-1, got %+v", cleanResp.Dream)
+	}
+	if !reflect.DeepEqual(cleanResp.Dream.VerifiedActive, []string{"DEC-2026-001"}) {
+		t.Fatalf("expected VerifiedActive=[DEC-2026-001], got %v", cleanResp.Dream.VerifiedActive)
+	}
+	mockHS.mu.Lock()
+	_, hasHS := mockHS.docs["okf:acme/gitops:DEC-2026-001"]
+	mockHS.mu.Unlock()
+	if !hasHS {
+		t.Fatalf("expected DEC-2026-001 synced to Hindsight")
+	}
+	vDir := cur.verifiedRepoDirFor("acme/gitops")
+	if _, statErr := os.Stat(filepath.Join(vDir, "clusters", "prod", "app.yaml")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected non-doc manifest clusters/prod/app.yaml not to be written to %s", vDir)
+	}
+
+	// 2. Drifted block guard, obsolete scope, asymmetric supersession, conflicting guards, and linked non-conflict.
+	localDrifted := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Keep web replicas >= 2",
+			Date:   "2026-11-26",
+			Repo:   "acme/gitops",
+			Scope:  RecordScope{Clusters: []string{"*"}, Paths: []string{"clusters/**"}},
+			Guard: &RecordGuard{
+				Rule:     "Keep replicas >= 2",
+				Severity: SeverityBlock,
+				Expect:   &GuardExpect{File: "clusters/**/*.yaml", Path: "spec.replicas", Op: ">=", Value: 2},
+			},
+		},
+		Body: "Local active copy.",
+	}
+	if err := SaveRecord(storeDir, &localDrifted); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	currentTar = makeSnapshotTarBase64(t, map[string]string{
+		"clusters/prod/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 1\n",
+		"clusters/a/pay.yaml":    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: pay\nspec:\n  replicas: 2\n",
+		"clusters/b/pay.yaml":    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: pay\nspec:\n  replicas: 2\n",
+		"knowledge/decision/DEC-2026-001.md": "---\ntype: decision\nid: DEC-2026-001\ntitle: Drifted web guard\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/prod/**\nguard:\n  rule: Keep replicas >= 2\n  severity: block\n  expect:\n    file: clusters/prod/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 2\n---\n\nDrifted guard.\n",
+		"knowledge/decision/DEC-2026-002.md": "---\ntype: decision\nid: DEC-2026-002\ntitle: Obsolete path guard\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - legacy/removed/**\nguard:\n  rule: Legacy guard\n  severity: block\n  expect:\n    file: legacy/removed/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 2\n---\n\nObsolete guard.\n",
+		"knowledge/lesson/LES-2026-001.md": "---\ntype: lesson\nid: LES-2026-001\ntitle: Old lesson still active\nstatus: active\ndate: \"2026-11-25\"\nevidence:\n  pull_request: \"#10\"\nscope:\n  clusters:\n    - prod\n  paths:\n    - clusters/prod/**\nguard:\n  rule: Keep replicas >= 1\n  severity: warn\n  expect:\n    file: clusters/prod/linked.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 1\n---\n\nShould be marked superseded.\n",
+		"knowledge/decision/DEC-2026-003.md": "---\ntype: decision\nid: DEC-2026-003\ntitle: New decision superseding LES-2026-001\nstatus: active\ndate: \"2026-11-26\"\nsupersedes:\n  - LES-2026-001\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/prod/**\nguard:\n  rule: Keep replicas >= 3\n  severity: warn\n  expect:\n    file: clusters/prod/linked.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 3\n---\n\nSupersedes LES-2026-001, so no conflict on linked.yaml.\n",
+		"knowledge/decision/DEC-2026-004.md": "---\ntype: decision\nid: DEC-2026-004\ntitle: Conflict guard A\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/a/**\nguard:\n  rule: Replicas == 2\n  severity: warn\n  expect:\n    file: clusters/a/pay.yaml\n    path: spec.replicas\n    op: \"==\"\n    value: 2\n---\n\nConflict A.\n",
+		"knowledge/decision/DEC-2026-005.md": "---\ntype: decision\nid: DEC-2026-005\ntitle: Conflict guard B\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/a/**\nguard:\n  rule: Replicas == 4\n  severity: warn\n  expect:\n    file: clusters/a/pay.yaml\n    path: spec.replicas\n    op: \"==\"\n    value: 4\n---\n\nConflict B.\n",
+		"knowledge/lesson/LES-2026-010.md": "---\ntype: lesson\nid: LES-2026-010\ntitle: Cluster A payment OOM\nstatus: active\ndate: \"2026-11-25\"\nevidence:\n  pull_request: \"#20\"\nscope:\n  clusters:\n    - cluster-a\n  paths:\n    - clusters/a/pay.yaml\n  checks:\n    - CHK-PAY-MEM\n---\n\nLesson A.\n",
+		"knowledge/lesson/LES-2026-011.md": "---\ntype: lesson\nid: LES-2026-011\ntitle: Cluster B payment OOM\nstatus: active\ndate: \"2026-11-26\"\nevidence:\n  pull_request: \"#21\"\nscope:\n  clusters:\n    - cluster-b\n  paths:\n    - clusters/b/pay.yaml\n  checks:\n    - CHK-PAY-MEM\n---\n\nLesson B.\n",
+	})
+	currentRev = "rev-findings-2"
+	mu.Unlock()
+
+	findResp := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/gitops"})
+	if !findResp.OK || findResp.Dream == nil {
+		t.Fatalf("findings HandleDream failed: %+v", findResp)
+	}
+	rep := findResp.Dream
+	if rep.Silent {
+		t.Fatalf("expected Silent=false when findings exist, got %+v", rep)
+	}
+	// DEC-2026-002 is obsolete and must not appear in DemotedDrifted or VerifiedActive.
+	if len(rep.Obsolete) != 1 || rep.Obsolete[0].ID != "DEC-2026-002" {
+		t.Fatalf("expected Obsolete=[DEC-2026-002], got %+v", rep.Obsolete)
+	}
+	for _, id := range rep.DemotedDrifted {
+		if id == "DEC-2026-002" {
+			t.Fatalf("obsolete record DEC-2026-002 must not be double-counted in DemotedDrifted")
+		}
+	}
+	foundDrifted001 := false
+	for _, id := range rep.DemotedDrifted {
+		if id == "DEC-2026-001" {
+			foundDrifted001 = true
+		}
+	}
+	if !foundDrifted001 {
+		t.Fatalf("expected DEC-2026-001 in DemotedDrifted, got %v", rep.DemotedDrifted)
+	}
+	// Local copy of DEC-2026-001 must be downgraded to warn.
+	localRecs, err := LoadRecords(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range localRecs {
+		if r.Meta.ID == "DEC-2026-001" && (r.Meta.Guard == nil || r.Meta.Guard.Severity != SeverityWarn) {
+			t.Fatalf("expected local DEC-2026-001 downgraded to warn, got %+v", r.Meta.Guard)
+		}
+	}
+	// Non-doc manifest still must not exist in .git-verified.
+	if _, statErr := os.Stat(filepath.Join(vDir, "clusters", "prod", "app.yaml")); !os.IsNotExist(statErr) {
+		t.Fatalf("non-doc manifest leaked to %s", vDir)
+	}
+	// Asymmetric supersession: DEC-2026-003 supersedes active LES-2026-001.
+	if len(rep.SupersessionIssues) != 1 || rep.SupersessionIssues[0].ID != "LES-2026-001" || rep.SupersessionIssues[0].SupersededBy != "DEC-2026-003" || rep.SupersessionIssues[0].CurrentStatus != StatusActive {
+		t.Fatalf("unexpected SupersessionIssues: %+v", rep.SupersessionIssues)
+	}
+	// Conflicts: DEC-2026-004 vs DEC-2026-005 (and NOT DEC-2026-003 vs LES-2026-001 which has supersedes link).
+	if len(rep.Conflicts) != 1 || rep.Conflicts[0].File != "clusters/a/pay.yaml" || !reflect.DeepEqual(rep.Conflicts[0].RecordIDs, []string{"DEC-2026-004", "DEC-2026-005"}) {
+		t.Fatalf("unexpected Conflicts: %+v", rep.Conflicts)
+	}
+	// Cross-cluster recurrence graduation: LES-2026-010 + LES-2026-011 -> 1 proposed DEC-*.
+	if len(rep.GraduatedDecisions) != 1 {
+		t.Fatalf("expected 1 graduated decision, got %v", rep.GraduatedDecisions)
+	}
+	gradFound := false
+	for _, r := range localRecs {
+		if r.Meta.ID == rep.GraduatedDecisions[0] {
+			gradFound = true
+			if r.Meta.Status != StatusProposed {
+				t.Fatalf("expected graduated decision %s to be status:proposed, got %s", r.Meta.ID, r.Meta.Status)
+			}
+		}
+	}
+	if !gradFound {
+		t.Fatalf("graduated decision %s not saved in local store", rep.GraduatedDecisions[0])
+	}
+}
+
+func TestBrokerBackedDreamLargeRepo413TargetedPrefixAndSafeFallback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+
+	docTar := makeSnapshotTarBase64(t, map[string]string{
+		"knowledge/decision/DEC-2026-001.md": "---\ntype: decision\nid: DEC-2026-001\ntitle: Replica floor\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/prod/**\nguard:\n  rule: Replicas >= 3\n  severity: block\n  expect:\n    file: clusters/prod/*.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 3\n---\n\nDrifted when replicas=1.\n",
+		"knowledge/decision/DEC-2026-002.md": "---\ntype: decision\nid: DEC-2026-002\ntitle: Unchecked path on large repo\nstatus: active\ndate: \"2026-11-26\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - deep/nonexistent/path/**\n---\n\nMust not be marked obsolete when fullTree=false.\n",
+	})
+	guardTar := makeSnapshotTarBase64(t, map[string]string{
+		"clusters/prod/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  replicas: 1\n",
+	})
+
+	var failTargeted413 atomic.Bool
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Repository string   `json:"repository"`
+			Paths      []string `json:"paths"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(body.Paths) == 0 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":     "SNAPSHOT_TOO_LARGE",
+				"revision": "rev-413",
+				"entries": []map[string]string{
+					{"path": "knowledge", "type": "dir"},
+					{"path": "clusters", "type": "dir"},
+				},
+			})
+			return
+		}
+		if len(body.Paths) == 1 && body.Paths[0] == "knowledge" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"revision":      "rev-413",
+				"archiveBase64": docTar,
+			})
+			return
+		}
+		if len(body.Paths) == 1 && body.Paths[0] == "clusters" {
+			if failTargeted413.Load() {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":     "SNAPSHOT_TOO_LARGE",
+					"revision": "rev-413",
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"revision":      "rev-413",
+				"archiveBase64": guardTar,
+			})
+			return
+		}
+		http.Error(w, "unexpected paths", http.StatusBadRequest)
+	}))
+	defer brokerSrv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   t.TempDir(),
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/large-gitops",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Targeted prefix succeeds -> evaluates drift accurately, does NOT mark obsolete (fullTree=false).
+	resp1 := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/large-gitops"})
+	if !resp1.OK || resp1.Dream == nil {
+		t.Fatalf("413 targeted HandleDream failed: %+v", resp1)
+	}
+	if len(resp1.Dream.Obsolete) != 0 {
+		t.Fatalf("expected 0 obsolete on 413 truncated tree, got %+v", resp1.Dream.Obsolete)
+	}
+	if !reflect.DeepEqual(resp1.Dream.DemotedDrifted, []string{"DEC-2026-001"}) {
+		t.Fatalf("expected DemotedDrifted=[DEC-2026-001] from targeted prefix fetch, got %v", resp1.Dream.DemotedDrifted)
+	}
+
+	// 2. Targeted prefix also returns 413 -> skips drift demotion safely instead of false-positive demotion.
+	failTargeted413.Store(true)
+	resp2 := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/large-gitops"})
+	if !resp2.OK || resp2.Dream == nil {
+		t.Fatalf("413 fallback HandleDream failed: %+v", resp2)
+	}
+	if len(resp2.Dream.DemotedDrifted) != 0 || len(resp2.Dream.Obsolete) != 0 || !resp2.Dream.Silent {
+		t.Fatalf("expected safe silent skip when targeted prefix also returns 413, got %+v", resp2.Dream)
+	}
+}
+
+func TestHandleDreamRejectsContextAndUnlistedReposAndDoesNotBlockQuery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 1. Explicit RoleContext rejected even when /etc/gitops is unconfigured.
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+	unconfCur, err := NewCurator(CuratorConfig{RepoDir: t.TempDir(), RepoID: "acme/gitops"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := unconfCur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/gitops", Role: RoleContext}); resp.OK || !strings.Contains(resp.Error, "restricted to managed") {
+		t.Fatalf("expected explicit RoleContext rejection, got %+v", resp)
+	}
+
+	// 2. Configured managed_repos / context_repos rejects context and unlisted repos.
+	stateDir := t.TempDir()
+	managedPath := filepath.Join(stateDir, "managed_repos")
+	contextPath := filepath.Join(stateDir, "context_repos")
+	if err := os.WriteFile(managedPath, []byte(`[{"url":"https://github.com/acme/gitops.git","role":"gitops"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contextPath, []byte(`[{"url":"https://github.com/acme/handbook.git"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITOPS_STATE_PATH", managedPath)
+
+	brokerStarted := make(chan struct{})
+	releaseBroker := make(chan struct{})
+	slowBroker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(brokerStarted)
+		<-releaseBroker
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"revision":      "rev-slow",
+			"archiveBase64": makeSnapshotTarBase64(t, map[string]string{}),
+		})
+	}))
+	defer slowBroker.Close()
+
+	storeDir := t.TempDir()
+	seed := Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-099",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Concurrent recall target",
+			Date:   "2026-11-26",
+			Repo:   "acme/gitops",
+			Scope:  RecordScope{Clusters: []string{"*"}, Paths: []string{"**"}},
+		},
+		Body: "Concurrent recall body.",
+	}
+	if err := SaveRecord(storeDir, &seed); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   storeDir,
+		BrokerURL: slowBroker.URL,
+		RepoID:    "acme/gitops",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/handbook"}); resp.OK || !strings.Contains(resp.Error, "restricted to managed") {
+		t.Fatalf("expected context repo rejection, got %+v", resp)
+	}
+	if resp := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/unlisted"}); resp.OK || !strings.Contains(resp.Error, "not in managed_repos") {
+		t.Fatalf("expected unlisted repo rejection, got %+v", resp)
+	}
+
+	// 3. Concurrent HandleQuery must complete immediately while HandleDream blocks on slow broker HTTP.
+	dreamDone := make(chan MemoryQueryResponse, 1)
+	go func() {
+		dreamDone <- cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/gitops"})
+	}()
+	<-brokerStarted
+
+	queryDone := make(chan MemoryQueryResponse, 1)
+	go func() {
+		queryDone <- cur.HandleQuery(ctx, MemoryQueryRequest{Query: "Concurrent recall"})
+	}()
+	select {
+	case qResp := <-queryDone:
+		if len(qResp.Results) == 0 {
+			t.Fatalf("expected concurrent HandleQuery to return seed record, got %+v", qResp)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseBroker)
+		t.Fatal("HandleQuery was blocked while HandleDream waited on slow broker HTTP")
+	}
+
+	close(releaseBroker)
+	dResp := <-dreamDone
+	if !dResp.OK {
+		t.Fatalf("expected slow HandleDream to finish cleanly, got %+v", dResp)
+	}
+}
+
+func TestDream413WildcardRootSkippedAndTruncatedTarSafe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+
+	// 1. Direct unit check: truncated tar archive returns complete=false.
+	validTarB64 := makeSnapshotTarBase64(t, map[string]string{
+		"clusters/prod/deploy.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n",
+	})
+	validTar, err := base64.StdEncoding.DecodeString(validTarB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Truncate mid-file-body (after the 512-byte header) and mid-header.
+	truncatedBodyTar := validTar[:520]
+	if _, complete := extractGuardFilesFromTar(truncatedBodyTar, []string{"clusters/**/*.yaml"}); complete {
+		t.Fatal("expected extractGuardFilesFromTar to return complete=false for truncated file body tar")
+	}
+	if _, complete := extractGuardFilesFromTar(validTar[:256], []string{"clusters/**/*.yaml"}); complete {
+		t.Fatal("expected extractGuardFilesFromTar to return complete=false for truncated header tar")
+	}
+	if _, complete := extractGuardFilesFromTar([]byte("not-a-valid-tar-header"), []string{"clusters/**/*.yaml"}); complete {
+		t.Fatal("expected extractGuardFilesFromTar to return complete=false for corrupt tar")
+	}
+
+	// 2. Broker 413 response with one literal-root guard and one wildcard-root guard.
+	docTar := makeSnapshotTarBase64(t, map[string]string{
+		"knowledge/decision/DEC-2026-101.md": "---\ntype: decision\nid: DEC-2026-101\ntitle: Literal root replica floor\nstatus: active\ndate: \"2026-11-27\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/prod/**\nguard:\n  rule: Keep replicas >= 3\n  severity: block\n  expect:\n    file: clusters/prod/deploy.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 3\n---\n\nLiteral root guard.\n",
+		"knowledge/decision/DEC-2026-102.md": "---\ntype: decision\nid: DEC-2026-102\ntitle: Wildcard root replica floor\nstatus: active\ndate: \"2026-11-27\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - \"**/deploy.yaml\"\nguard:\n  rule: Keep all deploy replicas >= 5\n  severity: block\n  expect:\n    file: \"**/deploy.yaml\"\n    path: spec.replicas\n    op: \">=\"\n    value: 5\n---\n\nWildcard root guard.\n",
+	})
+	guardTar := makeSnapshotTarBase64(t, map[string]string{
+		"clusters/prod/deploy.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 1\n",
+	})
+	truncatedGuardTarB64 := base64.StdEncoding.EncodeToString(truncatedBodyTar)
+
+	var serveTruncated atomic.Bool
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Paths []string `json:"paths"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(body.Paths) == 0 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":     "SNAPSHOT_TOO_LARGE",
+				"revision": "rev-413-wild",
+				"entries": []map[string]string{
+					{"path": "knowledge", "type": "dir"},
+					{"path": "clusters", "type": "dir"},
+				},
+			})
+			return
+		}
+		if len(body.Paths) == 1 && body.Paths[0] == "knowledge" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"revision":      "rev-413-wild",
+				"archiveBase64": docTar,
+			})
+			return
+		}
+		if len(body.Paths) == 1 && body.Paths[0] == "clusters" {
+			payload := guardTar
+			if serveTruncated.Load() {
+				payload = truncatedGuardTarB64
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"revision":      "rev-413-wild",
+				"archiveBase64": payload,
+			})
+			return
+		}
+		http.Error(w, "unexpected paths", http.StatusBadRequest)
+	}))
+	defer brokerSrv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   t.TempDir(),
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/large-wild",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/large-wild"})
+	if !resp.OK || resp.Dream == nil {
+		t.Fatalf("HandleDream failed: %+v", resp)
+	}
+	if !reflect.DeepEqual(resp.Dream.DemotedDrifted, []string{"DEC-2026-101"}) {
+		t.Fatalf("expected only literal-root DEC-2026-101 demoted (and wildcard DEC-2026-102 skipped), got %v", resp.Dream.DemotedDrifted)
+	}
+
+	// 3. Truncated targeted tar prevents any false drift demotion.
+	serveTruncated.Store(true)
+	respTrunc := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/large-wild"})
+	if !respTrunc.OK || respTrunc.Dream == nil {
+		t.Fatalf("HandleDream with truncated tar failed: %+v", respTrunc)
+	}
+	if len(respTrunc.Dream.DemotedDrifted) != 0 || !respTrunc.Dream.Silent {
+		t.Fatalf("expected zero demotions on truncated tar, got %+v", respTrunc.Dream)
+	}
+}
+
+func TestRunDreamForRepoFailsClosedWithoutBrokerOrVerifiedDir(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir: t.TempDir(),
+		RepoID:  "acme/gitops",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cur.RunDreamForRepo(ctx, "acme/gitops"); err == nil || !strings.Contains(err.Error(), ErrBrokerNotConfigured) {
+		t.Fatalf("expected RunDreamForRepo to fail closed with %q, got %v", ErrBrokerNotConfigured, err)
+	}
+	resp := cur.HandleDream(ctx, MemoryQueryRequest{Action: "dream", Repo: "acme/gitops"})
+	if resp.OK || !strings.Contains(resp.Error, ErrBrokerNotConfigured) {
+		t.Fatalf("expected HandleDream to fail closed with %q, got %+v", ErrBrokerNotConfigured, resp)
+	}
+}
+
+func TestRunDreamForRepoUpdatesDriftedSeverityInCacheAndHindsight(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(t.TempDir(), "nonexistent"))
+	mockHS, hsSrv := newMockHindsightServer(t)
+
+	tarB64 := makeSnapshotTarBase64(t, map[string]string{
+		"clusters/prod/app.yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 1\n",
+		"knowledge/decision/DEC-2026-201.md": "---\ntype: decision\nid: DEC-2026-201\ntitle: Drifted block guard\nstatus: active\ndate: \"2026-11-27\"\nscope:\n  clusters:\n    - \"*\"\n  paths:\n    - clusters/prod/**\nguard:\n  rule: Keep replicas >= 3\n  severity: block\n  expect:\n    file: clusters/prod/app.yaml\n    path: spec.replicas\n    op: \">=\"\n    value: 3\n---\n\nDrifted guard body.\n",
+	})
+	brokerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"revision":      "rev-drift-201",
+			"archiveBase64": tarB64,
+		})
+	}))
+	defer brokerSrv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   t.TempDir(),
+		BrokerURL: brokerSrv.URL,
+		RepoID:    "acme/gitops",
+		Hindsight: NewHindsightClient(hsSrv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := cur.RunDreamForRepo(ctx, "acme/gitops")
+	if err != nil {
+		t.Fatalf("RunDreamForRepo failed: %v", err)
+	}
+	if !reflect.DeepEqual(report.DemotedDrifted, []string{"DEC-2026-201"}) {
+		t.Fatalf("expected DemotedDrifted=[DEC-2026-201], got %v", report.DemotedDrifted)
+	}
+
+	cur.mu.Lock()
+	cached := cur.indexedRepoRecords["acme/gitops"]
+	cur.mu.Unlock()
+	if len(cached) != 1 || cached[0].Meta.Guard == nil || cached[0].Meta.Guard.Severity != SeverityWarn {
+		t.Fatalf("expected cached indexedRepoRecords severity=%q, got %+v", SeverityWarn, cached)
+	}
+
+	mockHS.mu.Lock()
+	hsDoc, ok := mockHS.docs["okf:acme/gitops:DEC-2026-201"]
+	mockHS.mu.Unlock()
+	if !ok {
+		t.Fatalf("expected DEC-2026-201 synced to Hindsight")
+	}
+	hasWarnTag := false
+	for _, tag := range hsDoc.Tags {
+		if tag == "guard:block" {
+			t.Fatalf("expected Hindsight tags to drop guard:block after drift demotion, got %v", hsDoc.Tags)
+		}
+		if tag == "guard:warn" {
+			hasWarnTag = true
+		}
+	}
+	if !hasWarnTag {
+		t.Fatalf("expected Hindsight tags to include guard:warn, got %v", hsDoc.Tags)
+	}
+	if !strings.Contains(hsDoc.Content, "Guard (warn):") {
+		t.Fatalf("expected Hindsight content to reflect warn severity, got %q", hsDoc.Content)
+	}
+}
+
+func TestCheckConflictingActiveGuardsPrecedenceAndScope(t *testing.T) {
+	makeGuardRec := func(id string, clusters, resources []string, op string, val any) Record {
+		return Record{
+			Meta: RecordMeta{
+				ID:     id,
+				Type:   RecordTypeDecision,
+				Status: StatusActive,
+				Title:  id,
+				Scope: RecordScope{
+					Clusters:  clusters,
+					Resources: resources,
+				},
+				Guard: &RecordGuard{
+					Rule:     id,
+					Severity: SeverityWarn,
+					Expect: &GuardExpect{
+						File:  "clusters/app.yaml",
+						Path:  "spec.replicas",
+						Op:    op,
+						Value: val,
+					},
+				},
+			},
+		}
+	}
+
+	// 1. Fleet-wide ["*"] vs narrow ["staging"] -> intentional override, no conflict.
+	if got := checkConflictingActiveGuards([]Record{
+		makeGuardRec("DEC-2026-301", []string{"*"}, nil, ">=", 3),
+		makeGuardRec("DEC-2026-302", []string{"staging"}, nil, "==", 1),
+	}); len(got) != 0 {
+		t.Fatalf("expected 0 conflicts for fleet-wide vs narrow cluster override, got %+v", got)
+	}
+
+	// 2. Disjoint ["prod"] vs ["staging"] -> no conflict.
+	if got := checkConflictingActiveGuards([]Record{
+		makeGuardRec("DEC-2026-303", []string{"prod"}, nil, ">=", 3),
+		makeGuardRec("DEC-2026-304", []string{"staging"}, nil, "==", 1),
+	}); len(got) != 0 {
+		t.Fatalf("expected 0 conflicts for disjoint clusters, got %+v", got)
+	}
+
+	// 3. Disjoint scope.resources on the same file -> no conflict.
+	if got := checkConflictingActiveGuards([]Record{
+		makeGuardRec("DEC-2026-305", []string{"prod"}, []string{"Deployment/web"}, "==", 2),
+		makeGuardRec("DEC-2026-306", []string{"prod"}, []string{"Deployment/api"}, "==", 4),
+	}); len(got) != 0 {
+		t.Fatalf("expected 0 conflicts for disjoint scope.resources, got %+v", got)
+	}
+
+	// 4. Overlapping same-cluster and same-resource contradictory guards -> flagged as conflict,
+	// while a third disjoint-cluster guard on the same file is excluded.
+	got := checkConflictingActiveGuards([]Record{
+		makeGuardRec("DEC-2026-307", []string{"prod"}, []string{"Deployment/web"}, "==", 2),
+		makeGuardRec("DEC-2026-308", []string{"prod"}, []string{"Deployment/web"}, "==", 4),
+		makeGuardRec("DEC-2026-309", []string{"staging"}, []string{"Deployment/web"}, "==", 1),
+	})
+	if len(got) != 1 || !reflect.DeepEqual(got[0].RecordIDs, []string{"DEC-2026-307", "DEC-2026-308"}) {
+		t.Fatalf("expected conflict [DEC-2026-307 DEC-2026-308], got %+v", got)
+	}
+}

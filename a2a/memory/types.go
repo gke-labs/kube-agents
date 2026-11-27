@@ -362,6 +362,7 @@ type MemoryQueryResponse struct {
 	Results  []HindsightRecallResult `json:"results"`
 	Records  []BlueprintRecordDigest `json:"records,omitempty"`
 	Outcome  *OutcomeProcessResult   `json:"outcome,omitempty"`
+	Dream    *DreamReport            `json:"dream,omitempty"`
 	Error    string                  `json:"error,omitempty"`
 }
 
