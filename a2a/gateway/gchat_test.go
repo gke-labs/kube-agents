@@ -1038,12 +1038,12 @@ func startRigOnBackend(t *testing.T, backend string, spawn spawner, opts ...func
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}
