@@ -3180,9 +3180,15 @@ class WithinWindowTest(unittest.TestCase):
     def test_a_line_of_the_windows_first_second_stays(self):
         """An entry's time is read to the second; the window's start has a fraction."""
         since = self.SINCE.replace(microsecond=500000)
-        first_second = conntrack_entry(stamp="2026-11-20T12:00:00.100000000Z")
+        first_second = conntrack_entry(stamp="2026-11-20T12:00:00.700000000Z")
         before = conntrack_entry(stamp="2026-11-20T11:59:59.900000000Z")
         self.assertEqual(cf.within_window([before, first_second], since), [first_second])
+
+    def test_the_windows_start_is_cut_to_the_second_and_no_further(self):
+        since = datetime.datetime(2026, 11, 20, 12, 34, 56, 500000, tzinfo=datetime.timezone.utc)
+        second_before = conntrack_entry(stamp="2026-11-20T12:34:55.900000000Z")
+        same_second = conntrack_entry(stamp="2026-11-20T12:34:56.100000000Z")
+        self.assertEqual(cf.within_window([second_before, same_second], since), [same_second])
 
     def test_an_entry_with_no_time_that_reads_as_one_stays(self):
         bare = conntrack_entry()

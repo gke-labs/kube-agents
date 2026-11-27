@@ -1796,7 +1796,7 @@ def _entry_time(entry) -> datetime.datetime | None:
 
 
 def within_window(entries: list, since: datetime.datetime) -> list:
-    """The entries stamped at or after `since`.
+    """The entries stamped at or after the start of the second that holds `since`.
 
     `gcloud` and the relay add a read's time bound only to a filter without
     the word `timestamp`, and a clause that is added to the filter after this
