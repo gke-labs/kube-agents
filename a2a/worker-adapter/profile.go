@@ -93,6 +93,9 @@ type ProfileWorkerConfig struct {
 	// and points each task's kubectl there. Without one, nothing starts and
 	// kubectl goes to the broker as before.
 	KubeProxy KubeProxyLoopbackConfig
+	// kubeProxyTaskEndHook, when set, runs as each task's end at the
+	// loopback begins. Tests use it to see what has been reported by then.
+	kubeProxyTaskEndHook func(task string)
 	// scriptCheck replaces the image's script-file check in tests.
 	scriptCheck scriptFileCheck
 	// resetTimeout replaces resetTimeout in tests.
@@ -152,6 +155,7 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		return err
 	}
 	if kubeProxy != nil {
+		kubeProxy.taskEndHook = pw.kubeProxyTaskEndHook
 		defer func() { _ = kubeProxy.Close() }()
 	}
 	b, closeBus, err := dialBus(ctx, cfg)

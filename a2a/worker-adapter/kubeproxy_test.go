@@ -20,11 +20,25 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // testWait bounds every wait on a channel in these tests: long enough that
 // only a hang reaches it.
 const testWait = 20 * time.Second
+
+const (
+	// kubeTestStallAfter is how long the flood's upstream lets one write
+	// wait before it takes the response as backed up.
+	kubeTestStallAfter = time.Second
+	// kubeTestShortDrain stands in for kubeProxyDrainTimeout where a test
+	// leaves a handler stuck.
+	kubeTestShortDrain = 50 * time.Millisecond
+	// kubeTestOrderProbe is how long a task's end is held to see whether its
+	// outcome was reported first.
+	kubeTestOrderProbe = time.Second
+)
 
 // kubeUpstream is a TLS server standing in for kube-proxy. It records each
 // request with the connection it came on, and tells when a connection closes.
@@ -45,12 +59,13 @@ type kubeUpstream struct {
 
 type kubeCall struct {
 	method, path, query, host, conn string
-	hdr                             http.Header
+	hdr, trailer                    http.Header
 	body                            []byte
 }
 
 const (
 	kubeTestCluster   = "/clusters/gke_proj_us-central1_alpha"
+	kubeTestFloodPath = kubeTestCluster + "/flood"
 	kubeTestHangPath  = kubeTestCluster + "/hang"
 	kubeTestWatchPath = kubeTestCluster + "/api/v1/pods"
 	kubeTestExecPath  = kubeTestCluster + "/api/v1/namespaces/default/pods/p/exec"
@@ -93,11 +108,28 @@ func startKubeUpstream(t *testing.T) *kubeUpstream {
 func (u *kubeUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	u.mu.Lock()
-	u.calls = append(u.calls, kubeCall{r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.RemoteAddr, r.Header.Clone(), body})
+	u.calls = append(u.calls, kubeCall{r.Method, r.URL.Path, r.URL.RawQuery, r.Host, r.RemoteAddr, r.Header.Clone(), r.Trailer.Clone(), body})
 	u.mu.Unlock()
 	switch r.URL.Path {
 	case kubeTestHangPath:
 		// Never answers: holds the request until its connection ends.
+		u.started <- r.URL.Path
+		<-r.Context().Done()
+		u.gone <- r.URL.Path
+	case kubeTestFloodPath:
+		// Writes without end. A write that waits kubeTestStallAfter means
+		// nothing downstream is reading; then it holds the request open.
+		rc := http.NewResponseController(w)
+		chunk := make([]byte, 64<<10)
+		for {
+			_ = rc.SetWriteDeadline(time.Now().Add(kubeTestStallAfter))
+			if _, err := w.Write(chunk); err != nil {
+				break
+			}
+			if err := rc.Flush(); err != nil {
+				break
+			}
+		}
 		u.started <- r.URL.Path
 		<-r.Context().Done()
 		u.gone <- r.URL.Path
@@ -185,8 +217,38 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 // clusterCredential is a value shaped like a task credential whose claims
 // name a cluster. Nothing here verifies it.
 func clusterCredential(cluster string) string {
-	claims := fmt.Sprintf(`{"nats":{"target":{"project":"proj","location":"us-central1","cluster":%q}}}`, cluster)
+	return taskClusterCredential(cluster, "task")
+}
+
+// taskClusterCredential is clusterCredential for a named task, so two tasks
+// on one cluster hold different credentials.
+func taskClusterCredential(cluster, task string) string {
+	claims := fmt.Sprintf(`{"nats":{"task":%q,"target":{"project":"proj","location":"us-central1","cluster":%q}}}`, task, cluster)
 	return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".sig"
+}
+
+// rawRequest writes request to the loopback as it is, and returns the
+// status and body of the answer.
+func rawRequest(t *testing.T, addr, request string) (int, string) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(testWait)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
 }
 
 // reportCredential is shaped like a task credential whose claims name no
@@ -200,6 +262,9 @@ type kubeLoopbackFixture struct {
 	p         *KubeProxyLoopback
 	tokenFile string
 	client    *http.Client
+	// addr is the loopback's host:port; logs is what it logged.
+	addr string
+	logs *lockedBuffer
 }
 
 func startKubeLoopback(t *testing.T) *kubeLoopbackFixture {
@@ -209,7 +274,8 @@ func startKubeLoopback(t *testing.T) *kubeLoopbackFixture {
 	if err := os.WriteFile(tokenFile, []byte("pod-token-1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p, err := StartKubeProxyLoopback(KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: up.caFileFor(t), PodTokenFile: tokenFile}, discardLogger())
+	logs := &lockedBuffer{}
+	p, err := StartKubeProxyLoopback(KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: up.caFileFor(t), PodTokenFile: tokenFile}, slog.New(slog.NewTextHandler(logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +284,7 @@ func startKubeLoopback(t *testing.T) *kubeLoopbackFixture {
 	t.Cleanup(func() { _ = p.Close() })
 	transport := &http.Transport{}
 	t.Cleanup(transport.CloseIdleConnections)
-	return &kubeLoopbackFixture{up: up, p: p, tokenFile: tokenFile, client: &http.Client{Transport: transport}}
+	return &kubeLoopbackFixture{up: up, p: p, tokenFile: tokenFile, client: &http.Client{Transport: transport}, addr: strings.TrimPrefix(p.URL, "http://"), logs: logs}
 }
 
 // get is one GET through the loopback, its status and body.
@@ -363,7 +429,7 @@ func TestTheKubeProxyLoopbackRefusesWithoutATaskOrACluster(t *testing.T) {
 // idle is closed.
 func TestATaskSwitchChangesTheCredentialAndTheConnections(t *testing.T) {
 	f := startKubeLoopback(t)
-	credA, credB := clusterCredential("alpha"), clusterCredential("beta")
+	credA, credB := taskClusterCredential("alpha", "task-a"), taskClusterCredential("alpha", "task-b")
 
 	endA := f.p.BeginTask("task-a", credA)
 	for range 2 {
@@ -535,7 +601,7 @@ func TestNoRequestCarriesAnotherTasksCredential(t *testing.T) {
 	index := map[string]int64{}
 	credentials := make([]string, tasks+1)
 	for i := 1; i <= tasks; i++ {
-		credentials[i] = clusterCredential(fmt.Sprintf("c%d", i))
+		credentials[i] = taskClusterCredential("alpha", fmt.Sprintf("task-%d", i))
 		index[credentials[i]] = int64(i)
 	}
 	// begun is the number of tasks whose begin has been called; ended the
@@ -663,6 +729,26 @@ func TestAnUnusableKubeProxyStopsTheWorker(t *testing.T) {
 		}
 	}
 
+	// A refused value is never printed whole: it can carry credentials.
+	for _, upstream := range []string{
+		"https://user:s3cr3t-in-userinfo@kube-proxy:8443",
+		"http://user:s3cr3t-in-userinfo@kube-proxy:8443",
+		"https://kube-proxy:8443/?token=s3cr3t-in-query",
+		"https://user:s3cr3t-in-userinfo@kube-proxy:8443/%zz",
+		"https://user:s3cr3t-in-userinfo@kube proxy:8443",
+	} {
+		_, err := startKubeProxyLoopback(KubeProxyLoopbackConfig{Upstream: upstream, CAFile: ca, PodTokenFile: token}, discardLogger())
+		if err == nil {
+			t.Errorf("startKubeProxyLoopback(%q) started", upstream)
+			continue
+		}
+		for _, leaked := range []string{"s3cr3t", "user:", "token="} {
+			if strings.Contains(err.Error(), leaked) {
+				t.Errorf("the error for a refused URL prints %q: %v", leaked, err)
+			}
+		}
+	}
+
 	// The worker itself refuses to start, before it reaches the bus.
 	cfg := profileWorkerConfig(t, startServer(t), stub(t, "exit 0"))
 	err := RunProfileWorker(context.Background(), cfg, ProfileWorkerConfig{
@@ -751,7 +837,10 @@ func TestARotatedCAIsReadAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ca := &caFile{path: path}
+	logs := &lockedBuffer{}
+	ca := &caFile{path: path, log: slog.New(slog.NewTextHandler(logs, nil))}
+	const failed, recovered = "doesn't load", "loads again"
+	logged := func(what string) int { return strings.Count(logs.String(), what) }
 	first, err := ca.pool()
 	if err != nil {
 		t.Fatal(err)
@@ -759,18 +848,359 @@ func TestARotatedCAIsReadAgain(t *testing.T) {
 	if again, err := ca.pool(); err != nil || again != first {
 		t.Errorf("an unchanged file was read again: %v", err)
 	}
-	// Half-written: the last pool stands.
+	// Half-written: the last pool stands, and it is said once however many
+	// connections ask.
 	if err := os.WriteFile(path, []byte("junk"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if kept, err := ca.pool(); err != nil || kept != first {
-		t.Errorf("a file of junk gave %v, want the last certificates kept", err)
+	for range 3 {
+		if kept, err := ca.pool(); err != nil || kept != first {
+			t.Errorf("a file of junk gave %v, want the last certificates kept", err)
+		}
 	}
-	// Rotated: a new pool.
+	if got := logged(failed); got != 1 {
+		t.Errorf("%d lines for one failing version of the file, want 1:\n%s", got, logs)
+	}
+	if !strings.Contains(logs.String(), path) {
+		t.Errorf("the line doesn't name the file:\n%s", logs)
+	}
+	// Another failing version is said once more.
+	if err := os.WriteFile(path, []byte("more junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if kept, err := ca.pool(); err != nil || kept != first {
+			t.Errorf("a second file of junk gave %v, want the last certificates kept", err)
+		}
+	}
+	if got := logged(failed); got != 2 {
+		t.Errorf("%d lines for two failing versions of the file, want 2:\n%s", got, logs)
+	}
+	if got := logged(recovered); got != 0 {
+		t.Errorf("a recovery was logged while the file still fails:\n%s", logs)
+	}
+	// Rotated: a new pool, and the recovery is said once.
 	if err := os.WriteFile(path, append(slices.Clone(good), '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if rotated, err := ca.pool(); err != nil || rotated == first {
+	rotated, err := ca.pool()
+	if err != nil || rotated == first {
 		t.Errorf("a rotated file was not read again: %v", err)
+	}
+	if again, err := ca.pool(); err != nil || again != rotated {
+		t.Errorf("the rotated file was read twice: %v", err)
+	}
+	if got := logged(recovered); got != 1 {
+		t.Errorf("%d recovery lines, want 1:\n%s", got, logs)
+	}
+}
+
+// TestATaskIsHeldToItsOwnCluster: a path that names any cluster but the
+// task's target is answered 403 here, naming neither credential, and nothing
+// is sent; the task's own cluster is forwarded.
+func TestATaskIsHeldToItsOwnCluster(t *testing.T) {
+	f := startKubeLoopback(t)
+	credential := clusterCredential("alpha")
+	end := f.p.BeginTask("task-a", credential)
+	defer end()
+	for _, path := range []string{
+		"/clusters/gke_proj_us-central1_beta/api/v1/pods",
+		"/clusters/gke_other_us-central1_alpha/api/v1/pods",
+		"/clusters/gke_proj_us-central1_alpha-2/api/v1/pods",
+		"/clusters/gke_proj_us-central1_alph/api/v1/pods",
+		"/clusters/GKE_proj_us-central1_alpha/api/v1/pods",
+		"/clusters/alpha/api/v1/pods",
+	} {
+		status, body, _ := f.get(t, path)
+		if status != http.StatusForbidden || !strings.Contains(body, kubeProxyOtherClusterMessage) {
+			t.Errorf("%s: status %d, body %q; want a local 403", path, status, body)
+		}
+		if strings.Contains(body, credential) || strings.Contains(body, "pod-token-1") {
+			t.Errorf("%s: the refusal carries a credential: %q", path, body)
+		}
+	}
+	if calls := f.up.seen(); len(calls) != 0 {
+		t.Fatalf("the upstream saw %d requests for other clusters, want none", len(calls))
+	}
+	for _, path := range []string{kubeTestEchoPath, kubeTestCluster, kubeTestCluster + "/"} {
+		if status, _, _ := f.get(t, path); status != http.StatusOK {
+			t.Errorf("%s: status %d, want the task's own cluster forwarded", path, status)
+		}
+	}
+	if calls := f.up.seen(); len(calls) != 3 {
+		t.Errorf("the upstream saw %d requests for the task's cluster, want 3", len(calls))
+	}
+}
+
+// kubeTestBentPaths are paths that climb, stand still, leave the cluster
+// empty or spell it in an encoding, with the dots or the slash encoded too.
+var kubeTestBentPaths = []string{
+	"/clusters/../healthz",
+	"/clusters/gke_proj_us-central1_alpha/../../x",
+	"/clusters/gke_proj_us-central1_alpha/..",
+	"/clusters/gke_proj_us-central1_alpha/./api",
+	"/clusters/gke_proj_us-central1_alpha/api/v1/../../../../x",
+	"//clusters/gke_proj_us-central1_alpha/echo",
+	"/clusters//gke_proj_us-central1_alpha/echo",
+	"/clusters//echo",
+	"/clusters/%2e%2e/healthz",
+	"/clusters/%2E%2E/healthz",
+	"/clusters/.%2e/healthz",
+	"/clusters/gke_proj_us-central1_alpha/%2e%2e/%2e%2e/x",
+	"/clusters/gke_proj_us-central1_alpha/%2e/x",
+	"/clusters/gke_proj_us-central1_alpha/a%2f..%2f..%2fx",
+	"/clusters/gke_proj_us-central1_alpha/..%2fx",
+	"/clusters/gke_proj_us-central1_alph%61/echo",
+	"/clusters/gke_proj_us-central1_alpha%2fecho",
+	"/clusters/gke_proj_us-central1_alpha%2f..%2fx",
+	"/clusters/%67ke_proj_us-central1_alpha/echo",
+}
+
+// TestThePathGateReadsThePathAsItWasSent: the cluster is read from the
+// escaped path, and a bent path names none.
+func TestThePathGateReadsThePathAsItWasSent(t *testing.T) {
+	for _, path := range kubeTestBentPaths {
+		if cluster, ok := kubeProxyPathCluster(path); ok {
+			t.Errorf("kubeProxyPathCluster(%q) = %q, want it refused", path, cluster)
+		}
+	}
+	for path, want := range map[string]string{
+		kubeTestEchoPath:                         "gke_proj_us-central1_alpha",
+		kubeTestCluster:                          "gke_proj_us-central1_alpha",
+		kubeTestCluster + "/":                    "gke_proj_us-central1_alpha",
+		kubeTestCluster + "/api/v1/pods/a%20b":   "gke_proj_us-central1_alpha",
+		kubeTestCluster + "/apis/x/v1/..hidden":  "gke_proj_us-central1_alpha",
+		kubeTestCluster + "/api/v1/pods/a%2Fb/c": "gke_proj_us-central1_alpha",
+		"/clusters/gke_other_europe-west1_beta":  "gke_other_europe-west1_beta",
+	} {
+		if cluster, ok := kubeProxyPathCluster(path); !ok || cluster != want {
+			t.Errorf("kubeProxyPathCluster(%q) = %q, %v; want %q", path, cluster, ok, want)
+		}
+	}
+}
+
+// TestABentPathIsRefusedHere: each of those paths, sent as written, is a
+// local 404 with a task active, and nothing reaches the upstream.
+func TestABentPathIsRefusedHere(t *testing.T) {
+	f := startKubeLoopback(t)
+	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	defer end()
+	for _, path := range kubeTestBentPaths {
+		status, body := rawRequest(t, f.addr, fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, f.addr))
+		if status != http.StatusNotFound || !strings.Contains(body, kubeProxyNotFoundMessage) {
+			t.Errorf("%s: status %d, body %q; want a local 404", path, status, body)
+		}
+	}
+	if calls := f.up.seen(); len(calls) != 0 {
+		t.Errorf("the upstream saw %d requests, want none: %+v", len(calls), calls)
+	}
+}
+
+// TestTheLoopbackIsNotAProxyForOtherHosts: a request for another Host, or in
+// absolute form, is refused here even with a task active.
+func TestTheLoopbackIsNotAProxyForOtherHosts(t *testing.T) {
+	f := startKubeLoopback(t)
+	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	defer end()
+	for name, request := range map[string]string{
+		"another Host":          fmt.Sprintf("GET %s HTTP/1.1\r\nHost: kube-proxy.example:8443\r\nConnection: close\r\n\r\n", kubeTestEchoPath),
+		"the upstream's Host":   fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", kubeTestEchoPath, strings.TrimPrefix(f.up.srv.URL, "https://")),
+		"absolute form":         fmt.Sprintf("GET http://elsewhere.example%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", kubeTestEchoPath, f.addr),
+		"absolute form to self": fmt.Sprintf("GET http://%s%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", f.addr, kubeTestEchoPath, f.addr),
+	} {
+		status, body := rawRequest(t, f.addr, request)
+		if status != http.StatusForbidden || !strings.Contains(body, kubeProxyNotProxyMessage) {
+			t.Errorf("%s: status %d, body %q; want a local 403", name, status, body)
+		}
+	}
+	if calls := f.up.seen(); len(calls) != 0 {
+		t.Errorf("the upstream saw %d requests, want none", len(calls))
+	}
+}
+
+// TestWithoutAPodTokenNothingIsSent: a pod token that can't be read, or is
+// empty, is a local 503; no request goes upstream with an empty bearer.
+func TestWithoutAPodTokenNothingIsSent(t *testing.T) {
+	f := startKubeLoopback(t)
+	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	defer end()
+	expect503 := func(when string) {
+		t.Helper()
+		status, body, _ := f.get(t, kubeTestEchoPath)
+		if status != http.StatusServiceUnavailable || !strings.Contains(body, kubeProxyNoPodTokenMessage) {
+			t.Errorf("%s: status %d, body %q; want a local 503", when, status, body)
+		}
+	}
+	for when, content := range map[string]string{"an empty token file": "", "a token file of whitespace": " \n\t\n"} {
+		if err := os.WriteFile(f.tokenFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		expect503(when)
+	}
+	if err := os.Remove(f.tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	expect503("no token file")
+	if calls := f.up.seen(); len(calls) != 0 {
+		t.Errorf("the upstream saw %d requests, want none: %+v", len(calls), calls)
+	}
+	// The token back, the next request goes, with it.
+	if err := os.WriteFile(f.tokenFile, []byte("pod-token-3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := f.get(t, kubeTestEchoPath); status != http.StatusOK {
+		t.Fatalf("status %d with the token back, want 200", status)
+	}
+	for _, c := range f.up.seen() {
+		if got := c.hdr.Values("Authorization"); !slices.Equal(got, []string{"Bearer pod-token-3"}) {
+			t.Errorf("Authorization upstream = %q, want the pod's token", got)
+		}
+	}
+}
+
+// TestTrailersAndNominatedHeadersCantCarryACredential: a caller that sends
+// Authorization or the task credential as a trailer, or names them in
+// Connection so a proxy would drop them, still reaches the upstream with the
+// proxy's own two headers and neither trailer.
+func TestTrailersAndNominatedHeadersCantCarryACredential(t *testing.T) {
+	f := startKubeLoopback(t)
+	credential := clusterCredential("alpha")
+	end := f.p.BeginTask("task-a", credential)
+	defer end()
+	request := "POST " + kubeTestEchoPath + " HTTP/1.1\r\n" +
+		"Host: " + f.addr + "\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Trailer: Authorization, " + taskCredentialHeader + ", Impersonate-User, X-Checksum\r\n" +
+		"Connection: Authorization, " + taskCredentialHeader + ", close\r\n" +
+		"Authorization: Bearer the-agents-own\r\n" +
+		taskCredentialHeader + ": " + clusterCredential("forged") + "\r\n" +
+		"\r\n" +
+		"2\r\nhi\r\n0\r\n" +
+		"Authorization: Bearer in-a-trailer\r\n" +
+		taskCredentialHeader + ": " + clusterCredential("forged-trailer") + "\r\n" +
+		"Impersonate-User: system:admin\r\n" +
+		"X-Checksum: abc\r\n" +
+		"\r\n"
+	if status, body := rawRequest(t, f.addr, request); status != http.StatusOK {
+		t.Fatalf("status %d, body %q; want 200", status, body)
+	}
+	calls := f.up.seen()
+	if len(calls) != 1 {
+		t.Fatalf("the upstream saw %d requests, want 1", len(calls))
+	}
+	c := calls[0]
+	if string(c.body) != "hi" {
+		t.Errorf("the body upstream = %q, want it as sent", c.body)
+	}
+	if got := c.hdr.Values("Authorization"); !slices.Equal(got, []string{"Bearer pod-token-1"}) {
+		t.Errorf("Authorization upstream = %q, want the pod's token alone", got)
+	}
+	if got := c.hdr.Values(taskCredentialHeader); !slices.Equal(got, []string{credential}) {
+		t.Errorf("the task credential upstream = %q, want the active task's alone", got)
+	}
+	for _, fields := range []http.Header{c.hdr, c.trailer} {
+		for name, values := range fields {
+			if strings.HasPrefix(name, "Impersonate-") {
+				t.Errorf("%s reached the upstream", name)
+			}
+			for _, v := range values {
+				if strings.Contains(v, "the-agents-own") || strings.Contains(v, "in-a-trailer") || v == clusterCredential("forged") || v == clusterCredential("forged-trailer") {
+					t.Errorf("the caller's %s reached the upstream: %q", name, v)
+				}
+			}
+		}
+	}
+	for _, name := range []string{"Authorization", taskCredentialHeader} {
+		if _, sent := c.trailer[name]; sent {
+			t.Errorf("the upstream was sent a %s trailer", name)
+		}
+	}
+}
+
+// TestACallerThatStopsReadingIsLeftBehindAtTheBound: a handler stuck writing
+// to a caller that reads nothing doesn't hold its task's end past the drain
+// bound, and its connection to the upstream is closed all the same.
+func TestACallerThatStopsReadingIsLeftBehindAtTheBound(t *testing.T) {
+	f := startKubeLoopback(t)
+	f.p.drainTimeout = kubeTestShortDrain
+	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	conn, err := net.Dial("tcp", f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Closed before the loopback's cleanup, which frees the stuck handler.
+	defer conn.Close()
+	// The request, and then nothing is read.
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n", kubeTestFloodPath, f.addr)
+	await(t, f.up.started, "the response to back up")
+	ended := make(chan struct{})
+	go func() {
+		end()
+		close(ended)
+	}()
+	await(t, ended, "the task's end to give up on the stuck handler")
+	if !strings.Contains(f.logs.String(), "still returning") {
+		t.Errorf("the task ended without leaving a handler behind; the test didn't reach the bound:\n%s", f.logs)
+	}
+	await(t, f.up.gone, "the upstream to see the stuck request's connection end")
+	if status, _, _ := f.get(t, kubeTestEchoPath); status != http.StatusForbidden {
+		t.Errorf("status %d after the task, want 403", status)
+	}
+}
+
+// TestATasksConnectionsEndBeforeItsOutcomeIsReported runs a task through the
+// worker. The loopback's end of the task is held open for a moment, and no
+// final renewal, which follows the outcome, may arrive meanwhile: the
+// connections go before anything says the task is over.
+func TestATasksConnectionsEndBeforeItsOutcomeIsReported(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	up := startKubeUpstream(t)
+	podToken := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(podToken, []byte("pod-token-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const task = "task-order"
+	reportedFirst := make(chan bool, 1)
+	hook := func(id string) {
+		if id != task {
+			return
+		}
+		timer := time.NewTimer(kubeTestOrderProbe)
+		defer timer.Stop()
+		for {
+			select {
+			case r := <-d.leases:
+				if r.TaskID == task && r.Final {
+					reportedFirst <- true
+					return
+				}
+			case <-timer.C:
+				reportedFirst <- false
+				return
+			}
+		}
+	}
+	harness := stub(t, `
+read first || exit 1
+printf '{"type":"result","subtype":"success","result":"done"}\n'
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startProfileWorkerWith(t, ctx, profileWorkerConfig(t, url, harness), ProfileWorkerConfig{
+		Tier:                 pwTier,
+		KubeProxy:            KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: up.caFileFor(t), PodTokenFile: podToken},
+		kubeProxyTaskEndHook: hook,
+	})
+	d.offer(task, profileSubmission(t, task, "read the cluster", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.TaskID != task || !a.Accepted {
+		t.Fatalf("answer = %+v, want an accept", a)
+	}
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	if await(t, reportedFirst, "the task's end at the loopback") {
+		t.Fatal("the final renewal arrived while the task's connections were still open: the outcome was reported first")
+	}
+	if _, final := drainLeases(d, task, testWait); !final {
+		t.Fatal("no final renewal after the task ended")
 	}
 }
