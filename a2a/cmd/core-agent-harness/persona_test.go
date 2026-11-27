@@ -276,7 +276,10 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(linked, "instructions.md")); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, err := loadPersona(context.Background(), linked, true); err == nil {
+	// Not required, so the sealed-rendering check (which refuses this
+	// writable temp dir first) stays out of it and the reader's own
+	// confinement is what refuses the link.
+	if got, _, err := loadPersona(context.Background(), linked, false); err == nil {
 		t.Errorf("read instructions through a link outside the dir: %q", got)
 	}
 }
