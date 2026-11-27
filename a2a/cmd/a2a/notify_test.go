@@ -458,3 +458,81 @@ func TestNotifyCarriesReplyToOnAConsoleConversation(t *testing.T) {
 		t.Errorf("--report without --conversation: err = %v, want a refusal", err)
 	}
 }
+
+// An inject conversation's card goes out on chat.notify.inject. Where the
+// agent holds no grant on it, which is every install the operator rendered
+// without its eval flag, the bus refuses the publish and the CLI says so as
+// a refusal: not outcome-unknown (which a sender records as sent) and not
+// route-unavailable (which a sender waits out), the same answer as any other
+// refused notify.
+func TestNotifyOnAnInjectConversationIsRefusedWithoutTheGrant(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		allowed []string
+	}{
+		{"no grant", []string{lib.NotifySubjectGchat, lib.NotifySubjectSlack, lib.NotifySubjectTeams, lib.NotifySubjectConsole, "_INBOX.>"}},
+		{"the eval grant", []string{lib.NotifySubjectGchat, lib.NotifySubjectSlack, lib.NotifySubjectTeams, lib.NotifySubjectConsole, lib.NotifySubjectInject, "_INBOX.>"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := server.NewServer(&server.Options{
+				Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+				Users: []*server.User{
+					{Username: "agent", Password: "pw", Permissions: &server.Permissions{
+						Publish:   &server.SubjectPermission{Allow: tc.allowed},
+						Subscribe: &server.SubjectPermission{Allow: []string{lib.NotifyReplyPrefix + ">", "_INBOX.>"}},
+					}},
+					{Username: "gateway", Password: "gw"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			go s.Start()
+			if !s.ReadyForConnections(10 * time.Second) {
+				t.Fatal("nats-server not ready")
+			}
+			t.Cleanup(s.Shutdown)
+			gw, err := nats.Connect(s.ClientURL(), nats.UserInfo("gateway", "gw"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(gw.Close)
+			got := make(chan lib.NotifyRequest, 1)
+			if _, err := gw.Subscribe(lib.NotifySubjectInject, func(m *nats.Msg) {
+				var req lib.NotifyRequest
+				_ = json.Unmarshal(m.Data, &req)
+				got <- req
+				body, _ := json.Marshal(lib.NotifyReply{MessageID: "inject-1", ThreadID: req.Conversation})
+				_ = m.Respond(body)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := gw.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			notifyEnv(t, s.ClientURL())
+			t.Setenv("NATS_PASSWORD", "pw")
+
+			err = run([]string{"notify", "--platform", lib.NotifyPlatformInject, "--timeout", "10s",
+				"--conversation", "inject:eval-1", "--context", "ctx-1", "--reply-to", "task-7", "--report", "the report"})
+			if tc.name == "no grant" {
+				if err == nil || errors.Is(err, errNotifyOutcomeUnknown) || errors.Is(err, errNotifyRouteUnavailable) ||
+					!strings.Contains(err.Error(), "refused") {
+					t.Fatalf("err = %v, want a bus refusal: not outcome-unknown, not route-unavailable", err)
+				}
+				select {
+				case req := <-got:
+					t.Fatalf("the refused notify reached the gateway: %+v", req)
+				default:
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("notify: %v", err)
+			}
+			if req := <-got; req.Conversation != "inject:eval-1" || req.ReplyTo != "task-7" || !req.Report {
+				t.Errorf("request = %+v, want a report into inject:eval-1 naming task-7", req)
+			}
+		})
+	}
+}

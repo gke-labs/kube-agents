@@ -547,9 +547,9 @@ CONVERSATION_HASHED_PREFIX = "h-"
 CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
-# slackConversationID, teamsConversationID); a key for another backend is
-# refused.
-CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "teams": "teams:", "console": "console:"}
+# slackConversationID, teamsConversationID, and the eval inject door's
+# injectConversationKey); a key for another backend is refused.
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "teams": "teams:", "console": "console:", "inject": "inject:"}
 # The metadata key the route is kept under. Its own key, not the row's
 # platform/chat_id/thread_id: those are a chat thread's address, which other
 # readers (send_notification, the delegation headers) use as one, and a

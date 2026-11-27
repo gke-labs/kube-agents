@@ -188,8 +188,12 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # to a gateway conversation by kanban_event_routing (the hermes-bridge records
 # the route), and its chat_id is the session that holds the route, whose
 # context id conversation_context reads back: the report is sent with
-# --conversation and --context rather than --thread.
-CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "teams:", "console:")
+# --conversation and --context rather than --thread. "inject:" is the eval
+# harness's inject door (lib.NotifyPlatformInject): its report goes to
+# chat.notify.inject, which the operator grants only on an eval install, and
+# resolve serves it only when A2A_NOTIFY_CONVERSATIONS names it; anywhere else
+# the bus refuses the publish and the send fails as any refused notify does.
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "teams:", "console:", "inject:")
 # The console door's platform (lib.NotifyPlatformConsole). The gateway serves
 # its chat.notify route whenever the console runs, so it counts as served
 # with no environment variable naming it. Hermes has no console platform, and
@@ -203,6 +207,19 @@ CONSOLE_PLATFORM_LABEL = "kube-agents console (chat.notify only)"
 # task of the turn that filed it (kanban_event_routing.CONSOLE_THREAD_TASK_SEP),
 # which the report names with --reply-to.
 CONSOLE_THREAD_TASK_SEP = "#"
+# The eval inject door's platform (lib.NotifyPlatformInject). Unlike the
+# console's it is served only where A2A_NOTIFY_CONVERSATIONS names it, which
+# the operator does only under its eval flag, and it is registered with
+# Hermes only then (_register_conversation_platforms). An inject card's thread
+# is always "inject:<key>#<task>" (kanban_event_routing.INJECT_PLATFORM), split
+# on the last '#', since an inject key may contain one. Conversations only:
+# never a home-post route (CONVERSATION_ONLY_PLATFORMS).
+INJECT_PLATFORM = "inject"
+INJECT_PLATFORM_LABEL = "kube-agents eval inject door (chat.notify only)"
+# The platforms that serve gateway conversations and never home posts: left
+# out of routed_platforms' every-armed-route fallback, as
+# chat_notify.CONVERSATION_ONLY_PLATFORMS leaves them out of its copy.
+CONVERSATION_ONLY_PLATFORMS = (INJECT_PLATFORM,)
 # The attribute the home stand-in is cached under on the runner, which outlives
 # the per-tick collector and the per-delivery notification; resolve suffixes
 # the platform name, one slot per platform.
@@ -324,7 +341,7 @@ def routed_platforms() -> list:
         for platform, key in LEARNED_HOME_FILES
         if platform in armed and platform not in listed and _home_file_value(key)
     ]
-    return [*listed, *learned] or armed
+    return [*listed, *learned] or [p for p in armed if p not in CONVERSATION_ONLY_PLATFORMS]
 
 
 def routes(platform: Any) -> bool:
@@ -356,6 +373,30 @@ def served_platforms() -> set:
 def active_platforms(names: set) -> set:
     """``names`` plus the platforms the gateway's route serves."""
     return names | served_platforms()
+
+
+def _register_conversation_platforms() -> None:
+    """Register the console platform always, and the inject platform when A2A_NOTIFY_CONVERSATIONS names it."""
+    _register_console_platform()
+    if INJECT_PLATFORM in conversation_platforms():
+        _register_platform(INJECT_PLATFORM, INJECT_PLATFORM_LABEL)
+
+
+def _register_platform(name: str, label: str) -> None:
+    """Register ``name`` with Hermes's platform registry as a send-only, adapterless platform. Fails open, logged."""
+    try:
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        if not platform_registry.is_registered(name):
+            platform_registry.register(PlatformEntry(
+                name=name,
+                label=label,
+                adapter_factory=lambda _config: None,
+                check_fn=lambda: True,
+                source="builtin",
+            ))
+    except Exception as exc:  # not inside Hermes (tests), or a registry without this shape
+        logger.warning("chat.notify: %s platform not registered; its cards will not report: %s", name, exc)
 
 
 def _register_console_platform() -> None:
@@ -1075,6 +1116,14 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         context = conversation_context(chat_id)
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
+        if thread.startswith(INJECT_PLATFORM + ":"):
+            conversation, sep, task = thread.rpartition(CONSOLE_THREAD_TASK_SEP)
+            if not sep:
+                conversation, task = thread, ""
+            target = ["--conversation", conversation, "--context", context]
+            if task:
+                target += ["--reply-to", task]
+            return target
         if not thread.startswith(CONSOLE_PLATFORM + ":"):
             return ["--conversation", thread, "--context", context]
         conversation, _, task = thread.partition(CONSOLE_THREAD_TASK_SEP)
@@ -1101,4 +1150,4 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
 
 # Registered at import, which the notifier's trailer triggers before it reads
 # any subscription (apply_kanban_chat_notify.TRAILER).
-_register_console_platform()
+_register_conversation_platforms()

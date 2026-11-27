@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -61,8 +62,9 @@ const (
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
 // the agent side spells it with (Hermes's, and lib's NotifyPlatform names).
-// A conversation on any other door (inject, console, the A2A door, Discord) has
-// no chat notify route; identityRouteFor records an identity-only route for
+// The inject door's route is recorded only on an eval install
+// (injectRoutePrefix, routeForWith). A conversation on any other door (the A2A
+// door, Discord) has no chat notify route; identityRouteFor records an identity-only route for
 // doors that still carry speaker or audience context.
 var routePlatforms = map[string]string{
 	"gchat:":           lib.NotifyPlatformGchat,
@@ -74,6 +76,32 @@ var routePlatforms = map[string]string{
 // consoleRoutePrefix is the console conversation's key prefix, the one route
 // that carries its task (conversationRoute.TaskID).
 const consoleRoutePrefix = "console:"
+
+// injectRoutePrefix is the eval harness's inject door's conversation key
+// prefix (a2a/gateway/inject.go, injectKeyPrefix). Its route is recorded only
+// on a bridge armed for it (Config.InjectRoute): an eval install, where the
+// gateway serves chat.notify.inject. Like the console's it carries its turn's
+// task, so a card's report names the turn and the gateway keeps it by root.
+const injectRoutePrefix = "inject:"
+
+// NotifyConversationsEnv is the operator's list of the platforms whose
+// gateway conversations a card reports back to (A2A_NOTIFY_CONVERSATIONS,
+// rendered on the agent container and inherited by the bridge). The operator
+// names lib.NotifyPlatformInject in it only under its eval flag
+// (A2A_INJECT_BACKEND), so InjectRouteFromEnv is that flag as the bridge
+// sees it.
+const NotifyConversationsEnv = "A2A_NOTIFY_CONVERSATIONS"
+
+// InjectRouteFromEnv reports whether A2A_NOTIFY_CONVERSATIONS names the
+// inject platform: the switch for recording inject conversations' routes.
+func InjectRouteFromEnv() bool {
+	for _, name := range strings.Split(os.Getenv(NotifyConversationsEnv), ",") {
+		if strings.TrimSpace(name) == lib.NotifyPlatformInject {
+			return true
+		}
+	}
+	return false
+}
 
 // a2aDoorRoutePrefix is the gateway's A2A door's conversation key prefix
 // (a2a/gateway/a2adoor.go, a2aKeyPrefix): a client calling message/send,
@@ -170,6 +198,12 @@ func parseRouteAuthority(env *lib.Envelope) (routeAuthority, error) {
 // (audience.conversation, its session-record key), the platform it is on, and
 // the speaker identity and audience kind for memory scoping.
 func routeFor(env *lib.Envelope) (conversationRoute, error) {
+	return routeForWith(env, false)
+}
+
+// routeForWith is routeFor with the inject door's conversations among the
+// routed ones when inject is set (Config.InjectRoute), and never otherwise.
+func routeForWith(env *lib.Envelope, inject bool) (conversationRoute, error) {
 	auth, err := parseRouteAuthority(env)
 	if err != nil {
 		return conversationRoute{}, err
@@ -196,6 +230,16 @@ func routeFor(env *lib.Envelope) (conversationRoute, error) {
 			}
 			return route, nil
 		}
+	}
+	if inject && strings.HasPrefix(key, injectRoutePrefix) && len(key) > len(injectRoutePrefix) && env.ContextID != "" {
+		return conversationRoute{
+			Platform:     lib.NotifyPlatformInject,
+			Conversation: key,
+			ContextID:    env.ContextID,
+			UserID:       userID,
+			ChatType:     chatType,
+			TaskID:       env.TaskID,
+		}, nil
 	}
 	return conversationRoute{}, errNoChatConversation
 }
@@ -255,7 +299,7 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	if b.cfg.RouteURL == "" {
 		return errRouteDisabled
 	}
-	route, err := routeFor(env)
+	route, err := routeForWith(env, b.cfg.InjectRoute)
 	if err != nil {
 		if errors.Is(err, errNoChatConversation) {
 			if idRoute, ok := identityRouteFor(env); ok && b.recordedRoute(sessionID) != idRoute {

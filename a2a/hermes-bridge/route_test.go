@@ -3,6 +3,7 @@ package hermesbridge
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -647,5 +648,87 @@ func TestAPIEvalRunTag_OnlyAnInjectConversationCarriesOne(t *testing.T) {
 	}
 	if got := apiEvalRunTag(nil); got != "" {
 		t.Errorf("apiEvalRunTag(nil) = %q, want none", got)
+	}
+}
+
+// An inject door conversation's route is recorded only on a bridge armed for
+// it (Config.InjectRoute, from A2A_NOTIFY_CONVERSATIONS naming the inject
+// platform, which the operator renders only under its eval flag): with the
+// inject platform, the turn's task, and no requester principal (the door's
+// credential is shared). Unarmed, nothing is recorded, as before.
+func TestAPI_AnInjectRouteIsRecordedOnlyWhenArmed(t *testing.T) {
+	for _, armed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("armed=%v", armed), func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, http.StatusOK)
+			stub := newAPIStub(t, nil)
+			startAPIBridge(t, url, stub, func(c *Config) {
+				c.RouteURL, c.RouteKey = store.srv.URL, "kv-key"
+				c.InjectRoute = armed
+			})
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-inject", "ctx-inject", "inject:eval/run-1", "hello")
+			task := waitTerminal(t, c, "task-inject")
+			if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
+				t.Fatalf("answer = %q carries the route-lost note", got)
+			}
+			var routes []conversationRoute
+			for _, p := range store.seen() {
+				if p.body.Platform != "" {
+					routes = append(routes, p.body)
+				}
+			}
+			if !armed {
+				if len(routes) != 0 {
+					t.Fatalf("unarmed bridge recorded %+v, want no inject route", routes)
+				}
+				return
+			}
+			want := conversationRoute{Platform: lib.NotifyPlatformInject, Conversation: "inject:eval/run-1",
+				ContextID: "ctx-inject", TaskID: "task-inject", ChatType: "dm"}
+			if len(routes) != 1 {
+				t.Fatalf("routes = %+v, want one inject route", routes)
+			}
+			got := routes[0]
+			got.Ask = ""
+			if got != want {
+				t.Fatalf("route = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestRouteForWith_InjectOnlyWhenAsked(t *testing.T) {
+	env := &lib.Envelope{TaskID: "task-7", ContextID: "ctx-1",
+		Authority: json.RawMessage(`{"audience":{"conversation":"inject:eval-1"},"requester":{"principal":"hmac:0123456789abcdef0123456789abcdef","backend":"inject"}}`)}
+	if _, err := routeFor(env); !errors.Is(err, errNoChatConversation) {
+		t.Fatalf("routeFor(inject) err = %v, want errNoChatConversation", err)
+	}
+	if _, err := routeForWith(env, false); !errors.Is(err, errNoChatConversation) {
+		t.Fatalf("routeForWith(inject, false) err = %v, want errNoChatConversation", err)
+	}
+	got, err := routeForWith(env, true)
+	want := conversationRoute{Platform: lib.NotifyPlatformInject, Conversation: "inject:eval-1", ContextID: "ctx-1", TaskID: "task-7"}
+	if err != nil || got != want {
+		t.Fatalf("routeForWith(inject, true) = %+v, %v; want %+v", got, err, want)
+	}
+	// Armed, the other doors are what they were.
+	for _, conv := range []string{"a2a:ctx-1", "inject:"} {
+		e := &lib.Envelope{TaskID: "t", ContextID: "c", Authority: json.RawMessage(`{"audience":{"conversation":"` + conv + `"}}`)}
+		if _, err := routeForWith(e, true); !errors.Is(err, errNoChatConversation) {
+			t.Errorf("routeForWith(%q, true) err = %v, want errNoChatConversation", conv, err)
+		}
+	}
+}
+
+func TestInjectRouteFromEnv(t *testing.T) {
+	for value, want := range map[string]bool{
+		"": false, "google_chat,slack": false, "injected": false, "console": false,
+		"inject": true, "google_chat, inject": true,
+	} {
+		t.Setenv(NotifyConversationsEnv, value)
+		if got := InjectRouteFromEnv(); got != want {
+			t.Errorf("%s=%q: InjectRouteFromEnv() = %v, want %v", NotifyConversationsEnv, value, got, want)
+		}
 	}
 }

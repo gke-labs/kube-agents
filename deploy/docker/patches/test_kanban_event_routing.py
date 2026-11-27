@@ -222,6 +222,28 @@ class CompressedSessionTest(unittest.TestCase):
             ("console", "a2a-ctx-6", "console:tab-6"),
         )
 
+    def test_an_inject_card_reports_to_its_conversation_only_where_the_list_names_inject(self):
+        # The eval inject door's route is served only where
+        # A2A_NOTIFY_CONVERSATIONS names inject (the operator's eval flag), and
+        # its thread always carries the turn's task after its last '#', since
+        # an inject key may itself contain one.
+        routing_db(self.tmp / "inject.db", {
+            "a2a-ctx-7": {"conversation_route": {
+                "platform": "inject", "conversation": "inject:case#3", "context_id": "ctx-7", "task_id": "task-9"}},
+            "a2a-ctx-8": {"conversation_route": {
+                "platform": "inject", "conversation": "inject:case-8", "context_id": "ctx-8"}},
+        })
+        db = str(self.tmp / "inject.db")
+        for listed in ("", "google_chat,slack"):
+            with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": listed}):
+                self.assertEqual(resolve_chat_route("api_server", "a2a-ctx-7", None, db_path=db),
+                                 ("api_server", "a2a-ctx-7", None), listed)
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "slack,inject"}):
+            self.assertEqual(resolve_chat_route("api_server", "a2a-ctx-7", None, db_path=db),
+                             ("inject", "a2a-ctx-7", "inject:case#3#task-9"))
+            self.assertEqual(resolve_chat_route("api_server", "a2a-ctx-8", None, db_path=db),
+                             ("inject", "a2a-ctx-8", "inject:case-8#"))
+
     def test_a_route_without_its_context_is_not_used(self):
         routing_db(self.tmp / "partial.db", {"a2a-ctx-9": {"conversation_route": {"platform": "slack", "conversation": "slack:dm/D9"}}})
         self.assertEqual(

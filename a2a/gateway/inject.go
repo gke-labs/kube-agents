@@ -320,7 +320,20 @@ type InjectEntry struct {
 	// reads the token to tell the executor's own failure (bridge-shutdown,
 	// spawn-failed) from the persona's (hermes-exited-nonzero).
 	Reason string `json:"reason,omitempty"`
-	TS     string `json:"ts"`
+	// ReplyTo and Report are set on a post or edit the chat.notify route
+	// made (PostNotifyFrame) only: the root of the task the post reports on,
+	// as the console's notify frame carries it, and Report on every such
+	// entry, a card's settled report and its progress lines alike. Report
+	// marks what was relayed onto the conversation, never a turn's own
+	// reply: a reader (the eval harness) sets these entries apart by it.
+	ReplyTo string `json:"replyTo,omitempty"`
+	Report  bool   `json:"report,omitempty"`
+	// Kept is set on the one relayed post the gateway keeps under its root
+	// for the next human turn (the card's settled report, the request's
+	// `report`), never on a progress line: a reader waiting for that report
+	// waits on it.
+	Kept bool   `json:"kept,omitempty"`
+	TS   string `json:"ts"`
 }
 
 // injectRequest is the POST /inject body.
@@ -359,6 +372,19 @@ type injectRequest struct {
 	// location and cluster, and any the profile declares), checked where the
 	// turn is routed (resolveProfile). Only with Profile: platform takes none.
 	Parameters map[string]string `json:"parameters,omitempty"`
+	// ReplyTo, when set, names the task a relayed report was on (the
+	// transcript entry's ReplyTo, the root the gateway kept the report
+	// under): this turn answers that report, as the console frame's replyTo
+	// does (ConsoleInFrame.ReplyTo), and the gateway puts the task and the
+	// report it kept under that root on the submission. An inject
+	// conversation is not thread-keyed, so a turn naming no task carries no
+	// kept report. The report is looked up in this conversation's own kept
+	// reports alone (pushedReports.byRoot, keyed by the conversation), so a
+	// root kept under another conversation attaches nothing. Held to a task
+	// id's shape here, the one check the console's replyTo meets on its way
+	// out (lib.ReplyToPart); a malformed one is refused rather than dropped,
+	// as the door refuses a malformed profile.
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
 // injectResponse is the POST /inject reply.
@@ -607,6 +633,10 @@ type injectConversation struct {
 	// oldest entries have been dropped or the conversation was evicted and
 	// minted again under it.
 	nextSeq int
+	// relayed counts the entries the chat.notify route appended
+	// (PostNotifyFrame), so a turn's "answered without a task" reading
+	// counts only the turn's own entries.
+	relayed int
 	// terminals records the terminal state of every task that has ended on
 	// this conversation, so a reader that arrives after the event still
 	// learns the answer rather than waiting for one that has been and gone.
@@ -876,6 +906,31 @@ func (a *InjectAdapter) Edit(conversation, messageID, text string) error {
 	conv := a.conversationLocked(conversation)
 	a.appendLocked(conv, InjectEntry{Kind: InjectEntryEdit, Text: text, MessageID: messageID})
 	return nil
+}
+
+// PostNotifyFrame records a chat.notify post aimed at the conversation (the
+// inject notifier's consoleFramePoster, NewInjectNotifier): a post entry, or
+// an edit entry naming messageID for a keyed post the route made before,
+// carrying the task the post reports on and its report mark, as the
+// console's notify frame does. An empty messageID mints a new one.
+func (a *InjectAdapter) PostNotifyFrame(conversation, messageID, text, replyTo string, report, edit bool) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	if messageID == "" {
+		a.nextID = a.nextID + 1
+		messageID = injectMessageIDPrefix + strconv.Itoa(a.nextID)
+	}
+	kind := InjectEntryPost
+	if edit {
+		kind = InjectEntryEdit
+	}
+	// Every relayed entry is marked Report, the settled report or not: none
+	// is the turn's reply, and a turn's own reply carries no mark. Kept says
+	// which one is the settled report the gateway keeps (`report`).
+	a.appendLocked(conv, InjectEntry{Kind: kind, Text: text, MessageID: messageID, ReplyTo: replyTo, Report: true, Kept: report})
+	conv.relayed++
+	return messageID, nil
 }
 
 // PostMessage and EditMessage record text only: a chat message falls back
@@ -1188,13 +1243,14 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 			a.rememberFloorLocked(oldest, injectFloor{
 				nextSeq:     evicted.nextSeq,
 				outstanding: max(0, evicted.handed-evicted.turns),
+				relayed:     evicted.relayed,
 			})
 		}
 		delete(a.conversations, oldest)
 	}
 	a.mints++
 	floor := a.floorLocked(key)
-	conv := &injectConversation{nextSeq: floor.nextSeq, handed: floor.outstanding, terminals: map[string]string{}, gen: a.mints}
+	conv := &injectConversation{nextSeq: floor.nextSeq, handed: floor.outstanding, relayed: floor.relayed, terminals: map[string]string{}, gen: a.mints}
 	a.conversations[key] = conv
 	a.order = append(a.order, key)
 	return conv
@@ -1208,6 +1264,8 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 type injectFloor struct {
 	nextSeq     int
 	outstanding int
+	// relayed is the relayed entries among the sequence's first nextSeq-1.
+	relayed int
 }
 
 // rememberFloorLocked records where an evicted conversation stopped, bounded
@@ -1294,7 +1352,7 @@ func countsOf(conv *injectConversation) injectCounts {
 		starts:           conv.started.total,
 		accepted:         conv.accepted.total,
 		publishFailed:    conv.publishFailed.total,
-		entries:          conv.nextSeq - 1,
+		entries:          conv.nextSeq - 1 - conv.relayed,
 		drops:            conv.drops,
 		turns:            conv.turns,
 		cancelsPublished: conv.cancelsPublished,
@@ -1434,7 +1492,9 @@ func (a *InjectAdapter) waitCh() <-chan struct{} {
 	return a.notify
 }
 
-// handleInject is POST /inject: one inbound chat message.
+// handleInject is POST /inject: one inbound chat message. A turn answering a
+// report relayed onto its conversation names that report's task in replyTo
+// (injectRequest.ReplyTo); with none, it carries no kept report.
 func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	// First, before the method and before the body: an unauthenticated
 	// caller learns nothing from this door, not which methods it takes and
@@ -1492,6 +1552,10 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Profile == "" && len(req.Parameters) > 0 {
 		injectError(w, http.StatusBadRequest, "parameters go with a profile; platform takes none")
+		return
+	}
+	if req.ReplyTo != "" && !lib.ValidSubjectToken(req.ReplyTo) {
+		injectError(w, http.StatusBadRequest, "replyTo is not a task id")
 		return
 	}
 
@@ -1567,6 +1631,7 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		Intent:       req.Intent,
 		Profile:      req.Profile,
 		Parameters:   req.Parameters,
+		ReplyTo:      req.ReplyTo,
 		// Stamped rather than inferred: this door can be armed beside a real
 		// backend, and the authority block has to name the door the message
 		// came through rather than the backend the process was configured

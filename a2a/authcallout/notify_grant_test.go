@@ -225,3 +225,38 @@ func TestTheSlackNotifyRouteWorksForTheAgentAndNobodyElse(t *testing.T) {
 		}
 	}
 }
+
+// TestTheInjectNotifyRouteIsShutOnTheDefaultRender measures the default half
+// of the inject notify gate against a real server: under the render with the
+// operator's eval flag (A2A_INJECT_BACKEND) off, which is what the fixtures
+// are, the agent may not publish chat.notify.inject, the gateway may not
+// subscribe to it, and no other principal reaches it either. The operator's
+// TestInjectNotifyGrant* hold the render; this holds the server to it.
+func TestTheInjectNotifyRouteIsShutOnTheDefaultRender(t *testing.T) {
+	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+
+	gw, gwViolations := connectStatic(t, h, "gateway", renderedGatewayPassword)
+	if !subscribeRefused(t, gw, gwViolations, lib.NotifySubjectInject) {
+		t.Error("the gateway could subscribe to chat.notify.inject under the default render")
+	}
+
+	agent, agentViolations := h.connectAs(t, "agent", agentToken)
+	checkPublish(t, agent, agentViolations, map[string]bool{lib.NotifySubjectInject: true})
+
+	type principal struct {
+		name string
+		nc   *nats.Conn
+		v    chan error
+	}
+	bridge, bv := connectStatic(t, h, "bridge", "pw-bridge")
+	web, wv := connectStatic(t, h, "web", "pw-web")
+	session, sv := h.connectAs(t, podA, tokenPodA)
+	provision, pv := h.connectAs(t, "provision", tokenProvision)
+	verifier, vv := h.connectAs(t, "verifier", tokenVerifier)
+	for _, o := range []principal{{"bridge", bridge, bv}, {"web", web, wv}, {"session", session, sv}, {"provision", provision, pv}, {"verifier", verifier, vv}} {
+		checkPublish(t, o.nc, o.v, map[string]bool{lib.NotifySubjectInject: true})
+		if !subscribeRefused(t, o.nc, o.v, lib.NotifySubjectInject) {
+			t.Errorf("%s could subscribe to chat.notify.inject", o.name)
+		}
+	}
+}

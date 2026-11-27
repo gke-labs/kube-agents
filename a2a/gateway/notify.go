@@ -240,8 +240,8 @@ type Notifier struct {
 	// the gateway's conversations; nil leaves conversation requests refused.
 	convPrefix string
 	conv       NotifyConversations
-	// frames, set on the console notifier only, posts each conversation
-	// request as one notify frame (postConsole).
+	// frames, set on the console and inject notifiers only, posts each
+	// conversation request as one notify frame (postConsole).
 	frames consoleFramePoster
 	log    *slog.Logger
 	jobs   chan notifyJob
@@ -384,6 +384,21 @@ func NewConsoleNotifier(frames consoleFramePoster, log *slog.Logger) *Notifier {
 		log = slog.Default()
 	}
 	return &Notifier{subject: lib.NotifySubjectConsole, frames: frames, log: log, convPrefix: consoleKeyPrefix}
+}
+
+// NewInjectNotifier builds the inject door's notifier: the console route's
+// code path (postConsole) on the inject door's own subject and conversation
+// prefix. A card filed from an eval turn reports back into its inject
+// conversation as one transcript entry (InjectAdapter.PostNotifyFrame), and
+// a report is kept by the root of the task its reply_to names, exactly as on
+// the console, so the eval harness reads it back through the door's read
+// route. The caller builds it only when the inject door is armed: on any
+// other gateway nothing subscribes to chat.notify.inject.
+func NewInjectNotifier(frames consoleFramePoster, log *slog.Logger) *Notifier {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Notifier{subject: lib.NotifySubjectInject, frames: frames, log: log, convPrefix: injectKeyPrefix}
 }
 
 // SetConversations arms requests aimed at a conversation the gateway holds.

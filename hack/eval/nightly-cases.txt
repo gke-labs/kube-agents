@@ -1039,6 +1039,13 @@
 # needs the inject door.
 ./tasks/chat-reply-under-pushed-report/task.yaml
 
+# Two replies under a card's report the gateway relayed into the conversation
+# are answered from it (#6870): the inject notify route posts the report into
+# the inject conversation, and each reply names the opening's task as its
+# replyTo. Read-only against the crashloop-workload fixture. A run on an
+# install without the route is infrastructure, not graded.
+./tasks/chat-reply-under-relayed-report/task.yaml
+
 # A question naming one seeded cluster reaches that cluster's Cluster Agent
 # when the roster block counts the Cluster Agents instead of naming them
 # (#4432): the front door finds the assignee through list_agents' filter.

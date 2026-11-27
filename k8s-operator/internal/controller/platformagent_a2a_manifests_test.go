@@ -4912,6 +4912,8 @@ const (
 	notifyRequestTeams   = "chat.notify.teams"
 	notifyRequestConsole = "chat.notify.console"
 	notifyReply          = "chat.notify.reply.agent.>"
+	// notifyRequestInject (platformagent_a2a_inject_notify_test.go) is the
+	// inject door's, rendered under the operator's eval flag alone.
 )
 
 // The board route's two subjects, spelled independently for the same reason.
@@ -4922,7 +4924,7 @@ const (
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestTeams, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestTeams, notifyRequestConsole, notifyRequestInject, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -4961,6 +4963,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{notifyRequestSlack, true},
 		{notifyRequestTeams, true},
 		{notifyRequestConsole, true},
+		{notifyRequestInject, true},
 		{notifyReply, true},
 		{"a2a.task.>", true},
 		{"agents.hb.>", true},
@@ -4981,6 +4984,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		// yet routed, the namespace wildcard, the reply namespace widened to
 		// every principal, and one literal inside it.
 		{"chat.notify.discord", false},
+		{"chat.notify.inject.>", false},
 		{"chat.notify.>", false},
 		{"chat.notify.reply.>", false},
 		{"chat.notify.reply.agent.x", false},
@@ -6573,11 +6577,13 @@ func notifyDoorViolations(ids []a2aIdentity) []string {
 		{"publish", notifyRequestSlack, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"publish", notifyRequestTeams, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"publish", notifyRequestConsole, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", notifyRequestInject, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
 		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestSlack, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestTeams, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"subscribe", notifyRequestConsole, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequestInject, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
 		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
 	}
 	var out []string
@@ -6652,6 +6658,7 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 		{a2aBridgeUser, "publish", "chat.notify.gchat"},
 		{a2aBridgeUser, "publish", "chat.notify.slack"},
 		{a2aBridgeUser, "publish", "chat.notify.console"},
+		{a2aBridgeUser, "publish", "chat.notify.inject"},
 		{"web", "subscribe", "chat.notify.reply.>"},
 	} {
 		mutated := slices.Clone(ids)

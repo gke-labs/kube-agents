@@ -50,6 +50,12 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # What separates the platform names in either variable.
 PLATFORM_LIST_SEPARATOR = ","
+# The platforms NOTIFY_CONVERSATIONS_ENV may name that serve gateway
+# conversations and never home posts: the eval inject door's, which the
+# operator names only under its eval flag. routed_platforms' every-armed-route
+# fallback leaves them out (kanban_chat_notify.CONVERSATION_ONLY_PLATFORMS
+# spells the same tuple).
+CONVERSATION_ONLY_PLATFORMS = ("inject",)
 # The operator projects the home channel it admitted (the CR field, else the
 # channel the gateway learned) into a ConfigMap mounted as a directory in the
 # agent pod, so a learned channel reaches the pod without a restart. One file
@@ -219,7 +225,7 @@ def routed_platforms() -> list[str]:
     The rule reads only those two variables and the projected files, so
     every process computes the same list and a learned channel restarts no pod.
     """
-    return home_platforms() or gateway_platforms()
+    return home_platforms() or [p for p in gateway_platforms() if p not in CONVERSATION_ONLY_PLATFORMS]
 
 
 def in_routed_order(platforms: list[str]) -> list[str]:

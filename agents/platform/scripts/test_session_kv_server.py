@@ -375,6 +375,20 @@ class TestSessionKvServerApi(unittest.TestCase):
             self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
             self.assertNotIn("task_id", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
 
+    def test_an_inject_route_is_held_to_the_inject_doors_key(self):
+        # The eval inject door's conversations are a platform the gateway can
+        # hold (its chat.notify.inject route, armed on an eval install only):
+        # a route naming it is recorded for an inject: key and refused for
+        # any other backend's key, as every platform's is.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "inject", "conversation": "inject:eval/run-1", "context_id": "ctx-0123abcd"}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"],
+                         {"platform": "inject", "conversation": "inject:eval/run-1", "context_id": "ctx-0123abcd"})
+        for conversation in ("console:tab-1", "slack:dm/D123", "inject:"):
+            body["conversation"] = conversation
+            self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 400, conversation)
+
     def test_a_route_keeps_valid_user_id_and_chat_type(self):
         sid = "a2a-ctx-0123abcd"
         hmac_user = "hmac:0123456789abcdef0123456789abcdef"

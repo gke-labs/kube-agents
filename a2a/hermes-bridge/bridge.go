@@ -166,6 +166,10 @@ type Config struct {
 	// calls no server it did not ask for. The daemon sets DefaultRouteURL.
 	RouteURL string
 	RouteKey string
+	// InjectRoute records an inject door conversation's route too
+	// (route.go, InjectRouteFromEnv): set only on an eval install, where
+	// the operator names the inject platform in A2A_NOTIFY_CONVERSATIONS.
+	InjectRoute bool
 	// CardStopTimeout bounds a card stop's request to session-kv
 	// (cardstop.go); zero is DefaultCardStopTimeout. The wait for the
 	// session's turn before it is bounded apart (cardStopTurnWait).

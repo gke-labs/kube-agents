@@ -2492,6 +2492,11 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
     NOTIFY_TEAMS_PROBE = "chat.notify.teams"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"
+    # The inject door's route, granted only under the operator's eval flag
+    # (A2A_INJECT_BACKEND). The Go reading resolves the gated helper's
+    # literal whatever the flag, so the agent reads as its writer here; the
+    # served config, rendered with the flag off, names it nowhere.
+    NOTIFY_INJECT_PROBE = "chat.notify.inject"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
     def test_A3_a_notify_has_one_writer_and_its_answer_has_one(self) -> None:
@@ -2501,7 +2506,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         Slack-armed gateway, `chat.notify.slack`; on a Teams-armed one,
         `chat.notify.teams`) to the home channel as the
         install's bot, and what arrives on `chat.notify.console` into a console
-        conversation, so a second writer there is a second
+        conversation (on an eval install, `chat.notify.inject` into an inject
+        conversation), so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer
         as the gateway's word on where the post landed, so a second writer on
         the reply namespace -- the agent itself included -- can forge it. The
@@ -2514,6 +2520,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             (self.NOTIFY_SLACK_PROBE, ["agent"]),
             (self.NOTIFY_TEAMS_PROBE, ["agent"]),
             (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
+            (self.NOTIFY_INJECT_PROBE, ["agent"]),
             (self.NOTIFY_REPLY_PROBE, ["gateway"]),
         ):
             writers = sorted(

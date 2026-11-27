@@ -308,6 +308,36 @@ func TestChatNotifiersArmOnePerBackend(t *testing.T) {
 	}
 }
 
+// TestTheInjectRouteArmsOnlyWithTheInjectDoor holds the gateway half of the
+// inject notify gate: with no inject door (A2A_INJECT_LISTEN and its token
+// unset, which is every install but an eval one) there is no route on
+// chat.notify.inject, so the gateway neither subscribes to nor answers it;
+// with the door armed the route is on that subject and no other.
+func TestTheInjectRouteArmsOnlyWithTheInjectDoor(t *testing.T) {
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	if n := injectNotifier(nil, conversations, slog.Default()); n != nil {
+		t.Fatalf("no inject door, yet a route on %s", n.Subject())
+	}
+	cfg := &gateway.Config{InjectListen: "127.0.0.1:0", InjectToken: "inject-route-test-token"}
+	if !cfg.InjectArmed() {
+		t.Fatal("the test config does not arm the inject door")
+	}
+	door, err := newInjectDoor(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := injectNotifier(door, conversations, slog.Default())
+	if n == nil {
+		t.Fatal("the inject door is armed, yet it has no route")
+	}
+	if n.Subject() != lib.NotifySubjectInject || n.Subject() == lib.NotifySubjectConsole {
+		t.Fatalf("route subject = %q, want %q", n.Subject(), lib.NotifySubjectInject)
+	}
+	if !n.ServesConversations() {
+		t.Fatal("the inject route does not serve conversations")
+	}
+}
+
 // TestComposeAdaptersKeepsTheDoorOnTop builds the stack realMain drives with
 // both doors in it, the case nothing else exercises. The inject door has to
 // sit above the mux: the gateway finds its probe and observers by type

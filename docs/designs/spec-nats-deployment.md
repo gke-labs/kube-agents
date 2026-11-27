@@ -858,7 +858,10 @@ Layout:
   publish on `chat.notify.gchat`, `chat.notify.slack`, `chat.notify.teams` and `chat.notify.console` (one subject per
   backend the gateway can hold, and the console's) and subscribe on `chat.notify.reply.agent.>`;
   the gateway user gains the matching grants (subscribe on the four request subjects, publish on
-  the reply namespace). No other
+  the reply namespace). **Amended 11/24:** on an eval install (the operator's
+  `A2A_INJECT_BACKEND`), the agent also publishes, and the gateway also subscribes to,
+  `chat.notify.inject`, the inject door's route, with APP's export and TRUSTED's import of it
+  beside the console's; exactly that subject, and none of it is rendered with the flag off. No other
   principal holds either subject. The reply namespace is its own rather than the agent's
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
   replies. Core NATS, like the console subjects: the provision Job is untouched.

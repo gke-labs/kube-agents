@@ -1,0 +1,93 @@
+# Domain: chat and routing. Journey: a reply typed under a card's report that
+# the gateway relayed into the conversation is answered with that report, and
+# a second reply after it still is. gke-labs/kube-agents#6870.
+#
+# WHAT THIS GRADES. A card filed from a conversation reports back through the
+# A2A gateway's notify route, which posts the report into that conversation
+# and keeps it under the card's root task (a2a/gateway/notify.go,
+# Notifier.reply; KeepReport). A later human turn that names that task as its
+# replyTo carries the report as a pushedReport part, and the worker frames it
+# into its harness session once. So the first reply answers from the report,
+# and the second, on the same session, answers from the session's history.
+# Neither question states what the report found.
+#
+# HOW IT REACHES THE PATH. The prompt is a directive
+# (kube_agents_bench/relayed_report.py). The opening runs through the inject
+# door and asks for one card on seeded-a without waiting for it. On an eval
+# install the gateway's inject notify route (chat.notify.inject) relays the
+# card's report into the inject: conversation as a post the door marks
+# report and kept. The harness waits for that post, then sends reply1 and
+# reply2 on the same conversation, each naming the opening's task as its
+# replyTo. The replies' merged answer is the deliverable.
+#
+# RED WITHOUT THE ROUTE, GREEN WITH IT. Without the inject notify route
+# nothing posts the report into an inject conversation, the harness's wait
+# runs out, and the run is infrastructure rather than graded. With it, both
+# replies carry the planted defect's two facts, which the opening's answer
+# must not: OOMKilled and the 64Mi limit (bench/tf/fleet/fixtures.json).
+#
+# Needs the inject door, which every CI lane grades through.
+id: chat-reply-under-relayed-report
+name: Two replies under a card's relayed report are answered from it
+prompt: |-
+  [bench:reply-under-relayed-report]
+  opening: File one card for the cluster agent on seeded-a to find out why the payments-api deployment in the seeded-debug namespace keeps restarting. Do not wait for its result or look into it yourself: reply only that the card is filed, and I will read its report when it is posted here.
+  reply1: What did that report say is ending the payments-api container each time? Answer from the report itself, in one line.
+  fact1: OOMKilled
+  reply2: And what memory limit did the report say that container runs with? Answer from the report itself, in one line.
+  fact2: 64Mi
+expected_output: >-
+  The opening confirms one card is filed for seeded-a and answers nothing
+  else. After the card's report is posted into the conversation, the first
+  reply says the container is OOMKilled and the second says its memory limit
+  is 64Mi, each read from the report. Nothing in the cluster is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  - name: the-replies-carry-both-facts-from-the-report
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["OOMKilled", "64Mi"]
+  # The report post landed: a run where it did not is infrastructure in the
+  # harness already, and this keeps the plant graded in its own right.
+  - name: the-report-was-posted-into-the-conversation
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["harness_relay_report_posted"]
+      require_success: true
+  # Each reply carried its own fact, so the second answered from the session
+  # rather than riding on the first.
+  - name: each-reply-carried-its-fact
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["harness_relay_replies"]
+      require_success: true
+  # The card investigates; nothing may fix the planted defect.
+  - name: the-crashloop-was-reported-not-fixed
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: crashloop-workload
+      kind: deployment
+      resource_name: payments-api
+      namespace: seeded-debug
+      path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
+      op: eq
+      value: 64Mi

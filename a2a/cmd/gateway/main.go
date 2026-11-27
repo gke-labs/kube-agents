@@ -275,6 +275,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// eval installs only; the operator renders A2A_INJECT_LISTEN and the
 	// token only under its eval flag. See a2a/gateway/inject.go.
 	var doors []gateway.DoorSpec
+	var injectDoor *gateway.InjectAdapter
 	if cfg.InjectArmed() {
 		door, err := newInjectDoor(cfg, log)
 		if err != nil {
@@ -282,6 +283,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			return err
 		}
 		doors = append(doors, gateway.InjectDoorSpec(door))
+		injectDoor = door
 	}
 	// The A2A door is the same kind of thing for an agent caller: armed
 	// beside any backend or alone, routed by its own key prefix, its
@@ -342,6 +344,14 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		consoleNotifier := gateway.NewConsoleNotifier(console, log)
 		consoleNotifier.SetConversations(gw.Conversations(console))
 		defer runNotifier(ctx, consoleNotifier, client)()
+		// The inject door's route, on the console's code path, runs only
+		// with the door armed: a card filed from an eval turn reports back
+		// into its inject conversation, where the harness reads it. On any
+		// other gateway nothing subscribes to chat.notify.inject, and the
+		// operator grants the subject only under the same eval flag.
+		if n := injectNotifier(injectDoor, gw.Conversations, log); n != nil {
+			defer runNotifier(ctx, n, client)()
+		}
 		return gw.RunWith(ctx, opts)
 	}
 
@@ -460,6 +470,19 @@ func chatNotifiers(cfg *gateway.Config, backends map[string]gateway.Adapter, con
 		}
 	}
 	return notifiers
+}
+
+// injectNotifier builds the inject door's chat.notify route, or nil when the
+// door is not armed (door nil): the gateway then neither subscribes to nor
+// answers chat.notify.inject, and a publish there finds no responder even
+// where a grant would let it through.
+func injectNotifier(door *gateway.InjectAdapter, conversations func(gateway.Adapter) gateway.NotifyConversations, log *slog.Logger) *gateway.Notifier {
+	if door == nil {
+		return nil
+	}
+	n := gateway.NewInjectNotifier(door, log)
+	n.SetConversations(conversations(door))
+	return n
 }
 
 // chatNotifier builds the chat.notify route for the backend adapter, or nil

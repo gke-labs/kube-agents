@@ -772,6 +772,9 @@ const (
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
 	a2aNotifyPlatformSlack  = "slack"
+	// a2aNotifyPlatformInject is the inject door's (lib.NotifyPlatformInject),
+	// named in A2A_NOTIFY_CONVERSATIONS under the eval flag alone.
+	a2aNotifyPlatformInject = "inject"
 	// The agent reads A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS as
 	// comma-separated lists of the platform names above.
 	a2aNotifyPlatformSeparator = ","
@@ -1672,6 +1675,42 @@ func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }
 
+// a2aInjectNotifyGrants is the inject door's chat.notify subject, exactly,
+// when the operator was deployed with the eval flag (A2A_INJECT_BACKEND), and
+// nothing otherwise: the agent's publish grant and the gateway's subscribe
+// grant both append it beside the console's, so the subject is reachable on
+// an eval install and on no other. One subject, no wildcard. Here rather
+// than in the identities file because tests/conformance resolves an appended
+// grant helper out of this file.
+func a2aInjectNotifyGrants() []string {
+	if !a2aInjectBackendEnabled() {
+		return nil
+	}
+	return []string{
+		a2aNotifySubjectInject,
+	}
+}
+
+// a2aInjectNotifyExportLines is APP's export of the inject door's notify
+// subject to TRUSTED, where the gateway reads it, and
+// a2aInjectNotifyImportLines is TRUSTED's import of it: the console's pair,
+// under the eval flag alone, "" otherwise.
+func a2aInjectNotifyExportLines() string {
+	var b strings.Builder
+	for _, subject := range a2aInjectNotifyGrants() {
+		fmt.Fprintf(&b, "      { stream: %q, accounts: [ TRUSTED ] }\n", subject)
+	}
+	return b.String()
+}
+
+func a2aInjectNotifyImportLines() string {
+	var b strings.Builder
+	for _, subject := range a2aInjectNotifyGrants() {
+		fmt.Fprintf(&b, "      { stream: { account: APP, subject: %q } }\n", subject)
+	}
+	return b.String()
+}
+
 // a2aTargetAllowlistEnv renders the CR's Chat, Slack and, with the gateway's
 // Teams backend armed, Teams allowlists for the gateway. An absent list, or
 // the allow-all spelling allowAllUsers accepts (for Teams, the CRD's explicit
@@ -1801,6 +1840,17 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	}
 	if a2aTeamsNotifyArmed(agent) {
 		platforms = append(platforms, a2aNotifyPlatformTeams)
+	}
+	// The inject door's route (chat.notify.inject), last and only on an eval
+	// install: the gateway serves it only with the door armed, and the
+	// operator grants it only under the same flag (a2aInjectNotifyGrants).
+	// Naming it here is what arms the agent side: the kanban notifier's
+	// conversation stand-in and Hermes's inject platform, and the bridge's
+	// recording of an inject conversation's route (the bridge inherits this
+	// variable). Conversations only: the agent's home-post fallback leaves
+	// it out (chat_notify.CONVERSATION_ONLY_PLATFORMS).
+	if a2aInjectBackendEnabled() {
+		platforms = append(platforms, a2aNotifyPlatformInject)
 	}
 	return platforms
 }
@@ -2941,7 +2991,7 @@ accounts {
       { stream: { account: APP, subject: "chat.notify.slack" } }
       { stream: { account: APP, subject: "chat.notify.teams" } }
       { stream: { account: APP, subject: "chat.notify.console" } }
-      { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+` + a2aInjectNotifyImportLines() + `      { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
     ]
     users [
 ` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
@@ -2979,7 +3029,7 @@ accounts {
       { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
       { stream: "chat.notify.teams", accounts: [ TRUSTED ] }
       { stream: "chat.notify.console", accounts: [ TRUSTED ] }
-      { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+` + a2aInjectNotifyExportLines() + `      { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
     ]
     imports [
       { service: { account: TRUSTED, subject: "$JS.API.INFO" } }

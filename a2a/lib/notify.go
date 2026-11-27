@@ -20,6 +20,14 @@ const (
 	// The console has no home channel, so it serves conversation requests
 	// only.
 	NotifySubjectConsole = "chat.notify.console"
+	// NotifySubjectInject is the subject an inject-door notify is published
+	// on: the eval harness's stand-in for a chat user (a2a/gateway/inject.go).
+	// Like the console it has no home channel and serves conversation
+	// requests only. The gateway subscribes to it only with the inject door
+	// armed, and the operator grants it only under its eval flag
+	// (A2A_INJECT_BACKEND), so on any other install nothing may publish it
+	// and nothing answers it.
+	NotifySubjectInject = "chat.notify.inject"
 	// NotifyReplyPrefix is the namespace a notify's reply subject must sit
 	// under: the gateway answers there and nowhere else, and the agent
 	// principal is the one reader of it.
@@ -36,6 +44,11 @@ const (
 	// platform of its own; this is the name the agent side records on a
 	// console conversation's route.
 	NotifyPlatformConsole = "console"
+	// NotifyPlatformInject is the inject door's, the name a card on an
+	// inject conversation is sent with (`a2a notify --platform inject`).
+	// Its subject is granted only on an eval install; anywhere else the
+	// bus refuses the publish.
+	NotifyPlatformInject = "inject"
 )
 
 // NotifySubjects maps a caller's platform name to its notify subject.
@@ -44,6 +57,7 @@ var NotifySubjects = map[string]string{
 	NotifyPlatformSlack:   NotifySubjectSlack,
 	NotifyPlatformTeams:   NotifySubjectTeams,
 	NotifyPlatformConsole: NotifySubjectConsole,
+	NotifyPlatformInject:  NotifySubjectInject,
 }
 
 // NotifyRequest is the body of a chat.notify request.
