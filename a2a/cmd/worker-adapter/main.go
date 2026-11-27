@@ -256,6 +256,7 @@ func run() int {
 			// Whether the persona must carry a build-time content manifest.
 			RequirePersonaIntegrity: requireIntegrity,
 			Harness:                 harness,
+			Workdir:                 workdir,
 			ConfigRoot:              envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
