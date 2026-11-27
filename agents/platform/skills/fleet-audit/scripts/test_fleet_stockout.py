@@ -1635,6 +1635,13 @@ class GpuPoolMissingTaintTest(unittest.TestCase):
         ])
         self.assertTrue(fs.pod_requests_gpu(mixed))
 
+    def test_a_pod_list_item_that_is_no_object_is_skipped(self):
+        """A pod list item that is no JSON object has no node and no owner to
+        read: it is skipped, and the pods beside it are still counted."""
+        kept = running_pod("web-1", "n1")
+        counted = fs.pods_without_gpu([None, "not-a-pod", 7, kept], ["n1"])
+        self.assertEqual([p["metadata"]["name"] for p in counted], ["web-1"])
+
 
 class ReservationTest(unittest.TestCase):
     def test_flags_mostly_idle_reservation(self):
