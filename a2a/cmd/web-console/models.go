@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -24,7 +25,26 @@ const (
 	activeTargetAnnotation   = "kubeagents.x-k8s.io/active-model-target"
 	reasoningLevelAnnotation = "kubeagents.x-k8s.io/reasoning-level"
 	modelsTimeout            = 15 * time.Second
+
+	// liteLLMModelInfoPath lists the models the inference gateway names.
+	liteLLMModelInfoPath = "/model/info"
+	// ModelsResponse.ModelsSource: where the selector's list came from.
+	modelsSourceGateway = "gateway"
+	modelsSourcePresets = "presets"
+	// servedModelDescription describes a served model the preset catalog
+	// does not know.
+	servedModelDescription = "Served by the inference gateway"
+	// modelTestFailedCode is the error code of a pick the gateway did not
+	// answer for.
+	modelTestFailedCode = "model_test_failed"
+	// liteLLMWildcard marks a gateway route that matches models by pattern.
+	liteLLMWildcard = "*"
+	// geminiModelMarker is in the name of every Gemini model, which all
+	// take a reasoning level.
+	geminiModelMarker = "gemini"
 )
+
+var errNoServedModels = errors.New("LiteLLM reported no models")
 
 var validModelTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,127}$`)
 
@@ -40,12 +60,52 @@ type ModelOption struct {
 }
 
 type ModelsResponse struct {
-	ActiveModel    string        `json:"active_model"`
-	ActiveProvider string        `json:"active_provider"`
-	ActiveTarget   string        `json:"active_target"`
+	// ActiveModel is the preferred model: the one last picked in the
+	// selector unless the gateway's list rules it out, else the model in use.
+	ActiveModel    string `json:"active_model"`
+	ActiveProvider string `json:"active_provider"`
+	ActiveTarget   string `json:"active_target"`
+	// ModelInUse is the model the gateway's default alias routes to, the
+	// one the agent's requests reach; empty when the console cannot tell.
+	ModelInUse     string        `json:"model_in_use,omitempty"`
 	ReasoningLevel string        `json:"reasoning_level,omitempty"`
 	HelmValuesYAML string        `json:"helm_values_yaml,omitempty"`
+	ModelsSource   string        `json:"models_source"`
 	Models         []ModelOption `json:"models"`
+}
+
+// modelTestFailedResponse answers a pick the gateway did not answer for:
+// nothing was saved, and HelmValuesYAML is what would make the gateway
+// serve the model.
+type modelTestFailedResponse struct {
+	Error  string `json:"error"`
+	Detail string `json:"detail"`
+	Model  string `json:"model"`
+	// Target is the model target the test request named, and Reason the
+	// gateway's answer to it.
+	Target         string `json:"target"`
+	Reason         string `json:"reason"`
+	HelmValuesYAML string `json:"helm_values_yaml"`
+}
+
+// servedModels is what the inference gateway names in /model/info.
+type servedModels struct {
+	// options holds each served model once, however many aliases route to it.
+	options []ModelOption
+	// names holds every alias, model name and target the gateway lists.
+	names map[string]bool
+	// patterns is true when the gateway also routes models by pattern: it
+	// then serves models names does not hold.
+	patterns bool
+	// inUse is the model the default alias routes to; its ID is empty when
+	// the gateway lists no default alias.
+	inUse ModelOption
+}
+
+// serves reports whether the gateway lists the model under its name or
+// target. A gateway that routes by pattern may serve any model.
+func (m servedModels) serves(model, target string) bool {
+	return m.patterns || (model != "" && m.names[model]) || (target != "" && m.names[target])
 }
 
 type ModelSelectRequest struct {
@@ -254,10 +314,10 @@ func (s *server) testModel(ctx context.Context, modelID, target string) error {
 	return lastErr
 }
 
-// catalogModelsWithStatus returns the candidate model catalog, probing all
-// candidates only when probeAll is true. Without probeAll, candidates carry
-// Verified from prior probes (or when matching the active model on a cluster
-// with LiteLLM configured), avoiding an 11-request fan-out on cold GETs.
+// catalogModelsWithStatus returns the candidates, probing all of them only
+// when probeAll is true. Without probeAll, candidates carry Verified from
+// prior probes (or when matching the active model on a cluster with LiteLLM
+// configured), avoiding a request per candidate on cold GETs.
 func (s *server) catalogModelsWithStatus(ctx context.Context, candidates []ModelOption, activeModel, activeTarget string, probeAll bool) []ModelOption {
 	if probeAll && s.cfg.LiteLLMURL != "" {
 		probeCache.mu.RLock()
@@ -345,7 +405,145 @@ func generateModelHelmValuesYAML(modelID, provider, target, reasoningLevel strin
 	return sb.String()
 }
 
+// parseServedModels reads LiteLLM's /model/info into the models it serves,
+// naming each as parseLiteLLMModelInfo does.
+func parseServedModels(body []byte) (servedModels, error) {
+	var payload struct {
+		Data []struct {
+			ModelName     string `json:"model_name"`
+			LitellmParams struct {
+				Model string `json:"model"`
+			} `json:"litellm_params"`
+			ModelInfo struct {
+				Key                    string  `json:"key"`
+				LitellmProvider        string  `json:"litellm_provider"`
+				SupportsReasoning      bool    `json:"supports_reasoning"`
+				DefaultReasoningEffort *string `json:"default_reasoning_effort"`
+			} `json:"model_info"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return servedModels{}, err
+	}
+	out := servedModels{names: map[string]bool{}}
+	seen := map[string]bool{}
+	for _, item := range payload.Data {
+		alias := strings.TrimSpace(item.ModelName)
+		raw := strings.TrimSpace(item.LitellmParams.Model)
+		if raw == "" {
+			raw = strings.TrimSpace(item.ModelInfo.Key)
+		}
+		if raw == "" {
+			raw = alias
+		}
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(alias, liteLLMWildcard) || strings.Contains(raw, liteLLMWildcard) {
+			out.patterns = true
+			continue
+		}
+		provider := strings.TrimSpace(item.ModelInfo.LitellmProvider)
+		id := raw
+		if p, m, found := strings.Cut(raw, "/"); found {
+			if provider == "" {
+				provider = p
+			}
+			id = m
+		}
+		if lastSlash := strings.LastIndex(id, "/"); lastSlash != -1 {
+			id = id[lastSlash+1:]
+		}
+		target := raw
+		if !strings.Contains(raw, "/") && provider != "" {
+			target = provider + "/" + raw
+		}
+		opt := ModelOption{
+			ID:                id,
+			Name:              id,
+			Provider:          provider,
+			ModelTarget:       target,
+			SupportsReasoning: item.ModelInfo.SupportsReasoning || strings.Contains(strings.ToLower(id), geminiModelMarker),
+			Description:       servedModelDescription,
+		}
+		if catOpt, found := findCatalogOption(id, target); found {
+			opt.Name = catOpt.Name
+			opt.Description = catOpt.Description
+			opt.SupportsReasoning = catOpt.SupportsReasoning
+			opt.ReasoningLevel = catOpt.ReasoningLevel
+		}
+		if item.ModelInfo.DefaultReasoningEffort != nil && *item.ModelInfo.DefaultReasoningEffort != "" {
+			opt.ReasoningLevel = *item.ModelInfo.DefaultReasoningEffort
+		} else if opt.ReasoningLevel == "" && opt.SupportsReasoning {
+			opt.ReasoningLevel = "dynamic"
+		}
+		for _, name := range []string{alias, id, target} {
+			if name != "" {
+				out.names[name] = true
+			}
+		}
+		if alias == defaultAssistModel {
+			out.inUse = opt
+		}
+		if !seen[target] {
+			seen[target] = true
+			out.options = append(out.options, opt)
+		}
+	}
+	if len(out.options) == 0 {
+		return servedModels{}, errNoServedModels
+	}
+	return out, nil
+}
+
+// readServedModels asks the inference gateway which models it serves. It
+// reports false when no gateway is configured or it did not answer with a
+// list naming a model, in which case nothing can be said about any model.
+func (s *server) readServedModels(ctx context.Context) (servedModels, bool) {
+	if s.cfg.LiteLLMURL == "" {
+		return servedModels{}, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, modelFetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.LiteLLMURL+liteLLMModelInfoPath, nil)
+	if err != nil {
+		return servedModels{}, false
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return servedModels{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return servedModels{}, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetricsBodyBytes))
+	if err != nil {
+		return servedModels{}, false
+	}
+	served, err := parseServedModels(body)
+	if err != nil {
+		return servedModels{}, false
+	}
+	return served, true
+}
+
+// getActiveModelFromCluster returns the model, target and reasoning level
+// recorded on the PlatformAgent, without a model the gateway no longer serves.
 func (s *server) getActiveModelFromCluster(ctx context.Context) (string, string, string) {
+	if s.kube == nil || s.cfg.PodNamespace == "" {
+		return "", "", ""
+	}
+	served, servedOK := s.readServedModels(ctx)
+	return s.recordedModelAmong(ctx, served, servedOK)
+}
+
+// recordedModelAmong reads the model, target and reasoning level recorded on
+// the PlatformAgent. A recorded model the gateway no longer serves, as after
+// a Helm change of the default model, is returned empty so the caller shows
+// the model in use; when the gateway could not be asked, or routes models
+// by pattern, the record stands.
+func (s *server) recordedModelAmong(ctx context.Context, served servedModels, servedOK bool) (string, string, string) {
 	if s.kube == nil || s.cfg.PodNamespace == "" {
 		return "", "", ""
 	}
@@ -359,6 +557,9 @@ func (s *server) getActiveModelFromCluster(ctx context.Context) (string, string,
 		model := pa.Metadata.Annotations[activeModelAnnotation]
 		target := pa.Metadata.Annotations[activeTargetAnnotation]
 		reasoning := pa.Metadata.Annotations[reasoningLevelAnnotation]
+		if servedOK && !served.serves(model, target) {
+			model, target = "", ""
+		}
 		return model, target, reasoning
 	}
 	return "", "", ""
@@ -374,13 +575,28 @@ func findCatalogOption(id, target string) (ModelOption, bool) {
 }
 
 func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) ModelsResponse {
-	activeModel, activeTarget, clusterReasoning := s.getActiveModelFromCluster(ctx)
+	served, servedOK := s.readServedModels(ctx)
+	activeModel, activeTarget, clusterReasoning := s.recordedModelAmong(ctx, served, servedOK)
 	activeProvider := ""
 	reasoningLevel := clusterReasoning
+
+	modelInUse := s.cfg.ModelName
+	candidates := candidateModelCatalog
+	modelsSource := modelsSourcePresets
+	if servedOK {
+		candidates = served.options
+		modelsSource = modelsSourceGateway
+		if served.inUse.ID != "" {
+			modelInUse = served.inUse.ID
+		}
+	}
 
 	s.model.mu.Lock()
 	cachedModel := s.model.value
 	s.model.mu.Unlock()
+	if servedOK && !served.serves(cachedModel.Name, "") {
+		cachedModel = modelInfo{}
+	}
 	if activeModel == "" && cachedModel.Name != "" {
 		activeModel = cachedModel.Name
 		activeProvider = cachedModel.Provider
@@ -420,7 +636,7 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 	}
 
 	shouldProbe := len(probeAll) > 0 && probeAll[0]
-	verifiedModels := s.catalogModelsWithStatus(ctx, candidateModelCatalog, activeModel, activeTarget, shouldProbe)
+	verifiedModels := s.catalogModelsWithStatus(ctx, candidates, activeModel, activeTarget, shouldProbe)
 
 	models := make([]ModelOption, len(verifiedModels))
 	copy(models, verifiedModels)
@@ -495,8 +711,10 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 		ActiveModel:    activeModel,
 		ActiveProvider: activeProvider,
 		ActiveTarget:   activeTarget,
+		ModelInUse:     modelInUse,
 		ReasoningLevel: reasoningLevel,
 		HelmValuesYAML: generateModelHelmValuesYAML(activeModel, activeProvider, activeTarget, reasoningLevel),
+		ModelsSource:   modelsSource,
 		Models:         models,
 	}
 }
@@ -687,8 +905,14 @@ func (s *server) handleModelsPost(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.LiteLLMURL != "" {
 		if err := s.testModel(ctx, modelID, target); err != nil {
 			log.Printf(logPrefix+"model pre-flight test failed for %s (%s): %v", modelID, target, err)
-			writeError(w, http.StatusUnprocessableEntity, "model_test_failed",
-				fmt.Sprintf("Pre-flight check failed: model %s (%s) did not respond successfully in this environment: %v. Active model was not changed.", modelID, target, err))
+			writeJSON(w, http.StatusUnprocessableEntity, modelTestFailedResponse{
+				Error:          modelTestFailedCode,
+				Detail:         fmt.Sprintf("Pre-flight check failed: model %s (%s) did not respond successfully in this environment: %v. Active model was not changed.", modelID, target, err),
+				Model:          modelID,
+				Target:         target,
+				Reason:         err.Error(),
+				HelmValuesYAML: generateModelHelmValuesYAML(modelID, provider, target, reasoningLevel),
+			})
 			return
 		}
 		probeCache.mu.Lock()
@@ -727,12 +951,15 @@ func (s *server) handleModelsPost(w http.ResponseWriter, r *http.Request) {
 	s.model.readAt = time.Now()
 	s.model.mu.Unlock()
 
+	current := s.getModelsResponse(ctx)
 	writeJSON(w, http.StatusOK, ModelsResponse{
 		ActiveModel:    modelID,
 		ActiveProvider: provider,
 		ActiveTarget:   target,
+		ModelInUse:     current.ModelInUse,
 		ReasoningLevel: reasoningLevel,
 		HelmValuesYAML: generateModelHelmValuesYAML(modelID, provider, target, reasoningLevel),
-		Models:         s.getModelsResponse(ctx).Models,
+		ModelsSource:   current.ModelsSource,
+		Models:         current.Models,
 	})
 }
