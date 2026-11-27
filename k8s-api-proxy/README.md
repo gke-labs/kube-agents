@@ -62,8 +62,7 @@ verified against instead of the system roots; it is re-read when it changes, lik
 certificate below, and the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
 `pkg/mtlsauth` holds two authenticators for an embedder whose callers arrive over mutual TLS. The
-binary has no `--auth-mode` for them yet; its flags arrive in a following change. Neither imports
-`client-go`.
+binary has no `--auth-mode` for them. Neither imports `client-go`.
 
 ```go
 // The caller is the certificate: a workload's SPIFFE X.509-SVID, for example.
@@ -90,14 +89,18 @@ handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
 })
 ```
 
-Both read the client certificate from `Request.TLS`, so the listener must ask for one:
-`tls.VerifyClientCertIfGiven` with `ClientCAs` from `certreload.NewCAPoolUnion` over every
-authenticator's bundle (set per handshake through `GetConfigForClient`, so a rotated bundle is
-advertised) keeps certificate-less requests such as health probes working. Each authenticator
-then verifies the certificate again on every request, against its own bundle only, for client
-authentication, at the current time: a certificate that expired or whose CA left the bundle is
-refused on the next request of a connection that is already open, HTTP/2 included, and a
-certificate issued under one authenticator's CA is nothing to the other. A certificate with no
+Both read the client certificate from `Request.TLS`, and the listener must verify it when the
+connection opens: `tls.VerifyClientCertIfGiven` (which keeps certificate-less requests such as
+health probes working) or `tls.RequireAndVerifyClientCert`, with `ClientCAs` from
+`certreload.NewCAPoolUnion` over every authenticator's bundle, set per handshake through
+`GetConfigForClient` so a rotated bundle is advertised. Do not use `tls.RequestClientCert` or
+`tls.RequireAnyClientCert`: a peer no CA vouches for could then make every request pay for a
+chain search. In addition to the handshake, each authenticator verifies the certificate on every
+request, against its own bundle only, for client authentication, at the current time: a
+certificate that expired or whose CA left the bundle is refused on the next request of a
+connection that is already open, HTTP/2 included, and a certificate issued under one
+authenticator's CA is nothing to the other. A peer that presented more than eight certificates
+is refused before any verification. A certificate with no
 extended key usage extension is accepted, as `crypto/x509` accepts it; one that lists usages
 without client authentication is refused. Revocation (CRL, OCSP) is not checked. The bundle is
 reloaded like `Config.CAFile` above (`Reload` takes the `certreload.Options`); one that stops
@@ -105,10 +108,15 @@ loading is reported and the last good one keeps verifying, so neither authentica
 
 The peer's name comes from the one certificate field the configuration names (`uri`, `dns` or
 `cn`). No other field is tried when it is missing, and a certificate with two values there (two
-URI SANs, two DNS SANs, two common names) is refused. Names are compared byte for byte.
+URI SANs, two DNS SANs, two common names) is refused. Names are compared exactly, with no case
+folding or pattern. A URI is compared as Go's `net/url` writes it back, which lower-cases the
+scheme, and a URI with userinfo, a query or a fragment, even an empty one, is refused. X.509
+name constraints do not apply to the subject common name, so with `cn` a name-constrained CA in
+the bundle can still issue any name.
 `ClientCertAuthenticator` uses the name as `CallerIdentity.Username` and fills nothing else;
 `AllowedIdentities` admits only the listed names and `RequiredURIPrefix` (with `uri` only) only
-names that start with it, so end the prefix at a `/`. Without either, every client certificate
+names that start with it; the prefix must end in `/`, so that it cannot match a longer trust
+domain or path segment. Without either, every client certificate
 the CA issues is a caller.
 
 `FrontProxyAuthenticator` requires the peer's name in `AllowedNames` and then believes the
@@ -118,7 +126,8 @@ with no fallback to a later name. The username is always required, and the UID a
 are required once their headers are configured, so a caller never lands in the empty partition.
 Every value of every `GroupHeaders` header is a group, not split at commas. `AllowedPartitions`
 admits only the listed partitions, with the rules of `jwtauth`'s. A header name may appear in one
-list only. Every peer in `AllowedNames` can name any caller, so give front proxies a CA of their
+list only and must pass `k8sapiproxy.ValidateCallerHeaderNames`, the check
+`Config.ExtraCallerHeaders` applies. Every peer in `AllowedNames` can name any caller, so give front proxies a CA of their
 own and list only the proxies that authenticate their callers and overwrite these headers.
 
 In a chain of authenticators the two refuse differently. No client certificate, a certificate
@@ -128,7 +137,12 @@ authenticator is tried, which is how a workload's certificate passes the front-p
 authenticator and reaches its own. An allowed front proxy whose headers are missing, empty,
 repeated or name a partition that is not allowed is refused with an error wrapping
 `k8sapiproxy.ErrCallerRefused`, which ends the chain: no later authenticator admits the request
-on a credential the proxy only forwarded.
+on a credential the proxy only forwarded. That holds only for the authenticators after it, so
+the front-proxy authenticator must come first: with a bearer-token authenticator ahead of it, a
+request from an allowed proxy that forwards a token is admitted under the token's identity and
+the empty partition, and the headers are never read. The binary's chain is not exported and has
+no mode for these authenticators, so an embedder that combines them writes its own chain, which
+must stop at an error wrapping `ErrCallerRefused`.
 
 `upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
@@ -416,6 +430,6 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
 `AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
-`AuditEvent`, `proxyserver.Run`, `proxyserver.Options` and `pkg/mtlsauth` may change in any release. The version moves with every
+`AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.Options` and `pkg/mtlsauth` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

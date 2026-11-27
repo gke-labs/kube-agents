@@ -10,26 +10,36 @@
 // intermediates the peer sent are checked against the authenticator's own CA bundle, for
 // client authentication, at the current time. A certificate that expired, or whose CA was
 // rotated out of the bundle, is refused on the next request of a connection opened while
-// it was good. The TLS handshake proves the peer holds the certificate's key and nothing
-// more is asked of it, so the listener may use tls.VerifyClientCertIfGiven with the union
-// of the bundles (certreload.NewCAPoolUnion) or tls.RequestClientCert. Revocation (CRL,
-// OCSP) is not checked. A certificate without an extended key usage extension is accepted
-// as crypto/x509 and the TLS handshake accept it; one that lists usages without client
-// authentication is refused.
+// it was good. This check is in addition to the TLS handshake, not in place of it: the
+// listener must verify a client certificate when the connection opens, with
+// tls.VerifyClientCertIfGiven or tls.RequireAndVerifyClientCert and ClientCAs holding the
+// union of the bundles (certreload.NewCAPoolUnion). A listener that only requests a
+// certificate lets a peer no CA vouches for make every request pay for a chain search, so
+// do not use tls.RequestClientCert or tls.RequireAnyClientCert. As a bound of its own, a
+// peer that presented more than eight certificates is refused before any verification.
+// Revocation (CRL, OCSP) is not checked. A certificate without an extended key usage
+// extension is accepted as crypto/x509 and the TLS handshake accept it; one that lists
+// usages without client authentication is refused.
 //
 // The name is read from one certificate field, chosen in the configuration: the URI SAN,
 // the DNS SAN or the subject common name. No other field is tried when it is missing, and
 // a certificate carrying more than one value of the chosen field is refused, since which
-// one names the peer would be a guess. Names are compared byte for byte.
+// one names the peer would be a guess. Names are compared exactly, with no case folding
+// or pattern. A URI is compared as net/url writes it back, which lower-cases the scheme
+// and changes nothing else of an identifier such as a SPIFFE ID; a URI with userinfo, a
+// query or a fragment, even an empty one, is refused. X.509 name constraints do not apply
+// to the subject common name: with SourceCN, a name-constrained CA in the bundle can
+// still issue any name.
 //
 // # Errors
 //
 // The handler answers 401 for every error below; they differ in what a chain of
 // authenticators does next.
 //
-//   - No client certificate, a certificate that does not verify against this
-//     authenticator's bundle, a certificate without exactly one name in the configured
-//     field, and a name the allowlist or the prefix does not admit: a plain error. The
+//   - No client certificate, more certificates than the bound, a certificate that does
+//     not verify against this authenticator's bundle, a certificate without exactly one
+//     usable name in the configured field, and a name the allowlist or the prefix does not
+//     admit: a plain error. The
 //     certificate was not shown to be this authenticator's to judge, so a chain offers the
 //     request to the next authenticator. A certificate issued for the other authenticator
 //     of this package, under its own CA, ends here.
@@ -37,7 +47,10 @@
 //     missing, empty, repeated, or name a partition that is not allowed: an error wrapping
 //     k8sapiproxy.ErrCallerRefused. The request is the proxy's, and a proxy that names no
 //     caller must not have its request admitted by another authenticator on a credential
-//     the proxy merely forwarded. A chain stops there.
+//     the proxy merely forwarded. A chain stops there, which protects only the
+//     authenticators after this one: put FrontProxyAuthenticator first. An authenticator
+//     ahead of it that reads a bearer token would admit a front proxy's request under the
+//     token's identity before the headers are looked at.
 //   - Neither authenticator returns k8sapiproxy.ErrAuthenticationUnavailable: verification
 //     needs nothing but the bundle in memory. A bundle that cannot be read or parsed after
 //     a change is reported through the reload options and the last good one keeps
@@ -67,16 +80,29 @@ const (
 	// SourceCN reads the common name of the certificate's subject.
 	SourceCN IdentitySource = "cn"
 
-	// headerNameSymbols are the characters, besides letters and digits, of an HTTP field
-	// name (RFC 9110 section 5.6.2, tchar).
-	headerNameSymbols = "!#$%&'*+-.^_`|~"
+	// maxPeerCertificates bounds the certificates a peer may have presented, the leaf
+	// included. Every request searches for a chain through the intermediates the peer
+	// sent, so their number is the peer's lever on the cost of a request; a leaf under a
+	// root through six intermediates is deeper than any PKI in use.
+	maxPeerCertificates = 8
+	// uriDelimiters start a query or a fragment, which a URI used as a name cannot have,
+	// even an empty one (the SPIFFE ID rule).
+	uriDelimiters = "?#"
+	// sanURITag is the tag of a uniformResourceIdentifier in a subject alternative name
+	// (RFC 5280 section 4.2.1.6).
+	sanURITag = 6
 )
 
 var (
 	// oidCommonName is the X.520 common name attribute of a subject.
 	oidCommonName = asn1.ObjectIdentifier{2, 5, 4, 3}
 
+	// oidSubjectAltName is the subject alternative name extension.
+	oidSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
+
 	errNoClientCertificate = errors.New("the request carries no client certificate")
+	errTooManyCertificates = errors.New("the peer presented more certificates than are verified")
+	errURINotPlain         = errors.New("the client certificate's URI has userinfo, a query or a fragment")
 	errNotVerified         = errors.New("the client certificate does not verify against the configured CA bundle")
 	errNoName              = errors.New("the client certificate has no value in the configured field")
 	errSeveralNames        = errors.New("the client certificate has more than one value in the configured field")
@@ -119,6 +145,9 @@ func newPeerVerifier(owner, sourceField, caFile string, source IdentitySource, r
 func (p *peerVerifier) name(r *http.Request) (string, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return "", errNoClientCertificate
+	}
+	if len(r.TLS.PeerCertificates) > maxPeerCertificates {
+		return "", errTooManyCertificates
 	}
 	leaf := r.TLS.PeerCertificates[0]
 	opts := x509.VerifyOptions{
@@ -165,7 +194,46 @@ func certificateName(cert *x509.Certificate, source IdentitySource) (string, err
 	case values[0] == "":
 		return "", errNoName
 	}
+	if source == SourceURI && !plainURI(cert) {
+		return "", errURINotPlain
+	}
 	return values[0], nil
+}
+
+// plainURI reports whether the one URI SAN of cert is free of userinfo, a query and a
+// fragment. cert.URIs cannot say: net/url drops an empty fragment, so the delimiters are
+// looked for in the bytes the certificate carries.
+func plainURI(cert *x509.Certificate) bool {
+	if cert.URIs[0].User != nil {
+		return false
+	}
+	raw, ok := rawURINames(cert)
+	return ok && len(raw) == 1 && !strings.ContainsAny(raw[0], uriDelimiters)
+}
+
+// rawURINames returns the URI subject alternative names of cert as they are encoded; ok
+// is false when the extension cannot be read.
+func rawURINames(cert *x509.Certificate) (names []string, ok bool) {
+	for _, ext := range cert.Extensions {
+		if !ext.Id.Equal(oidSubjectAltName) {
+			continue
+		}
+		var san asn1.RawValue
+		if rest, err := asn1.Unmarshal(ext.Value, &san); err != nil || len(rest) > 0 {
+			return nil, false
+		}
+		for rest := san.Bytes; len(rest) > 0; {
+			var name asn1.RawValue
+			var err error
+			if rest, err = asn1.Unmarshal(rest, &name); err != nil {
+				return nil, false
+			}
+			if name.Class == asn1.ClassContextSpecific && name.Tag == sanURITag {
+				names = append(names, string(name.Bytes))
+			}
+		}
+	}
+	return names, true
 }
 
 // newAllowlist returns the trimmed, non-empty entries of list as a set; nil for an empty
@@ -185,22 +253,4 @@ func newAllowlist(field string, list []string) (map[string]struct{}, error) {
 		return nil, fmt.Errorf("mtlsauth: %s has only empty entries", field)
 	}
 	return set, nil
-}
-
-// validHeaderName reports whether name is a non-empty HTTP field name: letters, digits and
-// headerNameSymbols, so no spaces or colons.
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case strings.IndexByte(headerNameSymbols, c) >= 0:
-		default:
-			return false
-		}
-	}
-	return true
 }

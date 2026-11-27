@@ -744,3 +744,47 @@ func TestNewCAPoolUnionFailsFast(t *testing.T) {
 		})
 	}
 }
+
+// A reload error callback may read the pool it is reporting on: it runs with none of the
+// union's locks held.
+func TestCAPoolUnionReportsReloadErrorsOutsideItsLocks(t *testing.T) {
+	first, second := newAuthority(t, "first-ca"), newAuthority(t, "second-ca")
+	dir := t.TempDir()
+	firstFile, secondFile := filepath.Join(dir, caName), filepath.Join(dir, bundleName)
+	writeFile(t, firstFile, first.pem)
+	writeFile(t, secondFile, second.pem)
+
+	clock := newClock()
+	var pool *CAPool
+	var reported, stillTrusted atomic.Int64
+	opts := Options{CheckInterval: testInterval, Now: clock.now, OnReloadError: func(error) {
+		reported.Add(1)
+		if trusts(pool, first) && trusts(pool, second) {
+			stillTrusted.Add(1)
+		}
+	}}
+	pool, err := NewCAPoolUnion([]string{firstFile, secondFile}, opts)
+	if err != nil {
+		t.Fatalf("NewCAPoolUnion: %v", err)
+	}
+
+	writeFile(t, firstFile, []byte("not PEM"))
+	writeFile(t, secondFile, nil)
+	clock.advance()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pool.Pool()
+	}()
+	select {
+	case <-done:
+	case <-time.After(testInterval):
+		t.Fatal("Pool did not return: the reload error callback is called under a lock")
+	}
+	if got := reported.Load(); got != 2 {
+		t.Errorf("%d reload errors reported, want 2", got)
+	}
+	if got := stillTrusted.Load(); got != 2 {
+		t.Errorf("the callback saw both last good bundles %d times, want 2", got)
+	}
+}

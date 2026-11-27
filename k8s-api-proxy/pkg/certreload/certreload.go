@@ -98,9 +98,7 @@ func newReloader[T any](paths []string, parse func([][]byte) (T, error), opts Op
 		r.interval = DefaultCheckInterval
 	}
 	if r.onError == nil {
-		r.onError = func(err error) {
-			slog.Default().Warn("certreload: keeping the last good contents", "err", err)
-		}
+		r.onError = logReloadError
 	}
 	if r.now == nil {
 		r.now = time.Now
@@ -119,6 +117,11 @@ func newReloader[T any](paths []string, parse func([][]byte) (T, error), opts Op
 	}
 	r.value, r.raw, r.seen, r.checkedAt = value, raw, identity, r.now()
 	return r, nil
+}
+
+// logReloadError is the OnReloadError of Options that set none.
+func logReloadError(err error) {
+	slog.Default().Warn("certreload: keeping the last good contents", "err", err)
 }
 
 // get returns the current value, first reloading it when the check interval has passed
@@ -291,19 +294,29 @@ type caUnion struct {
 	// loaded is the version of each bundle that pool was built from.
 	loaded []*caBundle
 	pool   *x509.CertPool
+	// failures are the reload errors of the check in progress. A bundle's reloader hands
+	// them over while get holds mu, and get reports them once it has let go of it.
+	failures []error
+	onError  func(error)
 }
 
 // NewCAPoolUnion loads the PEM bundles in files, each under the rules of NewCAPool, into
 // one pool holding the certificates of all of them. A path listed twice is read once. Each
 // file is checked and reloaded on its own: when one changes into something that does not
 // load, opts.OnReloadError is called for it and its last good certificates stay in the
-// pool, while a change to another file is still picked up. It fails when files is empty,
-// names an empty path, or any file does not load.
+// pool, while a change to another file is still picked up. OnReloadError runs with none
+// of the pool's locks held, so it may call Pool. It fails when files is empty, names an
+// empty path, or any file does not load.
 func NewCAPoolUnion(files []string, opts Options) (*CAPool, error) {
 	if len(files) == 0 {
 		return nil, errors.New("certreload: at least one CA bundle file is required")
 	}
-	u := &caUnion{}
+	u := &caUnion{onError: opts.OnReloadError}
+	if u.onError == nil {
+		u.onError = logReloadError
+	}
+	// Each bundle's reloader calls this under its own lock and under mu, from get.
+	opts.OnReloadError = func(err error) { u.failures = append(u.failures, err) }
 	seen := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		if file == "" {
@@ -333,6 +346,15 @@ func NewCAPoolUnion(files []string, opts Options) (*CAPool, error) {
 // get returns the pool of every bundle's current certificates, rebuilt only when a
 // bundle was reloaded since the last call.
 func (u *caUnion) get() *x509.CertPool {
+	pool, failures := u.check()
+	for _, err := range failures {
+		u.onError(err)
+	}
+	return pool
+}
+
+// check reloads the bundles and returns the pool with the reload errors to report.
+func (u *caUnion) check() (*x509.CertPool, []error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	changed := u.pool == nil
@@ -351,7 +373,9 @@ func (u *caUnion) get() *x509.CertPool {
 		}
 		u.pool = pool
 	}
-	return u.pool
+	failures := u.failures
+	u.failures = nil
+	return u.pool, failures
 }
 
 func parseCABundle(data []byte) (*x509.CertPool, error) {

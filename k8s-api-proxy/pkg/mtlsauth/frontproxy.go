@@ -41,8 +41,8 @@ type FrontProxyConfig struct {
 	// NameSource is the certificate field the front proxy's name is read from. Required.
 	// A certificate without exactly one value there is not a front proxy.
 	NameSource IdentitySource
-	// AllowedNames lists the front proxies whose headers are believed, compared byte for
-	// byte with the certificate's name. Entries are trimmed and empty ones dropped; at
+	// AllowedNames lists the front proxies whose headers are believed, compared exactly
+	// with the certificate's name. Entries are trimmed and empty ones dropped; at
 	// least one is required. Every peer named here can act as any caller.
 	AllowedNames []string
 	// UsernameHeaders names, in order of preference, the headers holding the caller's
@@ -77,7 +77,8 @@ type FrontProxyConfig struct {
 // Groups and Partition from the headers and records nothing about the proxy itself.
 //
 // The headers are the caller's credential here, so they must not travel upstream: pass
-// HeaderNames to k8sapiproxy.Config.ExtraCallerHeaders.
+// HeaderNames to k8sapiproxy.Config.ExtraCallerHeaders. In a chain of authenticators put
+// this one first; see the package documentation.
 type FrontProxyAuthenticator struct {
 	peer              *peerVerifier
 	allowedNames      map[string]struct{}
@@ -89,8 +90,8 @@ type FrontProxyAuthenticator struct {
 }
 
 // NewFrontProxyAuthenticator returns a FrontProxyAuthenticator for cfg, or an error when
-// cfg is incomplete, names something that is not an HTTP header, names one header twice,
-// or ClientCAFile does not load.
+// cfg is incomplete, names a header k8sapiproxy.ValidateCallerHeaderNames refuses, names
+// one header twice, or ClientCAFile does not load.
 func NewFrontProxyAuthenticator(cfg FrontProxyConfig) (*FrontProxyAuthenticator, error) {
 	allowedNames, err := newAllowlist(allowedNamesName, cfg.AllowedNames)
 	if err != nil {
@@ -115,11 +116,12 @@ func NewFrontProxyAuthenticator(cfg FrontProxyConfig) (*FrontProxyAuthenticator,
 		{groupHeadersField, cfg.GroupHeaders},
 		{partitionHeadersField, cfg.PartitionHeaders},
 	} {
+		// The handler's own check, so every name can go into its ExtraCallerHeaders.
+		if err := k8sapiproxy.ValidateCallerHeaderNames(field.names); err != nil {
+			return nil, fmt.Errorf("mtlsauth: %s.%s %w", frontProxyConfigName, field.name, err)
+		}
 		canonical := make([]string, 0, len(field.names))
 		for _, name := range field.names {
-			if !validHeaderName(name) {
-				return nil, fmt.Errorf("mtlsauth: %s.%s entry %q is not an HTTP header name", frontProxyConfigName, field.name, name)
-			}
 			key := http.CanonicalHeaderKey(name)
 			if first, dup := seen[key]; dup {
 				return nil, fmt.Errorf("mtlsauth: %s.%s entry %q is already listed in %s", frontProxyConfigName, field.name, name, first)

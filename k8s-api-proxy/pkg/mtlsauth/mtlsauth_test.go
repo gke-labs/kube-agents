@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -151,7 +152,10 @@ type certSpec struct {
 	// one of them.
 	cns  []string
 	uris []string
-	dns  []string
+	// rawURIs, when set, are the URI SANs written as given, in place of uris and dns:
+	// forms net/url would not write back, such as an empty fragment.
+	rawURIs []string
+	dns     []string
 	// usages are the extended key usages; nil leaves the extension out.
 	usages []x509.ExtKeyUsage
 	// notBefore and notAfter default to a day either side of now.
@@ -186,6 +190,21 @@ func (a *authority) issue(t *testing.T, spec certSpec) *issued {
 			t.Fatal(err)
 		}
 		tmpl.URIs = append(tmpl.URIs, uri)
+	}
+	if len(spec.rawURIs) > 0 {
+		var names []byte
+		for _, raw := range spec.rawURIs {
+			name, err := asn1.Marshal(asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: sanURITag, Bytes: []byte(raw)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			names = append(names, name...)
+		}
+		san, err := asn1.Marshal(asn1.RawValue{Class: asn1.ClassUniversal, Tag: asn1.TagSequence, IsCompound: true, Bytes: names})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl.ExtraExtensions = []pkix.Extension{{Id: oidSubjectAltName, Value: san}}
 	}
 	if !spec.notBefore.IsZero() {
 		tmpl.NotBefore = spec.notBefore
@@ -222,6 +241,15 @@ func connection(leaf *issued, intermediates ...*authority) *tls.ConnectionState 
 		state.PeerCertificates = append(state.PeerCertificates, ca.cert)
 	}
 	return state
+}
+
+// repeat returns ca n times, for a peer that sends the same intermediate over and over.
+func repeat(ca *authority, n int) []*authority {
+	out := make([]*authority, n)
+	for i := range out {
+		out[i] = ca
+	}
+	return out
 }
 
 // request is a request that arrived on a connection in the given state; nil for plain
@@ -357,6 +385,14 @@ func TestClientCertReadsOneConfiguredField(t *testing.T) {
 		{name: "cn", source: SourceCN, spec: certSpec{cn: testWorkloadCN, dns: []string{testWorkloadDNS}, uris: []string{testWorkloadURI}}, username: testWorkloadCN},
 		{name: "cn absent, other fields present", source: SourceCN, spec: certSpec{dns: []string{testWorkloadDNS}, uris: []string{testWorkloadURI}}, wantErr: errNoName},
 		{name: "two common names", source: SourceCN, spec: certSpec{cns: []string{testWorkloadCN, "other"}}, wantErr: errSeveralNames},
+		{name: "uri scheme is lower-cased", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"SPIFFE://example.test/ns/agents/sa/sandbox"}}, username: testWorkloadURI},
+		{name: "uri written as given", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI}}, username: testWorkloadURI},
+		{name: "uri with userinfo", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://user@example.test/ns/agents/sa/sandbox"}}, wantErr: errURINotPlain},
+		{name: "uri with a query", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI + "?a=b"}}, wantErr: errURINotPlain},
+		{name: "uri with an empty query", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI + "?"}}, wantErr: errURINotPlain},
+		{name: "uri with a fragment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI + "#a"}}, wantErr: errURINotPlain},
+		{name: "uri with an empty fragment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI + "#"}}, wantErr: errURINotPlain},
+		{name: "two URIs written as given", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI, testOtherURI}}, wantErr: errSeveralNames},
 		{name: "two URIs do not matter to dns", source: SourceDNS, spec: certSpec{dns: []string{testWorkloadDNS}, uris: []string{testWorkloadURI, testOtherURI}}, username: testWorkloadDNS},
 	}
 	for _, tc := range tests {
@@ -418,6 +454,20 @@ func TestClientCertVerifiesTheCertificateOnEachRequest(t *testing.T) {
 			name:    "TLS without a client certificate",
 			state:   func(*testing.T) *tls.ConnectionState { return &tls.ConnectionState{} },
 			wantErr: errNoClientCertificate,
+		},
+		{
+			name: "as many certificates as are verified",
+			state: func(t *testing.T) *tls.ConnectionState {
+				return connection(intermediate.workload(t, testWorkloadURI), repeat(intermediate, maxPeerCertificates-1)...)
+			},
+			admit: true,
+		},
+		{
+			name: "more certificates than are verified",
+			state: func(t *testing.T) *tls.ConnectionState {
+				return connection(intermediate.workload(t, testWorkloadURI), repeat(intermediate, maxPeerCertificates)...)
+			},
+			wantErr: errTooManyCertificates,
 		},
 		{
 			name:  "client authentication usage",
@@ -575,6 +625,18 @@ func TestClientCertFilters(t *testing.T) {
 			spec:   certSpec{uris: []string{testProxyURI}},
 		},
 		{
+			name:   "longer path segment than the required prefix names",
+			source: SourceURI,
+			edit:   func(c *ClientCertConfig) { c.RequiredURIPrefix = testURIPrefix },
+			spec:   certSpec{uris: []string{"spiffe://example.test/ns/agents-evil/sa/sandbox"}},
+		},
+		{
+			name:   "longer trust domain than the required prefix names",
+			source: SourceURI,
+			edit:   func(c *ClientCertConfig) { c.RequiredURIPrefix = "spiffe://example.test/" },
+			spec:   certSpec{uris: []string{"spiffe://example.test.evil/ns/agents/sa/sandbox"}},
+		},
+		{
 			name:   "prefix and allowlist both apply",
 			source: SourceURI,
 			edit: func(c *ClientCertConfig) {
@@ -616,6 +678,8 @@ func TestNewClientCertAuthenticatorRefusesAnIncompleteConfig(t *testing.T) {
 		"identity source in upper case": func(c *ClientCertConfig) { c.IdentitySource = "URI" },
 		"URI prefix with dns":           func(c *ClientCertConfig) { c.IdentitySource, c.RequiredURIPrefix = SourceDNS, testURIPrefix },
 		"URI prefix with cn":            func(c *ClientCertConfig) { c.IdentitySource, c.RequiredURIPrefix = SourceCN, testURIPrefix },
+		"URI prefix cut inside a path":  func(c *ClientCertConfig) { c.RequiredURIPrefix = "spiffe://example.test/ns/agents" },
+		"URI prefix cut after the host": func(c *ClientCertConfig) { c.RequiredURIPrefix = "spiffe://example.test" },
 		"allowlist of empty entries":    func(c *ClientCertConfig) { c.AllowedIdentities = []string{"", "  "} },
 	}
 	for name, edit := range tests {
@@ -863,6 +927,9 @@ func TestNewFrontProxyAuthenticatorRefusesAnIncompleteConfig(t *testing.T) {
 		"UID header name with a newline":    func(c *FrontProxyConfig) { c.UIDHeaders = []string{"X-Uid\n"} },
 		"group header name not ASCII":       func(c *FrontProxyConfig) { c.GroupHeaders = []string{"X-Grüppe"} },
 		"partition header name empty":       func(c *FrontProxyConfig) { c.PartitionHeaders = []string{testTenantHeader, ""} },
+		"username header the proxy frames":  func(c *FrontProxyConfig) { c.UsernameHeaders = []string{"Host"} },
+		"group header the proxy drops":      func(c *FrontProxyConfig) { c.GroupHeaders = []string{"connection"} },
+		"partition header content-length":   func(c *FrontProxyConfig) { c.PartitionHeaders = []string{"Content-Length"} },
 		"one header in two fields":          func(c *FrontProxyConfig) { c.PartitionHeaders = []string{"x-caller-user"} },
 		"one header twice in a field":       func(c *FrontProxyConfig) { c.GroupHeaders = []string{testGroupHeader, testGroupHeader} },
 		"allowed partitions without header": func(c *FrontProxyConfig) { c.AllowedPartitions = []string{testTenant} },

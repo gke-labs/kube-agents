@@ -15,6 +15,11 @@ const (
 	clientCertConfigName  = "ClientCertConfig"
 	identitySourceField   = "IdentitySource"
 	allowedIdentitiesName = clientCertConfigName + ".AllowedIdentities"
+	// uriPrefixEnd is what a RequiredURIPrefix must end in, so that it names whole path
+	// segments: without it "spiffe://example.org/ns/agents" would also admit
+	// "spiffe://example.org/ns/agents-other/..." and "spiffe://example.org" would admit
+	// "spiffe://example.org.other/...".
+	uriPrefixEnd = "/"
 )
 
 var errIdentityNotAdmitted = errors.New("the client certificate's identity is not admitted")
@@ -31,13 +36,13 @@ type ClientCertConfig struct {
 	// IdentitySource is the certificate field the caller's username is read from. Required.
 	// A certificate without exactly one value there is refused.
 	IdentitySource IdentitySource
-	// AllowedIdentities, when not empty, lists the identities admitted, compared byte for
-	// byte. Entries are trimmed and empty ones dropped; a list left with none is an error.
+	// AllowedIdentities, when not empty, lists the identities admitted, compared exactly.
+	// Entries are trimmed and empty ones dropped; a list left with none is an error.
 	AllowedIdentities []string
 	// RequiredURIPrefix, when set, refuses a certificate whose URI does not start with it.
-	// It is valid only with SourceURI. The comparison is on the text alone, so end the
-	// prefix at a separator ("spiffe://example.org/", not "spiffe://example.org") to keep
-	// it from matching a longer trust domain or path segment.
+	// It is valid only with SourceURI and must end in "/" ("spiffe://example.org/", not
+	// "spiffe://example.org"): the comparison is on the text alone, and a prefix cut
+	// anywhere else would also match a longer trust domain or path segment.
 	RequiredURIPrefix string
 	// Reload tunes how ClientCAFile is checked for changes and where a failed reload is
 	// reported.
@@ -60,6 +65,9 @@ type ClientCertAuthenticator struct {
 func NewClientCertAuthenticator(cfg ClientCertConfig) (*ClientCertAuthenticator, error) {
 	if cfg.RequiredURIPrefix != "" && cfg.IdentitySource != "" && cfg.IdentitySource != SourceURI {
 		return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix requires %s %q", clientCertConfigName, identitySourceField, SourceURI)
+	}
+	if cfg.RequiredURIPrefix != "" && !strings.HasSuffix(cfg.RequiredURIPrefix, uriPrefixEnd) {
+		return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix %q must end in %q", clientCertConfigName, cfg.RequiredURIPrefix, uriPrefixEnd)
 	}
 	allowed, err := newAllowlist(allowedIdentitiesName, cfg.AllowedIdentities)
 	if err != nil {
