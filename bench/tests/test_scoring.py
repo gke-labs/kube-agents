@@ -3704,6 +3704,39 @@ def test_a_compound_beside_a_phrase_is_set_aside_only_when_it_failed(write_task,
     assert passed.not_applicable_checks == [] and passed.outcome == "pass"
 
 
+def test_a_case_whose_only_objective_is_set_aside_is_not_graded(write_task, inject_run):
+    """A case whose one objective reads the inputless call's arguments has
+    nothing left to grade once it is set aside: the repetition and the case
+    come out not graded on the transport, never a pass."""
+    spec = load_case(
+        write_task(
+            "bash-only",
+            {
+                "id": "bash-only",
+                "name": "Bash only",
+                "verification_spec": [
+                    {
+                        "name": BASH_ARGS_OBJECTIVE,
+                        "role": "objective",
+                        "check": {"type": "tool_called", "tool_names": ["Bash"], "arguments": {"command": "gcloud .*"}},
+                    }
+                ],
+            },
+        )
+    )
+
+    def only_the_bash_check(rec):
+        _arguments_shape([_bash(absent=True)], "fail", "pass")(rec)
+        rec["verification_report"] = [rec["verification_report"][1]]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+        rec["scores"].pop("VerificationCatastrophic", None)
+
+    rep = classify_rep(spec, inject_run(mutate=only_the_bash_check), 1)
+    assert rep.outcome != "pass" and rep.not_applicable_checks == [BASH_ARGS_OBJECTIVE], rep.reason
+    verdict = grade_case(spec, [inject_run(mutate=only_the_bash_check) for _ in range(3)], admitted=True)
+    assert verdict.rung is Rung.NOT_GRADED_ON_TRANSPORT and verdict.blocking is False, verdict.reason
+
+
 def test_an_inputless_worker_entry_is_not_the_routers(write_task, inject_run):
     spec = _arguments_spec(write_task)
     worker = {**_bash(absent=True), "agent": "cluster-a"}
