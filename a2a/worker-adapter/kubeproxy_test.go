@@ -402,11 +402,11 @@ func TestTheKubeProxyLoopbackRefusesWithoutATaskOrACluster(t *testing.T) {
 	expectRefusal("no task", http.StatusForbidden, kubeProxyNoTaskMessage, kubeTestEchoPath)
 
 	_, end := f.p.BeginTask("task-none", "")
-	expectRefusal("a task with no credential", http.StatusForbidden, kubeProxyNoCredentialMessage, kubeTestEchoPath)
+	expectRefusal("a task with no credential", http.StatusForbidden, kubeProxyNoClusterMessage, kubeTestEchoPath)
 	end()
 
 	_, end = f.p.BeginTask("task-report", reportCredential())
-	expectRefusal("a report credential", http.StatusForbidden, kubeProxyNoCredentialMessage, kubeTestEchoPath)
+	expectRefusal("a report credential", http.StatusForbidden, kubeProxyNoClusterMessage, kubeTestEchoPath)
 	end()
 
 	_, end = f.p.BeginTask("task-misshapen", "not a credential")
@@ -851,7 +851,7 @@ func TestAClusterThisPathCantAddressIsSaidSo(t *testing.T) {
 		t.Errorf("the task is held to %q, want no context", target)
 	}
 	status, body, _ := f.get(t, kubeTestEchoPath)
-	if status != http.StatusForbidden || !strings.Contains(body, kubeProxyUnaddressedMessage) || strings.Contains(body, kubeProxyNoCredentialMessage) {
+	if status != http.StatusForbidden || !strings.Contains(body, kubeProxyUnaddressedMessage) || strings.Contains(body, kubeProxyNoClusterMessage) {
 		t.Errorf("status %d, body %q; want a 403 saying the cluster can't be addressed", status, body)
 	}
 	end()
@@ -868,7 +868,7 @@ func TestAClusterThisPathCantAddressIsSaidSo(t *testing.T) {
 	if target != "" {
 		t.Errorf("a report task is held to %q, want no context", target)
 	}
-	if status, body, _ := f.get(t, kubeTestEchoPath); status != http.StatusForbidden || !strings.Contains(body, kubeProxyNoCredentialMessage) {
+	if status, body, _ := f.get(t, kubeTestEchoPath); status != http.StatusForbidden || !strings.Contains(body, kubeProxyNoClusterMessage) {
 		t.Errorf("a report task: status %d, body %q; want a 403 saying it has no cluster", status, body)
 	}
 	if got := strings.Count(f.logs.String(), logged); got != 1 {
@@ -1123,7 +1123,7 @@ func TestWithoutAPodTokenNothingIsSent(t *testing.T) {
 	expect503 := func(when string) {
 		t.Helper()
 		status, body, _ := f.get(t, kubeTestEchoPath)
-		if status != http.StatusServiceUnavailable || !strings.Contains(body, kubeProxyNoPodTokenMessage) {
+		if status != http.StatusServiceUnavailable || !strings.Contains(body, kubeProxyCallerUnknownMessage) {
 			t.Errorf("%s: status %d, body %q; want a local 503", when, status, body)
 		}
 	}

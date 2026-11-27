@@ -118,14 +118,14 @@ const (
 
 	// The local answers, each a Kubernetes Status so kubectl prints the
 	// message.
-	kubeProxyNoTaskMessage       = "worker-adapter: this pod is running no task, so there is no cluster to read. kubectl works only while a task runs."
-	kubeProxyNoCredentialMessage = "worker-adapter: this task was given no cluster, so kubectl has nothing to read. This is the task's scope, not an error to work around."
-	kubeProxyUnaddressedMessage  = "worker-adapter: this task has a cluster, but one this path can't address, so kubectl can't reach it from here. Retrying won't change that; say so in the task's report."
-	kubeProxyNotProxyMessage     = "worker-adapter: this listener serves kubectl on this pod only."
-	kubeProxyNotFoundMessage     = "worker-adapter: only paths under " + kubeProxyPathPrefix + " are served, in their plain form: a cluster with no percent-encoding, and no . or .. segment."
-	kubeProxyOtherClusterMessage = "worker-adapter: this task reads one cluster, and the request names another. This is the task's scope, not an error to work around."
-	kubeProxyNoPodTokenMessage   = "worker-adapter: the pod's own token can't be read, so kube-proxy can't tell who is calling."
-	kubeProxyUpstreamMessage     = "worker-adapter: the request to kube-proxy failed."
+	kubeProxyNoTaskMessage        = "worker-adapter: this pod is running no task, so there is no cluster to read. kubectl works only while a task runs."
+	kubeProxyNoClusterMessage     = "worker-adapter: this task was given no cluster, so kubectl has nothing to read. This is the task's scope, not an error to work around."
+	kubeProxyUnaddressedMessage   = "worker-adapter: this task has a cluster, but one this path can't address, so kubectl can't reach it from here. Retrying won't change that; say so in the task's report."
+	kubeProxyNotProxyMessage      = "worker-adapter: this listener serves kubectl on this pod only."
+	kubeProxyNotFoundMessage      = "worker-adapter: only paths under " + kubeProxyPathPrefix + " are served, in their plain form: a cluster with no percent-encoding, and no . or .. segment."
+	kubeProxyOtherClusterMessage  = "worker-adapter: this task reads one cluster, and the request names another. This is the task's scope, not an error to work around."
+	kubeProxyCallerUnknownMessage = "worker-adapter: the pod's own token can't be read, so kube-proxy can't tell who is calling."
+	kubeProxyUpstreamMessage      = "worker-adapter: the request to kube-proxy failed."
 
 	kubeProxyStatusKind        = "Status"
 	kubeProxyStatusAPIVersion  = "v1"
@@ -471,7 +471,7 @@ func (p *KubeProxyLoopback) serve(w http.ResponseWriter, r *http.Request) {
 	podToken, err := p.podToken()
 	if err != nil {
 		p.log.Warn("kube-proxy loopback: the pod's token can't be read", "file", p.podTokenFile, "err", err)
-		writeKubeProxyStatus(w, http.StatusServiceUnavailable, kubeProxyNoPodTokenMessage)
+		writeKubeProxyStatus(w, http.StatusServiceUnavailable, kubeProxyCallerUnknownMessage)
 		return
 	}
 	// The request ends with its caller or with its task, whichever is first.
@@ -649,7 +649,7 @@ func (p *KubeProxyLoopback) newTask(id, credential, target, refusal string) *kub
 // closes everything the task opened and waits for its requests to return;
 // it is safe to call more than once.
 func (p *KubeProxyLoopback) BeginTask(id, credential string) (string, func()) {
-	target, refusal := "", kubeProxyNoCredentialMessage
+	target, refusal := "", kubeProxyNoClusterMessage
 	switch {
 	case credential == "":
 	case len(credential) > maxTaskCredentialBytes || !taskCredentialShape.MatchString(credential):
