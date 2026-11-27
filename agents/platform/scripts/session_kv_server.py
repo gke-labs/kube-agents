@@ -1366,9 +1366,9 @@ DRIFT_UNKNOWN_FIELD = "unknown"
 # misstate it. The title is stored on the session's routing row, where
 # gateway/slack_ux_incident.py reads it; Slack's rename refuses `·`, so " in ".
 SLACK_PLATFORM = "slack"
-# The platforms a cron report's card goes to: Slack, and Google Chat where the gateway
-# routes it and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
-CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM)
+# The platforms a cron report's card goes to: Slack, and Google Chat and Microsoft Teams
+# where the gateway routes it and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
+CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM, chat_notify.TEAMS_PLATFORM)
 CRASHLOOP_REASON = "CrashLoopBackOff"
 BACKOFF_REASON = "BackOff"
 IMAGE_PULL_MARKER = "pulling image"
@@ -5918,8 +5918,8 @@ class AuditHeadline(NamedTuple):
 def _card_platform(platform: str, chat_id: str) -> bool:
     """Whether a cron report's card goes to ``platform``: with ``KAGE_SLACK_UX`` on, Slack
     (Block Kit through the relay, or a chat message through the gateway when
-    it holds Slack), or Google Chat when the gateway routes it, where the gateway
-    lays the chat message out; and a destination, the thread's chat or the home
+    it holds Slack), or Google Chat or Microsoft Teams when the gateway routes it, where
+    the gateway lays the chat message out; and a destination, the thread's chat or the home
     channel, which the gateway holds itself for the platform it routes."""
     routed = chat_notify.routes(platform)
     if not slack_presenter.enabled() or platform not in CARD_PLATFORMS or not (platform == SLACK_PLATFORM or routed):
@@ -6289,11 +6289,11 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
 def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) -> dict | None:
     """With ``KAGE_SLACK_UX`` on, the board-health card the report was said with (:mod:`board_health_card`).
 
-    None, and the leg posts the report as written, unless the leg is Slack, the
-    flag is on, a channel is known (the leg's chat id or the Slack home
-    channel), the job is ``kanban-board-health``, and its card file was written
-    for this very report. Never raises: a card that cannot be read posts as
-    text.
+    None, and the leg posts the report as written, unless the leg is a card
+    platform (:func:`_card_platform`), the flag is on, a channel is known (the
+    leg's chat id or the home channel), the job is ``kanban-board-health``, and
+    its card file was written for this very report. Never raises: a card that
+    cannot be read posts as text.
     """
     if job_id != kanban_board_health.JOB_ID or not _card_platform(platform, chat_id):
         return None
