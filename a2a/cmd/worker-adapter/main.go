@@ -273,6 +273,13 @@ func run() int {
 			// What a script-run task's credential is verified against
 			// (#5622): rendered into Job templates only.
 			TaskSigningKeys: os.Getenv("A2A_TASK_SIGNING_PUBLIC_KEYS"),
+			// The pod's kube-proxy, when the operator names one: kubectl then
+			// goes through the worker's loopback rather than the broker.
+			KubeProxy: workeradapter.KubeProxyLoopbackConfig{
+				Upstream:     os.Getenv(workeradapter.EnvKubeProxyURL),
+				CAFile:       os.Getenv(workeradapter.EnvKubeProxyCAFile),
+				PodTokenFile: os.Getenv(workeradapter.EnvCredentialProxyTokenFile),
+			},
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)

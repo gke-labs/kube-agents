@@ -694,6 +694,38 @@ func TestHandlerForwardsAHeaderNotNamed(t *testing.T) {
 	}
 }
 
+// The exported check and Config.ExtraCallerHeaders refuse the same names, so an
+// authenticator that validates its header names with it never hands NewHandler one it
+// rejects.
+func TestValidateCallerHeaderNamesMatchesExtraCallerHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		names []string
+		valid bool
+	}{
+		{names: nil, valid: true},
+		{names: []string{"X-Caller-User", "x-caller-user", "X_Caller.Tenant"}, valid: true},
+		{names: []string{""}},
+		{names: []string{"X-Caller-User", "X Caller"}},
+		{names: []string{"X-Caller:"}},
+		{names: []string{"X-Caller\n"}},
+		{names: []string{"Host"}},
+		{names: []string{"content-length"}},
+		{names: []string{"Transfer-Encoding"}},
+		{names: []string{"CONNECTION"}},
+		{names: []string{"Upgrade"}},
+	} {
+		err := ValidateCallerHeaderNames(tc.names)
+		if (err == nil) != tc.valid {
+			t.Errorf("ValidateCallerHeaderNames(%q) = %v, want valid = %t", tc.names, err, tc.valid)
+		}
+		if _, handlerErr := newExtraCallerHeaders(tc.names); (handlerErr == nil) != tc.valid {
+			t.Errorf("newExtraCallerHeaders(%q) = %v, want valid = %t", tc.names, handlerErr, tc.valid)
+		} else if handlerErr != nil && !strings.HasSuffix(handlerErr.Error(), err.Error()) {
+			t.Errorf("newExtraCallerHeaders(%q) = %v, want it to end with %v", tc.names, handlerErr, err)
+		}
+	}
+}
+
 func TestSanitizeRequestHeadersStripsExtraNamesInAnyCase(t *testing.T) {
 	extra, err := newExtraCallerHeaders([]string{"X-Test-Credential", "x-test-credential", "X-Other"})
 	if err != nil {

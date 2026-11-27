@@ -360,6 +360,15 @@ GET_CREDENTIALS_FETCHING_LINE = "Fetching cluster endpoint and auth data."
 GET_CREDENTIALS_GENERATED_LINE = "kubeconfig entry generated for {cluster}."
 DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
+# A profile worker's `KUBE_PROXY_URL` names its own adapter's loopback proxy
+# (a2a/worker-adapter/kubeproxy.go), plain http on 127.0.0.1, which attaches
+# the pod's token and the task's cluster credential itself. A kubeconfig for
+# it names no CA (there is no certificate to verify) and no token file (the
+# caller holds no credential to send). Only this exact form: plain http to any
+# other host gets the kubeconfig every other URL does.
+KUBE_PROXY_LOOPBACK_URL = re.compile(r"\Ahttp://127\.0\.0\.1:[0-9]{1,5}\Z")
+KUBECONFIG_CA_KEY = "certificate-authority"
+KUBECONFIG_TOKEN_FILE_KEY = "tokenFile"
 # Beside each kubeconfig the merge below checks, one line per context it found current or wrote:
 # `<context> <sha256 of the file> <sha256 of record version, proxy URL, CA file and token file>`. The
 # sandbox's kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an
@@ -1281,6 +1290,28 @@ def implicit_kubectl_context(argv: list[str]) -> str:
     return shell_context() or ""
 
 
+def _is_kube_proxy_loopback(proxy_url: str) -> bool:
+    """Whether `proxy_url` is a worker adapter's loopback proxy (KUBE_PROXY_LOOPBACK_URL)."""
+    return KUBE_PROXY_LOOPBACK_URL.match(proxy_url.rstrip("/")) is not None
+
+
+def _kube_proxy_cluster_entry(context: str, proxy_url: str, ca_file: str) -> dict:
+    """The kubeconfig `cluster` for `context` behind `proxy_url`: with the CA file, except for the
+    loopback proxy, which serves plain http."""
+    cluster = {"server": f"{proxy_url}/clusters/{context}"}
+    if not _is_kube_proxy_loopback(proxy_url):
+        cluster[KUBECONFIG_CA_KEY] = ca_file
+    return cluster
+
+
+def _kube_proxy_user_entry(proxy_url: str, token_file: str) -> dict:
+    """The kubeconfig `user` for a caller of `proxy_url`: its token file, except for the loopback
+    proxy, which supplies the credential itself."""
+    if _is_kube_proxy_loopback(proxy_url):
+        return {}
+    return {KUBECONFIG_TOKEN_FILE_KEY: token_file}
+
+
 def build_kube_proxy_kubeconfig(
     context: str,
     proxy_url: str | None = None,
@@ -1307,18 +1338,13 @@ def build_kube_proxy_kubeconfig(
         "clusters": [
             {
                 "name": context,
-                "cluster": {
-                    "server": f"{resolved_url}/clusters/{context}",
-                    "certificate-authority": resolved_ca,
-                },
+                "cluster": _kube_proxy_cluster_entry(context, resolved_url, resolved_ca),
             }
         ],
         "users": [
             {
                 "name": KUBE_PROXY_USER_NAME,
-                "user": {
-                    "tokenFile": resolved_token,
-                },
+                "user": _kube_proxy_user_entry(resolved_url, resolved_token),
             }
         ],
         "contexts": [
@@ -1526,7 +1552,8 @@ def _merge_context_into_kubeconfig_file(
             return
         if not isinstance(doc, dict):
             return
-        expected_server = f"{proxy_url}/clusters/{context}"
+        expected_cluster = _kube_proxy_cluster_entry(context, proxy_url, ca_file)
+        expected_user = _kube_proxy_user_entry(proxy_url, token_file)
         existing_clusters = list(doc.get("clusters") or [])
         existing_contexts = list(doc.get("contexts") or [])
         existing_users = list(doc.get("users") or [])
@@ -1534,8 +1561,8 @@ def _merge_context_into_kubeconfig_file(
             isinstance(c, dict)
             and c.get("name") == context
             and isinstance(c.get("cluster"), dict)
-            and c["cluster"].get("server") == expected_server
-            and c["cluster"].get("certificate-authority") == ca_file
+            and c["cluster"].get("server") == expected_cluster["server"]
+            and c["cluster"].get(KUBECONFIG_CA_KEY) == expected_cluster.get(KUBECONFIG_CA_KEY)
             for c in existing_clusters
         )
         has_context = any(
@@ -1549,7 +1576,7 @@ def _merge_context_into_kubeconfig_file(
         has_user = any(
             isinstance(u, dict)
             and u.get("name") == KUBE_PROXY_USER_NAME
-            and u.get("user") == {"tokenFile": token_file}
+            and u.get("user") == expected_user
             for u in existing_users
         )
         if has_cluster and has_context and has_user:
@@ -1564,10 +1591,7 @@ def _merge_context_into_kubeconfig_file(
         clusters.append(
             {
                 "name": context,
-                "cluster": {
-                    "server": expected_server,
-                    "certificate-authority": ca_file,
-                },
+                "cluster": expected_cluster,
             }
         )
         doc["clusters"] = clusters
@@ -1579,7 +1603,7 @@ def _merge_context_into_kubeconfig_file(
         users.append(
             {
                 "name": KUBE_PROXY_USER_NAME,
-                "user": {"tokenFile": token_file},
+                "user": expected_user,
             }
         )
         doc["users"] = users

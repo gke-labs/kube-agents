@@ -358,9 +358,14 @@ readonly EVAL_FENCE_GATEWAY_AWAY_LATCH=".gateway-away"
 readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
-# script, so five stalled calls still finish and name themselves inside this.
-# A first-run audit's pause comes after one more read of the roster and the
-# runs' ledger, bounded at 10s by the ledger's busy timeout.
+# script and not tried again in a pass once it has timed out. A first-run
+# audit's pause comes after one more read of the roster and the runs' ledger,
+# bounded at 10s by the ledger's busy timeout. So a pause whose every call
+# stalls still finishes and names them inside this when it covers the
+# first-run stage's audits, or the other model-run jobs
+# (scripts/test_ci_pause_scheduled_audits.py holds both). A pass over the
+# other model-run jobs and stage audits together can outlast it: a pause once
+# the stage is past some of its audits, or the resume of all that were paused.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
@@ -2662,8 +2667,8 @@ scheduled_audits() { # <pause|chain|resume> <label>
 }
 
 # The first-run stage's audits are three of the clock-started ones plus two more, and
-# the stage skips one that is paused, so the lease and fan-out pauses leave them on
-# (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
+# the stage skips one that is paused, so the lease and fan-out pauses leave each on
+# until the stage is past it (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
 # says when), every
 # EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
 # run would be a second full run nothing grades. Started outside the job table
@@ -4941,6 +4946,9 @@ unit_cost_hint() {
     # The same shape again, plus a detector stop and relaunch before the live
     # card wait. Unmeasured; priced with its siblings.
     gitops-drift-backlog-digest) echo 900 ;;
+    # The same shape with no detector stop: a publish, a card wait and the
+    # digest's settle. Unmeasured; priced with its siblings.
+    gitops-drift-own-release-digest) echo 900 ;;
     # The two CUJ 1 halves (#2889), registered 2026-10-20. Same shape as
     # gitops-drift-out-of-band-triage and gitops-drift-noise-filtered-triage
     # -- infra lock, a plant, an inject and a card wait -- and the band is a
@@ -5031,7 +5039,8 @@ unit_cost_hint() {
     # One real scheduled compliance audit the stack fires and waits out, with
     # the stream's stored report and digest record moved aside, so a full
     # audit every time. The fired run took 11 to 13 minutes on two dev
-    # installs; unmeasured on a lane. Off the infra lock (infra_lock_exempt),
+    # installs, and 329 to 539s on the nightlies of 2026-11-25 and 11-26, a
+    # repetition 483 to 684s. Off the infra lock (infra_lock_exempt),
     # so it is in none of the stack chains this hint prices; priced as the
     # case above, over compliance-rbac-overgrant's requested run, so it
     # launches early.
