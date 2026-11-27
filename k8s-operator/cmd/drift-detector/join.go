@@ -144,7 +144,8 @@ const (
 	// writes come from Helm's Go client, so a late kubectl write is far more
 	// likely a person's edit made just before a restart. The user agent is
 	// self-declared; the rule only routes such a record the way a live one
-	// goes.
+	// goes. The one exception is a write to a kube-agents CRD, which the
+	// installer itself makes with kubectl: see ownRelease.wrote.
 	kubectlUserAgentPrefix = "kubectl/"
 
 	// slowAnswer stands in for the cause of a bench whose lookup answered, so
@@ -163,9 +164,10 @@ type slowCluster struct {
 	cause   string
 }
 
-// digestible reports whether a record goes to the daemon's digest rather than
-// a card, when the daemon takes the digest route: a backlog record not sent by
-// kubectl. See kubectlUserAgentPrefix.
+// digestible reports whether a late record goes to the daemon's digest rather
+// than a card, when the daemon takes the digest route: a backlog record not
+// sent by kubectl. See kubectlUserAgentPrefix. A record the own-release rule
+// marks goes to the digest route whatever this says.
 func digestible(record AuditRecord) bool {
 	return record.Backlog && !strings.HasPrefix(record.UserAgent, kubectlUserAgentPrefix)
 }
@@ -255,14 +257,19 @@ type joinCounts struct {
 
 	// SkippedBacklog is records not looked up because they are backlog.
 	SkippedBacklog int
+
+	// OwnRelease is records the own-release rule marked
+	// (DriftEvent.OwnRelease). Not an outcome: the record keeps the outcome
+	// its lookup had.
+	OwnRelease int
 }
 
 // String renders the tally for the shutdown line, always printing every
 // outcome. A zero that is absent reads as a category that did not apply; a zero
 // that is printed reads as one that did not happen, and those differ.
 func (c joinCounts) String() string {
-	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d benched=%d skipped_backlog=%d",
-		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed, c.Benched, c.SkippedBacklog)
+	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d benched=%d skipped_backlog=%d own_release=%d",
+		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed, c.Benched, c.SkippedBacklog, c.OwnRelease)
 }
 
 // DriftEvent is an audit record plus what the live object says about it. It is
@@ -332,12 +339,32 @@ type DriftEvent struct {
 	// boundary from a misconfiguration is whether a profile names the cluster.
 	OutOfScope bool
 
-	// Digest is set by the joiner on a backlog record that goes to the daemon's
-	// digest route rather than a card: the daemon advertises the route and the
-	// record is not held out of scope. It is what the DRIFT line's backlog
-	// marker reports, so a backlog record that is still carded (an older
-	// daemon) is not logged as one that is not.
+	// Digest is set by the joiner on a record that goes to the daemon's digest
+	// route rather than a card: a backlog record, or one OwnRelease marks. The
+	// daemon advertises the route and the record is not held out of scope. It
+	// is what the DRIFT line's markers report, so a backlog record that is
+	// still carded (an older daemon) is not logged as one that is not.
 	Digest bool
+
+	// HelmRelease is the release the live object's annotations name, zero
+	// unless Outcome is joinEnriched.
+	HelmRelease helmRelease
+
+	// OwnRelease is which part of ownRelease.wrote the record matched, set
+	// only with the digest route on. A match implies Digest, late or not.
+	OwnRelease ownReleaseKind
+
+	// ReleaseRevision is the Helm revision the record starts and
+	// ReleaseRevisionEnd the one it ends (ownRelease.releaseRevision), "" for
+	// every other record.
+	ReleaseRevision    string
+	ReleaseRevisionEnd string
+}
+
+// late reports whether the event goes to the digest and reached the detector
+// late, whatever else marks it.
+func (e DriftEvent) late() bool {
+	return e.Digest && e.Record.Backlog
 }
 
 // driftEventHandler consumes an enriched record. logDriftEvent is one; with
@@ -497,6 +524,12 @@ type joiner struct {
 	// advertises the digest route, because that is when a backlog record is
 	// not going to a card.
 	skipBacklog bool
+
+	// own is the install's own Helm release, for DriftEvent.OwnRelease. Left
+	// zero, which marks nothing, unless the daemon advertises
+	// featureDriftOwnRelease: a daemon without it has nowhere but a card to
+	// send the record, or would digest it by count and word it as late.
+	own ownRelease
 }
 
 // newJoiner builds the handler. An empty or nil cluster set is legal and
@@ -577,7 +610,13 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 	case joinSkippedBacklog:
 		j.counts.SkippedBacklog++
 	}
-	event.Digest = j.skipBacklog && digestible(record) && !event.OutOfScope
+	backlogDigest := j.skipBacklog && digestible(record) && !event.OutOfScope
+	event.OwnRelease = j.own.wrote(event)
+	event.ReleaseRevision, event.ReleaseRevisionEnd = j.own.releaseRevision(record)
+	if event.OwnRelease != ownReleaseNone {
+		j.counts.OwnRelease++
+	}
+	event.Digest = backlogDigest || event.OwnRelease != ownReleaseNone
 
 	j.next(ctx, event)
 }
@@ -744,6 +783,7 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 
 	event.Outcome = joinEnriched
 	event.Owners = ownership(obj)
+	event.HelmRelease = releaseOf(obj)
 	event.Reconciled, event.ReconciledBy = j.reconciledBy(event.Owners, record.Timestamp)
 	return event
 }
@@ -1029,8 +1069,17 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 	if event.OutOfScope {
 		line += " " + injectHeldOutOfScopeMarker
 	}
-	if event.Digest {
+	if event.late() {
 		line += fmt.Sprintf(" %s publish_time=%s", backlogMarker, record.PublishTime.Format(time.RFC3339))
+	}
+	if event.OwnRelease != ownReleaseNone {
+		line += fmt.Sprintf(" %s=%s", ownReleaseField, event.OwnRelease)
+	}
+	if event.ReleaseRevision != "" {
+		line += fmt.Sprintf(" %s=%s", releaseRevisionField, event.ReleaseRevision)
+	}
+	if event.ReleaseRevisionEnd != "" {
+		line += fmt.Sprintf(" %s=%s", releaseRevisionEndField, event.ReleaseRevisionEnd)
 	}
 
 	log.Print(line)

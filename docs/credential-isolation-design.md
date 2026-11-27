@@ -136,7 +136,12 @@ lowercase word, before either reaches that Pod. The tier also goes, normalised t
 the A2A gateway, which sets it on the session Pods it starts under the cluster view, since their
 kubectl runs the same admission, and to the credential broker (stateful and exec tiers), whose
 kubectl admission charges profile workers' cluster-wide reads from the same table; it is reserved
-there, so `spec.deployment.env` cannot pass a raw value through. The three
+there, so `spec.deployment.env` cannot pass a raw value through. Literal `HTTP_PROXY`,
+`HTTPS_PROXY`, `NO_PROXY`, `http_proxy`, `https_proxy`, and `no_proxy` entries from
+`spec.deployment.env` (`a2aGatewayProxyEnvNames` in
+`k8s-operator/internal/controller/platformagent_a2a_manifests.go`, ignoring `valueFrom`) also
+forward to `<name>-a2a-gateway`; its in-cluster Kubernetes API and Google Chat/Teams relay clients
+bypass proxy resolution. The three
 earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
 `KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
 the switch knows or `off`, and the agent pinned in its managed `.env` rather than
@@ -312,7 +317,10 @@ would drop every open watch. Envoy's admin interface stays
 on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
-8643 and forwards to the agent on loopback using a non-secret sentinel. It is a
+8643, answers `GET /api/scope` directly from `fleet_scope.json`, the Cluster
+Agent profile directories on `/opt/data`, and `k8s-event-watcher`'s loopback
+`/metrics` port, and forwards other paths to the agent on loopback using a
+non-secret sentinel. It is a
 native sidecar in the gateway Pod, so the kubelet starts it before every app
 container and stops it after them, and an unready sidecar makes the Pod unready.
 It also hosts the `k8s-event-watcher`, which is why splitting the broker out
@@ -1110,8 +1118,10 @@ relay.
 
 The Kubernetes Service sends API traffic to port 8643 on `agent-api-auth`, the
 native sidecar in the gateway Pod. It validates the configured external bearer
-key and replaces it with the fixed, non-secret sentinel before forwarding to port
-8642 on loopback.
+key, answers `GET /api/scope` directly from `fleet_scope.json`, the Cluster
+Agent profile directories on the data volume, and `k8s-event-watcher`'s loopback
+`/metrics` listener, and replaces the key with the fixed, non-secret sentinel
+before forwarding other requests to port 8642 on loopback.
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
 

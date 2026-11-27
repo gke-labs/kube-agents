@@ -56,7 +56,7 @@ func generate(t *testing.T, gw *fakeGemini) (string, error) {
 	t.Setenv("GOOGLE_GEMINI_BASE_URL", proxy.URL)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	m, err := buildModel(ctx, "gemini-default")
+	m, err := buildModel(ctx, "gemini-default", false)
 	if err != nil {
 		t.Fatal(err)
 	}

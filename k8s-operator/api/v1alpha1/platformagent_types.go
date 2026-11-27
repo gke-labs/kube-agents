@@ -93,21 +93,37 @@ type PlatformAgentSpec struct {
 	// +optional
 	Tiers *PlatformAgentTiersSpec `json:"tiers,omitempty"`
 
-	// Schedules adjusts the built-in AgentSchedules the operator renders.
+	// Schedules suspends built-in schedules: the built-in AgentSchedules the
+	// operator renders, and the scheduled jobs the agent image ships in the
+	// Platform Agent's cron roster.
 	// +optional
 	Schedules *PlatformAgentSchedulesSpec `json:"schedules,omitempty"`
 }
 
-// PlatformAgentSchedulesSpec adjusts the operator's built-in AgentSchedules.
-// A built-in's spec is the operator's to write, and the admission policy
-// freezes it except spec.suspend, so an override is the one supported way
-// to change a built-in without a release.
+// PlatformAgentSchedulesSpec suspends built-in schedules: the operator's
+// built-in AgentSchedules, and the jobs the agent image ships in the Platform
+// Agent's cron roster. A built-in AgentSchedule's spec is the operator's to
+// write, and the admission policy freezes it except spec.suspend, so this is
+// the one supported way to change a built-in without a release.
 type PlatformAgentSchedulesSpec struct {
+	// SuspendAll suspends every built-in schedule that no entry in
+	// overrides names: the built-in AgentSchedules, and the scheduled jobs
+	// the agent image still ships in the Platform Agent's cron roster, which
+	// take the change when the agent pod restarts. An entry in overrides
+	// wins, so suspend: false there turns one schedule back on. A
+	// run-now-only built-in is not affected.
+	// +optional
+	SuspendAll bool `json:"suspendAll,omitempty"`
+
 	// Overrides sets spec.suspend on built-in schedules, keyed on the
 	// schedule's rendered name: a canary (<name>-canary) and its live row
 	// are separate entries, so a suspend never carries from one phase to the
-	// other. An entry naming no built-in is reported on the PlatformAgent's
-	// BuiltinSchedules condition and otherwise ignored. A run-now-only
+	// other. A scheduled job in the Platform Agent's cron roster takes an
+	// entry under its job id, applied when the agent pod restarts; suspend:
+	// false does not start a job the image ships disabled. An entry naming no
+	// built-in and no such job is ignored, and is reported on the
+	// PlatformAgent's BuiltinSchedules condition while the operator runs
+	// AgentSchedules. A run-now-only
 	// built-in, such as onboarding, takes only suspend: true, which stops
 	// the operator from starting its run; suspend: false is refused and
 	// reported, since it would put the schedule on its nominal cron.
@@ -118,14 +134,15 @@ type PlatformAgentSchedulesSpec struct {
 	Overrides []AgentScheduleOverride `json:"overrides,omitempty"`
 }
 
-// AgentScheduleOverride sets one built-in schedule's spec.suspend.
+// AgentScheduleOverride suspends, or turns back on, one built-in schedule.
 type AgentScheduleOverride struct {
-	// Name is the built-in schedule's rendered name.
+	// Name is the built-in AgentSchedule's rendered name, or a job id in the
+	// Platform Agent's cron roster.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 	// Suspend is the value the operator writes to the schedule's
-	// spec.suspend.
+	// spec.suspend. For a roster job, true holds the job off.
 	Suspend bool `json:"suspend"`
 }
 

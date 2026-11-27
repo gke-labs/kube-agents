@@ -22,11 +22,16 @@ written before the turn (the newest, per repository store) or during it, unless 
 ledger to give.
 
 The store is read after the reply with the install's own reader: ``report_status.py`` from the
-agent image (root-owned, so the model cannot have edited the grader's reader), run in the shell
-sandbox, where the audits' shell writes the store. The sandbox is not optional on this operator
-(``ShellSandboxSpec``), so there is nowhere else to read: a sandbox pod that cannot be read is an
-error, never a fallback, and a store root absent in the sandbox is a store nothing has written to
-yet, which the pass reason and ``raw`` say.
+agent image (root-owned, so the model cannot have edited the grader's reader), run where the
+audits' shell keeps the store. Which store that is, the operator renders on the sandbox's shell
+container as ``FLEET_AUDIT_REPORT_STORE`` (``onboarding.report_store``). With it unset, empty or
+``file``, the store is on the sandbox's own volume and is read in the shell sandbox. With it
+``broker`` (#6110), the shell writes through the credential broker, whose files are under the same
+root on the gateway pod's data volume, so the store is read in the agent container. Any other value,
+or a pod spec that cannot be read, is an error: a guess would grade the run against a store it did
+not write. The sandbox is not optional on this operator (``ShellSandboxSpec``), so there is nowhere
+else to read: a pod that cannot be read is an error, never a fallback, and a store root absent
+there is a store nothing has written to yet, which the pass reason and ``raw`` say.
 
 Which envelopes count is decided by when each file was written, not by its ``finished_at``:
 ``finish`` stamps a run before it publishes and writes the store after, so a run stamped before
@@ -67,10 +72,17 @@ from kube_agents_bench.verifiers import (
     AuditId,
     _OnboardingPollVerifier,
 )
+from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
 # The install's copy of the store's reader in the agent image (deploy/docker/Dockerfile copies
 # agents/platform/skills to /opt/platform-template/skills and chowns it to root).
 READER_PATH = "/opt/platform-template/skills/fleet-audit/scripts/report_status.py"
+# The interpreter the driver runs under: the sandbox's python3 on PATH, or in the agent
+# container its own interpreter, where a bare `python3` on PATH is not guaranteed.
+SANDBOX_PYTHON = "python3"
+AGENT_PYTHON = f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; "$PY"'
+# How the broker store's read place is named in reasons and ``raw``.
+AGENT_CONTAINER_PLACE = "the agent container"
 READER_READ = "__REPORT_STATUS_SOURCE__"
 STORE_READ = "__REPORT_STORE_REPLY__"
 # A reply cites a stored ledger URL when the URL appears in it with no digit right after, so
@@ -155,15 +167,18 @@ def read_reader_source(timeout: float) -> str | None:
     return source if source and source.strip() else None
 
 
-def store_command(source: str, root: str, since: float, audits: list[str]) -> str:
-    """The ``sh -c`` line that runs the driver over ``source`` against ``root``."""
+def store_command(source: str, root: str, since: float, audits: list[str], python: str = SANDBOX_PYTHON) -> str:
+    """The ``sh -c`` line that runs the driver over ``source`` against ``root`` under ``python``."""
     args = [source, root, repr(since), *audits]
-    return "python3 -I -c " + " ".join(shlex.quote(a) for a in [_DRIVER, *args])
+    return python + " -I -c " + " ".join(shlex.quote(a) for a in [_DRIVER, *args])
 
 
-def read_store(shell, source: str, since: float, audits: list[str], timeout: float) -> dict[str, Any] | None:
+def read_store(
+    shell, source: str, since: float, audits: list[str], timeout: float, python: str = SANDBOX_PYTHON
+) -> dict[str, Any] | None:
     """The driver's document, or None when the pod gave none."""
-    tail = _after_sentinel(shell(store_command(source, REPORT_STORE_ROOT, since, audits), timeout), STORE_READ)
+    command = store_command(source, REPORT_STORE_ROOT, since, audits, python)
+    tail = _after_sentinel(shell(command, timeout), STORE_READ)
     if tail is None:
         return None
     try:
@@ -205,9 +220,10 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
     """Checks that the reply gives each audit's latest report from the fleet-audit report store.
 
     ``audits``: the audits the request names, each graded as the module docstring says. A reply
-    that does not mention an audit fails it. A run with no start time, a sandbox pod that cannot
-    be read, a reader that cannot be fetched, or an envelope with no ``issue_url`` key at all (a
-    store format this check does not know) is ``status="error"``.
+    that does not mention an audit fails it. A run with no start time, a report store switch that
+    cannot be read or is neither ``file`` nor ``broker``, a store pod that cannot be read, a reader
+    that cannot be fetched, or an envelope with no ``issue_url`` key at all (a store format this
+    check does not know) is ``status="error"``.
     """
 
     type: Literal["report_store_reply"]
@@ -225,10 +241,19 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
             return "error", f"could not read {READER_PATH} from the agent container", None
         since = snap.started_at - self.max_clock_skew_sec
         audits = list(dict.fromkeys(self.audits))
-        pod = onboarding.sandbox_pod()
-        store = read_store(onboarding.sandbox_shell, source, since, audits, read_timeout)
+        try:
+            kind = onboarding.report_store(read_timeout)
+        except RuntimeError as exc:
+            return "error", str(exc), None
+        if kind == onboarding.REPORT_STORE_BROKER:
+            place = where = AGENT_CONTAINER_PLACE
+            store = read_store(onboarding.agent_shell, source, since, audits, read_timeout, AGENT_PYTHON)
+        else:
+            where = onboarding.sandbox_pod()
+            place = f"the shell sandbox pod {where}"
+            store = read_store(onboarding.sandbox_shell, source, since, audits, read_timeout)
         if store is None:
-            return "error", f"could not read the report store in the shell sandbox pod {pod}", None
+            return "error", f"could not read the report store in {place}", None
         accepted: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for audit in audits:
             entry = store["audits"].get(audit) or {}
@@ -266,10 +291,10 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
                 expected = sorted(needed)[:REASON_URLS_SHOWN]
                 failures.append(f"{audit}: no ledger URL of its latest report; expected one of {expected}")
         root_exists = bool(store.get("root_exists"))
-        raw = {"accepted": accepted, "pod": pod, "root_exists": root_exists}
+        raw = {"accepted": accepted, "pod": where, "root_exists": root_exists}
         if failures:
             return "fail", "; ".join(failures), raw
-        reason = f"each of the {len(audits)} audits has its latest report from the store in {pod}"
+        reason = f"each of the {len(audits)} audits has its latest report from the store in {where}"
         if not root_exists:
             reason += " (the store root is absent there: nothing stored yet, so no link was required)"
         return "pass", reason, raw

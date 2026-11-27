@@ -188,6 +188,10 @@ HTTP_NOT_FOUND = 404
 ORIGIN_CACHE_TTL_SECONDS = 30
 #: Minting and redeeming a ticket each wait at most this long, on loopback.
 STAMP_TICKET_TIMEOUT_SECONDS = 2.0
+#: Session KV is on the pod's loopback address: a proxy from the environment
+#: must not get the request and its bearer token, and urllib does not leave
+#: out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 #: The card a dispatcher-spawned worker runs, as the dispatcher sets it.
 WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
@@ -319,7 +323,7 @@ def _fetch_session_origin(session_id: str) -> Optional[dict]:
         session_id=urllib.parse.quote(session_id, safe="")
     )
     try:
-        with urllib.request.urlopen(
+        with _SESSION_KV_OPENER.open(
             urllib.request.Request(url, headers=headers), timeout=SESSION_LOOKUP_TIMEOUT_SECONDS
         ) as response:
             loaded = json.loads(response.read() or b"{}")
@@ -415,7 +419,7 @@ def _session_kv(path: str, payload: Optional[dict] = None) -> dict:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=STAMP_TICKET_TIMEOUT_SECONDS) as response:
+    with _SESSION_KV_OPENER.open(request, timeout=STAMP_TICKET_TIMEOUT_SECONDS) as response:
         loaded = json.loads(response.read() or b"{}")
     return loaded if isinstance(loaded, dict) else {}
 

@@ -73,6 +73,10 @@ METADATA = "the metadata server"
 HINDSIGHT = "the Hindsight Service"
 
 LOOPBACK_BEARER = "a loopback http call with a bearer token; the suggested NO_PROXY does not cover 127.0.0.1"
+LOOPBACK_PROMPT = (
+    "a loopback http call with the prompt; a proxy cannot reach the pod's loopback, so the turn fails; "
+    "the suggested NO_PROXY does not cover 127.0.0.1"
+)
 BROKER_BEARER = "an http call inside the cluster, or on the pod, with the projected ServiceAccount token"
 API_SERVER_BEARER = "an in-cluster https call with a ServiceAccount token; a proxy must not be in its path"
 PUBLIC_HOST = "a public host; an install behind an egress proxy needs the proxy"
@@ -93,21 +97,19 @@ DECISIONS = (
     Decision("agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py", "<module>._GATEWAY_API_OPENER", BUILD_OPENER, REFUSES, REFUSE, GATEWAY_API, LOOPBACK_BEARER),
     Decision("agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py", "PubsubRelay.__init__", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     # The chat profile.
-    Decision("agents/chat/defaults/plugins/chat_metrics/metrics.py", "ProposalsOpenedGauge._read", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision("agents/chat/scripts/bootstrap_delivery.py", "_post_surfaced", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision("agents/chat/scripts/bootstrap_delivery.py", "_post_cron_report", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision("agents/chat/scripts/memory_file_import.py", "Hindsight.call", URLOPEN, TAKES, REFUSE, HINDSIGHT, "an in-cluster http call that carries memory text"),
-    Decision("agents/chat/scripts/memory_ttl_curator.py", "Hindsight.call", URLOPEN, TAKES, REFUSE, HINDSIGHT, "an in-cluster http call that carries memory text"),
+    Decision("agents/chat/defaults/plugins/chat_metrics/metrics.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision("agents/chat/scripts/bootstrap_delivery.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision("agents/chat/scripts/memory_file_import.py", "<module>._HINDSIGHT_OPENER", BUILD_OPENER, REFUSES, REFUSE, HINDSIGHT, "an in-cluster http call that carries memory text"),
+    Decision("agents/chat/scripts/memory_ttl_curator.py", "<module>._HINDSIGHT_OPENER", BUILD_OPENER, REFUSES, REFUSE, HINDSIGHT, "an in-cluster http call that carries memory text"),
     # The platform profile's plugins.
-    Decision("agents/platform/plugins/incident_context/__init__.py", "_post", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision("agents/platform/plugins/incident_context/__init__.py", "_get", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision("agents/platform/plugins/incident_context/__init__.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(
         "agents/platform/plugins/model_identity/__init__.py", "<module>._MODEL_INFO_OPENER", BUILD_OPENER, REFUSES, REFUSE,
         "the LiteLLM inference gateway", "an in-cluster http call that may carry the inference gateway bearer key",
     ),
-    Decision("agents/platform/plugins/pr_opened/__init__.py", "_session_kv_post", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision("agents/platform/plugins/pr_opened/__init__.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     # The platform profile's scripts.
-    Decision(SCRIPTS + "agent_common_server.py", "call_agent", URLOPEN, TAKES, REFUSE, "the platform agent Service", "an in-cluster call with the gateway key"),
+    Decision(SCRIPTS + "agent_common_server.py", "<module>._AGENT_OPENER", BUILD_OPENER, REFUSES, REFUSE, "the platform agent Service", "an in-cluster https call with the prompt; a proxy must not be in its path"),
     Decision(SCRIPTS + "audit_report_store.py", "_http_get_json", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
     Decision(SCRIPTS + "broker_admission.py", "<module>._OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "credential_proxy.py", "<module>._METADATA_OPENER", BUILD_OPENER, REFUSES, REFUSE, METADATA, "a link-local address must never go through a proxy"),
@@ -117,7 +119,7 @@ DECISIONS = (
     Decision(SCRIPTS + "credential_proxy.py", "<module>._TEAMS_OPENER", BUILD_OPENER, TAKES, KEEP, "the Microsoft identity and Bot Framework hosts", PUBLIC_HOST),
     Decision(SCRIPTS + "dial_state.py", "<module>._BROKER_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, "an in-cluster http call with the broker token"),
     Decision(SCRIPTS + "feedback_broker.py", "_fetch", URLOPEN, TAKES, KEEP, "api.github.com, github.io and docs.google.com", PUBLIC_HOST),
-    Decision(SCRIPTS + "findings_nudge.py", "_request", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(SCRIPTS + "findings_nudge.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(SCRIPTS + "github_token_refresh.py", "<module>.metadata_open", BUILD_OPENER, REFUSES, REFUSE, METADATA, "a link-local address must never go through a proxy"),
     Decision(
         SCRIPTS + "github_token_refresh.py", "<module>._IN_CLUSTER_OPENER", BUILD_OPENER, REFUSES, REFUSE,
@@ -130,7 +132,7 @@ DECISIONS = (
         "outside the cluster is behind the install's egress; the operator's minter goes through the opener above",
     ),
     Decision(SCRIPTS + "google_chat_relay_patch.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
-    Decision(SCRIPTS + "inventory_findings.py", "_request", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(SCRIPTS + "inventory_findings.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(SCRIPTS + "platform_mcp_server.py", "send_notification", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(SCRIPTS + "platform_mcp_server.py", "send_notification", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(SCRIPTS + "platform_mcp_server.py", "report_to_chat", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
@@ -140,17 +142,17 @@ DECISIONS = (
         "a GitHub, GitLab, Bitbucket or Gitea host; the site tells an operator to set HTTPS_PROXY for this client",
     ),
     Decision(SCRIPTS + "scope_publisher.py", "_kube_request", URLOPEN, TAKES, REFUSE, API_SERVER, API_SERVER_BEARER),
-    Decision(SCRIPTS + "session_kv_server.py", "_create_gateway_session", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_BEARER),
-    Decision(SCRIPTS + "session_kv_server.py", "_start_agent_turn", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_BEARER),
+    Decision(SCRIPTS + "session_kv_server.py", "_create_gateway_session", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_PROMPT),
+    Decision(SCRIPTS + "session_kv_server.py", "_start_agent_turn", URLOPEN, TAKES, REFUSE, GATEWAY_API, LOOPBACK_PROMPT),
     Decision(SCRIPTS + "slack_blocks_post.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
     Decision(SCRIPTS + "slack_relay_patch.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
-    Decision(SCRIPTS + "stall_watch.py", "session_kv", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(SCRIPTS + "stall_watch.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(SCRIPTS + "teams_relay_patch.py", "<module>._RELAY_OPENER", BUILD_OPENER, REFUSES, REFUSE, BROKER, BROKER_BEARER),
-    Decision(SCRIPTS + "upgrade_readiness_review.py", "kv_request", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(SCRIPTS + "upgrade_readiness_review.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
     Decision(SCRIPTS + "wif_credentials.py", "_post", URLOPEN, TAKES, KEEP, "the Google STS and IAM Credentials hosts", PUBLIC_HOST),
     # The decision-memory skill.
     Decision(
-        "agents/platform/skills/decision-memory/scripts/decision_memory.py", "Hindsight._req", URLOPEN, TAKES, REFUSE, HINDSIGHT,
+        "agents/platform/skills/decision-memory/scripts/decision_memory.py", "<module>._HINDSIGHT_OPENER", BUILD_OPENER, REFUSES, REFUSE, HINDSIGHT,
         "an in-cluster or loopback http call that carries decision records",
     ),
     Decision(
@@ -160,13 +162,11 @@ DECISIONS = (
         "that the suggested NO_PROXY covers",
     ),
     # The patches of the gateway image, and its chat plugin.
-    Decision(PATCHES + "cron_job_template.py", "recorded_origin", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(PATCHES + "cron_job_template.py", "record_job_origin", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(PATCHES + "kanban_notifier.py", "_post_incident", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(PATCHES + "kanban_origin.py", "_fetch_session_origin", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(PATCHES + "kanban_origin.py", "_session_kv", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision(PATCHES + "slack_ux_clicks.py", "_board_request", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
-    Decision("deploy/docker/plugins/chat/adapter.py", "_post", URLOPEN, TAKES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(PATCHES + "cron_job_template.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(PATCHES + "kanban_notifier.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(PATCHES + "kanban_origin.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision(PATCHES + "slack_ux_clicks.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
+    Decision("deploy/docker/plugins/chat/adapter.py", "<module>._SESSION_KV_OPENER", BUILD_OPENER, REFUSES, REFUSE, SESSION_KV, LOOPBACK_BEARER),
 )
 
 # The files of the audit. A file stays here when its last call is gone, so a

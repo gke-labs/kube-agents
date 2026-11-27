@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Signs promoted GA release container images in GHCR using Keyless Cosign OIDC.
+# Signs promoted GA release container images using Keyless Cosign OIDC, in each
+# registry the release is published to (release_registry_prefixes in common.sh).
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 set -euo pipefail
 
@@ -33,12 +34,14 @@ if ! is_ci_pipeline; then
   exit 0
 fi
 
-REGISTRY_PREFIX="$(get_registry_prefix)"
+release_registries=()
+release_registry_lines="$(release_registry_prefixes)"
+while IFS= read -r release_registry; do release_registries+=("${release_registry}"); done <<<"${release_registry_lines}"
 
 echo "======================================================================"
 echo "🛡️ SIGNING RELEASE CONTAINER IMAGES (COSIGN OIDC)"
 echo "Release Version: ${RELEASE_VERSION}"
-echo "Registry Prefix: ${REGISTRY_PREFIX}"
+echo "Registry Prefix: ${release_registries[*]}"
 echo "======================================================================"
 
 # The list to sign is the release's own: scripts/release/common.sh as the
@@ -51,14 +54,16 @@ if [ "${#release_images[@]}" -eq 0 ]; then
   exit 1
 fi
 
-for img in "${release_images[@]}"; do
-  local_target="${REGISTRY_PREFIX}/${img}:${RELEASE_VERSION}"
-  echo "  • Signing ${local_target}..."
-  if ! cosign sign --yes "${local_target}"; then
-    echo "❌ ERROR: Failed to sign ${local_target} with cosign!" >&2
-    exit 1
-  fi
-  echo "    ✅ Signed ${local_target}"
+for release_registry in "${release_registries[@]}"; do
+  for img in "${release_images[@]}"; do
+    local_target="${release_registry}/${img}:${RELEASE_VERSION}"
+    echo "  • Signing ${local_target}..."
+    if ! cosign sign --yes "${local_target}"; then
+      echo "❌ ERROR: Failed to sign ${local_target} with cosign!" >&2
+      exit 1
+    fi
+    echo "    ✅ Signed ${local_target}"
+  done
 done
 
 echo "✅ Successfully signed all ${#release_images[@]} container images for release ${RELEASE_VERSION}."

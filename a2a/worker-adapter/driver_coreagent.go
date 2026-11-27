@@ -24,9 +24,11 @@ import (
 // starting over at each compaction summary, and the next turn's envelope
 // carries them back.
 type coreAgentDriver struct {
-	// Policy and MCP are the turn's tool policy and MCP servers, set by
-	// NewCoreAgentDriver from the worker's grant (the session allowlist
-	// today; MCP is none until the delegate server is wired).
+	// Policy is the turn's tool policy, set by NewCoreAgentDriver from the
+	// worker's grant: the session allowlist on a session pod, the persona's on
+	// a profile worker (WithPolicy). MCP is the turn's MCP servers, set each
+	// turn by WithMCP from the persona's (adapter.run, turnDriver); the pod's
+	// driver carries none.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 	// Instructions are the session pod's system-prompt lines, sent in each
@@ -53,6 +55,20 @@ func newCoreAgentDriver() coreAgentDriver {
 const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure reason token, not a credential
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
+
+// WithPolicy is the driver with p in its envelopes; the conversation history
+// it holds is shared.
+func (d coreAgentDriver) WithPolicy(p coreagentwire.Policy) Driver {
+	d.Policy = p
+	return d
+}
+
+// WithMCP is the driver with servers in its envelopes; the conversation
+// history it holds is shared, as every turn of the pod's needs it.
+func (d coreAgentDriver) WithMCP(servers []coreagentwire.MCPServer) Driver {
+	d.MCP = servers
+	return d
+}
 
 // WithInstructions is d with the worker's system-prompt lines for core-agent,
 // which reads them from each turn's envelope; any other driver is returned as
@@ -239,10 +255,11 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	return nil, nil
 }
 
-// NewCoreAgentDriver is the core-agent driver carrying a turn's tool
-// policy and MCP servers, which every turn's envelope sends to the
-// harness. DriverFor's driver carries none: no built-in or MCP tool is
-// offered (the persona's read-only skill tools still are).
+// NewCoreAgentDriver is the core-agent driver carrying the worker's tool
+// policy, which every turn's envelope sends to the harness. Each turn sets
+// its MCP servers itself (adapter.run, WithMCP), so mcp here is only a
+// starting value. DriverFor's driver carries no policy: no built-in tool is
+// offered (the persona's MCP and read-only skill tools still are).
 func NewCoreAgentDriver(p coreagentwire.Policy, mcp []coreagentwire.MCPServer) Driver {
 	// Built from newCoreAgentDriver, so the conversation history store is
 	// there: a driver without it would drop history between turns.

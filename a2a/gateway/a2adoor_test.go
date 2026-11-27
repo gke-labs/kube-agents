@@ -90,13 +90,13 @@ func startA2ARigTuned(t *testing.T, stack func(*A2ADoor) Adapter, tune a2aRigTun
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("a2a-gateway-test"),
+	client, err := connectClientTest(ctx, url, lib.WithName("a2a-gateway-test"),
 		lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("a2a-executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("a2a-executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}

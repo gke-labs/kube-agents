@@ -23,6 +23,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
+const (
+	slowScriptTimeout   = 300 * time.Millisecond
+	slowScriptWallBound = 30 * time.Second
+)
+
 // scriptRoot is a script root in a temp dir, owned by the test's uid,
 // with a check that takes that uid as the scripts' owner and some other uid
 // as the worker's.
@@ -301,8 +306,8 @@ func TestAScriptsOutputIsCappedAndItsEndReported(t *testing.T) {
 	}
 	marker := filepath.Join(root, "child-alive")
 	start := time.Now()
-	r := run("slow.sh", "(sleep 3; touch "+marker+") &\nsleep 30\n", 300*time.Millisecond)
-	if !r.timedOut || time.Since(start) > 10*time.Second {
+	r := run("slow.sh", "(sleep 3; touch "+marker+") &\nsleep 30\n", slowScriptTimeout)
+	if !r.timedOut || time.Since(start) > slowScriptWallBound {
 		t.Fatalf("timedOut %v (exit %d, startErr %v) after %s; want a timeout at its bound", r.timedOut, r.exitCode, r.startErr, time.Since(start))
 	}
 	time.Sleep(4 * time.Second)

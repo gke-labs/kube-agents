@@ -137,7 +137,7 @@ The entries that share the Platform Agent's roster without being audits. The tab
 - `eod-event-watcher-daily-report`: a weekday script that renders the k8s-event-watcher recap from the session ledger.
 - `stall-watch`: every half hour runs the Cluster Agent's `stall_report.py` over the non-system namespaces of every running or reconciling cluster that has a Cluster Agent, each kind read once per cluster, four clusters at a time, and keeps a ledger. Its `tick_timing` and `cluster_timings` entries record what the last tick and each cluster cost. On a new stall it sends the Session KV server a `controller-stall` inject per namespace, at most three a tick: the alert is posted, the cluster's Cluster Agent runs `gke-stall-detection` and reports in the alert's thread with fixes a reply of "apply" can authorize, and the watch adds one chat line when a stall clears. [`spec.harness.stallWatch`](/kube-agents/operator/platformagent-crd/#specharnessstallwatch) can exclude namespaces, hold young stalls and change the kinds scanned.
   - It reads every cluster in the resolved scope that isn't excluded, with or without a Cluster Agent. A stall on a cluster with no Cluster Agent raises no alert: the watch says it once in chat, by cluster name, while it stays stalled.
-- `upgrade-readiness-watch`: once a day reads the version each cluster's release channel offers and, when a cluster is below a version the watch has not reported or reported more than a week ago, runs the `fleet-upgrade-verification` readiness report, saves it on the gateway pod and posts one line with the blocked clusters.
+- `upgrade-readiness-watch`: once a day reads the version each cluster's release channel offers and, when a cluster is below a version the watch has not reported or reported more than a week ago, runs the `fleet-upgrade-verification` readiness report, saves it on the gateway pod and posts one short message a tick: for each version it reports, how many clusters are not ready yet (or how many are ready) and, for up to five of them, the first thing that blocks each and, where that kind of blocker has one, a short fix.
 - `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief`: the Saturday pair for upgrade readiness. The review is one more `no_agent` script, which grades every cluster in scope and registers each blocker and risk on the findings queue. The brief is the exception: a prompt job an hour later that composes the week's brief from that review and the queue under its own SOP, a model turn that is not an audit and is not counted among the audits above.
 - `sa-role-watch`: every hour reads the IAM policy of the management project and of each project in `spec.scope` and names any role bound to the agent's Google service account (the one the agent's ServiceAccount names for Workload Identity, and the credential broker's own when federation is armed) that the `read-only` permission set does not carry: when it appears, once a day while it is held, and when it goes, since a role granted after install would otherwise go unnoticed.
 - `leeway-watch`: runs `leeway report --topology-tier-c-signals --parallelism 2` daily and saves Markdown and JSON reports under `<profile home>/leeway/reports/`. Its chat message opens with a bold headline, such as "2 pod placement problems on 2 clusters (all new)", then names up to three by workload, cluster and cause in plain words. Problems that have cleared get their own headline in the same post. `unknown`-cause topology findings at their pigeonhole floor are dropped by default so balanced odd-replica workloads do not page.
@@ -278,7 +278,7 @@ Each job in `jobs.json` follows this schema:
 - **`id`** — stable identifier, referenced in observability and disable/enable ops. It outlives renames: `obtainability-audit` is now the Workload Reliability Audit, but the id stays put.
 - **`risk`** — declared risk tier (`"low"` or `"high"`). For agentic (prompt-driven) jobs, `"high"` applies a fail-closed read-only command policy requiring every command segment to be an allowlisted inspection command (`kubectl get/describe/logs/top`, `gcloud … list/describe`, read-only text utilities, `--dry-run` validations) and refusing mutations while the run continues. `"low"` retains the profile's configured `cron_mode` (typically `approve`). Runtime-created jobs default to `"low"`, legacy volume entries backfill to `"low"`, and unannotated in-flight dispatches default fail-closed to `"high"`.
 
-  For `no_agent: true` jobs like `github-repo-watcher`, there is no agent loop and therefore no tool-approval surface to gate; `"high"` is an input-threat classification of untrusted input: repository events for `github-repo-watcher`, cluster event text for `stall-watch`, the budget and workload names `upgrade-readiness-watch` saves, the budget, pool, exclusion and webhook names `upgrade-readiness-weekly-review` registers, and the workload names `leeway-watch` prints; today the tier is metadata only for those jobs, and nothing isolates the subprocess at runtime.
+  For `no_agent: true` jobs like `github-repo-watcher`, there is no agent loop and therefore no tool-approval surface to gate; `"high"` is an input-threat classification of untrusted input: repository events for `github-repo-watcher`, cluster event text for `stall-watch`, the budget and workload names `upgrade-readiness-watch` saves and the blocking object names it posts, the budget, pool, exclusion and webhook names `upgrade-readiness-weekly-review` registers, and the workload names `leeway-watch` prints; today the tier is metadata only for those jobs, and nothing isolates the subprocess at runtime.
 
 - **`schedule.expr`** — standard 5-field cron in the pod's local time zone (UTC unless the pod's TZ is overridden).
 - **`prompt`** — what the run is asked to do, copied verbatim into the turn. Governance jobs point at an SOP **by its absolute path in the profile home** (`/opt/data/profiles/platform/governance/<sop>.md`), since a cron run starts in a directory of its own under `cron/runs/`. The profile home's `governance/` is where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory. An absolute `/opt/defaults/governance/...` path does not resolve — nothing is mounted there.
@@ -295,11 +295,48 @@ Each job in `jobs.json` follows this schema:
 
 ## Disabling a watchdog
 
+### On your install
+
+Set `platformAgent.schedules` in the chart values. No new image is needed.
+
+```yaml
+platformAgent:
+  schedules:
+    suspendAll: true
+    overrides:
+      - name: session-retention
+        suspend: false
+      - name: kanban-workspace-gc
+        suspend: false
+      - name: kanban-block-recheck
+        suspend: false
+```
+
+On an `install.sh` install, put the block in the `TF_VAR_extra_helm_values` line in `install.env`, as [Idle installs](#idle-installs) describes for another chart value. The chart writes the block to `spec.schedules` on the `PlatformAgent`. A hand edit of `spec.schedules` can be lost at the next chart apply.
+
+`suspendAll: true` turns off every job that the image ships in the Platform Agent's roster. An entry in `overrides` wins over it: `suspend: false` turns one job back on, and `suspend: true` with no `suspendAll` turns one job off. The name is the job's `id` in the [roster](/kube-agents/reference/cron-jobs/). A name that matches no job is ignored. The `BuiltinSchedules` condition reports it only while the operator runs AgentSchedules, so check the spelling.
+
+The setting does not reach a job that you or the agent added to the roster. Pause or remove that job with `hermes cron`.
+
+The operator restarts the agent pod when the setting changes for a roster job, and the jobs change state at that start. A suspended job keeps its run history. If a suspended job is run on demand, Hermes turns the job back on, and it stays on until the next pod restart. That happens when you run `hermes cron run`, and when you ask the agent in chat to run the job now. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
+
+`suspendAll` also turns off the [helper jobs](#the-helper-jobs), which do work that chat requests depend on:
+
+- `session-retention` and `kanban-workspace-gc` clean up. The data volume grows while they are off.
+- `kanban-block-recheck` retries a blocked card when its block clears. While it is off, a blocked card waits for a person.
+- `github-repo-watcher` and `post-merge-check` follow the GitOps repository. While they are off, the agent does not pick up new issues or check merged changes.
+
+Keep the first three on, as the example does, and turn the others back on when you want that work.
+
+The setting cannot start a job that the image ships disabled. A rollback to a release that does not have the setting turns every suspended job back on. It does not reach the Planning Agent's own jobs, which run the Platform Agent's roster and first-run onboarding. While an audit is suspended, onboarding does not start it.
+
+### In the image
+
 Flip `enabled` to `false` in `agents/platform/cron/jobs.json`. The scheduler honours the flag directly: the job stops being due, and nothing runs.
 
 Flip the flag; do not delete the entry. An id can be dropped from the roster only once no live cluster still needs the image to hold the job off, which is the path the five [retired watchdogs](#the-retired-jobs) took. Deleting is never the whole step: the same release must also name the id in the platform force-sync's `--cron-retire` (`deploy/shared/docker-entrypoint.sh`), or the volume keeps a disabled entry no later image can reach.
 
-**The Platform Agent's roster travels.** That profile is scaffolded by `profile_scaffold.py` on every start-up, and its `merge_cron_store` merges the image's roster over the volume's unfiltered — the image wins every key it ships, the volume keeps every key it does not. So redeploying an entry with `enabled: false` switches it off on every existing cluster at the next pod restart, and a stale enabled copy cannot outlive the release that retired it. A job an operator added by hand survives, because the merge never prunes — unless its id is on the force-sync's `--cron-retire` list, which is applied after the merge and deletes outright.
+**The Platform Agent's roster travels.** That profile is scaffolded by `profile_scaffold.py` on every start-up, and its `merge_cron_store` merges the image's roster over the volume's unfiltered — the image wins every key it ships, the volume keeps every key it does not. The one exception is [the install's own suspend setting](#on-your-install), which can hold a shipped job off. So redeploying an entry with `enabled: false` switches it off on every existing cluster at the next pod restart, and a stale enabled copy cannot outlive the release that retired it. A job an operator added by hand survives, because the merge never prunes — unless its id is on the force-sync's `--cron-retire` list, which is applied after the merge and deletes outright.
 
 **The Planning Agent's roster travels too, by a different road.** The Planning Agent is the `default` profile, which is not scaffolded: it lives at `$HERMES_HOME` directly, and the entrypoint reconciles the volume's `cron/jobs.json` against the shipped roster by job id, per key, under the same rule — the image wins every key it ships, `enabled` among them, and a key it ships nothing for stays as the volume had it.
 

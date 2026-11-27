@@ -206,6 +206,32 @@ func UnverifiedTrigger(token string) (*Trigger, error) {
 	return claims.Nats.Trigger, nil
 }
 
+// UnverifiedTarget is the cluster a credential's claims name, read without
+// checking its signature, nil when they name none (a report credential). It
+// is for routing and for messages only: a worker asks it which cluster a
+// task's kubectl should be pointed at and held to on the worker's own side,
+// where a forged claim can only send a request the verifier then refuses.
+// Nothing may authorise on what it returns; Verify is what does.
+func UnverifiedTarget(token string) (*Target, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("a task credential is three dot-separated parts")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't base64url: %w", err)
+	}
+	var claims struct {
+		Nats struct {
+			Target *Target `json:"target"`
+		} `json:"nats"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't JSON: %w", err)
+	}
+	return claims.Nats.Target, nil
+}
+
 // NewSigningKey generates a task-signing keypair.
 func NewSigningKey() (nkeys.KeyPair, error) {
 	return nkeys.CreateCluster()
