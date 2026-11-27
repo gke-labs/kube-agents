@@ -102,7 +102,10 @@ third then waits on the group. The group is what makes the reserve hold: per-pod
 would let three busy pods fill the cap. It is also the shape of the broker's control, which is one
 count for every profile caller (`CREDENTIAL_PROXY_PROFILE_SLOTS`, four commands). That variable is
 not reused: it counts whole `kubectl` commands, and these count HTTP requests, of which a command
-has several. Lowering `--max-in-flight` without lowering the group's limit shrinks the reserve.
+has several. Lowering `--max-in-flight` without lowering the group's limit shrinks the reserve, and at or below
+the group's limit there is none: the binary then logs a warning, once, at the first worker request,
+that names the group, its limit and the cap. `--max-in-flight=0`, no shared cap, is not warned
+about.
 
 Long-running requests take none of the shared slots; their limits bound the connections and
 upstream watches workers keep open. Eight for a pod covers one `kubectl logs -f` over a selector,

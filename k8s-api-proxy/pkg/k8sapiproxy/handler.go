@@ -47,7 +47,8 @@ type Config struct {
 	// Audit receives an AuditEvent for every request; NewSlogAuditSink(Logger) when nil.
 	Audit AuditSink
 	// Logger receives the reverse proxy's own errors, such as a response body that failed to
-	// copy; slog.Default() when nil.
+	// copy, and the warning about a CallerLimits group that can fill MaxInFlight;
+	// slog.Default() when nil.
 	Logger *slog.Logger
 	// Metrics records Prometheus metrics for requests, rejections, and Secret redactions; optional.
 	Metrics *Metrics
@@ -125,8 +126,8 @@ type Config struct {
 	// upgraded connection closes. One answered from the response cache or joined to
 	// another's fetch is counted like any other, as MaxInFlight counts it.
 	//
-	// Callers are told apart by CallerLimits.Key, which is CallerIdentity.Username unless
-	// the func sets it. The partition is not part of the default: it names an upstream
+	// Callers are told apart by CallerIdentity.Username, or by CallerLimits.Key when the
+	// func sets one. The partition is not part of the default: it names an upstream
 	// credential, usually one many callers share, and a caller whose requests fall in
 	// several partitions would get the limit once for each. An embedder whose authenticators
 	// can give two principals one username, or that wants a count per pod of one
@@ -237,7 +238,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		partition:        cfg.CallerPartition,
 		factory:          NewRequestInfoFactory(),
 		slots:            slots,
-		callers:          newCallerLimiter(cfg.CallerLimits),
+		callers:          newCallerLimiter(cfg.CallerLimits, cfg.MaxInFlight, logger),
 		proxy: &httputil.ReverseProxy{
 			// Rewrite rather than Director: the reverse proxy then also drops the caller's
 			// Forwarded, X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto headers. The

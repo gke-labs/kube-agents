@@ -2,14 +2,17 @@ package k8sapiproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -381,8 +384,8 @@ func TestCallerLongRunningLimitHoldsAnUpgradedConnection(t *testing.T) {
 // Many goroutines at once against an upstream that keeps every admitted request open: the
 // limiter admits exactly as many as the limit and refuses every other, for a caller's own
 // limit and for a group's, for requests in flight and for long-running ones, and when the
-// held requests end nothing is left counted. Three rounds, so a round's releases are what
-// admit the next.
+// held requests end nothing is left counted. Three rounds through one handler and one
+// limiter, so the releases of a round are what admit the next.
 func TestCallerLimitsAdmitExactlyTheLimitUnderConcurrency(t *testing.T) {
 	const (
 		limit      = 5
@@ -416,13 +419,23 @@ func TestCallerLimitsAdmitExactlyTheLimitUnderConcurrency(t *testing.T) {
 		{"a group's long-running requests", groupLimit, ownCaller, limitWatchPath, ReasonCallerGroupLongRunningLimit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// One handler for every round; each round swaps in an upstream of its own to hold
+			// and release.
+			var current atomic.Pointer[holdingUpstream]
+			upstream := transportFunc(func(ctx context.Context, clusterID string, req *http.Request) (*http.Response, error) {
+				return current.Load().RoundTripCluster(ctx, clusterID, req)
+			})
+			sink := &recordingSink{}
+			h, _ := newTestHandler(t, Config{Authenticator: headerAuthenticator{}, Upstream: upstream, Audit: sink, CallerLimits: tc.limits})
+			hh := h.(*handler)
 			for round := range rounds {
 				up := &holdingUpstream{entered: make(chan struct{}, goroutines), gate: make(chan struct{})}
 				up.release = sync.OnceFunc(func() { close(up.gate) })
 				t.Cleanup(up.release)
-				sink := &recordingSink{}
-				h, _ := newTestHandler(t, Config{Authenticator: headerAuthenticator{}, Upstream: up, Audit: sink, CallerLimits: tc.limits})
-				hh := h.(*handler)
+				current.Store(up)
+				sink.mu.Lock()
+				sink.events = nil
+				sink.mu.Unlock()
 
 				answers := make(chan int, goroutines)
 				start := make(chan struct{})
@@ -506,7 +519,7 @@ func TestCallerGroupLimit(t *testing.T) {
 			if longRunning {
 				keyReason, groupReason = ReasonCallerLongRunningLimit, ReasonCallerGroupLongRunningLimit
 			}
-			l := newCallerLimiter(limits)
+			l := newCallerLimiter(limits, 0, slog.New(slog.DiscardHandler))
 			first, _, ok := l.acquire(pod("pod-a"), longRunning)
 			if !ok {
 				t.Fatal("the first pod's request was refused")
@@ -665,7 +678,7 @@ func TestCallerLimiter(t *testing.T) {
 		release()
 	}
 
-	l := newCallerLimiter(limitsFor(CallerLimits{MaxInFlight: 1, MaxLongRunning: 1}))
+	l := newCallerLimiter(limitsFor(CallerLimits{MaxInFlight: 1, MaxLongRunning: 1}), 0, slog.New(slog.DiscardHandler))
 	caller := &CallerIdentity{Username: limitedCaller, Partition: "team-a"}
 	release, _, ok := l.acquire(caller, false)
 	if !ok {
@@ -699,5 +712,138 @@ func TestCallerLimiter(t *testing.T) {
 	stream()
 	if got := l.entries(); got != 0 {
 		t.Errorf("%d callers counted with nothing open, want 0", got)
+	}
+}
+
+// A key an embedder sets and a username are different counts even when the strings are
+// equal: a caller whose username is another caller's key does not land in its bucket.
+func TestCallerKeyAndUsernameDoNotCollide(t *testing.T) {
+	const podKey = limitedCaller + "/pod-a"
+	limits := func(caller *CallerIdentity) CallerLimits {
+		if caller.Username == limitedCaller {
+			return CallerLimits{Key: podKey, MaxInFlight: 1}
+		}
+		// As a per-caller flag would give a caller the embedder does not key.
+		return CallerLimits{MaxInFlight: 1}
+	}
+	l := newCallerLimiter(limits, 0, slog.New(slog.DiscardHandler))
+	keyed, _, ok := l.acquire(&CallerIdentity{Username: limitedCaller}, false)
+	if !ok {
+		t.Fatal("the keyed caller was refused")
+	}
+	named, _, ok := l.acquire(&CallerIdentity{Username: podKey}, false)
+	if !ok {
+		t.Fatal("a caller whose username equals another caller's key was counted under that key")
+	}
+	if _, reason, ok := l.acquire(&CallerIdentity{Username: podKey}, false); ok || reason != ReasonCallerInFlightLimit {
+		t.Errorf("that caller's second request = (ok %t, %q), want refused under its own count", ok, reason)
+	}
+	if got := l.entries(); got != 2 {
+		t.Errorf("%d counts kept, want 2: one for the key and one for the username", got)
+	}
+	keyed()
+	if _, _, ok := l.acquire(&CallerIdentity{Username: podKey}, false); ok {
+		t.Error("the key's release freed the username's count")
+	}
+	named()
+	if got := l.entries(); got != 0 {
+		t.Errorf("%d counts kept with nothing open, want 0", got)
+	}
+}
+
+// A group whose in-flight limit is not below a non-zero shared cap can take every shared
+// slot: that is logged, at warning level, once for each such group name, and in no other
+// case.
+func TestGroupThatFillsTheSharedCapIsWarnedAboutOnce(t *testing.T) {
+	const sharedCap = 4
+	groupOf := func(name string, maxInFlight int) *CallerIdentity {
+		return &CallerIdentity{Username: name, Extra: map[string][]string{testPodExtra: {strconv.Itoa(maxInFlight)}}}
+	}
+	// The username is the group, and the extra its in-flight limit; "" is no group.
+	limits := func(caller *CallerIdentity) CallerLimits {
+		maxInFlight, _ := strconv.Atoi(caller.Extra[testPodExtra][0])
+		return CallerLimits{MaxInFlight: 1, MaxLongRunning: 1, Group: caller.Username, GroupMaxInFlight: maxInFlight, GroupMaxLongRunning: sharedCap * 2}
+	}
+	for _, tc := range []struct {
+		name      string
+		sharedCap int
+		callers   []*CallerIdentity
+		want      []string
+	}{
+		{"below the cap", sharedCap, []*CallerIdentity{groupOf("workers", sharedCap-1)}, nil},
+		{"at the cap", sharedCap, []*CallerIdentity{groupOf("workers", sharedCap)}, []string{"workers"}},
+		{"above the cap", sharedCap, []*CallerIdentity{groupOf("workers", sharedCap+1)}, []string{"workers"}},
+		{"no shared cap", 0, []*CallerIdentity{groupOf("workers", sharedCap)}, nil},
+		{"no group", sharedCap, []*CallerIdentity{groupOf("", sharedCap)}, nil},
+		{"a group with no in-flight limit", sharedCap, []*CallerIdentity{groupOf("workers", 0)}, nil},
+		{"two groups, one of them under the cap", sharedCap,
+			[]*CallerIdentity{groupOf("workers", sharedCap), groupOf("sessions", 1), groupOf("batch", sharedCap)}, []string{"workers", "batch"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			l := newCallerLimiter(limits, tc.sharedCap, slog.New(slog.NewJSONHandler(&logged, nil)))
+			// Each caller several times, of both kinds, refused requests included.
+			for range 3 {
+				for _, caller := range tc.callers {
+					for _, longRunning := range []bool{false, true} {
+						release, _, ok := l.acquire(caller, longRunning)
+						if !ok {
+							t.Fatalf("%s was refused", caller.Username)
+						}
+						_, _, _ = l.acquire(caller, longRunning)
+						release()
+					}
+				}
+			}
+			lines := strings.Split(strings.TrimSpace(logged.String()), "\n")
+			if logged.Len() == 0 {
+				lines = nil
+			}
+			if len(lines) != len(tc.want) {
+				t.Fatalf("%d records logged, want %d:\n%s", len(lines), len(tc.want), logged.String())
+			}
+			for i, group := range tc.want {
+				for _, want := range []string{`"level":"WARN"`, groupFillsCapWarning, `"` + logKeyGroup + `":"` + group + `"`, `"` + logKeySharedCap + `":` + strconv.Itoa(tc.sharedCap)} {
+					if !strings.Contains(lines[i], want) {
+						t.Errorf("record %d lacks %q: %s", i, want, lines[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// The handler compares a group's limit with its own Config.MaxInFlight and warns on its
+// Config.Logger.
+func TestHandlerWarnsAboutAGroupThatFillsMaxInFlight(t *testing.T) {
+	limits := func(*CallerIdentity) CallerLimits {
+		return CallerLimits{Group: "workers", GroupMaxInFlight: 2}
+	}
+	for name, tc := range map[string]struct {
+		maxInFlight int
+		want        int
+	}{
+		"a cap the group can fill": {2, 1},
+		"a cap above the group":    {3, 0},
+		"no cap":                   {0, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logged bytes.Buffer
+			h, _ := newTestHandler(t, Config{
+				Authenticator: headerAuthenticator{},
+				Audit:         &recordingSink{},
+				Logger:        slog.New(slog.NewJSONHandler(&logged, nil)),
+				MaxInFlight:   tc.maxInFlight,
+				CallerLimits:  limits,
+			})
+			for range 3 {
+				if rec := getAs(h, limitedCaller, limitNSPath); rec.Code != http.StatusOK {
+					t.Fatalf("code = %d, want 200", rec.Code)
+				}
+			}
+			if got := strings.Count(logged.String(), groupFillsCapWarning); got != tc.want {
+				t.Errorf("the warning was logged %d times, want %d:\n%s", got, tc.want, logged.String())
+			}
+		})
 	}
 }

@@ -258,7 +258,11 @@ together. A request is admitted only when its caller and its group both have roo
 and gives both back when it ends. That bounds a set of callers in aggregate, which per-caller
 limits cannot: enough callers, each under its own limit, still fill the shared cap. When callers of
 one group return different limits, each request is held to the limits its own caller returned,
-against the one count. No flag sets a group.
+against the one count. No flag sets a group. A group whose `GroupMaxInFlight` is not below a
+non-zero `--max-in-flight` can take every shared slot, so it reserves nothing for other callers;
+the handler logs a warning once for each such group name, on `Config.Logger`. A key the func sets
+and a username are separate namespaces, as group names are, so a caller whose username equals
+another caller's key is still counted on its own.
 
 A caller at a limit gets the shared cap's answer, the same `429` with `Retry-After`, audited as
 `throttled` with one of four values of `rejection_reason` and counted under it in
@@ -280,6 +284,34 @@ shared cap. Each replica counts for itself. Set an in-flight limit well under `-
 and know what a low one costs: against an API server without aggregated discovery a cold `kubectl`
 asks for every group version at once, some thirty requests, so under a smaller limit it completes
 only through client-go's retries of the `429`s, and a request answered `429` ten times fails.
+
+The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
+and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
+empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
+give its path to both flags. Files without a matching certificate and key stop the proxy at
+startup. The files are reloaded
+without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
+modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
+seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
+not load, such as one read mid-rotation, is logged, counted in
+`kubeagents_kube_proxy_certificate_reload_failures_total` (which also counts a changed
+`--upstream-ca-file` that does not load), and the last good certificate keeps
+being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
+`Transport` verifies each new connection against the current bundle, with hostname and IP SAN
+checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+`certreload.NewCAPoolUnion` pools several bundles, such as the client CAs a listener advertises
+for more than one authenticator; each file reloads on its own, and one that stops loading keeps
+its last good certificates in the pool while the others follow their files.
+
+Cached responses and coalesced fetches are shared across callers, which is safe while the
+`UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
+transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
+authenticated caller is part of the cache and coalescing keys, so requests share a response or a
+fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
+the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
+partition needs the cache off (`Config.Cache` nil). A write evicts the resource's entries
+in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
+caller's partition only, since only that credential's access changed.
 
 An embedder with a rule of its own about who may ask what sets `Config.Authorize`. The handler
 calls it for every request that names a cluster and classifies as an API request, after the
