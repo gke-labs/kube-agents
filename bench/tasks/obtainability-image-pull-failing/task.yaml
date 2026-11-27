@@ -31,8 +31,9 @@
 # collector marks the finding `needs_triage: image-pull`. Each repetition
 # also raises the product's own alert for the two workloads.
 #
-# Expected cost bracket: the full-audit shape plus the stack's wait, about
-# 1300-2000s a repetition. Unmeasured on the lane.
+# Cost: the full-audit shape plus the stack's wait. Measured on the lane at
+# 1030-1174s a repetition, that wait included (the main-e nightly of
+# 2026-11-25 and 2026-11-26).
 id: obtainability-image-pull-failing
 name: Reliability audit keeps a finding for a workload whose image pull keeps failing
 prompt: >-

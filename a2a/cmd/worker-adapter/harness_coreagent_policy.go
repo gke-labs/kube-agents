@@ -8,6 +8,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib/coreagentwire"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/toolgrant"
+	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
 // The Claude Code tool names a session allowlist uses, as
@@ -34,15 +35,11 @@ func coreAgentSessionGrant(getenv func(string) string, workdir string) (coreagen
 		return coreagentwire.Policy{}, err
 	}
 	if p.WebSearch {
-		// The harness's model has every Gemini built-in off; search can't
-		// be granted until it's wired.
-		return coreagentwire.Policy{}, fmt.Errorf("web search has no core-agent grant yet")
+		// No session allowlist grants WebSearch (harnessCommand); an override
+		// that adds it gets no server-side search on core-agent either.
+		return coreagentwire.Policy{}, fmt.Errorf("web search is not granted to a session pod")
 	}
-	g, err := p.CoreAgent(workdir)
-	if err != nil {
-		return coreagentwire.Policy{}, err
-	}
-	return coreagentwire.Policy{Tools: g.Builtins, Allow: g.Allow, Deny: g.Deny}, nil
+	return workeradapter.CoreAgentWirePolicy(p, workdir)
 }
 
 // sessionToolPolicy reads a Claude Code allowlist/denylist pair as a
