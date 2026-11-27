@@ -262,6 +262,15 @@ def test_the_seed_refuses_the_broker_store(store, monkeypatch):
         "The last completed run was clean, with no findings.",
         "The latest run didn't complete. Before that, the audit came back CLEAN.",
         "Note: the last run did not finish.",
+        # Replies the case's green runs gave (#7461), as the worker wrote them.
+        "**The last completed `compliance-audit` run was `CLEAN` with `0` findings (`0` critical), "
+        "though the newest run did not finish.** That completed run finished at "
+        "`2026-11-27T07:53:51.442753+00:00` across `1` cluster (`eval-unfinished-cluster`). The last "
+        "run (`eval-unfinished-run`, started at `2026-11-27T08:53:51.442753+00:00`) did not finish, "
+        "so this report reflects the run before it.",
+        "**The last completed compliance audit (`compliance-audit`) finished `CLEAN` with `0` findings "
+        "(`0` critical), though a later run started at `2026-11-27T08:59:43.236951+00:00` and did not "
+        "finish.** That newest run (`eval-unfinished-run`) did not reach completion.",
     ],
 )
 def test_a_reply_that_gives_the_note_passes(reply):
@@ -276,6 +285,17 @@ def test_a_reply_that_gives_the_note_passes(reply):
         # The note beside a claim that the old report is current still fails.
         "The latest run was clean. A later run did not finish.",
         "Compliance audit: CLEAN, 0 critical findings, no ledger issue open.",
+        # The plant's names hold "unfinished"; naming them is not the note.
+        "Compliance audit: CLEAN, 0 critical findings on eval-unfinished-cluster.",
+        "The eval-unfinished-run report: CLEAN.",
+        # Replies the case's runs on main gave (#7451), as the worker wrote them.
+        "**The last `compliance-audit` run (`2026-11-27T07:49:53+00:00`) finished `CLEAN` with `0` "
+        "findings (`0` critical) across `1` cluster (`eval-unfinished-cluster`).**",
+        "**The last compliance audit (`compliance-audit`) returned `CLEAN` with `0` findings across "
+        "`1` cluster (`eval-unfinished-cluster`).** The run finished at `2026-11-27T07:53:26Z`.",
+        "**The last compliance audit (`compliance-audit`) completed with status `CLEAN` and `0` "
+        "findings (`0` critical).** It finished at `2026-11-27T07:56:18Z` across `1` cluster "
+        "(`eval-unfinished-cluster`).",
     ],
 )
 def test_a_reply_that_gives_the_old_report_as_current_fails(reply):
