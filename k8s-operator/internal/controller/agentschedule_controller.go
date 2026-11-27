@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -120,6 +121,13 @@ var ErrScheduleGatewayUnavailable = errors.New("the gateway did not accept the s
 // cap: the slot is counted and dropped, never retried.
 var ErrScheduleRateLimited = errors.New("the gateway refused the submission under the trigger's rate cap")
 
+// runReasonShape is the CRD's pattern for a run's Reason, the gateway's own
+// token alphabet (reasonToken: letters, digits, '.', '_', '-'). The gateway sends
+// only tokens from its reason tables, all of this shape
+// (TestRunReasonTokensFitTheOperatorsPattern pins that across the modules);
+// anything else is dropped here rather than failing the status write.
+var runReasonShape = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
 // ScheduleSubmission is one run, as the reconciler hands it to the gateway.
 type ScheduleSubmission struct {
 	IdempotencyKey string
@@ -150,6 +158,9 @@ type ScheduleTaskState struct {
 	// Delivery is how its report was delivered (an AgentScheduleReport*
 	// value), or empty while the gateway has no record of it.
 	Delivery string
+	// Reason is why it ended when Terminal: the gateway's bare reason
+	// token, or empty.
+	Reason string
 }
 
 // ScheduleTaskTracker reports on a run in flight.
@@ -249,15 +260,20 @@ func AgentScheduleTriggerName(sched *agentv1alpha1.AgentSchedule) string {
 }
 
 // agentScheduleBuiltinNames is the set of built-in schedules the install's
-// PlatformAgent renders. The operator renders none yet: the change that
-// renders them fills this from the list it renders from, so a schedule is
-// read as built-in only when the operator would have written it.
+// PlatformAgent renders: the names of the table the PlatformAgent reconciler
+// renders from (builtinSchedules, platformagent_builtin_schedules.go), so a
+// schedule is read as built-in only when the operator would have written it.
 //
 // That renderer must own the whole object it renders: a schedule someone
 // created under a built-in's name before the admission policy existed has to
 // be overwritten in full (labels, references and spec) or deleted and
 // created again, never adopted by name with its content kept.
-func agentScheduleBuiltinNames(*agentv1alpha1.PlatformAgent) []string { return nil }
+func agentScheduleBuiltinNames(agent *agentv1alpha1.PlatformAgent) []string {
+	if !AgentSchedulesEnabled() {
+		return nil
+	}
+	return builtinScheduleNames(builtinSchedules(agent))
+}
 
 // builtinNames is the reconciler's built-in set: BuiltinNames when a test
 // sets it, the rendered set otherwise.
@@ -503,6 +519,9 @@ func (r *AgentScheduleReconciler) fire(ctx context.Context, sched *agentv1alpha1
 
 	// 3. Run now: a token not handled yet starts a run, or adopts the one
 	// in flight. It leaves the cadence alone.
+	// run-now is handled before the slot below, whose suspend skip it must
+	// not reach: a run-now-only built-in (onboarding) renders suspended and
+	// runs only this way (TestARunNowRunsASuspendedSchedule).
 	if token := sched.Annotations[agentv1alpha1.AgentScheduleRunNowAnnotation]; token != "" && token != st.LastHandledRunNow && st.PendingSlot == nil {
 		// A run in flight that is being stopped isn't adopted: a run-now
 		// asked for after a stop is a new run, started once the stopped one
@@ -601,12 +620,12 @@ func (r *AgentScheduleReconciler) trackActive(ctx context.Context, sched *agentv
 	switch {
 	case state.Found && state.Terminal:
 		taskID := st.ActiveTaskID
-		r.settle(pass, sched, state.Outcome, state.CompletedAt)
+		r.settle(pass, sched, state.Outcome, state.Reason, state.CompletedAt)
 		recordDelivery(st, taskID, state.Delivery)
 	case !state.Found:
-		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, "", now)
 	case st.ActiveTaskStartedAt != nil && now.Sub(st.ActiveTaskStartedAt.UTC()) > deadline+agentScheduleLostGrace:
-		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, now)
+		r.settle(pass, sched, agentv1alpha1.AgentScheduleOutcomeLost, "", now)
 	}
 }
 
@@ -677,20 +696,31 @@ func knownOutcome(outcome string) string {
 	return agentv1alpha1.AgentScheduleOutcomeFailed
 }
 
+// knownReason is reason when it has the CRD's shape, else empty.
+func knownReason(reason string) string {
+	if runReasonShape.MatchString(reason) {
+		return reason
+	}
+	return ""
+}
+
 // settle records a run's end and clears it from flight.
-func (r *AgentScheduleReconciler) settle(pass *schedulePass, sched *agentv1alpha1.AgentSchedule, outcome string, at time.Time) {
+func (r *AgentScheduleReconciler) settle(pass *schedulePass, sched *agentv1alpha1.AgentSchedule, outcome, reason string, at time.Time) {
 	st := &sched.Status
 	outcome = knownOutcome(outcome)
+	reason = knownReason(reason)
 	if at.IsZero() {
 		at = r.now()
 	}
 	done := metav1.NewTime(at)
 	st.LastCompletionTime = &done
 	st.LastOutcome = outcome
+	st.LastReason = reason
 	for i := range st.RecentRuns {
 		if st.RecentRuns[i].TaskID == st.ActiveTaskID {
 			st.RecentRuns[i].CompletionTime = &done
 			st.RecentRuns[i].Outcome = outcome
+			st.RecentRuns[i].Reason = reason
 		}
 	}
 	pass.count(agentScheduleRunsTotal.WithLabelValues(sched.Name, strings.ToLower(outcome)))

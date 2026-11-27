@@ -54,6 +54,13 @@ func (g *Gateway) reuseLivePod(ctx context.Context, rec *SessionRecord) bool {
 	if !ok {
 		return false
 	}
+	if !rec.PodClaimedAt.IsZero() && time.Now().Add(g.cfg.TaskDeadline+2*podDeadlineGrace).After(rec.PodClaimedAt.Add(podLifetime(g.cfg, true))) {
+		// A pod claimed from the warm pool lives longer than a fresh spawn
+		// by the time it waited (warmPodLifetime), so its reuse window is
+		// counted from the claim: it ends when a pod spawned at the claim
+		// would have stopped taking turns, and the next turn starts fresh.
+		return false
+	}
 	rec.Addressee = rec.BusSession
 	g.log.Info("routing the turn to the live session pod", "conversation", rec.Key, "pod", rec.PodName)
 	return true
@@ -241,6 +248,7 @@ func (g *Gateway) retireOverdue(ctx context.Context, key string) {
 		g.log.Warn("overdue check: closed a wedged task and retired its pod", "task", active.TaskID, "pod", rec.PodName,
 			"age", time.Since(active.SubmittedAt).Round(time.Second))
 		rec.PodName = ""
+		g.kickCapQueue()
 	}
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("overdue check: record write failed", "conversation", rec.Key, "err", err)

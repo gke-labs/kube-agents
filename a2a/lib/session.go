@@ -1,5 +1,7 @@
 package lib
 
+import "strings"
+
 // Session consumer naming — the contract between a session worker and the
 // grants the auth callout mints for it.
 //
@@ -42,8 +44,9 @@ const (
 	OriginSeqUnknown = "unknown"
 	// EnvClusterView is the spawner telling the worker that this pod has
 	// the credential broker's read-only kubectl/gcloud wrappers on PATH
-	// (the operator's A2A_SESSION_CLUSTER_VIEW flag, rendered onto the
-	// gateway and translated here per pod). Literal "true" is on. One
+	// (the session pods' cluster view, which the operator turns on for the
+	// session route or under its A2A_SESSION_CLUSTER_VIEW flag, renders onto
+	// the gateway, and the gateway translates here per pod). Literal "true" is on. One
 	// constant for both ends, like EnvOriginSeq above: a spelling that
 	// drifted would leave a pod with the token and the shims but no Bash,
 	// and nothing would say so.
@@ -69,10 +72,33 @@ const (
 	// EnvProfileWorkerOneShot ends a profile worker after its first task: a
 	// Job's pod. Literal "1" or "true" is on.
 	EnvProfileWorkerOneShot = "PROFILE_WORKER_ONE_SHOT"
-	// EnvProfileHarness names the persona adapter a profile worker renders
-	// its persona with (persona.ClaudeCode is the default and, for now, the
-	// only one written).
+	// EnvHarness names the harness a worker runs, session pod or profile
+	// worker alike (persona.ClaudeCode, persona.Antigravity or
+	// persona.CoreAgent): its driver, its argv and env, and a profile
+	// worker's persona adapter. Unset is Claude Code; a value the worker
+	// doesn't know refuses to start. Antigravity also needs
+	// EnvHarnessUnisolated and A2A_HARNESS_PATH, and core-agent
+	// EnvHarnessUnisolated (cmd/worker-adapter's selectHarness).
+	EnvHarness = "A2A_HARNESS"
+	// EnvProfileHarness is EnvHarness's older name, read only by a profile
+	// worker and only when EnvHarness is unset. It once picked the persona
+	// adapter alone.
 	EnvProfileHarness = "PROFILE_HARNESS"
+	// EnvHarnessUnisolated must be HarnessUnisolatedAllow for a worker to
+	// select persona.Antigravity or persona.CoreAgent, which run without
+	// their isolation until #6710 lands; #6710 removes it.
+	// Nothing in the operator or chart sets it to allow; the operator
+	// renders it empty beside A2A_HARNESS on a profile that names
+	// spec.harness.type.
+	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
+	HarnessUnisolatedAllow = "allow"
+
+	// EnvToolWithheld lists, comma-separated, the worker container's
+	// variables sourced from a Secret (an env entry's secretKeyRef). The
+	// worker withholds each one from the processes a turn's tools start. It
+	// names variables, not values. The operator renders the same name for
+	// profile workers (k8s-operator's envToolWithheld).
+	EnvToolWithheld = "A2A_TOOL_WITHHELD_ENV"
 	// EnvPersonaIntegrity sets whether a profile worker requires its persona
 	// to carry a build-time content manifest (persona.IntegrityManifestFile).
 	// PersonaIntegrityRequired refuses a persona without one; unset loads it
@@ -104,6 +130,43 @@ const (
 	// so a pod from an older spawner, which exits after one task, is never
 	// sent one.
 	EnvSessionReuse = "A2A_SESSION_REUSE"
+	// EnvSessionWarm is "true" on a warm session pod: one the gateway's pool
+	// starts before any conversation needs it, with no TASK_ID and no
+	// conversation of its own. Its adapter opens its task watcher on its own
+	// `…in` subjects and waits there; the gateway makes it a conversation's
+	// session by addressing that conversation's first task to the pod's name.
+	// It needs EnvSessionReuse too: a warm pod serves its conversation the
+	// way a reused pod does.
+	EnvSessionWarm = "A2A_SESSION_WARM"
+	// EnvSessionWarmIdleSeconds is how long a warm pod waits for its first
+	// task before it exits with nothing to publish. It is what bounds an
+	// unclaimed warm pod under a gateway that does not know about warm pods
+	// (a rollback): such a gateway's sweep deletes the exited pod, and the
+	// slot it held is free again.
+	EnvSessionWarmIdleSeconds = "A2A_SESSION_WARM_IDLE_SECONDS"
+	// SessionWarmStatusPort is the loopback port a warm pod's adapter
+	// answers SessionWarmReadyPath on, from the moment its task watcher's
+	// consumer exists until the process ends. The gateway hands a warm pod a
+	// conversation only once it is Ready, so the first task never waits on a
+	// consumer that is not there yet. It is the adapter's own state, not a
+	// file: once claimed the pod runs a model-directed harness that can write
+	// wherever the adapter can, and a claimed pod's probe must never start
+	// failing because a turn removed something. Bound to 127.0.0.1 only, so
+	// nothing outside the pod reaches it.
+	SessionWarmStatusPort = 8090
+	// SessionWarmReadyPath is the path the warm status endpoint answers.
+	SessionWarmReadyPath = "/readyz"
+	// SessionWarmReadyCommand is the worker-adapter subcommand the warm
+	// pod's readiness probe runs: exit 0 once the status endpoint answers.
+	SessionWarmReadyCommand = "warm-ready"
+	// SessionWarmReadyWaitSeconds is how long SessionWarmReadyCommand waits
+	// for the endpoint before it fails. A probe that failed while the adapter
+	// was still dialling the bus would record a Warning Unhealthy Event for
+	// every warm pod the pool starts, about every half hour on an idle
+	// install, and the cluster's event watcher counts Unhealthy toward an
+	// incident; waiting out the start keeps a routine recycle quiet, and a
+	// watcher still not live after this is a probe failure worth its Event.
+	SessionWarmReadyWaitSeconds = 20
 )
 
 const (
@@ -135,6 +198,23 @@ func SessionConsumerName(session, role string) string {
 // /readyz and /healthz on. The operator's readiness probe names it, so the
 // two ends share this number.
 const ProfileWorkerStatusPort = 8080
+
+// The session pod's shipped Claude Code home: the persona file and the
+// skills directory cmd/session-persona writes at image build, beside the
+// state the harness keeps in the same directory.
+const (
+	SessionHomePersonaFile = "CLAUDE.md"
+	SessionHomeSkillsDir   = "skills"
+)
+
+// SessionHomeCovers reports whether a path relative to the session pod's
+// Claude Code home is part of what the image shipped there, and so what its
+// build-time content manifest covers: the persona file and everything under
+// the skills directory. The harness's own state beside them is not.
+func SessionHomeCovers(rel string) bool {
+	return rel == SessionHomePersonaFile || rel == SessionHomeSkillsDir ||
+		strings.HasPrefix(rel, SessionHomeSkillsDir+"/")
+}
 
 // ProfilePersonaDir is where a profile pod mounts its persona, read-only
 // (#3662). The operator's profilepod.PersonaMountPath is the same path.

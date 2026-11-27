@@ -3,9 +3,11 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
@@ -87,8 +89,19 @@ const (
 	EventThinking
 	// EventProgress is a piece of the model's own prose (Event.Text).
 	EventProgress
-	// EventActivity is a tool invocation (Event.Tool, Event.Input).
+	// EventActivity is a tool invocation (Event.Tool, Event.Input), with the
+	// harness's id for the call when the driver reads one (Event.CallID)
+	// and, for the harness's skill tool, the skill it asks for
+	// (Event.SkillCall, Event.Skill).
 	EventActivity
+	// EventToolResult marks that one tool step's result is in, so the call
+	// that ran it has exited. A driver emits exactly one per tool step.
+	// From the event the adapter reads the call's id (Event.CallID),
+	// whether the harness reported the result as an error (Event.Failed)
+	// and the tool's name (Event.Tool), each where the driver sets it, for
+	// the per-tool log line (toollog.go). It reads the write-refusal record
+	// on the event (refusal.go), never the result itself.
+	EventToolResult
 	// EventResult ends a turn: Event.Text is the deliverable, Event.Failed
 	// and Event.Token whether it failed and the reason token, and
 	// Event.Telemetry what the turn cost.
@@ -99,6 +112,13 @@ const (
 // its Kind names are set.
 type Event struct {
 	Kind EventKind
+	// At is when the adapter read the event's line from the harness's
+	// stdout. The adapter's stdout scanner sets it on every event
+	// (startHarnessWith), ahead of the adapter's event loop, which a slow
+	// publish can hold; a decoder leaves it zero. It is the adapter's time,
+	// not the harness's. While harnessEventDepth lines already wait for the
+	// loop the scanner itself waits, and a line is then read late.
+	At time.Time
 
 	Session      string
 	Model        string
@@ -108,8 +128,22 @@ type Event struct {
 
 	Tool  string
 	Input json.RawMessage
+	// CallID is the harness's id for a tool call, when the driver reads one:
+	// on the call (EventActivity), where the activity entry carries it and a
+	// refused-call log record names it, and the same value on the call's
+	// result (EventToolResult), which is how the per-tool log line joins the
+	// two (toollog.go). The Claude Code driver reads it on both events; the
+	// core-agent driver reads it on the call.
+	CallID string
+	// SkillCall marks a call of the harness's skill tool, and Skill is the
+	// name its input asks for, or "" when the input names none the driver
+	// can read. The name is the model's text: the per-tool log line writes it
+	// only when the task's persona has a skill of that name.
+	SkillCall bool
+	Skill     string
 
-	// Failed is a turn the harness reported as failed. Token is the reason
+	// Failed is a turn the harness reported as failed, or a tool result it
+	// reported as an error (EventToolResult). Token is the reason
 	// token a failed terminal carries (`reason: <token>`); an empty Token on
 	// a failed result completes the task with its text, as it always has.
 	Failed    bool
@@ -152,4 +186,43 @@ func (a *adapter) turnDirs(env []string) TurnDirs {
 		}
 	}
 	return dirs
+}
+
+// DriverFor is the driver for harness h, the value of the worker's harness
+// selector. Empty means Claude Code. Antigravity is agyDriver; the worker
+// refuses it without its isolation waiver (cmd/worker-adapter's
+// selectHarness). Anything else is refused as unknown. A worker
+// never falls back to Claude Code for a value it does not know: a typo would
+// otherwise run the wrong harness without a word.
+func DriverFor(h persona.Harness) (Driver, error) {
+	switch h {
+	case "", persona.ClaudeCode:
+		return claudeDriver{}, nil
+	case persona.Antigravity:
+		return agyDriver{}, nil
+	case persona.CoreAgent:
+		return newCoreAgentDriver(), nil
+	}
+	return nil, fmt.Errorf("unknown harness %q (want %q, %q or %q)", h, persona.ClaudeCode, persona.Antigravity, persona.CoreAgent)
+}
+
+// turnRestarter is implemented by a driver whose harness takes one user
+// turn per process: the adapter ends the process at each turn boundary and
+// starts the next turn on a fresh one that resumes the conversation, so
+// nothing the last turn started is still running when the driver prepares
+// the next (Driver.PrepareTurn).
+type turnRestarter interface {
+	RestartsPerTurn() bool
+}
+
+func restartsPerTurn(d Driver) bool {
+	r, ok := d.(turnRestarter)
+	return ok && r.RestartsPerTurn()
+}
+
+// turnBudgeter is implemented by a driver whose argv carries a wall-clock
+// bound for the harness, so a fresh process for a later turn gets the time
+// left on the task rather than the whole of it.
+type turnBudgeter interface {
+	WithTurnBudget(argv []string, left time.Duration) []string
 }

@@ -1,4 +1,25 @@
 apiVersion: v1
+data:
+  hold.json: |
+    {}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-hold
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   annotations:
@@ -681,6 +702,57 @@ subjects:
     name: kubeagents-platform-agent
     namespace: kubeagents-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-credential-proxy-pod-read
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
 apiVersion: v1
 data:
   ca.crt: PFJFREFDVEVEX0ZPUl9URVNUUz4=
@@ -723,6 +795,57 @@ metadata:
       kind: PlatformAgent
       name: platformagent
       uid: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-pod-read
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-kube-proxy-pod-read
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
 ---
 apiVersion: v1
 kind: Service
@@ -833,6 +956,8 @@ spec:
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
             - name: KUBE_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
               value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
@@ -881,6 +1006,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-hold-vol
+              readOnly: true
       dnsConfig:
         options:
           - name: ndots
@@ -911,6 +1039,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-hold
+            optional: true
+          name: platform-agent-hold-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1429,6 +1565,7 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-template-hash: <SHA256_FOR_TESTS>
       labels:
         app: platformagent-credential-proxy
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -1505,6 +1642,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-a2a-mcp
             - name: CREDENTIAL_PROXY_SCOPE_FILE
               value: /etc/kube-agents/scope/scope.json
+            - name: CREDENTIAL_PROXY_HOLD_FILE
+              value: /etc/kube-agents/hold/hold.json
             - name: CREDENTIAL_PROXY_A2A_REPORTS_AUDIENCE
               value: kubeagents-credential-proxy-a2a-reports
             - name: CREDENTIAL_PROXY_A2A_REPORTS_CALLERS
@@ -1603,6 +1742,9 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+            - mountPath: /etc/kube-agents/hold
+              name: platform-agent-hold-vol
+              readOnly: true
             - mountPath: /var/run/secrets/kubeagents/audit-report-store
               name: audit-report-store-ksa
               readOnly: true
@@ -1677,6 +1819,14 @@ spec:
             name: platformagent-config
             optional: true
           name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: hold.json
+                path: hold.json
+            name: platformagent-hold
+            optional: true
+          name: platform-agent-hold-vol
         - name: audit-report-store-ksa
           projected:
             defaultMode: 256
@@ -5443,6 +5593,10 @@ spec:
               value: kubeagents-system
             - name: GOMEMLIMIT
               value: "228170137"
+            - name: A2A_PROFILE_SUPERVISOR_CUTOFF
+              value: <LATCH_TIME_PLUS_MARGIN_FOR_TESTS>
+            - name: A2A_PROFILE_NAMES_FILE
+              value: /etc/a2a-profile-names/profiles.json
             - name: A2A_MCP_BROKER_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: A2A_MCP_BROKER_TOKEN_FILE
@@ -5500,6 +5654,9 @@ spec:
             - mountPath: /var/run/secrets/a2a-mcp-broker
               name: mcp-broker-token
               readOnly: true
+            - mountPath: /etc/a2a-profile-names
+              name: a2a-profile-names
+              readOnly: true
           workingDir: /
       dnsConfig:
         options:
@@ -5538,6 +5695,10 @@ spec:
                   audience: kubeagents-credential-proxy-mcp
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            name: platformagent-a2a-profile-names
+            optional: true
+          name: a2a-profile-names
 status: {}
 ---
 apiVersion: v1
@@ -6252,6 +6413,8 @@ spec:
               value: "false"
             - name: A2A_CARD_STOP_TIMEOUT
               value: 75s
+            - name: A2A_DELEGATION_ROUNDS_MAX
+              value: "1"
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
@@ -6302,6 +6465,10 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: A2A_REPORT_STORE_TOKEN_FILE
               value: /var/run/secrets/a2a-reports/token
+            - name: A2A_PROFILE_SUPERVISOR_CUTOFF
+              value: <LATCH_TIME_PLUS_MARGIN_FOR_TESTS>
+            - name: A2A_PROFILE_NAMES_FILE
+              value: /etc/a2a-profile-names/profiles.json
             - name: A2A_TIERS_FILE
               value: /etc/a2a-tiers/tiers.json
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
@@ -6348,6 +6515,9 @@ spec:
               readOnly: true
             - mountPath: /etc/a2a-tiers
               name: a2a-tiers
+              readOnly: true
+            - mountPath: /etc/a2a-profile-names
+              name: a2a-profile-names
               readOnly: true
           workingDir: /
       dnsConfig:
@@ -6410,6 +6580,10 @@ spec:
             name: platformagent-a2a-tiers
             optional: true
           name: a2a-tiers
+        - configMap:
+            name: platformagent-a2a-profile-names
+            optional: true
+          name: a2a-profile-names
 status: {}
 ---
 apiVersion: batch/v1
@@ -6982,3 +7156,25 @@ spec:
           name: tmp
   ttlSecondsAfterFinished: 86400
 status: {}
+---
+apiVersion: v1
+data:
+  profiles.json: |
+    {"profiles":[]}
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: profile-names
+  name: platformagent-a2a-profile-names
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""

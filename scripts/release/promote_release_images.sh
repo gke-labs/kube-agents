@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Promotes verified container images from candidate commit SHA to GA release tag in GHCR without rebuilding.
+# Promotes verified container images from candidate commit SHA to GA release tag in GHCR without rebuilding,
+# and in the candidate registry too when that is a second registry (promote_release_images in common.sh).
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 set -euo pipefail
 

@@ -3,8 +3,7 @@ Subject: Name audit_cluster.sh by full path so a kanban worker can run it
 Why: the command names the script relative to the skill folder. A kanban worker starts in its card's workspace, where `scripts/audit_cluster.sh` names nothing and the shell exits 127. The full path under the platform profile home resolves from any working directory.
 Local-Issue: #3219
 Eval-Case: none (exempt: a direct live test of each changed command)
-Upstream-Issue: none (specific to this repository)
-Retire-When: upstream names the script by a path that resolves outside the skill folder
+Retire-When: never; the work folder of a kanban worker and the path of the platform profile home are this repository's
 
 diff --git a/SKILL.md b/SKILL.md
 --- a/SKILL.md

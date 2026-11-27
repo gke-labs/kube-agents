@@ -241,7 +241,8 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 #: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
 #: that read the bus directly would use the same name). Such a record's
 #: ``tokens`` are the chain's usage as the gateway's probe reported it, and
-#: its ``total`` is null when it reported none (a gateway older than the
+#: its ``total`` is null when the harness holds none (the harness made no
+#: usage read or got none from it, or the gateway reported none: a gateway older than the
 #: field, or turns that published no usage), whatever the delegated workers
 #: billed; its liveness signal is then the
 #: executor's own events instead: an entry of this
@@ -851,8 +852,8 @@ def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
     # so the log says which one happened. The one record that legitimately
-    # carries null buckets is an inject transport run whose gateway
-    # reported no usage, and its liveness is the executor's status events in
+    # carries null buckets is an inject transport run that holds no usage
+    # for the chain, and its liveness is the executor's status events in
     # the trajectory instead (see _a2a_run_evidence).
     total = record.tokens.get("total")
     if total is None:

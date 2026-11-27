@@ -1,0 +1,189 @@
+# NIGHTLY -- an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: fleet audits. Journey: a run of an audit published a wrong
+# remediation, and the next run finds the same finding unchanged. `finish`
+# keeps the previous run's wording for an unchanged finding, so the wrong
+# remediation stayed on every later run (gke-labs/kube-agents#5880). `finish`
+# now judges a kept remediation by two content rules: a command for another
+# cluster, and a literal value where the procedure leaves the value to the
+# cluster's owner. A kept remediation that fails one gives way to this run's,
+# when this run's own passes both.
+#
+# WHAT IS GRADED. The same finding and the same four checks as
+# fleet-audit-remediation-right-and-not-stale: the drift stream's
+# authorized-networks outlier on seeded-c, read in the stored report as data.
+# Its remediation is `kind: gcloud`, the command with both flags on this
+# cluster, with no literal range as the flag's value and without the planted
+# run's mark.
+#
+# THE PLANT (prebuilt/unchanged-finding-wording, `planted_remediation:
+# gcloud-same`). A previous run in the report store with the same finding id,
+# the same evidence and severity as this run's, and a marked `gcloud` command
+# that gives a literal range. Without the rules `finish` publishes that
+# command in place of this run's own: the range check and the mark check both
+# fail (tests/test_unchanged_finding_wording_plant.py holds both directions
+# against the carry code). The planted title and impact are still kept, as
+# for any unchanged finding; the four checks read the recommendation and the
+# remediation only. A plant lost before grading is an error, never a pass.
+# A worker whose own command gives a literal range keeps the planted one: the
+# range check and the mark check then fail, and that red is the worker's.
+#
+# THE WITNESS. A plant on other evidence keeps nothing, and the four checks
+# would then pass with no rule asked. So a fifth check reads the finding's
+# title: `finish` keeps the planted title for an unchanged finding, and the
+# mark in it shows that the plant matched this run's finding. It does not
+# show that a rule was asked. Two states pass on a build with no rule: a
+# worker that copies the marked title from the store by hand while the plant
+# missed (the-store-was-not-read puts a read by the store's path, by
+# `latest.json` or by the query script on the record), and a worker whose
+# own note already holds a note that the harness writes, which `finish` never
+# replaces.
+#
+# What the case does not cover: a wrong command that this run wrote itself;
+# the other content rule, a command for another cluster (unit tests hold it;
+# this plant fails the owner-value rule only); and any wrong text other than
+# the two that the rules name.
+#
+# Planted defect required: drift-outlier (bench/tf/fleet/fixtures.json).
+# Isolation class: cluster-read-only, GitOps-repo write, as for
+# consistency-drift-outlier: the run opens or rewrites the stream's ledger
+# issue in the throwaway eval repository. A tofu case, so it holds the infra
+# lock; its run is a full drift audit.
+id: fleet-audit-wrong-kept-remediation-gives-way
+name: A wrong remediation that a previous run published gives way to this run's command
+
+fixtures:
+  - drift-outlier
+
+# The run writes the stream's ledger, and the checks read the stored report:
+# the runner takes the stream from this line.
+audit_streams:
+  - fleet-consistency-drift
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/unchanged-finding-wording"
+  teardown: true
+  variables:
+    # Letters, digits and hyphens only, as the sibling case's mark.
+    mark: "kept-remedy-5c1f"
+    planted_remediation: "gcloud-same"
+
+validated: false
+
+domain: fleet-audits
+
+prompt: >-
+  Run the fleet consistency drift audit, following the
+  fleet-consistency-drift SOP.
+
+expected_output: >-
+  The ledger issue for the fleet-consistency-drift stream names the
+  authorized-networks outlier on seeded-c. Its remediation is a gcloud
+  command that enables master authorized networks on seeded-c and leaves the
+  ranges to the cluster's owner: no range copied from a peer, none invented,
+  and not the command with a literal range that the previous run's report
+  holds for the same finding. The closing response is
+  the SOP's one line, with the ledger URL in full.
+
+verification_spec:
+  # Two id fragments bind the check and the cluster: the id's middle segment
+  # (project and location) differs per project and is clipped past 100
+  # characters.
+  - name: the-outlier-remediation-is-a-gcloud-command
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      finding:
+        id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
+        remediation_kind: gcloud
+  - name: the-command-enables-authorized-networks-on-the-outlier
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      finding:
+        id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
+        command_prefix: "gcloud container clusters update"
+        command_argument: "seeded-c"
+        command_flags:
+          [
+            "--enable-master-authorized-networks",
+            "--master-authorized-networks",
+          ]
+  # The value is the owner's to give. A literal range is a peer's block or an
+  # invented one; a comment that quotes the peers' block is not a value.
+  - name: the-command-gives-no-literal-range
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      finding:
+        id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
+        command_prefix: "gcloud container clusters update"
+        no_cidr_value: ["--master-authorized-networks"]
+  - name: the-remediation-is-not-the-previous-runs
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      finding:
+        id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
+        forbidden_text: ["kept-remedy-5c1f"]
+        planted_mark: "kept-remedy-5c1f"
+  # The witness: the planted title was kept, so the plant matched this run's
+  # finding and the four checks above are not passed by a plant that missed.
+  - name: the-kept-title-shows-that-the-plant-matched
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      finding:
+        id_contains: ["authorized-networks.", "._.cluster-seeded-c"]
+        title_contains: ["kept-remedy-5c1f"]
+  # The worker must not copy the mark from the store by hand: a copied title
+  # answers the witness when the plant did not match. Each pattern is a read
+  # of the drift stream's stored reports, as in
+  # fleet-audit-unchanged-finding-keeps-wording.
+  - name: the-store-was-not-read
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - "fleet-audit/reports"
+        - 'report_query\.py'
+        - 'latest\.json'
+  # The audit proposes the command and never runs it: enabling the setting on
+  # seeded-c removes the fixture for every case on the fleet. Graded where the
+  # lane reads worker commands; the agent's role is read-only besides. The
+  # check reads each command as an argv, so it matches a real `gcloud ...
+  # container clusters update`, also behind `cd x &&`, an exec wrapper,
+  # `bash -c` or `$(...)`. A worker that fills its report by a script writes
+  # the proposed command as text, and plain text in a quoted string is not a
+  # run. The limits are the shell reader's, and this text does not list them
+  # all. The reader can take a command that a worker only wrote for a run.
+  # Two examples: a command in backticks inside double quotes, and the SOP's
+  # command broken over two lines by a backslash, as lines of a heredoc that
+  # `cat` writes to a file. And a call that the reader cannot read can be an
+  # error of the check. For those reasons the severity is the sibling's
+  # (fleet-audit-unread-target-keeps-finding): a failure is on the record and
+  # does not alone fail the case. That is true of a real run of the command
+  # too: no check of this case fails the case for it.
+  - name: the-audit-did-not-run-the-command
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: gcloud
+          word_patterns: ["^container$", "^clusters$", "^update$"]

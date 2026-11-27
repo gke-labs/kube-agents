@@ -192,6 +192,8 @@ func TestTaskTerminalsAreCountedByStateAndSource(t *testing.T) {
 		`kubeagents_a2a_gateway_task_terminals_total{source="other",state="other"} 0`,
 		`kubeagents_a2a_gateway_gchat_events_received_total 0`,
 		`kubeagents_a2a_gateway_gchat_pulls_total{outcome="empty"} 0`,
+		`kubeagents_a2a_gateway_teams_events_received_total 0`,
+		`kubeagents_a2a_gateway_teams_pulls_total{outcome="empty"} 0`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics does not carry %q:\n%s", want, body)
@@ -847,8 +849,11 @@ func TestAnswerFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
 	series := make(chan prometheus.Metric, 16)
 	m.answerFeedback.Collect(series)
 	close(series)
-	if got := len(series); got != 8 {
-		t.Errorf("answer_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 answers)", got)
+	if got := len(series); got != 12 {
+		t.Errorf("answer_feedback_total series = %d, want 12 (3 backends x 2 ratings x 2 answers)", got)
+	}
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformTeams, FeedbackDown, answerReply)); got != 0 {
+		t.Errorf("answer_feedback_total{teams,down,reply} = %v, want 0", got)
 	}
 	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp, answerReply)); got != 0 {
 		t.Errorf("answer_feedback_total{googlechat,up,reply} = %v, want 0", got)

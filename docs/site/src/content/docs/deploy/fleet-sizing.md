@@ -103,10 +103,12 @@ Many small commands are bounded by the kubectl admission instead. Its limits com
 sandbox's memory limit: at the default 2 GiB, 13 kubectl reads run at once and 13 more may wait
 (fewer under gVisor). A read that finds both full fails at once with a `capacity:` reason.
 
-The shell's kubectl admission refuses such a read before it starts, with a reason that names a
+The shell's kubectl admission, and the credential broker's for the kubectl it runs for profile workers, refuses such a read before it starts, with a reason that names a
 narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
 whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
-[`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
+the chart value `platformAgent.deployment.env`; [Applying it](#applying-it) shows the `install.env` line that carries such an entry. A hand edit of the CR's [`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment) can be lost at the next chart apply.
+
+The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
 The operator passes the tier to the shell sandbox and, under the session cluster view, to the
 session Pods the A2A gateway starts. On the `default` tier at the default session memory limit
@@ -186,16 +188,14 @@ through the inputs, or add pools beside the managed ones.
 
 Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
 the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
-The proxy Deployment recreates its pod rather than rolling it: applied on the default pools, the
-example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and
-`kubectl` command, and the Google Chat relay, is then down until a node fits.
+On default and fixed profiles (`""`, `small`, `medium`, `fleet`), the proxy Deployment recreates its pod (`Recreate`) and leaves the new proxy pod `Pending` until a node fits.
 
-The same holds under `spec.deployment.sizingProfile: auto`, which applies the `medium` row at 10
-clusters and the `fleet` row at 25 with no human in the loop. Before a step up the operator checks
-the namespace's `ResourceQuota` and the bounds of its `LimitRange` objects, not node
-allocatable capacity. A Standard pool therefore needs nodes that fit the `fleet` row's 4 vCPU proxy
-request (`e2-standard-8` or larger) before the count reaches 25. The `medium` row's 1 vCPU request
-fits an `e2-standard-4`. A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
+Under `spec.deployment.sizingProfile: auto`, the cluster-count floor sets `medium` at 10 clusters and `fleet` at 25. It also promotes or steps down proactively from live pod and broker metrics with no human in the loop. Under `auto` in-cluster, the proxy Deployment rolls with active-standby `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`): if the new surge pod stays `Pending`, the existing active broker pod keeps serving. Only a fresh install with no running pod stays unavailable until a node fits.
+
+Before each tier transition, the operator checks
+the namespace's `ResourceQuota` (including the broker's surge pod) and `LimitRange` bounds, not node
+allocatable capacity. It rolls back a `Pending` surge pod past two minutes with `SizingCappedByQuota` (`SurgeUnschedulable`) while keeping the running pod active. A Standard pool still needs nodes that fit the `fleet` row's 4 vCPU proxy
+request (`e2-standard-8` or larger) before load or count reaches `fleet` (`medium`'s 1 vCPU request fits an `e2-standard-4`). A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
 the tier at the row it admits, and the CR's `SizingCappedByQuota` condition names it.
 
 | Pool             | Shape (modeled)                                                                                                                                         | Carries                                                               |
@@ -263,10 +263,10 @@ caveat beside it:
   ([The data volume](#the-data-volume)), which raises the agent's claim alone.
 - `platformAgent.harness.tuning.maxInProgress: 3`: kanban workers at once, board-wide.
 - `platformAgent.deployment.credentialProxy.resources`: 4 vCPU and 8 GiB requests, 8 vCPU and
-  8 GiB limits. The broker admits at most eight commands at once, a cap the operator fixes, and
-  the 2 GiB default already covers the eight at 176 MiB a slot. The raise is headroom for a
-  child that outgrows its reserve on a large cluster, close to 1 GiB a slot (modeled), and it
-  admits nothing more in parallel.
+  8 GiB limits. Because `values-fleet.yaml` leaves `sizingProfile` unset (`small`) and fixed profiles
+  keep the eight-slot default cap, `2 GiB -> 8 GiB` adds about `1 GiB` of headroom per command
+  (modeled). Set `sizingProfile` to `auto` to scale both resources and the slot cap (`8` small,
+  `12` medium, `16` fleet).
 - `platformAgent.deployment.agentAPIAuth.resources`: 0.5 vCPU and 2 GiB requests, a 4 GiB
   memory limit, `limits.cpu` left at its default because the watcher's `GOMAXPROCS` follows it.
 - `platformAgent.deployment.env`: `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, which keeps the fleet
@@ -277,9 +277,9 @@ caveat beside it:
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
-the shell sandbox, where the audits run, sends `KUBEAGENTS_KUBECTL_COST_TIER` to the A2A gateway for
-its session Pods too, and passes every name it does not reserve to the
-credential proxy and `agent-api-auth` containers. The name in the example reaches the container
+the shell sandbox, where the audits run. `KUBEAGENTS_KUBECTL_COST_TIER` also goes to the A2A gateway
+for its session Pods and to the credential broker's stateful and exec tiers. Every name the operator
+does not reserve passes to the credential proxy and `agent-api-auth` containers. The name in the example reaches the container
 that reads it.
 
 A process tunable such as `MALLOC_ARENA_MAX` is not on the agent container's allowlist. A values

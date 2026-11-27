@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 )
 
 // CallerIdentity is an authenticated sandbox caller.
@@ -11,12 +12,48 @@ type CallerIdentity struct {
 	Username string
 	UID      string
 	Groups   []string
+	// Partition is a verified tenant or namespace the authenticator read from the caller's
+	// credential, for a Config.CallerPartition that separates callers by it; empty when the
+	// authenticator names none.
+	Partition string
+	// Authenticator names the authenticator that admitted the caller, for a deployment
+	// with more than one; empty when the embedder's authenticator does not say.
+	Authenticator string
+	// Extra holds further attributes of the caller that the authenticator verified, for a
+	// Config.Authorize or Config.CallerPartition that decides on more than the name; nil
+	// when the authenticator supplies none. The keys are the authenticator's own:
+	// pkg/tokenreview copies the TokenReview's status.user.extra, where Kubernetes names the
+	// pod a pod-bound ServiceAccount token belongs to
+	// (authentication.kubernetes.io/pod-name and authentication.kubernetes.io/pod-uid, for
+	// example). The handler reads none of it, and NewSlogAuditSink does not write it: the
+	// values can be large and are not the proxy's to judge safe to log. A custom AuditSink
+	// that wants them reads AuditEvent.Caller.
+	Extra map[string][]string
+}
+
+// clone returns a copy of c that shares no slice or map with it.
+func (c *CallerIdentity) clone() *CallerIdentity {
+	out := *c
+	out.Groups = slices.Clone(c.Groups)
+	if c.Extra != nil {
+		out.Extra = make(map[string][]string, len(c.Extra))
+		for key, values := range c.Extra {
+			out.Extra[key] = slices.Clone(values)
+		}
+	}
+	return &out
 }
 
 // ErrAuthenticationUnavailable is the error a CallerAuthenticator wraps when it could not
 // decide (a TokenReview or a key fetch failed), so the handler answers 503 rather than
 // telling the caller its credential is wrong.
 var ErrAuthenticationUnavailable = errors.New("caller authentication is unavailable")
+
+// ErrCallerRefused is the error a CallerAuthenticator wraps when it identified the caller's
+// credential as its own kind and refused it, such as a pod's ServiceAccount token sent from
+// another address. The handler answers 401 as for any refusal; a chain of authenticators
+// stops there and does not offer the credential to the next one.
+var ErrCallerRefused = errors.New("caller refused")
 
 // CallerAuthenticator identifies the caller of a request, returning an error when it is not
 // an authorized sandbox. The caller gets a fixed 401, or a fixed 503 when the error wraps

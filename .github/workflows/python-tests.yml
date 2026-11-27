@@ -149,7 +149,7 @@ jobs:
       # is what stops the strongest cross-language test in the repository from
       # being silently absent from the job that gates on it.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum
@@ -491,7 +491,7 @@ jobs:
       # Go and Helm for the same reason the coverage job installs them: the
       # injector seam and the chart-rendering suites skip silently without them.
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum
@@ -546,6 +546,25 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           make test-bench-deps
+
+      # The fix recipes: each loads, names an eval case that names it back, and
+      # carries no scaffold line. On a pull request it also flags a change that
+      # edits a recipe and the shared plumbing beside it (a warning, for a
+      # platform owner's review). The checkout is the pull request's merge
+      # commit, one deep; its first parent is the base it merged onto, so a
+      # second commit of depth gives exactly the pull request's change. It
+      # fetches that commit by SHA, not the merge ref, which GitHub may have
+      # rebuilt since checkout (main moved, or an old job re-ran).
+      - name: Check the fix recipes
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          base=""
+          if [ "$IS_PR" = "true" ]; then
+            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
+            base="HEAD^1"
+          fi
+          make recipe-check RECIPE_CHECK_BASE="$base"
 
       - name: Run the bench harness tests
         run: make test-bench

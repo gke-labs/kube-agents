@@ -175,6 +175,11 @@ func main() {
 		setupLog.Error(nil, "invalid --webhook-port: must be between 1 and 65535", "port", webhookPort)
 		os.Exit(1)
 	}
+	// A delegation rounds setting the gateway can't take yet is refused by
+	// name and rendered as 1, not a reason to stop reconciling every install.
+	if err := controller.ValidateA2ADelegationRoundsMax(); err != nil {
+		setupLog.Error(err, "delegation rounds setting refused")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -318,7 +323,7 @@ func main() {
 	// would record a Warning on every CR blaming a NetworkPolicy for the gap.
 	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
 	if operatorNamespace == "" {
-		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, credential-proxy falls back to Recreate without standby, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv)
 	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
 		// The value becomes kubernetes.io/metadata.name in the metrics rule's
@@ -328,7 +333,7 @@ func main() {
 		// would have the API server reject the policy on every reconcile. Clear
 		// it either way, so the rule is not rendered and the poller, which could
 		// reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, and the webhook admits a PlatformAgent in any namespace",
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports, status.usage's counters will not advance, credential-proxy falls back to Recreate without standby, and the webhook admits a PlatformAgent in any namespace",
 			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
 		operatorNamespace = ""
 	}

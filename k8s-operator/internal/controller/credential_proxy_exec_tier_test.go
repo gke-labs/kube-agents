@@ -336,7 +336,7 @@ func TestTheExecTierIgnoresFieldsOthersSetOnTheBroker(t *testing.T) {
 			},
 		}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
+	if _, err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
 		t.Fatal(err)
 	}
 	dep := &appsv1.Deployment{}
@@ -846,6 +846,106 @@ func TestABrokerEphemeralStorageOverrideDoesNotReachTheExecTier(t *testing.T) {
 					if !v.EmptyDir.SizeLimit.Equal(resource.MustParse(credentialProxyExecTierTmpSizeLimit)) {
 						t.Errorf("exec /tmp sizeLimit = %v", v.EmptyDir.SizeLimit)
 					}
+				}
+			}
+		})
+	}
+}
+
+// The kubectl cost tier reaches the broker's container on both tiers, the
+// stateful broker and the exec pods, normalised as the shell sandbox's copy
+// is: the broker's kubectl cost gate charges the same column the sandbox's
+// admission does. A value the normalisation refuses reaches neither, raw or
+// otherwise.
+func TestTheKubectlCostTierReachesBothBrokerTiers(t *testing.T) {
+	tiers := func(spec corev1.PodSpec) []corev1.EnvVar {
+		var out []corev1.EnvVar
+		for _, c := range spec.Containers {
+			if c.Name != credentialProxyContainerName {
+				continue
+			}
+			for _, e := range c.Env {
+				if e.Name == envKubectlCostTier {
+					out = append(out, e)
+				}
+			}
+		}
+		return out
+	}
+	render := func(env ...corev1.EnvVar) (broker, exec []corev1.EnvVar) {
+		agent := execTierTestAgent(ptr.To(int32(2)))
+		agent.Spec.Deployment.Env = env
+		dep := buildCredentialProxyDeployment(agent, "hash")
+		return tiers(dep.Spec.Template.Spec), tiers(buildCredentialProxyExecTierDeployment(agent, dep).Spec.Template.Spec)
+	}
+
+	if broker, exec := render(); len(broker) != 0 || len(exec) != 0 {
+		t.Errorf("%s set with no spec.deployment.env entry: broker %v, exec %v", envKubectlCostTier, broker, exec)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		broker, exec := render(corev1.EnvVar{Name: envKubectlCostTier, Value: value})
+		for tier, got := range map[string][]corev1.EnvVar{"broker": broker, "exec": exec} {
+			if len(got) != 1 || got[0].Value != want || got[0].ValueFrom != nil {
+				t.Errorf("%s on the %s tier = %v for the CR value %q; want exactly %q", envKubectlCostTier, tier, got, value, want)
+			}
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		if broker, exec := render(corev1.EnvVar{Name: envKubectlCostTier, Value: value}); len(broker) != 0 || len(exec) != 0 {
+			t.Errorf("%s reached the broker for the CR value %q: broker %v, exec %v", envKubectlCostTier, value, broker, exec)
+		}
+	}
+	fromConfigMap := corev1.EnvVar{Name: envKubectlCostTier, ValueFrom: &corev1.EnvVarSource{
+		ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "c"}, Key: "k"},
+	}}
+	if broker, exec := render(fromConfigMap); len(broker) != 0 || len(exec) != 0 {
+		t.Errorf("%s with a valueFrom reached the broker: broker %v, exec %v", envKubectlCostTier, broker, exec)
+	}
+}
+
+func TestTheExecTierPinsSlotCapAcrossSizingProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		name, profile, effectiveTier string
+		wantStatefulSlots            string
+	}{
+		{"small", sizingProfileSmall, "", credentialProxyMaxConcurrentCommands},
+		{"medium", sizingProfileMedium, "", credentialProxyMaxConcurrentCommands},
+		{"fleet", sizingProfileFleet, "", credentialProxyMaxConcurrentCommands},
+		{"auto-medium", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMaxConcurrentCommands},
+		{"auto-fleet", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMaxConcurrentCommands},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := execTierTestAgent(ptr.To(int32(1)))
+			agent.Spec.Deployment.SizingProfile = tc.profile
+			agent.Status.EffectiveSizingTier = tc.effectiveTier
+			statefulDep := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+			var gotStateful string
+			for _, c := range statefulDep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				for _, e := range c.Env {
+					if e.Name == credentialProxyMaxConcurrentCommandsEnv {
+						gotStateful = e.Value
+					}
+				}
+			}
+			if gotStateful != tc.wantStatefulSlots {
+				t.Fatalf("stateful %s at %s = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, tc.name, gotStateful, tc.wantStatefulSlots)
+			}
+			dep := buildCredentialProxyExecTierDeployment(agent, statefulDep)
+			for _, c := range dep.Spec.Template.Spec.Containers {
+				if c.Name != credentialProxyContainerName {
+					continue
+				}
+				var found string
+				for _, e := range c.Env {
+					if e.Name == credentialProxyMaxConcurrentCommandsEnv {
+						found = e.Value
+					}
+				}
+				if found != credentialProxyMaxConcurrentCommands {
+					t.Fatalf("exec %s at %s = %q, want %q", credentialProxyMaxConcurrentCommandsEnv, tc.name, found, credentialProxyMaxConcurrentCommands)
 				}
 			}
 		})

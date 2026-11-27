@@ -18,9 +18,10 @@ const (
 
 	// EphemeralConsumerInactiveThreshold is how long the server keeps an
 	// ephemeral consumer this module creates on TASKS after its last client
-	// went away. TasksGet sets it on the replay's ordered consumer and the
-	// worker adapter sets it on a session's named consumers, so the two
-	// reap on the same clock.
+	// went away. TasksGet sets it on the replay's ordered consumer,
+	// lastBySubject on its stored-time consumer (supervisor_cutoff.go), and
+	// the worker adapter on a session's named consumers, so all three reap on
+	// the same clock.
 	//
 	// It is set explicitly because nats.go's ordered-consumer default is five
 	// MINUTES (v1.53.1, jetstream/ordered.go:635; the caller's value replaces
@@ -83,7 +84,9 @@ type Task struct {
 	//
 	// Surfaced like it but NOT counted like it: TasksGet logs it, and does
 	// not add it to protocolViolations. PostFinalDropped counts a publisher
-	// breaking the protocol; the common cause of this one is TASKS' own
+	// breaking the protocol, with one expected case: a dispatcher terminal
+	// written twice (a restart between its publish and its settle, or a lost
+	// ack on the six-token form, #6883). The common cause of this one is TASKS' own
 	// per-subject limit doing exactly what it was configured to do, and a
 	// counter that rises when our own retention policy works is a counter
 	// nobody can alert on.
@@ -231,16 +234,17 @@ func TaskReplaySubjects(addressee, taskID string) []string {
 
 // TasksGet replays the task's events and supervisor subjects from sequence 1
 // on an ephemeral ordered consumer and folds the result — the durability
-// payoff: no live executor required. ProfileTask among opts reads it as a
-// profile task: on a client with a cutoff (WithProfileSupervisorCutoff), a
-// five-token supervisor message stored after it is left out of the fold
-// (AcceptsSupervisorEvent), and a task with nothing else is TaskNotFound. The two subjects share the TASKS stream
+// payoff: no live executor required. On a client with a cutoff
+// (WithProfileSupervisorCutoff), a five-token supervisor message on a
+// profile's addressee (WithProfileNames) stored after it is left out of the
+// fold (AcceptSupervisorEvent), and a task with nothing else is
+// TaskNotFound. The two subjects share the TASKS stream
 // sequence, so the ordered consumer supplies their total order and the fold
 // needs no merge: a supervisor terminal that raced an executor's own lands
 // wherever the stream put it, and whichever came second is the post-final
 // drop.
-func (c *Client) TasksGet(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, error) {
-	task, _, _, err := c.tasksGet(ctx, addressee, taskID, opts)
+func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task, error) {
+	task, _, _, err := c.tasksGet(ctx, addressee, taskID)
 	return task, err
 }
 
@@ -250,8 +254,8 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string, opts ..
 // whether the failure came before the consumer existed (a creation refusal,
 // such as the stream's consumer cap, which clears) or after (a consumer is
 // now live for the inactive threshold, and a retry would open another).
-func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, bool, error) {
-	task, _, opened, err := c.tasksGet(ctx, addressee, taskID, opts)
+func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string) (*Task, bool, error) {
+	task, _, opened, err := c.tasksGet(ctx, addressee, taskID)
 	return task, opened, err
 }
 
@@ -261,8 +265,8 @@ func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string, o
 // rides beside the Task rather than in it, because a Task is the fold of
 // bare envelopes and the live fold and the replay must stay equal (assertion
 // 11); which subject carried the terminal is a fact about the replay.
-func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, string, error) {
-	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID, opts)
+func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string) (*Task, string, error) {
+	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID)
 	return task, terminal.subject, err
 }
 
@@ -272,8 +276,8 @@ func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID strin
 // is the publisher's word and can say anything; a caller timing a window
 // from the terminal needs a clock the publisher does not control. Beside
 // the Task for the same reason as the subject (assertion 11).
-func (c *Client) TasksGetTerminal(ctx context.Context, addressee, taskID string, opts ...ReadOption) (*Task, string, time.Time, error) {
-	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID, opts)
+func (c *Client) TasksGetTerminal(ctx context.Context, addressee, taskID string) (*Task, string, time.Time, error) {
+	task, terminal, _, err := c.tasksGet(ctx, addressee, taskID)
 	return task, terminal.subject, terminal.storedAt, err
 }
 
@@ -288,7 +292,7 @@ type replayTerminal struct {
 // tasksGet's third result is replay's found: true from the moment the
 // ordered consumer was created, which is also when a later error leaves a
 // consumer live for the inactive threshold.
-func (c *Client) tasksGet(ctx context.Context, addressee, taskID string, opts []ReadOption) (*Task, replayTerminal, bool, error) {
+func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, replayTerminal, bool, error) {
 	events, eventMeta, found, err := c.replay(ctx, TaskReplaySubjects(addressee, taskID), taskID)
 	if err != nil {
 		return nil, replayTerminal{}, found, err
@@ -299,7 +303,7 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string, opts []
 	empty := !found
 	if found {
 		var dropped bool
-		events, eventMeta, dropped = c.screenSupervisorEvents(taskID, events, eventMeta, readOptionsOf(opts).profileTask)
+		events, eventMeta, dropped = c.screenSupervisorEvents(taskID, events, eventMeta)
 		empty = dropped && len(events) == 0
 	}
 	if empty {
@@ -339,10 +343,10 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string, opts []
 // screenSupervisorEvents drops from a replay what AcceptSupervisorEvent
 // refuses, in step with its metadata, and reports whether it dropped any.
 // The common case refuses nothing and returns its arguments as they are.
-func (c *Client) screenSupervisorEvents(taskID string, events []*Envelope, meta []replayTerminal, profileTask bool) ([]*Envelope, []replayTerminal, bool) {
+func (c *Client) screenSupervisorEvents(taskID string, events []*Envelope, meta []replayTerminal) ([]*Envelope, []replayTerminal, bool) {
 	keep := -1
 	for i := range events {
-		if c.AcceptSupervisorEvent(meta[i].subject, meta[i].storedAt, profileTask) {
+		if c.AcceptSupervisorEvent(meta[i].subject, meta[i].storedAt) {
 			if keep >= 0 {
 				events[keep], meta[keep] = events[i], meta[i]
 				keep++
@@ -389,9 +393,10 @@ func (c *Client) TaskInReplay(ctx context.Context, addressee, taskID string) (ev
 // returns it parsed and screened the way the replay screens: nil, with no
 // error, when the subject holds nothing in the retention window or when its
 // newest message is one the replay would have dropped (unparseable, or in
-// disagreement with its subject). It opens no consumer, which is the point: a
-// caller whose question the newest message answers does not pay the replay's
-// five-second ephemeral for it. An error is the read failing, not the subject
+// disagreement with its subject). It opens no consumer, but for a profile's
+// five-token supervisor subject on a reader with a cutoff (LastEnvelopeOn),
+// which is the point: a caller whose question the newest message answers does
+// not pay the replay's five-second ephemeral for it. An error is the read failing, not the subject
 // being empty.
 func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, error) {
 	_, js := c.conn()
@@ -399,28 +404,69 @@ func (c *Client) LastEnvelope(ctx context.Context, subject string) (*Envelope, e
 	if err != nil {
 		return nil, fmt.Errorf("stream %s: %w", TasksStream, err)
 	}
+	env, _, err := c.LastEnvelopeOn(ctx, stream, subject)
+	return env, err
+}
+
+// LastEnvelopeOn is LastEnvelope on a TASKS stream handle the caller already
+// holds, with the message's stream sequence: a caller reading several
+// subjects in one pass looks the stream up once, and can order what it reads
+// across subjects (they share the stream's sequence). The envelope is
+// screened as LastEnvelope screens it; nil when the subject is empty or its
+// newest message is dropped. The supervisor cutoff applies as
+// TaskReplayHeads applies it: a refused newest message reads as an empty
+// subject (sequence 0). As there, a direct get gives no stored time
+// (storedTimeOf), so where the time decides, the subject is read again on
+// lastBySubject's consumer for the server's time.
+//
+// The sequence is the direct get's Nats-Sequence header, which sits after the
+// publisher's own header block and so can be forged (the replay's horizon
+// note says how), except on that stored-time path, where it is the consumer's
+// delivery metadata, which the server writes. So it is fit for present /
+// absent, and for ordering subjects only the executor or the dispatcher can
+// write (`.events`, the six-token supervisor subject), not the
+// gateway-writable five-token supervisor subject, whose order comes from the
+// consumer path when the cutoff decides. Where no cutoff decides (none set,
+// or an addressee that isn't a listed profile), that subject is the task's
+// legitimate supervisor's, and probeTask orders it by the direct get's
+// sequence like the others.
+func (c *Client) LastEnvelopeOn(ctx context.Context, stream jetstream.Stream, subject string) (*Envelope, uint64, error) {
 	msg, err := stream.GetLastMsgForSubject(ctx, subject)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("newest message on %s: %w", subject, err)
+		return nil, 0, fmt.Errorf("newest message on %s: %w", subject, err)
 	}
-	env, err := ParseEnvelope(msg.Data)
+	// seq is the direct get's header, forgeable; where the cutoff decides,
+	// lastBySubject replaces it with the consumer's, which the server writes.
+	data, seq, storedAt := msg.Data, msg.Sequence, storedTimeOf(msg, directGets(stream))
+	if c.storedTimeDecides(subject, storedAt) {
+		if data, storedAt, seq, err = c.lastBySubject(ctx, subject); err != nil {
+			return nil, 0, err
+		}
+	}
+	// The cutoff, as TaskReplayHeads applies it: a profile task's five-token
+	// supervisor message stored past it isn't the task's, so the subject
+	// reads as empty (the conservative reading TaskReplayHeads names).
+	if !c.AcceptSupervisorEvent(subject, storedAt) {
+		return nil, 0, nil
+	}
+	env, err := ParseEnvelope(data)
 	if err != nil {
 		c.log.Error("a2a newest-message read skipping unparseable envelope", "subject", subject, "err", err)
-		return nil, nil
+		return nil, seq, nil
 	}
 	if aerr := CheckSubjectAgreement(subject, env, c.opts.agreement); aerr != nil {
 		c.protocolViolations.Add(1)
 		if !IsAdvisoryDisagreement(aerr) {
 			c.log.Error("a2a newest-message read skipping envelope that disagrees with its subject", "subject", subject, "err", aerr)
-			return nil, nil
+			return nil, seq, nil
 		}
 		// The advisory writer check, as in the replay: counted, returned.
 		c.log.Warn("a2a newest-message read returning envelope whose writer disagrees with its subject (advisory)", "subject", subject, "err", aerr)
 	}
-	return env, nil
+	return env, seq, nil
 }
 
 // IsFinalStatus reports whether env is a status-update carrying final=true,
@@ -453,11 +499,23 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	}
 	// Snapshot the replay horizon first: fold what the stream holds now, and
 	// terminate deterministically even while the task is still emitting.
-	// GetLastMsgForSubject is single-subject, so the horizon is the latest
-	// across the subjects, and a task exists if any subject holds a message.
-	var last uint64
+	// The direct gets say only whether a subject holds a message, and a task
+	// exists if any does. They do not give the horizon: a direct get's
+	// Nats-Sequence is a header after the publisher's own header block, and
+	// a blank line inside that block ends it for the client's parse, so the
+	// server's sequence is hidden and a publisher's forged one is all the
+	// client reads (the same forgery storedTimeOf refuses for the time). A
+	// forged low one would stop the replay early and hide the task's later
+	// events; a forged high one would let it fold events stored after the
+	// call. The horizon is the stream's last sequence from STREAM.INFO, read
+	// after the direct gets, so every message they found is at or under it.
+	// It is the stream's, not the subjects', so the loop below also stops at
+	// the first message past it and does not fold that one. The cost is one
+	// STREAM.INFO round trip per replay that finds the task, on top of the
+	// direct gets; the replay already opens a consumer, so it is the cheaper
+	// of its two extra calls.
 	for _, subject := range subjects {
-		msg, err := stream.GetLastMsgForSubject(ctx, subject)
+		_, err := stream.GetLastMsgForSubject(ctx, subject)
 		if err != nil {
 			if errors.Is(err, jetstream.ErrMsgNotFound) {
 				continue
@@ -465,12 +523,18 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 			return nil, nil, false, fmt.Errorf("replay horizon for %s: %w", taskID, err)
 		}
 		found = true
-		if msg.Sequence > last {
-			last = msg.Sequence
-		}
+		break
 	}
 	if !found {
 		return nil, nil, false, nil
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("replay horizon for %s: %w", taskID, err)
+	}
+	last := info.State.LastSeq
+	if replayHorizonTaken != nil {
+		replayHorizonTaken()
 	}
 	cons, err := js.OrderedConsumer(ctx, TasksStream, jetstream.OrderedConsumerConfig{
 		FilterSubjects:    subjects,
@@ -510,6 +574,11 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 		if err != nil {
 			return nil, nil, true, fmt.Errorf("replay metadata for %s: %w", taskID, err)
 		}
+		if meta.Sequence.Stream > last {
+			// Stored after the horizon: the call folds what the stream held
+			// when it was made.
+			break
+		}
 		subject := msg.Subject()
 		env, err := ParseEnvelope(msg.Data())
 		if err != nil {
@@ -547,6 +616,11 @@ func (c *Client) replay(ctx context.Context, subjects []string, taskID string) (
 	}
 	return events, eventMeta, true, nil
 }
+
+// replayHorizonTaken, when set, runs in replay right after the horizon is
+// read and before the consumer is made. Tests set it to store a message
+// past the horizon; it is nil otherwise.
+var replayHorizonTaken func()
 
 // finalEvent is the subject and stored time of the event that made the fold
 // final: the first final status-update in stream order, which is the one

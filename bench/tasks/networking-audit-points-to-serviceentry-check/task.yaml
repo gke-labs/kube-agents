@@ -1,0 +1,54 @@
+# Security (compliance-audit): a question about the GCP networking fabric
+# audit's coverage of Istio ServiceEntry collisions is answered with where the
+# check lives. The networking audit reads only GCP APIs; the collision check is
+# compliance-audit §2.19 (`serviceentry-host-collision`), and the networking
+# skill points there so a reader looking in the networking audit finds it
+# (gke-labs/kube-agents#1983).
+#
+# deployer: noop. Read-only: no audit runs and nothing is written; the answer
+# is graded on its final message.
+#
+# A weak guard by design: the compliance SOP's own §2.19 heading names the
+# slug, so an agent that searches the profile can answer without the pointer.
+# What the case pins is the answer's shape, both halves of it, which a
+# regression to "the networking audit covers it" fails.
+id: networking-audit-points-to-serviceentry-check
+name: "The networking audit's coverage question names compliance-audit §2.19 for ServiceEntry collisions"
+domain: security
+fixtures: []
+prompt: >-
+  Does the GCP networking fabric audit check for colliding Istio
+  ServiceEntries, where two namespaces declare the same host? If it doesn't,
+  tell me which audit and check does. Don't run any audit or change anything.
+expected_output: >-
+  The answer says the GCP networking fabric audit does not check ServiceEntry
+  collisions, because it reads only GCP APIs, and names the compliance audit's
+  check §2.19, serviceentry-host-collision, as the one that does.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  # Both halves in the final answer: that the networking audit does not check
+  # this, and the compliance audit's check by section number or slug. The text
+  # is lowercased before matching, so the patterns are lower case.
+  - name: the-answer-names-compliance-audit-2-19
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The negation has to be about the networking audit, in either order:
+      # "networking ... does not check" or "not checked by ... networking", or
+      # the skill's own "not in this audit". An affirmative about the networking
+      # audit and ServiceEntries or collisions fails, in any tense, as does a
+      # "yes" on the same line as "networking" even across a full stop. Plain
+      # "the networking audit checks VPC subnets" is not an affirmative here.
+      forbidden_patterns:
+        - "\\byes\\b[^\n]{0,80}networking"
+        - "networking[^\n.]{0,60}\\b(covers|checks|detects|flags|catches|includes|does check|does cover|do check|do cover)\\b[^\n.]{0,60}(serviceentr|collision)"
+      required_patterns:
+        - "compliance[ _-]?audit"
+        - "networking[^\n.]{0,80}\\b(does not|doesn.t|do not|don.t|is not|isn.t|not|never)\\b[^\n.]{0,40}(check|cover|detect|include|read|flag)|\\b(not|never)\\b[^\n.]{0,40}(checked|covered|detected|flagged|included|part of)[^\n.]{0,40}networking|\\bnot in (this|the networking)|\\bno\\b[^\n]{0,30}networking"
+      any_of_patterns:
+        - "(^|[^0-9.])2\\.19([^0-9]|$)"
+        - "serviceentry-host-collision"

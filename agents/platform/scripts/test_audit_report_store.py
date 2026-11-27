@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import gc
 import hashlib
 import http.server
 import json
@@ -717,20 +718,26 @@ class HardeningTests(StoreTestCase):
         (directory / "latest.json").mkdir()
         # Warm up: the first request opens sockets and threads of its own.
         self.call("GET", f"{STREAM}/latest")
+        self.call("GET", "/v1/audit-reports")
+        self.api.stop()
+        gc.collect()
         before = len(os.listdir("/dev/fd"))
         for _ in range(5):
             self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
             listed = self.call("GET", "/v1/audit-reports")
             self.assertEqual(200, listed.status_code)
             self.assertEqual(STAMP_1, listed.json()[0]["newest_run"])
+        gc.collect()
         self.assertEqual(before, len(os.listdir("/dev/fd")))
         # And directly.
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
+            gc.collect()
             before = len(os.listdir("/dev/fd"))
             with self.assertRaises(store.Refused) as caught:
                 store._read_at(fd, "latest.json")
             self.assertEqual(409, caught.exception.status)
+            gc.collect()
             self.assertEqual(before, len(os.listdir("/dev/fd")))
         finally:
             os.close(fd)

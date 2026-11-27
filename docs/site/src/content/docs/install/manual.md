@@ -32,7 +32,7 @@ platform/
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
 ├── cron/jobs.json           # the governance watchdog roster (see below)
-├── plugins/                 # in-tree Hermes plugins (incident_context, pr_opened, memory)
+├── plugins/                 # in-tree Hermes plugins (eval_run_tag, incident_context, model_identity, pr_opened)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```
@@ -63,7 +63,7 @@ See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Ref
 The manual install covers only the agent workspace. To reach parity with an automated `install.sh` installation, you still need:
 
 - **Cluster access**: a Kubernetes context the agent can call. The shipping config reaches the [GKE MCP server](https://container.googleapis.com/mcp) through the credential proxy's MCP relay, which the operator wires up (`KUBE_AGENTS_MCP_RELAY_URL`). A manual install has no relay, so point the `gke` entry at your own Kubernetes MCP server or add `kubectl` to the toolset.
-- **Chat ingress**: Google Chat Pub/Sub or Slack Socket Mode. See [ChatOps](/kube-agents/concepts/chatops/).
+- **Chat ingress**: Google Chat Pub/Sub, Slack Socket Mode, or Microsoft Teams through Bot Framework ([Microsoft Teams app setup](/kube-agents/install/teams-app/)). See [ChatOps](/kube-agents/concepts/chatops/).
 - **Inference gateway**: any Completions-API-compatible endpoint (LiteLLM is the default recommendation). See [Inference gateway](/kube-agents/concepts/inference-gateway/).
 - **GitHub token minter**: for the `submit-suggestion` and `github-issue-resolver` skills. See [Deploy → Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on GitLab or Bitbucket needs no minter: the credential broker holds the forge's access token. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/).
 

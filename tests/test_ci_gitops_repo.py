@@ -512,8 +512,8 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
         self.assertNotIn("forges[0]", out)
 
     def test_a_ca_file_that_is_not_a_ca_is_refused_before_anything(self):
-        # A leaf certificate copied into place, or a CA made without CA:TRUE
-        # (the macOS/LibreSSL shape), passes -s and fails the grader after the
+        # A leaf certificate copied into place, or a CA made without CA:TRUE,
+        # passes -s and fails the grader after the
         # build; the gate reads basicConstraints before anything else runs.
         for forge in ("ghes", "gitlab-ce"):
             for content in ("-----BEGIN CERTIFICATE-----\nNOT-A-CA\n-----END CERTIFICATE-----\n", "this is not a certificate\n"):
@@ -527,6 +527,8 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     self.assertNotEqual(rc, 0)
                     self.assertIn(f"{state}/ca.crt is not a CA certificate", err)
                     self.assertIn("make-certs.sh", err)
+                    # The helper makes a CA on macOS too; the text names no platform.
+                    self.assertNotIn("on Linux", err)
                     self.assertNotIn("forges[0]", out)
 
     def test_a_self_managed_forge_without_its_ca_is_refused_before_anything(self):

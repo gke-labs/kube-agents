@@ -439,6 +439,10 @@ COMMAND_ARG_KEYS = ("command", "cmd")
 # list (`SECRET_READ_COMMAND_RE`): the paths that hold a credential are not
 # enumerable, so that rule names the well-known mounts and the directory
 # names that announce one.
+# A credential read from the metadata server is a list too
+# (`METADATA_CREDENTIAL_PATH_RE`, and `METADATA_CREDENTIAL_PATH_VARIABLE_RE`
+# for a last path part that is one shell variable): it reads the whole text
+# of the command, not each simple command.
 #
 # The shell's escape and the separators `split_shell_commands` reads; the
 # quotes are `SHELL_QUOTE_CHARS` above.
@@ -643,6 +647,49 @@ SECRET_READ_COMMAND_RE = re.compile(
     r"(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_|(?:[^\s/]*-)?(?:secrets?|creds|credentials)/)[^\r\n]*"
     r")"
 )
+# A read of a credential from the metadata server: the path of a service
+# account's `token` or `identity`, in a command that also holds a sign of the
+# metadata server (one of its hosts or addresses, or the header that a request
+# to it carries). The path is read from `instance/` on, because the part ahead
+# of it is often in a variable (`"$MD/instance/service-accounts/default/token"`),
+# so the path of each version of the server's tree counts. The last part can
+# hold other text ahead of the word, as a brace list does
+# (`default/{email,token}`). The sign can stand anywhere in the command, on
+# another of its lines too: a command often assigns the host in one place and
+# reads the path in another. The rule reads the text and not the command word,
+# so any client withholds (`curl`, `wget`, a script in a quoted argument), and
+# so does a command that only prints such a read. A path with no sign is text
+# about the server (`grep -rn instance/service-accounts/default/token docs/`),
+# and an account's other paths (`email`, `scopes`) hold no credential; both
+# are served. The path pattern starts from fixed text and reads to the next
+# `/` or blank, and the sign pattern is fixed text, so a run of either costs
+# linear time.
+METADATA_CREDENTIAL_PATH_RE = re.compile(r"(?i)instance/service-accounts/[^/\s]+/[^/\s]*\b(?:token|identity)\b")
+# The same path with one shell variable as its whole last part
+# (`default/$T`, `default/${FIELD}`, `default/$1`, `default/$@`): the value
+# can be `token`, and the text cannot tell, so the rule decides closed. A
+# brace form counts with text in it that holds no blank and no brace
+# (`${T:-email}`, `${!T}`), and so do quotes and backslashes between the `/`
+# and the `$` (`default/"$T"`, `"…/default/"$T`, `default/\$T` in a script in
+# double quotes). The variable must end the path: the end of the text, a
+# blank, a quote, a backtick, a backslash or one of `? # ; | & ) < > } ]`
+# follows it. A variable with more text in its part (`$NAME.txt`, `x$T`), one
+# that is not the last part (`$DIR/`), and a variable for the account alone
+# (`service-accounts/$SA`) do not count. The account part holds no `>`, so a
+# redirect behind a list of the accounts (`service-accounts/>$DIR/$OUT`) does
+# not count. The pattern starts from fixed text, and neither the account part
+# nor the brace form can read past the next start (a `/` and a `{` stop
+# them), so a run of them costs linear time.
+METADATA_CREDENTIAL_PATH_VARIABLE_RE = re.compile(
+    r"(?i)instance/service-accounts/[^/\s>]+/[\"'\\]*\$(?:\{[^{}\s]*\}|[a-z0-9_]+|[@*])(?=$|[\s\"'`?#;|&)<>\\}\]])"
+)
+METADATA_FLAVOR_HEADER = "metadata-flavor"
+METADATA_SERVER_HOSTS = ("metadata.google.internal", "metadata.goog", "169.254.169.254", "169.254.169.252", "fd20:ce::254")
+# `metadata.goog` also matches the longer host name, which is in the list for the reader. The short
+# host name `metadata` counts only behind `//` (`//metadata/`, `//metadata:80`).
+METADATA_SERVER_SIGN_RE = re.compile(
+    r"(?i)" + "|".join(re.escape(sign) for sign in (METADATA_FLAVOR_HEADER, *METADATA_SERVER_HOSTS)) + r"|//metadata(?![\w.-])"
+)
 # A command that prints the caller's own token or its environment, which holds
 # whatever credentials the process was started with
 # (`script_prints_token_or_environment`). One simple command is read as shell
@@ -707,6 +754,7 @@ GCLOUD_TOKEN_PRINTER_GROUPS = {
     "config-helper": GCLOUD_CONFIG_GROUP,
 }
 GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
+GCLOUD_TOKEN_PRINTER_GROUP_WORDS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS.values())
 # `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
 GCLOUD_SSH_COMMAND = "ssh"
 SCRIPT_LONG_FLAG = "--command"
@@ -874,6 +922,19 @@ MAX_READ_LINES = 256
 MAX_READ_CHARS_FACTOR = 6
 MAX_READ_CHARS_FLOOR = 65536
 READ_COST_CHARS = 16
+# A line that holds a simple command longer than this is withheld with no
+# read. The readers take a command's words from `shlex`, which builds a word
+# one character at a time and copies it each time, so one very long word (a
+# file body in one quoted argument, an unclosed quote over many lines) costs
+# each reader quadratic time. A simple command is at least as long as its
+# longest word, so the limit bounds that cost for the pieces that the cut
+# gives, with the line's comments and without them. The readers of the token
+# and environment rule cut a line with a quote model of their own, so a quote
+# in a quoted substitution, or a blank that only `str.strip` takes as one, can
+# still give them a longer word. The limit is the floor of the read budget
+# above, and a line with a simple command past it is decided as a call past
+# its budget is.
+MAX_SIMPLE_COMMAND_CHARS = MAX_READ_CHARS_FLOOR
 # A script that stood in double quotes keeps the backslash ahead of a `$` or a
 # backtick; the shell that runs the script reads them as a substitution's
 # start. A backslash that another backslash escapes is no such backslash: in
@@ -1528,11 +1589,19 @@ def mask_served_values(text: str, values: Sequence[tuple[tuple[str, int], ...]])
 
 
 def as_json_structure(text: str) -> Any:
+    """The JSON object or array that `text` is, or `None` for text that is not one.
+
+    Raises `RecursionError` where the parser gives up for the depth. A caller
+    must not read that as "not a document": the text rules alone are a weaker
+    rule than a less deep document gets, which is withheld when the walk over
+    it reaches the recursion limit. `scrub_step_text` withholds the step on
+    the error, and `is_secret_read_tool_call` counts it as a secret read.
+    """
     if text.lstrip()[:1] not in JSON_STRUCTURE_OPENERS:
         return None
     try:
         parsed = json.loads(text)
-    except (ValueError, RecursionError):
+    except ValueError:
         return None
     return parsed if isinstance(parsed, (dict, list)) else None
 
@@ -1746,7 +1815,11 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     read as text and its other arguments as prose; a `tool_result` takes the
     inline-object rule and the rest-of-line mask (`VALUE_SPAN_LINE`); a reply
     keeps the first-token mask. Returns `withheld` for every kind when
-    `redactor` is `None` or the structure is deeper than Python recurses, so
+    `redactor` is `None`, or when the text, or a string value in it that the
+    walk parses, is a JSON document too deep to parse or too deep to walk, or
+    when an inline object in a tool result's line is too deep to parse. (A
+    string value that a rule masks whole is masked, not parsed.) Text that
+    the parser gives up on for its depth is withheld too, document or not. So
     an unscrubbable step is never served as written.
     """
     if redactor is None:
@@ -2215,6 +2288,22 @@ def _first_operands(words: Sequence[str], start: int) -> List[int]:
     return found
 
 
+def _token_printer_behind_its_group(words: Sequence[str]) -> bool:
+    """Whether a gcloud token printer stands behind its group word.
+
+    One pass: it keeps the group words met so far. A copy of the words
+    ahead of each printer made the read quadratic on a command that repeats
+    a printer word.
+    """
+    groups_ahead = set()
+    for word in words:
+        if word in GCLOUD_TOKEN_PRINTERS and GCLOUD_TOKEN_PRINTER_GROUPS[word] in groups_ahead:
+            return True
+        if word in GCLOUD_TOKEN_PRINTER_GROUP_WORDS:
+            groups_ahead.add(word)
+    return False
+
+
 def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: List[int]) -> bool:
     """Whether one command's words print a token or the environment."""
     words = list(words)
@@ -2224,7 +2313,7 @@ def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: 
         return False
     if any(word.endswith(ENVIRON_PATH_SUFFIX) for word in words):
         return True
-    if any(GCLOUD_TOKEN_PRINTER_GROUPS[word] in words[:index] for index, word in enumerate(words) if word in GCLOUD_TOKEN_PRINTERS):
+    if _token_printer_behind_its_group(words):
         return True
     steps = 0
     starts, read = [(0, False)], set()
@@ -2735,11 +2824,32 @@ def _command_reads_a_secret(command: str, depth: int) -> bool:
     folded = fold_shell_continuations(command)
     if SECRET_READ_COMMAND_RE.search(folded):
         return True
+    names_a_credential_path = METADATA_CREDENTIAL_PATH_RE.search(folded) or METADATA_CREDENTIAL_PATH_VARIABLE_RE.search(folded)
+    if names_a_credential_path and METADATA_SERVER_SIGN_RE.search(folded):
+        return True
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))
+
+
+def _holds_a_long_simple_command(command: str) -> bool:
+    """Whether a simple command of the line is longer than `MAX_SIMPLE_COMMAND_CHARS`.
+
+    The line is cut two times, as it is and with its comments off, because
+    the first read takes the comments off before it cuts: a quote character
+    in a comment moves the cut.
+    """
+    if len(command) <= MAX_SIMPLE_COMMAND_CHARS:
+        return False
+    return any(
+        len(simple) > MAX_SIMPLE_COMMAND_CHARS
+        for text in (command, strip_shell_comments(command))
+        for simple in split_shell_commands(fold_shell_continuations(text))
+    )
 
 
 def command_reads_a_secret(command: str) -> bool:
     """Whether the shell line `command` prints a secret's value, deciding closed where it cannot tell."""
+    if _holds_a_long_simple_command(command):
+        return True
     return _command_reads_a_secret(command, 0) or script_prints_token_or_environment(command, 0)
 
 
@@ -2748,8 +2858,13 @@ def is_secret_read_tool_call(raw_args: Any) -> bool:
 
     `raw_args` is the arguments as Hermes stores them: a JSON string or an
     object whose `command`/`cmd` carries the shell line, or the bare line.
+    Arguments too deep to parse count as a secret read: nothing shows that
+    they are not one, and `scrub_step_text` withholds them too.
     """
-    parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    try:
+        parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    except RecursionError:
+        return True
     if isinstance(parsed, dict):
         cmd = next((parsed.get(k) for k in COMMAND_ARG_KEYS if parsed.get(k)), "")
         return isinstance(cmd, str) and command_reads_a_secret(cmd)

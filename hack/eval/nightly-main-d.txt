@@ -14,5 +14,8 @@ incident-triage-workload-fold
 triage-start-burst
 # Added when the case joined the nightly (#1983): the shortest chain then.
 security-serviceentry-host-collision
+# Added with the case (#5880), after its sibling went to main-b: the shortest
+# chain then.
+fleet-audit-wrong-kept-remediation-gives-way
 # Added when the case joined the nightly (#6812); the chains still balance.
 fleet-audit-unfinished-run-reported

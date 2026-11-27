@@ -264,7 +264,7 @@ layout and are collected from the moment they start running.
       billed on both transports: on the api transport the front door's
       session plus its delegated workers; on the inject transport the front
       door's turns plus the chain's child tasks plus the workers (and null
-      when the gateway reported no usage, whatever the workers billed).
+      when the harness holds no usage for the chain, whatever the workers billed).
       `input` and `output` differ by transport: on the api transport they
       include the workers and `input` excludes cached reads (unless the
       front door's session row could not be read); on the inject
@@ -791,7 +791,11 @@ what the renderer does with them.
   note. Its runs' `job` is always the prefix's last segment, and they count
   as the writers part only when that segment is
   `ci-kube-agents-eval-nightly-writers` (`nightly.NIGHTLY_WRITERS_JOB`);
-  any other is warned about and reported as the main part.
+  any other is warned about and reported as the main part. Among
+  `--nightly-prefix` and the part flags, each job and each prefix is listed
+  once, under the first flag that names it, `--nightly-prefix` first: a part
+  flag that names a job or a prefix an earlier flag already lists is warned
+  about and not read. A trailing `/` does not make a prefix another one.
 - `--nightly-main-b-prefix [<gs prefix>]` — the same for the periodic that
   runs the main part's main-b shard; given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/`.
@@ -1257,8 +1261,16 @@ spreads and appear nowhere else (not as points, nights, key changes or in
 only when it is not today). `nights[]` is every night inside the drawn window the
 store holds a record for, oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
 `build:<prow build id>` from the object name (or `at:<recorded_at>` for a
-record without one; the records of a split night's two builds share the
-build `nightly.nights[]` files that night by), `started` and `log_url` the collector's when that
+record without one; the records of a split night's builds share the
+build `nightly.nights[]` files that night by; a build that `data.json`'s
+nightly runs lack, as after a refresh that swept a bounded span or while a
+part is not collected yet, is grouped with the builds of its night date
+that started within 15 minutes (`NIGHT_START_SPREAD` in `trend.py`) of the
+first of them, each start read from the build id and used only when a
+record of the build is stamped at or after it and within 14 h 30 m
+(`RUNNING_MAX_AGE` in `nightly.py`) of it, and shares the build of the nearest start in the group that
+`data.json` files, else the first of the group to start, so a re-run
+started past those 15 minutes begins a night of its own), `started` and `log_url` the collector's when that
 build is a nightly run in `data.json` (`null` otherwise); the page dates
 every night by `at`, the stamp its points and markers are placed by, and
 uses `build` only for the link to the report. `cases{}` is per case `{domain, points[],

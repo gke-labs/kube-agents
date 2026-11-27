@@ -340,7 +340,7 @@ func TestDelegateMCPOffersABatchOnlyOverAWidthOfOne(t *testing.T) {
 		"width zero": {&lib.DelegateTargets{Targets: platform}, singleSchemaPlatform},
 		"width one":  {&lib.DelegateTargets{Targets: platform, WidthMax: 1}, singleSchemaPlatform},
 	} {
-		got, err := json.Marshal(delegateToolSchema(tc.targets))
+		got, err := json.Marshal(delegateToolSchema(tc.targets, nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,7 +349,7 @@ func TestDelegateMCPOffersABatchOnlyOverAWidthOfOne(t *testing.T) {
 		}
 	}
 
-	wide := delegateToolSchema(&lib.DelegateTargets{Targets: platform, WidthMax: 4})
+	wide := delegateToolSchema(&lib.DelegateTargets{Targets: platform, WidthMax: 4}, nil)
 	schema := wide["inputSchema"].(map[string]any)
 	tasks, ok := schema["properties"].(map[string]any)["tasks"].(map[string]any)
 	if !ok || tasks["type"] != "array" || tasks["maxItems"] != 4 || tasks["minItems"] != 2 {

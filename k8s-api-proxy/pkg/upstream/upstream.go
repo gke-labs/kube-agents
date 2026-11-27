@@ -1,5 +1,6 @@
-// Package upstream implements k8sapiproxy.UpstreamTransport for the cluster the proxy runs in
-// and for GKE clusters, which it reaches with the proxy's own Google credentials.
+// Package upstream implements k8sapiproxy.UpstreamTransport: Transport (New) reaches the
+// in-cluster API server and GKE clusters with Google credentials, while StaticTransport
+// (NewStatic) forwards to one pre-resolved HTTP or HTTPS endpoint without cloud discovery.
 package upstream
 
 import (
@@ -36,6 +37,9 @@ const (
 	connectionHeader    = "Connection"
 	upgradeToken        = "upgrade"
 	http1Proto          = "http/1.1"
+	// adcNotFound opens the error of a gke_ request made without Config.TokenSource
+	// where no Application Default Credentials are found.
+	adcNotFound = "Google Application Default Credentials are needed for a gke_ cluster and were not found"
 )
 
 // Config configures a Transport.
@@ -48,7 +52,8 @@ type Config struct {
 	HostClusterID string
 	// TokenSource authenticates to the Container API and to GKE control planes. Nil uses
 	// Application Default Credentials: on GKE, the Workload Identity the proxy's service
-	// account maps to.
+	// account maps to. They are looked up when a gke_ cluster is first requested, so a
+	// Transport that only serves the cluster it runs in needs no Google credentials.
 	TokenSource oauth2.TokenSource
 	// ContainerAPIURL is the Container API base URL; empty is container.googleapis.com.
 	ContainerAPIURL string
@@ -84,9 +89,47 @@ type clusterEntry struct {
 	expires  time.Time
 }
 
-// New returns a Transport. It reads the in-cluster configuration and finds the default Google
-// credentials up front, so a pod missing either fails at startup rather than per request.
-func New(ctx context.Context, cfg Config) (*Transport, error) {
+// defaultCredentials is a TokenSource over Application Default Credentials that looks them
+// up on the first Token call rather than when the Transport is built. It serves a caller of
+// New that passes no Config.TokenSource. A lookup that fails is tried again on the next
+// call, which finds a credentials file written since; whether a metadata server exists is
+// probed once per process, so one that appears later is not found without a restart.
+type defaultCredentials struct {
+	find func() (oauth2.TokenSource, error)
+
+	mu     sync.Mutex
+	source oauth2.TokenSource
+}
+
+func newDefaultCredentials() *defaultCredentials {
+	return &defaultCredentials{find: func() (oauth2.TokenSource, error) {
+		// The source outlives the request that first needs it and refreshes its token on
+		// later ones, so it is not tied to that request's context.
+		return google.DefaultTokenSource(context.Background(), cloudPlatformScope)
+	}}
+}
+
+func (d *defaultCredentials) Token() (*oauth2.Token, error) {
+	d.mu.Lock()
+	source := d.source
+	if source == nil {
+		found, err := d.find()
+		if err != nil {
+			d.mu.Unlock()
+			return nil, fmt.Errorf("%s: %w", adcNotFound, err)
+		}
+		source, d.source = found, found
+	}
+	d.mu.Unlock()
+	return source.Token()
+}
+
+// New returns a Transport. It reads the in-cluster configuration up front, so a pod missing
+// it fails at startup rather than per request. Google credentials are not needed to start:
+// without Config.TokenSource, Application Default Credentials are looked up when a gke_
+// cluster is first requested, and a request for one fails with the reason when there are
+// none, while in-cluster requests keep being served.
+func New(_ context.Context, cfg Config) (*Transport, error) {
 	inCluster := cfg.InCluster
 	if inCluster == nil {
 		var err error
@@ -109,9 +152,7 @@ func New(ctx context.Context, cfg Config) (*Transport, error) {
 	}
 	tokens := cfg.TokenSource
 	if tokens == nil {
-		if tokens, err = google.DefaultTokenSource(ctx, cloudPlatformScope); err != nil {
-			return nil, fmt.Errorf("default Google credentials: %w", err)
-		}
+		tokens = newDefaultCredentials()
 	}
 	apiURL := strings.TrimRight(cfg.ContainerAPIURL, "/")
 	if apiURL == "" {

@@ -207,9 +207,7 @@ image overrides are already decided. The operator's render tests check that the 
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
 
-A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
-`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
-clusters. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
+The session pods the gateway spawns get a temporary read-only view of the clusters: on by default when the install's route is `session` (since 2026-11-20, #6538 and #6987), and otherwise with `A2A_SESSION_CLUSTER_VIEW=true` on the operator, a switch of the same kind as the one above. The flag overrides the default either way: `"true"` turns the view on on any route, and `"false"` turns it off on the session route too. The operator binds the session ServiceAccount (`CREDENTIAL_PROXY_SESSION_CALLERS`) to the
 session audience (`CREDENTIAL_PROXY_SESSION_AUDIENCE`) on both `<agent>-kube-proxy` and the
 credential broker, where the broker's `session` role reaches `/v1/exec` for `gcloud` only and no
 other caller may present that audience. It opens ingress and session egress to `<agent>-kube-proxy`
@@ -219,21 +217,18 @@ other caller may present that audience. It opens ingress and session egress to `
 either state; `kubectl` routes through `<agent>-kube-proxy` under its `read-only-dry-run` policy
 (`get`, `list`, `watch`, and `?dryRun=All` validation) with `Secret` value redaction, as
 [credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
-describes. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
-widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
-between a person and that read is the gateway's ingress allowlist. That differs from the design of
-record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
-[03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
-`spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
-child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
-built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
-that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
-no longer admit the same people. The view retires on the default flip (#2371); until then, on an
-install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
-a person the gateway refuses a delegation to `platform` can still read its clusters through a
-session's view. The flag stays off by default for that reason. An install with a single user, or
-whose allowed users are the same people the platform agent admits, can turn it on, and gets
-sessions that answer cluster questions themselves instead of delegating each one.
+describes. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Who controls the view changed with the default. Before 2026-11-20 it was operator-level, for the reason above: the pod executes model output, and widening its fence was left to whoever deployed the operator. Now whoever can set `spec.harness.tuning.defaultRoute: session` on the PlatformAgent turns the view on with the route, and whoever runs the operator can still turn it off for every install with `A2A_SESSION_CLUSTER_VIEW=false`. bnaylor made that call on 2026-11-20 (#6538), so that the session route answers cluster questions as the platform route does.
+
+Under the view a session reads clusters with the platform agent's broker scope, and the only gate between a person and that read is the gateway's ingress allowlist. That differs from the design of record ([architecture 02](../architecture/02-agent-personas.md) §2.4, [03](../architecture/03-security-model.md) §4a, and "Sessions by default" in `spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted child task and the gateway checks the target agent's `AllowedUsers` against the requester first. That is built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view skips that check, so on an install whose CR narrows the platform agent's allowlist the two gates no longer admit the same people. With the view on, a person the gateway refuses a delegation to `platform` can still read its clusters through a session.
+
+Skipping that check is accepted, for now, because what it opens is bounded:
+
+- every `kubectl` call goes through `<agent>-kube-proxy`'s `read-only-dry-run` policy with `Secret` values redacted;
+- `gcloud` goes through the broker's `session` role, reads only;
+- the gateway's ingress allowlist still decides who reaches a session at all;
+- where the CR sets no allowlist for the platform agent, which is the default, a chat requester the ingress admits is admitted to a `platform` delegation too, so the two gates already agree.
+
+An install whose CR narrows the platform agent's allowlist below the gateway's ingress should set `A2A_SESSION_CLUSTER_VIEW=false` until the view is replaced by the profile path (#6483), which restores the per-agent check by reading clusters through a child task. The flag doesn't change the route: `defaultRoute: session` routes plain turns to session pods with the view on or off.
 
 ## Per-feature overrides - sketched, not built
 

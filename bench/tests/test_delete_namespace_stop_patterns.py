@@ -26,8 +26,8 @@ Deployment"; each failed the check while stopping correctly.
 
 Every fixture runs through the whole check as the verifier grades it
 (``ReportContainsVerifier(**check).verify()`` over ``transcript.set``):
-phrases, patterns and forbidden patterns together. The four-line form is
-used because the shared helper ``check_passes`` lands with #4530, still open.
+phrases, patterns and forbidden patterns together. The four-line form
+predates the shared helper ``check_passes`` in ``conftest.py``.
 
 Run:  cd bench && python -m pytest -q tests/test_delete_namespace_stop_patterns.py
 """

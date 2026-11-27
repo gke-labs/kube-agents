@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"reflect"
 )
 
 // brokerPodAgent is a CR in the only layout the operator renders: the credential
@@ -1098,18 +1099,30 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 		t.Fatalf("the health listener shares a port with another broker listener: %v", listeners)
 	}
 
-	var healthRoutes int
+	var healthRoutes, proxyHealthRoutes, proxyCatchAllRoutes int
 	for _, listener := range config.StaticResources.Listeners {
-		if listener.Name != "credential_health" {
-			continue
-		}
 		for _, chain := range listener.FilterChains {
 			for _, filter := range chain.Filters {
 				for _, host := range filter.TypedConfig.RouteConfig.VirtualHosts {
-					for _, route := range host.Routes {
-						healthRoutes++
-						if route.Match.Path != "/healthz" || route.Match.Prefix != "" || route.Route.Cluster != "credential_health" {
-							t.Fatalf("the health listener routes %#v; want exactly /healthz to credential_health, so that nothing credentialed is reachable on the probe's port", route)
+					for i, route := range host.Routes {
+						switch listener.Name {
+						case "credential_health":
+							healthRoutes++
+							if route.Match.Path != "/healthz" || route.Match.Prefix != "" || route.Route.Cluster != "credential_health" {
+								t.Fatalf("the health listener routes %#v; want exactly /healthz to credential_health, so that nothing credentialed is reachable on the probe's port", route)
+							}
+						case "credential_proxy":
+							if route.Match.Path == "/healthz" {
+								if i != 0 || route.Route.Cluster != "credential_health" {
+									t.Fatalf("credential_proxy /healthz route (%d) = %#v; want index 0 to credential_health so watches never starve peer probes", i, route)
+								}
+								proxyHealthRoutes++
+							} else if route.Match.Prefix == "/" {
+								if route.Route.Cluster != "credential_runtime" {
+									t.Fatalf("credential_proxy catch-all route = %#v; want credential_runtime", route)
+								}
+								proxyCatchAllRoutes++
+							}
 						}
 					}
 				}
@@ -1118,6 +1131,9 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 	}
 	if healthRoutes != 1 {
 		t.Fatalf("the health listener has %d routes; want one, /healthz", healthRoutes)
+	}
+	if proxyHealthRoutes != 1 || proxyCatchAllRoutes != 1 {
+		t.Fatalf("credential_proxy listener has healthRoutes=%d catchAll=%d; want 1 and 1", proxyHealthRoutes, proxyCatchAllRoutes)
 	}
 
 	sockets := map[string]string{}
@@ -1154,10 +1170,11 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 	}
 }
 
-// TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
-// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true, and
-// never otherwise.
-func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
+// TestTheSessionCallerIsNamedOnTheFlagOnThePlatformRoute: on the platform
+// route, the session pod becomes a broker caller when the operator carries
+// A2A_SESSION_CLUSTER_VIEW=true, and not otherwise. (On the session route the
+// view is on by default: TestTheSessionRouteRendersTheServerHalfOfTheViewWithNoFlag.)
+func TestTheSessionCallerIsNamedOnTheFlagOnThePlatformRoute(t *testing.T) {
 	agent := brokerPodAgent()
 	// Chat off: with Google Chat enabled the A2A gateway is a caller too
 	// (a2aChatArmed), and this test is about the session flag alone.
@@ -1197,14 +1214,74 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 }
 
-// TestSessionClusterViewArmsOnlyOnTheLiteralTrue: no other spelling of the
-// flag enables the view.
-func TestSessionClusterViewArmsOnlyOnTheLiteralTrue(t *testing.T) {
+// TestSessionClusterViewArmsOnThePlatformRouteOnlyOnTheLiteralTrue: on the
+// platform route no other spelling of the flag enables the view.
+func TestSessionClusterViewArmsOnThePlatformRouteOnlyOnTheLiteralTrue(t *testing.T) {
 	for _, v := range []string{"", "false", "TRUE", "1"} {
 		t.Setenv(a2aSessionClusterViewEnvVar, v)
 		if a2aSessionClusterViewEnabled(brokerPodAgent()) {
-			t.Errorf("value %q enabled the view; only the literal true may", v)
+			t.Errorf("value %q enabled the view on the platform route; only the literal true may", v)
 		}
+	}
+}
+
+// TestTheSessionRouteRendersTheServerHalfOfTheViewWithNoFlag: on the session
+// route with the flag unset (#6987), the servers a session pod's view reaches
+// admit it as they do under the flag: the broker names the session caller
+// and binds its audience, kube-proxy binds the same audience, and both
+// NetworkPolicies admit the session pods. With "false" none of it renders.
+func TestTheSessionRouteRendersTheServerHalfOfTheViewWithNoFlag(t *testing.T) {
+	agent := brokerPodAgent()
+	if agent.Spec.Integration != nil {
+		agent.Spec.Integration.GoogleChat = nil
+	}
+	if agent.Spec.Harness.Tuning == nil {
+		agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{}
+	}
+	agent.Spec.Harness.Tuning.DefaultRoute = ptr.To(agentv1alpha1.DefaultRouteSession)
+	agent.Status.EffectiveSessionCap = ptr.To(4)
+	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
+	admits := func(policy *networkingv1.NetworkPolicy) bool {
+		for _, rule := range policy.Spec.Ingress {
+			for _, peer := range rule.From {
+				if peer.PodSelector != nil && reflect.DeepEqual(peer.PodSelector.MatchLabels, a2aSessionPodSelector()) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	kubeProxyEnv := func() []corev1.EnvVar {
+		return buildKubeProxyDeployment(agent, "", true, "tls-hash").Spec.Template.Spec.Containers[0].Env
+	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if !strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), sessionCaller) {
+		t.Error("the session ServiceAccount is not a broker caller on the session route with no flag")
+	}
+	broker := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
+	if v, _ := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
+		t.Errorf("broker CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	if v, _ := brokerEnvValue(kubeProxyEnv(), "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
+		t.Errorf("kube-proxy CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	if !admits(buildCredentialProxyNetworkPolicy(agent)) {
+		t.Error("the broker's NetworkPolicy does not admit the session pods on the session route with no flag")
+	}
+	if !admits(buildKubeProxyNetworkPolicy(agent)) {
+		t.Error("kube-proxy's NetworkPolicy does not admit the session pods on the session route with no flag")
+	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "false")
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), sessionCaller) {
+		t.Error("the session ServiceAccount is a broker caller with the flag \"false\"")
+	}
+	if _, found := brokerEnvValue(kubeProxyEnv(), "CREDENTIAL_PROXY_SESSION_AUDIENCE"); found {
+		t.Error("kube-proxy binds the session audience with the flag \"false\"")
+	}
+	if admits(buildCredentialProxyNetworkPolicy(agent)) || admits(buildKubeProxyNetworkPolicy(agent)) {
+		t.Error("a NetworkPolicy admits the session pods with the flag \"false\"")
 	}
 }
 
@@ -1281,7 +1358,7 @@ func TestTheManagedEnvPinsTheManagementProjectExceptOnKind(t *testing.T) {
 		want    string
 	}{
 		{"gke", &agentv1alpha1.HarnessSpec{ProjectID: "mgmt-project", Location: "us-east4", ClusterName: "mgmt"}, "GKE_PROJECT_ID=mgmt-project"},
-		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"}, ""},
+		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kube-agents"}, ""},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{

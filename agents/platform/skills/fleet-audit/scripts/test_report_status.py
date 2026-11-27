@@ -232,6 +232,34 @@ class TestProjection(ReportStatusTestCase):
                 report_status.store_path(str(self.root), AUDIT, repo)
 
 
+class TestShadowStreams(ReportStatusTestCase):
+    """A shadow run's stream (#5623) is left out of the projection unless asked for."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_latest()
+        self.write_latest(audit="compliance-audit-canary", shadow=True)
+
+    def test_the_projection_leaves_it_out_and_counts_it(self):
+        projection = self.project()
+        self.assertEqual(sorted(projection["streams"]), [AUDIT])
+        self.assertEqual(projection["shadow_hidden"], 1)
+
+    def test_include_shadow_projects_it(self):
+        projection = report_status.project(str(self.root), NOW, scratch=str(self.scratch), include_shadow=True)
+        self.assertEqual(sorted(projection["streams"]), sorted([AUDIT, "compliance-audit-canary"]))
+        self.assertEqual(projection["shadow_hidden"], 0)
+
+    def test_the_cli_takes_the_opt_in(self):
+        for argv, want in (([], [AUDIT]), (["--include-shadow"], sorted([AUDIT, "compliance-audit-canary"]))):
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    rc = report_status.main(["--root", str(self.root), "--scratch", str(self.scratch), *argv])
+                self.assertEqual(rc, 0)
+                self.assertEqual(sorted(json.loads(out.getvalue())["streams"]), want)
+
+
 class TestLiveness(ReportStatusTestCase):
     def test_the_ttl_is_the_leases(self):
         self.assertEqual(report_status.INFLIGHT_TTL_S, audit_report.INFLIGHT_TTL_SECONDS)

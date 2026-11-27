@@ -481,7 +481,8 @@ func TestAFollowedTaskTooLargeToReadIsReadOnce(t *testing.T) {
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 	b := dial(t, url)
-	s := mustServer(t, SendMessageTool(b, NewConversations()))
+	convs := NewConversations()
+	s := mustServer(t, SendMessageTool(b, convs))
 	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check the rollout", "wait_seconds": 3})
 	if res.IsError {
 		t.Fatalf("send_message failed: %s", res.Content[0].Text)
@@ -492,9 +493,27 @@ func TestAFollowedTaskTooLargeToReadIsReadOnce(t *testing.T) {
 	// The turn leaves that task as the conversation's running one, and the
 	// next message can't wait on a task it can't read: it goes, rather than
 	// the conversation refusing every message from now on.
-	res = callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check it again", "wait_seconds": 3})
-	if res.IsError || strings.Contains(res.Content[0].Text, "running task") {
-		t.Fatalf("a second message after a too-large task: %s", res.Content[0].Text)
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := TaskRef{Addressee: "cluster-a", TaskID: "task-deleg1"}
+	if running, ok := convs.runningTask(token); !ok || running != child {
+		t.Fatalf("the conversation's running task is %v (%v); want %s, the task too large to read", running, ok, child)
+	}
+	// Sent through SendTurn, not the tool: a tool call's one wait covers both
+	// reading the running task and following the new turn, which never ends
+	// here, so a wait long enough for the read on a loaded runner would be
+	// spent in full on the follow. SendTurn returns once the gateway has
+	// submitted the turn's task, so its wait bounds the read alone and costs
+	// only what the read takes. At the tool's 3s the read of the task, which
+	// is past the 4 MiB read budget, did not finish under load, and the
+	// conversation answered busy. A busy answer here is the failure: the read
+	// did not find the task too large and let the message through.
+	sent, w, err := b.SendTurn(t.Context(), convs, token, "delegate check it again", TurnAddress{}, time.Minute)
+	defer w.close()
+	if err != nil || sent.Task == nil {
+		t.Fatalf("a second message after a too-large task: sent=%+v err=%v", sent, err)
 	}
 }
 
@@ -513,6 +532,61 @@ func TestATaskPastItsEventCapIsTooLargeToRead(t *testing.T) {
 	err := w.next(context.Background())
 	if !tooLargeToRead(err) {
 		t.Fatalf("a read past %d events returned %v; want it too large to read", maxTaskEvents, err)
+	}
+}
+
+// A wait checks for the task's end when a final status-update arrives, not
+// after an artifact or a progress status: neither can end a task, and a fold
+// parses every payload read so far.
+// Folding after each artifact of a task near readMaxBytes took the gap
+// between pulls past taskConsumerIdle on a loaded runner, and the server
+// reaped the consumer under the read.
+func TestATaskWaitFoldsOnlyAfterAFinalStatus(t *testing.T) {
+	url, js := testBus(t)
+	b := dial(t, url)
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-fold1"}
+	publishRun(t, js, ref.Addressee, ref.TaskID, "", false)
+	w, err := b.watchTask(t.Context(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	// readTo reads until the watch holds n events: on the count, not on one
+	// fetch's wait.
+	readTo := func(n int) {
+		t.Helper()
+		for len(w.events) < n {
+			if err := w.next(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	readTo(2)
+	if w.finalUnfolded {
+		t.Error("submitted and working marked the task for a fold; neither is final")
+	}
+	if task, final := w.ended(); final {
+		t.Fatalf("a working task read as ended: %+v", task)
+	}
+	publishResult(t, js, ref.Addressee, ref.TaskID, answerText)
+	readTo(3)
+	if w.finalUnfolded {
+		t.Error("an artifact marked the task for a fold; only a final status-update can end it")
+	}
+	if task, final := w.ended(); final {
+		t.Fatalf("an artifact ended the task: %+v", task)
+	}
+	publishStatus(t, js, ref.Addressee, ref.TaskID, lib.StateCompleted, true)
+	readTo(4)
+	if !w.finalUnfolded {
+		t.Fatal("the completed status was read and no fold is owed")
+	}
+	task, final := w.ended()
+	if !final {
+		t.Fatal("the completed status did not end the task")
+	}
+	if task.State != lib.StateCompleted || task.Artifact(lib.ArtifactResult) == nil {
+		t.Errorf("the ended task is %s with result %v; want completed with the result read before it", task.State, task.Artifact(lib.ArtifactResult))
 	}
 }
 
@@ -914,11 +988,52 @@ func TestASlotWithNothingToReapGoesBackAtOnce(t *testing.T) {
 	if _, err := b.readerSlot(); err != errReadersBusy {
 		t.Errorf("a slot came back before its consumer's reap: err = %v", err)
 	}
-	if consumerMayExist(&jetstream.APIError{Code: 400, ErrorCode: jetstream.JSErrCodeConsumerCreate}) {
-		t.Error("a server refusal counted as a consumer that may exist")
+}
+
+// hangingCreator answers creates from plan in turn: "hang" blocks until the
+// attempt's context ends, as a create placed on a bus server that is down
+// does (#7082); "ok" answers with a consumer.
+type hangingCreator struct {
+	plan  []string
+	calls int
+}
+
+type createdConsumer struct{ jetstream.Consumer }
+
+func (createdConsumer) CachedInfo() *jetstream.ConsumerInfo {
+	return &jetstream.ConsumerInfo{Name: "read-1"}
+}
+
+func (h *hangingCreator) CreateConsumer(ctx context.Context, _ jetstream.ConsumerConfig) (jetstream.Consumer, error) {
+	step := h.plan[min(h.calls, len(h.plan)-1)]
+	h.calls++
+	if step == "ok" {
+		return createdConsumer{}, nil
 	}
-	if !consumerMayExist(context.DeadlineExceeded) {
-		t.Error("a timed-out create counted as one that made nothing")
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A read whose consumer create lands on a bus server that is down retries and
+// answers within its wait. The timed-out attempt keeps its reader slot until
+// the consumer it may have left would be reaped, and a read that can't get a
+// slot for its retry says the readers are busy rather than hanging.
+func TestAReadConsumerPlacedOnADownServerIsRetriedOnItsOwnSlot(t *testing.T) {
+	b := &NATSBus{readers: make(chan struct{}, maxTaskReaders), reapDelay: time.Hour, createAttemptTimeout: 50 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cons, release, err := b.createReadConsumer(ctx, &hangingCreator{plan: []string{"hang", "ok"}}, lib.TasksStream, jetstream.ConsumerConfig{})
+	if err != nil || cons.CachedInfo().Name != "read-1" {
+		t.Fatalf("create = %v, %v; want the retried consumer", cons, err)
+	}
+	if got := len(b.readers); got != 2 {
+		t.Fatalf("%d slots held, want 2: the timed-out attempt's and the consumer's", got)
+	}
+	release(true)
+
+	full := &NATSBus{readers: make(chan struct{}, 1), reapDelay: time.Hour, createAttemptTimeout: 50 * time.Millisecond}
+	if _, _, err := full.createReadConsumer(ctx, &hangingCreator{plan: []string{"hang"}}, lib.TasksStream, jetstream.ConsumerConfig{}); !errors.Is(err, errReadersBusy) {
+		t.Fatalf("a retry with no slot left: err = %v, want errReadersBusy", err)
 	}
 }
 
