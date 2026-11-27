@@ -49,9 +49,11 @@ audio, video) that decodes as base64 and starts the way that media does; a
 payload of any other type is refused. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
-`messages` or `contents` that is not a list of objects, or anything at a
-payload position that is not binary base64, answered with 400 since the same
-request is refused every time. Model responses are not touched.
+`messages` or `contents` that is not a list of objects, anything at a
+payload position that is not binary base64, or nesting past the
+interpreter's recursion limit (tool-call arguments too deep to decode, or any
+value too deep to copy and walk), answered with 400 since the same request is
+refused every time. Model responses are not touched.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
@@ -261,6 +263,10 @@ ARGUMENTS_KEY = "arguments"
 TOOL_USE_TYPE = "tool_use"
 TOOL_USE_INPUT_KEY = "input"
 DATA_KEY = "data"
+
+# What a refusal says about JSON nested past the recursion limit; it names no
+# key or value.
+DEEP_NESTING_REFUSAL = "JSON nested too deeply to walk"
 
 
 def _is_data_url(value: Any) -> bool:
@@ -888,19 +894,26 @@ class KubeAgentsRedactionCallback(CustomLogger):
         and never their values.
         """
         self._check_shape(data)
-        kept = self._carve(data)
         # The text rules' counts for each decoded tool output are taken when
         # it is masked before decoding. Counts are rule applications: a value
         # a text rule masked in part and a structure rule then masked whole
         # counts once for each.
         counts: Dict[str, int] = {}
-        arguments = self._tool_arguments(data) + self._tool_outputs(data, counts)
-        for key in list(data):
-            if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
-                continue
-            mine = [(path[1:], value) for path, value in kept if path[0] == key]
-            args = [(path[1:], source, document, style) for path, source, document, style in arguments if path[0] == key]
-            data[key] = self._redact_field(data[key], mine, args, counts)
+        try:
+            kept = self._carve(data)
+            arguments = self._tool_arguments(data) + self._tool_outputs(data, counts)
+            for key in list(data):
+                if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
+                    continue
+                mine = [(path[1:], value) for path, value in kept if path[0] == key]
+                args = [(path[1:], source, document, style) for path, source, document, style in arguments if path[0] == key]
+                data[key] = self._redact_field(data[key], mine, args, counts)
+        except RecursionError:
+            # Nesting the decoder, the copy or the walk can't follow. Refused
+            # rather than walked as text: the request is not forwarded, so the
+            # fields already rewritten in place go nowhere. `from None` keeps
+            # the thousands of frames out of the log.
+            raise self._refuse(DEEP_NESTING_REFUSAL) from None
         return counts
 
 

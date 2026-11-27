@@ -90,6 +90,13 @@ _RULE_MATCHING_BASE64 = "iVBORw0KGgoAIza" + "B" * 37  # a PNG header, then the G
 _PNG_BASE64 = "iVBORw0KGgo="
 _PDF_BASE64 = "JVBERi0xLjQK"  # %PDF-1.4
 _WAV_BASE64 = "UklGRiQAAABXQVZFZm10IA=="  # RIFF....WAVE
+# Nesting depths, against the interpreter's recursion limit (1000 by
+# default): past the limit the copy and walk can't go, past it by far the
+# JSON decoder can't either, and at a quarter of it arguments were walked
+# before the deep-nesting refusal existed and still are.
+_TOO_DEEP_TO_WALK = 2 * sys.getrecursionlimit()
+_TOO_DEEP_TO_DECODE = 100 * sys.getrecursionlimit()
+_DEEP_BUT_WALKABLE = sys.getrecursionlimit() // 4
 
 
 def _stub_litellm() -> None:
@@ -902,6 +909,55 @@ class TestCallback(unittest.TestCase):
             self._run(data)
         self.assertEqual(refused.exception.status_code, 400)
         self.assertIn("refuses a request it cannot walk", str(refused.exception.detail))
+
+    def test_json_nested_too_deeply_to_walk_is_refused_with_400(self) -> None:
+        # Nesting past Python's recursion limit used to escape the hook as a
+        # RecursionError, which LiteLLM answers with a 500 that a caller
+        # retries. The same request is refused every time, so it is a 400 like
+        # any other request the hook cannot walk, and its text is never in
+        # the refusal. The shapes: arguments the decoder itself can't take,
+        # arguments and an Anthropic tool input it decodes but the copy and
+        # walk can't, and object-shaped values the walk can't.
+        secret = "prod-eu-1"
+
+        def nested(depth: int) -> str:
+            return "[" * depth + json.dumps(secret) + "]" * depth
+
+        def tool_call(arguments) -> dict:
+            return {"messages": [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "t", "arguments": arguments}},
+            ]}]}
+
+        deep_object: object = secret
+        for _ in range(_TOO_DEEP_TO_WALK):
+            deep_object = [deep_object]
+        cases = {
+            "arguments the decoder can't take": tool_call(nested(_TOO_DEEP_TO_DECODE)),
+            "arguments the walk can't take": tool_call(nested(_TOO_DEEP_TO_WALK)),
+            "an Anthropic tool input the walk can't take": {"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "u", "name": "t", "input": nested(_TOO_DEEP_TO_WALK)},
+            ]}]},
+            "arguments sent as an object": tool_call(deep_object),
+            "a top-level field": {"messages": [{"role": "user", "content": "hi"}], "tools": deep_object},
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(HTTPException) as refused:
+                    self._run(data)
+                self.assertEqual(refused.exception.status_code, 400)
+                self.assertIn("nested too deeply", str(refused.exception.detail))
+                self.assertNotIn(secret, str(refused.exception.detail))
+
+    def test_deeply_nested_arguments_that_can_be_walked_are_still_redacted(self) -> None:
+        # The refusal is for what can't be walked, not a depth cap: arguments
+        # nested this deep were redacted before it existed and still are.
+        arguments = "[" * _DEEP_BUT_WALKABLE + json.dumps("prod-eu-1") + "]" * _DEEP_BUT_WALKABLE
+        data = {"messages": [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c", "type": "function", "function": {"name": "t", "arguments": arguments}},
+        ]}]}
+        sent = self._run(data)["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        self.assertNotIn("prod-eu-1", sent)
+        self.assertIn("[cluster-name:", sent)
 
     def test_a_fault_in_the_hook_is_not_answered_with_400(self) -> None:
         # Only a refused shape becomes a 400: any other exception from the
