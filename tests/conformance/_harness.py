@@ -466,6 +466,13 @@ SOURCES: dict[str, Source] = {
         "agents/platform/scripts/audit_report_store.py",
         ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
     ),
+    # The task-credential verifier, read as text for the same reason
+    # (cryptography). The A3 permit row spells this permit as a literal; a
+    # rename in the verifier turns the anchor check red.
+    "task_credential_verifier": Source(
+        "agents/platform/scripts/task_credential.py",
+        ('PERMIT_VCS_UNATTENDED_WRITE = "vcs:unattended-write"',),
+    ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("operatorPodNameLabel", "operatorPodNameValue"),

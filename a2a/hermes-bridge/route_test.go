@@ -40,7 +40,15 @@ type routePut struct {
 func newRouteStore(t *testing.T, status int) *routeStore {
 	t.Helper()
 	s := &routeStore{status: status}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.srv = httptest.NewServer(s.handler())
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+// handler answers as the session-kv store does for the writes and reads the
+// bridge makes, counting route and origin writes.
+func (s *routeStore) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			// The pushed-report lookup (incident.go) reads the same store;
 			// this one holds no report and counts route writes alone.
@@ -69,9 +77,7 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 		s.mu.Unlock()
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, `{"detail":"refused"}`)
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
+	})
 }
 
 func (s *routeStore) setStatus(status int) {
