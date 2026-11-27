@@ -217,6 +217,10 @@ type TeamsAdapter struct {
 	// adaptiveCards renders a reply as an Adaptive Card when true; plain
 	// text when false (spec.integration.teams.adaptiveCards).
 	adaptiveCards bool
+	// messageMarks draws the marks on a person's message as the bot's own
+	// reactions (teams_reactions.go); on unless SetMessageMarks turns it
+	// off. Guarded by mu.
+	messageMarks bool
 	// allowed is the allowed-users list, lowercased, and allowAll its
 	// explicit off switch (SetAllowedUsers). A sender may be listed by the
 	// Entra object id or the Bot Framework user id; classify hands the
@@ -294,6 +298,7 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		tokenPath:      tokenPath,
 		tenantID:       strings.TrimSpace(tenantID),
 		adaptiveCards:  adaptiveCards,
+		messageMarks:   true,
 		client:         newRelayHTTPClient(teamsRelayTimeout),
 		log:            log,
 		seen:           map[string]bool{},
@@ -978,8 +983,8 @@ func (a *TeamsAdapter) Roster(string) ([]string, bool, error) { return nil, fals
 func (a *TeamsAdapter) OpenDirect(string) (string, error) { return "", errTeamsNoOpenDirect }
 
 // AnswersOnLine is true for every Teams conversation (LineAnswerer): the
-// adapter draws no reaction and no Working… status, so the task's line is
-// the ask's one receipt, and it ends as the hand-off acknowledgement or a
+// adapter draws no Working… status and its reaction on the ask comes off
+// with the turn, so the task's line is the ask's lasting receipt, and it ends as the hand-off acknowledgement or a
 // bare mark rather than "✅ completed" under the question, as on Chat.
 func (a *TeamsAdapter) AnswersOnLine(string) bool { return true }
 
@@ -991,11 +996,6 @@ func (a *TeamsAdapter) AnswersWholeOnLine(string) bool { return true }
 
 // PieceSize is teamsPieceBytes for every conversation (PieceSizer).
 func (a *TeamsAdapter) PieceSize(string) int { return teamsPieceBytes }
-
-// React and RemoveReaction draw no mark on Teams: a nil no-op, as the
-// Adapter contract allows a backend that does not react.
-func (a *TeamsAdapter) React(string, string, string) error          { return nil }
-func (a *TeamsAdapter) RemoveReaction(string, string, string) error { return nil }
 
 // teamsFitActivity builds the outbound activity for text and keeps it under
 // cap bytes: the card as asked, then plain text (a card adds a TextBlock per

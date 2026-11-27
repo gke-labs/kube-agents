@@ -11,17 +11,20 @@ import (
 // The Bot Framework operations the Teams adapter makes through the broker's
 // passthrough, as the method label names them.
 const (
-	teamsAPIMethodCreate = "conversations.activities.create"
-	teamsAPIMethodUpdate = "conversations.activities.update"
+	teamsAPIMethodCreate  = "conversations.activities.create"
+	teamsAPIMethodUpdate  = "conversations.activities.update"
+	teamsAPIMethodReact   = "conversations.activities.reactions.add"
+	teamsAPIMethodUnreact = "conversations.activities.reactions.remove"
 )
 
 // teamsAPIMethodLabel is the method label for one passthrough call: the
 // Bot Framework operation the HTTP method and endpoint spell (a POST to a
-// conversation's activities creates one, a PUT to an activity updates it),
-// other for anything else, a DELETE included: the broker's passthrough
-// admits only POST and PUT, so the adapter never deletes. The endpoint is
-// the adapter's own, never a user's text, and the label set is closed
-// either way.
+// conversation's activities creates one, a PUT to an activity updates it,
+// a PUT or a DELETE under an activity's reactions adds or removes the bot's
+// own reaction), other for anything else, a DELETE of an activity included:
+// the broker's passthrough admits a DELETE on the reactions path only, so
+// the adapter never deletes a message. The endpoint is the adapter's own,
+// never a user's text, and the label set is closed either way.
 func teamsAPIMethodLabel(httpMethod, endpoint string) string {
 	path := strings.TrimSuffix(endpoint, "/")
 	if !strings.HasPrefix(path, teamsConversationsPath) {
@@ -29,7 +32,14 @@ func teamsAPIMethodLabel(httpMethod, endpoint string) string {
 	}
 	onActivities := strings.HasSuffix(path, teamsActivitiesSuffix)
 	underActivities := !onActivities && strings.Contains(path, teamsActivitiesSuffix+"/")
+	onReaction := underActivities && strings.Contains(path, teamsReactionsSuffix)
 	switch {
+	case httpMethod == http.MethodPut && onReaction:
+		return teamsAPIMethodReact
+	case httpMethod == http.MethodDelete && onReaction:
+		return teamsAPIMethodUnreact
+	case onReaction:
+		return metricsLabelOther
 	case httpMethod == http.MethodPost && onActivities:
 		return teamsAPIMethodCreate
 	case httpMethod == http.MethodPut && underActivities:

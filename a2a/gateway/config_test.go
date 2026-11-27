@@ -714,6 +714,9 @@ func TestFromEnvTeamsBackendSelection(t *testing.T) {
 	if !cfg.TeamsAdaptiveCards {
 		t.Fatal("cards must be on unless stated")
 	}
+	if !cfg.TeamsMessageMarks {
+		t.Fatal("message marks must be on unless stated")
+	}
 	t.Setenv("A2A_TEAMS_ALLOW_ALL_USERS", "true")
 	t.Setenv("A2A_TEAMS_ADAPTIVE_CARDS", "false")
 	t.Setenv("A2A_TEAMS_TOKEN_PATH", "/var/run/secrets/teams/token")
@@ -727,6 +730,14 @@ func TestFromEnvTeamsBackendSelection(t *testing.T) {
 	t.Setenv("A2A_TEAMS_ADAPTIVE_CARDS", "off")
 	if cfg, err = FromEnv(); err != nil || !cfg.TeamsAdaptiveCards {
 		t.Fatalf("only the word false turns cards off: cards %v err %v", cfg.TeamsAdaptiveCards, err)
+	}
+	t.Setenv("A2A_TEAMS_MESSAGE_MARKS", "false")
+	if cfg, err = FromEnv(); err != nil || cfg.TeamsMessageMarks {
+		t.Fatalf("false turns message marks off: marks %v err %v", cfg.TeamsMessageMarks, err)
+	}
+	t.Setenv("A2A_TEAMS_MESSAGE_MARKS", "off")
+	if cfg, err = FromEnv(); err != nil || !cfg.TeamsMessageMarks {
+		t.Fatalf("only the word false turns message marks off: marks %v err %v", cfg.TeamsMessageMarks, err)
 	}
 }
 

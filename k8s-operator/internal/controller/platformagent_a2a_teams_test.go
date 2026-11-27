@@ -446,3 +446,40 @@ func TestTheTeamsAnswerFeedbackSwitchReachesAnArmedGateway(t *testing.T) {
 		})
 	}
 }
+
+// The operator's A2A_TEAMS_MESSAGE_MARKS=false reaches an armed gateway
+// under the same name, and nothing else does: unset, "true" or a typo leaves
+// the pod as it was, and an unarmed gateway never carries it.
+func TestTheTeamsMessageMarksSwitchReachesAnArmedGateway(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name, armed, flag string
+		want              bool
+	}{
+		{"armed, off", "true", "false", true},
+		{"armed, unset", "true", "", false},
+		{"armed, on", "true", "true", false},
+		{"armed, typo", "true", "no", false},
+		{"unarmed, off", "", "false", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aTeamsBackendEnvVar, tc.armed)
+			t.Setenv(a2aTeamsMessageMarksEnvVar, tc.flag)
+			dep := buildA2AGatewayDeployment(teamsTestAgent(true))
+			if dep == nil {
+				if tc.want {
+					t.Fatal("no gateway Deployment although the backend is armed")
+				}
+				return
+			}
+			env := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aTeamsMessageMarksEnvVar]
+			if ok != tc.want {
+				t.Fatalf("rendered = %v, want %v", ok, tc.want)
+			}
+			if ok && got.Value != "false" {
+				t.Errorf("value = %q, want false", got.Value)
+			}
+		})
+	}
+}

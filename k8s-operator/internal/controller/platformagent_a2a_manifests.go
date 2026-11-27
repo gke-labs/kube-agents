@@ -749,6 +749,13 @@ const (
 	// switch like a2aTeamsBackendEnvVar, since Teams has no answerFeedback
 	// field on the CR yet.
 	a2aTeamsAnswerFeedbackEnvVar = "A2A_TEAMS_ANSWER_FEEDBACK"
+	// a2aTeamsMessageMarksEnvVar turns the marks on a person's message off
+	// on a gateway that holds the Teams backend: "false" on the
+	// controller-manager Deployment is carried to the gateway under the
+	// same name (a2a/gateway's envTeamsMessageMarks), and anything else
+	// renders nothing, which leaves the marks on. An operator switch like
+	// a2aTeamsAnswerFeedbackEnvVar, for the same reason.
+	a2aTeamsMessageMarksEnvVar = "A2A_TEAMS_MESSAGE_MARKS"
 	// The gateway's rule for a Teams home conversation id
 	// (a2a/gateway/teams.go, teamsIsHomeConversationID): one of the two shapes
 	// Teams issues, "19:…" (a channel, group or meeting chat) or "a:…" (a
@@ -7710,6 +7717,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// only the off is rendered, as on Chat and Slack.
 		if os.Getenv(a2aTeamsAnswerFeedbackEnvVar) == strconv.FormatBool(false) {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
+		// The marks on a person's message are on unless the operator's
+		// switch turns them off; only the off is rendered.
+		if os.Getenv(a2aTeamsMessageMarksEnvVar) == strconv.FormatBool(false) {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aTeamsMessageMarksEnvVar, Value: strconv.FormatBool(false)})
 		}
 		if len(chatVolumes) == 0 {
 			chatMounts, chatVolumes = a2aChatRelayToken()

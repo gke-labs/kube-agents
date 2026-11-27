@@ -716,9 +716,6 @@ func TestTeamsUnservedOperations(t *testing.T) {
 	if err != nil || complete || len(ids) != 0 {
 		t.Fatalf("roster: %v %v %v", ids, complete, err)
 	}
-	if a.React("c", "m", "ok") != nil || a.RemoveReaction("c", "m", "ok") != nil {
-		t.Fatal("reactions are a nil no-op")
-	}
 }
 
 func TestTeamsBackendIsArmedByTheRelayURL(t *testing.T) {

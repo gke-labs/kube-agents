@@ -318,8 +318,8 @@ type LineAnswerer interface {
 // WholeLineAnswerer is a LineAnswerer that takes a completed task's whole
 // answer on the task's live message when it fits one piece (PieceSizer):
 // the line becomes the answer, in place of a post under a bare mark. Teams
-// implements it: it draws no reaction, so without it every direct answer
-// sits under a card holding ✅ alone. An answer past the piece size posts
+// implements it: without it every direct answer sits under a card holding
+// ✅ alone. An answer past the piece size posts
 // as on any backend, and the line ends as lineDoneMark. An edit raises no
 // notification where a post does; a backend takes that trade knowingly.
 type WholeLineAnswerer interface {

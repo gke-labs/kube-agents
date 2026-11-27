@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -641,6 +642,47 @@ func TestRealMainWiresTeamsMetrics(t *testing.T) {
 	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
 
 	waitForRisingMetric(t, metricsPort, "kubeagents_a2a_gateway_teams_pulls_total{outcome=\"empty\"} ")
+}
+
+// The Teams adapter the gateway builds takes the config's message-marks
+// switch: off, a mark adds no reaction through the relay; on, it adds one.
+func TestBuildBackendAdaptersWiresTheTeamsMessageMarksSwitch(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		var calls atomic.Int32
+		relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/chat/teams/api" && r.Method == http.MethodPost {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"response":{}}`))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		tokenFile := filepath.Join(t.TempDir(), "teams-token")
+		if err := os.WriteFile(tokenFile, []byte("test-token"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := &gateway.Config{TeamsRelayURL: relaySrv.URL, TeamsTokenPath: tokenFile, TeamsAdaptiveCards: true, TeamsMessageMarks: on}
+		adapters, err := buildBackendAdapters(cfg, gateway.NewMetrics(), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+		teams, ok := adapters[gateway.BackendTeams]
+		if !ok {
+			t.Fatalf("no Teams adapter among %v", adapters)
+		}
+		if err := teams.React("teams:19:abc@thread.tacv2", "act-1", "question"); err != nil {
+			t.Fatalf("marks %v: react: %v", on, err)
+		}
+		relaySrv.Close()
+		want := int32(0)
+		if on {
+			want = 1
+		}
+		if got := calls.Load(); got != want {
+			t.Errorf("marks %v: %d reaction calls reached the relay, want %d", on, got, want)
+		}
+	}
 }
 
 // waitForRisingMetric runs realMain under the environment the caller set and
