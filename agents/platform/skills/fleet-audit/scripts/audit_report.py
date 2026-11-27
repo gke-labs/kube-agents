@@ -1915,7 +1915,7 @@ NOTES_LEAD = "Read but not visible, which is not a coverage gap"
 NOTES_SECTION_CAP = 6_000
 # The row that says what the cap left out, wherever the cap applied.
 MORE_NOTES_ROW = "…and {more} more; the stored report carries every full note"
-# A collected target's manifest entry may list the objects its `notes` names
+# A collected target's manifest entry may list objects that a check did not see
 # as `{check, object}` (and `namespace` where the check has one, and an
 # optional `command`, the read that says so): each one an object whose result
 # a check could not see. `finish` refuses a `resolved_because`

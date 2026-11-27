@@ -350,7 +350,7 @@ the held set for a run is defined on the marker: the previous body's marker ids 
 less the ids the document carries. The identity of each held entry — check, cluster, namespace,
 object, and the command that produced it — comes from the manifest candidate that still emits it,
 which is what the collector vouches for, or for a noted object from its `noted_objects` entry, with
-the object's own read as the command; the title is the previous body's where its heading
+the entry's `command` as the command, or the check's joined record where the entry has none; the title is the previous body's where its heading
 survived and is otherwise built from the check and the object. That set drives the `HELD` merge on
 a clean run, the exclusion from `resolved`, and the carried rows on a findings run.
 

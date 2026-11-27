@@ -35,8 +35,9 @@ All five of the SOP's checks are implemented here:
   one finding that names each. On a day with no such line it asks for any one
   serial console entry of the node pools of its first read in the last 30
   days; with none, nothing shows that the project stores that log, and
-  `notes` says so. A first read that fails leaves the check unevaluated; a
-  later one leaves the node pools that it did not reach in `limitations` and
+  `notes` says so. A first read that fails, or a control read that fails,
+  leaves the check unevaluated; a later read of the kernel's line that fails
+  leaves the node pools that it did not reach in `limitations` and
   `noted_objects`.
 - `gce-startup-script-status` enumerates with `compute instances list`, keeps
   the RUNNING instances that actually run a startup script — its own metadata
@@ -475,7 +476,8 @@ SERIAL_LOGGING_FORMAT = "--format=json(name,zone)"
 # exclusion on the project's sink, a sink to another project, or the
 # organization policy `compute.disableSerialPortLogging` leaves the value at
 # "true" and stores no line. So when a run finds no kernel line, it asks for
-# any one serial console entry of the node pools it read, with no text filter.
+# any one serial console entry of the node pools of its first read, with no
+# text filter.
 # None means that the check has no sign that this log reaches Cloud Logging
 # here, and "clean" would rest on nothing. The window is the log bucket's
 # default retention and not the audit's day, because a healthy node can write
@@ -516,6 +518,8 @@ CONNTRACK_MORE_NODES = " and {more} more"
 # RFC 3339 down to the second: what an excerpt shows of an entry's timestamp.
 STAMP_SECONDS_CHARS = 19
 STAMP_UTC_SUFFIX = "Z"
+# The form of those characters. Cloud Logging writes an entry's timestamp in UTC.
+STAMP_SECONDS_FORMAT = "%Y-%m-%dT%H:%M:%S"
 UNKNOWN_TIME_TEXT = "an unknown time"
 # What a failed read's reason says when the command wrote nothing to stderr.
 NO_STDERR_TEXT = "no stderr"
@@ -1778,7 +1782,37 @@ class ConntrackLines(NamedTuple):
     failed: tuple | None
 
 
-def read_conntrack_lines(project: str, units: dict[str, dict], *, run: RunFn) -> ConntrackLines:
+def _entry_time(entry) -> datetime.datetime | None:
+    """A log entry's own time to the second, or None when it carries none that reads as one."""
+    text = str(entry.get(LOG_TIMESTAMP_KEY) or "") if isinstance(entry, dict) else ""
+    try:
+        stamp = datetime.datetime.strptime(text[:STAMP_SECONDS_CHARS], STAMP_SECONDS_FORMAT)
+    except ValueError:
+        return None
+    return stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+def within_window(entries: list, since: datetime.datetime) -> list:
+    """The entries stamped at or after `since`.
+
+    `gcloud` and the relay add a read's time bound only to a filter without
+    the word `timestamp`, and a clause that is added to the filter after this
+    collector wrote it (an excluded cluster's name) can hold that word. So the
+    collector holds the window itself too, on each entry's own time. An entry
+    with no time that reads as one stays, and its finding says the time is
+    unknown.
+    """
+    kept = []
+    for entry in entries:
+        stamp = _entry_time(entry)
+        if stamp is None or stamp >= since:
+            kept.append(entry)
+    return kept
+
+
+def read_conntrack_lines(
+    project: str, units: dict[str, dict], *, run: RunFn, since: datetime.datetime
+) -> ConntrackLines:
     """The serial console entries of `units` that carry the kernel's line.
 
     One read names `groups_per_read` units and returns one page, newest
@@ -1788,6 +1822,10 @@ def read_conntrack_lines(project: str, units: dict[str, dict], *, run: RunFn) ->
     for leaves nothing hidden. A read that fails, or the
     CONNTRACK_READS_MAX-th read, ends the reading; the pages before it are
     kept, and the units not reached are `unread`.
+
+    A page keeps the entries `within_window` of `since` only. A page that
+    reached an older entry holds every newer line of the units asked for,
+    because a page is newest first, so it ends the rounds for them.
     """
     pages: list = []
     unread: list[str] = []
@@ -1811,8 +1849,10 @@ def read_conntrack_lines(project: str, units: dict[str, dict], *, run: RunFn) ->
             page = _json_list(result)
             if page is None:
                 return ConntrackLines(pages, unread + asked + pending, (argv, result))
+            returned = len(page)
+            page = within_window(page, since)
             pages.append((shlex.join(argv), result, page))
-            if len(page) < CONNTRACK_LOG_LIMIT:
+            if returned < CONNTRACK_LOG_LIMIT or len(page) < returned:
                 asked = []
                 break
             seen = {conntrack_unit(units, name) for name, _stamp_text in _conntrack_lines(page)}
@@ -2216,7 +2256,8 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 reads[CONNTRACK_SLUG].add(switch_command, logged_result)
                 covered = instance_keys(logged) & set(nodes)
                 uncovered = sorted(set(nodes) - covered)
-                # The node pools this run could not see, with the read that says so.
+                # The node pools this run could not see. The value is the read of
+                # the logging switch where that read says why, else empty.
                 unseen: dict[str, str] = {}
                 if uncovered:
                     named = pool_names(nodes, uncovered)
@@ -2225,8 +2266,16 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 # The findings of this run, as the ledger spells their objects.
                 found: set[str] = set()
                 units = conntrack_units(nodes, covered)
+                # A limitation on node pools that no read reached; it is said
+                # only where the check stays evaluated.
+                unread_limitation = ""
                 if units:
-                    lines = read_conntrack_lines(project, units, run=run)
+                    # Before the first read, so that a read's own bound is never the wider one.
+                    started = datetime.datetime.now(datetime.timezone.utc)
+                    lines = read_conntrack_lines(
+                        project, units, run=run,
+                        since=started - datetime.timedelta(hours=CONNTRACK_FRESHNESS_HOURS),
+                    )
                     if not lines.pages:
                         failed_argv, failed_result = lines.failed
                         conntrack_cause = UNREAD_CONNTRACK_LOG_REASON.format(total=len(nodes))
@@ -2255,7 +2304,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                             limitation = (
                                 CONNTRACK_UNREAD_FAILED_LIMITATION if lines.failed else CONNTRACK_UNREAD_FULL_LIMITATION
                             )
-                            limitations.append(limitation.format(count=len(missed), reads=len(lines.pages)))
+                            unread_limitation = limitation.format(count=len(missed), reads=len(lines.pages))
                             if lines.failed:
                                 log(CONNTRACK_LATER_READ_FAILED_LOG.format(project=project, error=_failure_text(*lines.failed)))
                             for obj in missed:
@@ -2278,6 +2327,10 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                                 limit=SERIAL_CONTROL_LIMIT,
                             )
                             control = _json_list(control_result)
+                            if control is not None:
+                                control = within_window(
+                                    control, started - datetime.timedelta(days=SERIAL_CONTROL_FRESHNESS_DAYS)
+                                )
                             if control is None:
                                 conntrack_cause = UNREAD_SERIAL_CONTROL_REASON.format(total=len(nodes))
                                 conntrack_error = _failure_text(control_argv, control_result)
@@ -2289,13 +2342,16 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                                     for obj in node_objects(nodes, covered):
                                         unseen.setdefault(obj, "")
                 if not conntrack_cause:
+                    if unread_limitation:
+                        limitations.append(unread_limitation)
                     # A pool with a finding this run was seen; the rest of the
                     # unseen pools keep an earlier finding from being resolved.
                     # One entry for each spelling that the ledger knows. Only the
                     # switch read is written on an entry: it is the same text on
                     # every run. A log read names that day's groups, and its text
                     # on every entry would be most of a large manifest; the
-                    # target's `commands` record has it once.
+                    # target's `commands` record shows the first reads whole and
+                    # counts the rest.
                     noted: dict[str, dict] = {}
                     for obj, command in sorted(unseen.items()):
                         if ledger_segment(obj) not in found:

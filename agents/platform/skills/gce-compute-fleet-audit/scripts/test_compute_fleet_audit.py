@@ -2864,7 +2864,17 @@ POOL_BATCH = "NodePool/us-central1-a/seeded-a/idle-batch-pool"
 NAME_LABEL = 'labels."compute.googleapis.com/resource_name"'
 
 
-def conntrack_entry(name: str = NODE_A, stamp: str = "2026-11-20T19:59:32.454392524Z", zone: str = NODE_ZONE,
+def stamp_ago(**ago) -> str:
+    """A log entry's timestamp that far before now."""
+    then = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(**ago)
+    return then.strftime("%Y-%m-%dT%H:%M:%S.454392524Z")
+
+
+# Inside the day that §2.6 reads: the collector drops an older entry itself.
+RECENT_STAMP = stamp_ago(hours=1)
+
+
+def conntrack_entry(name: str = NODE_A, stamp: str = RECENT_STAMP, zone: str = NODE_ZONE,
                     text: str = "[  368.753785] nf_conntrack: nf_conntrack: table full, dropping packet\\r\\n") -> dict:
     """One Cloud Logging entry of the serial console log, in the shape a live
     test's entries had (GKE Standard 1.35.8, 2026-11-20; read back 2026-11-24)."""
@@ -3156,6 +3166,25 @@ class ConntrackSaturationTest(unittest.TestCase):
         self.assertIn("between an unknown time and an unknown time", hit["excerpt"])
 
 
+class WithinWindowTest(unittest.TestCase):
+    """The window that the collector holds itself, on each entry's own time."""
+
+    SINCE = datetime.datetime(2026, 11, 20, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+    def test_an_entry_older_than_the_window_is_dropped(self):
+        old = conntrack_entry(stamp="2026-11-20T11:59:59.999999999Z")
+        edge = conntrack_entry(stamp="2026-11-20T12:00:00.000000000Z")
+        new = conntrack_entry(stamp="2026-11-20T12:00:01Z")
+        self.assertEqual(cf.within_window([old, edge, new], self.SINCE), [edge, new])
+
+    def test_an_entry_with_no_time_that_reads_as_one_stays(self):
+        bare = conntrack_entry()
+        del bare["timestamp"]
+        odd = conntrack_entry(stamp="yesterday")
+        entries = [bare, odd, "not an entry"]
+        self.assertEqual(cf.within_window(entries, self.SINCE), entries)
+
+
 class ConntrackInCollectProjectTest(unittest.TestCase):
     """§2.6 inside `collect_project`: its reads, and what each outcome leaves
     in the manifest entry."""
@@ -3342,6 +3371,15 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         _, issued = self.collect(self.responses(nodes=nodes))
         (control,) = self.control_reads(issued)
         self.assertEqual(control[3].count("|") + 1, cf.CONNTRACK_GROUPS_PER_READ)
+
+    def test_the_control_of_a_large_project_asks_for_the_groups_of_its_first_read(self):
+        nodes = [pool_node(i) for i in range(501)]
+        _, issued = self.collect(self.responses(nodes=nodes))
+        (control,) = self.control_reads(issued)
+        named = cf.groups_per_read(len(nodes))
+        self.assertGreater(named, cf.CONNTRACK_GROUPS_PER_READ)
+        self.assertEqual(control[3].count("|") + 1, named)
+        self.assertEqual(control[3].split(NAME_LABEL)[1], self.day_reads(issued)[0].split(NAME_LABEL)[1])
 
     # --- the standing states: a note, and the pool held ----------------------------------
 
@@ -3653,6 +3691,42 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertIn("DEADLINE_EXCEEDED", logged_text)
         self.assertIn("logging read", logged_text)
 
+    # --- the window, held by the collector too -------------------------------------------------
+
+    def test_a_line_older_than_the_day_is_not_a_finding(self):
+        """A read whose time bound was lost returns older lines. The collector
+        drops them by their own time; with no line left, the control asks."""
+        old = conntrack_entry(stamp=stamp_ago(hours=cf.CONNTRACK_FRESHNESS_HOURS + 1))
+        entry, issued = self.collect(self.responses(entries=[old, old]))
+        self.assertEqual(self.conntrack(entry), [])
+        self.assertEqual(len(self.control_reads(issued)), 1)
+        self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+
+    def test_a_line_of_the_day_beside_an_older_one_is_counted_alone(self):
+        old = conntrack_entry(stamp=stamp_ago(hours=cf.CONNTRACK_FRESHNESS_HOURS + 1))
+        entry, issued = self.collect(self.responses(entries=[conntrack_entry(), old, old]))
+        (finding,) = self.conntrack(entry)
+        self.assertIn("1 kernel line(s)", finding["excerpt"])
+        self.assertEqual(self.control_reads(issued), [])
+
+    def test_a_full_page_that_reaches_an_older_line_is_whole_for_its_groups(self):
+        """A page is newest first, so one that reached a line older than the
+        day holds every line of the day: no second read, and an exact count."""
+        old = conntrack_entry(stamp=stamp_ago(hours=cf.CONNTRACK_FRESHNESS_HOURS + 1))
+        page = [conntrack_entry()] * 2 + [old] * (cf.CONNTRACK_LOG_LIMIT - 2)
+        entry, issued = self.collect(self.responses(nodes=self.TWO_POOLS, entries=page))
+        self.assertEqual(len(self.day_reads(issued)), 1)
+        (finding,) = self.conntrack(entry)
+        self.assertIn("2 kernel line(s)", finding["excerpt"])
+        self.assertFalse(finding["excerpt"].startswith("At least"), finding["excerpt"])
+        self.assertNotIn("limitations", entry)
+        self.assertEqual(self.noted(entry), [])
+
+    def test_a_control_entry_older_than_its_window_does_not_show_a_stored_log(self):
+        old = dict(QUIET_ENTRY, timestamp=stamp_ago(days=cf.SERIAL_CONTROL_FRESHNESS_DAYS + 1))
+        entry, _ = self.collect(self.responses(control=[old]))
+        self.assertIn(cf.NO_SERIAL_ENTRIES_NOTE.format(days=cf.SERIAL_CONTROL_FRESHNESS_DAYS), entry["notes"])
+
     # --- many node pools: the reads ------------------------------------------------------------
 
     def test_a_pool_named_with_the_time_word_keeps_the_days_window(self):
@@ -3689,6 +3763,18 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertIn(cf.NO_SERIAL_ENTRIES_NOTE.format(days=30), entry["notes"])
         self.assertIn(cf.CONNTRACK_UNREAD_FAILED_LIMITATION.format(count=5, reads=1), entry["limitations"])
         self.assertEqual(len(self.noted(entry)), len(nodes))
+
+    def test_a_failed_control_after_a_failed_later_read_is_said_once(self):
+        """The first read returned nothing, the second failed and the control
+        failed: the check is unevaluated, and the run says so in one sentence."""
+        nodes = [pool_node(i) for i in range(cf.CONNTRACK_GROUPS_PER_READ + 5)]
+        failed = run_of(1, "", "ERROR: DEADLINE_EXCEEDED")
+        answers = self.responses(nodes=nodes, entries=[], later_pages=[failed], **{self.CONTROL_READ: failed})
+        entry, _ = self.collect(answers)
+        self.assertIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+        self.assertIn("node-conntrack-saturation could not be evaluated", entry["limitations"])
+        self.assertNotIn(cf.CONNTRACK_UNREAD_FAILED_LIMITATION.format(count=5, reads=1), entry["limitations"])
+        self.assertEqual(self.noted(entry), [])
 
     def test_a_read_that_fails_leaves_every_group_after_it_unread(self):
         nodes = [pool_node(i) for i in range(cf.CONNTRACK_GROUPS_PER_READ * 2 + 10)]
@@ -3853,6 +3939,35 @@ class ConntrackComposesWithAuditReportTest(unittest.TestCase):
         self.assertEqual(data["findings"], [])
         audit_report.cross_check_manifest(data, manifest)
         audit_report.validate_findings(data, self.AUDIT)
+
+
+
+class ConntrackSopNumbersTest(unittest.TestCase):
+    """SOP §2.6 states the read's numbers in prose. They are the collector's
+    constants; a change to one without the other fails here."""
+
+    SOP = Path(__file__).resolve().parents[3] / "governance" / "gce_compute_fleet_sop.md"
+    WORDS = {5: "five", 10: "ten", 20: "twenty"}
+
+    def test_the_sops_numbers_are_the_collectors(self):
+        text = self.SOP.read_text()
+        words = self.WORDS
+        every_group = cf.CONNTRACK_GROUPS_PER_READ_MAX * cf.CONNTRACK_FIRST_READS
+        for phrase in (
+            f"--freshness={cf.CONNTRACK_FRESHNESS} --limit={cf.CONNTRACK_LOG_LIMIT} ",
+            f"at most {cf.CONNTRACK_GROUPS_PER_READ} instance groups and returns the newest {cf.CONNTRACK_LOG_LIMIT:,} lines",
+            f"more than {cf.CONNTRACK_GROUPS_PER_READ * cf.CONNTRACK_FIRST_READS} groups a read names more, up to {cf.CONNTRACK_GROUPS_PER_READ_MAX}",
+            f"{words[cf.CONNTRACK_FIRST_READS]} reads ask for every group of up to {every_group:,}",
+            f"up to {words[cf.CONNTRACK_READ_ROUNDS]} reads for one set of groups and {words[cf.CONNTRACK_READS_MAX]} reads for the project",
+            f"in the last {cf.SERIAL_CONTROL_FRESHNESS_DAYS} days",
+            f"(at most {words[cf.CONNTRACK_NODES_SHOWN]}, then",
+        ):
+            self.assertIn(phrase, text)
+
+    def test_the_sops_command_is_the_collectors_filter_for_one_group(self):
+        units = units_of(gke_node(NODE_A))
+        sent = cf.CONNTRACK_LOG_FILTER + cf.names_clause(units, sorted(units))
+        self.assertIn(sent.replace(GROUP_A, "$NODE_GROUPS"), self.SOP.read_text())
 
 
 if __name__ == "__main__":
