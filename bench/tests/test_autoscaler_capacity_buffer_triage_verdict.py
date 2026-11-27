@@ -88,8 +88,8 @@ def test_command_objective_rejects_wrong_group_invalid_version_missing_all_ns_or
 def test_conditions_objective_accepts_valid_triage_spellings():
     for report in (
         "CONDITIONS: ReadyForProvisioning=False for template/config error; LimitedByQuotas=True for quota cap; Provisioning=False for fake-pod failure; NotTriggerScaleUp events on the CapacityBuffer.",
-        "**CONDITIONS:** `ReadyForProvisioning` is `False`; `LimitedByQuotas` is `True`; `Provisioning` is `False`; `NotTriggerScaleUp` events (healthy buffers stay `Provisioning=True`).",
-        "- CONDITIONS: Healthy buffers stay Provisioning=True; failures are ReadyForProvisioning: False, LimitedByQuotas: True, Provisioning: False, and NotTriggerScaleUp events.",
+        "Healthy buffers stay `Provisioning=True`.\n**CONDITIONS:** `ReadyForProvisioning` is `False`; `LimitedByQuotas` is `True`; `Provisioning` is `False`; `NotTriggerScaleUp` events.",
+        "Healthy buffers stay Provisioning=True.\n- CONDITIONS: ReadyForProvisioning: False, LimitedByQuotas: True, Provisioning: False, and NotTriggerScaleUp events.",
         "CONDITIONS: ReadyForProvisioning (False) / LimitedByQuotas (True) / Provisioning (False) / NotTriggerScaleUp",
     ):
         assert _passes(CONDITIONS_CHECK, report), report
@@ -106,8 +106,17 @@ def test_conditions_objective_rejects_inverted_booleans_and_incomplete_replies()
         # Inverted Provisioning=True (no Provisioning=False)
         "CONDITIONS: ReadyForProvisioning=False; LimitedByQuotas=True; Provisioning=True; NotTriggerScaleUp",
         "CONDITIONS: ReadyForProvisioning=False; LimitedByQuotas=True; Provisioning=True (Ready=False); NotTriggerScaleUp",
-        # Negated boolean
+        # Hedged both booleans on one line
+        "CONDITIONS: ReadyForProvisioning=True or ReadyForProvisioning=False; LimitedByQuotas=False or LimitedByQuotas=True; Provisioning=True or Provisioning=False; NotTriggerScaleUp",
+        "CONDITIONS: ReadyForProvisioning=False; LimitedByQuotas=True; Provisioning=True or Provisioning=False; NotTriggerScaleUp",
+        # Negated boolean (word, contraction, !=, or leading negation)
         "CONDITIONS: ReadyForProvisioning is not False; LimitedByQuotas=True; Provisioning=False; NotTriggerScaleUp",
+        "CONDITIONS: ReadyForProvisioning!=False; LimitedByQuotas!=True; Provisioning!=False; NotTriggerScaleUp",
+        "CONDITIONS: ReadyForProvisioning isn't False; LimitedByQuotas=True; Provisioning=False; NotTriggerScaleUp",
+        "CONDITIONS: not ReadyForProvisioning=False; LimitedByQuotas=True; Provisioning=False; no NotTriggerScaleUp",
+        "CONDITIONS: never ReadyForProvisioning=False; LimitedByQuotas=True; Provisioning=False; NotTriggerScaleUp",
+        # Wrong v1alpha1 Ready=False claim
+        "CONDITIONS: ReadyForProvisioning=False; LimitedByQuotas=True; Provisioning=False; Ready=False; NotTriggerScaleUp",
         # Unbound condition before another condition
         "CONDITIONS: ReadyForProvisioning and Provisioning=False; LimitedByQuotas=True; NotTriggerScaleUp",
         # Missing ReadyForProvisioning

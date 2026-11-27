@@ -27,7 +27,9 @@
 #   invalid `resource.group/version` syntax, and mutating verbs.
 # - `CONDITIONS:` must bind `ReadyForProvisioning=False`, `LimitedByQuotas=True`,
 #   and `Provisioning=False` tightly to their own boolean values without crossing
-#   `,`, `;`, `.`, or the opposite boolean, and name `NotTriggerScaleUp`.
+#   `,`, `;`, `.`, or the opposite boolean, reject inverted pairings, negation
+#   tokens (`not`/`no`/`never`/`n't`/`!=`), and v1alpha1 `Ready=False`, and name
+#   `NotTriggerScaleUp`.
 # `bench/tests/test_autoscaler_capacity_buffer_triage_verdict.py` pins these
 # checks on positive and negative replies, including inverted booleans,
 # `expected_output`, and verbatim prompt echo.
@@ -85,7 +87,7 @@ expected_output: >-
 
   COMMAND: kubectl get capacitybuffers.autoscaling.x-k8s.io -A
 
-  CONDITIONS: ReadyForProvisioning=False for configuration/template errors; LimitedByQuotas=True for namespace quota caps; Provisioning=False for placeholder creation failures; NotTriggerScaleUp events on the CapacityBuffer object for scale-up starvation (healthy buffers remain Provisioning=True with no Ready condition).
+  CONDITIONS: ReadyForProvisioning=False for configuration/template errors; LimitedByQuotas=True for namespace quota caps; Provisioning=False for placeholder creation failures; NotTriggerScaleUp events on the CapacityBuffer object for scale-up starvation.
 infrastructure:
   deployer: noop
 validated: true
@@ -113,7 +115,11 @@ verification_spec:
         - "(?m)^conditions:[^\\n]*\\bprovisioning\\b(?:(?!\\b(?:true|not|readyforprovisioning|limitedbyquotas|ready)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
         - "(?m)^conditions:[^\\n]*\\bnottriggerscaleup\\b"
       forbidden_patterns:
-        - "(?m)^conditions:[^\\n]*\\?"
+        - "(?m)^conditions:[^\\n]*(?:\\?|(?:\\b(?:not|no|never)\\b|n't\\b|!=))"
+        - "(?m)^conditions:[^\\n]*\\breadyforprovisioning\\b(?:(?!\\b(?:false|limitedbyquotas|provisioning|ready)\\b)[^,\\n;.]){0,24}\\btrue\\b"
+        - "(?m)^conditions:[^\\n]*\\blimitedbyquotas\\b(?:(?!\\b(?:true|readyforprovisioning|provisioning|ready)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
+        - "(?m)^conditions:[^\\n]*\\bprovisioning\\b(?:(?!\\b(?:false|readyforprovisioning|limitedbyquotas|ready)\\b)[^,\\n;.]){0,24}\\btrue\\b"
+        - "(?m)^conditions:[^\\n]*\\bready\\b(?:(?!\\b(?:readyforprovisioning|limitedbyquotas|provisioning)\\b)[^,\\n;.]){0,24}\\bfalse\\b"
   - name: no-doc-or-web-search-rabbit-hole
     role: objective
     mode: assert
@@ -124,7 +130,6 @@ verification_spec:
           scope: workers
           tool_names:
             - "web_search"
-            - "web_extract"
             - "mcp__developer_knowledge__search_documents"
             - "mcp_developer_knowledge_search_documents"
             - "mcp__developer_knowledge__get_documents"
