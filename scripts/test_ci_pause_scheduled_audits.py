@@ -50,6 +50,9 @@ ROSTER_SOURCE = REPO / "agents" / "platform" / "cron" / "jobs.json"
 ROUND_SLEEP_LINE_RE = re.compile(r"^PAUSE_ROUND_SLEEP_SECONDS = .+$", re.M)
 SHORT_ROUND_SLEEP_LINE = "PAUSE_ROUND_SLEEP_SECONDS = 0.01"
 HERMES_TIMEOUT_LINE_RE = re.compile(r"^HERMES_TIMEOUT_SECONDS = .+$", re.M)
+# The per-call bound of the test whose stand-in stalls. Seconds, not a fraction of one:
+# under load the stand-in took longer than 0.3s to start and count its call.
+STALL_TEST_TIMEOUT_SECONDS = 5
 
 
 def script_text(real_round_sleep=False, hermes_timeout=None):
@@ -79,13 +82,13 @@ FAKE_HERMES = textwrap.dedent('''\
     if mode == "fail":
         print("boom", file=sys.stderr)
         sys.exit(1)
+    assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
     if mode == "stall":
         # A wedged store: the call is counted, then outlasts the script's per-call bound.
         import time
         with open(os.environ["FAKE_ROSTER"] + ".calls", "a") as calls:
             calls.write(sys.argv[5] + os.linesep)
-        time.sleep(30)
-    assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
+        time.sleep(60)
     if mode == "noop":
         sys.exit(0)
     if mode.startswith("lose-first:") and sys.argv[5] == mode.split(":", 1)[1]:
@@ -545,14 +548,17 @@ class ChainTest(unittest.TestCase):
     def test_a_call_that_times_out_is_not_tried_again_in_the_pass(self):
         # What the runner's bound on one exec rests on: a pass whose calls all
         # stall spends one timeout on each job, whatever the number of rounds.
+        # Two audits and a bound of seconds: the stand-in must start and count
+        # its call before the bound ends, which a busy machine makes slow.
+        stalled = list(STAGE_FIVE[:2])
         self.write_roster(self.five())
-        self.write_stage(fired=STAGE_FIVE, done=True)
-        result, store = self.run_script(mode="stall", chain=True, hermes_timeout=0.3)
+        self.write_stage(fired=stalled)
+        result, store = self.run_script(mode="stall", chain=True, hermes_timeout=STALL_TEST_TIMEOUT_SECONDS)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         calls = pathlib.Path(f"{self.roster}.calls").read_text().split()
-        self.assertEqual(sorted(calls), sorted(STAGE_FIVE))
-        for audit in STAGE_FIVE:
-            self.assertIn(f"{audit} (timed out after 0.3s)", result.stdout)
+        self.assertEqual(sorted(calls), sorted(stalled))
+        for audit in stalled:
+            self.assertIn(f"{audit} (timed out after {STALL_TEST_TIMEOUT_SECONDS}s)", result.stdout)
             self.assertTrue(store[audit]["enabled"], audit)
 
     def test_every_audit_is_paused_once_the_chain_is_done(self):
