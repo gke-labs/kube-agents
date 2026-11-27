@@ -106,8 +106,9 @@ func (m *sideCallRecorder) GenerateContent(ctx context.Context, req *llm.Request
 }
 
 // The request that compacts the history goes out as a side call, the mark
-// buildModel's sideCallsWithoutBuiltins keys on to send it with no
-// server-side tools (TestASideCallCarriesNoServerSideTool).
+// buildModel's sideCallsWithoutBuiltins keys on. This test's model is a
+// fake, so it pins only that mark; that a side call then carries no
+// server-side tool is TestASideCallCarriesNoServerSideTool's.
 func TestTheCompactionRequestIsASideCall(t *testing.T) {
 	m := &sideCallRecorder{}
 	withModel(t, m)

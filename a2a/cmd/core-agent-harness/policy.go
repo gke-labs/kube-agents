@@ -91,12 +91,14 @@ func policySetup(p coreagentwire.Policy, mcp []coreagentwire.MCPServer, workdir 
 		// refuse an unmatched call. What still holds: registration (only
 		// the policy's built-ins), this plugin (only the policy's tools),
 		// deny rules, core-agent's built-in shell denylist, and two of its
-		// gate's checks left at their defaults, each narrowing the shell:
-		// the sandbox refuses a command that writes outside workdir and the
-		// temp directories (a redirection, or a cp, mv, mkdir, tee and the
-		// like), and the search gate refuses a search-shaped command such
-		// as grep -rn or find . while the native grep and glob tools are
-		// registered. So "any command" means any command those pass. The
+		// gate's checks left at their defaults, each a best-effort narrowing
+		// and neither a boundary: a scan of a command's visible write
+		// targets (a top-level redirection, or a cp, mv, mkdir, tee and the
+		// like) refuses one outside workdir and the temp directories, which
+		// an interpreter (bash -c, python3 -c) passes unseen; and the search
+		// gate refuses a search-shaped command such as grep -rn or find .
+		// while the native grep and glob tools are registered. So "any
+		// command" means any command those pass. The
 		// read tools' workspace scope doesn't hold, which a shell that reads
 		// anywhere never had. The grant may not carry a file write: no
 		// persona grants one, and in this mode the path scope wouldn't

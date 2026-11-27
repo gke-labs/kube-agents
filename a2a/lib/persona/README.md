@@ -187,12 +187,14 @@ worker refuses `antigravity`, which has no persona adapter yet.
     before-tool check, deny rules and core-agent's shell denylist still
     hold, and the read tools aren't workspace-scoped there (the shell reads
     anywhere it can reach anyway). Two of core-agent's own gate checks
-    still narrow that shell: its sandbox refuses a command that writes
-    outside the workspace and the temp directories (a redirection, or a
-    `cp`, `mv`, `mkdir`, `tee` and the like), and its search gate refuses a
-    search-shaped command such as `grep -rn` or `find .` while the native
-    `grep` and `glob` tools are registered. The shell's boundary is the
-    sandbox and the broker, as on Claude Code. Without the shell, the read
+    still narrow that shell, best effort and neither a boundary: a scan of a
+    command's visible write targets (a top-level redirection, or a `cp`,
+    `mv`, `mkdir`, `tee` and the like) refuses one outside the workspace and
+    the temp directories, which a write through an interpreter (`bash -c`,
+    `python3 -c`) passes unseen; and its search gate refuses a search-shaped
+    command such as `grep -rn` or `find .` while the native `grep` and
+    `glob` tools are registered. The shell's boundary is the pod's sandbox
+    and the broker, as on Claude Code. Without the shell, the read
     tools stay inside the workspace. Search is server-side and not gated
     per call, as WebSearch is on Claude Code, and works only where the
     model endpoint offers it beside function calls (Gemini 3 or later, by

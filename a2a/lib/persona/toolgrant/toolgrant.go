@@ -12,7 +12,8 @@
 //     deny rules win (CoreAgentGrant.Allow, Deny). A grant with Shell runs
 //     in core-agent's mode that refuses no unmatched call instead
 //     (CoreAgentGrant.AnyShellCommand), where the deny rules, core-agent's
-//     shell denylist and its sandbox and search checks still hold;
+//     shell denylist and its best-effort write-target and search checks
+//     still apply;
 //   - the before-tool check: the harness's plugin re-checks every call
 //     against the grant's tools as it happens (plus the read-only skill
 //     tools), so a tool that reaches the model by some other path is still
@@ -47,7 +48,8 @@ type Policy struct {
 	// persona's `shell`, which Claude Code grants as an unrestricted Bash):
 	// the harness runs the turn in core-agent's mode that refuses no
 	// unmatched call (CoreAgentGrant.AnyShellCommand), keeping deny rules,
-	// core-agent's built-in denylist and its sandbox and search checks.
+	// core-agent's built-in denylist and its best-effort write-target and
+	// search checks.
 	// That mode also drops the read tools' workspace scope, so the harness
 	// refuses a grant that pairs Shell with a file write. Its boundary is
 	// the sandbox and the credential broker, as on Claude Code. A session's
@@ -165,7 +167,7 @@ type CoreAgentGrant struct {
 	// Builtins are the built-in tools to register, sorted.
 	Builtins []string
 	// Allow and Deny are gate rules, "<tool>:<glob>", for CoreAgentMode.
-	// With AnyShellCommand only Deny refuses a call.
+	// With AnyShellCommand, of the patterns, only Deny refuses a call.
 	Allow, Deny []string
 	// MCP maps a server to the tools it may expose (its tool allowlist).
 	MCP map[string][]string

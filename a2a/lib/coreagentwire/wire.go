@@ -57,7 +57,7 @@ type Policy struct {
 	Tools []string `json:"tools,omitempty"`
 	// Allow and Deny are core-agent permission patterns (`tool:key` globs).
 	// A call no Allow pattern matches is refused, never prompted, unless
-	// AnyShellCommand is set; then only Deny refuses.
+	// AnyShellCommand is set; then, of the patterns, only Deny refuses.
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
 	// WebSearch turns on the model's server-side Google Search, the one
@@ -68,7 +68,8 @@ type Policy struct {
 	// (pipes, chains, redirections, expansions) included: the harness runs
 	// the turn in core-agent's mode that refuses no unmatched call, which
 	// keeps the deny rules, the built-in shell denylist and the gate's
-	// sandbox and search checks, and drops the read tools' workspace scope,
+	// best-effort write-target and search checks, and drops the read tools'
+	// workspace scope,
 	// so the policy may not carry a file write. Only a persona's shell
 	// grant sets it; a session's shell is its command prefixes.
 	AnyShellCommand bool `json:"any_shell_command,omitempty"`
