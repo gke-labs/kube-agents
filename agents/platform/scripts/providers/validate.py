@@ -28,6 +28,9 @@ from workspace_paths import WorkspaceError
 # validates repositories and never sees a branch.
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+STATUS_CONTEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+COMMIT_STATUS_STATES = frozenset({"success", "pending", "failure"})
+MAX_STATUS_DESCRIPTION = 140
 # An account a listing is filtered on: a login, an automation's `[bot]`
 # spelling, or an `app/<slug>` search form. No space, colon or quote, because a
 # forge may read it from inside a search query, where any of them would start
@@ -200,6 +203,18 @@ def validate_labels(value: Any) -> list[str]:
     ):
         raise WorkspaceError("labels must be a list of non-empty strings")
     return [label.strip() for label in value]
+
+
+def validate_status_state(value: Any) -> str:
+    if not isinstance(value, str) or value.strip().lower() not in COMMIT_STATUS_STATES:
+        raise WorkspaceError("state must be one of success, pending, failure")
+    return value.strip().lower()
+
+
+def validate_status_context(value: Any) -> str:
+    if not isinstance(value, str) or not STATUS_CONTEXT_RE.match(value.strip()):
+        raise WorkspaceError("context is not an acceptable status context name")
+    return value.strip()
 
 
 def repo_segments(url: str, hosts: tuple[str, ...]) -> list[str]:

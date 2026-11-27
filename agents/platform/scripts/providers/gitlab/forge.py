@@ -49,6 +49,7 @@ from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
+    MAX_STATUS_DESCRIPTION,
     repo_segments,
     validate_branch,
     validate_comment_limit,
@@ -57,7 +58,10 @@ from ..validate import (
     validate_login,
     validate_number,
     validate_page,
+    validate_revision,
     validate_state,
+    validate_status_context,
+    validate_status_state,
     validate_text,
 )
 from . import translate
@@ -154,6 +158,7 @@ class GitLabForge(Forge):
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
     labels = True
+    commit_statuses = True
     # A `/label ~x` line in a note or a description is a quick action GitLab
     # runs under the credential that posted it.
     text_sets_labels = True
@@ -952,3 +957,25 @@ class GitLabForge(Forge):
                 changes["description"] = description
             node = api("PUT", f"{labels}/{quoted}", body=changes) if changes else existing
         return {"label": translate.label(node)}
+
+    def commit_status_set(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        revision = validate_revision(payload.get("revision"), "revision")
+        state = validate_status_state(payload.get("state"))
+        context = validate_status_context(payload.get("context"))
+        description = validate_text(payload.get("description"), "description", required=False)[
+            :MAX_STATUS_DESCRIPTION
+        ]
+        gitlab_state = "failed" if state == "failure" else state
+        api(
+            "POST",
+            f"{self._project(repo)}/statuses/{revision}",
+            body={"state": gitlab_state, "name": context, "description": description},
+        )
+        return {
+            "status": {
+                "revision": revision,
+                "state": state,
+                "context": context,
+                "description": description,
+            }
+        }

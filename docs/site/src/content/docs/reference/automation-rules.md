@@ -35,6 +35,10 @@ automerge:
   allow:
     - fix: no-pdb
       environments: [dev]
+    - max_risk: low
+      environments: [test]
+    - max_risk: medium
+      environments: [dev]
   deny:
     - fix: "*"
       environments: [prod]
@@ -43,35 +47,76 @@ automerge:
 `version` is required and must be `1`. `automerge` holds two optional lists, `allow` and `deny`. A
 file with only `version: 1` is valid and allows nothing.
 
-Each rule has exactly two keys:
+Each rule has `environments` plus one target selector:
 
 - `fix`: the kind of fix, named by the audit check that finds the problem. The one kind today is
   `no-pdb`, which adds a missing PodDisruptionBudget. A rule naming any other kind refuses the
   whole file.
+- `max_risk` (in `allow` rules only): the highest deterministic pull request risk level (`low` or
+  `medium`) permitted for unattended auto-merge in `dev` or `test` environments when the change also
+  has `disruptiveness: non_disruptive`, `revertability: easy`, `supported: true`, and
+  `effective_changes: true`. `high`, `critical`, `unknown`, and `*` are refused in `allow` rules.
+  Non-dev environments such as `staging` and `prod` are refused on `max_risk` rules and require
+  proven `fix` recipes.
+- `risk` (in `deny` rules only): denies risk-based auto-merge at or above that risk level (`low`,
+  `medium`, `high`, `critical`, or `*`). A `deny` rule with `fix: "*"` denies both recipe fixes and
+  risk-based rules in those environments.
 - `environments`: a non-empty list of environment names, written as GKE label values (lowercase
   letters, digits, `_` and `-`, at most 63 characters).
 
-`*` matches every fix or every environment, in deny rules only. An allow rule must name its fix
-and its environments, so a new kind of fix, or a new environment, never merges unattended because
-of a rule written before it existed.
+`*` matches every fix, risk level, or environment, in deny rules only. An allow rule must name its
+fix or `max_risk` level and its environments, so a new kind of fix, or a new environment, never
+merges unattended because of a rule written before it existed.
+
+Risk-based auto-merge stays off by default even when `KUBEAGENTS_AUTOMERGE` is `on` for `no-pdb`.
+An install admin must set `KUBEAGENTS_AUTOMERGE_MAX_RISK` to `low` or `medium` to opt in (`off` or unset disables it).
+`max_risk` rules obey the Autonomy dial's top-level Auto-merge ceiling, while sitting outside per-recipe clean-merge counters on the dial panel.
+Post-merge health verification and automatic step-down currently cover registered fix recipes (`no-pdb`) only, not `max_risk` merges.
+Run `KUBEAGENTS_AUTOMERGE=practice` in `dev` or `test` before turning `on` (reason-code post-merge health tracking is a planned follow-up).
+
+The credential broker computes `risk:low`, `risk:medium`, `risk:high`, `risk:critical`, or `risk:unknown` labels on GitHub and Gitea; callers cannot modify any `risk:*` label.
+Unrendered Helm, Kustomize, or Terraform changes record an `unsupported` `kube-agents/risk` commit status without adding a `risk:unknown` label.
 
 ## The environment of a fix
 
-A fix's environment is the target cluster's `environment` resource label. When that label is not
+For changes under `clusters/<cluster>/`, kube-agents resolves the cluster across `GKE_PROJECT_ID` (or comma-separated `GKE_PROJECTS`) and reads its `environment` resource label. When that label is not
 set, kube-agents reads `env`, then `stage`, then `tier`, the same keys the fleet-drift audit groups
 clusters by. The value is compared exactly as written: fleet drift reads `production` as `prod`,
 this file does not, so a rule names the label value your clusters carry. A cluster with none of
 these labels has no environment, and no rule matches it.
+
+For repositories organized by directory or branch rather than `clusters/<cluster>/`, declare an optional top-level `environments` mapping:
+
+```yaml
+environments:
+  dev:
+    paths: ["envs/dev/**", "apps/*/envs/dev/**"]
+    branches: [main]
+```
+
+Every changed file in the pull request must match at least one glob in `paths` (and target a branch in `branches` when set). If zero or multiple declared environments match, evaluation fails closed.
 
 ## How a fix is decided
 
 1. The switch is `off`: not allowed. The file is not read.
 2. The file is absent: not allowed.
 3. The file is refused: not allowed. See the next section.
-4. The cluster has no environment label: not allowed.
-5. A deny rule matches the fix and the environment: not allowed.
-6. An allow rule matches: allowed.
-7. Otherwise: not allowed.
+4. No single environment can be verified from `clusters/<cluster>/` resource labels or from a declared `environments` entry: not allowed.
+5. For risk-based rules (`max_risk`), the credential broker classifies the pull request from git
+   across four orthogonal axes before consulting allow/deny rules:
+   - `risk_level`: `low | medium | high | critical | unknown` (only `low` or `medium` can qualify,
+     capped by `KUBEAGENTS_AUTOMERGE_MAX_RISK`, which must be `low` or `medium`).
+   - `blast_radius`: `low | medium | high | critical | unknown`.
+   - `revertability`: `easy | moderate | difficult | irreversible | unknown` (auto-merge requires
+     `easy`).
+   - `disruptiveness`: `non_disruptive | disruptive | destructive | unknown` (auto-merge requires
+     `non_disruptive`).
+     Auto-merge also requires `supported: true`, `effective_changes: true`, and `stale_base: false`
+     (if the base branch modified any of the same files since the pull request branched, a rebase is
+     required). Registered fix-recipe pull requests (both added and edited manifests, such as `no-pdb`) are always evaluated under their recipe rule and live cluster safety checks, never via `max_risk`.
+6. A deny rule matches the fix or risk level and the environment: not allowed.
+7. An allow rule matches the fix or `max_risk` threshold and the environment: allowed.
+8. Otherwise: not allowed.
 
 ## When the file is refused
 
@@ -83,8 +128,12 @@ cannot be caught this way: it is a valid label value that matches no cluster.
 - `.kube-agents` or the file is a symbolic link.
 - `version` is missing or is not the number `1`.
 - A key is unknown or appears twice, at any level. YAML merge keys (`<<`) are not supported.
-- A rule is missing `fix` or `environments`, names a fix kind kube-agents does not open, has an
-  environment that is not a label value, or is an allow rule that uses `*`.
+- A rule is missing `environments`, omits a selector (`fix` or `max_risk` in `allow`; `fix` or `risk`
+  in `deny`), or sets more than one selector on the same rule.
+- A rule names an unknown fix kind or invalid risk level, has an environment that is not a label
+  value, sets `max_risk` on a non-dev/test environment (such as `staging` or `prod`), or uses `*`
+  inside an `allow` rule.
+- An `environments` entry omits both `paths` and `branches`, or contains an invalid relative glob or branch name.
 
 ## The auto-merge labels
 
@@ -103,21 +152,39 @@ With the switch `practice` or `on`, each time the fleet audit opens or refreshes
    one's name. The new budget's selector is the workload's live selector and selects no other
    workload's pods.
 
-A pull request that carries a label and no longer qualifies loses it on the audit's next
-run, which includes after the switch is turned back to `off`. A change of switch value swaps
-one label for the other. While the autonomy dial is below Auto-merge, `kube-agents:auto-merge` is held
-back and a carried one comes off. The broker reads all of this itself, and no request from the agent can add,
-remove or create either label. The pull request's body shows the same safety checks under **Safety
-checks**.
+For general GitOps pull requests opened by kube-agents (`proposal-create`) or updated via `publish`,
+the broker also runs deterministic git risk classification (`proposal-risk-label`):
 
-A push kube-agents makes to the branch takes the label off at once. A push made any other way keeps
-it until the audit's next run, so a pipeline that merges on the label should also require that every
-commit on the pull request is kube-agents' own.
+1. The pull request is open, originates from the managed repository (not a fork), was opened by
+   kube-agents, and targets the repository's base branch at a verified head commit SHA.
+2. The broker applies the computed `risk:low`, `risk:medium`, `risk:high`, `risk:critical`, or
+   `risk:unknown` label, removes any stale `risk:*` label, and posts a `kube-agents/risk` commit status
+   on the head SHA citing the base SHA and reason codes.
+3. The broker checks `KUBEAGENTS_AUTOMERGE_MAX_RISK` (`low` or `medium`) and `.kube-agents/automation.yaml`
+   on the base branch for a matching `max_risk` rule in the verified cluster environment. It also requires
+   `disruptiveness: non_disruptive`, `revertability: easy`, `supported: true`, `effective_changes: true`,
+   and `stale_base: false`. When all hold, it records a green `kube-agents/auto-merge` commit status on
+   the head SHA (`on`) and applies `kube-agents:would-auto-merge` (`practice`) or
+   `kube-agents:auto-merge` (`on`, when the autonomy dial allows auto-merge).
 
-The labels are applied only on GitHub and Gitea. Bitbucket has no labels, and on GitLab a `/label` line in a comment or a description sets a
+A pull request that carries a label and no longer qualifies loses it when re-evaluated, which
+includes after the switch is turned back to `off` or if a pull request is retargeted. A change of
+switch value swaps one label for the other. While the autonomy dial is below Auto-merge,
+`kube-agents:auto-merge` is held back and a carried one comes off. The broker reads all of this
+itself, verifies the head commit SHA before and after applying labels, and refuses any caller request
+to add, remove, or create `kube-agents:*` auto-merge or `risk:*` labels.
+
+Before pushing a new commit in `publish`, the broker strips carried `risk:*` and auto-merge labels,
+then re-evaluates the pushed head SHA. Your auto-merge pipeline should require the green
+`kube-agents/auto-merge` commit status on the current head SHA (plus up-to-date base branches or a merge
+queue), rather than merging on the `kube-agents:auto-merge` label alone.
+
+GitHub, GitLab, and Bitbucket branch protection cannot exempt pull requests from required human approvals by path or label. GitHub auto-merge and merge queues also enforce required review counts even for ruleset bypass actors. Unattended `max_risk` auto-merge therefore requires a dedicated zero-approval `dev` or `test` branch or repository gated on CI and the `kube-agents/auto-merge` commit status.
+
+Commit statuses (`kube-agents/risk` and `kube-agents/auto-merge`) are posted on GitHub, Gitea, GitLab, Bitbucket Cloud, and Bitbucket Data Center. Pull request labels are applied only on GitHub and Gitea. Bitbucket has no labels, and on GitLab a `/label` line in a comment or a description sets a
 label, so no label there is kube-agents' alone. Under `practice` the label is the whole effect:
 compare the pull requests that carry it with the ones your team merged. Under `on` your pipeline may
-merge a pull request that carries `kube-agents:auto-merge`. kube-agents merges nothing in either
+merge a pull request that carries `kube-agents:auto-merge` or a green `kube-agents/auto-merge` commit status. kube-agents merges nothing in either
 mode.
 
 ## When an auto-merged fix is still broken
@@ -145,17 +212,28 @@ that kind there, or is laid out in a way kube-agents cannot add a rule to. A fai
 is tried again on later runs, five attempts in all; then kube-agents comments once on the fix with what did and did not
 open, and stops.
 
-## Check a file
+## Check a file or classify a pull request
 
 In the install's shell sandbox (the `<name>-shell` Pod), where the agent's checkouts live:
 
 ```bash
+# Check a recipe fix rule:
 python3 /opt/defaults/scripts/automation_rules.py <checkout> --fix no-pdb --environment dev
+
+# Check a risk-based rule across risk_level, disruptiveness, and revertability:
+KUBEAGENTS_AUTOMERGE_MAX_RISK=low python3 /opt/defaults/scripts/automation_rules.py <checkout> \
+  --risk low --disruptiveness non_disruptive --revertability easy --environment test
+
+# Deterministically classify an open or merged pull request via the credential broker (read-only):
+python3 /opt/defaults/scripts/vcs_client.py proposal-classify-risk <number> --repo <owner/name> --format summary
 ```
 
-It prints the parsed rules, the reason a file was refused, and the decision for the
-fix and environment given, as JSON. It exits 1 when the file is refused. With the switch `off` it
-reports `switch-off` without reading the file.
+`automation_rules.py` prints the parsed rules, the reason a file was refused, and the decision for
+the fix or risk evaluation and environment given, as JSON. It exits 1 when the file is refused. With
+the switch `off` it reports `switch-off` without reading the file. `vcs_client.py proposal-classify-risk`
+returns the full 4-axis classification (`risk_level`, `blast_radius`, `revertability`,
+`disruptiveness`), `risk_label`, driving `reasons`, and `automerge` eligibility as JSON (default) or
+as a concise multi-line summary (`--format summary`).
 
 The parser is
 [`agents/platform/scripts/automation_rules.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/automation_rules.py),

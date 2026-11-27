@@ -15416,9 +15416,15 @@ def _cluster_read(executor: CommandExecutor, argv: list[str], context: str) -> t
     A refusal or a failure to start is an answer with a non-zero code, so the
     caller reads it as "not read" rather than as an error of its own.
     """
+    exclusions = getattr(executor, "exclusions", None)
+    if exclusions is not None:
+        try:
+            cluster_metadata_scope.check_cluster_reads(argv, exclusions)
+        except scope_exclude.ExcludedCluster as error:
+            return 1, "", str(error)
     try:
         result = executor.execute(argv, kubeconfig_context=context or None)
-    except (ValueError, RuntimeError, OSError) as error:
+    except (ValueError, RuntimeError, OSError, scope_exclude.ExcludedCluster) as error:
         return 1, "", str(error)
     if result.truncated or result.timed_out:
         return 1, "", "the read was cut short"
@@ -15466,6 +15472,8 @@ def build_vcs_broker(
         # describe and a namespaced kubectl get, through the same executor,
         # kubeconfig selection and output cap as a caller's.
         cluster_read=lambda argv, context: _cluster_read(executor, argv, context),
+        cluster_exclusions=getattr(executor, "exclusions", None),
+        auto_label_risk=True,
         on_decision_memory_check=(
             metrics.record_decision_memory_check if metrics is not None else None
         ),

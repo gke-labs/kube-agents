@@ -47,6 +47,7 @@ from ..credentials import (
 from ..validate import (
     MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
+    MAX_STATUS_DESCRIPTION,
     repo_segments,
     validate_branch,
     validate_comment_limit,
@@ -55,7 +56,10 @@ from ..validate import (
     validate_login,
     validate_number,
     validate_page,
+    validate_revision,
     validate_state,
+    validate_status_context,
+    validate_status_state,
     validate_text,
 )
 from . import translate
@@ -182,6 +186,7 @@ class GitHubForge(Forge):
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
     labels = True
+    commit_statuses = True
     search_routes = frozenset({SEARCH_PATH})
     COMMIT_CAP = COMMIT_CAP
 
@@ -1032,3 +1037,24 @@ class GitHubForge(Forge):
             else:
                 node = api("PATCH", f"repos/{repo}/labels/{quoted}", body=body)
         return {"label": translate.label(node)}
+
+    def commit_status_set(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        revision = validate_revision(payload.get("revision"), "revision")
+        state = validate_status_state(payload.get("state"))
+        context = validate_status_context(payload.get("context"))
+        description = validate_text(payload.get("description"), "description", required=False)[
+            :MAX_STATUS_DESCRIPTION
+        ]
+        api(
+            "POST",
+            f"repos/{repo}/statuses/{revision}",
+            body={"state": state, "context": context, "description": description},
+        )
+        return {
+            "status": {
+                "revision": revision,
+                "state": state,
+                "context": context,
+                "description": description,
+            }
+        }

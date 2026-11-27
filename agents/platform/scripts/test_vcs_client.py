@@ -1704,5 +1704,180 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(self.into.exists())
 
 
+class RiskClassificationClientTest(unittest.TestCase):
+    """Tests for `classify_proposal_risk`, `label_proposal_risk`, and the `vcs_client.py` CLI."""
+
+    SAMPLE_CLASSIFICATION = {
+        "repo": "acme/infra",
+        "forge": "local",
+        "number": 17,
+        "sourceRevision": "abcdef0123456789abcdef0123456789abcdef01",
+        "stale_base": False,
+        "schema_version": 2,
+        "risk_level": "low",
+        "risk_label": "risk:low",
+        "blast_radius": "low",
+        "revertability": "easy",
+        "disruptiveness": "non_disruptive",
+        "supported": True,
+        "effective_changes": True,
+        "reasons": [
+            {
+                "code": "REPLICA_SCALE_UP_BOUNDED",
+                "dimension": "blast_radius",
+                "severity": "low",
+                "message": "scales Deployment 'web' replicas 3 -> 4",
+                "file": "clusters/staging-c1/web.yaml",
+                "field_path": "spec.replicas",
+                "resource": {
+                    "group": "apps",
+                    "version": "v1",
+                    "kind": "Deployment",
+                    "namespace": "shop",
+                    "name": "web",
+                },
+            }
+        ],
+        "automerge": {
+            "switch": "on",
+            "dial_allows_automerge": True,
+            "dial_level": "automerge",
+            "install_max_risk": None,
+            "eligible_for_automerge": True,
+            "would_label": "kube-agents:auto-merge",
+            "reason": "allowed by automerge.allow[0] (max_risk=low)",
+        },
+    }
+
+    def test_classify_and_label_helpers_send_expected_payloads(self):
+        seen = []
+
+        def fake_call(verb, payload):
+            seen.append((verb, payload))
+            return dict(self.SAMPLE_CLASSIFICATION)
+
+        with mock.patch.object(vcs_client, "call", fake_call):
+            res1 = vcs_client.classify_proposal_risk(
+                17,
+                "acme/infra",
+                cluster="proj/us-east4/staging-c1",
+                expected_head_sha="a" * 40,
+            )
+            res2 = vcs_client.label_proposal_risk(17, "acme/infra", expected_head_sha="b" * 40)
+
+        self.assertEqual(res1["risk_level"], "low")
+        self.assertEqual(res2["risk_label"], "risk:low")
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "proposal-classify-risk",
+                    {
+                        "number": 17,
+                        "cluster": "proj/us-east4/staging-c1",
+                        "expected_head_sha": "a" * 40,
+                        "repository": "acme/infra",
+                    },
+                ),
+                (
+                    "proposal-risk-label",
+                    {
+                        "number": 17,
+                        "expected_head_sha": "b" * 40,
+                        "repository": "acme/infra",
+                    },
+                ),
+            ],
+        )
+
+    def test_invalid_arguments_raise_vcs_error_before_network(self):
+        with mock.patch.object(vcs_client, "call", side_effect=AssertionError("network called")):
+            for bad_num in (0, -3, True, False, "17", None):
+                with self.subTest(bad_num=bad_num), self.assertRaises(vcs_client.VcsError) as ctx:
+                    vcs_client.classify_proposal_risk(bad_num, "acme/infra")  # type: ignore[arg-type]
+                self.assertEqual(ctx.exception.code, "INVALID_ARGUMENT")
+            with self.assertRaises(vcs_client.VcsError):
+                vcs_client.classify_proposal_risk(17, "acme/infra", cluster="   ")
+            with self.assertRaises(vcs_client.VcsError):
+                vcs_client.label_proposal_risk(17, "acme/infra")
+            with self.assertRaises(vcs_client.VcsError):
+                vcs_client.label_proposal_risk(17, "acme/infra", expected_head_sha="")
+
+    def test_cli_json_and_summary_output_and_error_handling(self):
+        buf = io.StringIO()
+        with mock.patch.object(vcs_client, "call", return_value=dict(self.SAMPLE_CLASSIFICATION)), contextlib.redirect_stdout(buf):
+            rc = vcs_client.main(["proposal-classify-risk", "17", "--repo", "acme/infra", "--format", "summary"])
+        self.assertEqual(rc, 0)
+        summary = buf.getvalue()
+        self.assertIn("Proposal #17 (acme/infra @ abcdef012345)", summary)
+        self.assertIn("risk_level:     low (risk:low)", summary)
+        self.assertIn("blast_radius:   low", summary)
+        self.assertIn("revertability:  easy", summary)
+        self.assertIn("disruptiveness: non_disruptive", summary)
+        self.assertIn("eligible=True (kube-agents:auto-merge)", summary)
+        self.assertIn("REPLICA_SCALE_UP_BOUNDED", summary)
+        self.assertIn("clusters/staging-c1/web.yaml | apps/Deployment shop/web | spec.replicas", summary)
+        self.assertNotIn("{'group':", summary)
+
+        # Also verify `repository` fallback when `repo` key is absent and cluster-scoped core/RBAC resource formatting
+        alt_summary = vcs_client._format_risk_summary({
+            "repository": "acme/fallback-repo",
+            "number": 42,
+            "sourceRevision": "1234567890abcdef",
+            "risk_level": "critical",
+            "risk_label": "risk:critical",
+            "blast_radius": "critical",
+            "revertability": "easy",
+            "disruptiveness": "non_disruptive",
+            "supported": True,
+            "effective_changes": True,
+            "stale_base": False,
+            "labelled": False,
+            "label": None,
+            "reason": "risk level exceeds max_risk",
+            "reasons": [
+                {
+                    "code": "CLUSTER_ADMIN_BINDING",
+                    "severity": "critical",
+                    "message": "binds cluster-admin",
+                    "file": "clusters/prod/rbac.yaml",
+                    "field_path": "roleRef",
+                    "resource": {
+                        "group": "rbac.authorization.k8s.io",
+                        "version": "v1",
+                        "kind": "ClusterRoleBinding",
+                        "namespace": "",
+                        "name": "pwn-admin",
+                    },
+                }
+            ],
+        })
+        self.assertIn("Proposal #42 (acme/fallback-repo @ 1234567890ab)", alt_summary)
+        self.assertIn(
+            "clusters/prod/rbac.yaml | rbac.authorization.k8s.io/ClusterRoleBinding pwn-admin | roleRef",
+            alt_summary,
+        )
+        self.assertNotIn("{'group':", alt_summary)
+
+        json_buf = io.StringIO()
+        with mock.patch.object(vcs_client, "call", return_value=dict(self.SAMPLE_CLASSIFICATION)), contextlib.redirect_stdout(json_buf):
+            rc_json = vcs_client.main(["proposal-classify-risk", "17", "--repo", "acme/infra"])
+        self.assertEqual(rc_json, 0)
+        parsed = json.loads(json_buf.getvalue())
+        self.assertEqual(parsed["risk_level"], "low")
+        self.assertEqual(parsed["disruptiveness"], "non_disruptive")
+
+        err_buf = io.StringIO()
+        with mock.patch.object(
+            vcs_client, "call", side_effect=vcs_client.VcsError("not managed", code="REPOSITORY_NOT_MANAGED")
+        ), contextlib.redirect_stdout(err_buf):
+            rc_err = vcs_client.main(
+                ["proposal-risk-label", "17", "--repo", "acme/other", "--expected-head-sha", "a" * 40]
+            )
+        self.assertEqual(rc_err, 1)
+        err_doc = json.loads(err_buf.getvalue())
+        self.assertEqual(err_doc["code"], "REPOSITORY_NOT_MANAGED")
+
+
 if __name__ == "__main__":
     unittest.main()

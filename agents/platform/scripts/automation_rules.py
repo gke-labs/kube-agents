@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -37,6 +38,19 @@ MAX_FILE_BYTES = 64 * 1024
 # The kinds of fix kube-agents opens today, by the audit check that finds them
 # (`fix_recipes/registry.py`). A rule naming anything else makes the file invalid.
 KNOWN_FIX_TYPES = registry.kinds()
+# Risk levels that `.kube-agents/automation.yaml` may opt into for unattended
+# auto-merge. `high`, `critical`, and `unknown` are never allowed in allow rules.
+ALLOWABLE_RISK_LEVELS = ("low", "medium")
+CONCRETE_RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+INSTALL_MAX_RISK_ENV = "KUBEAGENTS_AUTOMERGE_MAX_RISK"
+# Unearned `max_risk` rules do not go through per-recipe clean-merge proof or
+# post-merge health checks, so only dev/test environments may opt into them.
+UNEARNED_RISK_ENVIRONMENTS = frozenset(
+    {"dev", "development", "test", "testing", "sandbox", "ephemeral", "qa"}
+)
+_NON_DEV_ENV_TOKENS = frozenset(
+    {"prod", "production", "prd", "live", "staging", "stage", "stg", "preprod", "uat", "canary"}
+)
 # What a person calls each of them, for text kube-agents writes; one per known type.
 FIX_TYPE_NAMES = {recipe.kind: recipe.name for recipe in registry.recipes()}
 WILDCARD = "*"
@@ -65,20 +79,98 @@ LOADED = "loaded"
 _FIX_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # A GKE label value: lowercase letters, digits, `_` and `-`, at most 63.
 _ENV_RE = re.compile(r"[a-z0-9_-]{1,63}")
-_TOP_KEYS = frozenset({"version", "automerge"})
+_GLOB_PATH_RE = re.compile(r"[A-Za-z0-9._/*?-]{1,256}")
+_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+_TOP_KEYS = frozenset({"version", "automerge", "environments"})
 _AUTOMERGE_KEYS = frozenset({"allow", "deny"})
-_RULE_KEYS = frozenset({"fix", "environments"})
+_ALLOW_RULE_KEYS = frozenset({"fix", "max_risk", "environments"})
+_DENY_RULE_KEYS = frozenset({"fix", "risk", "environments"})
+_ENV_BINDING_KEYS = frozenset({"paths", "branches"})
+
+
+def is_unearned_risk_environment(env: str) -> bool:
+    """Return True iff `env` is a valid dev/test environment name eligible for `max_risk` allow rules."""
+    if not isinstance(env, str) or not _ENV_RE.fullmatch(env):
+        return False
+    tokens = [tok for tok in re.split(r"[-_]+", env) if tok]
+    if not tokens:
+        return False
+    if any(tok in _NON_DEV_ENV_TOKENS for tok in tokens):
+        return False
+    return any(tok in UNEARNED_RISK_ENVIRONMENTS for tok in tokens)
+
+
+@dataclass(frozen=True)
+class EnvironmentBinding:
+    """Optional repository-declared mapping of path globs and/or target branches to an environment."""
+
+    name: str
+    paths: tuple[str, ...] = ()
+    branches: tuple[str, ...] = ()
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.paths:
+            out["paths"] = list(self.paths)
+        if self.branches:
+            out["branches"] = list(self.branches)
+        return out
 
 
 @dataclass(frozen=True)
 class Rule:
-    fix: str
-    environments: tuple[str, ...]
+    fix: str = ""
+    environments: tuple[str, ...] = ()
+    max_risk: str = ""
+    risk: str = ""
 
     def matches(self, fix_type: str, environment: str) -> bool:
+        if not self.fix:
+            return False
         return self.fix in (WILDCARD, fix_type) and (
             WILDCARD in self.environments or environment in self.environments
         )
+
+    def matches_risk_allow(self, risk_level: str, environment: str) -> bool:
+        if not isinstance(risk_level, str) or not isinstance(environment, str):
+            return False
+        if not self.max_risk or self.fix or self.risk:
+            return False
+        if risk_level not in ALLOWABLE_RISK_LEVELS or self.max_risk not in ALLOWABLE_RISK_LEVELS:
+            return False
+        if environment == WILDCARD or WILDCARD in self.environments:
+            return False
+        if not is_unearned_risk_environment(environment):
+            return False
+        return (
+            CONCRETE_RISK_ORDER[risk_level] <= CONCRETE_RISK_ORDER[self.max_risk]
+            and environment in self.environments
+        )
+
+    def matches_risk_deny(self, risk_level: str, environment: str) -> bool:
+        if not isinstance(environment, str):
+            return False
+        env_match = WILDCARD in self.environments or environment in self.environments
+        if not env_match:
+            return False
+        # Existing `deny: [{fix: "*", environments: [prod]}]` blocks risk-based
+        # auto-merge in that environment too, so existing prod denials stay closed.
+        if self.fix == WILDCARD or self.risk == WILDCARD:
+            return True
+        if isinstance(risk_level, str) and self.risk in CONCRETE_RISK_ORDER and risk_level in CONCRETE_RISK_ORDER:
+            return CONCRETE_RISK_ORDER[risk_level] >= CONCRETE_RISK_ORDER[self.risk]
+        return False
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.fix:
+            out["fix"] = self.fix
+        if self.max_risk:
+            out["max_risk"] = self.max_risk
+        if self.risk:
+            out["risk"] = self.risk
+        out["environments"] = list(self.environments)
+        return out
 
 
 @dataclass(frozen=True)
@@ -88,6 +180,7 @@ class Rules:
     status: str
     allow: tuple[Rule, ...] = ()
     deny: tuple[Rule, ...] = ()
+    environments: tuple[EnvironmentBinding, ...] = ()
     # Why the file was refused (`INVALID`), for the operator's log.
     error: str = ""
     # Rules that parse but can never match, e.g. an unknown fix type.
@@ -151,11 +244,8 @@ def _require_keys(value: Any, where: str, allowed: frozenset, required: frozense
 
 
 def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str]) -> Rule:
-    data = _require_keys(raw, where, _RULE_KEYS, _RULE_KEYS)
-    fix = data["fix"]
-    if not isinstance(fix, str) or not (_FIX_RE.fullmatch(fix) or (wildcard_ok and fix == WILDCARD)):
-        hint = "" if wildcard_ok else " (`*` is allowed only in deny rules)"
-        raise RulesError(f"{where}.fix: expected a fix type such as `no-pdb`{hint}")
+    allowed_keys = _DENY_RULE_KEYS if wildcard_ok else _ALLOW_RULE_KEYS
+    data = _require_keys(raw, where, allowed_keys, frozenset({"environments"}))
     envs = data["environments"]
     if not isinstance(envs, list) or not envs:
         raise RulesError(f"{where}.environments: expected a non-empty list")
@@ -165,13 +255,104 @@ def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str])
             raise RulesError(
                 f"{where}.environments[{index}]: expected an environment label value such as `dev`{hint}"
             )
-    # Refused, not warned: a misspelt deny rule kept but never matching would
-    # leave the allow rules beside it in force. A file written for a newer
-    # kube-agents is refused by an older one, and a refused file allows nothing.
-    if fix != WILDCARD and fix not in KNOWN_FIX_TYPES:
-        known = ", ".join(f"`{name}`" for name in sorted(KNOWN_FIX_TYPES))
-        raise RulesError(f"{where}.fix: `{fix}` is not a fix kube-agents opens (known: {known})")
-    return Rule(fix=fix, environments=tuple(envs))
+
+    has_fix = "fix" in data
+    has_max_risk = "max_risk" in data
+    has_risk = "risk" in data
+    selectors = int(has_fix) + int(has_max_risk) + int(has_risk)
+    if selectors == 0:
+        expected_key = "`fix` or `risk`" if wildcard_ok else "`fix` or `max_risk`"
+        raise RulesError(f"{where}: missing {expected_key}")
+    if selectors > 1:
+        raise RulesError(f"{where}: specify only one of `fix` or risk selector, not both")
+
+    if has_fix:
+        fix = data["fix"]
+        if not isinstance(fix, str) or not (_FIX_RE.fullmatch(fix) or (wildcard_ok and fix == WILDCARD)):
+            hint = "" if wildcard_ok else " (`*` is allowed only in deny rules)"
+            raise RulesError(f"{where}.fix: expected a fix type such as `no-pdb`{hint}")
+        # Refused, not warned: a misspelt deny rule kept but never matching would
+        # leave the allow rules beside it in force. A file written for a newer
+        # kube-agents is refused by an older one, and a refused file allows nothing.
+        if fix != WILDCARD and fix not in KNOWN_FIX_TYPES:
+            known = ", ".join(f"`{name}`" for name in sorted(KNOWN_FIX_TYPES))
+            raise RulesError(f"{where}.fix: `{fix}` is not a fix kube-agents opens (known: {known})")
+        return Rule(fix=fix, environments=tuple(envs))
+
+    if has_max_risk:
+        max_risk = data["max_risk"]
+        if not isinstance(max_risk, str) or max_risk not in ALLOWABLE_RISK_LEVELS:
+            allowed_str = ", ".join(f"`{r}`" for r in ALLOWABLE_RISK_LEVELS)
+            raise RulesError(f"{where}.max_risk: expected one of {allowed_str} (`high`, `critical`, `unknown`, and `*` cannot be allowed)")
+        for index, env in enumerate(envs):
+            if not is_unearned_risk_environment(env):
+                raise RulesError(
+                    f"{where}.environments[{index}]: `max_risk` is restricted to dev/test environments "
+                    f"(such as `dev`, `test`, `qa`, `sandbox`), not `{env}`"
+                )
+        return Rule(max_risk=max_risk, environments=tuple(envs))
+
+    risk = data["risk"]
+    deny_risk_levels = tuple(CONCRETE_RISK_ORDER)
+    valid_deny_risks = set(deny_risk_levels) | {WILDCARD}
+    if not isinstance(risk, str) or risk not in valid_deny_risks:
+        allowed_str = ", ".join(f"`{r}`" for r in (*deny_risk_levels, WILDCARD))
+        raise RulesError(f"{where}.risk: expected one of {allowed_str}")
+    return Rule(risk=risk, environments=tuple(envs))
+
+
+def _parse_environments(raw: Any) -> tuple[EnvironmentBinding, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise RulesError("environments: expected a mapping")
+    bindings: list[EnvironmentBinding] = []
+    for env_name, spec in raw.items():
+        if not isinstance(env_name, str) or not _ENV_RE.fullmatch(env_name):
+            raise RulesError(f"environments.{env_name}: expected an environment label value such as `dev`")
+        where = f"environments.{env_name}"
+        entry = _require_keys(spec, where, _ENV_BINDING_KEYS)
+        if not entry:
+            raise RulesError(f"{where}: specify `paths` and/or `branches`")
+        paths: list[str] = []
+        if "paths" in entry:
+            raw_paths = entry["paths"]
+            if not isinstance(raw_paths, list) or not raw_paths:
+                raise RulesError(f"{where}.paths: expected a non-empty list")
+            for idx, pat in enumerate(raw_paths):
+                if (
+                    not isinstance(pat, str)
+                    or not pat.strip()
+                    or pat != pat.strip()
+                    or pat.startswith("/")
+                    or pat.endswith("/")
+                    or "\\" in pat
+                    or "//" in pat
+                    or not _GLOB_PATH_RE.fullmatch(pat)
+                    or any(seg in ("", ".", "..") for seg in pat.split("/"))
+                ):
+                    raise RulesError(
+                        f"{where}.paths[{idx}]: expected a clean relative path glob such as `envs/dev/**`"
+                    )
+                paths.append(pat)
+        branches: list[str] = []
+        if "branches" in entry:
+            raw_branches = entry["branches"]
+            if not isinstance(raw_branches, list) or not raw_branches:
+                raise RulesError(f"{where}.branches: expected a non-empty list")
+            for idx, br in enumerate(raw_branches):
+                if (
+                    not isinstance(br, str)
+                    or not _BRANCH_RE.fullmatch(br)
+                    or ".." in br
+                    or "@{" in br
+                    or br.endswith(".lock")
+                    or br == "HEAD"
+                ):
+                    raise RulesError(f"{where}.branches[{idx}]: expected a valid git branch name")
+                branches.append(br)
+        bindings.append(EnvironmentBinding(name=env_name, paths=tuple(paths), branches=tuple(branches)))
+    return tuple(bindings)
 
 
 def parse(text: str) -> Rules:
@@ -200,9 +381,10 @@ def parse(text: str) -> Rules:
         version = top["version"]
         if type(version) is not int or version != SCHEMA_VERSION:
             raise RulesError(f"version: expected {SCHEMA_VERSION}")
+        env_bindings = _parse_environments(top.get("environments"))
         automerge = top.get("automerge")
         if automerge is None:
-            return Rules(status=LOADED)
+            return Rules(status=LOADED, environments=env_bindings)
         section = _require_keys(automerge, "automerge", _AUTOMERGE_KEYS)
         parsed: dict[str, tuple[Rule, ...]] = {}
         for key in ("allow", "deny"):
@@ -221,7 +403,13 @@ def parse(text: str) -> Rules:
         # A key too large to print (a YAML 1.1 base-60 integer past Python's
         # 4300-digit str limit) fails while the error message is built.
         return Rules(status=INVALID, error=f"not a rules file ({exc})")
-    return Rules(status=LOADED, allow=parsed["allow"], deny=parsed["deny"], warnings=tuple(warnings))
+    return Rules(
+        status=LOADED,
+        allow=parsed["allow"],
+        deny=parsed["deny"],
+        environments=env_bindings,
+        warnings=tuple(warnings),
+    )
 
 
 def _symlinked_component(tree: Path, relative: str) -> str | None:
@@ -270,6 +458,68 @@ def read_rules(tree: Path, *, automerge: str | None = None) -> Rules:
     return load(tree)
 
 
+def _segment_matches_glob(seg: str, pat: str) -> bool:
+    rx = "^" + "".join("[^/]*" if ch == "*" else ("[^/]" if ch == "?" else re.escape(ch)) for ch in pat) + "$"
+    return bool(re.match(rx, seg))
+
+
+def _path_matches_glob(rel_path: str, pattern: str) -> bool:
+    if not isinstance(rel_path, str) or not rel_path or rel_path.startswith("/") or "\\" in rel_path:
+        return False
+    p_parts = tuple(p for p in rel_path.split("/") if p)
+    g_parts = tuple(g for g in pattern.split("/") if g)
+    if not p_parts or not g_parts or any(seg in (".", "..") for seg in p_parts):
+        return False
+    memo: dict[tuple[int, int], bool] = {}
+
+    def _match(pi: int, gi: int) -> bool:
+        if (pi, gi) in memo:
+            return memo[(pi, gi)]
+        if gi == len(g_parts):
+            ans = pi == len(p_parts)
+        elif g_parts[gi] == "**":
+            if gi == len(g_parts) - 1:
+                ans = pi < len(p_parts)
+            else:
+                ans = _match(pi, gi + 1) or (pi < len(p_parts) and _match(pi + 1, gi))
+        else:
+            ans = pi < len(p_parts) and _segment_matches_glob(p_parts[pi], g_parts[gi]) and _match(pi + 1, gi + 1)
+        memo[(pi, gi)] = ans
+        return ans
+
+    return _match(0, 0)
+
+
+def resolve_declared_environment(
+    rules: Rules,
+    changed_paths: Sequence[str],
+    target_branch: str,
+) -> tuple[str, str]:
+    """Resolve an environment from `rules.environments` path/branch bindings.
+
+    Returns `(environment, error_reason)`. Fails closed if zero or multiple
+    declared environments match all `changed_paths` and `target_branch`.
+    """
+    if rules.status != LOADED or not rules.environments:
+        return UNKNOWN_ENVIRONMENT, ""
+    if not changed_paths:
+        return UNKNOWN_ENVIRONMENT, "no changed files to bind to an environment"
+    matched: list[str] = []
+    for binding in rules.environments:
+        if binding.branches and target_branch not in binding.branches:
+            continue
+        if binding.paths and not all(
+            any(_path_matches_glob(path, pat) for pat in binding.paths) for path in changed_paths
+        ):
+            continue
+        matched.append(binding.name)
+    if len(matched) == 1:
+        return matched[0], ""
+    if len(matched) > 1:
+        return UNKNOWN_ENVIRONMENT, "changed files match multiple declared environments"
+    return UNKNOWN_ENVIRONMENT, "changed files do not match any declared environment"
+
+
 def cluster_environment(labels: Mapping[str, Any] | None) -> str:
     """The environment a cluster's resource labels declare, or `UNKNOWN_ENVIRONMENT`.
 
@@ -303,6 +553,104 @@ def decide(rules: Rules, fix_type: str, environment: str) -> Decision:
         if rule.fix in KNOWN_FIX_TYPES and rule.matches(fix_type, environment):
             return Decision(True, f"allowed by automerge.allow[{index}]")
     return Decision(False, f"no allow rule names {fix_type} in {environment}")
+
+
+def has_risk_allow_rules(rules: Rules) -> bool:
+    """Return True if a loaded rules file contains at least one `max_risk` allow rule."""
+    return rules.status == LOADED and any(bool(r.max_risk) for r in rules.allow)
+
+
+def install_max_risk_ceiling(raw_override: str | None = None) -> str:
+    """Return the install-level risk ceiling from `KUBEAGENTS_AUTOMERGE_MAX_RISK`.
+
+    Autonomy stays off by default: an unset or empty variable returns `"off"` so
+    an install already running `KUBEAGENTS_AUTOMERGE=on` for `no-pdb` never
+    implicitly activates risk-tier auto-merge on upgrade without explicit admin
+    opt-in (`"low"` or `"medium"`).
+    """
+    raw = os.environ.get(INSTALL_MAX_RISK_ENV, "") if raw_override is None else raw_override
+    clean = raw.strip().lower()
+    if clean in ALLOWABLE_RISK_LEVELS:
+        return clean
+    return "off"
+
+
+def decide_risk(
+    rules: Rules,
+    risk_level: str,
+    environment: str,
+    *,
+    disruptiveness: str = "non_disruptive",
+    revertability: str = "easy",
+    effective_changes: bool = True,
+    supported: bool = True,
+    install_max_risk: str | None = None,
+    classification: Mapping[str, Any] | None = None,
+) -> Decision:
+    """Whether rules + safety gates allow a PR at `risk_level` in `environment` to auto-merge.
+
+    When `classification` is provided (from live broker/git classification), all 4 axes plus
+    `supported` and `effective_changes` are read directly from it with fail-closed defaults so
+    an untrusted `risk:*` label or partial payload can never authorize auto-merge.
+    """
+    if classification is not None:
+        if not isinstance(classification, Mapping):
+            return Decision(False, "invalid classification payload; nothing merges unattended")
+        raw_level = classification.get("risk_level")
+        risk_level = raw_level if isinstance(raw_level, str) and raw_level else "unknown"
+        raw_disrupt = classification.get("disruptiveness")
+        disruptiveness = raw_disrupt if isinstance(raw_disrupt, str) and raw_disrupt else "unknown"
+        raw_revert = classification.get("revertability")
+        revertability = raw_revert if isinstance(raw_revert, str) and raw_revert else "unknown"
+        effective_changes = classification.get("effective_changes") is True
+        supported = classification.get("supported") is True
+
+    if rules.status == SWITCH_OFF:
+        return Decision(False, "KUBEAGENTS_AUTOMERGE is off; the rules file was not read")
+    if rules.status == ABSENT:
+        return Decision(False, f"no {RULES_FILE}; nothing merges unattended")
+    if rules.status != LOADED:
+        return Decision(False, f"{RULES_FILE} refused ({rules.error}); nothing merges unattended")
+    if supported is not True:
+        return Decision(False, "unsupported changes are never eligible for unattended auto-merge")
+    if not isinstance(risk_level, str) or risk_level not in ALLOWABLE_RISK_LEVELS:
+        return Decision(False, f"risk level `{risk_level}` is never eligible for unattended auto-merge")
+    if disruptiveness != "non_disruptive":
+        return Decision(
+            False,
+            f"changes with disruptiveness `{disruptiveness}` are not eligible for auto-merge (requires `non_disruptive`)",
+        )
+    if revertability != "easy":
+        return Decision(
+            False,
+            f"changes with revertability `{revertability}` are not eligible for auto-merge (requires `easy`)",
+        )
+    if effective_changes is not True:
+        return Decision(False, "no effective runtime changes to auto-merge")
+    if install_max_risk is not None:
+        if install_max_risk == "off" or install_max_risk not in ALLOWABLE_RISK_LEVELS:
+            return Decision(False, f"{INSTALL_MAX_RISK_ENV} disables risk-based auto-merge")
+        if CONCRETE_RISK_ORDER[risk_level] > CONCRETE_RISK_ORDER[install_max_risk]:
+            return Decision(
+                False,
+                f"risk level `{risk_level}` exceeds install ceiling {INSTALL_MAX_RISK_ENV}={install_max_risk}",
+            )
+    if not isinstance(environment, str) or not environment:
+        return Decision(False, "the cluster declares no environment label")
+    if not _ENV_RE.fullmatch(environment):
+        return Decision(False, f"invalid cluster environment label `{environment}`")
+    if not is_unearned_risk_environment(environment):
+        return Decision(
+            False,
+            f"risk-based auto-merge (`max_risk`) is restricted to dev/test environments, not `{environment}`",
+        )
+    for index, rule in enumerate(rules.deny):
+        if rule.matches_risk_deny(risk_level, environment):
+            return Decision(False, f"denied by automerge.deny[{index}]")
+    for index, rule in enumerate(rules.allow):
+        if rule.matches_risk_allow(risk_level, environment):
+            return Decision(True, f"allowed by automerge.allow[{index}] (max_risk={rule.max_risk})")
+    return Decision(False, f"no allow rule permits risk `{risk_level}` in {environment}")
 
 
 def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str:
@@ -405,7 +753,7 @@ def _with_rule(text: str, section: str, fix_type: str, environment: str, note: s
         expected = (before.allow + (added,), before.deny)
     else:
         expected = (before.allow, before.deny + (added,))
-    if edited.status != LOADED or (edited.allow, edited.deny) != expected:
+    if edited.status != LOADED or (edited.allow, edited.deny) != expected or edited.environments != before.environments:
         raise RulesError(f"could not add {what} rule to this layout of {RULES_FILE}")
     if section == "allow" and not decide(edited, fix_type, environment).allowed:
         # A deny already covers it, so the edit would allow nothing.
@@ -438,21 +786,51 @@ def _insert_after_line(text: str, index: int, lines: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=f"Check a GitOps checkout's {RULES_FILE}.")
     parser.add_argument("tree", type=Path, help="the checkout's root")
-    parser.add_argument("--fix", default="", help="also decide for this fix type")
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--fix", default="", help="also decide for this fix type")
+    selector.add_argument(
+        "--risk",
+        default="",
+        help="also decide for this PR risk level (low, medium, high, critical, unknown)",
+    )
+    parser.add_argument(
+        "--disruptiveness",
+        default="non_disruptive",
+        choices=("non_disruptive", "disruptive", "destructive", "unknown"),
+        help="PR disruptiveness axis when evaluating --risk (default: non_disruptive)",
+    )
+    parser.add_argument(
+        "--revertability",
+        default="easy",
+        choices=("easy", "moderate", "difficult", "irreversible", "unknown"),
+        help="PR revertability axis when evaluating --risk (default: easy)",
+    )
     parser.add_argument("--environment", default="", help="and this environment")
     args = parser.parse_args(argv)
     rules = read_rules(args.tree)
     out: dict[str, Any] = {
         "status": rules.status,
-        "allow": [vars(r) | {"environments": list(r.environments)} for r in rules.allow],
-        "deny": [vars(r) | {"environments": list(r.environments)} for r in rules.deny],
+        "allow": [r.to_summary_dict() for r in rules.allow],
+        "deny": [r.to_summary_dict() for r in rules.deny],
     }
+    if rules.environments:
+        out["environments"] = {b.name: b.to_summary_dict() for b in rules.environments}
     if rules.error:
         out["error"] = rules.error
     if rules.warnings:
         out["warnings"] = list(rules.warnings)
     if args.fix:
         decision = decide(rules, args.fix, args.environment)
+        out["decision"] = {"allowed": decision.allowed, "reason": decision.reason}
+    elif args.risk:
+        decision = decide_risk(
+            rules,
+            args.risk,
+            args.environment,
+            disruptiveness=args.disruptiveness,
+            revertability=args.revertability,
+            install_max_risk=install_max_risk_ceiling(),
+        )
         out["decision"] = {"allowed": decision.allowed, "reason": decision.reason}
     print(json.dumps(out, indent=2))
     return 1 if rules.status == INVALID else 0

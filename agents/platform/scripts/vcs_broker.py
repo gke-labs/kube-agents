@@ -82,6 +82,8 @@ import automation_rules
 import automerge_edit
 import automerge_eligibility
 import okf_guard
+import risk_classifier
+import scope_exclude
 from fix_recipes import registry as fix_recipes_registry
 from providers import (
     CliTransport,
@@ -280,7 +282,7 @@ PATHSPEC_NO_MATCH = "did not match any files"
 # `export-ignore` is unset too: it leaves files out of the tar with no sign,
 # and a caller would read a partial tree as the whole one.
 SNAPSHOT_ATTRIBUTES_FILE = Path("info") / "attributes"
-SNAPSHOT_ATTRIBUTES = "* -export-subst -export-ignore -ident -text -working-tree-encoding\n"
+SNAPSHOT_ATTRIBUTES = "* -export-subst -export-ignore -ident -text -working-tree-encoding -filter\n"
 # What `git ls-tree` prints for each entry of the revision `snapshot` measures:
 # the mode, the size (`-` for a tree or a submodule) and the path, NUL-ended.
 SNAPSHOT_LISTING_FORMAT = "--format=%(objectmode) %(objectsize) %(path)"
@@ -491,6 +493,7 @@ def _age_seconds(created: Any, now: datetime) -> float | None:
 
 # A GKE cluster as the fleet audit names it, `<project>/<location>/<name>`,
 # each part as GKE allows it, so none can reach gcloud as a flag.
+_GKE_CLUSTER_SHORT_NAME = re.compile(r"[a-z](?:[-a-z0-9]{0,38}[a-z0-9])?")
 _GKE_CLUSTER = re.compile(r"([a-z][a-z0-9-]{4,28}[a-z0-9])/([a-z]+-[a-z]+[0-9]+(?:-[a-z0-9]+)?)/([a-z](?:[-a-z0-9]{0,38}[a-z0-9])?)")
 _KUBERNETES_NAME = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
 
@@ -504,6 +507,106 @@ def _reserved_labels_on(proposal: Mapping[str, Any]) -> list[str]:
     """The reserved auto-merge labels a proposal carries, in their own spelling."""
     names = {str(label).casefold() for label in proposal.get("labels") or []}
     return [label for label in automerge_eligibility.RESERVED_LABELS if label.casefold() in names]
+
+
+def _risk_labels_on(proposal: Mapping[str, Any]) -> list[str]:
+    """All `risk:*` labels a proposal carries, preserving exact forge spellings."""
+    found: list[str] = []
+    for raw in proposal.get("labels") or []:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip()
+        if name.casefold().startswith(risk_classifier.RISK_LABEL_PREFIX) and name not in found:
+            found.append(name)
+    return found
+
+
+def _extract_expected_head_sha(payload: Mapping[str, Any]) -> str:
+    """Validate optional `expected_head_sha` / `expectedRevision` pinned by caller."""
+    raw = payload.get("expected_head_sha")
+    if raw is None:
+        raw = payload.get("expectedRevision")
+    if raw is None or raw == "":
+        return ""
+    return validate_revision(raw, "expected_head_sha")
+
+
+_MAX_SUMMARY_REASONS = 10
+_MAX_STATUS_DESC_LEN = 140
+_MAX_STATUS_REASON_CODES = 4
+_RISK_SHALLOW_FETCH_DEPTH = 64
+_RISK_DEEPEN_STEP = 192
+_MAX_PUBLISH_RISK_PROPOSALS = 3
+_PUBLISH_SYNC_DELAYS: tuple[float, ...] = (0.5, 1.0)
+_GKE_PROJECT_ID_RE = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
+_PACKAGING_UNSUPPORTED_CODES: frozenset[str] = frozenset(
+    {
+        "UNRENDERED_PACKAGE_OR_OVERLAY",
+        "UNRENDERED_TEMPLATE",
+        "KUSTOMIZE_OVERLAY",
+        "TERRAFORM_OR_HCL_CHANGE",
+    }
+)
+RISK_VERDICT_STATUS_CONTEXT = "kube-agents/risk"
+RISK_AUTOMERGE_STATUS_CONTEXT = "kube-agents/auto-merge"
+
+
+def _is_packaging_unsupported(verdict: risk_classifier.ClassificationResult) -> bool:
+    """Return True when `unknown` comes solely from unrendered packaging, overlay, or IaC files."""
+    return (
+        verdict.risk_level == risk_classifier.RISK_UNKNOWN
+        and not verdict.supported
+        and bool(verdict.reasons)
+        and all(r.code in _PACKAGING_UNSUPPORTED_CODES for r in verdict.reasons)
+    )
+
+
+def _format_risk_status_description(
+    verdict: risk_classifier.ClassificationResult,
+    base_rev: str,
+    *,
+    prefix: str = "",
+) -> str:
+    """Format a commit-status description citing risk axes, base revision, and reason codes."""
+    codes: list[str] = []
+    for item in verdict.reasons:
+        if item.code and item.code not in codes:
+            codes.append(item.code)
+        if len(codes) >= _MAX_STATUS_REASON_CODES:
+            break
+    base_short = base_rev[:12] if base_rev else "unknown"
+    code_part = f" [{','.join(codes)}]" if codes else ""
+    level_part = "unsupported" if _is_packaging_unsupported(verdict) else f"risk:{verdict.risk_level}"
+    text = (
+        f"{prefix}{level_part} ({verdict.disruptiveness}, {verdict.revertability}) "
+        f"base:{base_short}{code_part}"
+    )
+    return text[:_MAX_STATUS_DESC_LEN]
+
+
+def _risk_summary_payload(risk_res: Mapping[str, Any]) -> dict[str, Any]:
+    """Concise 4-axis risk classification and auto-merge summary for write responses."""
+    reasons = risk_res.get("reasons")
+    if not isinstance(reasons, list):
+        cls_dict = risk_res.get("classification")
+        reasons = cls_dict.get("reasons") if isinstance(cls_dict, Mapping) else []
+    top_reasons = list(reasons[:_MAX_SUMMARY_REASONS]) if isinstance(reasons, list) else []
+    return {
+        "number": risk_res.get("number"),
+        "sourceRevision": risk_res.get("sourceRevision", ""),
+        "stale_base": bool(risk_res.get("stale_base", False)),
+        "risk_level": risk_res.get("risk_level"),
+        "risk_label": risk_res.get("risk_label"),
+        "blast_radius": risk_res.get("blast_radius"),
+        "revertability": risk_res.get("revertability"),
+        "disruptiveness": risk_res.get("disruptiveness"),
+        "supported": bool(risk_res.get("supported", False)),
+        "effective_changes": bool(risk_res.get("effective_changes", False)),
+        "labelled": bool(risk_res.get("labelled", False)),
+        "label": risk_res.get("label"),
+        "reason": risk_res.get("reason", ""),
+        "reasons": top_reasons,
+    }
 
 
 def _automerge_switch() -> str:
@@ -903,13 +1006,19 @@ class VcsBroker:
         repository_role: Callable[[Forge, str], str] | None = None,
         bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
         cluster_read: Callable[[list[str], str], tuple[int, str, str]] | None = None,
+        cluster_exclusions: scope_exclude.Exclusions | None = None,
         automerge_switch: Callable[[], str] | None = None,
+        auto_label_risk: bool = False,
         on_decision_memory_check: Callable[[str], None] | None = None,
         allowed_commit_emails: Callable[[str, str], frozenset[str]] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         self.on_decision_memory_check = on_decision_memory_check
         self._allowed_commit_emails = allowed_commit_emails
+        self._auto_label_risk = bool(auto_label_risk)
+        self._cluster_exclusions = (
+            cluster_exclusions if cluster_exclusions is not None else scope_exclude.Exclusions()
+        )
         # `(argv, kubeconfig context) -> (exit code, stdout, stderr)`: a gcloud
         # or kubectl read the broker runs on its own behalf, through the same
         # executor and cluster selection a caller's read takes. Only
@@ -1959,15 +2068,31 @@ class VcsBroker:
                 policy_base_rev,
                 tip,
             )
+            # Strip carried risk:* and auto-merge labels BEFORE pushing so a
+            # synchronize pipeline triggered by the push never sees stale labels
+            # on the new, unjudged head commit.
+            open_numbers = (
+                self._drop_practice_label(bound, branch) if (existing_head or advance) else []
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
-        if existing_head:
-            self._drop_practice_label(bound, branch)
+        risk_summaries: list[dict[str, Any]] = []
+        if self._auto_label_risk and open_numbers:
+            for num in open_numbers[:_MAX_PUBLISH_RISK_PROPOSALS]:
+                r_res = self._best_effort_risk_label(
+                    bound, payload, num, expected_head_sha=tip
+                )
+                if isinstance(r_res, dict):
+                    risk_summaries.append(_risk_summary_payload(r_res))
         result: dict[str, Any] = {"branch": branch, "revision": tip}
         if dm_markdown:
             result["decisionMemoryMarkdown"] = dm_markdown
+        if risk_summaries:
+            result["risk"] = risk_summaries[0]
+            if len(risk_summaries) > 1:
+                result["proposals_risk"] = risk_summaries
         return bound.stamp(result)
 
     def _require_install_commit_identities(
@@ -3075,7 +3200,23 @@ class VcsBroker:
 
     def proposal_create(self, payload):
         self._refuse_decision_override_labels(payload)
-        return self._forge_verb("proposal-create", payload, pinned_target=True)
+        created = self._forge_verb("proposal-create", payload, pinned_target=True)
+        if self._auto_label_risk and isinstance(created, dict):
+            prop = created.get("proposal")
+            num = prop.get("number") if isinstance(prop, dict) else None
+            if type(num) is int and num > 0:
+                bound = self._bind(payload)
+                raw_sha = str(prop.get("sourceRevision") or "")
+                expected_sha = raw_sha if _OBJECT_ID.fullmatch(raw_sha) else ""
+                if expected_sha:
+                    risk_res = self._best_effort_risk_label(
+                        bound, payload, num, expected_head_sha=expected_sha
+                    )
+                    if isinstance(risk_res, dict):
+                        created["risk"] = _risk_summary_payload(risk_res)
+                        if isinstance(risk_res.get("applied_labels"), list):
+                            prop["labels"] = list(risk_res["applied_labels"])
+        return created
 
     def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
         """`{url, number, title}` when the forge says this install just opened the proposal.
@@ -3157,10 +3298,40 @@ class VcsBroker:
         # `proposal-create`, and the rule stays true the day an adapter learns
         # to retarget.
         self._refuse_decision_override_labels(payload)
-        return self._forge_verb(
+        updated = self._forge_verb(
             "proposal-update", payload,
             pinned_target=payload.get("target") is not None,
         )
+        if payload.get("target") is not None and isinstance(updated, dict):
+            prop = updated.get("proposal")
+            num = prop.get("number") if isinstance(prop, dict) else None
+            if type(num) is int and num > 0:
+                bound = self._bind(payload)
+                if self._auto_label_risk:
+                    raw_sha = str(prop.get("sourceRevision") or "")
+                    expected_sha = raw_sha if _OBJECT_ID.fullmatch(raw_sha) else ""
+                    risk_res = (
+                        self._best_effort_risk_label(
+                            bound, payload, num, expected_head_sha=expected_sha
+                        )
+                        if expected_sha
+                        else None
+                    )
+                    if isinstance(risk_res, dict):
+                        updated["risk"] = _risk_summary_payload(risk_res)
+                        if isinstance(risk_res.get("applied_labels"), list):
+                            prop["labels"] = list(risk_res["applied_labels"])
+                elif getattr(bound.forge, "labels", False) and not bound.forge.text_sets_labels:
+                    carried = _reserved_labels_on(prop) + _risk_labels_on(prop)
+                    if carried and prop.get("state") == OPEN_PROPOSAL_STATE:
+                        try:
+                            bound.forge.proposal_update(
+                                bound.api, bound.repo, {"number": num, "labelsRemove": carried}
+                            )
+                            prop["labels"] = [lbl for lbl in (prop.get("labels") or []) if lbl not in carried]
+                        except Exception as exc:  # noqa: BLE001
+                            LOGGER.warning("proposal_update label strip failed repo=%s number=%s: %s", bound.repo, num, exc)
+        return updated
 
     def proposal_close(self, payload):
         return self._forge_verb("proposal-close", payload)
@@ -3265,7 +3436,9 @@ class VcsBroker:
         view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": on}) or {}
         proposal = view.get("proposal") or {}
         checks: list[dict] = []
+        risk_verdict: risk_classifier.ClassificationResult | None = None
         if on:
+            viewer = ""
             try:
                 viewer = self._viewer(bound)
                 reason = self._practice_refusal(bound, payload, viewer, proposal, view.get("diff"), checks)
@@ -3273,6 +3446,30 @@ class VcsBroker:
                 LOGGER.warning("practice label: a read failed repo=%s number=%s type=%s: %s",
                                bound.repo, number, type(exc).__name__, str(exc)[:400])
                 reason, checks = "a read the judgement needs failed", []
+            # If the PR is NOT a known recipe fix (add-manifest or edit-manifest),
+            # check whether `.kube-agents/automation.yaml` defines `max_risk` rules
+            # that qualify it, so periodic `fleet-audit` sweeps never strip valid
+            # risk-based auto-merge labels. Any registered recipe fix is NEVER overridden here.
+            is_recipe_pr = (
+                (reason is not None and " is the " in reason and " recipe's," in reason)
+                or self._is_recognized_recipe_proposal(bound, payload, proposal, view.get("diff"))
+            )
+            if (
+                reason is not None
+                and not is_recipe_pr
+                and getattr(bound.forge, "labels", False)
+                and not bound.forge.text_sets_labels
+                and proposal.get("state") == OPEN_PROPOSAL_STATE
+                and viewer
+                and _login_key(str(proposal.get("author") or "")) == _login_key(viewer)
+            ):
+                qualifies, risk_reason, risk_verdict = self._practice_risk_qualifies(
+                    bound, payload, number, proposal, switch
+                )
+                if qualifies:
+                    reason = None
+                elif risk_verdict is not None and risk_reason:
+                    reason = risk_reason
         else:
             # Off reads no cluster and no rules; it only takes back a label an
             # earlier `practice` or `on` left.
@@ -3316,7 +3513,7 @@ class VcsBroker:
             after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
         # A label this call just added was never earned by a head that moved,
         # so it comes off whatever the state; an older one stays on a merge.
-        if stale and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
+        if stale and getattr(bound.forge, "labels", False) and (added or (after or {}).get("state") == OPEN_PROPOSAL_STATE):
             bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
         LOGGER.info(
             "practice label repo=%s number=%s switch=%s labelled=%s reason=%s checks=%s",
@@ -3326,15 +3523,21 @@ class VcsBroker:
         # The caller learns which checks passed, not what the cluster read
         # said: the details name workloads and budgets on whatever cluster the
         # budget named, and stay in this log.
-        return bound.stamp(
-            {
-                "labelled": reason is None,
-                "label": want,
-                "switch": switch,
-                "reason": reason or "eligible",
-                "checks": [{"name": c["name"], "passed": c["passed"]} for c in checks],
-            }
-        )
+        out_practice: dict[str, Any] = {
+            "labelled": reason is None,
+            "label": want,
+            "switch": switch,
+            "reason": reason or "eligible",
+            "checks": [{"name": c["name"], "passed": c["passed"]} for c in checks],
+        }
+        if risk_verdict is not None:
+            out_practice["risk_level"] = risk_verdict.risk_level
+            out_practice["risk_label"] = risk_verdict.risk_label
+            out_practice["blast_radius"] = risk_verdict.blast_radius
+            out_practice["revertability"] = risk_verdict.revertability
+            out_practice["disruptiveness"] = risk_verdict.disruptiveness
+            out_practice["reasons"] = [r.to_dict() for r in risk_verdict.reasons[:_MAX_SUMMARY_REASONS]]
+        return bound.stamp(out_practice)
 
     def _practice_refusal(
         self,
@@ -3481,6 +3684,46 @@ class VcsBroker:
         LOGGER.info("practice label: edit verified kind=%s path=%s changes=%s", edit.kind, path, edit.changes)
         return f"the edit is the {edit.kind} recipe's, but edited manifests are not labelled yet"
 
+    def _is_recognized_recipe_proposal(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        proposal: dict[str, Any],
+        diff: Any,
+    ) -> bool:
+        """Return True if `diff` matches any registered `add-manifest` or `edit-manifest` fix recipe."""
+        if not isinstance(diff, str) or not diff:
+            return False
+        for recipe in fix_recipes_registry.recipes():
+            if recipe.verify == "add-manifest":
+                if automerge_eligibility.verify_added_manifest(recipe.kind, diff, check_path=False) is not None:
+                    return True
+        edit_recipes = [r for r in fix_recipes_registry.recipes() if r.verify == "edit-manifest"]
+        mod = automerge_edit.modified_file_from_diff(diff) if edit_recipes else None
+        if mod is None:
+            return False
+        path = mod[0]
+        base = self._practice_base(bound)
+        if not base:
+            return False
+        text, _, _ = self._base_file(payload, base, path)
+        if text is None:
+            return False
+        source, revision = str(proposal.get("source") or ""), str(proposal.get("sourceRevision") or "")
+        if not source or not revision:
+            return False
+        head, _, read_at = self._base_file(payload, source, path)
+        if head is None or read_at != revision:
+            return False
+        for recipe in edit_recipes:
+            try:
+                fix = fix_recipes_registry.generator(recipe.kind)
+                automerge_edit.verify_edited_manifest(recipe, fix, diff, path, text, head)
+                return True
+            except (automerge_edit.EditRefused, fix_recipes_registry.RecipeError):
+                continue
+        return False
+
     def _base_file(self, payload: dict[str, Any], ref: str, path: str) -> tuple[str | None, str, str]:
         """`(text, "", revision)` for `path` on `ref`, or `(None, why, "")`: one
         regular, non-executable file of at most `automerge_edit.MAX_FILE_BYTES`
@@ -3519,23 +3762,1337 @@ class VcsBroker:
         finally:
             self._discard_scratch(root)
 
-    def _drop_practice_label(self, bound: Binding, branch: str) -> None:
-        """Take the reserved label off any open proposal from `branch`, after
-        a push to it: the broker judged the diff before the push, not this one.
-        Logged and left on a forge that cannot be asked, rather than failing a
-        publish that has already landed."""
-        if not getattr(bound.forge, "labels", False):
-            return
+    def _drop_practice_label(self, bound: Binding, branch: str) -> list[int]:
+        """Take reserved auto-merge and risk labels off any open proposal from
+        `branch`, after a push to it: the broker judged the diff before the
+        push, not this one. Returns the open proposal numbers found. Logged and
+        left on a forge that cannot be asked, rather than failing a publish
+        that has already landed."""
+        has_labels = bool(getattr(bound.forge, "labels", False))
+        can_strip_labels = has_labels and not bound.forge.text_sets_labels
+        wants_open_for_status = (
+            self._auto_label_risk
+            and bool(getattr(bound.forge, "commit_statuses", False))
+            and "proposal-list" in getattr(bound.forge, "verbs", ())
+        )
+        if not has_labels and not wants_open_for_status:
+            return []
+        open_numbers: list[int] = []
         try:
             listed = bound.forge.proposal_list(bound.api, bound.repo, {"source": branch, "state": OPEN_PROPOSAL_STATE})
             for proposal in listed.get("proposals") or []:
-                carried = _reserved_labels_on(proposal)
+                num = proposal.get("number")
+                if type(num) is int and num > 0:
+                    open_numbers.append(num)
+                if not can_strip_labels:
+                    continue
+                carried = _reserved_labels_on(proposal) + _risk_labels_on(proposal)
                 if carried:
-                    bound.forge.proposal_update(
-                        bound.api, bound.repo, {"number": proposal["number"], "labelsRemove": carried}
-                    )
+                    try:
+                        bound.forge.proposal_update(
+                            bound.api, bound.repo, {"number": proposal["number"], "labelsRemove": carried}
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- continue stripping sibling proposals
+                        LOGGER.warning(
+                            "practice label not dropped after a push repo=%s branch=%s number=%s: %s",
+                            bound.repo, branch, num, exc,
+                        )
         except Exception as exc:  # noqa: BLE001 -- the push stands either way
             LOGGER.warning("practice label not dropped after a push repo=%s branch=%s: %s", bound.repo, branch, exc)
+        return open_numbers
+
+    # ------------------------------------------------------------------
+    # Deterministic PR Risk Classification & Autonomy-Dial Labelling
+    # ------------------------------------------------------------------
+
+    def _classify_proposal_from_git(
+        self,
+        bound: Binding,
+        number: int,
+        *,
+        proposal_override: dict[str, Any] | None = None,
+        expected_head_sha: str = "",
+        out_context: dict[str, Any] | None = None,
+        read_rules: bool = False,
+    ) -> tuple[dict[str, Any], risk_classifier.ClassificationResult, list[str], bool]:
+        """Fetch target & proposal refs into one bare scratch repo and classify in-process.
+
+        Returns `(proposal, verdict, changed_paths, stale_base)`.
+        - Open PRs classify `merge-base(target, head)..head` and flag `stale_base=True`
+          when `target` has modified any of the same paths since `merge-base`.
+        - Merged PRs with `mergeCommit` classify `mergeCommit^1..mergeCommit` so
+          historical PR audits reflect the exact merged delta even after `main` moves
+          or the head branch is deleted.
+        """
+        if proposal_override is not None:
+            proposal = proposal_override
+        else:
+            view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}
+            proposal = view.get("proposal") or {}
+
+        state = str(proposal.get("state") or "")
+        source_repo = str(proposal.get("sourceRepo") or "")
+        # Non-merged PRs must explicitly originate from this repository (an empty
+        # `sourceRepo` on a forge means an external or deleted fork).
+        if state != "merged" and (not source_repo or source_repo.casefold() != bound.repo.casefold()):
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "FORK_PROPOSAL_UNSUPPORTED",
+                    f"pull request originates from external or unknown fork {source_repo!r}",
+                ),
+                [],
+                False,
+            )
+
+        target_branch = str(proposal.get("target") or "")
+        source_branch = str(proposal.get("source") or "")
+        expected_rev = str(proposal.get("sourceRevision") or "")
+        merge_commit = str(proposal.get("mergeCommit") or "")
+
+        if expected_head_sha and state != "merged":
+            if not expected_rev or expected_rev.lower() != expected_head_sha.lower():
+                return (
+                    proposal,
+                    risk_classifier.unknown_result(
+                        "HEAD_SHA_MISMATCH",
+                        f"proposal head revision {(expected_rev or 'missing')[:12]} does not match expected_head_sha {expected_head_sha[:12]}",
+                    ),
+                    [],
+                    False,
+                )
+
+        if not target_branch or target_branch.startswith("-") or any(ch.isspace() or ord(ch) < 0x20 for ch in target_branch):
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "MISSING_TARGET_BRANCH",
+                    "proposal does not name a valid target branch",
+                ),
+                [],
+                False,
+            )
+        if source_branch and (source_branch.startswith("-") or any(ch.isspace() or ord(ch) < 0x20 for ch in source_branch)):
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "INVALID_SOURCE_BRANCH",
+                    "proposal names an invalid source branch",
+                ),
+                [],
+                False,
+            )
+
+        if state == OPEN_PROPOSAL_STATE and (not expected_rev or not _OBJECT_ID.fullmatch(expected_rev)):
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "MISSING_HEAD_REVISION",
+                    "open proposal has no verified commit revision id",
+                ),
+                [],
+                False,
+            )
+
+        if state == "merged" and (not merge_commit or not _OBJECT_ID.fullmatch(merge_commit)):
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "MERGED_PR_NO_MERGE_COMMIT",
+                    f"merged proposal #{number} has no mergeCommit (fast-forward or unavailable)",
+                ),
+                [],
+                False,
+            )
+
+        bound.ensure()
+        root = self._scratch("risk")
+        bare = root / "repo.git"
+        git = bound.git
+        bare_git = functools.partial(bound.git, bare=True)
+        last_watch, stopped_ceiling = [0.0], [False]
+
+        def over_ceiling() -> bool:
+            now = time.monotonic()
+            if now - last_watch[0] < CLONE_WATCH_SECONDS:
+                return False
+            last_watch[0] = now
+            stopped_ceiling[0] = _tree_bytes(bare, self.max_clone_bytes) > self.max_clone_bytes
+            return stopped_ceiling[0]
+
+        def guarded_fetch(*fetch_args: str, check: bool = False) -> subprocess.CompletedProcess:
+            remedy = "The fetched git objects exceed the broker clone ceiling."
+            proc = bare_git(
+                bare,
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "origin",
+                *fetch_args,
+                check=False,
+                stop=over_ceiling,
+            )
+            if stopped_ceiling[0]:
+                raise self._clone_too_large(bound.repo, remedy)
+            self._enforce_ceiling(bare, bound.repo, remedy=remedy)
+            if check and proc.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, ["git", "fetch", *fetch_args], proc.stdout, proc.stderr
+                )
+            return proc
+
+        try:
+            git(root, "init", "--bare", "--quiet", str(bare))
+            bare_git(bare, "remote", "add", "origin", bound.forge.clone_url(bound.repo))
+
+            diff_base = ""
+            diff_head = ""
+            target_tip = ""
+            stale_base = False
+
+            if state == "merged":
+                # Merged PR: try shallow `--depth=2 <merge_commit>` first so we avoid
+                # fetching full target-branch history and still succeed when a release
+                # target branch was deleted after merge.
+                guarded_fetch("--depth=2", merge_commit, check=False)
+                probe = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^{{commit}}", check=False)
+                parent_proc = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^1", check=False)
+                if probe.returncode != 0 or parent_proc.returncode != 0:
+                    guarded_fetch(
+                        f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
+                        check=False,
+                    )
+                    probe = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^{{commit}}", check=False)
+                    if probe.returncode != 0:
+                        guarded_fetch(merge_commit, check=True)
+                    parent_proc = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^1", check=False)
+                if parent_proc.returncode != 0:
+                    return (
+                        proposal,
+                        risk_classifier.unknown_result(
+                            "MERGED_PARENT_UNAVAILABLE",
+                            f"could not resolve parent commit for merged proposal #{number}",
+                        ),
+                        [],
+                        False,
+                    )
+                second_parent = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^2", check=False)
+                if second_parent.returncode == 0:
+                    third_parent = bare_git(bare, "rev-parse", "--verify", f"{merge_commit}^3", check=False)
+                    if third_parent.returncode == 0:
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "MERGED_PR_OCTOPUS_MERGE",
+                                f"merged proposal #{number} used an octopus merge commit; parent delta is ambiguous",
+                            ),
+                            [],
+                            False,
+                        )
+                    p2_sha = second_parent.stdout.strip()
+                    if expected_rev and _OBJECT_ID.fullmatch(expected_rev) and p2_sha.lower() != expected_rev.lower():
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "MERGED_PR_AMBIGUOUS_PARENTS",
+                                f"merged proposal #{number} mergeCommit second parent {p2_sha[:12]} does not match proposal revision {expected_rev[:12]}",
+                            ),
+                            [],
+                            False,
+                        )
+                else:
+                    # Single-parent mergeCommit: exact for 1-commit PRs (rebase/ff/squash),
+                    # ambiguous for multi-commit PRs (squash vs rebase-and-merge where
+                    # mergeCommit^1..mergeCommit would miss earlier rebased commits).
+                    commits: Any = None
+                    commits_truncated = False
+                    if hasattr(bound.forge, "proposal_commits"):
+                        try:
+                            commits_resp = bound.forge.proposal_commits(bound.api, bound.repo, {"number": number}) or {}
+                            commits = commits_resp.get("commits")
+                            commits_truncated = bool(commits_resp.get("truncated"))
+                        except Exception:  # noqa: BLE001
+                            commits = None
+                    if commits_truncated or not isinstance(commits, list) or len(commits) != 1:
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "MERGED_PR_MULTI_COMMIT_SINGLE_PARENT",
+                                f"merged proposal #{number} has a single-parent merge commit across multiple or unknown commits; cannot distinguish squash from rebase-and-merge",
+                            ),
+                            [],
+                            False,
+                        )
+                diff_base = parent_proc.stdout.strip()
+                diff_head = merge_commit
+            else:
+                # Open or closed-unmerged PR: fetch bounded shallow window first to keep
+                # inline request latency small on large repositories; deepen only if
+                # merge-base falls outside the initial window.
+                refspecs = [f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}"]
+                if source_branch:
+                    refspecs.append(f"refs/heads/{source_branch}:refs/remotes/origin/{source_branch}")
+                fetched = guarded_fetch(f"--depth={_RISK_SHALLOW_FETCH_DEPTH}", *refspecs, check=False)
+                if fetched.returncode != 0:
+                    if state == OPEN_PROPOSAL_STATE:
+                        # An open PR whose source or target branch cannot be fetched fails closed.
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "HEAD_REVISION_UNAVAILABLE",
+                                f"could not fetch open proposal branch {source_branch!r} or target {target_branch!r}",
+                            ),
+                            [],
+                            False,
+                        )
+                    # Closed-unmerged PR: head branch may have been deleted; fetch target first, then try expected_rev
+                    guarded_fetch(
+                        f"--depth={_RISK_SHALLOW_FETCH_DEPTH}",
+                        f"refs/heads/{target_branch}:refs/remotes/origin/{target_branch}",
+                        check=True,
+                    )
+                    if expected_rev and _OBJECT_ID.fullmatch(expected_rev):
+                        rev_fetch = guarded_fetch(f"--depth={_RISK_SHALLOW_FETCH_DEPTH}", expected_rev, check=False)
+                        if rev_fetch.returncode != 0:
+                            return (
+                                proposal,
+                                risk_classifier.unknown_result(
+                                    "HEAD_REVISION_UNAVAILABLE",
+                                    f"could not fetch source branch {source_branch!r} or revision {expected_rev[:12]}",
+                                ),
+                                [],
+                                False,
+                            )
+                    else:
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "HEAD_REVISION_UNAVAILABLE",
+                                f"could not fetch source branch {source_branch!r}",
+                            ),
+                            [],
+                            False,
+                        )
+
+                target_tip = bare_git(bare, "rev-parse", f"refs/remotes/origin/{target_branch}").stdout.strip()
+                head_probe = (
+                    bare_git(bare, "rev-parse", "--verify", f"refs/remotes/origin/{source_branch}", check=False)
+                    if source_branch
+                    else None
+                )
+                head_sha = head_probe.stdout.strip() if (head_probe and head_probe.returncode == 0) else ""
+                if state == OPEN_PROPOSAL_STATE:
+                    # Live git branch tip MUST match the forge proposal's sourceRevision.
+                    # Never fall back to classifying a stale ancestor if the git branch
+                    # already advanced ahead of an eventually-consistent forge API response.
+                    if not head_sha or head_sha.lower() != expected_rev.lower():
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "PROPOSAL_BRANCH_MOVED",
+                                "the proposal's git branch tip differs from its reported revision",
+                            ),
+                            [],
+                            False,
+                        )
+                elif expected_rev and head_sha and head_sha.lower() != expected_rev.lower():
+                    return (
+                        proposal,
+                        risk_classifier.unknown_result(
+                            "PROPOSAL_BRANCH_MOVED",
+                            "the proposal's git branch tip differs from its reported revision",
+                        ),
+                        [],
+                        False,
+                    )
+                elif expected_rev and not head_sha:
+                    sha_probe = bare_git(bare, "rev-parse", "--verify", f"{expected_rev}^{{commit}}", check=False)
+                    if sha_probe.returncode != 0 and _OBJECT_ID.fullmatch(expected_rev):
+                        guarded_fetch(f"--depth={_RISK_SHALLOW_FETCH_DEPTH}", expected_rev, check=False)
+                        sha_probe = bare_git(bare, "rev-parse", "--verify", f"{expected_rev}^{{commit}}", check=False)
+                    if sha_probe.returncode != 0:
+                        return (
+                            proposal,
+                            risk_classifier.unknown_result(
+                                "PROPOSAL_BRANCH_MOVED",
+                                "the proposal's branch moved before its revision could be classified",
+                            ),
+                            [],
+                            False,
+                        )
+                    head_sha = expected_rev
+                if not head_sha:
+                    return (
+                        proposal,
+                        risk_classifier.unknown_result(
+                            "MISSING_HEAD_REVISION",
+                            "proposal has no resolvable head commit",
+                        ),
+                        [],
+                        False,
+                    )
+
+                def _shallow_set() -> set[str]:
+                    s_file = bare / "shallow"
+                    return set(s_file.read_text(encoding="utf-8").split()) if s_file.is_file() else set()
+
+                mb = bare_git(bare, "merge-base", target_tip, head_sha, check=False)
+                shallow_oids = _shallow_set()
+                if shallow_oids and (
+                    mb.returncode != 0 or not mb.stdout.strip() or mb.stdout.strip() in shallow_oids
+                ):
+                    deepen_specs = list(refspecs) if head_probe and head_probe.returncode == 0 else [refspecs[0]]
+                    guarded_fetch(f"--deepen={_RISK_DEEPEN_STEP}", *deepen_specs, check=False)
+                    mb = bare_git(bare, "merge-base", target_tip, head_sha, check=False)
+                    shallow_oids = _shallow_set()
+                    if shallow_oids and (
+                        mb.returncode != 0 or not mb.stdout.strip() or mb.stdout.strip() in shallow_oids
+                    ):
+                        guarded_fetch("--unshallow", *deepen_specs, check=False)
+                        mb = bare_git(bare, "merge-base", target_tip, head_sha, check=False)
+
+                if mb.returncode != 0 or not mb.stdout.strip():
+                    return (
+                        proposal,
+                        risk_classifier.unknown_result(
+                            "MERGE_BASE_UNAVAILABLE",
+                            f"could not compute merge-base between {target_branch!r} and {head_sha[:12]}",
+                        ),
+                        [],
+                        False,
+                    )
+                diff_base = mb.stdout.strip()
+                diff_head = head_sha
+
+            verdict, changed_paths = risk_classifier.classify_git_range(
+                bare,
+                diff_base,
+                diff_head,
+                git=bare_git,
+                scratch_dir=root,
+                disable_gitattributes=True,
+            )
+
+            # For open PRs, check if target branch advanced on any of the same paths.
+            # Scope diff-tree to changed_paths in chunks and fail closed on error/truncation.
+            if state == OPEN_PROPOSAL_STATE and target_tip and target_tip != diff_base and changed_paths:
+                for start in range(0, len(changed_paths), 200):
+                    chunk = changed_paths[start : start + 200]
+                    adv = bare_git(
+                        bare,
+                        "--literal-pathspecs",
+                        "diff-tree",
+                        "-r",
+                        "--name-only",
+                        "-z",
+                        diff_base,
+                        target_tip,
+                        "--",
+                        *chunk,
+                        check=False,
+                    )
+                    if adv.returncode != 0 or getattr(adv, "truncated", False):
+                        stale_base = True
+                        break
+                    if adv.stdout:
+                        raw_adv = (
+                            adv.stdout
+                            if isinstance(adv.stdout, bytes)
+                            else adv.stdout.encode("utf-8", errors="replace")
+                        )
+                        if any(p for p in raw_adv.split(b"\x00") if p):
+                            stale_base = True
+                            break
+
+            if out_context is not None:
+                out_context["diff_base"] = diff_base
+                out_context["target_tip"] = target_tip
+            if out_context is not None and state == OPEN_PROPOSAL_STATE and target_tip:
+                resolved_base = ""
+                try:
+                    if "_practice_base" not in self.__dict__:
+                        pinned = self._pinned_base(bound.forge, bound.repo)
+                        resolved_base = pinned or self._default_branch_of_remote(
+                            bare_git, bare, self._tls_refusal
+                        )
+                    else:
+                        resolved_base = self._practice_base(bound)
+                    out_context["base"] = resolved_base
+                except (WorkspaceError, subprocess.SubprocessError, OSError) as exc:
+                    LOGGER.info(
+                        "risk classifier: base lookup failed repo=%s number=%s: %s",
+                        bound.repo, number, str(exc)[:300],
+                    )
+                    out_context["base"] = ""
+                if (
+                    read_rules
+                    and resolved_base
+                    and target_branch == resolved_base
+                    and "_practice_rules" not in self.__dict__
+                ):
+                    try:
+                        out_context["rules"] = self._read_rules_from_bare(
+                            bare_git, bare, root, target_tip
+                        )
+                    except (WorkspaceError, subprocess.SubprocessError, OSError) as exc:
+                        LOGGER.info(
+                            "risk classifier: rules read failed repo=%s number=%s: %s",
+                            bound.repo, number, str(exc)[:300],
+                        )
+                        out_context["rules"] = automation_rules.Rules(
+                            status=automation_rules.INVALID,
+                            error=f"not read ({type(exc).__name__})",
+                        )
+
+            return proposal, verdict, changed_paths, stale_base
+        except WorkspaceError as exc:
+            code = str(exc.fields.get("code") or "GIT_CLASSIFICATION_ERROR")
+            LOGGER.info(
+                "risk classifier: workspace refusal repo=%s number=%s code=%s: %s",
+                bound.repo, number, code, str(exc)[:400],
+            )
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    code if code == "CLONE_TOO_LARGE" else "GIT_CLASSIFICATION_ERROR",
+                    f"failed to classify proposal from git: {code}",
+                ),
+                [],
+                False,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail closed to unknown on any unexpected classifier/git error
+            LOGGER.info(
+                "risk classifier: git read failed repo=%s number=%s: %s",
+                bound.repo, number, str(exc)[:400],
+            )
+            return (
+                proposal,
+                risk_classifier.unknown_result(
+                    "GIT_CLASSIFICATION_ERROR",
+                    f"failed to classify proposal from git: {type(exc).__name__}",
+                ),
+                [],
+                False,
+            )
+        finally:
+            self._discard_scratch(root)
+
+    def _resolve_risk_environment(
+        self,
+        payload: dict[str, Any],
+        changed_paths: list[str],
+        *,
+        rules: automation_rules.Rules | None = None,
+        base: str = "",
+    ) -> tuple[str, str]:
+        """Resolve verified environment from `clusters/<name>/` cluster labels or declared `rules.environments`.
+
+        Returns `(environment, error_reason)`. Fails closed when paths span
+        multiple clusters or declared environments, touch an excluded cluster,
+        or cluster labels cannot be uniquely verified.
+        """
+        if not changed_paths:
+            return automation_rules.UNKNOWN_ENVIRONMENT, "no changed files to bind to a cluster"
+
+        explicit_target: tuple[str, str, str] | None = None
+        if "cluster" in payload and payload["cluster"] is not None:
+            explicit = payload["cluster"]
+            if not isinstance(explicit, str) or not explicit.strip():
+                return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster coordinate"
+            explicit_target = _gke_cluster(explicit.strip())
+            if explicit_target is None:
+                return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster coordinate"
+
+        clusters = {automerge_edit.cluster_of(p) for p in changed_paths}
+        if None in clusters or len(clusters) != 1:
+            if explicit_target is not None:
+                return (
+                    automation_rules.UNKNOWN_ENVIRONMENT,
+                    "cluster coordinate does not match changed paths",
+                )
+            if rules is not None and rules.environments:
+                decl_env, decl_err = automation_rules.resolve_declared_environment(rules, changed_paths, base)
+                if decl_err:
+                    return automation_rules.UNKNOWN_ENVIRONMENT, decl_err
+                if decl_env:
+                    try:
+                        self._cluster_exclusions.check_unnamed(include_holds=False)
+                    except scope_exclude.ExcludedCluster as exc:
+                        LOGGER.info("risk label: unnamed scope exclusion active for declared env=%s: %s", decl_env, exc)
+                        return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+                    return decl_env, ""
+            return (
+                automation_rules.UNKNOWN_ENVIRONMENT,
+                "changed files do not all belong to a single cluster's tree (`clusters/<name>/`)",
+            )
+
+        short_name = next(iter(clusters))
+        assert short_name is not None
+        if not _GKE_CLUSTER_SHORT_NAME.fullmatch(short_name):
+            return automation_rules.UNKNOWN_ENVIRONMENT, "invalid cluster directory name"
+        if explicit_target is not None and explicit_target[2] != short_name:
+            return (
+                automation_rules.UNKNOWN_ENVIRONMENT,
+                "cluster coordinate does not match changed paths",
+            )
+        if self._cluster_read is None:
+            return automation_rules.UNKNOWN_ENVIRONMENT, "this broker has no cluster reader"
+
+        # Broker-side cluster resolution across configured fleet projects:
+        # never let a caller-supplied `cluster` steer `--project` or bypass
+        # uniqueness across same-named clusters.
+        raw_projects = os.environ.get("GKE_PROJECTS", "").strip() or os.environ.get("GKE_PROJECT_ID", "").strip()
+        project_ids: list[str] = []
+        if raw_projects:
+            for part in raw_projects.split(","):
+                cand = part.strip()
+                if not cand:
+                    continue
+                if not _GKE_PROJECT_ID_RE.fullmatch(cand):
+                    return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+                if cand not in project_ids:
+                    project_ids.append(cand)
+
+        matches: list[tuple[str, dict[str, Any]]] = []
+        query_projects = project_ids if project_ids else [""]
+        for proj in query_projects:
+            argv = [
+                "gcloud", "container", "clusters", "list",
+                f"--filter=name={short_name}",
+                "--format=json(name,location,selfLink,resourceLabels)",
+            ]
+            if proj:
+                argv.extend(["--project", proj])
+            code, out, err = self._cluster_read(argv, "")
+            if code != 0:
+                LOGGER.info("risk label: cluster list failed name=%s project=%s exit=%s: %s", short_name, proj, code, err[:400])
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+            try:
+                items = json.loads(out or "[]")
+            except json.JSONDecodeError:
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+            if not isinstance(items, list):
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+            for item in items:
+                if isinstance(item, dict) and item.get("name") == short_name:
+                    matches.append((proj, item))
+
+        if len(matches) != 1:
+            LOGGER.info("risk label: expected 1 cluster named %r, found %s", short_name, len(matches))
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+
+        queried_proj, match = matches[0]
+        raw_loc = match.get("location")
+        item_location = raw_loc.strip() if isinstance(raw_loc, str) else ""
+        item_project = queried_proj
+        raw_link = match.get("selfLink")
+        self_link = raw_link if isinstance(raw_link, str) else ""
+        m_link = re.search(r"/projects/([^/]+)/(?:locations|zones)/([^/]+)/clusters/([^/?#]+)", self_link)
+        if m_link:
+            item_project = m_link.group(1)
+            if not item_location:
+                item_location = m_link.group(2)
+
+        try:
+            if item_project and item_location:
+                self._cluster_exclusions.check(item_project, item_location, short_name, include_holds=False)
+            else:
+                self._cluster_exclusions.check_unnamed(include_holds=False)
+        except scope_exclude.ExcludedCluster as exc:
+            LOGGER.info("risk label: excluded cluster %s: %s", short_name, exc)
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+
+        if explicit_target is not None:
+            exp_proj, exp_loc, _ = explicit_target
+            if not item_project or not item_location or exp_proj != item_project or exp_loc != item_location:
+                LOGGER.info(
+                    "risk label: caller cluster coordinate %s/%s/%s disagreed with resolved %s/%s/%s",
+                    exp_proj, exp_loc, short_name, item_project, item_location, short_name,
+                )
+                return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster's labels could not be read"
+
+        labels = match.get("resourceLabels") or {}
+        env = automation_rules.cluster_environment(labels) if isinstance(labels, dict) else ""
+        if not env:
+            LOGGER.info("risk label: cluster %s declares no environment label", short_name)
+            return automation_rules.UNKNOWN_ENVIRONMENT, "the cluster declares no environment label"
+        return env, ""
+
+    def _read_rules_from_bare(
+        self,
+        bare_git: Callable[..., Any],
+        bare: Path,
+        root: Path,
+        target_tip: str,
+    ) -> automation_rules.Rules:
+        """Read `.kube-agents/automation.yaml` directly from `target_tip` in `bare`."""
+        dir_listed = bare_git(
+            bare,
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            SNAPSHOT_LISTING_FORMAT,
+            target_tip,
+            "--",
+            ".kube-agents",
+            check=False,
+        )
+        if dir_listed.returncode != 0 or getattr(dir_listed, "truncated", False):
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not read")
+        dir_out = (dir_listed.stdout or "").strip("\x00")
+        if not dir_out:
+            return automation_rules.Rules(status=automation_rules.ABSENT)
+        dir_parts = dir_out.split(" ", 2)
+        if len(dir_parts) != 3 or dir_parts[0] != GIT_MODE_TREE or dir_parts[2] != ".kube-agents":
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+
+        file_listed = bare_git(
+            bare,
+            "--literal-pathspecs",
+            "ls-tree",
+            "-z",
+            SNAPSHOT_LISTING_FORMAT,
+            target_tip,
+            "--",
+            automation_rules.RULES_FILE,
+            check=False,
+        )
+        if file_listed.returncode != 0 or getattr(file_listed, "truncated", False):
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not read")
+        entries = [e for e in (file_listed.stdout or "").split("\x00") if e]
+        if not entries:
+            return automation_rules.Rules(status=automation_rules.ABSENT)
+        if len(entries) != 1:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        parts = entries[0].split(" ", 2)
+        if len(parts) != 3 or parts[2] != automation_rules.RULES_FILE:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        mode, size_str, _ = parts
+        if mode == GIT_MODE_SYMLINK or mode in GIT_MODES_DIRECTORY:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        try:
+            blob_size = int(size_str)
+        except ValueError:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+        if blob_size > automation_rules.MAX_FILE_BYTES:
+            return automation_rules.Rules(
+                status=automation_rules.INVALID,
+                error=f"larger than {automation_rules.MAX_FILE_BYTES} bytes",
+            )
+
+        attributes = bare / SNAPSHOT_ATTRIBUTES_FILE
+        attributes.parent.mkdir(parents=True, exist_ok=True)
+        attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
+        rules_tar = root / "automation-rules.tar"
+        try:
+            written = bare_git(
+                bare,
+                "--literal-pathspecs",
+                "archive",
+                "--format=tar",
+                f"--output={rules_tar}",
+                target_tip,
+                "--",
+                automation_rules.RULES_FILE,
+                check=False,
+            )
+            if written.returncode != 0:
+                return automation_rules.Rules(status=automation_rules.INVALID, error="not read")
+            with tarfile.open(rules_tar) as tar:
+                members = [m for m in tar.getmembers() if not m.isdir()]
+                if len(members) != 1 or not members[0].isreg() or members[0].name != automation_rules.RULES_FILE:
+                    return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+                extracted = tar.extractfile(members[0])
+                if extracted is None:
+                    return automation_rules.Rules(status=automation_rules.INVALID, error="not one regular file")
+                raw = extracted.read(automation_rules.MAX_FILE_BYTES + 1)
+        except (OSError, tarfile.TarError, ValueError) as exc:
+            return automation_rules.Rules(status=automation_rules.INVALID, error=f"not read ({exc})")
+        finally:
+            rules_tar.unlink(missing_ok=True)
+        try:
+            return automation_rules.parse(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return automation_rules.Rules(status=automation_rules.INVALID, error="not UTF-8")
+
+    def _evaluate_risk_automerge(
+        self,
+        payload: dict[str, Any],
+        base: str,
+        switch: str,
+        verdict: risk_classifier.ClassificationResult,
+        changed_paths: list[str],
+        stale_base: bool,
+        *,
+        rules_override: automation_rules.Rules | None = None,
+    ) -> tuple[str | None, str]:
+        """Evaluate switch, autonomy dial, stale-base guard, cluster env, and `.kube-agents/automation.yaml`."""
+        if switch not in automerge_eligibility.LABELLING_SWITCH_VALUES:
+            return None, "KUBEAGENTS_AUTOMERGE is off"
+        if switch == "on" and not dial_allows_automerge():
+            return None, "the autonomy dial is below Auto-merge"
+        if stale_base:
+            return None, "base branch modified the same file since this PR branched; rebase required"
+        if not verdict.supported:
+            first_code = verdict.reasons[0].code if verdict.reasons else "UNSUPPORTED"
+            first_msg = verdict.reasons[0].message if verdict.reasons else "proposal could not be deterministically classified"
+            return None, f"classification is unsupported ({first_code}: {first_msg})"
+        rules = (
+            rules_override
+            if (rules_override is not None and "_practice_rules" not in self.__dict__)
+            else self._practice_rules(payload, base)
+        )
+        if rules.status != automation_rules.LOADED:
+            return None, f"{automation_rules.RULES_FILE} on {base} allows nothing ({rules.status})"
+        if not automation_rules.has_risk_allow_rules(rules):
+            return None, f"{automation_rules.RULES_FILE} has no max_risk allow rules"
+        env, env_err = self._resolve_risk_environment(payload, changed_paths, rules=rules, base=base)
+        if env_err:
+            return None, env_err
+        ceiling = automation_rules.install_max_risk_ceiling()
+        decision = automation_rules.decide_risk(
+            rules,
+            verdict.risk_level,
+            env,
+            disruptiveness=verdict.disruptiveness,
+            revertability=verdict.revertability,
+            effective_changes=verdict.effective_changes,
+            supported=verdict.supported,
+            install_max_risk=ceiling,
+        )
+        if not decision.allowed:
+            LOGGER.info("risk automerge refused env=%s level=%s: %s", env, verdict.risk_level, decision.reason)
+            if decision.reason.startswith(("denied by automerge.deny[", "no allow rule permits risk")):
+                return None, f"{automation_rules.RULES_FILE} does not allow this change in this cluster's environment"
+            return None, decision.reason
+        return automerge_eligibility.LABEL_FOR_SWITCH[switch], f"{automation_rules.RULES_FILE} allows auto-merge"
+
+    def _practice_risk_qualifies(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        number: int,
+        proposal: dict[str, Any],
+        switch: str,
+    ) -> tuple[bool, str, risk_classifier.ClassificationResult | None]:
+        """Return `(qualifies, reason, verdict)` if an open agent PR is evaluated under `max_risk` rules.
+
+        Fast-paths out without cloning when `.kube-agents/automation.yaml` has no
+        `max_risk` allow rules, keeping `no-pdb`-only repos zero-overhead.
+        """
+        try:
+            if automation_rules.install_max_risk_ceiling() == "off":
+                return False, "", None
+            base = self._practice_base(bound)
+            if not base or proposal.get("target") != base:
+                return False, "", None
+            rules = self._practice_rules(payload, base)
+            if not automation_rules.has_risk_allow_rules(rules):
+                return False, "", None
+            git_ctx: dict[str, Any] = {}
+            _, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
+                bound, number, proposal_override=proposal, out_context=git_ctx
+            )
+            want, reason = self._evaluate_risk_automerge(
+                payload, base, switch, verdict, changed_paths, stale_base, rules_override=rules
+            )
+            if want == automerge_eligibility.AUTOMERGE_LABEL:
+                head_rev = str(proposal.get("sourceRevision") or "")
+                base_rev = str(git_ctx.get("target_tip") or git_ctx.get("diff_base") or "")
+                if not getattr(bound.forge, "commit_statuses", False) or not _OBJECT_ID.fullmatch(head_rev):
+                    return False, "forge cannot record a commit-bound auto-merge status", verdict
+                bound.forge.commit_status_set(
+                    bound.api,
+                    bound.repo,
+                    {
+                        "revision": head_rev,
+                        "state": "success",
+                        "context": RISK_AUTOMERGE_STATUS_CONTEXT,
+                        "description": _format_risk_status_description(verdict, base_rev, prefix="eligible "),
+                    },
+                )
+            return want is not None, reason, verdict
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.info("practice risk fallback failed repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
+            return False, "", None
+
+    @staticmethod
+    def _risk_label_gate(bound: Binding) -> tuple[bool, str]:
+        """Check whether this forge supports broker-exclusive proposal labels."""
+        if not getattr(bound.forge, "labels", False):
+            return False, "this forge has no labels"
+        if bound.forge.text_sets_labels:
+            return False, "on this forge a comment or a description can set a label, so no label is the broker's alone"
+        return True, ""
+
+    def _risk_proposal_provenance(
+        self,
+        bound: Binding,
+        proposal: dict[str, Any],
+        *,
+        base_override: str | None = None,
+        expected_head_sha: str = "",
+    ) -> tuple[bool, str, str]:
+        """Check proposal state, non-fork/SHA provenance, credential authorship, and target base branch."""
+        if proposal.get("state") != OPEN_PROPOSAL_STATE:
+            return False, "the proposal is not open", ""
+        source_repo = str(proposal.get("sourceRepo") or "")
+        if not source_repo or source_repo.casefold() != bound.repo.casefold():
+            return False, "the proposal is from a fork, not this repository", ""
+        source_rev = str(proposal.get("sourceRevision") or "")
+        if not source_rev or not _OBJECT_ID.fullmatch(source_rev):
+            return False, "the proposal has no verified commit revision id", ""
+        if expected_head_sha and source_rev.lower() != expected_head_sha.lower():
+            return False, "the proposal's head revision does not match expected_head_sha", ""
+        viewer = self._viewer(bound)
+        if not viewer or _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
+            return False, "the proposal is not this credential's own", ""
+        if base_override is not None and "_practice_base" not in self.__dict__:
+            base = base_override
+        else:
+            try:
+                base = self._practice_base(bound)
+            except (WorkspaceError, subprocess.SubprocessError, OSError) as exc:
+                LOGGER.info("risk label: base lookup failed repo=%s: %s", bound.repo, str(exc)[:300])
+                base = ""
+        if not base or proposal.get("target") != base:
+            return False, f"the proposal does not target the repository's base branch ({base or 'unknown'})", base
+        return True, "", base
+
+    def _risk_proposal_gate(
+        self,
+        bound: Binding,
+        proposal: dict[str, Any],
+        *,
+        base_override: str | None = None,
+        expected_head_sha: str = "",
+    ) -> tuple[bool, str, str]:
+        """Check forge label capability plus proposal provenance."""
+        labels_ok, label_reason = self._risk_label_gate(bound)
+        if not labels_ok:
+            return False, label_reason, ""
+        return self._risk_proposal_provenance(
+            bound,
+            proposal,
+            base_override=base_override,
+            expected_head_sha=expected_head_sha,
+        )
+
+    def proposal_classify_risk(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Deterministically classify a pull request's risk from broker-verified git state.
+
+        Read-only verb: returns `schema_version: 2` 4-axis classification plus
+        current autonomy-dial and `.kube-agents/automation.yaml` eligibility.
+        """
+        number = validate_number(payload.get("number"))
+        expected_sha = _extract_expected_head_sha(payload)
+        bound = self._bind(payload)
+        switch = self._automerge_switch()
+        dial_ok = dial_allows_automerge()
+        level = dial_level()
+        ceiling = automation_rules.install_max_risk_ceiling()
+
+        wants_rules = switch in automerge_eligibility.LABELLING_SWITCH_VALUES
+        git_ctx: dict[str, Any] = {}
+        proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
+            bound,
+            number,
+            expected_head_sha=expected_sha,
+            out_context=git_ctx if wants_rules else None,
+            read_rules=wants_rules,
+        )
+        want_label: str | None = None
+        eligible_for_automerge = False
+        if switch not in automerge_eligibility.LABELLING_SWITCH_VALUES:
+            am_reason = "KUBEAGENTS_AUTOMERGE is off"
+        else:
+            prov_ok, prov_reason, base = self._risk_proposal_provenance(
+                bound,
+                proposal,
+                base_override=git_ctx.get("base"),
+                expected_head_sha=expected_sha,
+            )
+            labels_ok, label_reason = self._risk_label_gate(bound)
+            has_statuses = bool(getattr(bound.forge, "commit_statuses", False))
+            if not prov_ok:
+                am_reason = prov_reason
+            elif not labels_ok and not has_statuses:
+                am_reason = label_reason
+            else:
+                want_eval, am_reason = self._evaluate_risk_automerge(
+                    payload,
+                    base,
+                    switch,
+                    verdict,
+                    changed_paths,
+                    stale_base,
+                    rules_override=git_ctx.get("rules"),
+                )
+                if want_eval is not None:
+                    diff_view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": True}) or {}
+                    if self._is_recognized_recipe_proposal(bound, payload, proposal, diff_view.get("diff")):
+                        want_eval = None
+                        am_reason = "the proposal matches a registered fix recipe and must pass its recipe safety checks"
+                if want_eval is not None:
+                    if labels_ok:
+                        want_label = want_eval
+                        eligible_for_automerge = True
+                    elif want_eval == automerge_eligibility.AUTOMERGE_LABEL and has_statuses:
+                        eligible_for_automerge = True
+                    else:
+                        am_reason = label_reason
+
+        out = verdict.to_dict()
+        out["number"] = number
+        out["sourceRevision"] = str(proposal.get("sourceRevision") or "")
+        out["stale_base"] = stale_base
+        out["automerge"] = {
+            "switch": switch,
+            "dial_allows_automerge": dial_ok,
+            "dial_level": level,
+            "install_max_risk": ceiling,
+            "eligible_for_automerge": eligible_for_automerge,
+            "would_label": want_label,
+            "reason": am_reason,
+        }
+        return bound.stamp(out)
+
+    def proposal_risk_label(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Classify a PR from git and apply SHA-bound commit statuses + `risk:<level>` and auto-merge labels."""
+        number = validate_number(payload.get("number"))
+        raw_expected = payload.get("expected_head_sha")
+        if raw_expected is None:
+            raw_expected = payload.get("expectedRevision")
+        expected_sha = validate_revision(raw_expected, "expected_head_sha")
+        bound = self._bind(payload)
+        switch = self._automerge_switch()
+
+        wants_rules = switch in automerge_eligibility.LABELLING_SWITCH_VALUES
+        git_ctx: dict[str, Any] = {}
+        proposal, verdict, changed_paths, stale_base = self._classify_proposal_from_git(
+            bound,
+            number,
+            expected_head_sha=expected_sha,
+            out_context=git_ctx,
+            read_rules=wants_rules,
+        )
+        transient_mismatch = any(
+            r.code in ("PROPOSAL_BRANCH_MOVED", "HEAD_SHA_MISMATCH") for r in verdict.reasons
+        )
+        packaging_unsupported = _is_packaging_unsupported(verdict)
+        want_risk_label = None if (transient_mismatch or packaging_unsupported) else verdict.risk_label
+        prov_ok, prov_reason, base = self._risk_proposal_provenance(
+            bound,
+            proposal,
+            base_override=git_ctx.get("base"),
+            expected_head_sha=expected_sha,
+        )
+        labels_ok, label_reason = self._risk_label_gate(bound)
+        gate_ok = prov_ok and labels_ok
+
+        want_auto_eval: str | None = None
+        eval_reason = ""
+        if prov_ok:
+            want_auto_eval, eval_reason = self._evaluate_risk_automerge(
+                payload,
+                base,
+                switch,
+                verdict,
+                changed_paths,
+                stale_base,
+                rules_override=git_ctx.get("rules"),
+            )
+            if want_auto_eval is not None:
+                diff_view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": True}) or {}
+                if self._is_recognized_recipe_proposal(bound, payload, proposal, diff_view.get("diff")):
+                    want_auto_eval = None
+                    eval_reason = "the proposal matches a registered fix recipe and must pass its recipe safety checks"
+
+        carried_risk = _risk_labels_on(proposal)
+        carried_auto = _reserved_labels_on(proposal)
+        # Preserve an already-carried recipe auto-merge label (`no-pdb`) when risk
+        # rules didn't independently grant one.
+        keep_auto: set[str] = set()
+        if (
+            want_auto_eval is None
+            and carried_auto
+            and gate_ok
+            and not transient_mismatch
+            and switch in automerge_eligibility.LABELLING_SWITCH_VALUES
+        ):
+            try:
+                view_diff = bound.forge.proposal_view(bound.api, bound.repo, {"number": number, "diff": True}) or {}
+                viewer = self._viewer(bound)
+                checks: list[dict] = []
+                if self._practice_refusal(bound, payload, viewer, proposal, view_diff.get("diff"), checks) is None:
+                    recipe_want = automerge_eligibility.LABEL_FOR_SWITCH.get(switch)
+                    if recipe_want and (recipe_want != automerge_eligibility.AUTOMERGE_LABEL or dial_allows_automerge()):
+                        keep_auto.add(recipe_want)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Bind the verdict and any auto-merge eligibility to the exact judged head SHA
+        # and base revision via broker-owned commit statuses on every status-capable forge.
+        head_rev = str(proposal.get("sourceRevision") or "")
+        base_rev = str(git_ctx.get("target_tip") or git_ctx.get("diff_base") or "")
+        verdict_status_posted = False
+        auto_status_posted = False
+        if prov_ok and not transient_mismatch and _OBJECT_ID.fullmatch(head_rev):
+            if getattr(bound.forge, "commit_statuses", False):
+                try:
+                    bound.forge.commit_status_set(
+                        bound.api,
+                        bound.repo,
+                        {
+                            "revision": head_rev,
+                            "state": "success",
+                            "context": RISK_VERDICT_STATUS_CONTEXT,
+                            "description": _format_risk_status_description(verdict, base_rev),
+                        },
+                    )
+                    verdict_status_posted = True
+                except Exception as exc:  # noqa: BLE001 -- informational risk status is best-effort
+                    LOGGER.info(
+                        "risk commit status failed repo=%s number=%s rev=%s: %s",
+                        bound.repo, number, head_rev[:12], str(exc)[:300],
+                    )
+            if want_auto_eval == automerge_eligibility.AUTOMERGE_LABEL:
+                if not getattr(bound.forge, "commit_statuses", False):
+                    want_auto_eval = None
+                    eval_reason = "forge cannot record a commit-bound auto-merge status"
+                else:
+                    try:
+                        bound.forge.commit_status_set(
+                            bound.api,
+                            bound.repo,
+                            {
+                                "revision": head_rev,
+                                "state": "success",
+                                "context": RISK_AUTOMERGE_STATUS_CONTEXT,
+                                "description": _format_risk_status_description(
+                                    verdict, base_rev, prefix="eligible "
+                                ),
+                            },
+                        )
+                        auto_status_posted = True
+                    except Exception as exc:  # noqa: BLE001 -- fail closed when status cannot be recorded
+                        LOGGER.warning(
+                            "auto-merge commit status failed repo=%s number=%s rev=%s: %s",
+                            bound.repo, number, head_rev[:12], str(exc)[:300],
+                        )
+                        want_auto_eval = None
+                        eval_reason = "could not record commit-bound auto-merge status on head revision"
+            elif (
+                getattr(bound.forge, "commit_statuses", False)
+                and any(
+                    lbl.casefold() == automerge_eligibility.AUTOMERGE_LABEL.casefold()
+                    for lbl in carried_auto
+                )
+                and automerge_eligibility.AUTOMERGE_LABEL not in keep_auto
+            ):
+                try:
+                    bound.forge.commit_status_set(
+                        bound.api,
+                        bound.repo,
+                        {
+                            "revision": head_rev,
+                            "state": "pending",
+                            "context": RISK_AUTOMERGE_STATUS_CONTEXT,
+                            "description": f"held: {eval_reason}"[:_MAX_STATUS_DESC_LEN],
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.info(
+                        "auto-merge status revocation failed repo=%s number=%s: %s",
+                        bound.repo, number, str(exc)[:300],
+                    )
+
+        if not prov_ok:
+            want_risk_apply: str | None = None
+            want_auto: str | None = None
+            reason = prov_reason
+        elif not labels_ok:
+            want_risk_apply = None
+            want_auto = None
+            reason = eval_reason if auto_status_posted else label_reason
+        else:
+            want_risk_apply = want_risk_label
+            want_auto = want_auto_eval
+            reason = eval_reason
+        status_posted = verdict_status_posted or auto_status_posted
+
+        carried_risk_fold = {lbl.casefold() for lbl in carried_risk}
+        carried_auto_fold = {lbl.casefold() for lbl in carried_auto}
+        want_all = [lbl for lbl in (want_risk_apply, want_auto) if lbl is not None]
+        to_add = [
+            lbl
+            for lbl in want_all
+            if lbl.casefold() not in carried_risk_fold and lbl.casefold() not in carried_auto_fold
+        ]
+        added: list[str] = []
+        after: dict[str, Any] | None = None
+
+        if to_add:
+            fresh = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+            if fresh.get("state") != OPEN_PROPOSAL_STATE or fresh.get("sourceRevision") != proposal.get("sourceRevision"):
+                reason = "the proposal moved, merged or closed while it was judged"
+                want_risk_apply = None
+                want_auto = None
+                to_add = []
+
+        if to_add:
+            for lbl in to_add:
+                if lbl in risk_classifier.RISK_LABEL_COLORS:
+                    bound.forge.label_ensure(
+                        bound.api,
+                        bound.repo,
+                        {
+                            "name": lbl,
+                            "color": risk_classifier.RISK_LABEL_COLORS[lbl],
+                            "description": risk_classifier.RISK_LABEL_DESCRIPTIONS[lbl],
+                        },
+                    )
+                elif lbl in automerge_eligibility.LABEL_DESCRIPTIONS:
+                    bound.forge.label_ensure(
+                        bound.api,
+                        bound.repo,
+                        {
+                            "name": lbl,
+                            "color": automerge_eligibility.LABEL_COLOR,
+                            "description": automerge_eligibility.LABEL_DESCRIPTIONS[lbl],
+                        },
+                    )
+            bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsAdd": to_add})
+            added = list(to_add)
+            for lbl in added:
+                if lbl.casefold().startswith(risk_classifier.RISK_LABEL_PREFIX):
+                    carried_risk.append(lbl)
+                else:
+                    carried_auto.append(lbl)
+
+        # Post-write revision check: rollback newly added labels if branch moved to a
+        # different SHA; preserve labels if the PR merged immediately at the same SHA.
+        if want_risk_apply is not None or want_auto is not None or carried_risk or carried_auto:
+            if gate_ok:
+                after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+                if after.get("sourceRevision") != proposal.get("sourceRevision"):
+                    reason = "the proposal's branch moved while it was judged"
+                    want_risk_apply = None
+                    want_auto = None
+                    keep_auto.clear()
+
+        can_manage_labels = bool(getattr(bound.forge, "labels", False)) and not bound.forge.text_sets_labels
+        should_reconcile_stale = can_manage_labels and (
+            gate_ok or bool(added) or proposal.get("state") == OPEN_PROPOSAL_STATE
+        )
+        stale_risk: list[str] = []
+        if should_reconcile_stale:
+            kept_primary = False
+            for lbl in carried_risk:
+                if (
+                    not kept_primary
+                    and want_risk_apply is not None
+                    and lbl.casefold() == want_risk_apply.casefold()
+                ):
+                    kept_primary = True
+                else:
+                    stale_risk.append(lbl)
+        stale_auto = (
+            [lbl for lbl in carried_auto if lbl != want_auto and lbl not in keep_auto]
+            if should_reconcile_stale
+            else []
+        )
+        stale = stale_risk + stale_auto
+        base_labels = list((after if after is not None else proposal).get("labels") or [])
+        for lbl in added:
+            if all(str(existing).strip().casefold() != lbl.casefold() for existing in base_labels):
+                base_labels.append(lbl)
+        removed_stale = False
+        if stale:
+            if after is None:
+                after = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+                base_labels = list(after.get("labels") or [])
+            # Rollback newly added labels if branch moved; strip stale labels while open
+            if added and after.get("sourceRevision") != proposal.get("sourceRevision"):
+                bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
+                removed_stale = True
+            elif after.get("state") == OPEN_PROPOSAL_STATE:
+                bound.forge.proposal_update(bound.api, bound.repo, {"number": number, "labelsRemove": stale})
+                removed_stale = True
+        if removed_stale:
+            stale_fold = {lbl.casefold() for lbl in stale}
+            base_labels = [lbl for lbl in base_labels if str(lbl).strip().casefold() not in stale_fold]
+
+        LOGGER.info(
+            "risk label repo=%s number=%s risk=%s blast=%s revert=%s disrupt=%s risk_label=%s automerge_label=%s switch=%s reason=%s",
+            bound.repo,
+            number,
+            verdict.risk_level,
+            verdict.blast_radius,
+            verdict.revertability,
+            verdict.disruptiveness,
+            want_risk_apply,
+            want_auto,
+            switch,
+            reason,
+        )
+        return bound.stamp(
+            {
+                "number": number,
+                "sourceRevision": head_rev,
+                "baseRevision": base_rev,
+                "commit_status_posted": status_posted,
+                "automerge_status_posted": auto_status_posted,
+                "stale_base": stale_base,
+                "risk_level": verdict.risk_level,
+                "blast_radius": verdict.blast_radius,
+                "revertability": verdict.revertability,
+                "disruptiveness": verdict.disruptiveness,
+                "supported": verdict.supported,
+                "effective_changes": verdict.effective_changes,
+                "risk_label": want_risk_apply,
+                "labelled": want_auto is not None,
+                "label": want_auto,
+                "applied_labels": base_labels,
+                "switch": switch,
+                "dial_allows_automerge": dial_allows_automerge(),
+                "reason": reason,
+                "reasons": [r.to_dict() for r in verdict.reasons],
+                "classification": verdict.to_dict(),
+            }
+        )
+
+    def _best_effort_risk_label(
+        self,
+        bound: Binding,
+        payload: dict[str, Any],
+        number: int,
+        *,
+        expected_head_sha: str = "",
+    ) -> dict[str, Any] | None:
+        """Auto-classify and label an open agent PR inside the broker without failing the write."""
+        try:
+            req: dict[str, Any] = {"repository": payload.get("repository"), "number": number}
+            if isinstance(payload.get("cluster"), str) and payload["cluster"].strip():
+                req["cluster"] = payload["cluster"]
+            if expected_head_sha:
+                req["expected_head_sha"] = expected_head_sha
+            res = self.proposal_risk_label(req)
+            if expected_head_sha:
+                for delay in _PUBLISH_SYNC_DELAYS:
+                    codes = {
+                        r.get("code")
+                        for r in (res.get("reasons") or [])
+                        if isinstance(r, Mapping)
+                    }
+                    if "HEAD_SHA_MISMATCH" not in codes:
+                        break
+                    time.sleep(delay)
+                    res = self.proposal_risk_label(req)
+            return res
+        except Exception as exc:  # noqa: BLE001 -- never fail proposal_create or publish
+            LOGGER.warning("auto risk label skipped repo=%s number=%s: %s", bound.repo, number, str(exc)[:300])
+            return None
 
     def _practice_rules(self, payload: dict[str, Any], target: str) -> automation_rules.Rules:
         """The rules file on `target`, as `automation_rules` reads it: absent
@@ -3583,6 +5140,7 @@ WRITE_VERBS = frozenset(
         "label-ensure",
         "branch-delete",
         "proposal-practice-label",
+        "proposal-risk-label",
     }
 )
 
@@ -3611,6 +5169,7 @@ PROPOSE_VERBS = frozenset(
         "proposal-acknowledge",
         # Writes a proposal's labels, which a pipeline may merge on.
         "proposal-practice-label",
+        "proposal-risk-label",
     }
 )
 
@@ -3813,6 +5372,8 @@ VCS_VERBS = frozenset(
         "branch-delete",
         "revision-contains",
         "proposal-practice-label",
+        "proposal-classify-risk",
+        "proposal-risk-label",
     }
 )
 
@@ -3852,6 +5413,8 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "branch-delete": broker.branch_delete,
         "revision-contains": broker.revision_contains,
         "proposal-practice-label": broker.proposal_practice_label,
+        "proposal-classify-risk": broker.proposal_classify_risk,
+        "proposal-risk-label": broker.proposal_risk_label,
     }
 
 

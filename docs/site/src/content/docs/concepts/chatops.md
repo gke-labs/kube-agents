@@ -625,6 +625,8 @@ When an auto-merged fix is still broken, the post-merge check opens a pull reque
 
 A member listed in `KUBEAGENTS_DIAL_ADMINS` also gets the level's radio buttons and a **Request auto-merge** or **Stop** button for the repository shown. Everyone else sees the same lines read-only. The agent checks the presser on every change, and its one-line answer appears under the panel for the person who pressed. While a step-down's pull request is open, **Stop** answers that it is already stopping and opens nothing, and **Request auto-merge** is refused until that pull request is merged or closed.
 
+Risk-tier rules (`max_risk` in `.kube-agents/automation.yaml`) apply only to `dev` and `test` environments and obey the dial's top-level Auto-merge ceiling. They do not appear as per-kind clean-merge rows on the panel, and post-merge health tracking currently covers registered fix recipes only.
+
 ### People seen
 
 The gateway keeps a record of the people who write to it, so an install can count them. Each person who writes on Google Chat, Slack, Discord or, with the gateway's Teams backend armed, Microsoft Teams, once the gateway has verified them, has one hashed key and the time of their last turn, within an hour. A person is the identity the gateway attributes the turn to, so a principal map that folds two member IDs into one identity makes them one person. The key is derived for this record alone and matches no other pseudonym the install keeps.
