@@ -9,8 +9,14 @@ checked in the code and what was not. Nothing here is a proposal.
   renders. The broker runs it on the managed kubeconfig of the task's target cluster. The
   identity is the install's Google identity; with the scoped service account pool armed, it is
   the account that the cluster maps to. Each reaches each namespace of the cluster.
+- That path moves to `kube-proxy` (#7278, open). On `main` the proxy has a task credential
+  gate, and the worker adapter has a loopback proxy that sends `kubectl` to it. Neither is on
+  in an install: the operator renders no identity map for the proxy, so the proxy accepts no
+  token of a profile worker, and no worker pod gets the proxy's address. The operator's part of
+  #7278 turns them on and removes `kubectl` from the profile role on `/v1/exec`; it is not
+  merged. [The proxy and its gate](#the-proxy-and-its-gate) has the facts of the proxy.
 - The task credential names the target as project, location and cluster. Both verifiers refuse
-  another key.
+  another key, and both need all three.
 - The profile role reaches four routes: `/v1/exec`, the documentation relay, the audit-report
   store and the version-control verbs. The Cloud API relay is closed to the role today.
 - On `/v1/exec` the role runs `kubectl` and `gcloud` only. A flag must be on a fixed list.
@@ -54,6 +60,9 @@ checked in the code and what was not. Nothing here is a proposal.
   audit-report store. That list holds two fixed names.
 - The identity map is an environment value that the broker reads one time, at start. It is read
   strictly: an entry with a key that the broker does not know stops the broker's start.
+- The gate of `kube-proxy` is a third strict reader of the same value, beside the broker and
+  the exec tier: it accepts exactly `profile` and `tier` in an entry and does not start on
+  another key. The operator does not render the value for the proxy today.
 - Two files of the operator reach the broker with no restart and fail closed. The hold file is
   a ConfigMap of its own. The scope file is a key of the agent's config ConfigMap. Each is
   mounted as a directory, and the broker reads the file's state on each request. A file that
@@ -63,8 +72,13 @@ checked in the code and what was not. Nothing here is a proposal.
 
 ## How a change reaches each component
 
-- The broker is one pod with the `Recreate` strategy. A change of the identity map restarts it,
-  and each of its routes is down for that time.
+- The broker is one active pod. With the default and the fixed sizing profiles it has the
+  `Recreate` strategy: a change of the identity map restarts it, and each of its routes is down
+  for that time. Under `sizingProfile: auto` in-cluster it rolls with `maxSurge` 1 and
+  `maxUnavailable` 0, and the operator hands over from the active pod to a standby.
+- `kube-proxy` has two replicas and rolls one pod at a time (`maxUnavailable` 1, `maxSurge` 0).
+  Its image is the one that the operator's environment names for it. With none, it follows the
+  operator's image, and with no operator reference the agent's image.
 - The exec tier is off by default. Its Deployment is a copy of the broker's, with the identity
   map, so each exec pod holds the map of its own pod template. It rolls one pod at a time
   (`maxUnavailable` 1, `maxSurge` 0). With 2 or more replicas it stays up during a roll. At one
@@ -102,7 +116,7 @@ checked in the code and what was not. Nothing here is a proposal.
   chart refuses a render when the AgentProfile CRD lacks a field that the chart needs.
 - An apply of a CRD set does not prune. It does not change a CRD that the set does not have.
 - The operator writes a profile's card on the bus directory. The gateway reads the card with a
-  tolerant parse. A card has no field for a team profile today.
+  tolerant parse. A card has no field for a target shape today.
 - The ServiceAccount of a profile at one tier has a fixed prefix, the profile's name and the
   tier in its name, unless `spec.identity.serviceAccountName` names one. The operator refuses a
   named one with that prefix, with a reserved name, with the name of a bus principal or of
@@ -141,6 +155,85 @@ checked in the code and what was not. Nothing here is a proposal.
 - Linux limits one environment string to 128 KiB.
 - The tier page says for membership: a rollback to a release without it runs each person at
   `read` again.
+
+## The proxy and its gate
+
+- `kube-proxy` is the install's proxy in front of the Kubernetes API of each cluster. Its
+  callers today are the shell sandbox and, with the session cluster view on, the session pods.
+- For one request the proxy runs, in this order: the authentication, the split of the cluster
+  from the path, the exclusions, the holds, the classification of the request, the `Authorize`
+  hook, the verb policy, the response cache and the upstream. The hook also runs for a path
+  that is no resource.
+- The classification is the API server's own: the proxy calls the library's `RequestInfo`
+  factory. The hook gets the request, the caller, the cluster and that `RequestInfo`, with the
+  verb, the API group, the resource, the subresource, the namespace and the name.
+- The task credential gate is that hook. It gates only a caller that its identity map names. It
+  needs one credential that verifies, the pod and the pod UID of the caller's token, and the
+  profile and the tier of the caller's entry. It needs a target, and the target's cluster must
+  be the cluster of the request. It does not read the `RequestInfo` today.
+- The gate checks a credential one time, when a request starts. The worker adapter's loopback
+  proxy closes each connection that a task opened when the task ends. The loopback itself
+  checks the cluster of the path and no namespace.
+- A worker's token is for the profile audience. With the gate on, the proxy accepts that
+  audience from exactly the ServiceAccounts that the gate's identity map names, so a worker that
+  the proxy admits is a worker that the gate checks. With the gate off, or in an image from
+  before the gate, the proxy accepts no token of that audience. A caller of another audience
+  that the map does not name is not asked for a credential.
+- A task's credential for the proxy and the broker is in a file of the worker pod, for the
+  `kubectl` and `gcloud` shims; the task's processes can read it. The dispatcher sets a
+  credential's expiry from the task's deadline. After each task the worker adapter empties
+  each reset path (the working directory, `HOME`, `/tmp` and the like) and ends the worker when
+  that fails. That no process of a task outlives the task was not checked.
+- A worker pod's own connection to the bus reaches the task subjects of each task of its
+  profile. The callout's code names the change that gives each task a connection of its own
+  (#3889); it is not merged.
+- The operator renders the proxy in the mode `read-only-dry-run`. That mode admits `get`, `list`
+  and `watch`, and `create`, `update` and `patch` only with a dry run. `exec`, `attach`,
+  `portforward` and `proxy` are refused, and so is an upgraded connection. `pods/log` is a read.
+  A watch and a log follow stream.
+- The paths that are no resource and that the proxy admits, for `GET` and `HEAD`: `/api`,
+  `/apis`, `/version`, `/openapi/v2`, `/openapi/v3`, `/healthz`, `/livez`, `/readyz` and
+  `/metrics`, and by pattern the paths below `/openapi/v3`, `/api/<version>`, `/apis/<group>` and
+  `/apis/<group>/<version>`.
+- A read of Secrets returns metadata only, for each caller: the proxy asks the API server for a
+  form with no values, redacts the answer, and removes an annotation that holds a copy of the
+  Secret. A Secret subresource, an update and a patch are refused.
+- The verb policy gets no caller. A rule for one class of callers has one place, the hook.
+
+## The grant, the scope and the mint
+
+- A scope is a sequence of kind and name segments. It is well-formed when it is not empty, has
+  an even count of segments and has no empty segment. The verifier checks no kind and no
+  count.
+- The scope of a cluster target has six segments: `project/<p>/location/<l>/cluster/<c>`. The
+  gateway and the dispatcher each build it. The gateway's delegation code reads a scope as a
+  cluster scope only with exactly six segments.
+- A grant permits a scope only if the grant's scope is a prefix of it, segment by segment. So a
+  grant with more segments than the scope that is asked does not permit it.
+- The gateway gives a task its target from the card. A card with `clusterRef` gives the pin's
+  cluster. A card that declares `project`, `location` and `cluster` takes the three from the
+  task. A card with neither refuses a task that names one of the three, and gives no target.
+- The gateway reads a card with a tolerant parse and ignores a field that it does not know. It
+  refuses a parameter that the card does not declare. For a task with a target it writes the
+  three parameters itself, and the grant's scope is the cluster scope. For a task with no
+  target the grant's scope is the install's namespace.
+- The dispatcher builds the scope that it asks the capability verifier about, and the target
+  that it mints, from the three parameters of the submission. With one or two of them it
+  refuses. It reads a submission with a tolerant parse.
+- Both verifiers of the task credential refuse a key of the target that they do not know, and
+  with it the whole credential. The worker adapter reads the target for its routing with a
+  tolerant parse.
+- `allowedTiers` of an AgentProfile has four items at most. A profile has one ServiceAccount and
+  one identity entry for each of its tiers. The durables of the profiles are consumers of one
+  stream, whose allowance is 64.
+- A parameter of an AgentProfile has a name and a `required` flag only. A parameter's value has
+  no `/`, no comma and no space.
+- No code reads a namespace of a target cluster as a task's target or as a part of a grant's
+  scope. The scope of a task with no target is `namespace/<the install's namespace>`, with the
+  kind `namespace` as its first segment.
+- An interactive profile runs as a warm pool for each tier, and a pod of the pool takes one task
+  after the other. The dispatch spec says that each path that a task can write is reset between
+  two tasks, or the container restarts. The reset itself was not checked in the code.
 
 ## A pinned profile today
 
@@ -276,6 +369,13 @@ The facts have no line numbers, because they go stale. The main files for each s
 - The upgrade and the rollback: `scripts/installer/installer_common.sh`, and the upgrade page,
   the rollback page and the user-interfaces page of the site.
 - The roles and the policies: `charts/kube-agents/templates/`.
+- The proxy and its gate: `kube-proxy/taskgate/`, `k8s-api-proxy/pkg/k8sapiproxy/` with
+  `handler.go`, `authorize.go`, `policy.go` and `secrets.go`,
+  `k8s-operator/internal/controller/kube_proxy_manifests.go`, `a2a/worker-adapter/kubeproxy.go`,
+  and [`kube-proxy.md`](kube-proxy.md).
+- The grant, the scope and the mint: `a2a/capability/entry.go` and `verb.go`,
+  `a2a/gateway/profiles.go` and `delegation_chain.go`, `a2a/dispatch/admission.go` and
+  `dispatcher.go`, `a2a/taskcred/taskcred.go`, `agents/platform/scripts/task_credential.py`.
 
 ## Checked, and not checked
 
@@ -318,6 +418,33 @@ Checked in the code on `main` at `439361639`:
   CRD step of the upgrade page and the rollback page; the rollback sentence of the tier page.
 - The roles: the web console's `patch` and its policy's gate; the agent's own roles; that no
   admission policy names AgentProfiles or Tiers; the default of the PlatformAgent's webhook.
+
+Checked in the code on `main` at `5d8905f37`, for the two sections on the proxy and on the
+grant; the gate's files, the worker's credential file and reset, and the callout's grant for a
+worker pod were read again at `830912607`:
+
+- The gate: the callers that it gates, each check of a credential, and that it does not read
+  the `RequestInfo`; the two keys of an identity entry; the fields that the hook gets; the
+  prefix rule of a grant's scope and the call that applies it; the three cases of a card in the
+  gateway and the scope of each; the dispatcher's scope and target from the three parameters;
+  the strict read of the target in both verifiers; the audience that the proxy accepts from a
+  worker and its callers; the file of a task's credential; the reset after a task; the grant
+  of a worker pod's own bus connection.
+- By a second reader only: the order of the proxy's handler; the mode that the operator
+  renders and what it admits; the list of the paths that are no resource; the subresources; the
+  Secret rule; that the verb policy gets no caller; the proxy's replicas, roll and image; its
+  callers and that the operator renders no identity map for it; the loopback proxy's checks;
+  the rule for a well-formed scope; the six segments in the delegation code; the tolerant
+  parses of the card and of the submission; the tolerant read of the target in the worker
+  adapter; the limits of `allowedTiers` and of a parameter; the allowance of the stream; the
+  rollout form of the broker under `sizingProfile: auto`, from its design document.
+- #7278 and its pull requests, as GitHub showed them on 2026-11-27.
+
+Not checked for those two sections: what the library's classifier gives for a list across
+namespaces, for a cluster-scoped read, for a read of a namespace object and for each discovery
+path; what the worker adapter does with a target key that it does not know, past its routing;
+what the delegation code does with a scope of eight segments; the proxy's server wiring from
+its environment to its policy.
 
 Not checked: the behaviour of `gcloud` and `kubectl` for a kubeconfig with no default
 namespace; what each confined `gcloud` command returns; what the API server answers to a field
