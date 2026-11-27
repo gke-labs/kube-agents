@@ -2,52 +2,28 @@ package hermesbridge
 
 import (
 	"fmt"
-	"strings"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 )
 
 // An answer that is the model's own reasoning is withheld, not posted
 // (#3206, #3773). Gemini through LiteLLM sometimes writes its reasoning as
 // plain assistant content instead of a thought part, so reasoning_content is
 // empty, Hermes's tag-based think scrubber passes it through, and the bridge
-// took it as the answer. No reliable boundary marks where the reasoning ends
-// and an answer begins, so the bridge does not try to cut one out: the turn
-// ends failed with unstructuredReasoningToken, and the reason carries the
-// notice and the session, never the text. The image's
-// unstructured_reasoning_replay patch keeps such a reply out of the history
-// Hermes sends the model on later calls, which is what made it repeat; its
-// copy of the rule below is deploy/docker/patches/unstructured_reasoning.py,
-// and the two must agree.
+// took it as the answer. The rule (answerscrub.OpensWithUnstructuredReasoning),
+// the token and the notice are one shared implementation for the bridge and
+// session paths: the turn ends failed with the token, and the reason carries
+// the notice and the session, never the text.
 const (
 	// unstructuredReasoningToken is the terminal's reason token.
-	unstructuredReasoningToken = "hermes-unstructured-reasoning" // #nosec G101 -- a reason label, not a credential
-	// unstructuredReasoningWord and unstructuredReasoningSeparator spell
-	// the rule opensWithUnstructuredReasoning applies.
-	unstructuredReasoningWord      = "thought"
-	unstructuredReasoningSeparator = ":"
+	unstructuredReasoningToken = answerscrub.UnstructuredReasoningToken
 	// unstructuredReasoningNotice is what the person reads after the token.
-	// The check runs on the finished answer, after every tool call the turn
-	// made, so it says so: asking again repeats whatever the turn did.
-	unstructuredReasoningNotice = "the agent's reply was withheld because it contained unstructured model reasoning instead of an answer; " +
-		"anything the agent did during the turn has already happened, so check that before asking again"
+	unstructuredReasoningNotice = answerscrub.UnstructuredReasoningNotice
 )
 
-// opensWithUnstructuredReasoning is the rule. Three shapes have been seen: a
-// first line `thought`, a first line `thought:`, and `thought:` with the
-// reasoning on the same line ("thought:The user asked..."). So it reports
-// whether answer's first non-empty line, with its surrounding whitespace
-// dropped and compared case-insensitively, is exactly `thought` or starts with
-// `thought:`. Prose that only starts with the letters ("Thought about it",
-// "thoughts") does not match, and neither does "thought" past the first
-// non-empty line. Lines split on "\n" only, as the Python copy splits them.
+// opensWithUnstructuredReasoning is answerscrub.OpensWithUnstructuredReasoning.
 func opensWithUnstructuredReasoning(answer string) bool {
-	for _, line := range strings.Split(answer, "\n") {
-		line = strings.ToLower(strings.TrimSpace(line))
-		if line == "" {
-			continue
-		}
-		return line == unstructuredReasoningWord || strings.HasPrefix(line, unstructuredReasoningWord+unstructuredReasoningSeparator)
-	}
-	return false
+	return answerscrub.OpensWithUnstructuredReasoning(answer)
 }
 
 // unstructuredReasoningReason is the terminal message for a withheld answer:

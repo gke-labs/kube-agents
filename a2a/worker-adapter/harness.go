@@ -23,7 +23,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
@@ -37,6 +39,11 @@ const (
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
 	stderrTailBytes = 2048
+	// stderrScanBytes is how much stderr is held before the scrub, which
+	// runs on the whole window before the tail is cut to stderrTailBytes,
+	// as the bridge scrubs its tails: a value the cut would split is still
+	// whole when it's redacted.
+	stderrScanBytes = 64 << 10
 	// harnessEventDepth buffers events between the scanner goroutine and the
 	// adapter loop, so a slow publish does not stall the read that keeps the
 	// harness's stdout pipe draining.
@@ -187,7 +194,7 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 	if err != nil {
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
-	stderr := &tailBuffer{max: stderrTailBytes}
+	stderr := &tailBuffer{max: stderrScanBytes}
 	// The tail is kept for a failed turn's reason; refused tool calls the
 	// harness reports go to the worker's log as well (refusalLines).
 	cmd.Stderr = io.MultiWriter(stderr, &refusalLines{log: log})
@@ -368,7 +375,7 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		if errors.Is(serr, os.ErrClosed) {
 			serr = nil
 		}
-		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence())
+		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence(answerscrub.ScrubInline))
 	}
 	return p, nil
 }
@@ -450,14 +457,27 @@ func exitEvidence(waitErr error) string {
 }
 
 // stderrEvidence is the harness's stderr tail as a failure reason carries
-// it, or nothing when the harness wrote none. Call it after Wait, which is
-// what guarantees the tail holds everything the harness wrote.
-func (p *harnessProc) stderrEvidence() string {
-	tail := strings.TrimSpace(p.stderr.String())
+// it: the held window scrubbed whole, then cut to its last stderrTailBytes;
+// nothing when the harness wrote none. Call it after Wait, which is what
+// guarantees the window holds everything the harness wrote.
+func (p *harnessProc) stderrEvidence(scrub func(string) string) string {
+	tail := strings.TrimSpace(scrub(p.stderr.String()))
 	if tail == "" {
 		return ""
 	}
-	return stderrTailHeading + tail
+	return stderrTailHeading + lastBytes(tail, stderrTailBytes)
+}
+
+// lastBytes is s cut to its last max bytes, on a rune boundary.
+func lastBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	i := len(s) - max
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // writeUser writes one user message line onto the harness stdin. Steers

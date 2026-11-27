@@ -135,6 +135,11 @@ func overrideFor(agent *agentv1alpha1.PlatformAgent, name string) (agentv1alpha1
 	return agentv1alpha1.AgentScheduleOverride{}, false
 }
 
+// builtinSuspendAll is spec.schedules.suspendAll: every built-in no override names is suspended.
+func builtinSuspendAll(agent *agentv1alpha1.PlatformAgent) bool {
+	return agent.Spec.Schedules != nil && agent.Spec.Schedules.SuspendAll
+}
+
 // builtinRunNowSuspended reports a run-now-only built-in that an override suspends: the
 // operator then never sets its run-now, so an operator can stop it without a release.
 func builtinRunNowSuspended(agent *agentv1alpha1.PlatformAgent, row builtinSchedule) bool {
@@ -175,6 +180,9 @@ func desiredBuiltinSpec(agent *agentv1alpha1.PlatformAgent, row builtinSchedule,
 		spec.Suspend = true
 	case overridden:
 		spec.Suspend = o.Suspend
+	case builtinSuspendAll(agent):
+		// Ahead of a directly set value: the PlatformAgent says every built-in is off.
+		spec.Suspend = true
 	case existing != nil && directlySetSuspend(existing):
 		// Someone set it directly since the operator last did: it stands.
 		spec.Suspend = existing.Spec.Suspend
@@ -214,7 +222,8 @@ func directlySetSuspend(s *agentv1alpha1.AgentSchedule) bool {
 
 // builtinOverrideProblems is what the condition reports about the overrides: entries naming no
 // built-in, and entries that would unsuspend a run-now-only one. With schedules off nothing
-// renders, so no entry is reported as naming nothing.
+// renders, so no entry is reported as naming nothing. An entry naming a job in the image's cron
+// roster (imageCronJobIDs) names something: the agent pod applies it.
 func builtinOverrideProblems(agent *agentv1alpha1.PlatformAgent, rows []builtinSchedule, schedulesOn bool) (unknown, refused []string) {
 	if agent.Spec.Schedules == nil {
 		return nil, nil
@@ -226,6 +235,7 @@ func builtinOverrideProblems(agent *agentv1alpha1.PlatformAgent, rows []builtinS
 	for _, o := range agent.Spec.Schedules.Overrides {
 		row, ok := byName[o.Name]
 		switch {
+		case !ok && imageCronJob(o.Name):
 		case !ok && schedulesOn:
 			unknown = append(unknown, o.Name)
 		case ok && row.RunNowOnly && !o.Suspend:

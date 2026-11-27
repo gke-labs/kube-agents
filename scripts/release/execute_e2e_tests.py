@@ -243,7 +243,9 @@ def run_suite_tests(
     # Merge custom environment variables: YAML defaults must not override explicit workflow environment
     custom_env_vars = env.get("env_vars", {})
     kube_ctx = os.environ.get("KUBE_CONTEXT") or (f"gke_{project_id}_{region}_{cluster_name}" if (project_id and cluster_name and region) else "")
-    reg = os.environ.get("REGISTRY") or os.environ.get("REGISTRY_PREFIX") or (f"{region}-docker.pkg.dev/{project_id}/kube-agents" if (project_id and region) else "")
+    # Where the suites push the images they build. Not REGISTRY_PREFIX: that is
+    # where an environment reads published images, which it may not write.
+    reg = os.environ.get("REGISTRY") or (f"{region}-docker.pkg.dev/{project_id}/kube-agents" if (project_id and region) else "")
     env_vars = {
         **custom_env_vars,
         **os.environ,

@@ -167,9 +167,10 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   "non-detached" below mean exactly this state and its absence.
   One stop cancels the conversation's whole task tree (amended for fan-out, #5682):
   the task holding the conversation, the AgentProfile parents waiting open on it,
-  and, walking down from the chain's root through each task's children, every
-  other task of the tree the gateway hasn't seen end, a fan-out's children
-  included. Each gets a cancel on its own addressee's `…in`, is marked canceled on
+  and, walking down from the chain's root through each task's children and
+  from each child to the wake its end started (a wake may delegate again,
+  #6861), every other task of the tree the gateway hasn't seen end, a fan-out's
+  children included. The walk also starts at the stopped task itself. Each gets a cancel on its own addressee's `…in`, is marked canceled on
   its history entry, and gets its `DISPATCH_STOPS` record when it is a
   profile task; a task that keeps its own line on its history entry (a batch child,
   a delegating turn) has it closed on "🛑 stopped". A task that has already ended is
@@ -620,8 +621,8 @@ by the `chat` profile's own deadline, and the executors it delegates to run to t
 two do not nest. When the session delegates, its turn completes with a reply that says so
 ("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
 thread as it does for any task, and the child's terminal wakes the session for one more turn
-with the child's result as its input, so the session can synthesize it (the wake can't delegate
-again; below). A follow-up
+with the child's result as its input, so the session can synthesize it (whether the wake may delegate
+again is the gateway's call; below). A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
 today: the platform executor queues each one and answers it after the current turn (on its
 `api` executor; the `cli` executor refuses it `no-resume`), and
@@ -733,14 +734,7 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
-`A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
-off by its adapter for each task whose authority block carries `via`, which only a wake's does
-and only the gateway can publish. A wake that could delegate read an interim answer such as "still
-checking, the results will post here" as a reason to ask again, and each ask woke another pod
-until the depth bound refused, with nothing answered. A message the person sends while the wake
-runs steers the wake like any other running turn, so it is answered without the tool as well. A
-question sent after the wake answers is a new human turn and has the tool.
+running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. Since #6861 a session wake may delegate again, within the depth bound. The gateway grants it only when the wake is in a session's chain and not below a schedule, its depth is under `A2A_DELEGATION_DEPTH_MAX`, and no Cluster Agent card report is still to come. The grant is `delegate: true` on the wake's `via`, which only the gateway can publish. A pod spawned for a granted wake gets the delegate tool, and a pod that serves every turn keeps it for that task. The granted wake's guide says not to delegate again for anything the result says is still running or will follow, only for a different next step, such as a change the result didn't make. Every other wake runs without the tool: a pod spawned for one gets `A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn turns it off for any task whose `via` lacks the grant. Its guide says it can't delegate on this turn, and the gateway refuses a delegation from it anyway (`delegation.wake`). A wake that could delegate on any interim answer such as "still checking, the results will post here" asked again, and each ask woke another pod until the depth bound refused, with nothing answered (#2819). A wake's delegations are held to the depth and width bounds like any turn's. A message the person sends while the wake runs steers the wake like any other running turn. A question sent after the wake answers is a new human turn and has the tool.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain
@@ -1041,7 +1035,7 @@ the capability check, its own consumer on its own `…in` subject for steering a
 deadline and its own terminal. The harness is started again for each task with
 `--resume <session id>`, the id the previous run reported, so the model has the conversation
 without a primer; the primer goes to the first harness run only. The delegate tool is decided per
-task as well: off for a wake (see "The wake" above). SIGTERM while the shim is idle exits 0 with
+task as well: off for a wake the gateway didn't let delegate again, on for one it did (see "The wake" above). SIGTERM while the shim is idle exits 0 with
 nothing published; mid-task it is that task's eviction, as before. A harness run that reports no
 session, or a task that ended without its terminal reaching the bus, ends the process instead of
 waiting for the next task: the pod reaches a terminal phase, Sweep closes what is owed, and the

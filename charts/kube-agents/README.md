@@ -1860,7 +1860,10 @@ helm uninstall kube-agents -n kubeagents-system
   (CI enforces this via `make chart-check`). `make chart-check` also renders
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
-  (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+  (`hack/check_chart_webhooks.py`); fix that one by editing the template. It
+  also renders the chart across its feature-toggle value sets and fails if any
+  rendered YAML document repeats a mapping key
+  (`tests/test_chart_no_duplicate_keys.py`).
 - `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
   operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`

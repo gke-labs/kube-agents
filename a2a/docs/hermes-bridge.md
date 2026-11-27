@@ -532,7 +532,10 @@ it contained unstructured model reasoning instead of an answer; anything the age
 turn has already happened, so check that before asking again[; session: <id>][; turn: N]`, and the
 bridge logs a warning with the task, session and answer size, never the text. That holds when a
 cancel raced the end of the turn too: a withheld answer ends `failed`, not `completed`. The rule is
-`opensWithUnstructuredReasoning` in `reasoning_leak.go`. The image patch
+`OpensWithUnstructuredReasoning` in `a2a/lib/answerscrub` (`reasoning.go`), one shared
+implementation for the bridge and session paths: the session front door's worker-adapter withholds
+such an answer with the same reason and the harness session, publishes no assistant text block
+that opens that way as progress, and attaches none as a failure's partial output. The image patch
 `apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
 model on later calls. On the API executor one more guard follows the answer: a reply that names a card
 or task id (`t_` and eight hex characters) when the turn's prompt, the user's words, names no task,
@@ -723,7 +726,9 @@ The answer stays on `TASKS`, because the gateway delivers it from there, so the 
 shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
 published (`scrubAnswer` in `answer_scrub.go`, over `answerscrub.Scrub` in `a2a/lib/answerscrub`,
 #5280). That covers the `result` artifact and the chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
-answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
+answer. The scrub is one shared implementation for the bridge and session paths: the session front
+door's worker-adapter keeps the same per-task set, fed from the tool results the harness reports,
+and scrubs its `result` artifact, its `progress` text and a failed terminal's partial output. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
 a failed CLI run's stdout and stderr tails, and an API error's body or error tail. Each is
 scrubbed before it is cut to its tail: the CLI executor keeps the last 64 KiB of each stream
 (`failureScrubWindowBytes`), scrubs that, then keeps 2 KiB, so a private key whose header is
@@ -959,7 +964,7 @@ task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. 
 unmatched deliveries are answered 204 and dropped.
 
 What goes on the bus, one `data` part per invocation at `post_tool_call`, a superset of the
-worker adapter's `{"tool","input"}` so one fold reads both executors:
+worker adapter's `{"tool","title"}` so one fold reads both executors:
 
 ```json
 {

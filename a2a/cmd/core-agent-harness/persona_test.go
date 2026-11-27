@@ -148,8 +148,14 @@ func TestALoadedSkillNamesItsBaseDirectory(t *testing.T) {
 		if !strings.HasPrefix(text, skillBaseDirPrefix+base+"\n") {
 			t.Errorf("%s: instructions don't open with its base directory", s.Name)
 		}
-		// A skill with scripts lists each by its absolute path, the form the
-		// shell runs.
+		// A skill with scripts lists each by its absolute path. A persona
+		// that ships scripts grants the shell, which runs any command, so
+		// the note tells the model nothing is refused that the shell would
+		// in fact run (an interpreter in front of a script, for one).
+		header, _, _ := strings.Cut(text, "\n\n")
+		if strings.Contains(header, "refused") || strings.Contains(header, "python3") {
+			t.Errorf("%s: the skill's header tells the model a command is refused: %q", s.Name, header)
+		}
 		for _, f := range s.Files {
 			if f.Executable && !strings.Contains(text, "- "+filepath.Join(base, f.Path)+"\n") {
 				t.Errorf("%s: script %s isn't listed by its absolute path", s.Name, f.Path)
