@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The ``post_merge_outcome`` verifier: merge, apply, ticks, record and comment, with every outside call faked.
+"""The ``post_merge_outcome`` verifier: merge, sync wait, ticks, record and comment, with every outside call faked.
 
 The two in-pod reads run here for real, against a local SQLite file and a
 local jobs.json, through ``sh -c`` in place of ``kubectl exec``.
@@ -31,7 +31,7 @@ from devops_bench.verification.spec import parse_node
 from kube_agents_bench import fleet, forges, onboarding, post_merge, transcript
 
 PR = "https://github.com/gke-agentic/pool-infra/pull/7"
-MANIFEST = "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata: {name: checkout-gateway}\n"
+MANIFEST = "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata: {name: order-ledger-pdb}\n"
 
 
 REAL_RUN = subprocess.run
@@ -76,16 +76,19 @@ class Forge:
         self.merge_status = merge_status
         self.comments = comments if comments is not None else []
         self.writes: list[tuple[str, str]] = []
+        self.reverted = False
 
     def write(self, method, url, token, body):
         self.writes.append((method, url))
+        if method == "DELETE" and url.endswith("order-ledger-pdb.yaml"):
+            self.reverted = True
         if url.endswith("/merge"):
             return self.merge_status, {"message": "nope"} if self.merge_status != 200 else {"merged": True}
         return 200, {}
 
     def get(self, url, token, timeout):
         if "/files" in url:
-            return 200, [{"filename": "clusters/seeded-a/seeded-reliability/checkout-gateway-pdb.yaml",
+            return 200, [{"filename": "clusters/seeded-a/seeded-post-merge/order-ledger-pdb.yaml",
                           "status": "added", "patch": "@@ -0,0 +1,3 @@\n+" + MANIFEST.rstrip("\n").replace("\n", "\n+")}
                          ] + self.extra_files
         if "/comments" in url:
@@ -100,7 +103,7 @@ class Forge:
 @pytest.fixture
 def world(pod, monkeypatch):
     forge = Forge()
-    applied: list[str] = []
+    reads: list[str] = []
     ticks: list[str] = []
     monkeypatch.setenv(post_merge.WRITE_TOKEN_ENV, "w-token")
     monkeypatch.setattr(forges, "read_token", lambda forge_name, environ=None: "r-token")
@@ -108,9 +111,22 @@ def world(pod, monkeypatch):
     monkeypatch.setattr(transcript, "get", lambda: SimpleNamespace(started_at=1.0, final_message=f"ledger, {PR}"))
     monkeypatch.setattr(post_merge, "_github_write", forge.write)
     monkeypatch.setattr(post_merge, "_forge_get_json", forge.get)
-    monkeypatch.setattr(post_merge, "_apply", lambda text, kubeconfig: applied.append(text) or (True, ""))
+
+    def reconciler(text, kubeconfig):
+        """Config Sync, faked: the merged budget appears after `sync_after` reads and goes after `prune_after`."""
+        reads.append(text)
+        merged = any(url.endswith("/merge") for _, url in forge.writes)
+        if not merged:
+            return False, ""
+        world.sync_reads += 1
+        return world.sync_reads > world.sync_after, ""
+
+    monkeypatch.setattr(post_merge, "_present", reconciler)
     monkeypatch.setattr(fleet, "kubeconfig_for_role", lambda role, directory=None: "/tmp/kc")
     monkeypatch.setattr(post_merge, "TICK_INTERVAL_SEC", 0.0)
+    # The sync and prune waits poll without sleeping and give up within a blink.
+    monkeypatch.setattr(post_merge, "SYNC_POLL_SEC", 0.0)
+    monkeypatch.setattr(post_merge, "SYNC_DEADLINE_SEC", 0.05)
     monkeypatch.setattr(post_merge.time, "sleep", lambda s: None)
     monkeypatch.setattr(subprocess, "run", _no_kubectl(subprocess.run))
 
@@ -122,7 +138,8 @@ def world(pod, monkeypatch):
             return f"tick\n{post_merge.TICK_READ} 0\n"
         return _local(script, timeout)
 
-    world = SimpleNamespace(forge=forge, applied=applied, ticks=ticks, pod=pod, on_tick=None)
+    world = SimpleNamespace(forge=forge, reads=reads, ticks=ticks, pod=pod, on_tick=None,
+                            sync_after=0, sync_reads=0)
     monkeypatch.setattr(onboarding, "agent_shell", shell)
     return world
 
@@ -171,13 +188,13 @@ def test_report_needs_a_phrase():
         _verifier(report="report")
 
 
-def test_report_merges_applies_ticks_and_passes_on_one_marked_comment(world):
+def test_report_merges_waits_for_the_sync_ticks_and_passes_on_one_marked_comment(world):
     world.forge.comments = [MARKED, "an unrelated comment"]
     world.on_tick = lambda n: n == 3 and _set_record(world.pod.db, outcome="verified_fixed", reported_at="2026-11-18")
     result = _verifier(report="report", comment_phrase="Verified fixed").verify(0)
     assert result.status == "pass", result.reason
     assert len(world.ticks) == 3
-    assert world.applied == [MANIFEST]
+    assert set(world.reads) == {MANIFEST}
     methods = [m for m, _ in world.forge.writes]
     assert methods[0] == "PUT" and world.forge.writes[0][1].endswith("/pulls/7/merge")
     # The merged pull request loses its audit labels, so the next audit does not bind it to the
@@ -187,18 +204,13 @@ def test_report_merges_applies_ticks_and_passes_on_one_marked_comment(world):
     assert methods[-1] == "DELETE" and "/contents/clusters/seeded-a/" in world.forge.writes[-1][1]
 
 
-def test_cleanup_restores_a_modified_file_and_survives_a_kubectl_failure(world, monkeypatch):
+def test_cleanup_restores_a_modified_file(world, monkeypatch):
     world.forge.extra_files = [{"filename": "clusters/seeded-a/kustomization.yaml", "status": "modified"}]
     monkeypatch.setattr(post_merge, "DRIVE_DEADLINE_SEC", 0.0)
-
-    def broken_kubectl(argv, *args, **kwargs):
-        raise subprocess.TimeoutExpired(argv, 1)
-
-    monkeypatch.setattr(subprocess, "run", broken_kubectl)
     _verifier().verify(0)
     writes = world.forge.writes
     contents = [(m, url) for m, url in writes if "/contents/" in url]
-    assert contents[0][0] == "DELETE" and contents[0][1].endswith("checkout-gateway-pdb.yaml")
+    assert contents[0][0] == "DELETE" and contents[0][1].endswith("order-ledger-pdb.yaml")
     assert contents[1][0] == "PUT" and contents[1][1].endswith("/contents/clusters/seeded-a/kustomization.yaml")
 
 
@@ -243,7 +255,8 @@ def test_an_unscheduled_cron_job_fails(world):
         (lambda w, mp: setattr(w.forge, "merge_status", 403), "403"),
         (lambda w, mp: mp.setattr(transcript, "get", lambda: SimpleNamespace(started_at=1.0, final_message="no url")),
          "names 0 pull requests"),
-        (lambda w, mp: mp.setattr(post_merge, "_apply", lambda t, k: (False, "denied")), "denied"),
+        (lambda w, mp: mp.setattr(post_merge, "_present", lambda t, k: (None, "Forbidden")), "Forbidden"),
+        (lambda w, mp: setattr(w, "sync_after", 10**6), "did not apply"),
     ],
 )
 def test_setup_failures_are_errors_not_fails(world, monkeypatch, setup, why):
@@ -266,12 +279,66 @@ def test_a_bad_role_name_fails_at_load():
         _verifier(apply_fixture_role="No_Such Role")
 
 
-def test_a_failed_apply_after_the_merge_still_unlabels_and_restores(world, monkeypatch):
-    monkeypatch.setattr(post_merge, "_apply", lambda text, kubeconfig: (False, "denied"))
-    assert _verifier().verify(0).status == "error"
+def test_a_sync_that_never_lands_still_unlabels_and_reverts(world):
+    world.sync_after = 10**6
+    result = _verifier().verify(0)
+    assert result.status == "error" and "the reconciler did not apply" in result.reason
     writes = [(m, url.rsplit("/", 1)[1]) for m, url in world.forge.writes]
     assert ("DELETE", "audit%3Aremediation") in writes
-    assert ("DELETE", "checkout-gateway-pdb.yaml") in writes
+    assert ("DELETE", "order-ledger-pdb.yaml") in writes
+
+
+def test_the_harness_writes_nothing_to_the_cluster_and_waits_for_the_sync(world, monkeypatch):
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, *a, **kw: calls.append(argv) or REAL_RUN(argv, *a, **kw))
+    world.sync_after = 3
+    world.on_tick = lambda n: _set_record(world.pod.db, outcome="verified_fixed")
+    result = _verifier().verify(0)
+    assert result.status == "pass", result.reason
+    assert world.sync_reads == 4, "three reads before Config Sync applied the merge, then the one that saw it"
+    assert not [argv for argv in calls if argv and argv[0] == "kubectl"]
+
+
+def test_cleanup_reverts_the_branch_and_reads_the_cluster_no_more(world, monkeypatch):
+    # The setup stack's destroy restores the budget and waits for it; the
+    # check's cleanup only puts the branch back.
+    monkeypatch.setattr(post_merge, "DRIVE_DEADLINE_SEC", 0.0)
+    _set_record(world.pod.db, outcome="verified_fixed")
+    _verifier().verify(0)
+    reads_at_verify = len(world.reads)
+    assert world.forge.reverted and reads_at_verify == world.sync_reads
+
+
+def test_a_poll_after_a_sync_wait_ran_out_waits_again_and_never_merges_twice(world):
+    world.sync_after = 10**6
+    verifier = _verifier()
+    assert verifier._merge_and_apply(5)[0] == "error"
+    world.sync_after = 0
+    assert verifier._merge_and_apply(5)[0] == "pass"
+    assert len([url for _, url in world.forge.writes if url.endswith("/merge")]) == 1
+
+
+@pytest.mark.parametrize(
+    "returncode, stdout, want",
+    [(0, "poddisruptionbudget.policy/order-ledger-pdb\n", True), (0, "", False), (1, "", None)],
+)
+def test_present_reads_the_objects_with_kubectl_get(monkeypatch, returncode, stdout, want):
+    seen = []
+
+    def run(argv, *args, **kwargs):
+        seen.append((argv, kwargs.get("input")))
+        return subprocess.CompletedProcess(argv, returncode, stdout, "Forbidden" if returncode else "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert post_merge._present(MANIFEST, "/tmp/kc")[0] is want
+    argv, given = seen[0]
+    assert argv[:4] == ["kubectl", "--kubeconfig", "/tmp/kc", "get"] and given == MANIFEST
+
+
+def test_present_reads_some_of_several_objects_as_neither(monkeypatch):
+    two = MANIFEST + "---\n" + MANIFEST.replace("order-ledger-pdb", "other-pdb")
+    monkeypatch.setattr(subprocess, "run", lambda argv, *a, **kw: subprocess.CompletedProcess(argv, 0, "pdb/a\n", ""))
+    assert post_merge._present(two, "/tmp/kc") == (None, "1 of 2 objects on the cluster")
 
 
 def test_an_unreadable_jobs_file_is_an_error(world):
@@ -334,3 +401,59 @@ def test_the_tick_runs_the_cron_script_under_the_jobs_lock(tmp_path, monkeypatch
     held.close()
     runner.join(30)
     assert "ticked" in out[0] and f"{post_merge.TICK_READ} 3" in out[0]
+
+
+SYNCED = {"synced_directory": "clusters/*-a/seeded-post-merge", "synced_namespace": "seeded-post-merge"}
+
+
+def test_a_fix_in_the_synced_directory_and_namespace_merges(world, monkeypatch):
+    good = MANIFEST.replace("metadata: {name: order-ledger-pdb}", "metadata: {name: order-ledger-pdb, namespace: seeded-post-merge}")
+    monkeypatch.setattr(post_merge, "_added_file_text", lambda entry: good)
+    assert _verifier(**SYNCED)._merge_and_apply(5)[0] == "pass"
+
+
+def test_a_fix_outside_the_synced_directory_fails_before_any_merge(world, monkeypatch):
+    real_get = world.forge.get
+
+    def get(url, token, timeout):
+        if "/files" in url:
+            return 200, [{"filename": "clusters/seeded-a/seeded-reliability/order-ledger-pdb.yaml", "status": "added", "patch": "@@"}]
+        return real_get(url, token, timeout)
+
+    monkeypatch.setattr(post_merge, "_forge_get_json", get)
+    monkeypatch.setattr(post_merge, "_added_file_text", lambda entry: MANIFEST)
+    status, reason = _verifier(**SYNCED)._merge_and_apply(5)
+    assert status == "fail" and "outside clusters/*-a/seeded-post-merge" in reason
+    assert not any(url.endswith("/merge") for _, url in world.forge.writes)
+
+
+def test_a_fix_in_another_namespace_fails_before_any_merge(world, monkeypatch):
+    wrong = MANIFEST.replace("metadata: {name: order-ledger-pdb}", "metadata: {name: order-ledger-pdb, namespace: seeded-reliability}")
+    monkeypatch.setattr(post_merge, "_added_file_text", lambda entry: wrong)
+    status, reason = _verifier(**SYNCED)._merge_and_apply(5)
+    assert status == "fail" and "'seeded-reliability'" in reason
+    assert not any(url.endswith("/merge") for _, url in world.forge.writes)
+
+
+@pytest.mark.parametrize(
+    "path, text, why",
+    [
+        ("clusters/other/seeded-a/seeded-post-merge/b.yaml", "kind: PodDisruptionBudget\nmetadata: {namespace: seeded-post-merge}\n", "outside"),
+        ("clusters/seeded-a/seeded-post-merge/b.yaml", "# only a comment\n---\n", "declares no object"),
+        ("clusters/seeded-a/seeded-post-merge/b.yaml", "kind: PodDisruptionBudget\nmetadata: order-ledger-pdb\n", "namespace '(none)'"),
+    ],
+)
+def test_a_fix_the_reconciler_cannot_apply_fails_and_never_crashes(world, monkeypatch, path, text, why):
+    real_get = world.forge.get
+
+    def get(url, token, timeout):
+        if "/files" in url:
+            return 200, [{"filename": path, "status": "added", "patch": "@@"}]
+        return real_get(url, token, timeout)
+
+    monkeypatch.setattr(post_merge, "_forge_get_json", get)
+    monkeypatch.setattr(post_merge, "_added_file_text", lambda entry: text)
+    status, reason = _verifier(**SYNCED)._merge_and_apply(5)
+    assert status == "fail" and why in reason
+    assert not any(url.endswith("/merge") for _, url in world.forge.writes)
+

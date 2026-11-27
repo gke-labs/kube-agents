@@ -18,5 +18,10 @@
     "address": "terraform_data.orphan_snapshots",
     "why": "the orphaned-snapshot fixtures' planter (main.tf) is replaced whenever orphan_snapshot.py, the source disk's name or a snapshot name changes, on every plan whose probe reads a snapshot missing or the source disk present (the probe stamps such a reading with its time, so a recurrence is never read as the stored trigger), or after a failed run taints it; the resource holds no state of its own, and the replace re-runs orphan_snapshot.py, which takes only a snapshot that is missing, deletes only disks of the throwaway source's name, in any zone, and never touches an existing snapshot, so a re-run does not restart the check's 91-day clock; the run after a repair plans one more replace, a no-op, when the probe reads the repaired state",
     "standing": true
+  },
+  {
+    "address": "terraform_data.post_merge_repo_sync",
+    "why": "the seeded-post-merge RepoSync's writer (post-merge-sync.tf) is replaced whenever repo_sync.py or the RepoSync's spec changes, seeded-a is re-created (its CA certificate is a trigger), or a failed run taints it; the resource holds no state of its own, and the replace re-runs repo_sync.py, a server-side apply that is safe to repeat",
+    "standing": true
   }
 ]

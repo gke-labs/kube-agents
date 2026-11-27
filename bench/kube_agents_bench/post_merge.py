@@ -1,4 +1,4 @@
-"""The ``post_merge_outcome`` verifier: merge the agent's fix, play the reconciler, read the outcome.
+"""The ``post_merge_outcome`` verifier: merge the agent's fix, wait for the reconciler, read the outcome.
 
 The post-merge check (design gke-labs/kube-agents#5054) runs in the agent pod
 on a five-minute tick. Once a fix pull request the install opened merges, it
@@ -7,17 +7,19 @@ re-runs the audit's check and stores one outcome in Session KV's
 ``post_merge_records`` table. Under ``KUBEAGENTS_POST_MERGE_CHECK=report`` it
 also comments once on the pull request, ending the comment with a hidden marker.
 
-Nobody merges an agent's pull request inside a run, and the eval GitOps
-repositories have no reconciler, so this check does both, then drives the
-ticks itself rather than waiting on the five-minute cron. On its first poll it:
+Nobody merges an agent's pull request inside a run, so this check merges it,
+then drives the ticks itself rather than waiting on the five-minute cron. It
+applies nothing: the fixture role's cluster runs a reconciler (Config Sync on
+the seeded fleet's post-merge fixture, bench/tf/fleet/post-merge-sync.tf) that
+applies the merge, as a customer's does. On its first poll it:
 
 1. finds the one pull request the run's reply names, under ``owner``;
 2. merges it with the harness's write token (:data:`WRITE_TOKEN_ENV`), never
    the agent's;
-3. applies every manifest the pull request adds to the cluster carrying
-   ``apply_fixture_role``, as a reconciler would. No reconciler names the merge
-   commit, so the check's apply step sees the object the fix adds instead.
-   Reconciler matching is covered by ``post_merge_check``'s unit tests;
+3. waits, up to :data:`SYNC_DEADLINE_SEC`, until every object the pull
+   request's added manifests declare is on the cluster carrying
+   ``apply_fixture_role``, read with that role's read-only kubeconfig. A sync
+   that never lands is an error: it says nothing about the agent;
 4. runs ``post_merge_check.py`` (the cron job's own entry, no arguments) in
    the agent container every :data:`TICK_INTERVAL_SEC` until the record has an
    outcome or :data:`DRIVE_DEADLINE_SEC` (15 minutes) passes. The fix's own health window
@@ -42,9 +44,9 @@ the check passes when that outcome is ``outcome`` and the report matches
 - ``report``: exactly one comment carries both ``comment_phrase`` and the marker.
 
 A different outcome or report is a fail. A pod, record or forge that cannot be read is ``status="error"``.
-Setting up (no reply URL, no write token, a merge GitHub refuses, a manifest that
-does not apply) is an error too, because none of them says anything about the
-agent.
+Setting up (no reply URL, no write token, a merge GitHub refuses, a merge the
+reconciler does not apply in time) is an error too, because none of them says
+anything about the agent.
 """
 
 from __future__ import annotations
@@ -113,7 +115,13 @@ FILES_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 5
 COMMENT_PAGE_SIZE = 100
 HTTP_TIMEOUT_SEC = 30.0
-APPLY_TIMEOUT_SEC = 120.0
+#: One ``kubectl get`` of the added objects.
+READ_TIMEOUT_SEC = 60.0
+#: How long the reconciler has to apply the merge: Config Sync polls the
+#: branch every 15 s (post-merge-sync.tf) and applies within a minute of a
+#: commit it sees; this leaves room for a reconciler that restarts once.
+SYNC_DEADLINE_SEC = 300.0
+SYNC_POLL_SEC = 10.0
 
 _READ_SCRIPT = r"""
 import json, os, sqlite3, sys
@@ -236,15 +244,31 @@ def _github_write(method: str, url: str, token: str, body: dict) -> tuple[int, A
         return 0, {"message": str(exc)}
 
 
-def _apply(manifest: str, kubeconfig: str) -> tuple[bool, str]:
+def _present(manifest: str, kubeconfig: str) -> tuple[bool | None, str]:
+    """Whether every object ``manifest`` declares is on the cluster (True) or none is (False); None, why when unread.
+
+    A read, never a write: ``kubeconfig`` is the fixture role's, which may not write.
+    Some but not all present is None, with the count: neither synced nor pruned.
+    """
+    import yaml
+
+    try:
+        wanted = sum(1 for doc in yaml.safe_load_all(manifest) if doc)
+    except yaml.YAMLError as exc:
+        return None, f"the manifest is not YAML: {exc}"
     try:
         done = subprocess.run(
-            ["kubectl", "--kubeconfig", kubeconfig, "apply", "-f", "-"],
-            input=manifest, capture_output=True, text=True, timeout=APPLY_TIMEOUT_SEC, check=False,
+            ["kubectl", "--kubeconfig", kubeconfig, "get", "--ignore-not-found", "-o", "name", "-f", "-"],
+            input=manifest, capture_output=True, text=True, timeout=READ_TIMEOUT_SEC, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    return done.returncode == 0, (done.stderr or done.stdout).strip()[-300:]
+        return None, str(exc)
+    if done.returncode != 0:
+        return None, (done.stderr or done.stdout).strip()[-300:]
+    found = len([line for line in done.stdout.splitlines() if line.strip()])
+    if found == wanted:
+        return True, ""
+    return (False, "") if found == 0 else (None, f"{found} of {wanted} objects on the cluster")
 
 
 @VERIFIERS.register("post_merge_outcome")
@@ -259,8 +283,14 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
     report: Literal["silent", "report"] = "silent"
     # Under `report`, text the one comment must carry beside the marker.
     comment_phrase: str = ""
-    # The fixture role whose cluster plays the reconciler's target.
+    # The fixture role whose cluster runs the reconciler that applies the merge.
     apply_fixture_role: str = Field(min_length=1)
+    # Where the reconciler applies from, a glob on the added file's directory
+    # (`clusters/*-a/seeded-post-merge` covers a dev fleet's `<prefix>-a`),
+    # and the one namespace it applies to. A fix outside either is a graded
+    # fail before any merge. Empty skips the check.
+    synced_directory: str = ""
+    synced_namespace: str = ""
     # The fix recipe the case grades: the record's `kind`, a directory under
     # agents/platform/scripts/fix_recipes/ whose recipe.yaml names this case.
     recipe: str = Field(min_length=1)
@@ -289,7 +319,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
 
     _merged: tuple[str, str, int] | None = PrivateAttr(default=None)
     _ticks: list[str] = PrivateAttr(default_factory=list)
-    # What the merge put on the default branch and the apply put on the
+    # What the merge put on the default branch and the reconciler on the
     # cluster, for _clean_up: the pool's fixture must read as unbudgeted again.
     _added: list[tuple[str, str]] = PrivateAttr(default_factory=list)
     _repo: tuple[str, str] | None = PrivateAttr(default=None)
@@ -305,24 +335,18 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             self._clean_up()
 
     def _clean_up(self) -> None:
-        """Best effort, every step on its own: delete what was applied, then put the default branch back.
+        """Best effort, every step on its own: unlabel the merged pull request and put the default branch back.
 
-        Without it the next audit on this pool project finds checkout-gateway
-        budgeted, declared and live, and every no-pdb case after it goes red.
         Each file the pull request touched goes back to its content at the
         pull request's base: an added file is deleted, a modified or removed
-        one is written back. A step that fails is logged and the rest still run.
+        one is written back. Nothing here writes to the cluster. The fixture's
+        steady state, the budget merged and applied, is the case's setup
+        stack's to restore (bench/tf/prebuilt/post-merge-sync-budget), at its
+        destroy, which runs after this. A step that fails is logged and the
+        rest still run.
         """
         import os
 
-        for _, text in self._added if self._kubeconfig else []:
-            try:
-                subprocess.run(
-                    ["kubectl", "--kubeconfig", self._kubeconfig, "delete", "--ignore-not-found", "-f", "-"],
-                    input=text, capture_output=True, text=True, timeout=APPLY_TIMEOUT_SEC, check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                logger.warning("post_merge_outcome: could not delete an applied manifest: %s", exc)
         token = (os.environ.get(WRITE_TOKEN_ENV) or "").strip()
         if not token or self._repo is None:
             return
@@ -442,7 +466,71 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
                 return
             time.sleep(TICK_INTERVAL_SEC)
 
+    def _wait_for_sync(self) -> str:
+        """Polls until every added manifest's objects are all on the cluster; "" then, else why not.
+
+        Before the merge the case's setup stack has taken the budget off the
+        branch and waited for the prune, so an object seen here is the merge's.
+        """
+        deadline = time.monotonic() + SYNC_DEADLINE_SEC
+        while True:
+            why = ""
+            for path, text in self._added:
+                state, err = _present(text, self._kubeconfig)
+                if state is not True:
+                    why = err or f"{path} is not on the cluster"
+                    break
+            if not why or time.monotonic() + SYNC_POLL_SEC > deadline:
+                return why
+            time.sleep(SYNC_POLL_SEC)
+
+    def _outside_the_sync(self) -> str:
+        """Why an added manifest is not one the reconciler applies; "" when every one is.
+
+        A file outside ``synced_directory`` is applied by nothing, and an object
+        in another namespace is refused by the RepoSync: either way the merge
+        would wait out the sync deadline and report the infrastructure, when it
+        is the fix that went to the wrong place.
+        """
+        import fnmatch
+
+        import yaml
+
+        for path, text in self._added:
+            directory = path.rpartition("/")[0]
+            # fnmatch's `*` crosses `/`, so the depth is compared as well.
+            if self.synced_directory and (
+                directory.count("/") != self.synced_directory.count("/")
+                or not fnmatch.fnmatchcase(directory, self.synced_directory)
+            ):
+                return f"{path} is outside {self.synced_directory}, the directory the reconciler applies"
+            try:
+                docs = [doc for doc in yaml.safe_load_all(text) if doc]
+            except yaml.YAMLError as exc:
+                return f"{path} is not YAML the reconciler can apply: {exc}"
+            if not docs:
+                return f"{path} declares no object for the reconciler to apply"
+            if not self.synced_namespace:
+                continue
+            for doc in docs:
+                metadata = doc.get("metadata") if isinstance(doc, dict) else None
+                namespace = str((metadata if isinstance(metadata, dict) else {}).get("namespace") or "")
+                if namespace != self.synced_namespace:
+                    return f"{path} puts an object in namespace {namespace or '(none)'!r}, not {self.synced_namespace!r}"
+        return ""
+
+    def _await_sync(self) -> tuple[VerificationStatus, str]:
+        owner, repo = self._repo
+        why = self._wait_for_sync()
+        if why:
+            return "error", f"the reconciler did not apply {owner}/{repo}#{self._number} within {SYNC_DEADLINE_SEC:.0f}s: {why}"
+        self._merged = (owner, repo, self._number)
+        return "pass", ""
+
     def _merge_and_apply(self, timeout: float) -> tuple[VerificationStatus, str]:
+        if self._repo is not None:
+            # Merged on an earlier poll whose sync wait ran out: wait again, never merge again.
+            return self._await_sync()
         snap = transcript.get()
         if snap is None:
             return "error", _NO_TRANSCRIPT_REASON
@@ -489,7 +577,12 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
             if len(files) < FILES_PAGE_SIZE:
                 break
         if not self._added:
-            return "error", f"{owner}/{repo}#{number} adds no manifest to apply"
+            return "error", f"{owner}/{repo}#{number} adds no manifest for the reconciler to apply"
+        outside = self._outside_the_sync()
+        if outside:
+            # The agent's fix went where no reconciler applies it: the run's
+            # outcome, so a fail, and nothing is merged.
+            return "fail", f"{owner}/{repo}#{number} is not a fix the reconciler can apply: {outside}"
         status, payload = _github_write("PUT", f"{api}/merge", write_token, {"merge_method": "squash"})
         if status not in (200, 405):
             return "error", f"GitHub answered {status} to merging {owner}/{repo}#{number}: {(payload or {}).get('message')}"
@@ -501,12 +594,7 @@ class PostMergeOutcomeVerifier(_OnboardingPollVerifier):
         self._repo = (owner, repo)
         self._number = number
         self._kubeconfig = kubeconfig
-        for _, manifest in self._added:
-            ok, why = _apply(manifest, self._kubeconfig)
-            if not ok:
-                return "error", f"applying {owner}/{repo}#{number}'s manifest failed: {why}"
-        self._merged = (owner, repo, number)
-        return "pass", ""
+        return self._await_sync()
 
     def _marked_comments(self, owner: str, repo: str, number: int, timeout: float) -> tuple[int, str]:
         token = forges.read_token(forges.FORGE_GITHUB) or ""

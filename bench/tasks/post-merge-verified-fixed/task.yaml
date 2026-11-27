@@ -16,31 +16,49 @@
 # WHAT THE HARNESS PLAYS. post_merge_outcome (bench/kube_agents_bench/
 # post_merge.py) merges the agent's pull request with a token the ledger App
 # mints for the job's GitOps repository (hack/ci-eval-pr.sh), because nothing
-# merges inside a run; applies the manifest the pull request adds to the
-# seeded cluster, because the pool repositories have no reconciler; and runs
-# the `post-merge-check` cron job's script back to back in the agent container
-# rather than waiting on its five-minute schedule. The schedule itself is
-# graded: the check requires the job in the platform profile's jobs.json. No
-# reconciler names the merge commit, so the apply is confirmed by observing
-# the budget; reconciler matching is post_merge_check's unit tests' to cover.
-# Afterwards the check deletes the budget from the cluster and the merged file
-# from the default branch, so the pool's no-pdb fixture reads unbudgeted again.
+# merges inside a run; waits, up to five minutes, for Config Sync on the
+# fixture's cluster to apply the budget, as observed by the budget appearing
+# (bench/tf/fleet/post-merge-sync.tf); and runs the `post-merge-check` cron
+# job's script back to back in the agent container rather than waiting on its
+# five-minute schedule. The schedule itself is graded: the check requires the
+# job in the platform profile's jobs.json. The harness writes nothing to the
+# cluster. Afterwards it reverts the merged file on the default branch.
+#
+# THE SETUP. The fixture is budgeted at steady state: order-ledger-pdb.yaml is
+# merged and Config Sync keeps it applied, so no other audit finds it. This
+# case's stack (bench/tf/prebuilt/post-merge-sync-budget) removes the file and
+# waits for the prune before the agent runs, and its destroy, after the
+# checks on every path, puts the seeded file back and waits for the budget.
+# A run killed between the two leaves the file off; the repository reset
+# before the next writer unit (hack/ci_reset_agent_pulls.py) puts it back.
+# The case requests a pull request, so it runs in the fan-out's writers
+# phase, one unit at a time after every other unit (unit_phase in
+# hack/ci-eval-pr.sh), and no other case reads the namespace while the
+# budget is off.
 #
 # RED BEFORE #6311. Without that change the platform profile has no
 # post-merge-check job, so the check fails at that gate, before it merges
 # anything; nor does post_merge_check.py take a tick that could store an
 # outcome.
 #
-# THE FIXTURE AND PROMPT are obtainability-major-pdb-auto-pr's: the audit
-# writes checkout-gateway's budget beside its declaration and `remediate`
-# opens it. hack/ci-deploy.sh sets KUBEAGENTS_POST_MERGE_CHECK=silent on every
-# CI install, so the pr_opened plugin records the fix.
+# THE FIXTURE is order-ledger in seeded-post-merge (post-merge-sync-workload),
+# which only this case uses: checkout-gateway, which eight cases read as
+# unbudgeted, is never merged or applied. The audit writes order-ledger's
+# budget beside its declaration, in the directory Config Sync syncs, and
+# `remediate` opens it. The prompt asks for that one fix, so the reply names
+# one pull request. hack/ci-deploy.sh sets KUBEAGENTS_POST_MERGE_CHECK=silent
+# on every CI install, so the pr_opened plugin records the fix.
 #
 # Isolation class: writes the ledger issue and one remediation pull request,
 # which the harness merges and then undoes: each file the pull request touched
 # goes back to its content at the base, and the merged pull request loses its
-# audit: labels so the next audit does not bind the finding to it. Plus one
-# budget it applies and deletes on the seeded cluster.
+# audit: labels so the next audit does not bind the finding to it. Plus the
+# setup's removal and restore of order-ledger-pdb.yaml, which Config Sync
+# prunes and applies in seeded-post-merge.
+#
+# THE RECIPE'S CASE. This is no-pdb's primary end-to-end case: its recipe.yaml
+# names it (eval_case), and the check grades a record of that kind (recipe:
+# no-pdb). bench/tests/test_recipe_eval_cases.py holds the link.
 #
 # THE RECIPE'S CASE. This is no-pdb's primary end-to-end case: its recipe.yaml
 # names it (eval_case), and the check grades a record of that kind (recipe:
@@ -55,20 +73,26 @@ id: post-merge-verified-fixed
 name: A merged no-pdb fix is verified fixed and reported once
 prompt: >-
   Run the workload reliability audit against the fleet, following the
-  obtainability-audit SOP. Then open every PodDisruptionBudget the audit
-  wrote itself as a remediation pull request: I am asking for those fixes
-  directly, so use the fleet-audit skill's `remediate` command for any that
-  `finish` did not open. Put the URL of every remediation pull request,
-  opened or still open, on your closing line after the ledger URL.
+  obtainability-audit SOP. Then open the PodDisruptionBudget the audit wrote
+  itself for the order-ledger Deployment in the seeded-post-merge namespace
+  as a remediation pull request: I am asking for that fix directly, so use
+  the fleet-audit skill's `remediate` command if `finish` did not open it.
+  Open no other remediation pull request. Put the URL of that pull request
+  on your closing line after the ledger URL.
 expected_output: >-
-  The audit writes a PodDisruptionBudget for checkout-gateway in
-  seeded-reliability and opens it as a remediation pull request whose URL the
+  The audit writes a PodDisruptionBudget for order-ledger in
+  seeded-post-merge and opens it as a remediation pull request whose URL the
   closing line carries. Once that pull request merges and the budget is
   applied, the install's post-merge check records the fix as verified_fixed
   and reports it silently, with no comment on the pull request.
 audit_streams: [obtainability-audit]
 infrastructure:
-  deployer: noop
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/post-merge-sync-budget"
+  teardown: true
+  # gitops_repo, bench_gitops_write_token_file and host_cluster_* arrive from the
+  # environment (TF_VAR_*, exported by hack/ci-eval-pr.sh).
 validated: false
 
 domain: reliability
@@ -76,14 +100,14 @@ domain: reliability
 owner: jayantid
 
 fixtures:
-  - no-pdb-workload
+  - post-merge-sync-workload
 
 verification_spec:
   # One fail-fast sequence: pull_request_opened checks that the reply names a
-  # pull request from this run before post_merge_outcome merges, applies and
+  # pull request from this run before post_merge_outcome merges, waits for and
   # ticks it, so a run that opened no pull request is a graded fail at the
   # first leaf, not a post_merge_outcome setup error at the coverage rung.
-  # One assert call of the second leaf does the merge, the apply and the
+  # One assert call of the second leaf does the merge, the sync wait and the
   # ticks; see the header.
   - name: the-merged-fix-is-verified-fixed-and-reported-silently
     role: objective
@@ -97,5 +121,7 @@ verification_spec:
           owner: gke-agentic
           outcome: verified_fixed
           report: silent
-          apply_fixture_role: no-pdb-workload
+          apply_fixture_role: post-merge-sync-workload
+          synced_directory: clusters/*-a/seeded-post-merge
+          synced_namespace: seeded-post-merge
           recipe: no-pdb

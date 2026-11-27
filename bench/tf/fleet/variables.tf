@@ -89,7 +89,70 @@ variable "exclusion_window_hours" {
 }
 
 variable "post_merge_sync_projects" {
-  description = "Project IDs whose seeded-a runs GKE-managed Config Sync and the post-merge fixture (config-sync.tf). Empty by default, so a project, pool or dev, plans none of it and reads no secret until it is listed. List one only after its pool steps (docs/ci-pool-projects.md 5.13): the deploy key's secret, roles/gkehub.editor for the reconciler and anthosconfigmanagement.googleapis.com. A dev project passes -var 'post_merge_sync_projects=[\"<project>\"]'."
+  description = "Project IDs whose seeded-a runs GKE-managed Config Sync and the post-merge fixture (config-sync.tf). An unlisted project, pool or dev, plans none of it and reads no secret. List one only after its pool steps (docs/ci-pool-projects.md 5.13): the deploy key's secret, roles/gkehub.editor for the reconciler and anthosconfigmanagement.googleapis.com. The default is every mapped pool project (gitops_repo_for_project in hack/ci-deploy.sh), in pool order, each provisioned. A dev project passes -var 'post_merge_sync_projects=[\"<project>\"]'."
   type        = list(string)
-  default     = []
+  default = [
+    "kube-agents-evals",
+    "kube-agents-evals-2",
+    "kube-agents-evals-3",
+    "kube-agents-evals-4",
+    "kube-agents-evals-5",
+    "kube-agents-evals-6",
+    "kube-agents-evals-7",
+    "kube-agents-evals-8",
+    "kube-agents-evals-9",
+    "kube-agents-evals-10",
+    "kube-agents-evals-11",
+    "kube-agents-evals-12",
+    "kube-agents-evals-13",
+    "kube-agents-evals-14",
+    "kube-agents-evals-15",
+    "kube-agents-evals-16",
+    "kube-agents-evals-17",
+    "kube-agents-evals-18",
+    "kube-agents-evals-19",
+    "kube-agents-evals-20",
+    "kube-agents-evals-21",
+    "kube-agents-evals-22",
+    "kube-agents-evals-23",
+    "kube-agents-evals-24",
+    "kube-agents-evals-25",
+    "kube-agents-evals-26",
+    "kube-agents-evals-27",
+    "kube-agents-evals-28",
+    "kube-agents-evals-29",
+    "kube-agents-evals-30",
+    "kube-agents-evals-31",
+    "kube-agents-evals-32",
+    "kube-agents-evals-33",
+    "kube-agents-evals-34",
+    "kube-agents-evals-35",
+    "kube-agents-evals-36",
+    "kube-agents-evals-37",
+    "kube-agents-evals-38",
+    "kube-agents-evals-39",
+    "kube-agents-evals-40",
+    "kube-agents-evals-41",
+    "kube-agents-evals-42",
+    "kube-agents-evals-43",
+    "kube-agents-evals-44",
+    "kube-agents-evals-45",
+    "kube-agents-evals-46",
+    "kube-agents-evals-47",
+    "kube-agents-evals-48",
+    "kube-agents-evals-49",
+    "kube-agents-evals-50",
+  ]
+}
+
+variable "post_merge_gitops_repo" {
+  description = "The `<owner>/<repo>` GitHub repository seeded-a's Config Sync reads the seeded-post-merge namespace from (post-merge-sync.tf). Empty is the pool convention, `gke-agentic/<project_id>-infra`; a dev project names the GitOps repository its install writes to, which scripts/provision_ci_pool_post_merge_sync.sh takes as its second argument."
+  type        = string
+  default     = ""
+}
+
+variable "post_merge_gitops_branch" {
+  description = "The branch of post_merge_gitops_repo Config Sync reads: the default branch, the one a merged remediation pull request lands on."
+  type        = string
+  default     = "main"
 }

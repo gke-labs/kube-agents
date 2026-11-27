@@ -470,6 +470,11 @@ def healthy_world(*projects):
             "deployment/checkout-gateway": {"status": {"readyReplicas": 2, "replicas": 2}},
             "namespace/seeded-intent": {"metadata": {"name": "seeded-intent"}},
             "deployment/notification-relay": {"status": {"readyReplicas": 2, "replicas": 2}},
+            # The post-merge fixture on slot a: order-ledger and the RepoSync that syncs its namespace.
+            "namespace/seeded-post-merge": {"metadata": {"name": "seeded-post-merge"}},
+            "deployment/order-ledger": {"status": {"readyReplicas": 2, "replicas": 2}},
+            "reposync/repo-sync": {"metadata": {"name": "repo-sync"}},
+            "poddisruptionbudget?app=order-ledger": {"items": [{"metadata": {"name": "order-ledger-pdb"}, "spec": {"maxUnavailable": 1}}]},
             "namespace/seeded-token": {"metadata": {"name": "seeded-token"}},
             "deployment/token-reader": {"status": {"readyReplicas": 1, "replicas": 1}},
             "deployment/token-sidecar": {"status": {"readyReplicas": 1, "replicas": 1}},
@@ -644,6 +649,10 @@ class ScanHarness(unittest.TestCase):
         self.world_path = self.tmp / "world.json"
         self.workdir = self.tmp / "work"
         self.roles = fixture_state.catalog_roles(CATALOG)
+        # The fake pool's projects are listed for the post-merge fixture, so the
+        # runner plants every role there; the unlisted test passes its own.
+        self.variables = self.tmp / "variables.tf"
+        self.variables.write_text(f'variable "post_merge_sync_projects" {{\n  default = ["{PROJECT}", "{OTHER}"]\n}}\n')
 
     def environ(self, **extra):
         env = {
@@ -652,6 +661,7 @@ class ScanHarness(unittest.TestCase):
             "STUB_WORLD": str(self.world_path),
             "TMPDIR": str(self.tmp),
             "HOME": os.environ.get("HOME", str(self.tmp)),
+            "FLEET_VARIABLES": str(self.variables),
         }
         env.update(extra)
         return env
@@ -769,10 +779,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 64, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 65, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 64, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 65, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -840,7 +850,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 127, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 129, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -859,7 +869,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 63, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 64, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})
@@ -947,6 +957,23 @@ class NotChecked(ScanHarness):
         self.assertIsNotNone(summary, proc.stderr)
         self.assertEqual(tuple(int(n) for n in summary.groups()), (len(self.roles) - 1, 1, 0), proc.stderr)
         self.assertIn("could not be read from", proc.stderr)
+
+    def test_a_role_an_unlisted_project_does_not_plant_is_not_checked_not_absent(self):
+        # post-merge-sync-workload is planted only on projects in
+        # post_merge_sync_projects; on another it is not the fleet's drift, so
+        # the scan reads it not checked, names why, and counts no absent role.
+        unlisted = self.tmp / "unlisted.tf"
+        unlisted.write_text('variable "post_merge_sync_projects" {\n  default = []\n}\n')
+        doc, _ = self.scan(healthy_world(PROJECT), FLEET_VARIABLES=str(unlisted))
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(self.states(doc)["post-merge-sync-workload"], "not_checked")
+        self.assertIn("by design", entry["roles"]["post-merge-sync-workload"]["detail"][0])
+        self.assertEqual(entry["summary"]["absent"], 0)
+        self.assertEqual(doc["summary"]["absent_projects"], 0)
+        # Not a failed read either: the digest's unread count stays at zero, so
+        # a fleet in its designed state still reads clean.
+        self.assertEqual(fixture_state.unread_units(doc), 0)
+        self.assertIsNone(fixture_state.not_checked_reason(doc))
 
     def test_a_probe_the_cluster_refused_is_not_checked_not_absent(self):
         # A 403 or a 5xx on the presence probe says nothing about whether the

@@ -27,6 +27,14 @@ What goes, and what stays:
   before it is closed. The fleet audit reads an unlabelled close as a human's
   refusal and never re-proposes that fix in that repository (#2228); a label
   that will not stick leaves the pull request open for the next attempt.
+* the post-merge fixture's steady state comes back: on a repository that
+  carries order-ledger's declaration (scripts/provision_ci_pool_post_merge_sync.sh
+  seeds it), a missing or changed `order-ledger-pdb.yaml` beside it is put
+  back as seeded, and the reset waits, bounded, for Config Sync to apply it
+  when the runner's fleet kubeconfigs are there. post-merge-verified-fixed's
+  setup stack takes it off for one run and puts it back at its destroy; a run
+  killed between the two leaves it off, and this is what heals that before
+  the next unit reads the namespace. A restore that fails is not clean.
 * every branch but the default, whatever its name, unless an open pull request
   that stays still has it as head. A pool repository is a fixture nothing else
   keeps branches in.
@@ -151,6 +159,17 @@ STACK_LABEL_LINES = (f"{STACK_LABEL_KEY}: {STACK_LABEL_VALUE}", f'"{STACK_LABEL_
 JSON_MEMBER_SEPARATOR = ","
 STACK_FILE_DELETE_MESSAGE = "test(bench): remove {path}, which an eval stack left behind (reset {scope})"
 HTTP_NOT_FOUND = 404
+# The post-merge fixture's steady state, by the name of the seeded cluster
+# that carries it (seeded-a, read as --kcc-cluster is): the budget beside the
+# declaration, as bench/tf/prebuilt/post-merge-sync-budget/budget.py seeds and
+# restores it, which this loads for the content and the cluster read.
+POST_MERGE_DIRECTORY = "clusters/{cluster}/seeded-post-merge"
+POST_MERGE_DECLARATION_FILE = "order-ledger.yaml"
+POST_MERGE_BUDGET_FILE = "order-ledger-pdb.yaml"
+POST_MERGE_BUDGET_MODULE = pathlib.Path(__file__).resolve().parents[1] / "bench" / "tf" / "prebuilt" / "post-merge-sync-budget" / "budget.py"
+POST_MERGE_RESTORE_MESSAGE = "test(bench): restore {path}, the post-merge fixture's steady state (reset {scope})"
+POST_MERGE_SYNC_WAIT_SECONDS = 300.0
+POST_MERGE_SYNC_POLL_SECONDS = 10.0
 RECORD_SCHEMA_VERSION = 1
 ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -340,6 +359,92 @@ def planted_stack_file(repo: str, path: str, branch: str, token: str) -> tuple[d
     return entry, any(line.strip().removesuffix(JSON_MEMBER_SEPARATOR) in STACK_LABEL_LINES for line in text.splitlines())
 
 
+def _post_merge_budget():
+    """bench/tf/prebuilt/post-merge-sync-budget/budget.py, loaded by path."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("post_merge_sync_budget", POST_MERGE_BUDGET_MODULE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _file_text(repo: str, path: str, branch: str, token: str) -> tuple[dict | None, str | None]:
+    """(the contents entry of `path` on `branch`, its text); (None, None) when no file is there."""
+    try:
+        entry = call("GET", f"/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(branch)}", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            return None, None
+        raise
+    if not isinstance(entry, dict) or not entry.get("sha"):
+        raise ResetError(f"GitHub answered the contents read of {path} in {repo} without a file")
+    # Bytes that are not UTF-8 read as a changed file, which the restore replaces.
+    try:
+        return entry, base64.b64decode(str(entry.get("content") or "")).decode("utf-8", errors="replace")
+    except ValueError as exc:
+        raise ResetError(f"GitHub answered the contents read of {path} in {repo} with content that is not base64: {exc}") from exc
+
+
+def restore_post_merge_budget(
+    repo: str, branch: str, token: str, scope: str, record: dict, dry_run: bool, cluster: str = "",
+    clock=time.monotonic,
+) -> None:
+    """Put the post-merge fixture's budget back as seeded, where the repository carries its declaration.
+
+    Fills record["steady_files_restored"] or ["steady_files_unrestored"]; a
+    repository without the declaration (a project whose post-merge sync was
+    never provisioned) is left alone.
+    """
+    directory = POST_MERGE_DIRECTORY.format(cluster=cluster or DEFAULT_KCC_CLUSTER)
+    declaration, _ = _file_text(repo, f"{directory}/{POST_MERGE_DECLARATION_FILE}", branch, token)
+    if declaration is None:
+        return
+    path = f"{directory}/{POST_MERGE_BUDGET_FILE}"
+    budget = _post_merge_budget()
+    entry, text = _file_text(repo, path, branch, token)
+    changed = text != budget.BUDGET_CONTENT
+    if changed:
+        print(f"  {path} {'missing' if entry is None else 'changed'}, put back as seeded")
+    if dry_run:
+        return
+    if changed:
+        body = {
+            "message": POST_MERGE_RESTORE_MESSAGE.format(path=path, scope=scope),
+            "content": base64.b64encode(budget.BUDGET_CONTENT.encode()).decode(),
+            "branch": branch,
+        }
+        if entry is not None:
+            body["sha"] = entry["sha"]
+        try:
+            write("PUT", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token, body)
+        except CALL_FAULTS as exc:
+            print(f"  {path} was not restored ({describe(exc)})", file=sys.stderr)
+            record["steady_files_unrestored"].append(path)
+            return
+    # The cluster is read on every reset where the fixture is provisioned,
+    # the branch already seeded included: an earlier reset may have restored
+    # the branch and timed out, or had no kubeconfig to wait with. The read
+    # needs the runner's read-only kubeconfig for the fixture's role, which the
+    # lease-time reset runs before; that reset restores the branch alone, and
+    # the per-unit resets, which run after the runner wrote them, wait.
+    kubeconfigs = os.environ.get(budget.KUBECONFIG_DIR_ENV, "")
+    if not kubeconfigs or not (pathlib.Path(kubeconfigs) / f"{budget.FIXTURE_ROLE}.kubeconfig").is_file():
+        if changed:
+            print(f"  {path} restored on the branch; no fleet kubeconfig to wait for Config Sync with")
+            record["steady_files_restored"].append(path)
+        return
+    deadline = clock() + POST_MERGE_SYNC_WAIT_SECONDS
+    while not budget.is_seeded(budget.budget_state()):
+        if clock() + POST_MERGE_SYNC_POLL_SECONDS > deadline:
+            print(f"  {path} is on the branch, but Config Sync did not apply it within {POST_MERGE_SYNC_WAIT_SECONDS:.0f}s", file=sys.stderr)
+            record["steady_files_unrestored"].append(path)
+            return
+        pause(POST_MERGE_SYNC_POLL_SECONDS)
+    if changed:
+        record["steady_files_restored"].append(path)
+
+
 def planted_stack_files(kcc_cluster: str = "") -> tuple[str, ...]:
     """Every path a case stack plants, the Config Connector declaration under
     `kcc_cluster`, or under DEFAULT_KCC_CLUSTER when that is empty."""
@@ -371,6 +476,8 @@ def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -
         "stack_files_deleted": [],
         "stack_files_undeleted": [],
         "stack_files_kept": [],
+        "steady_files_restored": [],
+        "steady_files_unrestored": [],
         "open_after": None,
         "branches_after": None,
         "clean": False,
@@ -470,6 +577,7 @@ def reset(
             record["stack_files_undeleted"].append(path)
             continue
         record["stack_files_deleted"].append(path)
+    restore_post_merge_budget(repo, default, token, scope, record, dry_run, kcc_cluster)
     if dry_run:
         print(f"would close {len(agent_pulls)} pull request(s) and delete {len(leftover) - len(record['kept_branches'])} branch(es) in {repo} {scope}")
         if stack_files:
@@ -486,7 +594,7 @@ def reset(
     still_files = [path for path in stack_paths if planted_stack_file(repo, path, default, token)[1]]
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
-    record["clean"] = not still_agent and not still_branches and not still_files
+    record["clean"] = not still_agent and not still_branches and not still_files and not record["steady_files_unrestored"]
     record["finished_at"] = time.strftime(ISO_UTC_FORMAT, time.gmtime(time.time()))
     print(
         f"closed {len(record['closed'])} pull request(s) and deleted {len(record['deleted'])} branch(es) in {repo} {scope}; "

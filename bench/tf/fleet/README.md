@@ -7,7 +7,9 @@ scenarios assert on.
 Boskos leases a project at random, so **a project without this stack applied is a
 project where every fleet check reports `status: "error"`**. The fleet is
 read-only for evaluations — every open pull request shares it, and no scenario may
-mutate it. Because we planted each defect and chose its name, the scenarios' assertions
+mutate it. The one exception is `post-merge-verified-fixed`, which takes the budget off its own
+fixture (`post-merge-sync-workload`) for its run: no other case reads that namespace, the case runs
+alone in the writers phase, and its setup stack's destroy restores the budget (and the repository reset before every writer unit, if a run was killed first). Because we planted each defect and chose its name, the scenarios' assertions
 can be exact rather than judged.
 
 The clusters carry `managed-by=kube-agents-seeded-fleet`, deliberately distinct from
@@ -58,7 +60,7 @@ writer: from `main`, under a Boskos lease per project, creates and in-place upda
 the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
 address, or per resource to cover every instance of a `count` or `for_each` one, with its
 reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
-pool's replace on a minor roll, the scaled-zero gateway's status writer, seeded-a's ConfigConnector writer and the orphaned snapshots' planter are the four standing ones). Its two Prow
+pool's replace on a minor roll, the scaled-zero gateway's status writer, seeded-a's ConfigConnector writer, the orphaned snapshots' planter and seeded-a's RepoSync writer are the five standing ones). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). After each
@@ -267,6 +269,7 @@ The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 | Defect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Where                                | Fixture role                        | Asserting scenario                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`                   | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`, `cluster-agent-stalled-controller-healthy-silence`, `upgrades-network-policy-enforcement-stated` (slot presence and its namespace's policy), `upgrades-retrospective-network-policy-enforcement`, `upgrades-retrospective-log-volume-gate` and `upgrades-rollout-family-held-by-canary-gate` (slot presence only) (the same)                                                                                                                                                        |
+| `order-ledger`, two replicas, on a project in `post_merge_sync_projects`, in a namespace Config Sync syncs from the pool repository's `clusters/seeded-a/seeded-post-merge/` through a RepoSync, a read-only deploy key and a Role that writes PodDisruptionBudgets alone (`post-merge-sync.tf`). Budgeted at steady state: `scripts/provision_ci_pool_post_merge_sync.sh` seeds the declaration and `order-ledger-pdb.yaml`, so no audit finds it. Unbudgeted only while its one case runs                                                                                                         | `seeded-a` / ns `seeded-post-merge`  | `post-merge-sync-workload`          | `post-merge-verified-fixed`, which stays off the nightly until the pool carries the fixture                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `notification-relay`, two replicas, no PDB, in a namespace with no NetworkPolicy, both declared on purpose by `knowledge/notification-relay-no-pdb.md` in the pool project's GitOps repository; provisioning seeds that note into a pool project's repository, and a dev project needs the same note (`GITOPS_INTENT_NOTE_CONTENT` in `scripts/provision_ci_pool_project.sh`; the path and its `declares` items are what the audit and the cases read) in whichever GitOps repository its install reads (a second such workload, so the declaration silences none of the checkout-gateway cases)    | `seeded-a` / ns `seeded-intent`      | `declared-no-pdb-workload`          | `obtainability-declared-intent-no-finding`, `compliance-declared-intent-no-finding`                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `token-reader` and `token-sidecar`, one replica each on the `default` ServiceAccount with the token mounted; the same note declares `token-reader` on purpose and not `token-sidecar`, so the compliance audit keeps the sibling's fix off the shared ServiceAccount                                                                                                                                                                                                                                                                                                                                | `seeded-a` / ns `seeded-token`       | `declared-token-workload`           | `compliance-declared-token-shields-siblings`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `burst-ingest`, two pause replicas requesting 10m / 128Mi each and using almost none of the memory; the same note declares the headroom on purpose, so the waste audit lists it under Declared intent instead of proposing a resize                                                                                                                                                                                                                                                                                                                                                                 | `seeded-a` / ns `seeded-headroom`    | `declared-overrequest-workload`     | `cost-declared-intent-no-finding`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -379,6 +382,12 @@ here in the same change; a `bench/tests/test_fleet_verifier.py` test fails when 
 `task.yaml` names a role the catalog lacks, or reads a namespace through a role the
 catalog puts elsewhere.
 
+A role the stack plants only on some projects names the list variable that says which in
+`projects_var` (`post-merge-sync-workload` names `post_merge_sync_projects`). On a project that list
+leaves out, `hack/fleet-kubeconfigs.sh` probes nothing for the role and reports it as not planted
+there by design, apart from its written, unreached and unplanted counts; the pool verifier does not
+expect it there, and the fixture-state scan reads it as not checked rather than absent.
+
 The chain, end to end:
 
 1. `hack/fleet-kubeconfigs.sh` **discovers** the seeded clusters in `$FLEET_PROJECT_ID` (defaulting
@@ -483,12 +492,32 @@ presubmit provisions its own cluster rather than borrowing slot a or b.
 
 `config-sync.tf` registers `seeded-a` to the project's fleet and turns on GKE-managed Config Sync
 for it, with no RootSync, for a project listed in `var.post_merge_sync_projects` and for no other.
-The list is empty by default, so a project plans and applies none of it until its pool steps are
-done: the reconciler holds `roles/gkehub.editor`, the project has
-`anthosconfigmanagement.googleapis.com`, and the post-merge fixture's deploy key is in its Secret
-Manager ([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) section 5.13). A pull
-request that adds a project to the list is the switch, reviewed like any fixture change; a dev
-fleet passes `-var 'post_merge_sync_projects=["<project>"]'`.
+The list's default names every mapped pool project (`gitops_repo_for_project()` in
+`hack/ci-deploy.sh`), in pool order, each with its pool steps done: the reconciler holds
+`roles/gkehub.editor`, the project has `anthosconfigmanagement.googleapis.com`, and the post-merge
+fixture's read-only deploy key is in its Secret Manager, with the declaration and the budget seeded
+([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) section 5.13). A project not on
+the list plans and applies none of it. Adding a new pool project to the list is the switch, after
+its pool steps, reviewed like any fixture change; a dev fleet passes
+`-var 'post_merge_sync_projects=["<project>"]'`.
+
+## The one fixture a reconciler writes
+
+`seeded-post-merge` on `seeded-a` is the one namespace with a second writer, on a project listed
+in `post_merge_sync_projects` (the section above); on any other the namespace, `order-ledger` and
+the RepoSync are not planted. Config Sync's one RepoSync there (`post-merge-sync.tf`) syncs
+`clusters/<seeded-a's name>/seeded-post-merge/` of the project's GitOps repository into the
+namespace every 15 seconds. Its reconciler may write PodDisruptionBudgets there and nothing else,
+and it reads the repository through a read-only deploy key on that one repository
+(`scripts/provision_ci_pool_post_merge_sync.sh`, [`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md)
+section 5.13), which this stack reads from the project's Secret Manager into the namespace's
+`git-creds` Secret on each apply, and keeps in its state. The repository's declaration of
+`order-ledger` carries `configmanagement.gke.io/managed: disabled`, so Config Sync leaves the
+Deployment to this stack. The steady state is the fix merged: `order-ledger-pdb.yaml` sits beside
+the declaration and Config Sync keeps the budget applied, so no audit of the fleet finds the
+workload unbudgeted. `post-merge-verified-fixed` alone takes it away, for its own run: its setup
+removes the file and waits for the prune, the budget the agent's fix adds is merged and applied,
+and the setup's teardown puts the seeded file back.
 
 ## A read-only credential for evaluations
 
