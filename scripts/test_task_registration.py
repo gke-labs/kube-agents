@@ -41,7 +41,9 @@ vacuously.
 """
 
 import contextlib
+import importlib.metadata
 import io
+import json
 import pathlib
 import re
 import sys
@@ -288,6 +290,18 @@ class TestEveryTaskIsValid(unittest.TestCase):
             "false; bench-gate would refuse it after the cluster lease:",
         )
 
+    def test_each_line_of_the_permit_pairs_file_is_a_pair(self):
+        # Tree-level, so validate_all() does not carry it and this is the
+        # assertion that gates it.
+        findings = validator.permit_pair_problems()
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nhack/eval/permit-pairs.txt names two cases on each line as a pair: the same "
+            "ask and the same checks, for the platform agent and for a profile "
+            "(docs/designs/permit-pairs.md). These lines break that:\n  " + "\n  ".join(findings),
+        )
+
     def test_no_run_record_is_committed(self):
         # Tree-level like the sanitizer, so validate_all() does not carry it
         # and this is the assertion that gates it.
@@ -450,6 +464,33 @@ class TestTheValidatorItself(unittest.TestCase):
         )
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
+
+    def test_a_ledger_check_with_only_patterns_asserts_something(self):
+        """`required_patterns` and `forbidden_patterns` carry a ledger check's
+        assertion as its phrase lists do; an empty list of either does not."""
+        for field in ("required_patterns", "forbidden_patterns"):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", field: ["x"]}, "check 'x'", problems)
+            self.assertEqual(problems, [])
+            validator._check_assertions({"type": "ledger_issue_contains", field: []}, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("can only pass", problems[0])
+
+    def test_a_delegated_to_check_with_only_min_children_zero_is_rejected(self):
+        """Every chain has at least zero children, so `min_children: 0` alone
+        asserts nothing; with another field set it is a real lower bound."""
+        problems = []
+        validator._check_assertions({"type": "delegated_to", "min_children": 0}, "check 'x'", problems)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("can only pass", problems[0])
+        for node in (
+            {"type": "delegated_to", "min_children": 0, "max_children": 1},
+            {"type": "delegated_to", "min_children": 1},
+            {"type": "delegated_to", "min_children": 0, "required_addressees": ["cluster"]},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
 
     def test_a_finding_scope_without_its_check_is_rejected(self):
         """The verifier's model refuses the pair after the cluster lease; this
@@ -627,6 +668,8 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
 
     ENTRY = {"name": "names-the-thing", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["x"]}}
     REFUSED = "Extra inputs are not permitted: 'no_such_field'"
+    # For `_distribution`: the record of devops-bench at the pinned commit.
+    CURRENT = object()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -649,8 +692,36 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
 
         return mock.patch.object(validator, "spec_parser", return_value=(yaml.safe_load, parse))
 
-    def _installed(self, package_dir):
-        """Stand-in modules for a bench package that is installed with its files in `package_dir`."""
+    def _distribution(self, entry_points=None, direct_url=CURRENT, missing=()):
+        """A stand-in for `importlib.metadata.distribution`: the bench package with `entry_points`
+        (the ones of bench/pyproject.toml by default) and devops-bench with `direct_url` as the
+        text of its record (the pinned commit by default; None is no record)."""
+        if entry_points is None:
+            entry_points = validator.declared_bench_data()[0]
+        if direct_url is self.CURRENT:
+            pinned = validator.declared_bench_data()[1]
+            direct_url = json.dumps({"url": "https://example.invalid/devops-bench", "vcs_info": {"vcs": "git", "commit_id": pinned}})
+        group = validator.VERIFIER_ENTRY_POINT_GROUP
+        installed = {
+            validator.BENCH_DISTRIBUTION: types.SimpleNamespace(
+                entry_points=[types.SimpleNamespace(name=name, value=value, group=group) for name, value in entry_points.items()]
+                + [types.SimpleNamespace(name="kubeagents", value="kube_agents_bench.agent:Agent", group="devops_bench.agents")],
+            ),
+            validator.HARNESS_DISTRIBUTION: types.SimpleNamespace(read_text=lambda name: direct_url if name == validator.DIRECT_URL_FILE else None),
+        }
+
+        def distribution(name):
+            if name in missing:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return installed[name]
+
+        return mock.patch.object(validator.importlib.metadata, "distribution", distribution)
+
+    def _installed(self, package_dir, **data):
+        """Stand-in modules for a bench package that is installed with its files in `package_dir`,
+        and with the installed data of `_distribution(**data)`."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(self._distribution(**data))
         bench = types.ModuleType("kube_agents_bench")
         bench.__file__ = str(package_dir / "__init__.py") if package_dir else None
         loader = types.ModuleType("devops_bench.tasks.loader")
@@ -661,7 +732,8 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
         modules.update({"kube_agents_bench": bench, "devops_bench.tasks.loader": loader, "devops_bench.verification.spec": spec})
         validator.spec_parser.cache_clear()
         self.addCleanup(validator.spec_parser.cache_clear)
-        return mock.patch.dict(sys.modules, modules)
+        stack.enter_context(mock.patch.dict(sys.modules, modules))
+        return stack
 
     def test_the_rule_reports_nothing_without_the_parser(self):
         self._write(self.ENTRY)
@@ -708,6 +780,103 @@ class TestTheParserRuleWithoutTheBenchPackage(unittest.TestCase):
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 self.assertEqual(validator.main([str(self.path)]), 0)
             self.assertTrue(output.getvalue().endswith(f"{note}\n"), output.getvalue())
+
+    def _assert_behind(self, difference, **data):
+        """This checkout's package with the installed data of `data` gives the note with
+        `difference`, the rule asks the parser nothing, and the CLI ends with the note."""
+        self._write(self.ENTRY)
+        with self._installed(validator.BENCH_PACKAGE_DIR, **data):
+            note = validator.spec_parser()
+            self.assertEqual(note, validator.FIELD_CHECK_STALE_DATA.format(difference=difference))
+            self.assertTrue(note.startswith("bench-case-check: the field check did NOT run"))
+            self.assertIn("installed, but behind the tree", note)
+            self.assertIn("make test-bench-deps", note)
+            # The stand-in parser refuses the entry; the rule must not ask it.
+            self.assertEqual(validator.unloadable_entries(self.path), [])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                self.assertEqual(validator.main([str(self.path)]), 0)
+            self.assertTrue(output.getvalue().endswith(f"{note}\n"), output.getvalue())
+            self.assertNotIn(validator.UNLOADABLE_ENTRY, output.getvalue())
+
+    def test_entry_points_behind_the_tree_give_a_note_and_no_verdict(self):
+        """An editable install of this checkout from before a pull: the environment registers the
+        check types of that day, so the parser would refuse a type that the tree added since."""
+        declared, _ = validator.declared_bench_data()
+        added, moved = sorted(declared)[:2]
+        older = {name: value for name, value in declared.items() if name != added}
+        cases = {
+            "a check type that the tree added": (older, added),
+            "a check type with another target": ({**declared, moved: "kube_agents_bench.gone:Verifier"}, moved),
+            "a check type that the tree removed": ({**declared, "retired_check": "kube_agents_bench.verifiers:Retired"}, "retired_check"),
+            "one of each": ({**older, "retired_check": "kube_agents_bench.verifiers:Retired"}, f"{added}, retired_check"),
+        }
+        for label, (entry_points, names) in cases.items():
+            with self.subTest(label):
+                difference = validator.ENTRY_POINTS_BEHIND.format(group="devops_bench.verifiers", names=names)
+                self._assert_behind(difference, entry_points=entry_points)
+
+    def test_a_package_with_no_installed_data_has_no_entry_points(self):
+        """The package on the import path with no install registers no check type."""
+        declared, _ = validator.declared_bench_data()
+        difference = validator.ENTRY_POINTS_BEHIND.format(group="devops_bench.verifiers", names=", ".join(sorted(declared)))
+        self._assert_behind(difference, missing=(validator.BENCH_DISTRIBUTION,))
+
+    def test_devops_bench_at_another_commit_gives_a_note_and_no_verdict(self):
+        """The environment from before a pull that moved the devops-bench pin."""
+        _, pinned = validator.declared_bench_data()
+        older = "0" * 40
+        record = json.dumps({"url": "https://example.invalid/devops-bench", "vcs_info": {"vcs": "git", "commit_id": older}})
+        self._assert_behind(validator.HARNESS_BEHIND.format(installed=older, pinned=pinned), direct_url=record)
+
+    def test_devops_bench_with_no_recorded_commit_gives_the_note(self):
+        """An install from a folder, a record that is not JSON, no record, and no distribution: none
+        of them shows the pinned commit."""
+        _, pinned = validator.declared_bench_data()
+        difference = validator.HARNESS_BEHIND.format(installed="no recorded commit", pinned=pinned)
+        from_a_folder = json.dumps({"url": "file:///somewhere/devops-bench", "dir_info": {"editable": True}})
+        for label, data in (
+            ("a folder", {"direct_url": from_a_folder}),
+            ("not JSON", {"direct_url": "{"}),
+            ("a JSON list", {"direct_url": "[]"}),
+            ("no record", {"direct_url": None}),
+            ("no distribution", {"missing": (validator.HARNESS_DISTRIBUTION,)}),
+        ):
+            with self.subTest(label):
+                self._assert_behind(difference, **data)
+
+    def test_both_differences_are_in_one_note(self):
+        """One install then answers both; with the first one alone, a second note would follow it."""
+        declared, pinned = validator.declared_bench_data()
+        added = sorted(declared)[0]
+        older = "0" * 40
+        record = json.dumps({"url": "https://example.invalid/devops-bench", "vcs_info": {"vcs": "git", "commit_id": older}})
+        difference = "; ".join((
+            validator.ENTRY_POINTS_BEHIND.format(group="devops_bench.verifiers", names=added),
+            validator.HARNESS_BEHIND.format(installed=older, pinned=pinned),
+        ))
+        self._assert_behind(difference, entry_points={n: v for n, v in declared.items() if n != added}, direct_url=record)
+
+    def test_a_project_file_that_cannot_be_read_gives_a_note_and_no_crash(self):
+        """For example conflict markers after a pull: the other rules must still report."""
+        broken = pathlib.Path(self.tmp.name) / "pyproject.toml"
+        broken.write_text("<<<<<<< HEAD\n[project]\n", encoding="utf-8")
+        for label, path in (("not TOML", broken), ("not there", broken.with_name("absent.toml"))):
+            with self.subTest(label), mock.patch.object(validator, "BENCH_PYPROJECT", path):
+                self._write(self.ENTRY)
+                with self._installed(validator.BENCH_PACKAGE_DIR, entry_points={}, direct_url=None):
+                    note = validator.spec_parser()
+                    self.assertIn("bench/pyproject.toml cannot be read (", note)
+                    self.assertIn("installed, but behind the tree", note)
+                    self.assertEqual(validator.unloadable_entries(self.path), [])
+
+    def test_the_project_file_declares_the_check_types_and_the_pin(self):
+        """The compare reads these two from bench/pyproject.toml. If their form there changes, an
+        empty reading would agree with an empty environment; fail here first."""
+        declared, pinned = validator.declared_bench_data()
+        self.assertIn("report_contains", declared)
+        self.assertEqual(declared["report_contains"], "kube_agents_bench.verifiers:ReportContainsVerifier")
+        self.assertRegex(pinned or "", r"\A[0-9a-f]{40}\Z")
 
     def test_the_rule_reports_what_the_parser_refuses(self):
         self._write(self.ENTRY)
@@ -1053,6 +1222,20 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self._only("must be {slots:", scope_exclude=value)
 
+    # -- scope_hold --
+
+    def test_a_declared_hold_passes(self):
+        self.assertEqual(self._validate(scope_hold={"agent_cluster": True, "reason": "paused"}), [])
+        self.assertEqual(self._validate(scope_hold={"all": True, "agent_cluster": True, "reason": "paused"}), [])
+
+    def test_a_hold_the_runner_cannot_apply_is_rejected(self):
+        for value in (None, True, {"all": True}, {"all": False, "reason": "r"}, {"all": "true", "reason": "r"}, {"agent_cluster": True, "reason": "r", "clusters": []}):
+            with self.subTest(value=value):
+                self._only("'scope_hold:' must be", scope_hold=value)
+
+    def test_a_hold_beside_a_scope_exclusion_is_rejected(self):
+        self._only("declare one", scope_hold={"all": True, "reason": "r"}, scope_exclude={"slots": ["b"]})
+
     def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
         # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
         for text in ("{trailing,}", "null", '{"jobs": {"compliance-audit": {}}}'):
@@ -1290,6 +1473,44 @@ class TestTheRulesReject(unittest.TestCase):
             "malformed cluster placeholder",
             verification_spec=self._entry(check={"type": "report_contains", "forbidden_patterns": ["{cluster: a}: no"]}),
         )
+
+    def test_model_placeholder_is_accepted_only_in_report_contains_pattern_lists(self):
+        for key in ("forbidden_patterns", "required_patterns", "any_of_patterns"):
+            with self.subTest(valid_key=key):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]})),
+                    [],
+                )
+        for key in ("required_phrases", "forbidden_phrases", "any_of_phrases"):
+            with self.subTest(phrase_key=key):
+                problem = self._only(
+                    "which only report_contains expands",
+                    verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]}),
+                )
+                self.assertIn(repr(key), problem)
+        for bad_check in (
+            {"type": "worker_commands", "forbidden_patterns": ["{model}"]},
+            {"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-{model}"},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"assignee": "{model}"}},
+        ):
+            with self.subTest(bad_check=bad_check):
+                self._only("which only report_contains expands", verification_spec=self._entry(check=bad_check))
+        for valid_non_placeholder in (
+            {"type": "report_contains", "forbidden_patterns": [r'\{"model": "model-default"\}']},
+            {"type": "worker_commands", "required_patterns": [r"jsonpath=\{\.spec\.model\}"]},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"body": r'\{"model": "gemini"\}'}},
+        ):
+            with self.subTest(valid_non_placeholder=valid_non_placeholder):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check=valid_non_placeholder)),
+                    [],
+                )
+        for malformed in ("{ model }", "{Model}", "{model:default}"):
+            with self.subTest(malformed=malformed):
+                self._only(
+                    "malformed model placeholder",
+                    verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": [malformed]}),
+                )
 
     def test_a_slotless_overlay_role_is_rejected_in_fixture_roles(self):
         # `orphan-disks` is in the overlay with no slot, so `fixtures:` takes
@@ -1531,6 +1752,132 @@ class TestTheRunRecordGuard(unittest.TestCase):
 
     def test_a_file_outside_evidence_passes(self):
         self.assertEqual(self._findings(["a-case/fixture/results.json", "a-case/task.yaml"]), [])
+
+
+class TestThePermitPairRule(unittest.TestCase):
+    """permit_pair_problems() on a temporary pairs file and temporary cases."""
+
+    CHECKS = [{"name": "the-thing-was-done", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["done"]}}]
+    SIDE_B = "[bench:profile name=cluster intent=confirm project=p1 location=us-x1 cluster=c1] Do the thing on this cluster."
+    SIDE_A = "The target of this task: project p1, location us-x1, cluster c1. Do the thing on this cluster."
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+        self.pairs_file = self.root / "permit-pairs.txt"
+        self.thirds = (self.root / "writers-b.txt", self.root / "writers-c.txt")
+        for path in self.thirds:
+            path.write_text("# a third\n")
+        self.pairs_file.write_text("# why\n\nalpha-a alpha-b  # the first pair\n")
+        self._case("alpha-a", prompt=self.SIDE_A)
+        self._case("alpha-b", prompt=self.SIDE_B)
+
+    def _case(self, case, **fields):
+        path = self.root / "tasks" / case / "task.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        spec = {"id": case, "infrastructure": {"deployer": "noop"}, "fixtures": ["a-role"], "verification_spec": self.CHECKS, **fields}
+        path.write_text(yaml.safe_dump({key: value for key, value in spec.items() if value is not None}))
+
+    def _problems(self):
+        task_files = {path.parent.name: path for path in sorted((self.root / "tasks").glob("*/task.yaml"))}
+        return validator.permit_pair_problems(self.pairs_file, task_files, self.thirds)
+
+    def _assert_one(self, needle):
+        problems = self._problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(needle, problems[0])
+        return problems[0]
+
+    def test_a_pair_has_no_finding(self):
+        self.assertEqual(self._problems(), [])
+
+    def test_no_pairs_file_is_no_finding(self):
+        self.pairs_file.unlink()
+        self.assertEqual(self._problems(), [])
+
+    def test_what_a_pair_may_differ_in(self):
+        """The fields that name the case, the wrapping of the ask, and the names of the check entries."""
+        renamed = [{**self.CHECKS[0], "name": "the-platform-agent-did-the-thing"}]
+        self._case("alpha-a", prompt=self.SIDE_A.replace(". Do", ".\n  Do"), verification_spec=renamed, name="A", expected_output="A does it", owner="someone", domain="other")
+        self.assertEqual(self._problems(), [])
+
+    def test_a_side_b_with_no_parameters_has_no_target_sentence(self):
+        self.assertEqual(validator.pair_side_a_prompt("[bench:profile name=fleet-audit] Run the audit."), "Run the audit.")
+
+    def test_another_ask_is_a_finding(self):
+        for label, prompt in (
+            ("more words", self.SIDE_A + " And one thing more."),
+            ("no target sentence", "Do the thing on this cluster."),
+            ("another target", self.SIDE_A.replace("cluster c1", "cluster c2")),
+        ):
+            with self.subTest(label):
+                self._case("alpha-a", prompt=prompt)
+                found = self._assert_one("the asks differ")
+                self.assertTrue(found.startswith("alpha-a / alpha-b: "), found)
+                self.assertIn("change the other side in the same pull request, or remove the pair's line", found)
+
+    def test_each_other_field_is_held_equal(self):
+        other_checks = [{**self.CHECKS[0], "check": {"type": "report_contains", "required_phrases": ["something else"]}}]
+        for label, fields, needle in (
+            ("other checks", {"verification_spec": other_checks}, "`verification_spec` differs (only an entry's name may)"),
+            ("one check more", {"verification_spec": self.CHECKS + other_checks}, "`verification_spec` differs"),
+            ("other fixtures", {"fixtures": ["b-role"]}, "`fixtures` differs"),
+            ("another deployer", {"infrastructure": {"deployer": "tofu"}}, "`infrastructure` differs"),
+            ("a field that one side lacks", {"requested_pull_requests": 2}, "`requested_pull_requests` differs"),
+            ("a marker on one side", {"expected_fail": True}, "`expected_fail` differs"),
+        ):
+            with self.subTest(label):
+                self._case("alpha-a", prompt=self.SIDE_A, **fields)
+                self._assert_one(needle)
+
+    def test_a_side_on_the_wrong_route_is_a_finding(self):
+        self._case("alpha-a", prompt=self.SIDE_B)
+        self.assertTrue(any("side A alpha-a opens with [bench:profile ...], so it does not go to the default route" in found for found in self._problems()))
+        self._case("alpha-a", prompt=self.SIDE_A)
+        self._case("alpha-b", prompt="Do the thing on this cluster.")
+        self._assert_one("side B alpha-b: no [bench:profile ...] directive")
+        self._case("alpha-b", prompt="[bench:profile intent=confirm] Do the thing on this cluster.")
+        self._assert_one("side B alpha-b: [bench:profile: name= is required")
+
+    def test_a_case_that_cannot_be_a_side_is_a_finding(self):
+        self.pairs_file.write_text("alpha-a no-such-case\n")
+        self._assert_one("no-such-case is not a case under bench/tasks/")
+        self.pairs_file.write_text("alpha-a alpha-b\n")
+        (self.root / "tasks" / "alpha-b" / "task.yaml").write_text("- a list\n")
+        self._assert_one("alpha-b: its task file is not a mapping")
+        (self.root / "tasks" / "alpha-b" / "task.yaml").write_text("{")
+        self._assert_one("could not be parsed as YAML")
+        self._case("alpha-b", prompt=None)
+        self._assert_one("a side has no prompt")
+
+    def test_a_line_that_is_not_two_case_ids_is_a_finding(self):
+        for line in ("alpha-a", "alpha-a alpha-b gamma"):
+            with self.subTest(line=line):
+                self.pairs_file.write_text(line + "\n")
+                self._assert_one("is not two case ids, side A then side B")
+
+    def test_a_case_in_the_file_twice_is_a_finding(self):
+        self._case("other-b", prompt=self.SIDE_B)
+        self.pairs_file.write_text("alpha-a alpha-b\nalpha-a other-b\n")
+        self._assert_one("alpha-a is in the file twice")
+
+    def test_the_two_sides_run_in_one_third_of_the_writers_part(self):
+        """A rebalance that moves one side leaves the two on different installs."""
+        self.thirds[1].write_text("alpha-b\n")
+        self._assert_one("the two sides are in different thirds of the writers part (writers-b.txt, writers-c.txt)")
+        self.thirds[1].write_text("alpha-b\nalpha-a\n")
+        self.assertEqual(self._problems(), [])
+        self.thirds[0].write_text("alpha-a\n")
+        self.thirds[1].write_text("alpha-b\n")
+        self._assert_one("different thirds")
+
+    def test_the_cli_reports_a_line_that_is_not_a_pair(self):
+        self._case("alpha-a", prompt=self.SIDE_A + " And one thing more.")
+        output, found = io.StringIO(), self._problems()
+        with mock.patch.object(validator, "permit_pair_problems", return_value=found), contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(validator.main([]), 1)
+        self.assertIn("not a permit pair: alpha-a / alpha-b: the asks differ", output.getvalue())
 
 
 class TestTheSanitizer(unittest.TestCase):

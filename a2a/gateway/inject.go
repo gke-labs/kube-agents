@@ -274,6 +274,15 @@ const (
 	// steer onto a running task, a status answer, a stop. The reply the
 	// conversation received is in the entries.
 	injectRefusalNoTask = "no-task"
+	// injectRefusalQueued: the turn waits in the session-cap line (#6882):
+	// every session worker was busy, the gateway posted its queued notice
+	// (in the entries) and keeps the message. Nothing has started yet, and
+	// unlike the other codes something may: when a slot frees, the gateway
+	// runs the turn again and the task it starts lands on this conversation
+	// as a task entry, its answer and its terminal after it, which a caller
+	// reads off the read route. Past the line's wait bound the conversation
+	// gets the cap's refusal instead, and no task entry.
+	injectRefusalQueued = "queued"
 	// injectRefusalNoAnswer: the bound expired with the gateway having done
 	// nothing this door could see. Distinct from the three above because it
 	// is the absence of an answer rather than one.
@@ -523,6 +532,13 @@ type probeReport struct {
 	// the field, so a harness can tell "none" from "can't say". The inject
 	// door's alone: no chat surface or the console reports it.
 	ChildAddressees []string `json:"childAddressees"`
+	// ChildCount is how many child tasks the chain minted, every
+	// delegation counted, so a chain that delegated to platform twice
+	// reads 2 where ChildAddressees names platform once
+	// (ConversationState). On every read, like ChildAddressees: 0 when the
+	// chain delegated nothing, null when the read had no task to look at,
+	// and absent only on a door older than the field.
+	ChildCount *int `json:"childCount"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -620,6 +636,10 @@ type injectConversation struct {
 	// read counts one turn short and classify from the first turn's work.
 	turns  int
 	handed int
+	// queued counts the turns that ended waiting in the session-cap line
+	// (CapLineObserver.TurnQueued): read against the end of the turn, a
+	// turn that moved it is queued rather than one that started nothing.
+	queued int
 	// cancelsPublished counts the cancels the gateway put on the bus here
 	// (TaskObserver.CancelPublished). Read against the end of the turn: a
 	// cancel turn that ended without this moving did not publish one.
@@ -993,6 +1013,46 @@ func (a *InjectAdapter) MessageDropped(conversation, authorID string) {
 	a.notify = make(chan struct{})
 }
 
+// TurnQueued records that the turn now ending on this conversation waits in
+// the session-cap line. See CapLineObserver.
+func (a *InjectAdapter) TurnQueued(conversation string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	conv.queued++
+	close(a.notify)
+	a.notify = make(chan struct{})
+}
+
+// ClaimRedelivery counts n messages the session-cap line puts back on this
+// conversation's inbox as handed to the gateway, as claimTurn counts a POST's,
+// so the n turns they end in neither let a later POST claim the conversation
+// while they run nor pass for that POST's own turn. False, counting nothing,
+// while a turn this door handed over has not ended: a POST waiting on its
+// turn would otherwise read a redelivered turn's task as its own. See
+// CapLineObserver.
+func (a *InjectAdapter) ClaimRedelivery(conversation string, n int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversationLocked(conversation)
+	if conv.handed > conv.turns {
+		return false
+	}
+	conv.handed += n
+	return true
+}
+
+// ClaimReplay counts n replayed follow-ups of an admitted session-cap turn as
+// handed to the gateway, unconditionally: they run as that turn ends, which
+// ClaimRedelivery counted, so no POST's turn is running, and a POST that
+// arrives meanwhile waits in claimTurn until they have ended too. See
+// CapLineObserver.
+func (a *InjectAdapter) ClaimReplay(conversation string, n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.conversationLocked(conversation).handed += n
+}
+
 // TurnFinished records that a turn on this conversation has ended, which is
 // what tells a waiting POST that what it can see is all there is going to be.
 // See InboundObserver.
@@ -1142,7 +1202,8 @@ func (a *InjectAdapter) conversationLocked(key string) *injectConversation {
 
 // injectFloor is where an evicted conversation stopped: the sequence its next
 // entry would have carried, and the turns it had handed to the gateway that
-// had not ended (at most one, by the claim's guard). A re-mint of the key
+// had not ended (by the claim's guard, one POST's turn or the messages one
+// session-cap redelivery put back, ClaimRedelivery). A re-mint of the key
 // starts from both.
 type injectFloor struct {
 	nextSeq     int
@@ -1221,6 +1282,7 @@ type injectCounts struct {
 	drops            int
 	turns            int
 	cancelsPublished int
+	queued           int
 	// gen is the conversation's mint generation; see injectConversation.gen.
 	// Zero when the conversation did not exist when the counts were read.
 	gen int
@@ -1236,6 +1298,7 @@ func countsOf(conv *injectConversation) injectCounts {
 		drops:            conv.drops,
 		turns:            conv.turns,
 		cancelsPublished: conv.cancelsPublished,
+		queued:           conv.queued,
 		gen:              conv.gen,
 	}
 }
@@ -1779,6 +1842,13 @@ func (a *InjectAdapter) awaitTurn(ctx context.Context, key string, prior injectC
 				return "", "the gateway dropped this message: its principal map does not carry the " +
 					"author, so nothing was started (the notice naming the author is posted once per " +
 					"sender, so it may not be in the entries)", injectRefusalUnverifiedAuthor
+			case now.queued > prior.queued:
+				// Parked at the session cap: the queued notice is in the
+				// entries, and the task, if a slot frees inside the line's
+				// bound, is a later task entry on this conversation.
+				return "", "every session worker is busy, so this turn waits in the gateway's line; " +
+					"the queued notice is in entries, and the task it starts when a worker frees " +
+					"appears on this conversation (a task entry, then its answer and terminal)", injectRefusalQueued
 			case now.starts > prior.starts:
 				// Announced, and the turn ended without the publish either
 				// succeeding or failing. startTask's own paths all end in one
@@ -1986,6 +2056,7 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string, chainU
 		ChildUsage:      state.ChildUsage,
 		UsagePartial:    state.UsagePartial,
 		ChildAddressees: state.ChildAddressees,
+		ChildCount:      state.ChildCount,
 	}
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.

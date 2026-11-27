@@ -99,6 +99,7 @@ plugins:
     - tool_call_audit
     - pr_opened
     - eval_run_tag
+    - model_identity
 
 agent:
   environment_probe: false

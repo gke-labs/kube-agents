@@ -74,6 +74,21 @@ SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 HACK_DIR = REPO_ROOT / "hack"
 BENCH_DIR = REPO_ROOT / "bench"
 TASKS_DIR = BENCH_DIR / "tasks"
+TF_ROOT = BENCH_DIR / "tf"
+STACK_SOURCE_SUFFIXES = {".tf", ".py", ".sh"}
+# A stack that writes the Platform Agent's cron roster: it marks a job due
+# with Hermes' trigger_job, or pauses or resumes one through the CLI. A match
+# on the stack's text, so a stack that writes the roster another way is not
+# seen until this pattern names that way.
+ROSTER_WRITE = re.compile(r'trigger_job|"cron", *"(?:pause|resume)"')
+# The cases of the nightly's main part whose stacks do, in full: a new one
+# fails the test below until it is listed here. infra_lock_exempt's comment
+# in the script names their stacks and is kept by hand.
+ROSTER_WRITERS = (
+    "fleet-audit-scheduled-run-files-the-finding",
+    "fleet-audit-unchanged-manifest-skips-synthesis",
+    "oobe-first-run-audits",
+)
 
 
 def lifted_block(pattern: str) -> str:
@@ -719,13 +734,18 @@ class ArrayHygieneTest(unittest.TestCase):
             "stockout-pinned-pool",
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
+            "consistency-boot-disk-pool-outlier",
+            "consistency-kubelet-config-pool-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",
+            "gce-rotated-console-notes",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
             "gce-chat-request-runs-collector",
             "fleet-audit-manifest-fix-names-stalled-config-connector",
+            "fleet-audit-remediation-right-and-not-stale",
+            "fleet-audit-wrong-kept-remediation-gives-way",
         ):
             with self.subTest(audit=audit):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {audit}")
@@ -1217,6 +1237,43 @@ class NightlyPartTest(unittest.TestCase):
         self.assertTrue(onboarding, "the nightly runs onboarding cases")
         self.assertLessEqual(onboarding, set(self.names(shards[0])))
         self.assertFalse(onboarding & set(self.names(sum(shards[1:], []))))
+
+    def test_two_stacks_that_write_the_cron_roster_never_run_at_once(self):
+        # The roster is one file, and each such stack rewrites an entry of it
+        # through Hermes. lock-infra keeps two lock takers apart and a shared
+        # state lock keeps its holders apart; a case off the infra lock
+        # (infra_lock_exempt) has neither with a stack outside its state
+        # lock, so the two must run in different shards, on different installs.
+        shards = self.main_shards()
+        every = self.names(sum(shards, []))
+        stacks = self.script_answers(every, 'task_stack "${{BENCH_DIR}}/tasks/{name}/task.yaml"')
+        takes_lock = self.stack_cases(every)
+        state_lock = self.script_answers(every, "unit_state_lock {name}")
+
+        def writes_roster(case: str) -> bool:
+            stack = stacks.get(case, "")
+            if not stack:
+                return False
+            text = "\n".join(
+                p.read_text(encoding="utf-8")
+                for p in sorted((TF_ROOT / stack).rglob("*"))
+                if p.is_file() and p.suffix in STACK_SOURCE_SUFFIXES
+            )
+            return bool(ROSTER_WRITE.search(text))
+
+        writers = [case for case in every if writes_roster(case)]
+        self.assertEqual(sorted(writers), sorted(ROSTER_WRITERS))
+        for shard in shards:
+            here = [case for case in self.names(shard) if case in writers]
+            for i, one in enumerate(here):
+                for other in here[i + 1:]:
+                    with self.subTest(one=one, other=other):
+                        both_take_the_lock = one in takes_lock and other in takes_lock
+                        share_a_state_lock = bool(state_lock.get(one)) and state_lock.get(one) == state_lock.get(other)
+                        self.assertTrue(
+                            both_take_the_lock or share_a_state_lock,
+                            f"{one} and {other} run in one shard, both stacks write the cron roster, and no lock keeps them apart",
+                        )
 
     def test_a_cases_shard_depends_on_its_name_alone(self):
         # The shards are five periodics that each check out main; a case added

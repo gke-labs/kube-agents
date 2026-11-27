@@ -55,7 +55,9 @@ func startTriggerRig(t *testing.T, tweak func(*Config)) *triggerRig {
 			tweak(c)
 		}
 	})
-	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}})
+	// fleet-audit delegates (spec.delegates, #6789), so a scheduled run of it
+	// may fan out (#6744).
+	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}, Delegates: true})
 	r.g.profiles.put("readonly", &lib.AgentCard{Name: "readonly", Tiers: []string{"read"}})
 	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Tiers: []string{"read", "unattended"}, Parameters: clusterParams})
 	nc, err := connectTest(r.url)
@@ -1174,5 +1176,478 @@ func TestTriggerRecordMapsAreBounded(t *testing.T) {
 	g := &Gateway{cfg: &Config{TriggerRatePerHour: 60}}
 	if got := g.triggerKeysKept(); got < 60*24 {
 		t.Errorf("at 60 an hour the key cap is %d, under a day's runs", got)
+	}
+}
+
+// A scheduled run may fan out (#6744): its child is minted at the read tier,
+// as a fresh root on the parent's scope, with no trigger, so it can read for
+// its parent and never write under the schedule's trigger. The child's result
+// reaches the parent on its .in, and nothing is posted to chat, since a
+// trigger's conversation has no backend.
+func TestAScheduledRunsChildIsAReadRootWithNoTrigger(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	postsBefore := len(tr.adapter.posts) + len(tr.adapter.stopPostsCopy())
+
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "list this cluster's nodes",
+		targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	var childMsg *nats.Msg
+	waitFor(t, "the child's submission", func() bool {
+		for _, m := range tr.submissions() {
+			if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+				childMsg = m
+				return true
+			}
+		}
+		return false
+	})
+	profile, tier, _, _, _ := lib.ParseSubmitSubject(childMsg.Subject)
+	if profile != "cluster" || tier != string(capability.TierRead) {
+		t.Fatalf("child submitted on %s, want a read child of cluster", childMsg.Subject)
+	}
+	var childEnv lib.Envelope
+	if err := json.Unmarshal(childMsg.Data, &childEnv); err != nil {
+		t.Fatal(err)
+	}
+	if trig, err := capability.TriggerFromAuthority(childEnv.Authority); err != nil || trig != nil {
+		t.Fatalf("the child's authority claims trigger %+v (%v); a child carries none", trig, err)
+	}
+	ref, present, err := capability.RefFromAuthority(childEnv.Authority)
+	if err != nil || !present {
+		t.Fatalf("the child pins no grant: %v", err)
+	}
+	entry := readCapEntry(t, tr.url, ref)
+	if entry.Tier != capability.TierRead || entry.Trigger != nil || entry.Profile != "cluster" {
+		t.Fatalf("the child's grant = %+v, want read tier on cluster with no trigger", entry)
+	}
+
+	child := tr.execFor(t, &childEnv, "cluster")
+	if err := child.PublishArtifact(ctx, lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "three nodes, all ready"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child result on the parent's .in", func() bool {
+		for _, e := range streamEnvelopes(t, tr.url, lib.TaskInSubject("fleet-audit", origin.TaskID)) {
+			if c, ok := lib.ChildResultOf(messageParts(t, e.env)); ok && c.ChildTaskID == childEnv.TaskID && c.Text == "three nodes, all ready" {
+				return true
+			}
+		}
+		return false
+	})
+	if n := len(tr.adapter.posts) + len(tr.adapter.stopPostsCopy()); n != postsBefore {
+		t.Fatalf("the fan-out posted to chat: %d posts, was %d", n, postsBefore)
+	}
+}
+
+// TestAScheduledRunHandsNoTaskToAProfileThatTakesNoScheduledWork: the
+// child runs at read, but for a schedule, so its profile's card must list
+// unattended, as the trigger's own profile's must (#6744).
+func TestAScheduledRunHandsNoTaskToAProfileThatTakesNoScheduledWork(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifact(t, "readonly", "look")); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && strings.Contains(rec.delegationEndFor(origin.TaskID), fmt.Sprintf(noticeUnattendedChild, "readonly"))
+	})
+	for _, m := range tr.submissions() {
+		if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+			t.Fatalf("a child was minted on %s", m.Subject)
+		}
+	}
+}
+
+// TestAScheduledRunsChildCarriesTheScheduledMark: the child runs at read,
+// so the card check can't key on its tier when it delegates in turn; the
+// mark it carries (TaskRef.Scheduled) holds its own children to the same
+// cards. A child can't delegate while it is the conversation's live task
+// today (delegation.busy), so this checks the mark, not a grandchild.
+func TestAScheduledRunsChildCarriesTheScheduledMark(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	var child TaskRef
+	waitFor(t, "the child's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		if rec == nil {
+			return false
+		}
+		p, ok := rec.TaskRefFor(origin.TaskID)
+		if !ok || len(p.Children) == 0 {
+			return false
+		}
+		child, ok = rec.TaskRefFor(p.Children[0])
+		return ok
+	})
+	if child.Tier != string(capability.TierRead) || !child.Scheduled || !child.belowSchedule() {
+		t.Fatalf("the child's entry = tier %q scheduled %v, want read and marked", child.Tier, child.Scheduled)
+	}
+	if (TaskRef{Tier: string(capability.TierRead)}).belowSchedule() {
+		t.Fatal("an unmarked read task reads as below a schedule")
+	}
+}
+
+// TestAScheduledRunHandsNoTaskWhereAPinnedProfileTakesNoScheduledWork: a
+// trigger submitted straight to a profile on a cluster whose pinned
+// profile doesn't list unattended is refused, so a scheduled run's child
+// sent there is refused too, though it runs at read.
+func TestAScheduledRunHandsNoTaskWhereAPinnedProfileTakesNoScheduledWork(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	tr.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Tiers: []string{"read"},
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
+	ctx := context.Background()
+	s := goodScheduleSubmit()
+	reply := tr.submit(t, "schedule", s)
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look", targetParams("p1", "us-east1", "prod"))); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	waitFor(t, "the refusal on the run's entry", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		return rec != nil && strings.Contains(rec.delegationEndFor(origin.TaskID), "prod-east")
+	})
+	for _, m := range tr.submissions() {
+		if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+			t.Fatalf("a child was minted on %s", m.Subject)
+		}
+	}
+}
+
+// delegationEndFor is the reason a task's delegation minted no child
+// (TaskRef.DelegationEnd), or "".
+func (rec *SessionRecord) delegationEndFor(taskID string) string {
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		return ref.DelegationEnd
+	}
+	return ""
+}
+
+// startScheduledParent submits goodScheduleSubmit to tr and returns the
+// scheduled run's envelope and its executor, working.
+func startScheduledParent(t *testing.T, tr *triggerRig) (lib.Envelope, *lib.TaskExecution) {
+	t.Helper()
+	if reply := tr.submit(t, "schedule", goodScheduleSubmit()); reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	return origin, parent
+}
+
+// rawDelegateArtifact is a delegate artifact whose data is body as written,
+// so a test can add fields lib.DelegateRequest doesn't have.
+func rawDelegateArtifact(t *testing.T, body map[string]any) lib.Artifact {
+	t.Helper()
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lib.Artifact{ArtifactID: "artifact-raw-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate, Parts: []lib.Part{{Kind: "data", Data: data}}}
+}
+
+// TestAScheduledRunsChildRequestIsHeldToReadWithNoTrigger covers every
+// shape a scheduled run's delegate request can take (#6744). The request
+// has no tier or trigger field: the child's tier is fixed at read by the
+// gateway, and its authority is rebuilt from the parent's attribution, so a
+// field asking for a tier, a trigger or an authority is dropped unread. The
+// child's card must run at read and list unattended, and a card's unknown
+// tier is a name it lists, nothing more. A refusal ends the parent's
+// delegation with exactly the fixed notice and mints nothing.
+func TestAScheduledRunsChildRequestIsHeldToReadWithNoTrigger(t *testing.T) {
+	prod := targetParams("p1", "us-east1", "prod")
+	triggerClaim := map[string]any{"name": "schedule/compliance-audit", "origin": "builtin", "stream": "compliance-audit"}
+	cases := []struct {
+		name  string
+		cards []*lib.AgentCard
+		body  map[string]any
+		// wantProfile is the child's profile when one is minted; wantParams
+		// its parameters. Otherwise notice is the refusal, after
+		// noticeDelegationRefusedFor.
+		wantProfile string
+		wantParams  map[string]string
+		notice      string
+	}{
+		// Class 2: a request asking for a tier above read.
+		{name: "a tier field asking for a writer tier is dropped",
+			cards:       []*lib.AgentCard{{Name: "writer", Tiers: []string{"read", "oncall", "unattended"}}},
+			body:        map[string]any{"addressee": "writer", "text": "fix it", "tier": "oncall"},
+			wantProfile: "writer"},
+		{name: "a profile that runs only above read is refused",
+			cards:  []*lib.AgentCard{{Name: "writer", Tiers: []string{"oncall", "unattended"}}},
+			body:   map[string]any{"addressee": "writer", "text": "fix it"},
+			notice: fmt.Sprintf(noticeProfileTier, "writer", capability.TierRead)},
+		// Class 3: a request carrying a trigger or an authority.
+		{name: "trigger and authority fields are dropped",
+			body: map[string]any{"addressee": "cluster", "text": "look", "parameters": prod,
+				"trigger": triggerClaim, "authority": map[string]any{"trigger": triggerClaim}, "grants": []string{"ref"}},
+			wantProfile: "cluster", wantParams: prod},
+		{name: "an undeclared trigger parameter is refused",
+			body: map[string]any{"addressee": "cluster", "text": "look",
+				"parameters": map[string]string{"project": "p1", "location": "us-east1", "cluster": "prod", "trigger": "compliance-audit"}},
+			notice: fmt.Sprintf(noticeParamUndeclared, "cluster", "trigger", declaredParameters(lib.AgentCard{Parameters: clusterParams}))},
+		{name: "a declared trigger parameter stays a parameter",
+			cards: []*lib.AgentCard{{Name: "named", Tiers: []string{"read", "unattended"},
+				Parameters: []lib.ProfileParameter{{Name: "trigger"}}}},
+			body:        map[string]any{"addressee": "named", "text": "look", "parameters": map[string]string{"trigger": "compliance-audit"}},
+			wantProfile: "named", wantParams: map[string]string{"trigger": "compliance-audit"}},
+		// Class 4: an unknown tier on the request or the card.
+		{name: "an unknown tier field on the request is dropped",
+			body:        map[string]any{"addressee": "cluster", "text": "look", "parameters": prod, "tier": "no-such-tier"},
+			wantProfile: "cluster", wantParams: prod},
+		{name: "a card with an unknown tier beside read and unattended runs at read",
+			cards:       []*lib.AgentCard{{Name: "odd", Tiers: []string{"no-such-tier", "read", "unattended"}}},
+			body:        map[string]any{"addressee": "odd", "text": "look"},
+			wantProfile: "odd"},
+		{name: "a card with an unknown tier and no read is refused",
+			cards:  []*lib.AgentCard{{Name: "odd", Tiers: []string{"no-such-tier", "unattended"}}},
+			body:   map[string]any{"addressee": "odd", "text": "look"},
+			notice: fmt.Sprintf(noticeProfileTier, "odd", capability.TierRead)},
+		{name: "a card that lists no tiers takes no scheduled work",
+			cards:  []*lib.AgentCard{{Name: "legacy"}},
+			body:   map[string]any{"addressee": "legacy", "text": "look"},
+			notice: fmt.Sprintf(noticeUnattendedChild, "legacy")},
+		// Class 5, held to the exact notice.
+		{name: "a profile that doesn't list unattended",
+			body:   map[string]any{"addressee": "readonly", "text": "look"},
+			notice: fmt.Sprintf(noticeUnattendedChild, "readonly")},
+		{name: "a pinned profile that doesn't list unattended",
+			cards: []*lib.AgentCard{{Name: "prod-east", Tiers: []string{"read"},
+				ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}}},
+			body:   map[string]any{"addressee": "cluster", "text": "look", "parameters": prod},
+			notice: fmt.Sprintf(noticePinnedTier, clusterTarget{Project: "p1", Location: "us-east1", Cluster: "prod"}, "prod-east", capability.TierUnattended)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := startTriggerRig(t, nil)
+			for _, c := range tc.cards {
+				tr.g.profiles.put(c.Name, c)
+			}
+			ctx := context.Background()
+			origin, parent := startScheduledParent(t, tr)
+			if err := parent.PublishArtifact(ctx, rawDelegateArtifact(t, tc.body)); err != nil {
+				t.Fatal(err)
+			}
+			key := "trigger:schedule/kubeagents-system/compliance-audit"
+			if tc.notice != "" {
+				want := "reason: " + reasonDelegationRefused + " - " + noticeDelegationRefusedFor + tc.notice
+				var got string
+				waitFor(t, "the refusal on the run's entry", func() bool {
+					rec, _ := tr.g.reg.Get(ctx, key)
+					if rec != nil {
+						got = rec.delegationEndFor(origin.TaskID)
+					}
+					return got != ""
+				})
+				if got != want {
+					t.Fatalf("the parent's delegation ended %q, want %q", got, want)
+				}
+				for _, m := range tr.submissions() {
+					if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+						t.Fatalf("a child was minted on %s", m.Subject)
+					}
+				}
+				return
+			}
+			var childMsg *nats.Msg
+			waitFor(t, "the child's submission", func() bool {
+				for _, m := range tr.submissions() {
+					if _, _, kind, _, ok := lib.ParseSubmitSubject(m.Subject); ok && kind == lib.SubmitKindChild {
+						childMsg = m
+						return true
+					}
+				}
+				return false
+			})
+			if profile, tier, _, _, _ := lib.ParseSubmitSubject(childMsg.Subject); profile != tc.wantProfile || tier != string(capability.TierRead) {
+				t.Fatalf("child submitted on %s, want a read child of %s", childMsg.Subject, tc.wantProfile)
+			}
+			var childEnv lib.Envelope
+			if err := json.Unmarshal(childMsg.Data, &childEnv); err != nil {
+				t.Fatal(err)
+			}
+			if trig, err := capability.TriggerFromAuthority(childEnv.Authority); err != nil || trig != nil {
+				t.Fatalf("the child's authority claims trigger %+v (%v); a child carries none", trig, err)
+			}
+			ref, present, err := capability.RefFromAuthority(childEnv.Authority)
+			if err != nil || !present {
+				t.Fatalf("the child pins no grant: %v", err)
+			}
+			if entry := readCapEntry(t, tr.url, ref); entry.Tier != capability.TierRead || entry.Trigger != nil || entry.Profile != tc.wantProfile {
+				t.Fatalf("the child's grant = %+v, want read tier on %s with no trigger", entry, tc.wantProfile)
+			}
+			params, _, err := lib.TaskParametersOf(messageParts(t, &childEnv))
+			if err != nil || !mapsEqual(params.Parameters, tc.wantParams) {
+				t.Fatalf("child parameters = %v (%v), want %v", params.Parameters, err, tc.wantParams)
+			}
+			rec, _ := tr.g.reg.Get(ctx, key)
+			child, ok := rec.TaskRefFor(childEnv.TaskID)
+			if !ok || child.Tier != string(capability.TierRead) || !child.Scheduled {
+				t.Fatalf("the child's entry = %+v, want read and marked scheduled", child)
+			}
+		})
+	}
+}
+
+// TestAnInteractiveProfileParentsChildIsUntouchedByTheScheduleRules is the
+// pass-through: a profile task a person started delegates as before #6744.
+// Its child runs at the parent's tier, oncall as well as read, not forced
+// to read; its profile needn't list unattended; and it carries no
+// scheduled mark.
+func TestAnInteractiveProfileParentsChildIsUntouchedByTheScheduleRules(t *testing.T) {
+	for _, tc := range []struct{ author, want string }{{"1001", "oncall"}, {"1002", "read"}} {
+		t.Run(tc.want, func(t *testing.T) {
+			r := startTierRig(t, "1001")
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Tiers: []string{"read", "oncall"}, Delegates: true})
+			ctx := context.Background()
+			conv := "discord:6744/" + tc.author
+			turn := profileTurn(conv, "chat", nil)
+			turn.AuthorID = tc.author
+			r.adapter.inbox <- turn
+			origin := submissionOn(t, r, "chat")
+			parent := r.execFor(t, origin, "chat")
+			if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look at prod",
+				targetParams("p1", "us-east1", "prod"))); err != nil {
+				t.Fatal(err)
+			}
+			var got []subjectEnvelope
+			waitFor(t, "the child's submission", func() bool {
+				got = streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>")
+				return len(got) == 1
+			})
+			if _, tier, kind, _, ok := lib.ParseSubmitSubject(got[0].subject); !ok || tier != tc.want || kind != lib.SubmitKindChild {
+				t.Fatalf("child subject = %q, want a %s child submission", got[0].subject, tc.want)
+			}
+			if trig, err := capability.TriggerFromAuthority(got[0].env.Authority); err != nil || trig != nil {
+				t.Fatalf("the child's authority claims trigger %+v (%v)", trig, err)
+			}
+			rec := waitForRecord(t, r, conv, "the child's entry", func(rec *SessionRecord) bool {
+				_, ok := rec.TaskRefFor(got[0].env.TaskID)
+				return ok
+			})
+			child, _ := rec.TaskRefFor(got[0].env.TaskID)
+			if child.Tier != tc.want || child.Scheduled || child.belowSchedule() {
+				t.Fatalf("the child's entry = tier %q scheduled %v, want %s and unmarked", child.Tier, child.Scheduled, tc.want)
+			}
+			if p, _ := rec.TaskRefFor(origin.TaskID); p.DelegationEnd != "" {
+				t.Fatalf("the parent's delegation ended %q", p.DelegationEnd)
+			}
+		})
+	}
+}
+
+// TestAScheduledRunsBatchChildrenCarryTheScheduledMark: each child of a
+// scheduled run's batch carries the mark a single child does, so its own
+// delegation is held to the unattended card check as a single child's is.
+func TestAScheduledRunsBatchChildrenCarryTheScheduledMark(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	tr.g.cfg.DelegationWidthMax = 10
+	ctx := context.Background()
+	reply := tr.submit(t, "schedule", goodScheduleSubmit())
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	parent := tr.execFor(t, &origin, "fleet-audit")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	key := "trigger:schedule/kubeagents-system/compliance-audit"
+	var kids []TaskRef
+	waitFor(t, "both children's entries", func() bool {
+		rec, _ := tr.g.reg.Get(ctx, key)
+		if rec == nil {
+			return false
+		}
+		kids = rec.batchChildren(origin.TaskID)
+		return len(kids) == 2
+	})
+	for _, k := range kids {
+		if k.Tier != string(capability.TierRead) || !k.Scheduled || !k.belowSchedule() {
+			t.Fatalf("batch child %d = tier %q scheduled %v, want read and marked", k.BatchIndex, k.Tier, k.Scheduled)
+		}
 	}
 }

@@ -117,7 +117,7 @@ func a2aCuratorNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 
 func a2aCuratorPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{
-		"app":                             a2aCuratorName(agent),
+		"app":                           a2aCuratorName(agent),
 		"kubeagents.x-k8s.io/component": a2aCuratorComponent,
 	}
 }
@@ -173,6 +173,7 @@ func buildA2ACuratorServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 }
 
 // buildA2ACuratorDeployment builds the credential-free curator Deployment.
+// reconcileA2ACurator adds the curator's inference gateway key, once served.
 func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aCuratorName(agent)
 	selector := a2aCuratorPodSelector(agent)
@@ -279,10 +280,21 @@ func a2aCuratorResources() corev1.ResourceRequirements {
 	return resources
 }
 
-// buildA2ACuratorNetworkPolicy denies all ingress to the curator pod and limits
-// egress to cluster DNS, NATS, LiteLLM, and hindsight-api.
+// buildA2ACuratorNetworkPolicy restricts ingress to the curator pod's status/metrics
+// listener from the GMP collector namespace and limits egress to cluster DNS,
+// NATS, LiteLLM, hindsight-api, and credential-proxy.
 func buildA2ACuratorNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	dnsPeers := clusterDNSPeers(dnsClusterIPs)
+	ingress := []networkingv1.NetworkPolicyIngressRule{
+		{
+			From: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+				},
+			}},
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aCuratorStatusPort)},
+		},
+	}
 	egress := []networkingv1.NetworkPolicyEgressRule{
 		{
 			Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
@@ -337,7 +349,8 @@ func buildA2ACuratorNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Egress: egress,
+			Ingress: ingress,
+			Egress:  egress,
 		},
 	}
 }
@@ -350,6 +363,9 @@ func (r *PlatformAgentReconciler) reconcileA2ACurator(ctx context.Context, agent
 	}
 	sa := buildA2ACuratorServiceAccount(agent)
 	dep := buildA2ACuratorDeployment(agent)
+	// The curator class's inference gateway key, once the gateway serves it
+	// (inference_key_callers.go): the one Secret the curator reads.
+	withInferenceKeyEnv(&dep.Spec.Template.Spec, a2aCuratorContainer, inferenceKeyCallersFrom(ctx), inferenceKeyClassCurator, curatorInferenceKeyEnv)
 	objs := []client.Object{sa}
 	if !busHeld {
 		objs = append(objs, dep)

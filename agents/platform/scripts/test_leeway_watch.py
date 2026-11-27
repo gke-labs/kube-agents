@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -29,6 +29,18 @@ NO_REPORT_TIMED_OUT = "no cluster could be read this run: the reads timed out; i
 NO_REPORT_FAILED = "no cluster could be read this run: the reads failed; it will try again next run"
 NO_REPORT_MIXED = (
     "no cluster could be read this run: some reads timed out and others failed; it will try again next run"
+)
+FAILED_TIMED_OUT_LINE = (
+    "**The topology skew check didn't run today.** Reading the clusters took too long. "
+    "It will try again at its next scheduled run."
+)
+FAILED_ERROR_LINE = (
+    "**The topology skew check didn't run today.** Reading the clusters failed. "
+    "It will try again at its next scheduled run."
+)
+FAILED_MIXED_LINE = (
+    "**The topology skew check didn't run today.** Some cluster reads timed out and others failed. "
+    "It will try again at its next scheduled run."
 )
 # The simulated leeway's start-up and report assembly per call.
 SIM_STARTUP_SECONDS = 10.0
@@ -159,6 +171,7 @@ class GateAndReportingTests(unittest.TestCase):
             os.environ,
             {
                 watch.WATCH_HOME_ENV: str(self.home),
+                watch.HOME_ENV: self.tmp.name,
                 watch.PROJECTS_ENV: "p1",
                 watch.CLUSTERS_ENV: "",
                 watch.REFRESH_DAYS_ENV: "",
@@ -180,6 +193,10 @@ class GateAndReportingTests(unittest.TestCase):
         self.roster_patch.stop()
         self.env_patch.stop()
         self.tmp.cleanup()
+
+    def log_text(self) -> str:
+        path = self.home / "logs" / watch.WATCH_LOG_FILE
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
 
     def run_tick(self, fake_run, *, now: datetime = T0, dry_run: bool = False) -> tuple[int, str]:
         # The project under test has no Cluster Agent profiles (roster_patch), so
@@ -310,7 +327,12 @@ class GateAndReportingTests(unittest.TestCase):
         }
         code_err, out_err = self.run_tick(lambda *a, **kw: completed_json(make_report([c_error], t1)), now=t1)
         self.assertEqual(code_err, 0)
-        self.assertIn("leeway watch: the fleet scan was partial (1 error(s))", out_err)
+        self.assertIn(
+            "**The topology skew check couldn't read p1.** Existing findings there are kept until the next clean read.",
+            out_err,
+        )
+        self.assertIn("kubectl list nodes timed out", self.log_text())
+        self.assertNotIn("kubectl list nodes timed out", out_err)
         self.assertNotIn("retired", out_err)
         ledger = watch.load_ledger(self.home)
         self.assertEqual(len(ledger[watch.FINDINGS_KEY]), 1)
@@ -329,7 +351,8 @@ class GateAndReportingTests(unittest.TestCase):
         }
         code_ok, out_ok = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t3)), now=t3)
         self.assertEqual(code_ok, 0)
-        self.assertIn("leeway watch: every target that failed reads cleanly again", out_ok)
+        self.assertIn("The topology skew check read every project cleanly again.", out_ok)
+        self.assertNotIn("**The topology skew check read every project cleanly again.**", out_ok)
         self.assertIn("**1 pod placement problem has cleared**\n- checkout-api (shop) on seeded-d\n", out_ok)
         ledger_after = watch.load_ledger(self.home)
         self.assertEqual(ledger_after[watch.FINDINGS_KEY], {})
@@ -340,21 +363,23 @@ class GateAndReportingTests(unittest.TestCase):
 
         code1, out1 = self.run_tick(failing_run, now=T0)
         self.assertEqual(code1, 0)
-        self.assertIn("leeway watch: the tick failed:", out1)
+        self.assertEqual(out1.strip(), FAILED_ERROR_LINE)
+        self.assertIn("broker unreachable", self.log_text())
+        self.assertNotIn("broker unreachable", out1)
 
-        # Second failure with identical detail prints nothing.
+        # Second failure with identical reason prints nothing.
         code2, out2 = self.run_tick(failing_run, now=T0 + timedelta(days=1))
         self.assertEqual(code2, 0)
         self.assertEqual(out2, "")
 
-        # Recovery prints "the tick runs again".
+        # Recovery prints the plain recovery line.
         c_clean = {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}
         code3, out3 = self.run_tick(
             lambda *a, **kw: completed_json(make_report([c_clean], T0 + timedelta(days=2))),
             now=T0 + timedelta(days=2),
         )
         self.assertEqual(code3, 0)
-        self.assertEqual(out3.strip(), "leeway watch: the tick runs again")
+        self.assertEqual(out3.strip(), "**The topology skew check is running again.**")
 
     def test_dry_run_leaves_ledger_and_reports_untouched(self) -> None:
         c_skewed = {
@@ -368,10 +393,16 @@ class GateAndReportingTests(unittest.TestCase):
             dry_run=True,
         )
         self.assertEqual(code, 0)
-        self.assertIn("dry run: would report 1 finding(s) (1 new finding)", out)
-        self.assertIn("Deployment/shop/checkout-api [constraint_ignored, 100%]", out)
+        self.assertEqual(
+            out,
+            "dry run (nothing posted):\n"
+            "**1 pod placement problem on cluster seeded-d (new)**\n"
+            "- checkout-api (shop) on seeded-d: 100% of its pods in one zone; its zone spread rule is not being kept\n"
+            "Ask me how to fix any of these. If they're still open, I'll post them again on or after 2026-10-26.\n",
+        )
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
         self.assertFalse((self.home / watch.REPORTS_DIR_NAME).exists())
+        self.assertFalse(hasattr(watch, "due_finding_summary"))
 
     def test_prune_old_reports_keeps_newest_ten(self) -> None:
         c_skewed = {
@@ -439,7 +470,13 @@ class GateAndReportingTests(unittest.TestCase):
         c_clean = {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}
         code1, out1 = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], T0)), now=T0)
         self.assertEqual(code1, 0)
-        self.assertIn("refusing to overwrite it", out1)
+        self.assertEqual(
+            out1.strip(),
+            "**The topology skew check didn't run today.** Its record of earlier runs can't be read. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+        self.assertIn("refusing to overwrite it", self.log_text())
+        self.assertNotIn("refusing to overwrite it", out1)
         self.assertEqual(ledger_path.read_text(encoding="utf-8"), "{corrupt json")
 
         # Second tick with the same corrupt ledger is suppressed by the failure marker.
@@ -598,7 +635,10 @@ class GateAndReportingTests(unittest.TestCase):
 
             code, out = self.run_tick(fake_run, now=T0)
             self.assertEqual(code, 0)
-            self.assertIn("leeway watch: the fleet scan was partial (1 error(s))", out)
+            self.assertIn(
+                "**The topology skew check couldn't read p1.** Existing findings there are kept until the next clean read.",
+                out,
+            )
             ledger = watch.load_ledger(self.home)
             self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p1"), watch.iso(T0))
             self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p2"), watch.iso(T0))
@@ -613,11 +653,9 @@ class GateAndReportingTests(unittest.TestCase):
 
             return run
 
-        def entry(project: str) -> str:
-            return f"{project}: leeway scan for {project} failed: RuntimeError: leeway exited 1 without a report: err"
+        def partial(project: str) -> str:
+            return f"**The topology skew check couldn't read {project}.** Existing findings there are kept until the next clean read."
 
-        partial = "leeway watch: the fleet scan was partial ({count} error(s)): {reasons}; " \
-            "findings on unreadable clusters are retained until read again"
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
             outputs = [
                 self.run_tick(outcome, now=T0 + timedelta(days=day))[1].splitlines()
@@ -628,13 +666,14 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertEqual(
             outputs,
             [
-                [partial.format(count=1, reasons=entry("p2"))],
+                [partial("p2")],
                 [],  # the same target failing again is not re-posted
-                [partial.format(count=1, reasons=entry("p1"))],  # a new target posts; p2 read cleanly
+                [partial("p1")],  # a new target posts; p2 read cleanly
                 [],
-                ["leeway watch: every target that failed reads cleanly again"],
+                ["**The topology skew check read every project cleanly again.**"],
             ],
         )
+        self.assertIn("leeway exited 1 without a report: err", self.log_text())
 
     def test_retires_resolved_finding_in_clusters_mode_and_with_bare_cluster_names(self) -> None:
         with mock.patch.dict(
@@ -968,17 +1007,21 @@ class GateAndReportingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
             watch.shutil, "which", return_value="/usr/local/bin/a2a"
         ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
-            # Day 0: finding is due, report writes, topic publish fails -> report line AND single-line warning printed once.
+            # Day 0: finding is due, report writes, topic publish fails -> only the due finding posts to chat; failure is logged.
             code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
             self.assertEqual(code0, 0)
             lines0 = out0.strip().splitlines()
-            self.assertEqual(len(lines0), 4)
+            self.assertEqual(len(lines0), 3)
             self.assertIn("**1 pod placement problem on cluster seeded-d (new)**", lines0[0])
-            self.assertIn("publishing to blackboard topic topology-skew failed", lines0[3])
-            self.assertIn("Error: nats: no 'TOPICS-STATE' response", lines0[3])
-            self.assertIn("TopicsStateSubjectMissing", lines0[3])
-            self.assertIn("nats stream edit TOPICS-STATE", lines0[3])
+            self.assertNotIn("agent bus", out0)
+            for plumbing in ("Error: nats:", "TopicsStateSubjectMissing", "nats stream edit TOPICS-STATE", "kubectl"):
+                self.assertNotIn(plumbing, out0)
+                self.assertIn(plumbing, self.log_text())
             self.assertEqual(len(a2a_calls), 1)
+            self.assertEqual(
+                watch.load_ledger(self.home)[watch.ANNOUNCED_KEY].get(watch.ANNOUNCED_TOPIC_PUBLISH_KEY),
+                watch.ERROR_KIND_TOPIC_PUBLISH,
+            )
 
             # Day 1: quiet tick retries latest.json and fails again -> no duplicate warning spam.
             t1 = T0 + timedelta(days=1)
@@ -987,11 +1030,11 @@ class GateAndReportingTests(unittest.TestCase):
             self.assertEqual(out1, "")
             self.assertEqual(len(a2a_calls), 2)
 
-            # Day 2: operator added the subject to TOPICS-STATE -> quiet tick retry succeeds and announces recovery.
+            # Day 2: operator added the subject to TOPICS-STATE -> quiet tick retry succeeds and clears marker silently.
             t2 = T0 + timedelta(days=2)
             code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t2)
             self.assertEqual(code2, 0)
-            self.assertEqual(out2.strip(), "leeway watch: publishing to blackboard topic topology-skew succeeded again")
+            self.assertEqual(out2, "")
             self.assertEqual(len(a2a_calls), 3)
             ledger = watch.load_ledger(self.home)
             self.assertNotIn(watch.ANNOUNCED_KEY, ledger)
@@ -1066,7 +1109,12 @@ class GateAndReportingTests(unittest.TestCase):
             code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_day1_partial), now=t1)
             self.assertEqual(code1, 0)
             self.assertIn("**1 pod placement problem has cleared**", out1)
-            self.assertIn("the fleet scan was partial (1 error(s))", out1)
+            self.assertIn(
+                "The topology skew check couldn't read the configured clusters. "
+                "Existing findings there are kept until the next clean read.",
+                out1,
+            )
+            self.assertNotIn("**The topology skew check couldn't read", out1)
             self.assertEqual(len(published_payloads), 1)
             ledger1 = watch.load_ledger(self.home)
             self.assertEqual(
@@ -1079,8 +1127,7 @@ class GateAndReportingTests(unittest.TestCase):
             self.assertEqual(code2, 0)
             self.assertEqual(len(published_payloads), 2)
             self.assertEqual(published_payloads[1]["clusters"][0]["topology_findings"], [])
-            self.assertIn("every target that failed reads cleanly again", out2)
-            self.assertIn("publishing to blackboard topic topology-skew succeeded again", out2)
+            self.assertEqual(out2.strip(), "**The topology skew check read every project cleanly again.**")
             ledger2 = watch.load_ledger(self.home)
             self.assertNotIn(watch.ANNOUNCED_KEY, ledger2)
 
@@ -1241,20 +1288,18 @@ class GateAndReportingTests(unittest.TestCase):
         ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
             code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
             self.assertEqual(code0, 0)
+            self.assertNotIn("agent bus", out0)
+            self.assertNotIn("TimeoutExpired", out0)
             self.assertIn(
                 "publishing to blackboard topic topology-skew failed "
                 "(TimeoutExpired: a2a topics write topology-skew timed out after 30s)",
-                out0,
+                self.log_text(),
             )
-            warn_line = [ln for ln in out0.splitlines() if "publishing to blackboard topic" in ln][0]
-            self.assertNotIn("--text", warn_line)
-            self.assertNotIn("--data", warn_line)
-            self.assertNotIn("pod placement problem", warn_line)
 
             t1 = T0 + timedelta(days=1)
             code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t1)
             self.assertEqual(code1, 0)
-            self.assertEqual(out1.strip(), "leeway watch: publishing to blackboard topic topology-skew succeeded again")
+            self.assertEqual(out1, "")
 
         with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
             watch.shutil, "which", return_value="/usr/local/bin/a2a"
@@ -1810,6 +1855,8 @@ class DiscoveryTests(unittest.TestCase):
             os.environ,
             {
                 watch.WATCH_HOME_ENV: tmp,
+                watch.HOME_ENV: tmp,
+                "PLATFORM_AGENT_HOME": tmp,
                 watch.CLUSTERS_ENV: "",
                 watch.PROJECTS_ENV: "",
                 watch.MANAGEMENT_PROJECT_ENV: "",
@@ -1821,8 +1868,15 @@ class DiscoveryTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 code = watch.tick(now=T0)
+            log = (Path(tmp) / "logs" / watch.WATCH_LOG_FILE).read_text(encoding="utf-8")
         self.assertEqual(code, 0)
-        self.assertIn("no GCP project", buf.getvalue())
+        self.assertEqual(
+            buf.getvalue().strip(),
+            "**The topology skew check didn't run today.** It has no GCP project to read. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+        self.assertIn("no GCP project", log)
+        self.assertNotIn("LEEWAY_WATCH_CLUSTERS", buf.getvalue())
 
     def test_declared_scope_resolves_projects_and_drops_out_of_scope_roster(self) -> None:
         fake_scope = mock.Mock(
@@ -1924,6 +1978,8 @@ class DiscoveryTests(unittest.TestCase):
             os.environ,
             {
                 watch.WATCH_HOME_ENV: tmp,
+                watch.HOME_ENV: tmp,
+                "PLATFORM_AGENT_HOME": tmp,
                 watch.CLUSTERS_ENV: "",
                 watch.PROJECTS_ENV: "",
             },
@@ -1936,10 +1992,16 @@ class DiscoveryTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 code = watch.tick(now=T0)
+            log = (Path(tmp) / "logs" / watch.WATCH_LOG_FILE).read_text(encoding="utf-8")
         self.assertEqual(code, 0)
         output = buf.getvalue()
-        self.assertIn("failed", output)
-        self.assertIn("ScopeRenderUnreadable: unreadable json", output)
+        self.assertEqual(
+            output.strip(),
+            "**The topology skew check didn't run today.** It couldn't read the install's scope. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+        self.assertNotIn("ScopeRenderUnreadable", output)
+        self.assertIn("ScopeRenderUnreadable: unreadable json", log)
 
 
 class ClusterTimeoutTests(unittest.TestCase):
@@ -2076,7 +2138,9 @@ class BatchTests(unittest.TestCase):
         self.home = Path(self.tmp.name) / "leeway"
         self.env = mock.patch.dict(
             os.environ,
-            {watch.WATCH_HOME_ENV: str(self.home), watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "p1",
+            {watch.WATCH_HOME_ENV: str(self.home), watch.HOME_ENV: self.tmp.name,
+             "PLATFORM_AGENT_HOME": str(self.home),
+             watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "p1",
              watch.NATS_URL_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""},
             clear=False,
         )
@@ -2095,6 +2159,10 @@ class BatchTests(unittest.TestCase):
         self.roster_patch.stop()
         self.env.stop()
         self.tmp.cleanup()
+
+    def log_text(self) -> str:
+        path = self.home / "logs" / watch.WATCH_LOG_FILE
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
 
     def sandbox(self, outcome=None, *, seconds: float = 0.0, findings: dict | None = None):
         """A sandbox whose `leeway report` returns an ok row per requested cluster
@@ -2154,8 +2222,15 @@ class BatchTests(unittest.TestCase):
         return sorted(f["cluster"] for f in watch.load_ledger(self.home)[watch.FINDINGS_KEY].values())
 
     def partial(self, count: int, *entries: str) -> str:
-        return (f"leeway watch: the fleet scan was partial ({count} error(s)): {', '.join(entries)}; "
-                "findings on unreadable clusters are retained until read again")
+        targets = [e.split(": ", 1)[0] for e in entries]
+        return watch.PARTIAL_LINE.format(targets=watch.format_name_list(targets))
+
+    def partial_log(self, count: int, *entries: str) -> str:
+        return watch.PARTIAL_LOG.format(
+            prefix=watch.LINE_PREFIX,
+            errors=count,
+            reasons=watch.format_name_list(list(entries)),
+        )
 
     # --- batching ---------------------------------------------------------
 
@@ -2286,7 +2361,7 @@ class BatchTests(unittest.TestCase):
             lines = self.tick(1, first_fails)
         failed = next(clusters_arg(a) for a, _ in self.calls if "p1/l/c00" in clusters_arg(a))
         detail = f"{20 - len(failed)} of 20 clusters read — {len(failed)} failed (leeway crashed)"
-        self.assertEqual(lines[-1], self.partial(1, f"the configured clusters: {detail}"))
+        self.assertEqual(lines[-1], watch.plain_status_line(self.partial(1, f"the configured clusters: {detail}")))
         self.assertEqual(self.finding_clusters(), sorted(failed), "findings retire only on clusters read")
         self.assertEqual(watch.load_ledger(self.home)[watch.SCAN_ERRORS_KEY], {watch.EXPLICIT_TARGET_LABEL: detail})
 
@@ -2323,6 +2398,100 @@ class BatchTests(unittest.TestCase):
             {"p1/l/c00": watch.iso(T0), "p1/l/c01": watch.iso(T0), "p9/l/other": old},
         )
 
+    def test_cluster_stamps_for_out_of_scope_projects_and_removed_explicit_clusters_expire_by_age(self) -> None:
+        self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
+        at_cutoff = watch.iso(T0 - timedelta(days=watch.CLUSTER_RUNS_RETENTION_MULTIPLIER * watch.REFRESH_DAYS_DEFAULT))
+        past_cutoff = watch.iso(
+            T0 - timedelta(days=watch.CLUSTER_RUNS_RETENTION_MULTIPLIER * watch.REFRESH_DAYS_DEFAULT, seconds=1)
+        )
+        # p1 and p2 are in-scope projects; p9 left the scope. When p1 runs and
+        # spends the tick budget before p2 is reached, p2's active in-scope
+        # cluster stamp is preserved even though it is older than the cutoff,
+        # while out-of-scope p9's expired and corrupt stamps are pruned.
+        self.write_ledger(
+            **{
+                watch.CLUSTER_RUNS_KEY: {
+                    "p2/l/c00": past_cutoff,
+                    "p9/l/at-cutoff": at_cutoff,
+                    "p9/l/expired": past_cutoff,
+                    "p9/l/corrupt": "not-an-iso-timestamp",
+                }
+            }
+        )
+        spend_tick = watch.TICK_BUDGET_SECONDS - watch.MIN_PROJECT_RUN_SECONDS + 1.0
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.tick(0, seconds=spend_tick)
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+            {"p1/l/c00": watch.iso(T0), "p2/l/c00": past_cutoff, "p9/l/at-cutoff": at_cutoff},
+        )
+
+        # In LEEWAY_WATCH_CLUSTERS mode, a removed explicit cluster stays within
+        # the retention window and is pruned once older than 2 * LEEWAY_WATCH_REFRESH_DAYS,
+        # while an unreached active explicit cluster keeps its older stamp so
+        # least-recently-stamped ordering survives multi-tick rotations.
+        explicit = triples("p1", watch.CLUSTERS_PER_BATCH + 1)
+        with mock.patch.dict(
+            os.environ,
+            {watch.CLUSTERS_ENV: ",".join(explicit), watch.PROJECTS_ENV: "", watch.REFRESH_DAYS_ENV: "3"},
+        ):
+            within_six_days = watch.iso(T0 - timedelta(days=6))
+            older_than_six_days = watch.iso(T0 - timedelta(days=6, seconds=1))
+            unreached_active = explicit[-1]
+            self.write_ledger(
+                **{
+                    watch.CLUSTER_RUNS_KEY: {
+                        **dict.fromkeys(explicit[:-1], older_than_six_days),
+                        unreached_active: within_six_days,
+                        "p2/l/kept": within_six_days,
+                        "p2/l/dropped": older_than_six_days,
+                    }
+                }
+            )
+            # First batch (12 clusters, stamped older_than_six_days) runs and spends
+            # the tick; unreached_active is not called on this tick, and even if an
+            # unreached active cluster had an expired stamp it stays in cluster_runs.
+            self.write_ledger(
+                **{
+                    watch.CLUSTER_RUNS_KEY: {
+                        unreached_active: older_than_six_days,
+                        "p2/l/kept": within_six_days,
+                        "p2/l/dropped": older_than_six_days,
+                    }
+                }
+            )
+            self.tick(0, seconds=spend_tick)
+            saved_runs = watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY]
+            self.assertIn(unreached_active, saved_runs)
+            self.assertEqual(saved_runs["p2/l/kept"], within_six_days)
+            self.assertNotIn("p2/l/dropped", saved_runs)
+
+        # A failed tick saves updated sweep-order stamps via save_stamps without pruning old entries.
+        self.roster = {"p1": triples("p1", 1)}
+        self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p9/l/expired": past_cutoff}})
+        self.tick(0, hangs(*self.roster["p1"]))
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+            {"p1/l/c00": watch.iso(T0), "p9/l/expired": past_cutoff},
+        )
+
+        # A tick where listing spent the budget before any call could start
+        # (target_reads empty) does not prune existing cluster_runs entries.
+        self.roster = {}
+
+        def slow_listing(argv, **kw):
+            self.clock += spend_tick
+            return subprocess.CompletedProcess(argv, 0, "c00\tl\n", "")
+
+        self.write_ledger(**{watch.CLUSTER_RUNS_KEY: {"p9/l/expired": past_cutoff}})
+        self.clock = 0.0
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=slow_listing), redirect_stdout(io.StringIO()):
+            watch.tick(now=T0)
+        self.assertEqual(
+            watch.load_ledger(self.home)[watch.CLUSTER_RUNS_KEY],
+            {"p9/l/expired": past_cutoff},
+        )
+
     # --- one turn per project ---------------------------------------------
 
     def test_a_timed_out_call_ends_the_projects_turn_and_costs_only_its_own_clusters(self) -> None:
@@ -2346,7 +2515,10 @@ class BatchTests(unittest.TestCase):
         parts = [f"{len(killed)} failed (the sandbox run timed out after 900s)"]
         if left:
             parts.append(f"{left} not tried this run (reading stops at the first timeout)")
-        self.assertEqual(lines[-1], self.partial(1, f"p1: {read} of 30 clusters read — {' — '.join(parts)}"))
+        self.assertEqual(
+            lines[-1],
+            watch.plain_status_line(self.partial(1, f"p1: {read} of 30 clusters read — {' — '.join(parts)}")),
+        )
         # Findings retire on the clusters read and on the cluster p1 no longer lists.
         self.assertEqual(self.finding_clusters(), sorted(set(self.roster["p1"]) - self.ok))
         ledger = watch.load_ledger(self.home)
@@ -2381,14 +2553,15 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(firsts, ["p1", "p4", "p3"], "the projects that had a turn rotate behind")
         # The line names no target and no count, so the rotation does not
         # change it and it posts once.
-        self.assertEqual(outputs, [[NO_REPORT_PREFIX + NO_REPORT_TIMED_OUT], [], []])
+        self.assertEqual(outputs, [[FAILED_TIMED_OUT_LINE], [], []])
+        self.assertIn(NO_REPORT_PREFIX + NO_REPORT_TIMED_OUT, self.log_text())
         ledger = watch.load_ledger(self.home)
         self.assertEqual(set(ledger[watch.CLUSTER_RUNS_KEY]), set(every))
 
     def test_a_dry_run_writes_no_stamps_even_when_the_tick_fails(self) -> None:
         self.roster = {"p1": triples("p1", 2)}
         self.clock = 0.0
-        with self.sandbox(hangs(*self.roster["p1"])), redirect_stdout(io.StringIO()):
+        with self.sandbox(hangs(*self.roster["p1"])), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             watch.tick(now=T0, dry_run=True)
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
@@ -2501,7 +2674,7 @@ class BatchTests(unittest.TestCase):
             [self.partial(2, entry("p3"), entry("p1"))],  # the new target first
             [],
             [],  # p1 reads cleanly; p3 is still failing
-            ["leeway watch: every target that failed reads cleanly again"],
+            [watch.PARTIAL_CLEARED_LINE],
         ])
 
     def test_a_target_that_leaves_the_sweep_drops_its_episode(self) -> None:
@@ -2514,7 +2687,7 @@ class BatchTests(unittest.TestCase):
             return completed_json(make_report([{"cluster": c, "status": "error", "error": "denied"} for c in clusters]))
 
         self.assertEqual(self.tick(1, error_row), [self.partial(1, "p1: 0 of 1 clusters read — c00 returned an error (denied)")])
-        self.assertEqual(self.tick(2), ["leeway watch: every target that failed reads cleanly again"])
+        self.assertEqual(self.tick(2), [watch.PARTIAL_CLEARED_LINE])
 
     def test_recovery_waits_until_every_announced_target_reads_cleanly(self) -> None:
         self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1), "p3": triples("p3", 1)}
@@ -2531,7 +2704,7 @@ class BatchTests(unittest.TestCase):
             third = self.tick(2)
         self.assertEqual(len(first), 1)
         self.assertEqual(second, [])
-        self.assertEqual(third, ["leeway watch: every target that failed reads cleanly again"])
+        self.assertEqual(third, [watch.PARTIAL_CLEARED_LINE])
         self.assertNotIn(watch.ANNOUNCED_FAILED_TARGETS_KEY, watch.load_ledger(self.home).get(watch.ANNOUNCED_KEY, {}))
 
     def test_the_post_leads_with_what_is_due_then_what_cleared_then_the_scan(self) -> None:
@@ -2546,7 +2719,10 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(headlines[0], 0)
         self.assertTrue(lines[0].startswith("**1 pod placement problem on cluster "), lines)
         self.assertEqual(lines[headlines[1]], "**1 pod placement problem has cleared**")
-        self.assertTrue(lines[-1].startswith("leeway watch: the fleet scan was partial (1 error(s)): p2"), lines)
+        self.assertEqual(
+            lines[-1],
+            "The topology skew check couldn't read p2. Existing findings there are kept until the next clean read.",
+        )
 
     def test_the_topic_summary_is_the_headline_as_plain_text(self) -> None:
         self.roster = {"p1": triples("p1", 1)}
@@ -2659,7 +2835,7 @@ class BatchTests(unittest.TestCase):
     def test_an_older_ledgers_episodes_recover_once_or_announce_anew(self) -> None:
         self.roster = {"p1": triples("p1", 1), "p2": triples("p2", 1)}
         entry = "p2: leeway scan for p2 failed: RuntimeError: leeway exited 1 without a report: boom"
-        cleared = "leeway watch: every target that failed reads cleanly again"
+        cleared = watch.PARTIAL_CLEARED_LINE
         open_p2 = {"p2": ["p2/l/c00"]}
         signature = watch.ANNOUNCED_PARTIAL_KEY
         targets = watch.ANNOUNCED_FAILED_TARGETS_KEY
@@ -2714,7 +2890,7 @@ class BatchTests(unittest.TestCase):
             outputs.append(self.tick(2, hangs(*self.roster["p2"]), seconds=call_seconds))
         self.assertEqual(outputs, [
             [],
-            ["leeway watch: every target that failed reads cleanly again"],
+            [watch.PARTIAL_CLEARED_LINE],
             [self.partial(1, "p2: the sandbox run timed out after 900s")],
         ])
 
@@ -2747,7 +2923,7 @@ class BatchTests(unittest.TestCase):
             1, "p1: 77 of 100 clusters read — c42 returned an error (forbidden) — 22 not reached (out of time this run)"
         )]
         recovered = stuck_called.index(True, 20)
-        expected[recovered] = ["leeway watch: every target that failed reads cleanly again"]
+        expected[recovered] = [watch.PARTIAL_CLEARED_LINE]
         self.assertEqual(days, expected)
 
     def test_a_cluster_the_project_no_longer_lists_closes_its_episode(self) -> None:
@@ -2760,7 +2936,7 @@ class BatchTests(unittest.TestCase):
 
         self.assertEqual(len(self.tick(0, error_row)), 1)
         self.roster = {"p1": triples("p1", 2)}
-        self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
+        self.assertEqual(self.tick(1), [watch.PARTIAL_CLEARED_LINE])
 
     def test_a_bare_configured_cluster_that_leaves_the_list_closes_its_episode(self) -> None:
         # Bare names (no project/location) are a supported LEEWAY_WATCH_CLUSTERS
@@ -2779,10 +2955,10 @@ class BatchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: "web,api", watch.PROJECTS_ENV: ""}):
             self.assertEqual(len(self.tick(0, web_errors)), 1)
         with mock.patch.dict(os.environ, {watch.CLUSTERS_ENV: "api,db", watch.PROJECTS_ENV: ""}):
-            self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
+            self.assertEqual(self.tick(1), [watch.PARTIAL_CLEARED_LINE])
             lines = self.tick(2, db_errors)
         self.assertEqual(len(lines), 1)
-        self.assertIn("db returned an error (forbidden)", lines[0])
+        self.assertIn("db returned an error (forbidden)", self.log_text())
 
     def test_error_rows_name_up_to_three_clusters_then_count_them(self) -> None:
         def errors(names, causes=None):
@@ -2805,6 +2981,7 @@ class BatchTests(unittest.TestCase):
             with self.subTest(entry=entry):
                 self.write_ledger()
                 self.assertEqual(self.tick(0, outcome), [self.partial(1, entry)])
+                self.assertIn(self.partial_log(1, entry), self.log_text())
 
     def test_only_ok_rows_count_as_read_and_a_report_never_counts_past_its_call(self) -> None:
         self.roster = {"p1": triples("p1", 3)}
@@ -2819,6 +2996,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(
             self.tick(0, omits_one), [self.partial(1, "p1: 1 of 3 clusters read — c01 returned an error (forbidden)")]
         )
+        self.assertIn("p1: 1 of 3 clusters read — c01 returned an error (forbidden)", self.log_text())
         self.roster = {"p1": triples("p1", 1)}
 
         def extra_rows(clusters, _):
@@ -2831,6 +3009,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(
             self.tick(0, extra_rows), [self.partial(1, "p1: 0 of 1 clusters read — c00 returned an error (forbidden)")]
         )
+        self.assertIn("p1: 0 of 1 clusters read — c00 returned an error (forbidden)", self.log_text())
 
     def test_a_project_reached_late_is_stamped_only_when_every_cluster_got_a_call(self) -> None:
         # p1's call leaves 600 s: p2's turn starts with less than a full
@@ -2875,7 +3054,7 @@ class BatchTests(unittest.TestCase):
             watch.load_ledger(self.home)[watch.ANNOUNCED_KEY][watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": None}
         )
         listing["seconds"] = 0.0
-        self.assertEqual(tick(2), ["leeway watch: every target that failed reads cleanly again"])
+        self.assertEqual(tick(2), [watch.PARTIAL_CLEARED_LINE])
 
     # --- row matching -----------------------------------------------------
 
@@ -2930,7 +3109,7 @@ class BatchTests(unittest.TestCase):
         state["bad"] = bad.replace("us-b", "us-a")
         self.assertEqual(self.tick(1, leeway_rows), [])
         state["bad"] = None
-        self.assertEqual(self.tick(2, leeway_rows), ["leeway watch: every target that failed reads cleanly again"])
+        self.assertEqual(self.tick(2, leeway_rows), [watch.PARTIAL_CLEARED_LINE])
 
     def test_an_unnamed_error_row_is_counted_unnamed_and_its_episode_closes_on_the_next_clean_call(self) -> None:
         self.roster = {"p1": triples("p1", 4)}
@@ -2949,10 +3128,11 @@ class BatchTests(unittest.TestCase):
                 lines = self.tick(0, unnamed_errors(count))
                 # read + errored = clusters: each unnamed row counts once.
                 self.assertEqual(lines, [self.partial(1, f"p1: {4 - count} of 4 clusters read — {part} (forbidden)")])
+                self.assertIn(f"p1: {4 - count} of 4 clusters read — {part} (forbidden)", self.log_text())
                 self.assertNotIn(watch.DEFAULT_UNKNOWN, lines[0])
                 announced = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY]
                 self.assertEqual(announced[watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": None})
-                self.assertEqual(self.tick(1), ["leeway watch: every target that failed reads cleanly again"])
+                self.assertEqual(self.tick(1), [watch.PARTIAL_CLEARED_LINE])
 
         # Beside a named error row, an unnamed one still makes the episode whole.
         def named_and_unnamed(clusters, _):
@@ -2964,6 +3144,10 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.tick(0, named_and_unnamed), [self.partial(
             1, "p1: 2 of 4 clusters read — 2 clusters returned an error (denied + 1 other cause(s))"
         )])
+        self.assertIn(
+            "p1: 2 of 4 clusters read — 2 clusters returned an error (denied + 1 other cause(s))",
+            self.log_text(),
+        )
         announced = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY]
         self.assertEqual(announced[watch.ANNOUNCED_FAILED_TARGETS_KEY], {"p1": [watch.WHOLE_TARGET_MARKER, "p1/l/c00"]})
 
@@ -3007,7 +3191,7 @@ class BatchTests(unittest.TestCase):
             stored = watch.load_ledger(self.home)[watch.ANNOUNCED_KEY][watch.ANNOUNCED_FAILED_TARGETS_KEY]
             self.assertEqual(stored, {"p1": sorted(unread)})
             # Day 3: every cluster reads.
-            self.assertEqual(self.tick(3, ok), ["leeway watch: every target that failed reads cleanly again"])
+            self.assertEqual(self.tick(3, ok), [watch.PARTIAL_CLEARED_LINE])
 
     def test_a_project_whose_list_is_now_empty_closes_its_episode(self) -> None:
         self.roster = {"p1": []}
@@ -3020,7 +3204,7 @@ class BatchTests(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.object(watch.sandbox_exec, "run", side_effect=run), redirect_stdout(buf):
             watch.tick(now=T0)
-        self.assertEqual(buf.getvalue().splitlines(), ["leeway watch: every target that failed reads cleanly again"])
+        self.assertEqual(buf.getvalue().splitlines(), [watch.PARTIAL_CLEARED_LINE])
         self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
 
     # --- tick failure -----------------------------------------------------
@@ -3043,10 +3227,12 @@ class BatchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(self.roster)}):
             for day in range(6):
                 outputs.append(self.tick(day, outcome, seconds=30.0))
-        self.assertEqual(outputs, [[NO_REPORT_PREFIX + NO_REPORT_MIXED]] + [[]] * 5)
+        self.assertEqual(outputs, [[FAILED_MIXED_LINE]] + [[]] * 5)
         self.assertEqual(
-            (self.home / watch.FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip(), NO_REPORT_MIXED
+            (self.home / watch.FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip(),
+            watch.FAILED_REASON_MIXED,
         )
+        self.assertIn(NO_REPORT_PREFIX + NO_REPORT_MIXED, self.log_text())
 
     def test_the_no_report_line_names_the_kind_of_failure_and_posts_again_when_it_changes(self) -> None:
         self.roster = {p: triples(p, 1) for p in ("p1", "p2", "p3")}
@@ -3064,21 +3250,21 @@ class BatchTests(unittest.TestCase):
             return run
 
         timeouts, failures, mixed, clean = outcome(every), outcome(exiting=every), outcome(("p2", "p3"), ("p1",)), outcome()
-        recovered = ["leeway watch: the tick runs again"]
+        recovered = [watch.RECOVERED_LINE]
         days = (
-            (timeouts, [NO_REPORT_PREFIX + NO_REPORT_TIMED_OUT]),
+            (timeouts, [FAILED_TIMED_OUT_LINE]),
             (timeouts, []),
             (timeouts, []),
             # Another kind posts again; while the tick keeps failing the line
             # keeps both kinds, so a run that meets only one says nothing.
-            (failures, [NO_REPORT_PREFIX + NO_REPORT_MIXED]),
+            (failures, [FAILED_MIXED_LINE]),
             (timeouts, []),
             (clean, recovered),
-            (failures, [NO_REPORT_PREFIX + NO_REPORT_FAILED]),
+            (failures, [FAILED_ERROR_LINE]),
             (failures, []),
             (failures, []),
             (clean, recovered),
-            (mixed, [NO_REPORT_PREFIX + NO_REPORT_MIXED]),
+            (mixed, [FAILED_MIXED_LINE]),
             (mixed, []),
             (mixed, []),
         )
@@ -3088,6 +3274,7 @@ class BatchTests(unittest.TestCase):
         for detail in (NO_REPORT_TIMED_OUT, NO_REPORT_FAILED, NO_REPORT_MIXED):
             self.assertNotIn("p1", detail)
             self.assertNotIn("Error:", detail)
+            self.assertIn(NO_REPORT_PREFIX + detail, self.log_text())
 
     # --- refresh gate -----------------------------------------------------
 
@@ -3544,6 +3731,458 @@ class TopicPublishCapTests(unittest.TestCase):
 
 def report_findings(report: dict) -> list[dict]:
     return [f for c in report["clusters"] for f in c.get("topology_findings") or []]
+
+
+class PlainStatusAndDryRunTests(unittest.TestCase):
+    """Status lines carry no exception names, exit codes, or commands, and
+    `--dry-run` previews the exact due and resolved messages."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "leeway"
+        self.env = mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: str(self.home),
+                watch.HOME_ENV: str(self.root),
+                "PLATFORM_AGENT_HOME": str(self.root),
+                watch.PROJECTS_ENV: "p1",
+                watch.CLUSTERS_ENV: "",
+                watch.NATS_URL_ENV: "",
+                watch.MANAGEMENT_PROJECT_ENV: "",
+            },
+            clear=False,
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def write_roster(self, expr: str) -> None:
+        cron = self.root / "cron"
+        cron.mkdir(parents=True, exist_ok=True)
+        (cron / "jobs.json").write_text(
+            json.dumps({"jobs": [{"id": watch.WATCH_JOB_ID, "schedule": {"kind": "cron", "expr": expr}}]}),
+            encoding="utf-8",
+        )
+
+    def log_text(self) -> str:
+        path = self.root / "logs" / watch.WATCH_LOG_FILE
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def clear_marker_and_log(self) -> None:
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+        (self.root / "logs" / watch.WATCH_LOG_FILE).unlink(missing_ok=True)
+
+    def test_each_failure_class_posts_plain_reason_and_next_step_and_logs_raw_detail(self) -> None:
+        self.write_roster("30 8 * * *")
+        cases = (
+            (
+                watch.NoProject(watch.NO_PROJECT_DETAIL),
+                watch.FAILED_REASON_NO_PROJECT,
+                watch.FAILED_NEEDS_ADMIN,
+                watch.FAILED_TICK_LINE,
+                "no GCP project: set LEEWAY_WATCH_CLUSTERS",
+            ),
+            (
+                watch.fleet_scope_targets.ScopeRenderUnreadable("bad scope.json"),
+                watch.FAILED_REASON_SCOPE_UNREADABLE,
+                watch.FAILED_NEEDS_ADMIN,
+                watch.FAILED_TICK_LINE,
+                "ScopeRenderUnreadable: bad scope.json",
+            ),
+            (
+                watch.LedgerUnusable("ledger at /opt/data/leeway/ledger.json is not valid JSON"),
+                watch.FAILED_REASON_LEDGER,
+                watch.FAILED_NEEDS_ADMIN,
+                watch.FAILED_TICK_LINE,
+                "LedgerUnusable: ledger at /opt/data/leeway/ledger.json is not valid JSON",
+            ),
+            (
+                watch.SandboxTimedOut("the sandbox run timed out after 900s"),
+                watch.FAILED_REASON_TIMED_OUT,
+                watch.FAILED_NEXT_DAILY,
+                watch.FAILED_TICK_LINE,
+                "SandboxTimedOut: the sandbox run timed out after 900s",
+            ),
+            (
+                watch.NoReportReturned({watch.ERROR_KIND_TIMEOUT}),
+                watch.FAILED_REASON_TIMED_OUT,
+                watch.FAILED_NEXT_DAILY,
+                watch.FAILED_TICK_LINE,
+                NO_REPORT_TIMED_OUT,
+            ),
+            (
+                watch.NoReportReturned({watch.ERROR_KIND_SCAN_FAILED}),
+                watch.FAILED_REASON_ERROR,
+                watch.FAILED_NEXT_DAILY,
+                watch.FAILED_TICK_LINE,
+                NO_REPORT_FAILED,
+            ),
+            (
+                watch.NoReportReturned({watch.ERROR_KIND_TIMEOUT, watch.ERROR_KIND_SCAN_FAILED}),
+                watch.FAILED_REASON_MIXED,
+                watch.FAILED_NEXT_DAILY,
+                watch.FAILED_TICK_LINE,
+                NO_REPORT_MIXED,
+            ),
+            (
+                RuntimeError("leeway exited 1 without a report: connection refused"),
+                watch.FAILED_REASON_ERROR,
+                watch.FAILED_NEXT_DAILY,
+                watch.FAILED_TICK_LINE,
+                "RuntimeError: leeway exited 1 without a report: connection refused",
+            ),
+            (
+                watch.WriteFailed("cannot write ledger at /opt/data/leeway/ledger.json: No space left on device"),
+                watch.FAILED_REASON_WRITE,
+                watch.FAILED_NEEDS_ADMIN,
+                watch.FAILED_WRITE_LINE,
+                "cannot write ledger at /opt/data/leeway/ledger.json: No space left on device",
+            ),
+        )
+        for exc, reason, next_step, template, raw_snippet in cases:
+            with self.subTest(exc=type(exc).__name__, reason=reason):
+                self.clear_marker_and_log()
+                lines = watch.record_tick_failure(self.home, exc, dry_run=False)
+                expected = template.format(reason=reason, next=next_step)
+                self.assertEqual(lines, [expected])
+                for forbidden in ("leeway watch:", "RuntimeError", "exited 1", "LEEWAY_WATCH_", "No space left"):
+                    self.assertNotIn(forbidden, lines[0])
+                self.assertIn(raw_snippet, self.log_text())
+                self.assertEqual(
+                    (self.home / watch.FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8").strip(),
+                    reason,
+                )
+                # Repeating a failure with the same reason is suppressed even when raw exception text changes.
+                self.assertEqual(watch.record_tick_failure(self.home, exc, dry_run=False), [])
+
+    def test_write_failure_during_tick_exits_zero_and_suppresses_duplicates(self) -> None:
+        self.write_roster("30 8 * * *")
+        rep = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+        with mock.patch.object(watch, "roster_clusters_by_project", return_value={"p1": ["p1/us-central1/seeded-d"]}), mock.patch.object(
+            watch.sandbox_exec, "run", return_value=completed_json(rep)
+        ), mock.patch.object(
+            watch, "save_ledger", side_effect=watch.WriteFailed("cannot write ledger: disk full")
+        ):
+            buf1 = io.StringIO()
+            with redirect_stdout(buf1):
+                code1 = watch.main([])
+            buf2 = io.StringIO()
+            with redirect_stdout(buf2):
+                code2 = watch.main([])
+        self.assertEqual(code1, 0)
+        self.assertEqual(
+            buf1.getvalue().strip(),
+            "**The topology skew check didn't finish today.** It couldn't save its report. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+        self.assertEqual(code2, 0)
+        self.assertEqual(buf2.getvalue(), "")
+        self.assertIn("leeway watch: writing the ledger or the report failed: cannot write ledger: disk full", self.log_text())
+
+    def test_non_daily_schedule_uses_next_scheduled_run_sentence(self) -> None:
+        self.write_roster("30 8 * * 1")
+        lines = watch.record_tick_failure(self.home, RuntimeError("boom"), dry_run=False)
+        self.assertEqual(
+            lines,
+            [
+                "**The topology skew check didn't run today.** Reading the clusters failed. "
+                "It will try again at its next scheduled run."
+            ],
+        )
+
+    def test_dry_run_previews_due_and_resolved_messages_and_nothing_due(self) -> None:
+        c_skewed = {
+            "cluster": "p1/us-central1/seeded-d",
+            "status": "ok",
+            "topology_findings": [make_topology_finding()],
+        }
+        with mock.patch.object(watch, "roster_clusters_by_project", return_value={"p1": ["p1/us-central1/seeded-d"]}):
+            # 1. Seed the ledger with one finding via a real tick, plus a second finding on another cluster that will resolve.
+            rep_seed = make_report(
+                [
+                    c_skewed,
+                    {
+                        "cluster": "p1/us-central1/other",
+                        "status": "ok",
+                        "topology_findings": [make_topology_finding(name="old-svc")],
+                    },
+                ],
+                T0,
+            )
+            with mock.patch.object(
+                watch,
+                "roster_clusters_by_project",
+                return_value={"p1": ["p1/us-central1/seeded-d", "p1/us-central1/other"]},
+            ), mock.patch.object(watch.sandbox_exec, "run", return_value=completed_json(rep_seed)), redirect_stdout(
+                io.StringIO()
+            ):
+                watch.tick(now=T0)
+
+            # 2. Dry-run when nothing is due and nothing retired.
+            t1 = T0 + timedelta(days=1)
+            buf_quiet = io.StringIO()
+            with mock.patch.object(
+                watch,
+                "roster_clusters_by_project",
+                return_value={"p1": ["p1/us-central1/seeded-d", "p1/us-central1/other"]},
+            ), mock.patch.object(watch.sandbox_exec, "run", return_value=completed_json(rep_seed)), redirect_stdout(
+                buf_quiet
+            ):
+                watch.tick(dry_run=True, now=t1)
+            self.assertEqual(buf_quiet.getvalue().strip(), "dry run: nothing due; active findings: 2")
+
+            # 3. Dry-run with both a new due finding and a retired finding.
+            rep_both = make_report(
+                [
+                    {
+                        "cluster": "p1/us-central1/seeded-d",
+                        "status": "ok",
+                        "topology_findings": [make_topology_finding(name="new-svc")],
+                    },
+                    {"cluster": "p1/us-central1/other", "status": "ok", "topology_findings": []},
+                ],
+                t1,
+            )
+            buf_both = io.StringIO()
+            with mock.patch.object(
+                watch,
+                "roster_clusters_by_project",
+                return_value={"p1": ["p1/us-central1/seeded-d", "p1/us-central1/other"]},
+            ), mock.patch.object(watch.sandbox_exec, "run", return_value=completed_json(rep_both)), redirect_stdout(
+                buf_both
+            ):
+                watch.tick(dry_run=True, now=t1)
+            self.assertEqual(
+                buf_both.getvalue(),
+                "dry run (nothing posted):\n"
+                "**1 pod placement problem on cluster seeded-d (new)**\n"
+                "- new-svc (shop) on seeded-d: 100% of its pods in one zone; its zone spread rule is not being kept\n"
+                "Ask me how to fix any of these. If they're still open, I'll post them again on or after 2026-10-27.\n"
+                "dry run (nothing posted):\n"
+                "**2 pod placement problems have cleared**\n"
+                "- old-svc (shop) on other\n"
+                "- checkout-api (shop) on seeded-d\n",
+            )
+            for removed in (
+                "DRY_RUN_WOULD_REPORT",
+                "DRY_RUN_WOULD_RETIRE",
+                "due_finding_summary",
+                "DUE_SUBJECT_NAMESPACED",
+                "DUE_SUBJECT_CLUSTER",
+                "DUE_SUMMARY_WITH_SHARE",
+                "DUE_SUMMARY_NO_SHARE",
+                "DUE_CLUSTER_PREFIX",
+                "TOPIC_PUBLISH_CLEARED_LINE",
+                "TOPIC_PUBLISH_FAILED_LINE",
+            ):
+                self.assertFalse(hasattr(watch, removed), removed)
+
+    def test_dry_run_partial_scan_writes_nothing_to_log(self) -> None:
+        rep_p1 = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+
+        def run_side_effect(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "p1/us-central1/seeded-d" in argv[-1]:
+                return completed_json(rep_p1)
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="permission denied")
+
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False), mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=run_side_effect), redirect_stdout(buf):
+            code = watch.tick(dry_run=True, now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("**1 pod placement problem on cluster seeded-d (new)**", buf.getvalue())
+        self.assertEqual(self.log_text(), "")
+        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+
+    def test_legacy_no_report_marker_suppresses_duplicate_post_after_upgrade(self) -> None:
+        self.write_roster("30 8 * * *")
+        self.home.mkdir(parents=True, exist_ok=True)
+        marker = self.home / watch.FAILURE_MARKER_FILE_NAME
+        for cause, expected_reason in (
+            (watch.NO_REPORT_TIMED_OUT_CAUSE, watch.FAILED_REASON_TIMED_OUT),
+            (watch.NO_REPORT_FAILED_CAUSE, watch.FAILED_REASON_ERROR),
+            (watch.NO_REPORT_MIXED_CAUSE, watch.FAILED_REASON_MIXED),
+        ):
+            with self.subTest(cause=cause):
+                marker.write_text(watch.NO_REPORT_DETAIL.format(cause=cause) + "\n", encoding="utf-8")
+                kinds = (
+                    {watch.ERROR_KIND_TIMEOUT}
+                    if expected_reason == watch.FAILED_REASON_TIMED_OUT
+                    else {watch.ERROR_KIND_SCAN_FAILED}
+                    if expected_reason == watch.FAILED_REASON_ERROR
+                    else {watch.ERROR_KIND_TIMEOUT, watch.ERROR_KIND_SCAN_FAILED}
+                )
+                self.assertEqual(
+                    watch.record_tick_failure(self.home, watch.NoReportReturned(kinds), dry_run=False),
+                    [],
+                )
+
+    def test_announce_failed_targets_translates_unresolved_scope_row_in_chat(self) -> None:
+        announced: dict = {}
+        failures = {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: "resolved-scope.json is missing"}
+        lines = watch.announce_failed_targets(
+            announced,
+            failures,
+            {},
+            {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW, "p1"},
+            {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: watch.ERROR_KIND_SCAN_FAILED},
+        )
+        self.assertEqual(
+            lines,
+            [
+                "**The topology skew check couldn't read the declared scope's member projects.** "
+                "Existing findings there are kept until the next clean read."
+            ],
+        )
+        self.assertNotIn(watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW, lines[0])
+        self.assertIn("declared-scope: resolved-scope.json is missing", self.log_text())
+        self.assertEqual(
+            announced[watch.ANNOUNCED_FAILED_TARGETS_KEY],
+            {watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW: None},
+        )
+
+    def test_tick_times_out_in_projects_lookup_and_single_target_sweep(self) -> None:
+        self.write_roster("30 8 * * *")
+        expected = (
+            "**The topology skew check didn't run today.** Reading the clusters took too long. "
+            "It will try again tomorrow."
+        )
+        # 1. `gcloud config get-value project` in `projects()` times out.
+        buf_proj = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}, clear=False), mock.patch.object(
+            watch, "declared_scope", return_value=None
+        ), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={}
+        ), mock.patch.object(
+            watch.sandbox_exec,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd=list(watch.CONFIG_PROJECT_ARGV), timeout=30),
+        ), redirect_stdout(
+            buf_proj
+        ):
+            code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        self.assertEqual(buf_proj.getvalue().strip(), expected)
+        self.assertIn("SandboxTimedOut: the sandbox run timed out after 30s", self.log_text())
+
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+        # 2. Single-project sweep times out in its single leeway call (`len(scan_errors) == 1 and calls == whole_calls <= 1`).
+        buf_single = io.StringIO()
+        with mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={"p1": ["p1/us-central1/seeded-d"]}
+        ), mock.patch.object(
+            watch.sandbox_exec,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd=["leeway", "report"], timeout=90),
+        ), redirect_stdout(
+            buf_single
+        ):
+            code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        self.assertEqual(buf_single.getvalue().strip(), expected)
+        self.assertIn("SandboxTimedOut: p1: the sandbox run timed out after", self.log_text())
+
+    def test_dry_run_failing_tick_prints_detail_to_stderr_without_touching_log(self) -> None:
+        self.write_roster("30 8 * * *")
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}, clear=False
+        ), mock.patch.object(watch, "declared_scope", return_value=None), mock.patch.object(
+            watch, "roster_projects", return_value=set()
+        ), mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={}
+        ), mock.patch.object(
+            watch.sandbox_exec,
+            "run",
+            return_value=subprocess.CompletedProcess(args=list(watch.CONFIG_PROJECT_ARGV), returncode=1, stdout="", stderr=""),
+        ), redirect_stdout(
+            stdout_buf
+        ), redirect_stderr(
+            stderr_buf
+        ):
+            code = watch.main(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            stdout_buf.getvalue().strip(),
+            "**The topology skew check didn't run today.** It has no GCP project to read. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+        self.assertEqual(
+            stderr_buf.getvalue().strip(),
+            f"leeway watch: the tick failed: NoProject: {watch.NO_PROJECT_DETAIL}",
+        )
+        self.assertEqual(self.log_text(), "")
+        self.assertFalse((self.home / watch.FAILURE_MARKER_FILE_NAME).exists())
+
+    def test_status_lines_are_plain_text_when_following_an_earlier_line(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).write_text(watch.FAILED_REASON_ERROR + "\n", encoding="utf-8")
+        rep_p1_due = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+
+        def p2_fails(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "p1/us-central1/seeded-d" in argv[-1]:
+                return completed_json(rep_p1_due)
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="denied")
+
+        buf_with_due = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False), mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=p2_fails), redirect_stdout(buf_with_due):
+            watch.tick(now=T0)
+        lines_with_due = buf_with_due.getvalue().splitlines()
+        self.assertEqual([line for line in lines_with_due if line.startswith("**")], [lines_with_due[0]])
+        self.assertEqual(
+            lines_with_due[-2:],
+            [
+                "The topology skew check is running again.",
+                "The topology skew check couldn't read p2. Existing findings there are kept until the next clean read.",
+            ],
+        )
+
+        # When no finding is due or cleared, the first status line leads in bold and any later status line is plain text.
+        (self.home / watch.FAILURE_MARKER_FILE_NAME).write_text(watch.FAILED_REASON_ERROR + "\n", encoding="utf-8")
+        rep_clean = make_report(
+            [
+                {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]},
+                {"cluster": "p2/us-central1/broken", "status": "ok", "topology_findings": []},
+            ],
+            T0 + timedelta(days=1),
+        )
+        buf_status_only = io.StringIO()
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False), mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/seeded-d"], "p2": ["p2/us-central1/broken"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", return_value=completed_json(rep_clean)), redirect_stdout(
+            buf_status_only
+        ):
+            watch.tick(now=T0 + timedelta(days=1))
+        self.assertEqual(
+            buf_status_only.getvalue().splitlines(),
+            [
+                "**The topology skew check is running again.**",
+                "The topology skew check read every project cleanly again.",
+            ],
+        )
 
 
 if __name__ == "__main__":

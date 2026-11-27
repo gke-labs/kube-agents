@@ -127,6 +127,7 @@ func TestNewHandlerValidatesConfig(t *testing.T) {
 		"no mode":          func(c *Config) { c.Policy.Mode = "" },
 		"unknown mode":     func(c *Config) { c.Policy.Mode = "READ-ONLY" },
 		"negative cap":     func(c *Config) { c.MaxInFlight = -1 },
+		"bad default ID":   func(c *Config) { c.DefaultClusterID = "bad$id" },
 	} {
 		cfg := ok
 		mutate(&cfg)
@@ -204,6 +205,62 @@ func TestHandlerRefusesAPathWithNoCluster(t *testing.T) {
 	}
 	if upstream.calls != 0 {
 		t.Errorf("%d requests with no cluster reached an upstream", upstream.calls)
+	}
+}
+
+func TestHandlerRoutesBarePathsToDefaultClusterID(t *testing.T) {
+	metrics := NewMetrics()
+	h, upstream := newTestHandler(t, Config{
+		DefaultClusterID: InClusterID,
+		Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true, DenyStreaming: true},
+		Metrics:          metrics,
+	})
+
+	for _, tc := range []struct {
+		target, wantCluster, wantPath string
+	}{
+		{"/api/v1/namespaces/default/pods", InClusterID, "/api/v1/namespaces/default/pods"},
+		{"/clusters/in-cluster/api/v1/namespaces/default/pods", InClusterID, "/api/v1/namespaces/default/pods"},
+		{"/clusters/" + gkeFleet + "/api/v1/pods", gkeFleet, "/api/v1/pods"},
+		{"/metrics", InClusterID, "/metrics"},
+		{"/version", InClusterID, "/version"},
+	} {
+		rec := serve(h, httptest.NewRequest(http.MethodGet, tc.target, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code = %d: %s", tc.target, rec.Code, rec.Body.String())
+		}
+		if upstream.clusterID != tc.wantCluster || upstream.req.URL.Path != tc.wantPath {
+			t.Errorf("%s: got (%q, %q), want (%q, %q)", tc.target, upstream.clusterID, upstream.req.URL.Path, tc.wantCluster, tc.wantPath)
+		}
+	}
+
+	callsBefore := upstream.calls
+	for _, tc := range []struct {
+		target   string
+		wantCode int
+	}{
+		{"/api/v1/namespaces/default/pods?watch=true", http.StatusForbidden},
+		{"/api/v1/watch/namespaces/default/pods", http.StatusForbidden},
+		{"/api/v1/namespaces/default/pods/p/log?follow=true", http.StatusForbidden},
+		{"/api/v1/namespaces/%2e%2e/secrets", http.StatusBadRequest},
+	} {
+		rec := serve(h, httptest.NewRequest(http.MethodGet, tc.target, nil))
+		if rec.Code != tc.wantCode {
+			t.Errorf("%s: code = %d, want %d", tc.target, rec.Code, tc.wantCode)
+		}
+	}
+	if upstream.calls != callsBefore {
+		t.Errorf("refused requests reached upstream (%d -> %d)", callsBefore, upstream.calls)
+	}
+
+	exposition := scrapeMetricsText(t, metrics)
+	for _, want := range []string{
+		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="streaming_blocked",resource="pods",subresource="none",verb="watch"} 2`,
+		`kubeagents_kube_proxy_rejected_requests_total{mode="read-only-dry-run",reason="streaming_blocked",resource="pods",subresource="log",verb="get"} 1`,
+	} {
+		if !strings.Contains(exposition, want) {
+			t.Errorf("metrics missing %q\n%s", want, exposition)
+		}
 	}
 }
 
@@ -463,7 +520,7 @@ func TestSanitizeRequestHeaders(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			sanitizeRequestHeaders(tc.in, tc.preserveUpgrade)
+			sanitizeRequestHeaders(tc.in, nil, tc.preserveUpgrade)
 			if len(tc.in) != len(tc.want) {
 				t.Fatalf("headers = %v, want %v", tc.in, tc.want)
 			}

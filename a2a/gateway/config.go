@@ -4,8 +4,10 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -62,6 +65,14 @@ var backendArms = []backendArm{
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultWarmSessions is what WarmSessions means when A2A_WARM_SESSIONS is
+// unset: no warm pool. The operator renders the variable from
+// spec.harness.tuning.warmSessions (default 1) only on an install that
+// resolves to the session route, so unset is the platform route, where a
+// warm pod would serve nothing, or a gateway run by hand, which spends
+// nothing it was not asked to.
+const defaultWarmSessions = 0
+
 // defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
@@ -69,6 +80,15 @@ const defaultDelegationDepthMax = 3
 // defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationWidthMax = 10
+
+// delegationRoundsEnv sets DelegationRoundsMax.
+const delegationRoundsEnv = "A2A_DELEGATION_ROUNDS_MAX"
+
+// delegationRoundsSupportedMax is the most rounds New lets DelegationRoundsMax
+// keep: one, until a profile parent's later rounds (a new batch after the
+// first's ends are delivered) land. A higher setting is clamped to it, with a
+// warning, rather than advertised to a worker the gateway would then refuse.
+const delegationRoundsSupportedMax = 1
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
 // accepts: ten, the fleet question's width (#5682). The children queue to
@@ -146,10 +166,14 @@ const (
 // off when "false" (feedback.go); the operator renders each only from its
 // backend's answerFeedback=false. The gateway keeps one switch for every
 // backend it holds, so either name turns feedback off on Chat and Slack
-// alike.
+// alike. envTeamsAnswerFeedback is the same switch under Teams's name; no
+// CRD field renders it yet, so the operator carries it from its own
+// environment (A2A_TEAMS_ANSWER_FEEDBACK=false on the controller-manager,
+// the chart's operator.extraEnv) onto a gateway that holds Teams.
 const (
 	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
 	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+	envTeamsAnswerFeedback = "A2A_TEAMS_ANSWER_FEEDBACK"
 )
 
 // envPeopleSeen turns the people bucket's records off when "false"
@@ -157,6 +181,15 @@ const (
 // spec.telemetry.peopleSeen=false.
 const envPeopleSeen = "A2A_PEOPLE_SEEN"
 const envGoogleCloudUniverseDomain = "GOOGLE_CLOUD_UNIVERSE_DOMAIN"
+
+// envKubectlCostTier is the variable the kubectl admission
+// (deploy/sandbox/kubectl-admit.py) reads its sizing tier from when no tier
+// file names one: the shell sandbox's name for it, on the session pod.
+const envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
+
+// defaultKubectlCostTier is the tier the admission charges when none is
+// named; spawn names it rather than leave the variable unset.
+const defaultKubectlCostTier = "default"
 
 // The A2A door's Microsoft Entra sign-in class (a2adoor_entra.go), set by
 // hand on the gateway as the Google class's variables are.
@@ -357,8 +390,9 @@ type Config struct {
 	GatewayLease string
 	PodName      string
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
-	// googleChat.answerFeedback=false: no rating controls are drawn on any
-	// backend and nothing is kept, whatever the feedback bucket holds.
+	// googleChat.answerFeedback=false, or A2A_TEAMS_ANSWER_FEEDBACK=false:
+	// no rating controls are drawn on any backend and nothing is kept,
+	// whatever the feedback bucket holds.
 	AnswerFeedbackOff bool
 	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
 	// gateway records no one it sees in the people bucket.
@@ -553,6 +587,17 @@ type Config struct {
 	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
 
+	// DMIdleTTL replaces IdleTTL for a single-turn DM: a "dm" conversation
+	// whose current pod has taken at most one human turn (#2371,
+	// A2A_DM_IDLE_TTL, default 5m). Most DMs are one question, and under
+	// sessions by default each holds a session pod, and a slot of the session
+	// cap, for the full IdleTTL after its answer. A second turn for the pod
+	// puts the conversation back on IdleTTL. A reply after the reap still
+	// works: the next turn gets a new pod, rehydrated from the context's
+	// history. Never longer than IdleTTL (Config.idleTTLFor), and counted from
+	// the answer as well as the message (Config.idleExpired).
+	DMIdleTTL time.Duration
+
 	// SessionReuse keeps one pod per conversation across turns
 	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
 	// idle goes to it, and only a conversation with no live pod gets a new
@@ -692,6 +737,17 @@ type Config struct {
 	// Namespace and WorkerImage configure the dark spawn path.
 	Namespace   string
 	WorkerImage string
+	// SessionHarness is the harness every session pod runs, passed to it as
+	// A2A_HARNESS (A2A_SESSION_HARNESS, from the PlatformAgent's
+	// spec.harness.sessionWorker.type). Empty is the worker's default,
+	// Claude Code, and adds nothing to the pod.
+	SessionHarness string
+	// SessionHarnessRefused is an A2A_SESSION_HARNESS value outside
+	// sessionHarnesses (CRD or image skew). The gateway is shared by every
+	// conversation, so it keeps serving and spawns sessions on the default
+	// harness, and main logs this at error level, rather than refusing to
+	// start and taking the whole chat surface down.
+	SessionHarnessRefused string
 
 	// SessionServiceAccount is the ServiceAccount every session pod runs
 	// as, rendered by the operator as <agent>-a2a-session and passed here
@@ -708,19 +764,32 @@ type Config struct {
 	// SessionClusterView gives spawned session pods the temporary read-only
 	// cluster view: a projected token for the credential broker's session
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
-	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
+	// operator when the view is on (the session route's default, or its
+	// A2A_SESSION_CLUSTER_VIEW flag); off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
 	// New refuses the view without it. CredentialProxyExecURL is the
 	// broker's exec tier, empty while the operator renders none; the shim
 	// sends its commands there and falls back to CredentialProxyURL.
+	// KubectlCostTier is the sizing tier whose column of the kubectl cost
+	// table (deploy/sandbox/kubectl-costs.json) the session pod's kubectl
+	// admission charges; spawn passes it on as KUBEAGENTS_KUBECTL_COST_TIER
+	// beside KUBE_PROXY_URL. The operator forwards it normalised, as for the
+	// shell sandbox; anything but a plain lowercase name is dropped here too,
+	// and empty passes the admission's default tier by name.
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
 	KubeProxyURL           string
 	KubeProxyCAConfigMap   string
 	KubeProxyHostContext   string
-	UniverseDomain         string
-	ImagePullRefs          []string
+	// KubeProxyMode is the policy mode the operator gives kube-proxy
+	// (A2A_KUBE_PROXY_MODE). Session pods get it as KUBE_PROXY_MODE, and
+	// their kubectl wrapper records a failed write attempt only under a
+	// read-only mode. Empty records nothing.
+	KubeProxyMode   string
+	KubectlCostTier string
+	UniverseDomain  string
+	ImagePullRefs   []string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -797,6 +866,17 @@ type Config struct {
 	// margin absorbs.
 	MaxSessions int
 
+	// WarmSessions is how many warm session pods the leader keeps ready
+	// (A2A_WARM_SESSIONS, warm_pool.go): pods started before a conversation
+	// needs one, so a new conversation's first turn is handed a running pod
+	// instead of waiting on scheduling and the image pull. Each costs one
+	// session pod's requests while it waits. The pool keeps
+	// min(WarmSessions, MaxSessions - 1 - live sessions) of them, so it never
+	// takes the last slot, and none below a cap of 2; 0 turns it off. It runs
+	// only with SessionReuse, since a claimed warm pod serves its
+	// conversation the way a reused pod does.
+	WarmSessions int
+
 	// SessionResources are the session pod's CPU and memory requests and
 	// limits (#2371), from A2A_SESSION_{CPU,MEMORY}_{REQUEST,LIMIT}, which
 	// the operator renders resolved from spec.harness.tuning.sessionResources
@@ -838,6 +918,20 @@ type Config struct {
 	// set up to lib.DelegateBatchMax. FromEnv refuses a value under 1, as it
 	// does the depth bound, and one over 10.
 	DelegationWidthMax int
+
+	// DelegationRoundsMax bounds how many delegate requests one profile
+	// task may make (A2A_DELEGATION_ROUNDS_MAX), each minted or refused
+	// using up one; a request past it is refused under delegation.rounds.
+	// With rounds left, a request while the last round's children still run
+	// is no new round and stays a busy ignore; with none left (the default
+	// of one) it is refused like any other. A profile task's delegateTargets part
+	// advertises it when over one.
+	//
+	// Zero means 1. New clamps it to 1 to lib.DelegateRoundsCeiling, and
+	// then to delegationRoundsSupportedMax (1) with a warning, until rounds
+	// past the first are supported. FromEnv refuses a value that is not an
+	// integer.
+	DelegationRoundsMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
 	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
@@ -979,6 +1073,7 @@ func FromEnv() (*Config, error) {
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
+		SessionHarness:   os.Getenv(envSessionHarness),
 
 		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
@@ -988,6 +1083,8 @@ func FromEnv() (*Config, error) {
 		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
 		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
 		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		KubeProxyMode:          os.Getenv("A2A_KUBE_PROXY_MODE"),
+		KubectlCostTier:        kubectlCostTier(os.Getenv("A2A_KUBECTL_COST_TIER")),
 		UniverseDomain:         strings.TrimSpace(os.Getenv(envGoogleCloudUniverseDomain)),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
@@ -1047,7 +1144,8 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
 	}
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false) ||
-		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false)
+		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false) ||
+		strings.TrimSpace(os.Getenv(envTeamsAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
@@ -1107,6 +1205,9 @@ func FromEnv() (*Config, error) {
 	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
 	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
 		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
+	if cfg.SessionHarness != "" && !sessionHarnesses[cfg.SessionHarness] {
+		cfg.SessionHarnessRefused, cfg.SessionHarness = cfg.SessionHarness, ""
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
@@ -1229,6 +1330,12 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_MAX_SESSIONS %q: need an integer >= 1", maxSessions)
 	}
 	cfg.MaxSessions = n
+	warmSessions := envOr("A2A_WARM_SESSIONS", strconv.Itoa(defaultWarmSessions))
+	warm, err := strconv.Atoi(warmSessions)
+	if err != nil || warm < 0 {
+		return nil, fmt.Errorf("A2A_WARM_SESSIONS %q: need an integer >= 0", warmSessions)
+	}
+	cfg.WarmSessions = warm
 	sessionResources, err := sessionResourcesFromEnv()
 	if err != nil {
 		return nil, err
@@ -1249,6 +1356,13 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
+	if v := strings.TrimSpace(os.Getenv(delegationRoundsEnv)); v != "" {
+		rm, err := strconv.Atoi(v)
+		if err != nil || rm < 1 {
+			return nil, fmt.Errorf("%s %q: need an integer from 1 to %d", delegationRoundsEnv, v, lib.DelegateRoundsCeiling)
+		}
+		cfg.DelegationRoundsMax = rm
+	}
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
 	ba, err := strconv.Atoi(busyAt)
 	if err != nil || ba < 1 {
@@ -1264,6 +1378,15 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", ttl)
 	}
 	cfg.IdleTTL = d
+	dmTTL := envOr("A2A_DM_IDLE_TTL", defaultDMIdleTTL.String())
+	dmIdle, err := time.ParseDuration(dmTTL)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_DM_IDLE_TTL %q: %w", dmTTL, err)
+	}
+	if dmIdle < time.Minute {
+		return nil, fmt.Errorf("A2A_DM_IDLE_TTL %q is under the 1m floor; an instant reap deletes pods mid-conversation", dmTTL)
+	}
+	cfg.DMIdleTTL = dmIdle
 
 	// The adapter's deadline, in the adapter's own units (integer seconds) —
 	// see the field comment for why the env name is shared.
@@ -1433,6 +1556,19 @@ func pyStrip(s string) string {
 	})
 }
 
+// kubectlCostTierPattern is the tier name the operator forwards (its own
+// kubectlCostTierPattern) and the sandbox entrypoint accepts.
+var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+
+// kubectlCostTier is a forwarded tier name if it is a plain lowercase one,
+// else empty: the session pod's admission then charges its default tier.
+func kubectlCostTier(raw string) string {
+	if tier := strings.TrimSpace(raw); kubectlCostTierPattern.MatchString(tier) {
+		return tier
+	}
+	return ""
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -1473,6 +1609,66 @@ func (c *Config) validateCapabilityCeiling() error {
 		return fmt.Errorf("A2A_AUTHORITY_TIER/A2A_AUTHORITY_SCOPE: %w", err)
 	}
 	return nil
+}
+
+// defaultDMIdleTTL is A2A_DM_IDLE_TTL's default (#2371).
+const defaultDMIdleTTL = 5 * time.Minute
+
+// singleTurnDM reports whether rec is a DM whose current pod has taken at
+// most one human turn and no steer (SteeredSession). Two things are left out
+// of the count:
+//   - a wake (Role set): a session pod without cluster access delegates every
+//     cluster read, and the child's result comes back as a wake addressed to
+//     the pod, so counting wakes would put nearly every one-question DM on
+//     IdleTTL (seen live on ka-fleet-dev-1). A delegation still running holds
+//     the conversation's active slot (the child, or a fan-out's parent), which
+//     already exempts the pod from the reap, so leaving it out of the count
+//     never reaps a pod with a result still to come;
+//   - a turn addressed to an earlier pod: a DM keyed by its channel or space
+//     (Discord, an unthreaded Google Chat DM) keeps one record across every
+//     question the user asks, and each pod mints a fresh bus session.
+func (rec *SessionRecord) singleTurnDM() bool {
+	if rec.Kind != sessionKindDM {
+		return false
+	}
+	// A follow-up steered into the running task is a second message for this
+	// pod even though it started no task.
+	if rec.SteeredSession != "" && rec.SteeredSession == rec.BusSession {
+		return false
+	}
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == "" && t.Addressee == rec.BusSession {
+			n++
+		}
+	}
+	return n <= 1
+}
+
+// idleTTLFor is the reap threshold for rec: DMIdleTTL for a single-turn DM,
+// IdleTTL otherwise. DMIdleTTL is capped at IdleTTL, so setting it higher
+// never keeps a DM's pod longer than any other conversation's, and zero (a
+// Config built without it) reads as IdleTTL.
+func (c *Config) idleTTLFor(rec *SessionRecord) time.Duration {
+	if c.DMIdleTTL > 0 && c.DMIdleTTL < c.IdleTTL && rec.singleTurnDM() {
+		return c.DMIdleTTL
+	}
+	return c.IdleTTL
+}
+
+// idleExpired reports whether rec's pod has been idle past its TTL at now.
+// The clock is the last user message (idleSince). Under the short DM TTL it
+// is the answer too, whichever is later (LastTaskActivity, which an
+// executor's terminal moves): a DM task that ran longer than DMIdleTTL would
+// otherwise lose its pod the moment the answer posts, leaving no time to
+// follow up. Under IdleTTL the answer does not move it, as before.
+func (c *Config) idleExpired(rec *SessionRecord, now time.Time) bool {
+	ttl := c.idleTTLFor(rec)
+	since := rec.idleSince()
+	if ttl < c.IdleTTL && rec.LastTaskActivity.After(since) {
+		since = rec.LastTaskActivity
+	}
+	return now.Sub(since) >= ttl
 }
 
 // sessionResourcesFromEnv reads the session pod's requests and limits from
@@ -1532,4 +1728,31 @@ func (c *Config) sessionResources() corev1.ResourceRequirements {
 			corev1.ResourceMemory: pick(c.SessionResources.Limits, corev1.ResourceMemory, workerMemoryLimit),
 		},
 	}
+}
+
+// envSessionHarness names the session worker's harness (Config.SessionHarness).
+const envSessionHarness = "A2A_SESSION_HARNESS"
+
+// sessionHarnesses are the harnesses the gateway spawns session pods for.
+// Antigravity joins when its worker isolation lands.
+var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
+
+// clampDelegationRounds is the DelegationRoundsMax New keeps: unset is one, a
+// value outside 1 to lib.DelegateRoundsCeiling is clamped into it, and any
+// value over delegationRoundsSupportedMax is clamped to that, with a warning
+// naming the variable, until rounds past the first are supported.
+func clampDelegationRounds(n int, log *slog.Logger) int {
+	if n == 0 {
+		return 1
+	}
+	set := n
+	n = max(1, min(n, lib.DelegateRoundsCeiling))
+	if n > delegationRoundsSupportedMax {
+		log.Warn(delegationRoundsEnv+": rounds above 1 are not supported yet; using 1", "set", set, "using", delegationRoundsSupportedMax)
+		return delegationRoundsSupportedMax
+	}
+	if n != set {
+		log.Warn(delegationRoundsEnv+": out of range; clamped", "set", set, "using", n, "max", lib.DelegateRoundsCeiling)
+	}
+	return n
 }

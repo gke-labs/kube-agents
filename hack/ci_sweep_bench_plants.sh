@@ -9,7 +9,8 @@
 # first remover; this is the backstop hack/ci-teardown.sh runs at every lease
 # start and end, since a run killed between apply and destroy runs no destroy,
 # and a leftover ComputeClass or webhook is read by the next lease's audits
-# while a leftover pool bills.
+# while a leftover pool bills. A leftover CRD is read the same way: the
+# objects of its kind stay with it, and an audit files them.
 #
 # Dry run by default: every leg lists the names it matches and prints what it
 # would delete. --delete acts. Each leg lists first and deletes by name, so the
@@ -17,7 +18,11 @@
 # (a planted hook must not refuse the deletes after it), the readiness rules
 # next (the controller untaints before the pools go), the compute classes
 # before the pools (a class with nodePoolAutoCreation could provision a new
-# pool after the sweep), the pools last and --async: a synchronous pool delete
+# pool after the sweep), the planted CRDs after the classes (a CRD's delete
+# removes every object of its kind, in every namespace, so the sweep needs no
+# leg for those objects, and so it refuses a labelled CRD that holds an object
+# without the label: a product installed over a leftover keeps the label on
+# the CRD, and its objects are not the sweep's), the pools last and --async: a synchronous pool delete
 # is minutes, and the next sweep lists what is still going. Kubernetes deletes
 # are --wait=false for the same reason: a class held by a finalizer is listed
 # again next time instead of hanging this run.
@@ -32,6 +37,8 @@
 #
 # Exit 0 when every leg listed and every matched object was deleted (or would
 # be); 1 when a list or a delete failed, after every leg has run; 2 on usage.
+# On an Autopilot cluster the pool leg lists nothing, which is not a failure;
+# a failed read of the cluster's mode is one.
 # ==============================================================================
 
 set -uo pipefail
@@ -47,11 +54,20 @@ readonly PLANT_KINDS=(
   mutatingwebhookconfigurations.admissionregistration.k8s.io
   nodereadinessrules.readiness.node.x-k8s.io
   computeclasses.cloud.google.com
+  customresourcedefinitions.apiextensions.k8s.io
 )
 # The gcloud filter is client-side; a pool without the key evaluates false.
 # STOPPING is a pool already deleting: a second delete answers 409.
 readonly POOL_LIST_FILTER="config.resourceLabels.managed-by=kube-agents-bench AND status!=STOPPING"
 readonly POOL_NAME_NEVER_DELETED="default-pool"
+# How the describe answers for an Autopilot cluster: value() renders the
+# boolean as True, and a field GKE did not set as an empty line.
+readonly AUTOPILOT_FORMAT="value(autopilot.enabled)"
+readonly AUTOPILOT_TRUE="True"
+# A CRD's delete takes every object of its kind. The CRD leg lists the
+# objects that do not carry the bench label first, and refuses on any.
+readonly CRD_KIND="customresourcedefinitions.apiextensions.k8s.io"
+readonly FOREIGN_OBJECT_SELECTOR="managed-by!=kube-agents-bench"
 readonly ABSENT_KIND_RE="doesn't have a resource type"
 readonly KUBECTL_REQUEST_TIMEOUT="${BENCH_SWEEP_KUBECTL_REQUEST_TIMEOUT:-30s}"
 readonly EXIT_FAILED=1
@@ -125,6 +141,22 @@ MATCHED=0
 FAILED=0
 ABSENT=0
 
+# True when no object of the CRD's kind lacks the bench label. A list that
+# fails is not an empty list: the CRD stays, and the leg counts as failed.
+crd_holds_only_plants() { # <customresourcedefinition.../name>
+  local name="$1" foreign
+  if ! foreign="$(kubectl get "${name#*/}" --all-namespaces -l "${FOREIGN_OBJECT_SELECTOR}" -o name \
+    --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" 2>/dev/null)"; then
+    echo "✗ ${name}: could not list its objects; left in place"
+    return 1
+  fi
+  if [ -n "${foreign}" ]; then
+    echo "✗ refusing to delete ${name}: it holds objects without the bench label ($(tr '\n' ' ' <<<"${foreign}")); remove them or the CRD's label by hand"
+    return 1
+  fi
+  return 0
+}
+
 sweep_kind() { # <kind>
   local kind="$1" names err name
   err="$(mktemp)"
@@ -144,6 +176,10 @@ sweep_kind() { # <kind>
   while read -r name; do
     [ -n "${name}" ] || continue
     MATCHED=$((MATCHED + 1))
+    if [ "${kind}" = "${CRD_KIND}" ] && ! crd_holds_only_plants "${name}"; then
+      FAILED=$((FAILED + 1))
+      continue
+    fi
     if [ "${ACT}" -eq 0 ]; then
       echo "${VERB} ${name}"
     elif kubectl delete "${name}" --ignore-not-found --wait=false \
@@ -162,8 +198,19 @@ done
 
 # Node pools: the same pair as a GCE resource label on the pool
 # (`--labels managed-by=kube-agents-bench` at create). Empty output is zero
-# pools; a list that fails is a failed leg.
-if POOLS="$(gcloud container node-pools list --cluster "${CLUSTER}" \
+# pools; a list that fails is a failed leg. An Autopilot cluster is asked for
+# no list: a stack cannot plant a pool there, and its API refuses the call
+# (code 400, "Autopilot node pools cannot be accessed or modified"), which
+# would count one failed leg in every sweep. A describe that fails is a failed
+# leg: the pools were not read.
+if ! AUTOPILOT="$(gcloud container clusters describe "${CLUSTER}" \
+  --location "${LOCATION}" --project "${PROJECT}" \
+  --format="${AUTOPILOT_FORMAT}" </dev/null)"; then
+  echo "✗ node pools: could not read whether the cluster is Autopilot"
+  FAILED=$((FAILED + 1))
+elif [ "${AUTOPILOT}" = "${AUTOPILOT_TRUE}" ]; then
+  echo "node pools: Autopilot cluster, no pool to sweep"
+elif POOLS="$(gcloud container node-pools list --cluster "${CLUSTER}" \
   --location "${LOCATION}" --project "${PROJECT}" \
   --filter="${POOL_LIST_FILTER}" --format="value(name)" </dev/null)"; then
   while read -r pool; do

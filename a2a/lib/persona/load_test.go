@@ -132,6 +132,9 @@ func TestLoadRefuses(t *testing.T) {
 		{"a server named like a built-in", func(t *testing.T, d string) {
 			replaceIn(t, d, MCPFile, "servers:", "servers:\n  shell:\n    broker: gke")
 		}, "mcp.yaml: servers.shell: server name is a built-in tool name"},
+		{"the reserved server name", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "servers:", "servers:\n  a2a:\n    broker: gke")
+		}, "mcp.yaml: servers.a2a: server name \"a2a\" is reserved"},
 		{"a backslash in a skill file name", func(t *testing.T, d string) {
 			_ = os.WriteFile(filepath.Join(d, `skills/notes/a\b.md`), []byte("x\n"), 0o644)
 		}, `skills/notes/a\b.md: is not a plain relative path`},
@@ -139,6 +142,36 @@ func TestLoadRefuses(t *testing.T) {
 			_ = os.Remove(filepath.Join(d, ReadmeFile))
 			_ = os.Symlink("/etc/hosts", filepath.Join(d, ReadmeFile))
 		}, "README.md: is not a regular file"},
+		{"a frontmatter line that only starts with ---", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "---x\nallowed-tools: Bash\ndescription:")
+		}, "skills/triage/SKILL.md: has a frontmatter line holding --- that isn't exactly ---"},
+		{"a closing --- with trailing space", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "read-only.\n---\n", "read-only.\n--- \nallowed-tools: Bash\n---\n")
+		}, "skills/triage/SKILL.md: has a frontmatter line holding --- that isn't exactly ---"},
+		{"an opening --- with trailing space", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "---\nname: triage", "--- \nname: triage")
+		}, "skills/triage/SKILL.md: does not open with --- frontmatter"},
+		{"a YAML document end in the frontmatter", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "...\nallowed-tools: Bash\ndescription:")
+		}, "skills/triage/SKILL.md: has a frontmatter line starting with ... (a YAML document end)"},
+		{"a YAML directive in the frontmatter", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "%YAML 1.2\ndescription:")
+		}, "skills/triage/SKILL.md: has a frontmatter line starting with % (a YAML directive)"},
+		{"a byte-order mark", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "---\nname: triage", "\ufeff---\nname: triage")
+		}, "skills/triage/SKILL.md: has a byte-order mark"},
+		{"a lone carriage return", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "name: triage\n", "name: triage\rallowed-tools: Bash\n")
+		}, "skills/triage/SKILL.md: has a line break other than LF or CRLF"},
+		{"a next-line character", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "name: triage\n", "name: triage\u0085...\u0085allowed-tools: Bash\n")
+		}, "skills/triage/SKILL.md: has a line break other than LF or CRLF"},
+		{"--- inside a frontmatter line", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "read-only.", "read---only.")
+		}, "skills/triage/SKILL.md: has a frontmatter line holding --- that isn't exactly ---"},
+		{"an unclosed frontmatter", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "read-only.\n---\n", "read-only.\n")
+		}, "skills/triage/SKILL.md: does not close its --- frontmatter"},
 		{"allowed-tools in a skill", func(t *testing.T, d string) {
 			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "allowed-tools: Bash\ndescription:")
 		}, "skills/triage/SKILL.md: allowed-tools: is not an allowed frontmatter key"},

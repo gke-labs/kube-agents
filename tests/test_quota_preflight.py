@@ -89,6 +89,10 @@ _ORACLE_CASES = (
 )
 
 _EXEC_VALUE = "platformAgent.deployment.credentialProxy.exec.replicas"
+_TEAMS_VALUE = "platformAgent.integration.teams.enabled"
+_TEAMS_INBOUND_VALUE = "platformAgent.integration.teams.inbound.enabled"
+_TEAMS_TENANT_VALUE = "platformAgent.integration.teams.tenantId"
+_TEAMS_TENANT = "759d68f0-65ed-44cd-8487-ce6221b72b2a"
 
 _PROBE_TEMPLATE = """
 {{- if .Values.probe.emitRequirements }}
@@ -116,6 +120,8 @@ data:
 # The session pods at the default cap (#6028): maxSessions (10) times the operator's
 # DefaultSession* figures, 150m / 320Mi requested, 2 CPU / 2Gi limits, 1088Mi ephemeral.
 _DEFAULT_MAX_SESSIONS = 10
+# The operator's DefaultWarmSessions: one warm session pod, on the session route only.
+_DEFAULT_WARM_SESSIONS = 1
 _SESSION_REQUEST_MILLIS = 150
 _SESSION_LIMIT_MILLIS = 2000
 _SESSION_REQUEST_MEMORY_BYTES = 320 * 1024**2
@@ -440,6 +446,40 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * two_gib)
         self.assertEqual(three["limitsMemory"] - base["limitsMemory"], 3 * 2 * 1024**3)
 
+    def test_the_teams_inbound_receiver_adds_one_pod_while_its_switch_is_on(self) -> None:
+        """platformAgent.integration.teams.inbound.enabled beside teams.enabled adds the
+        receiver pod at the footprint's per-pod entry (50m/64Mi requests, 200m/128Mi
+        limits, no ephemeral storage); the inbound switch alone, with Teams off, adds
+        nothing, as the operator renders nothing then."""
+        base = self._requirements()
+        self.assertEqual(self._requirements([f"{_TEAMS_INBOUND_VALUE}=true"]), base)
+        on = self._requirements([f"{_TEAMS_VALUE}=true", f"{_TEAMS_TENANT_VALUE}={_TEAMS_TENANT}", f"{_TEAMS_INBOUND_VALUE}=true"])
+        per = yaml.safe_load(_FOOTPRINT.read_text())["operatorRenderedPerReplica"]["teamsInboundReceiver"]
+        for key, field in (("pods", "pods"), ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+                           ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+                           ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+                           ("limitsEphemeral", "ephemeralStorageBytesLimit")):
+            self.assertEqual(on[key] - base[key], per[field], key)
+        self.assertEqual(per["pods"], 1)
+        self.assertEqual(per["cpuMillisRequest"], 50)
+        self.assertEqual(per["ephemeralStorageBytesLimit"], 0)
+        self.assertEqual(on["persistentVolumeClaims"], base["persistentVolumeClaims"])
+
+    def test_the_teams_inbound_receiver_without_its_footprint_entry_fails_the_render(self) -> None:
+        footprint = self.chart / "files" / "footprint.yaml"
+        original = footprint.read_text()
+        try:
+            data = yaml.safe_load(original)
+            data["operatorRenderedPerReplica"].pop("teamsInboundReceiver")
+            footprint.write_text(yaml.safe_dump(data))
+            self.assertEqual(self._render({"probe": {"emitRequirements": True}}).returncode, 0)
+            res = self._render({"probe": {"emitRequirements": True}},
+                               [f"{_TEAMS_VALUE}=true", f"{_TEAMS_TENANT_VALUE}={_TEAMS_TENANT}", f"{_TEAMS_INBOUND_VALUE}=true"])
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("operatorRenderedPerReplica.teamsInboundReceiver", res.stderr)
+        finally:
+            footprint.write_text(original)
+
     def test_exec_tier_without_its_footprint_entry_fails_the_render(self) -> None:
         footprint = self.chart / "files" / "footprint.yaml"
         original = footprint.read_text()
@@ -491,6 +531,32 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["maxSessions"], count)
                 for key, field in self._SESSION_KEYS.items():
                     self.assertEqual(req[key], count * pod[field], key)
+
+    def test_the_chart_default_warm_count_is_the_operators(self) -> None:
+        types = (_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go").read_text()
+        match = re.search(r"const DefaultWarmSessions = (\d+)", types)
+        self.assertIsNotNone(match, "DefaultWarmSessions is gone from the API")
+        self.assertEqual(int(match.group(1)), _DEFAULT_WARM_SESSIONS)
+
+    def test_warm_sessions_count_only_on_the_session_route(self) -> None:
+        # warmSessions x one session pod's requests, held to the cap less one, on the session
+        # route only: an unset defaultRoute is platform, where the share is the cap alone.
+        pod = self._session_pod()
+        session = "platformAgent.harness.tuning.defaultRoute=session"
+        for sets, warm in (([], 0),
+                           (["platformAgent.harness.tuning.warmSessions=3"], 0),
+                           (["platformAgent.harness.tuning.defaultRoute=platform"], 0),
+                           ([session], _DEFAULT_WARM_SESSIONS),
+                           ([session, "platformAgent.harness.tuning.warmSessions=0"], 0),
+                           ([session, "platformAgent.harness.tuning.warmSessions=3"], 3),
+                           ([session, "platformAgent.harness.tuning.warmSessions=3",
+                             "platformAgent.harness.tuning.maxSessions=2"], 1),
+                           ([session, "platformAgent.harness.tuning.maxSessions=1"], 0)):
+            with self.subTest(sets=sets):
+                req = self._requirements(sets)
+                self.assertEqual(req.get("warmSessions", 0), warm)
+                self.assertEqual(req["sessionPods"], (req["maxSessions"] + warm) * pod["pods"])
+                self.assertEqual(req["sessionRequestsCpu"], (req["maxSessions"] + warm) * pod["cpuMillisRequest"])
 
     def test_a_session_resources_override_moves_the_share_by_the_cap_times_the_delta(self) -> None:
         base = self._requirements(["platformAgent.harness.tuning.maxSessions=4"])

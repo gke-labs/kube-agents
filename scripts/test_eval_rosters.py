@@ -742,11 +742,16 @@ def positive_check_types(node, negations: int = 0) -> set:
     return set()
 
 
+# The check types that grade the forge, for the GitLab lane and for the GHES
+# lane, which runs under the GitLab lane's rules: one set, so the two cannot drift.
+LANE_FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains", "forge_issue_state"}
+
+
 class GHESLaneTest(unittest.TestCase):
     """hack/eval/ghes-cases.txt: what the GHES lane runs (kube-agents#3684),
     under the GitLab lane's rules: registered cases that grade the forge."""
 
-    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    FORGE_CHECKS = LANE_FORGE_CHECKS
     PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
 
     def test_the_file_is_the_pinned_set(self):
@@ -771,7 +776,7 @@ class GitLabLaneTest(unittest.TestCase):
     runs (kube-agents#2394). Registered cases only, every entry a case that
     grades the forge."""
 
-    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    FORGE_CHECKS = LANE_FORGE_CHECKS
     PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
 
     def test_the_file_is_the_pinned_set(self):
@@ -803,6 +808,19 @@ class GitLabLaneTest(unittest.TestCase):
         either = {"verification_spec": [{"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}]}
         self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
         self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
+
+    def test_an_issue_state_check_alone_grades_the_forge(self):
+        # forge_issue_state reads the issue from the forge, GitLab included: a case may carry it as its only forge check.
+        only = {"verification_spec": [{"type": "forge_issue_state", "state": "closed"}]}
+        self.assertTrue(positive_check_types(only) & self.FORGE_CHECKS)
+        # A case that only reads the reply still grades nothing on the forge.
+        chat_only = {"verification_spec": [{"type": "report_contains", "required_phrases": ["closed"]}]}
+        self.assertFalse(positive_check_types(chat_only) & self.FORGE_CHECKS)
+        # Negated, or one alternative under an `any`, it counts no more than the other forge checks do.
+        negated = {"verification_spec": [{"type": "none", "checks": [{"type": "forge_issue_state", "state": "closed"}]}]}
+        self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
+        either = {"verification_spec": [{"type": "any", "checks": [{"type": "forge_issue_state", "state": "closed"}, {"type": "report_contains"}]}]}
+        self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
 
     def test_no_commented_out_case_path(self):
         self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_CASES_FILE.read_text(encoding="utf-8")), [])
@@ -895,6 +913,10 @@ INJECT_LANE_REQUESTING = [
     # cluster profile for the no-pdb pull request; its objective's
     # pull_request_opened leaf allows one.
     "cluster-profile-confirmed-pdb-pull-request",
+    # cluster-profile-finds-the-managed-repository: the same ask with the
+    # repository unnamed (#6389); its objective's pull_request_opened leaf
+    # allows one.
+    "cluster-profile-finds-the-managed-repository",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
@@ -913,9 +935,10 @@ INJECT_LANE_REQUESTING = [
     # objective's pull_request_opened leaf allows one.
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
-    # post-merge-verified-fixed: the post-merge check's case (#6343); its
-    # objective's pull_request_opened leaf allows the fix it opens.
-    "post-merge-verified-fixed",
+    # platform-agent-pdb-pull-request: side A of the first permit pair
+    # (#6539), the cluster profile's no-pdb ask on the default route; its
+    # objective's pull_request_opened leaf allows one.
+    "platform-agent-pdb-pull-request",
     "rca-remediation-pr",
     # scale-request-proposes-pr: asked to scale a Deployment, it may propose
     # the change as a pull request; its objective's pull_request_opened leaf

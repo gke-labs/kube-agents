@@ -291,6 +291,9 @@ type Gateway struct {
 	// minted, with the entry's index; true stops the mint there, as a
 	// gateway that died partway through a batch would (tests only).
 	beforeBatchChild func(i int) bool
+	// childResultFails, when set, runs before each childResult publish;
+	// true fails that publish, as a bus fault would (tests only).
+	childResultFails func() bool
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -321,10 +324,44 @@ type Gateway struct {
 	capCheck chan struct{}
 	capMu    sync.Mutex
 	capHolds map[string]capHold
+	// warmMu guards warmClaiming and warmDeleting, the warm pods a turn is
+	// claiming and the pool is deleting right now, so neither acts on a pod
+	// the other has in hand (warm_pool.go). It is held only to read and mark
+	// them, never across an API call.
+	warmMu       sync.Mutex
+	warmClaiming map[string]bool
+	warmDeleting map[string]bool
+	// warmMint, when set, mints the warm pool's pod names in place of
+	// mintSessionName: a test hook, so a name TASKS holds can be minted on
+	// purpose.
+	warmMint func(profile string) string
+	// warmUsedErr, when set, fails warmPodUsed for the pods it returns an
+	// error for: a test hook for a TASKS read that fails on one pod.
+	warmUsedErr func(pod string) error
+	// capQueue, guarded by capMu, is the line of turns waiting at the cap
+	// (session_cap_queue.go), oldest first; capTicket numbers the head's tries.
+	// capKick nudges the line's loop when a slot may have freed.
+	// capAdmitted, guarded by capMu, holds an admitted waiter's follow-ups
+	// by its try's id until that turn ends and replays them (capRetryDone).
+	// capWaitOverride and capPollOverride, when positive, stand in for
+	// sessionCapWaitMax and sessionCapQueuePoll (tests only).
+	capQueue  []*capWaiter
+	capTicket uint64
+	// capStopped, guarded by capMu, is set once the stop has refused the
+	// line (refuseParkedAtStop); no turn parks after it.
+	capStopped      bool
+	capAdmitted     map[uint64][]InboundMessage
+	capKick         chan struct{}
+	capWaitOverride atomic.Int64
+	capPollOverride atomic.Int64
 	// reapCursor tracks the scan position in session-state across reap passes,
 	// so a scan that hits reapPassTimeout resumes from where it left off
 	// rather than restarting from the beginning.
 	reapCursor string
+	// waitingPass caches the reap pass's waiting-children counts by profile
+	// and tier (waitingChildren, #7015); reapOnce starts each pass with a
+	// fresh one.
+	waitingPass map[string]int
 	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
 	// Returning false halts the reap scan early.
 	reapScanHook func(rec *SessionRecord) bool
@@ -337,11 +374,25 @@ type Gateway struct {
 	// fails relayTerminal's replay of the task's stream, as a transport
 	// error would.
 	terminalReplayHook func(taskID string) error
+	// fanOutReplayHook is an optional test hook, called with the task id each
+	// time a fan-out path replays a task's stream in full (fanOutReplay),
+	// so a test can tell those reads from the direct gets that open no
+	// consumer, but for a profile's five-token supervisor subject on a reader
+	// with a cutoff (lib.Client.LastEnvelopeOn) (#6646). Read under mu.
+	fanOutReplayHook func(taskID string)
+	// fanOutSpotChecks is, per fan-out parent, the running child the heal
+	// replayed in full last (nextFanOutSpotCheck). Read under mu; in memory,
+	// so a restart starts each fan-out's turn over, and dropped once the
+	// parent has no running child.
+	fanOutSpotChecks map[string]string
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
+	// namesHolds counts the relay's holds of a five-token supervisor event
+	// while the profile names are not loaded (relay.go).
+	namesHolds namesHolds
 	// cardStopTimers holds each in-flight card-stop control's timeout, by
 	// task id, under mu (cardstop.go). Memory only: a restart loses them,
 	// and the next turn on the conversation expires a control past its
@@ -627,6 +678,7 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DelegationWidthMax <= 0 {
 		o.Config.DelegationWidthMax = defaultDelegationWidthMax
 	}
+	o.Config.DelegationRoundsMax = clampDelegationRounds(o.Config.DelegationRoundsMax, log)
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}
@@ -994,6 +1046,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		if errors.Is(context.Cause(ctx), ErrTermBusLost) {
 			drain = min(drain, lostLeaseRelayDrain)
 		}
+		// The turns waiting at the session cap are memory; each is told it
+		// was not started while the adapter can still post.
+		g.refuseParkedAtStop()
 		g.relayInFlight.drain(drain)
 		if sub != nil {
 			sub.Stop()
@@ -1006,6 +1061,10 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
+		go g.capQueueLoop(ctx)
+	}
+	if g.warmPoolOn() {
+		go g.warmPoolLoop(ctx)
 	}
 
 	// The adapter's delivery goroutines only enqueue (or refuse a console
@@ -1202,6 +1261,11 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// a program say "the gateway answered without starting a task" as a fact
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
+	// The head of the session-cap line trying again: however this turn
+	// ends, the line must not stall behind it (capRetryDone).
+	if msg.capRetry != 0 {
+		defer g.capRetryDone(msg)
+	}
 
 	if g.droppedAtStop(msg) {
 		return
@@ -1211,7 +1275,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// counts the Hermes-side ingress before its allowlist, so the two halves
 	// of chatMessagesInboundTotal mean the same thing: a message a person
 	// sent, whether or not the gateway went on to answer it.
-	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok && !msg.capReplay {
 		g.metrics.messageInbound(platform)
 	}
 
@@ -1348,9 +1412,9 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
 		//
-		// Nor for a press of a Stop button, Slack's or Google Chat's: it
-		// asked the bot for nothing, and the notice, which names the
-		// presser, would land in a thread the channel reads.
+		// Nor for a press of a Stop button, Slack's, Google Chat's or
+		// Teams's: it asked the bot for nothing, and the notice, which
+		// names the presser, would land in a thread the channel reads.
 		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend) || isChatStopPress(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
@@ -1381,6 +1445,11 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 // route the message. The caller holds the conversation's session lock and
 // owns the context's clock.
 func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, principal string) {
+	// The turn as it arrived, for the session-cap line to park and deliver
+	// again whole (session_cap_queue.go), before anything below rewrites it.
+	if g.spawner != nil && parksAtCap(backend) && !g.unpostableTrigger(msg.Conversation) {
+		ctx = withParkableTurn(ctx, msg)
+	}
 	rec, err := g.reg.Get(ctx, msg.Conversation)
 	if err != nil {
 		g.log.Error("session lookup failed", "conversation", msg.Conversation, "err", err)
@@ -1454,7 +1523,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// (probeConversation) reports the same facts and heals nothing: the
 	// heal writes the record under this conversation's lock, and a read
 	// that also wrote would be a second writer racing the next turn.
-	g.healActiveTask(ctx, rec)
+	// A wake the heal starts checks the cap for itself, never parking this
+	// turn: the turn meets the cap on its own route below.
+	g.healActiveTask(withoutParking(ctx), rec)
 	// A card-stop control past its bound whose timer this process never
 	// held (it started before a restart) is given up here, before the stop
 	// switch reads it as in flight.
@@ -1529,7 +1600,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.cfg.CardStop && g.cardStopRoute(rec) {
 		msg.TaskID = ""
 	}
+	// A conversation with a turn waiting at the session cap: what a later
+	// message does waits behind that turn, but a stop or a status ask is
+	// answered now (routeParked).
+	parked := g.routeParked(rec, msg, backend, stopping)
 	switch {
+	case parked:
 	case msg.Intent == "" && bareFeedback:
 		// Answered without touching the record's task state: not a steer,
 		// not a stop, not a new task.
@@ -1557,7 +1633,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
-		// Google Chat's Stop button names its task (gchat_stop.go): a
+		// Google Chat's Stop button and Teams's name their task
+		// (gchat_stop.go, teams_press.go): a
 		// press on a task that is not the running one is a stale button,
 		// answered on its own line, and cancels nothing. Read before the
 		// requester gate below: it cancels nothing, so anyone may heal a
@@ -1566,16 +1643,18 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	case stopping && isStopPress(msg, backend) &&
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
 		// Only the people who asked for work in a thread may press its Stop
-		// button, Slack's native one or the one drawn on Google Chat
-		// (stopgate.go). Anyone else's press cancels nothing; on Google
-		// Chat, in a space, the presser alone is told so. A typed `stop`
-		// keeps the rule below.
+		// button, Slack's native one or the one drawn on Google Chat or
+		// on Teams (stopgate.go). Anyone else's press cancels nothing; on
+		// Google Chat, in a space, the presser alone is told so, and on
+		// Teams the running task's line says so. A typed `stop` keeps the
+		// rule below.
 		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
 		// A task a requester has already asked to stop (Detached) is
 		// settling: its line reads "cancel sent", and a line telling the
 		// presser to type stop would be stale advice, so nothing is said.
 		if active := rec.ActiveTask; active == nil || !active.Detached {
 			g.tellRefusedPresser(rec.Key, msg, backend)
+			g.tellRefusedOnLine(rec, msg, backend)
 		}
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
@@ -1585,8 +1664,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// press was made a typed stop above, and takes that path below.
 		g.chatStopPress(ctx, rec, msg, authority)
 	case stopping && isChatTypedStop(msg, backend) && active != nil && active.StatusMsgID != "" && !g.cardStopWanted(rec, msg):
-		// A stop typed on Google Chat with a line to answer on answers as a
-		// press does, on the line, and posts nothing (chat_stop_press.go):
+		// A stop typed on Google Chat or Teams with a line to answer on answers
+		// as a press does, on the line, and posts nothing (chat_stop_press.go):
 		// the cancel, or "cancel already sent" while its terminal is
 		// pending. With the card stop armed, or no line, it takes the typed
 		// stop's path below, posts and all.
@@ -1651,8 +1730,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// text that asks for a change the task has no permit to make.
 		g.post(rec.Key, noticeTurnNotStarted+noticeConfirmWhileRunning)
 	case active != nil && !active.Detached && rec.fanOutPending(active.TaskID):
-		// Text while a batch runs steers nothing: the turn that asked has
-		// ended, and which child it was meant for isn't for the gateway to
+		// Text while a batch runs steers nothing: a session's turn that
+		// asked has ended, a profile parent is waiting on its children,
+		// and which task the text was meant for isn't for the gateway to
 		// guess.
 		parent, _ := rec.TaskRefFor(active.TaskID)
 		g.refuseFanOutSteer(rec, parent)
@@ -1723,6 +1803,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			if rec.Profile == "" {
 				rec.Profile = sessionProfile
 			}
+			// Always minted, never a warm pod: a one-shot Delegate on a
+			// fixed-route conversation must not inherit a reused pod's
+			// lifetime (warmClaimEligible).
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
 			msg = wordsAfter(msg, rest)
@@ -1761,8 +1844,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				}
 				rec.SessionRouted = true
 				rec.Profile = sessionProfile
-				rec.BusSession = mintSessionName(rec.Profile)
-				rec.Addressee = rec.BusSession
+				g.claimOrMint(ctx, rec)
 			}
 		}
 		// The busy notice: counted once the task is on the bus, leaving the
@@ -1887,7 +1969,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// conversation for its children: they are what is healed, not its own
 	// hand-off line (healFanOut). A batch cut short heals below, where its
 	// request is read back from the stream and finished (delegationHandled).
-	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier == "" && ref.batchComplete() && rec.fanOutPending(active.TaskID) {
 		g.healFanOut(ctx, rec, active, ref)
 		return
 	}
@@ -1898,6 +1980,27 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
 	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID)
+	// A profile parent still waiting on its batch has its children healed
+	// first, an end the relay missed or couldn't send going to it now
+	// (healProfileBatch), and is then healed below as any task is: its own
+	// terminal is its end. One whose own terminal is already on the stream
+	// (the relay missed it) has ended: its children's ends are still booked
+	// (a child that completed is recorded completed, not cancelled as live
+	// below), but none is sent to it: for that pass it is marked endedUnread,
+	// in memory only, which profileParentListens reads. Its own terminal is
+	// then handled below as always (TerminalObserved, its result's delivery).
+	// A read that failed leaves it unmarked, and the batch heal sends as
+	// before.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.Tier != "" && ref.fanOut() && ref.batchComplete() {
+		ended := err == nil && task.Final
+		if ended {
+			rec.setEndedUnread(active.TaskID, true)
+		}
+		g.healProfileBatch(ctx, rec, ref)
+		if ended {
+			rec.setEndedUnread(active.TaskID, false)
+		}
+	}
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
@@ -2072,7 +2175,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), "")
 		}
-		rec.ActiveTask = nil
+		g.releaseEndedTask(ctx, rec, active)
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
 		// activity, and the session-thread window opens at the answer (the
@@ -2180,13 +2283,7 @@ func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionReco
 	if lib.IsTaskSupervisorSubject(terminalSubject, addressee, taskID) {
 		source = TerminalFromSupervisor
 	}
-	g.mu.Lock()
-	rs, ok := g.relays[taskID]
-	if !ok {
-		rs = &relayState{}
-		g.relays[taskID] = rs
-	}
-	g.mu.Unlock()
+	rs := g.relayFor(taskID)
 	g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 	status := lib.StatusUpdate{TaskID: taskID, ContextID: task.ContextID,
 		Status: lib.TaskStatus{State: task.State, Message: task.FinalMessage}, Final: true}
@@ -2432,6 +2529,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
 	state.ChildAddressees = chainChildAddressees(rec, taskID)
+	state.ChildCount = chainChildCount(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2533,6 +2631,30 @@ func chainChildAddressees(rec *SessionRecord, taskID string) []string {
 	return out
 }
 
+// chainChildCount is how many child tasks the delegation chain rooted at
+// taskID's root minted: every delegation, so two to the same addressee count
+// two where chainChildAddressees names it once. A child minted without an
+// addressee still counts, since it is a delegation whomever it went to. Zero
+// when the chain delegated nothing; nil only when taskID is unknown, so the
+// wire tells "none" from "unknown" as the addressees do. It counts the
+// children the record still holds: a long-lived conversation whose history
+// trim (trimHistory) dropped old child entries under a live root counts
+// fewer, which a fresh bench conversation never reaches.
+func chainChildCount(rec *SessionRecord, taskID string) *int {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == taskRoleChild && t.rootID() == root {
+			n++
+		}
+	}
+	return &n
+}
+
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.
 func usageSum(turns []lib.Usage) *lib.Usage {
 	if len(turns) == 0 {
@@ -2564,6 +2686,7 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 		if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
 			g.log.Warn(why+": incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
 		}
+		g.kickCapQueue()
 	}
 	rec.PodName = ""
 	return true
@@ -2590,8 +2713,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	if !g.retireIncarnation(ctx, rec, "session route", retireRefusalNotStarted) {
 		return false
 	}
-	rec.BusSession = mintSessionName(rec.Profile)
-	rec.Addressee = rec.BusSession
+	// A new conversation's first turn may be handed a warm pod instead of a
+	// fresh name (warm_pool.go); everything else mints, as before.
+	g.claimOrMint(ctx, rec)
 	return true
 }
 
@@ -2807,7 +2931,21 @@ func conversationIsOwnThread(backend, conversation string) bool {
 // clock would hold a true the registry had already withdrawn). For a
 // running task there is no bound to hand over, so it is now + IdleTTL: the
 // adapter asks again then, and a task still running is answered again.
+//
+// A conversation whose turn waits in the session-cap line is a session too,
+// though nothing has started in it yet: its stop, its status ask and its
+// later messages are what routeParked answers, and an adapter that dropped
+// them as replies to a thread the gateway is not in would leave the person
+// unable to reach their place in line. The line is memory, not the
+// registry, so it is read first, under capMu alone, and its true comes with
+// an until of now: the adapter asks again on the next reply, so a thread
+// whose turn has left the line (stopped, refused, or started, when
+// TaskStarted marks it anyway) carries no unmentioned reply on the line's
+// word after that.
 func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, time.Time, error) {
+	if g.parkedAtCap(conversation) {
+		return true, time.Now(), nil
+	}
 	rec, err := g.reg.Get(ctx, conversation)
 	if err != nil || rec == nil {
 		return false, time.Time{}, err
@@ -2905,6 +3043,11 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // the task its turn started, without reading TASKS.
 func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
+	// The task's pod is idle now, so the cap can evict it, or it is
+	// exiting: a slot for the session-cap line, maybe.
+	if g.spawner != nil {
+		g.kickCapQueue()
+	}
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(rec.Key, taskID, state, source, reason)
 	}
@@ -2964,8 +3107,11 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 // ends join on taskId. It is logged by the task's own id, for every task
 // that wrote an ingress line - a delegated child and a wake included - and
 // not from observeTaskTerminal, which names a chain by its root and is
-// called only for the task whose end is the chain's (observedAs). The
-// addressee is the one the task was published to, which is what ingress
+// called only for the task whose end is the chain's (observedAs). The one
+// line under a task's id that is not that task's own terminal is a chain's
+// wake-not-started end, logged under its root with its own source
+// (observeChainEnd, terminalLogChainEnd).
+// The addressee is the one the task was published to, which is what ingress
 // logged; after a Delegate re-home rec.Addressee is not it, so each caller
 // passes the one it holds. Chat already showed the user the reason; the log
 // keeps only its token (reasonToken), so a failing install's log says how
@@ -3244,6 +3390,8 @@ type taskStart struct {
 	// the waiting profile tasks above it, set only by a profile parent's
 	// child mint.
 	ProfileChain []string
+	// Scheduled goes onto a profile task's history entry (TaskRef.Scheduled).
+	Scheduled bool
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
 	Role         string
@@ -3285,6 +3433,9 @@ type taskStart struct {
 	// for a child of a batch of two or more only.
 	BatchIndex int
 	Target     string
+	// BatchRound is the delegation round a profile parent's child is minted
+	// in (TaskRef.BatchRound), 0 for round one.
+	BatchRound int
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -3423,6 +3574,20 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			extra = append(extra, part)
 		}
 	}
+	// A profile task submitted on its own, neither a child nor a wake (no
+	// via), of a profile whose card says it delegates, carries the profiles
+	// it may delegate to and the width, which its worker's delegate tool
+	// names (#6789): what the delegation will accept from it
+	// (profileDelegateTargets). Every other profile submission is as it was.
+	if ts.Route != nil && ts.Role == "" && ts.Authority.Via == nil {
+		// The entry startTaskWith writes below, as far as the delegation's
+		// checks read it.
+		requester := ts.Requester
+		parent := TaskRef{Addressee: addressee, Requester: &requester, Attribution: ts.Authority.Attribution(),
+			Depth: ts.Depth, Tier: string(ts.Route.Tier), Scope: string(ts.Route.Scope), ProfileChain: ts.ProfileChain}
+		parent.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
+		extra = append(extra, g.profileTargetsParts(rec, parent, taskID)...)
+	}
 	// A turn answering a report its client named carries the task that
 	// filed it, so the executor can read the report stored for that turn.
 	// One that is not a task id's shape is dropped here, the one check on
@@ -3447,14 +3612,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
 	// A chat thread's kept reports are forgotten once this turn is on the
 	// bus (below), not here: a publish that fails leaves them for the retry.
-	threadReportsRead := 0
+	var threadReportRead uint64
 	if ts.Role == "" {
-		if report, n, ok := g.relayedReport(rec, ts.ReplyTo); ok {
+		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
 			if part, err := lib.PushedReportPart(report); err != nil {
 				g.log.Warn("pushed report not attached; the turn runs without it", "taskId", taskID, "err", err)
 			} else {
 				extra = append(extra, part)
-				threadReportsRead = n
+				threadReportRead = seq
 			}
 		}
 	}
@@ -3540,7 +3705,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if ts.KeepActive {
 		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
-	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
+	ref.BatchIndex, ref.Target, ref.BatchRound = ts.BatchIndex, ts.Target, ts.BatchRound
 	ref.Lineless = lineless
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
@@ -3559,6 +3724,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Tier = string(ts.Route.Tier)
 		ref.Scope = string(ts.Route.Scope)
 		ref.ProfileChain = ts.ProfileChain
+		ref.Scheduled = ts.Scheduled
 	}
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
@@ -3626,11 +3792,12 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 		return "", false
 	}
-	if threadReportsRead > 0 {
+	if threadReportRead > 0 {
 		// The turn under the thread's newest report is on the bus: the
-		// reports it read are forgotten, so the next turn there is not under
-		// a report it was not about; one kept during the publish stays.
-		g.reports.forgetUpTo(rec.Key, threadReportsRead)
+		// reports through the one it read are forgotten, so the next turn
+		// there is not under a report it was not about; one kept during the
+		// publish stays, at the cap too.
+		g.reports.forgetThrough(rec.Key, threadReportRead)
 	}
 
 	// The submission is on the subject now, which is the first moment
@@ -3712,6 +3879,14 @@ var steerRefusalWhy = map[string]string{
 	lib.SteerReasonNoResume:   "this agent's executor can't continue a session, so follow-ups run on the api executor only",
 }
 
+// ruleSteerChangeRequested names the refusal of a steer into a task that
+// holds ChangeRequested (steerTask), and noticeSteerChangeRequested is what
+// its conversation is told.
+const (
+	ruleSteerChangeRequested   = "steer-change-requested"
+	noticeSteerChangeRequested = "⚠️ not sent: the running task is making a confirmed change, and what it's asked to do can't change while it runs. Stop it, then send what you want as a new confirm."
+)
+
 // steerTask forwards a message that arrived while the task runs as a
 // follow-up on the same taskId — injected, absorbed at the executor's next
 // turn boundary (decided 8/24). It reuses the task's correlationId; the
@@ -3740,6 +3915,20 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 			return
 		}
 	}
+	// A task that holds ChangeRequested was started by a person's
+	// structured confirm and may write. A steer would change what it is
+	// asked to do while it runs, and the gateway can't tell who on a door
+	// sent it (the console's human and its MCP server share one author), so
+	// no steer reaches it from any door: the requester stops the task and
+	// confirms again (#5884). A confirm is already refused while a task
+	// runs (noticeConfirmWhileRunning). Before the author is recorded, as
+	// for the checks below.
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok && ref.ChangeRequested {
+		g.log.Warn("steer refused", "rule", ruleSteerChangeRequested, "taskId", active.TaskID, "conversation", rec.Key,
+			"steerBackend", author.Backend, "steerAuthor", author.Subject)
+		g.post(rec.Key, noticeSteerChangeRequested)
+		return
+	}
 	// A profile task's grant was minted once, at its authors' tier: a steer
 	// from someone at another tier is refused, before the author is
 	// recorded, rather than left to reach a task that runs at a tier its
@@ -3753,6 +3942,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		}
 	}
 	rec.recordSteerAuthor(active.TaskID, author)
+	rec.SteeredSession = rec.BusSession
 	if rec.AddressedToOwnSession() {
 		rec.addSessionAuthor(author)
 	}
@@ -3807,7 +3997,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// the task, which is a pod still starting or nothing at all, so no reply
 	// is promised. A read that fails keeps the route's line. The read is
 	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
-	// consumer.
+	// consumer, but for the one taskStreamEmpty names.
 	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	noFirstEvent := emptyErr == nil && empty
 	if noFirstEvent {

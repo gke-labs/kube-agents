@@ -122,6 +122,10 @@ readonly FORGE_VM_BIND_DELAY_S=10
 # not seen yet. Any other failure stops the step at once.
 readonly FORGE_VM_BIND_RETRY_PATTERN="does not exist"
 readonly FORGE_RECORD_TTL=60
+# The Prow project's `us` repositories this project's build and node identities
+# read: the warm cache image's, and the one for per-commit candidate images.
+# scripts/verify_ci_pool_project.py checks the same two (PROW_READ_REPOSITORIES).
+readonly PROW_READ_REPOSITORIES=(kube-agents kube-agents-candidates)
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -471,6 +475,7 @@ gcloud services enable \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
   gkehub.googleapis.com \
+  anthosconfigmanagement.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   dns.googleapis.com \
@@ -516,14 +521,17 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 # Cross-project read of the warm cache image. hack/ci-deploy.sh defaults
 # CACHE_IMAGE to us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest,
 # which lives in the `us` multi-region repository -- not us-central1.
+# The same read on the repository for per-commit candidate images.
 echo "Granting Artifact Registry reader on kube-agents-prow (location: us)..."
-for member in "${CLOUDBUILD_SA}" "${COMPUTE_SA}"; do
-  gcloud artifacts repositories add-iam-policy-binding kube-agents \
-    --project=kube-agents-prow \
-    --location=us \
-    --member="${member}" \
-    --role="roles/artifactregistry.reader" \
-    --quiet >/dev/null
+for repository in "${PROW_READ_REPOSITORIES[@]}"; do
+  for member in "${CLOUDBUILD_SA}" "${COMPUTE_SA}"; do
+    gcloud artifacts repositories add-iam-policy-binding "${repository}" \
+      --project=kube-agents-prow \
+      --location=us \
+      --member="${member}" \
+      --role="roles/artifactregistry.reader" \
+      --quiet >/dev/null
+  done
 done
 
 # The pull-kube-agents-smoke-test job runs on the build-kube-agents cluster, not
@@ -588,6 +596,11 @@ done
 # (declared-mtu-peering, main.tf), and the create needs compute.networks.create,
 # .delete, .addPeering, .removePeering and .updatePeering, which no other role
 # here carries.
+# gkehub.editor: the stack registers seeded-a to the project's fleet and turns
+# on the Config Sync feature for it on a project listed in
+# post_merge_sync_projects (bench/tf/fleet/config-sync.tf), which needs
+# gkehub.memberships.* and gkehub.features.*; editor, not admin, which adds
+# setIamPolicy.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
@@ -597,6 +610,7 @@ for role in \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \
+  roles/gkehub.editor \
   roles/iam.serviceAccountAdmin \
   roles/iam.serviceAccountUser \
   roles/resourcemanager.projectIamAdmin \
@@ -755,6 +769,13 @@ echo "  (reader App ${LEDGER_READER_NUMBER} of ${LEDGER_SHARD_COUNT}: ${LEDGER_R
 echo "  except that until the Prow job mounts this App's key the eval reads through reader App 1, so keep the repository on that installation too)."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
+
+# ─── Step 1.4b: The post-merge sync's repository side ─────────────────────────
+echo -e "\n==> [Step 1.4b] Seeding the post-merge fixture and its read-only deploy key..."
+# The declaration, the budget and the deploy key's secret (docs/ci-pool-projects.md
+# 5.13). A step of its own, after the GitOps repository exists and before Step
+# 2.2's fleet apply, which reads the secret on a project the fleet lists.
+"${SCRIPT_DIR}/provision_ci_pool_post_merge_sync.sh" "${PROJECT_ID}" "${GITOPS_REPO}"
 
 # ─── Step 1.5: The self-managed forges' pieces ────────────────────────────────
 echo -e "\n==> [Step 1.5] Reserving the self-managed forges' zone, addresses, firewall rule and VM identity..."

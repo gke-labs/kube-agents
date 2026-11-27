@@ -26,8 +26,8 @@
 # gives, and the recommended remedy are the judge's, against `expected_output`.
 # The rule prints one note per pool the template can land on, and
 # multi-process-worker names no pool, so slot a's note column carries one per
-# pool of the cluster (default-pool, idle-batch-pool and
-# pinned-inference-pool), each reading `group-oom-kill: Deployment
+# pool of the cluster (a pool that holds no node gets its note too),
+# each reading `group-oom-kill: Deployment
 # seeded-shapes/multi-process-worker container supervisor runs a shell script
 # that forks a background job on pool <pool>, on cgroup v2 with a kubelet at
 # <the pool's version>, which already group-kills; not an upgrade risk`
@@ -119,7 +119,7 @@ expected_output: >-
   container supervisor runs a shell script that forks a background job on
   pool default-pool, on cgroup v2 with a kubelet at <version>, which already
   group-kills; not an upgrade risk", followed on the same line, after "; ",
-  by the same note for idle-batch-pool and pinned-inference-pool as the
+  by the same note for each other pool of the cluster as the
   report prints them, and for seeded-b, seeded-c and seeded-d
   "group-oom-kill: none". It cites no CVE identifiers and changes nothing.
 infrastructure:

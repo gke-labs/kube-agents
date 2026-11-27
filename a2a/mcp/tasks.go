@@ -18,7 +18,8 @@ const (
 	// taskReadTimeout bounds one plain read of a task.
 	taskReadTimeout = 10 * time.Second
 	// taskConsumerIdle is how long the server keeps a read's consumer once
-	// it goes idle; every read or watch here ends well inside it.
+	// it goes idle; the gap between one pull and the next has to stay well
+	// inside it.
 	taskConsumerIdle = 5 * time.Second
 	taskFetchBatch   = 256
 	taskFetchWait    = 2 * time.Second
@@ -28,7 +29,8 @@ const (
 
 	// maxTaskReaders bounds the consumers this server holds at once, across
 	// every caller and every reader (tasks, topics). A slot is held for a
-	// read or watch and then for taskConsumerIdle after it, which is how
+	// read or watch, or for a create attempt that timed out
+	// (createReadConsumer), and then for taskConsumerIdle after it, which is how
 	// long the server keeps the consumer before reaping it: the console
 	// grant cannot delete one, so a slot freed at the end of the read would
 	// let rapid reads pile consumers up against the stream's cap, which the
@@ -48,7 +50,8 @@ const (
 // out of the stream's retention.
 var ErrTaskNotFound = errors.New("no such task on the bus")
 
-// errReadersBusy is every task reader slot in use.
+// errReadersBusy is every task reader slot in use, by reads or by create
+// attempts that timed out.
 var errReadersBusy = fmt.Errorf("this server already holds its %d bus readers; try again in a few seconds", maxTaskReaders)
 
 // TaskRef names a task as the bus does: by the addressee it was submitted to
@@ -79,9 +82,10 @@ func ParseTaskRef(ref, addressee string) (TaskRef, error) {
 }
 
 // readerSlot takes one of the server's reader slots, or reports them all busy
-// without waiting. Release hands the slot back: once the consumer the read
-// created has had time to be reaped (taskConsumerIdle) when created says the
-// read may have left one, and at once when it cannot have.
+// without waiting. Release hands the slot back: once the consumer the read (or
+// one create attempt of it) created has had time to be reaped
+// (taskConsumerIdle) when created says it may have left one, and at once when
+// it cannot have.
 func (b *NATSBus) readerSlot() (release func(created bool), err error) {
 	select {
 	case b.readers <- struct{}{}:
@@ -100,13 +104,17 @@ func (b *NATSBus) readerSlot() (release func(created bool), err error) {
 	}
 }
 
-// consumerMayExist reports whether a failed CreateConsumer can still have left
-// a consumer on the server. A JetStream API error is the server's refusal, so
-// nothing was made; anything else (a timeout, a dropped connection) may have
-// been answered after the client stopped waiting.
-func consumerMayExist(err error) bool {
-	var refused *jetstream.APIError
-	return !errors.As(err, &refused)
+// createReadConsumer creates one of this server's read consumers on s, which
+// the log lines call stream, bounding and retrying each attempt
+// (lib.CreateEphemeralConsumer), which splits a short deadline across its
+// attempts. Each attempt takes a reader slot: one whose create timed out stays
+// taken until the consumer it may have left would be reaped, and one the
+// server refused goes back at once. The returned release is the consumer's
+// slot.
+func (b *NATSBus) createReadConsumer(ctx context.Context, s lib.ConsumerCreator, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, func(created bool), error) {
+	return lib.CreateEphemeralConsumer(ctx, s, cfg, lib.EphemeralCreateOptions{
+		Slot: b.readerSlot, Logger: b.logger(), Stream: stream, AttemptTimeout: b.createAttemptTimeout,
+	})
 }
 
 // ReadTask folds a task from TASKS as it stands now.
@@ -125,6 +133,11 @@ func (b *NATSBus) ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error) 
 		if err := w.next(ctx); err != nil {
 			return nil, err
 		}
+	}
+	if len(w.events) == 0 && w.dropped > 0 {
+		// Nothing on the task but what the cutoff refused: no events, as
+		// lib's replay answers it.
+		return nil, ErrTaskNotFound
 	}
 	return w.fold()
 }
@@ -157,8 +170,7 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 		return nil, ErrTaskNotFound
 	}
 	for {
-		t, ferr := w.fold()
-		if ferr == nil && t.Final {
+		if t, final := w.ended(); final {
 			return t, nil
 		}
 		if err := w.next(ctx); err != nil {
@@ -169,6 +181,14 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 				return w.fold()
 			}
 			return nil, err
+		}
+		if !submitted && w.pending == 0 && len(w.events) == 0 && w.dropped > 0 {
+			// Everything the task had was refused by the cutoff: not found
+			// at once, as ReadTask answers it, rather than holding a reader
+			// for the rest of the wait. The refusal is decided from the
+			// operator's inputs and the stored time alone, so it never
+			// waits on a read that could still fail and later succeed.
+			return nil, ErrTaskNotFound
 		}
 	}
 }
@@ -183,19 +203,20 @@ type taskWatch struct {
 	seen    int
 	pending uint64
 	release func(created bool)
+	// accept is the supervisor cutoff (lib.Client.AcceptSupervisorEvent);
+	// dropped counts what it refused.
+	accept func(subject string, storedAt time.Time) bool
+	// finalUnfolded is a final status-update taken since ended last folded.
+	finalUnfolded bool
+	dropped       int
 }
 
 func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error) {
-	release, err := b.readerSlot()
-	if err != nil {
-		return nil, err
-	}
 	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
-		release(false)
 		return nil, err
 	}
-	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{
+	cons, release, err := b.createReadConsumer(ctx, s, lib.TasksStream, jetstream.ConsumerConfig{
 		FilterSubjects:    lib.TaskReplaySubjects(ref.Addressee, ref.TaskID),
 		DeliverPolicy:     jetstream.DeliverAllPolicy,
 		AckPolicy:         jetstream.AckNonePolicy,
@@ -203,7 +224,6 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		InactiveThreshold: taskConsumerIdle,
 	})
 	if err != nil {
-		release(consumerMayExist(err))
 		return nil, err
 	}
 	pending := cons.CachedInfo().NumPending
@@ -214,7 +234,26 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		release(true)
 		return nil, err
 	}
-	return &taskWatch{ref: ref, r: r, pending: pending, release: release}, nil
+	return &taskWatch{ref: ref, r: r, pending: pending, release: release, accept: b.client.AcceptSupervisorEvent}, nil
+}
+
+// admit adds one event read off the stream to the watch, unless the
+// supervisor cutoff refuses it (lib.Client.AcceptSupervisorEvent: a
+// five-token supervisor message on a profile's addressee, as the operator's
+// profile names say, stored after the install's cutoff), which is counted.
+func (w *taskWatch) admit(subject string, storedAt time.Time, env *lib.Envelope) {
+	if w.accept != nil && !w.accept(subject, storedAt) {
+		w.dropped++
+		return
+	}
+	w.events = append(w.events, env)
+	w.noteTaken(env)
+}
+
+// noteTaken records, for ended, that an event the watch took is a final
+// status-update.
+func (w *taskWatch) noteTaken(env *lib.Envelope) {
+	w.finalUnfolded = w.finalUnfolded || lib.IsFinalStatus(env)
 }
 
 // errTooManyEvents is a task with more than maxTaskEvents events.
@@ -260,10 +299,15 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 		if w.seen > maxTaskEvents {
 			return fmt.Errorf("task %s has more than %d events: %w", w.ref, maxTaskEvents, errTooManyEvents)
 		}
-		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
-			w.events = append(w.events, env)
+		md, mdErr := msg.Metadata()
+		var storedAt time.Time
+		if mdErr == nil {
+			storedAt = md.Timestamp
 		}
-		if md, err := msg.Metadata(); err == nil {
+		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
+			w.admit(msg.Subject(), storedAt, env)
+		}
+		if mdErr == nil {
 			w.pending = md.NumPending
 		}
 		if w.pending == 0 {
@@ -285,6 +329,26 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 }
 
 func (w *taskWatch) fold() (*lib.Task, error) { return lib.FoldTask(w.ref.TaskID, w.events) }
+
+// ended reports a final task, one time for each final status-update taken: it
+// folds only when one has been taken since the last fold, because nothing
+// else ends a task (FoldTask sets Final from a status-update's final field
+// alone). A fold parses every payload read so far, so folding after each
+// artifact or progress status of a task near readMaxBytes costs the whole
+// task again between one pull and the next. On a loaded test runner that took
+// the gap between pulls past taskConsumerIdle, the server reaped the consumer
+// under the read, and the next pull failed with "no responders".
+func (w *taskWatch) ended() (*lib.Task, bool) {
+	if !w.finalUnfolded {
+		return nil, false
+	}
+	w.finalUnfolded = false
+	t, err := w.fold()
+	if err != nil || !t.Final {
+		return nil, false
+	}
+	return t, true
+}
 
 // taskAgreement is the supervisor check agreedEnvelope applies, the same
 // writers gateway.SupervisorAgreement accepts.

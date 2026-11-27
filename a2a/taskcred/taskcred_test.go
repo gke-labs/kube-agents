@@ -691,3 +691,84 @@ func TestNoPermitOmitsTheClaim(t *testing.T) {
 		}
 	}
 }
+
+// The unattended write permit rides only on a builtin schedule trigger that
+// binds its stream, and never beside the confirmed permit
+// (docs/designs/unattended-write-permit.md, rows 1 and 2). Mint and Verify
+// share the check, so Mint refuses each shape as well; the parity fixtures
+// hold Verify and the Python verifier to the same verdicts.
+func TestTheUnattendedWritePermitNeedsAScheduleTriggerWithItsStream(t *testing.T) {
+	kp, pub := signingKey(t)
+	now := time.Now()
+	proxy := func(permits []Permit, trigger *Trigger) Claims {
+		c := validClaims(now)
+		c.Audience = AudienceCredentialProxy
+		c.Target = &Target{Project: "p", Location: "l", Cluster: "c"}
+		c.Permits, c.Trigger = permits, trigger
+		return c
+	}
+	schedule := &Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin, Stream: "nightly"}
+	only := []Permit{PermitVCSUnattendedWrite}
+
+	report := proxy(only, schedule)
+	report.Tier, report.Target = ReportTier, nil
+	scripted := *schedule
+	scripted.Script = "nightly"
+	for name, c := range map[string]Claims{
+		"a cluster target":           proxy(only, schedule),
+		"a report credential":        report,
+		"a trigger naming a script":  proxy(only, &scripted),
+		"the confirmed permit alone": proxy([]Permit{PermitVCSProposalCreate}, schedule),
+	} {
+		got, err := Verify(mint(t, kp, c), []string{pub}, AudienceCredentialProxy, now, testLifetime, testSkew)
+		if err != nil {
+			t.Errorf("%s: refused: %v", name, err)
+			continue
+		}
+		if !slices.Equal(got.Permits, c.Permits) || got.Trigger == nil || *got.Trigger != *c.Trigger {
+			t.Errorf("%s: permits = %v, trigger = %+v, want %v and %+v", name, got.Permits, got.Trigger, c.Permits, *c.Trigger)
+		}
+	}
+
+	collectorReport := proxy(only, &Trigger{Name: "stall-watch", Origin: TriggerOriginBuiltin})
+	collectorReport.Tier, collectorReport.Target = ReportTier, nil
+	for name, c := range map[string]Claims{
+		"no trigger":                                     proxy(only, nil),
+		"a collector trigger":                            proxy(only, &Trigger{Name: "stall-watch", Origin: TriggerOriginBuiltin}),
+		"a schedule trigger with no stream":              proxy(only, &Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin}),
+		"a schedule trigger with a script and no stream": proxy(only, &Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin, Script: "nightly"}),
+		"a report credential with a collector trigger":   collectorReport,
+		"both permits, the unattended one first":         proxy([]Permit{PermitVCSUnattendedWrite, PermitVCSProposalCreate}, schedule),
+		"both permits, the confirmed one first":          proxy([]Permit{PermitVCSProposalCreate, PermitVCSUnattendedWrite}, schedule),
+		"the permit twice":                               proxy([]Permit{PermitVCSUnattendedWrite, PermitVCSUnattendedWrite}, schedule),
+	} {
+		if _, err := Mint(kp, c); err == nil {
+			t.Errorf("Mint accepted the unattended permit with %s", name)
+		}
+	}
+}
+
+// unattendedWriteTrigger states the permit's rule whole. Trigger.validate
+// refuses some of these shapes first today (another origin, a stream that is
+// not the schedule's own name), so only a direct call shows that the permit's
+// rule refuses them by itself.
+func TestTheUnattendedWriteTriggerRuleStandsWithoutTheTriggerShapeCheck(t *testing.T) {
+	for name, tc := range map[string]struct {
+		trigger *Trigger
+		want    bool
+	}{
+		"a builtin schedule trigger with its stream": {&Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin, Stream: "nightly"}, true},
+		"the same, naming a script":                  {&Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin, Stream: "nightly", Script: "nightly"}, true},
+		"no trigger":                                 {nil, false},
+		"no stream":                                  {&Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin}, false},
+		"no stream and an empty schedule name":       {&Trigger{Name: "schedule/", Origin: TriggerOriginBuiltin}, false},
+		"a user origin":                              {&Trigger{Name: "schedule/nightly", Origin: "user", Stream: "nightly"}, false},
+		"another schedule's stream":                  {&Trigger{Name: "schedule/nightly", Origin: TriggerOriginBuiltin, Stream: "weekly"}, false},
+		"a stream on another source":                 {&Trigger{Name: "watch/nightly", Origin: TriggerOriginBuiltin, Stream: "nightly"}, false},
+		"a stream on a bare source":                  {&Trigger{Name: "nightly", Origin: TriggerOriginBuiltin, Stream: "nightly"}, false},
+	} {
+		if got := unattendedWriteTrigger(tc.trigger); got != tc.want {
+			t.Errorf("%s: unattendedWriteTrigger = %v, want %v", name, got, tc.want)
+		}
+	}
+}

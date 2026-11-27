@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
@@ -695,5 +699,148 @@ func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
 	}
 	if got := resetPaths(""); len(got) != 0 {
 		t.Errorf("resetPaths(\"\") = %q, want none", got)
+	}
+}
+
+// harnessConfigDir is where the session check and the settings lookup both
+// look: $CLAUDE_CONFIG_DIR, else ~/.claude, else unknown.
+func TestHarnessConfigDir(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, "/cfg")
+	t.Setenv("HOME", "/home/u")
+	if got := harnessConfigDir(); got != "/cfg" {
+		t.Errorf("with %s set: %q", claudeConfigDirEnv, got)
+	}
+	t.Setenv(claudeConfigDirEnv, "")
+	if got := harnessConfigDir(); got != filepath.Join("/home/u", claudeDefaultConfigDir) {
+		t.Errorf("with HOME only: %q", got)
+	}
+	t.Setenv("HOME", "")
+	if got := harnessConfigDir(); got != "" {
+		t.Errorf("with neither: %q", got)
+	}
+}
+
+// TestSessionWriteRefusalDir: only a session pod with the cluster view keeps a
+// per-turn write-refusal record, under its workdir.
+func TestSessionWriteRefusalDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, session, clusterView, want string
+	}{
+		{"session with the cluster view", "chat-a", "true", "/scratch/.kube-agents"},
+		{"session without the cluster view", "chat-a", "", ""},
+		{"cluster view spelled otherwise", "chat-a", "TRUE", ""},
+		{"no session (a profile pod)", "", "true", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(lib.EnvClusterView, tc.clusterView)
+			if got := sessionWriteRefusalDir(tc.session, "/scratch"); got != tc.want {
+				t.Fatalf("sessionWriteRefusalDir(%q) = %q, want %q", tc.session, got, tc.want)
+			}
+		})
+	}
+}
+
+// A session with the cluster view reads for itself, and that pulls an ask
+// that also needs a change toward reading first: the reads fan out to read
+// delegations and the change never reaches platform (#6859). The delegate
+// prompt says to hand such an ask over whole, in the turn it arrives, when
+// platform is listed and the person named no other agent; a fix only asked
+// for as a proposal stays in the reply. It rests that on the shorter path,
+// not on a wake turn being unable to delegate, which a later change makes
+// false (#6861). A pod without the delegate tool gets no such line, since it
+// has nothing to hand over with.
+func TestTheClusterViewSessionHandsAChangeRequiringAskToPlatformWhole(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvProfileExecutor} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	prompt := func() string {
+		argv := harnessCommand()
+		for i, a := range argv {
+			if a == "--append-system-prompt" && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	p := prompt()
+	if !strings.Contains(p, clusterViewPrompt) {
+		t.Fatalf("view-on session prompt lacks the view's own prompt, so this is not the case under test: %q", p)
+	}
+	for _, want := range []string{
+		"wants a change made",
+		"opened as a pull request",
+		"`platform` is listed",
+		"hand the whole ask to `platform` in the turn it arrives",
+		"with the reads it depends on",
+		"unless they named another agent",
+		"only asked to propose is not a change",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("view-on session prompt lacks %q: %q", want, p)
+		}
+	}
+	for _, never := range []string{"can't delegate again", "cannot delegate again", "only one delegation"} {
+		if strings.Contains(strings.ToLower(p), never) {
+			t.Errorf("view-on session prompt rests the handoff on %q, which re-delegation on a wake makes false: %q", never, p)
+		}
+	}
+	// Read-only asks keep the view's latency win: the read-it-yourself line stays.
+	if !strings.Contains(p, "answer yourself when you can") {
+		t.Errorf("view-on session prompt dropped the answer-yourself line: %q", p)
+	}
+	t.Setenv(lib.EnvDelegateTool, "off")
+	p = prompt()
+	if !strings.Contains(p, clusterViewPrompt) {
+		t.Fatalf("delegate-off view pod lost the view's prompt, so the check below would pass on nothing: %q", p)
+	}
+	if strings.Contains(p, "hand the whole ask") {
+		t.Errorf("a pod without the delegate tool is told to hand asks over: %q", p)
+	}
+}
+
+// A warm session pod's env: no TASK_ID, warm and reuse on, the idle bound in
+// seconds, and the pod's ready file. Without the warm switch an empty TASK_ID
+// still refuses to start. The readiness subcommand answers from the file.
+func TestAWarmSessionPodStartsWithNoTaskID(t *testing.T) {
+	quiet := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	t.Setenv("TASK_ID", "")
+	t.Setenv("PROFILE", "chat")
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	t.Setenv(lib.EnvSessionReuse, "true")
+	t.Setenv(lib.EnvSessionWarm, "")
+	if _, ok := configFromEnv(quiet); ok {
+		t.Fatal("an empty TASK_ID started without the warm switch")
+	}
+	t.Setenv(lib.EnvSessionWarm, "true")
+	t.Setenv(lib.EnvSessionWarmIdleSeconds, "1800")
+	cfg, ok := configFromEnv(quiet)
+	if !ok {
+		t.Fatal("a warm pod's environment was refused")
+	}
+	if !cfg.Warm || !cfg.SessionReuse || cfg.WarmIdle != 30*time.Minute || cfg.WarmStatusAddr != warmStatusHostPort() {
+		t.Errorf("warm config = Warm %v SessionReuse %v WarmIdle %v WarmStatusAddr %q", cfg.Warm, cfg.SessionReuse, cfg.WarmIdle, cfg.WarmStatusAddr)
+	}
+	if !strings.HasPrefix(cfg.WarmStatusAddr, warmStatusHost+":") {
+		t.Errorf("the warm status endpoint binds %q, not the loopback interface alone", cfg.WarmStatusAddr)
+	}
+	// The probe waits out the adapter's start rather than failing during it,
+	// so a routine warm pod start records no Unhealthy Event, and fails only
+	// when nothing ever answers.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "http://" + ln.Addr().String() + lib.SessionWarmReadyPath
+	if warmReady(url, 0) == 0 {
+		t.Error("the readiness probe passed with nothing answering")
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	}()
+	if warmReady(url, 10*time.Second) != 0 {
+		t.Error("the readiness probe failed while the endpoint was on its way")
 	}
 }

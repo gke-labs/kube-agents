@@ -1809,5 +1809,3547 @@ class PrCommentsSweepOnGiteaTest(unittest.TestCase):
         self.assertEqual(self.sweep(Fork()).cards, [])
 
 
+class MemoryProposalsSweepTest(unittest.TestCase):
+    """Tests for ``sweep_memory_proposals`` (PR filing, merge approval, and close refusal)."""
+
+    @staticmethod
+    def _seed_post_merge_db(db_path: Path, **columns) -> None:
+        import re
+        import sqlite3
+
+        source = (
+            Path(__file__).resolve().parent / "session_kv_server.py"
+        ).read_text(encoding="utf-8")
+        ddl = re.search(
+            r"CREATE TABLE IF NOT EXISTS post_merge_records \((.*?)\)\s*\"\"\"",
+            source,
+            re.DOTALL,
+        ).group(0)[:-3]
+        row = {
+            "url": f"https://github.com/acme/infra/pull/{columns.get('number', 297)}",
+            "repo": "https://github.com/acme/infra",
+            "number": 297,
+            "kind": "no-pdb",
+            "human_edited": 0,
+            **columns,
+        }
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(ddl)
+            names = ", ".join(row)
+            conn.execute(
+                f"INSERT OR REPLACE INTO post_merge_records ({names}) VALUES ({', '.join('?' * len(row))})",
+                tuple(row.values()),
+            )
+
+    def test_pending_record_without_pr_opens_knowledge_pr_deterministically(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-010\nstatus: active\n---\n\n## Decision\n\nRequire ttl-hours.",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", return_value={"proposals": []}), \
+             mock.patch.object(
+                 forge,
+                 "open_memory_proposal_pr",
+                 return_value={
+                     "url": "https://github.com/acme/infra/pull/295",
+                     "number": 295,
+                     "revision": "deadbeef1234",
+                 },
+             ) as open_pr:
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        open_pr.assert_called_once()
+        kw = open_pr.call_args.kwargs
+        self.assertEqual(kw["repo"], "acme/infra")
+        self.assertEqual(kw["branch"], "platform-agent/memory/DEC-2026-010")
+        self.assertEqual(kw["rel_path"], "knowledge/decisions/DEC-2026-010-require-ttl-hours.md")
+        self.assertIn("status: active", kw["pr_markdown"])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("proposed", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+        self.assertIn("https://github.com/acme/infra/pull/295 (#295)", emit_cmd)
+        self.assertIn("--commit", emit_cmd)
+        self.assertIn("deadbeef1234", emit_cmd)
+
+    def test_merged_pr_emits_approved_to_curator(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pull_request": "https://github.com/acme/infra/pull/295 (#295)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 295,
+                         "state": "merged",
+                         "source": "platform-agent/memory/DEC-2026-010",
+                         "sourceRepo": "acme/infra",
+                         "url": "https://github.com/acme/infra/pull/295",
+                     }
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("approved", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+
+    def test_closed_unmerged_pr_emits_refused_with_reviewer_reason(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pull_request": "https://github.com/acme/infra/pull/295 (#295)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-closer":
+                return {"actor": "alice", "bot": False}
+            return {
+                "proposal": {
+                    "number": 295,
+                    "state": "closed",
+                    "source": "platform-agent/memory/DEC-2026-010",
+                    "sourceRepo": "acme/infra",
+                    "url": "https://github.com/acme/infra/pull/295",
+                },
+                "comments": [
+                    {"author": "alice", "body": "Stateful preview namespaces cannot use automatic TTL deletion."}
+                ],
+            }
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.return_value = True
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("refused", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+        self.assertIn("Stateful preview namespaces cannot use automatic TTL deletion.", emit_cmd)
+
+    def test_merged_pr_modified_by_reviewer_emits_modified_merged(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-011",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-011-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-011",
+                    "pull_request": "https://github.com/acme/infra/pull/296 (#296)",
+                    "guard_rule": "require annotation preview.example.com/ttl-hours in [1..48]",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 296,
+                         "state": "merged",
+                         "source": "platform-agent/memory/DEC-2026-011",
+                         "sourceRepo": "acme/infra",
+                         "url": "https://github.com/acme/infra/pull/296",
+                         "edited_guard_rule": "require annotation preview.example.com/ttl-hours in [1..168]",
+                         "commits": [
+                             {"author": "kage-bot"},
+                             {"author": "alice"},
+                         ],
+                     },
+                     "comments": [
+                         {"author": "alice", "body": "Extended maximum preview TTL to 168h for multi-day QA."}
+                     ],
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.return_value = True
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("modified-merged", emit_cmd)
+        self.assertIn("DEC-2026-011", emit_cmd)
+        self.assertIn("--initial-proposal", emit_cmd)
+        self.assertIn("require annotation preview.example.com/ttl-hours in [1..48]", emit_cmd)
+        self.assertIn("--rule", emit_cmd)
+        self.assertIn("require annotation preview.example.com/ttl-hours in [1..168]", emit_cmd)
+        self.assertIn("Extended maximum preview TTL to 168h for multi-day QA.", emit_cmd)
+
+    def test_merged_lesson_pr_holds_while_soaking_then_emits_resolved_merged_after_24h(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-012",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Bump memory limit to 1Gi on checkout-worker",
+                    "path": "knowledge/lessons/LES-2026-012-checkout-oom.md",
+                    "branch": "platform-agent/memory/LES-2026-012",
+                    "pull_request": "https://github.com/acme/infra/pull/297 (#297)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/297 (#297)",
+                    "finding_id": "checkout/Deployment/checkout-worker:OOMKilled",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        merged_view = {
+            "proposal": {
+                "number": 297,
+                "state": "merged",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/297",
+                "sync_status": "Synced",
+                "health_status": "Healthy",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=297,
+                finding_id="checkout/Deployment/checkout-worker:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", return_value=merged_view) as forge_call:
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                # At T+10m (12:10 UTC), the 24h soak is still in progress: no emit call and no forge call.
+                t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
+                result_early = gate.sweep_memory_proposals(now=t_10m)
+                self.assertEqual(result_early.cards, [])
+                self.assertEqual(len(calls), 1)  # only `curator pending`
+                forge_call.assert_not_called()
+
+                # At T+25h (next day 13:00 UTC), the 24h soak window is complete: emits resolved-merged.
+                calls.clear()
+                t_25h = datetime(2026, 11, 2, 13, 0, 0, tzinfo=timezone.utc)
+                result_ready = gate.sweep_memory_proposals(now=t_25h)
+                self.assertEqual(result_ready.cards, [])
+                self.assertEqual(len(calls), 2)
+                forge_call.assert_not_called()
+                emit_cmd = calls[1]
+                self.assertIn("resolved-merged", emit_cmd)
+                self.assertIn("LES-2026-012", emit_cmd)
+                self.assertIn("--soak-window", emit_cmd)
+                self.assertIn("24h", emit_cmd)
+
+    def test_merged_lesson_pr_emits_pr_merged_persists_when_still_broken_in_post_merge_records(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-013",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Bump memory limit to 512Mi on payment-worker",
+                    "path": "knowledge/lessons/LES-2026-013-payment-oom.md",
+                    "branch": "platform-agent/memory/LES-2026-013",
+                    "pull_request": "https://github.com/acme/infra/pull/298 (#298)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/298 (#298)",
+                    "finding_id": "payments/Deployment/payment-worker:OOMKilled",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=298,
+                finding_id="payments/Deployment/payment-worker:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="still_broken",
+                outcome_detail="OOMKilled (exit 137) under peak traffic",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call") as forge_call:
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
+                result = gate.sweep_memory_proposals(now=t_10m)
+                forge_call.assert_not_called()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("pr-merged-persists", emit_cmd)
+        self.assertIn("LES-2026-013", emit_cmd)
+        self.assertIn("--finding-id", emit_cmd)
+        self.assertIn("payments/Deployment/payment-worker:OOMKilled", emit_cmd)
+        self.assertIn("OOMKilled (exit 137) under peak traffic", " ".join(emit_cmd))
+
+    def test_gitops_prs_disabled_skips_filing_pr_card_for_pending_record(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-014",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Keep shared rules in Hindsight only",
+                    "path": "knowledge/decisions/DEC-2026-014-hindsight-only.md",
+                    "branch": "platform-agent/memory/DEC-2026-014",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-014\nstatus: active\n---\n\n## Decision\n\nHindsight only.",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict(
+            "os.environ",
+            {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "false"},
+        ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call") as forge_call_mock:
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        forge_call_mock.assert_not_called()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "pending")
+
+    def test_closed_pr_ignores_non_write_comment_and_retires_instead_of_refusing(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-020",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-020-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-020",
+                    "pull_request": "https://github.com/acme/infra/pull/300 (#300)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-closer":
+                return {"actor": "alice", "bot": False}
+            return {
+                "proposal": {
+                    "number": 300,
+                    "state": "closed",
+                    "source": "platform-agent/memory/DEC-2026-020",
+                    "sourceRepo": "acme/infra",
+                    "url": "https://github.com/acme/infra/pull/300",
+                },
+                "comments": [
+                    {"author": "driveby-user", "body": "Never use TTLs anywhere!"}
+                ],
+            }
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.return_value = False
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("retired", emit_cmd)
+        self.assertNotIn("refused", emit_cmd)
+        self.assertNotIn("Never use TTLs anywhere!", emit_cmd)
+
+    def test_closed_pr_with_situational_freeze_comment_retires_instead_of_refusing(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-021",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-021-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-021",
+                    "pull_request": "https://github.com/acme/infra/pull/301 (#301)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-closer":
+                return {"actor": "alice", "bot": False}
+            return {
+                "proposal": {
+                    "number": 301,
+                    "state": "closed",
+                    "source": "platform-agent/memory/DEC-2026-021",
+                    "sourceRepo": "acme/infra",
+                    "url": "https://github.com/acme/infra/pull/301",
+                },
+                "comments": [
+                    {"author": "alice", "body": "Closing stale PR during holiday freeze; reopen next week."}
+                ],
+            }
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.return_value = True
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("retired", emit_cmd)
+        self.assertNotIn("refused", emit_cmd)
+
+    def test_merged_knowledge_pr_after_lesson_soak_emits_approved(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-012",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "outcome": "resolved-merged",
+                    "title": "Bump memory limit to 1Gi on checkout-worker",
+                    "path": "knowledge/lessons/LES-2026-012-checkout-oom.md",
+                    "branch": "platform-agent/memory/LES-2026-012",
+                    "pull_request": "https://github.com/acme/infra/pull/305 (#305)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/297 (#297)",
+                    "finding_id": "checkout/Deployment/checkout-worker:OOMKilled",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 305,
+                         "state": "merged",
+                         "source": "platform-agent/memory/LES-2026-012",
+                         "sourceRepo": "acme/infra",
+                         "url": "https://github.com/acme/infra/pull/305",
+                     }
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("approved", emit_cmd)
+        self.assertIn("LES-2026-012", emit_cmd)
+        self.assertIn("--knowledge-pr", emit_cmd)
+
+    def test_merged_lesson_pr_respects_7d_revert_window_in_post_merge_records(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-030",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Bump memory limit to 2Gi on api-worker",
+                    "path": "knowledge/lessons/LES-2026-030-api-oom.md",
+                    "branch": "platform-agent/memory/LES-2026-030",
+                    "pull_request": "https://github.com/acme/infra/pull/310 (#310)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/310 (#310)",
+                    "finding_id": "api/Deployment/api-worker:OOMKilled",
+                    "soak_window": "7d",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=310,
+                finding_id="api/Deployment/api-worker:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls:
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                # At T+2d, 7d soak is still in progress.
+                t_2d = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+                self.assertEqual(gate.sweep_memory_proposals(now=t_2d).cards, [])
+                self.assertEqual(len(calls), 1)
+                calls.clear()
+                # At T+8d, 7d soak is complete -> emits resolved-merged.
+                t_8d = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+                gate.sweep_memory_proposals(now=t_8d)
+                self.assertEqual(len(calls), 2)
+                self.assertIn("resolved-merged", calls[1])
+                self.assertIn("7d", calls[1])
+
+    def test_memory_proposal_target_validation_rejects_traversal_and_bad_ids(self):
+        self.assertTrue(
+            forge.validate_memory_proposal_target(
+                "DEC-2026-010",
+                "platform-agent/memory/DEC-2026-010",
+                "knowledge/decisions/DEC-2026-010-ha-replicas.md",
+                "---\nid: DEC-2026-010\nstatus: active\n---\n",
+            )
+        )
+        self.assertTrue(
+            forge.validate_memory_proposal_target(
+                "LES-2026-001",
+                "platform-agent/memory/LES-2026-001",
+                "knowledge/lesson/LES-2026-001.md",
+                "---\nid: LES-2026-001\nstatus: active\n---\n",
+            )
+        )
+        for bad_id, bad_branch, bad_path, bad_md in (
+            ("DEC-20260401-01", "platform-agent/memory/DEC-20260401-01", "knowledge/decisions/DEC-20260401-01.md", "ok"),
+            ("DEC-2026-010", "platform-agent/other/DEC-2026-010", "knowledge/decisions/DEC-2026-010.md", "ok"),
+            ("DEC-2026-010", "platform-agent/memory/DEC-2026-010", "../evil.md", "ok"),
+            ("DEC-2026-010", "platform-agent/memory/DEC-2026-010", "clusters/prod/DEC-2026-010.md", "ok"),
+            ("DEC-2026-010", "platform-agent/memory/DEC-2026-010", "knowledge/decisions/DEC-2026-010/sub.md", "ok"),
+            ("DEC-2026-010", "platform-agent/memory/DEC-2026-010", "knowledge/decisions/DEC-2026-010.md", "   "),
+        ):
+            self.assertFalse(
+                forge.validate_memory_proposal_target(bad_id, bad_branch, bad_path, bad_md),
+                (bad_id, bad_branch, bad_path),
+            )
+
+    def test_real_forge_commits_and_diff_detect_human_modification(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-031",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation",
+                    "guard_rule": "require ttl-hours in [1..48]",
+                    "pull_request": "https://github.com/acme/infra/pull/311 (#311)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-view" and payload.get("diff"):
+                return {"diff": "--- a/knowledge/decisions/DEC-2026-031.md\n+++ b/knowledge/decisions/DEC-2026-031.md\n+  rule: require ttl-hours in [1..168]\n"}
+            if verb == "proposal-view":
+                return {
+                    "proposal": {
+                        "number": 311,
+                        "state": "merged",
+                        "source": "platform-agent/memory/DEC-2026-031",
+                        "sourceRepo": "acme/infra",
+                        "url": "https://github.com/acme/infra/pull/311",
+                    },
+                    "comments": [],
+                }
+            if verb == "proposal-commits":
+                return {"commits": [{"sha": "aaa", "author": "kage-bot"}, {"sha": "bbb", "author": "alice"}]}
+            return {}
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            gate.sweep_memory_proposals()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("modified-merged", calls[1])
+        self.assertIn("require ttl-hours in [1..168]", calls[1])
+
+    def test_closed_pr_holds_when_write_access_indeterminate_or_comments_truncated(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-032",
+                    "type": "decision",
+                    "status": "proposed",
+                    "pull_request": "https://github.com/acme/infra/pull/312 (#312)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        for view_payload, write_ans in (
+            (
+                {
+                    "proposal": {
+                        "number": 312,
+                        "state": "closed",
+                        "source": "platform-agent/memory/DEC-2026-032",
+                        "sourceRepo": "acme/infra",
+                        "url": "https://github.com/acme/infra/pull/312",
+                    },
+                    "comments": [{"author": "alice", "body": "Rejecting this policy permanently."}],
+                },
+                None,
+            ),
+            (
+                {
+                    "proposal": {
+                        "number": 312,
+                        "state": "closed",
+                        "source": "platform-agent/memory/DEC-2026-032",
+                        "sourceRepo": "acme/infra",
+                        "url": "https://github.com/acme/infra/pull/312",
+                    },
+                    "commentsTruncated": True,
+                    "comments": [],
+                },
+                True,
+            ),
+        ):
+            calls.clear()
+
+            def fake_call(verb, payload, repo, **kw):
+                if verb == "proposal-closer":
+                    return {"actor": "alice", "bot": False}
+                return view_payload
+
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_call):
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                bp_cls.return_value._has_write.return_value = write_ans
+                gate.sweep_memory_proposals()
+            self.assertEqual(len(calls), 1, "indeterminate/truncated close must hold, never retire")
+
+    def test_post_merge_records_reverted_and_human_edited_outcomes(self):
+        rec = {"id": "LES-2026-033", "type": "lesson", "finding_id": "payments/Deployment/pay-api:OOMKilled"}
+        state_no_row, _ = gate._evaluate_remediation_from_post_merge_record(rec, None)
+        self.assertEqual(state_no_row, "soaking")
+
+        state_reverted, why_rev = gate._evaluate_remediation_from_post_merge_record(
+            rec,
+            {
+                "outcome": "verified_fixed",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "reverted_at": "2026-11-02T12:00:00Z",
+                "human_edited": 0,
+            },
+            now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(state_reverted, "persists")
+        self.assertIn("reverted", why_rev)
+
+        state_edited, _ = gate._evaluate_remediation_from_post_merge_record(
+            rec,
+            {
+                "outcome": "verified_fixed",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "reverted_at": None,
+                "human_edited": 1,
+            },
+            now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(state_edited, "modified")
+
+    def test_emit_timeout_does_not_abort_sweep_and_multi_repo_routes_per_record(self):
+        pending_json = json.dumps({
+            "repo": "acme/hub-gitops",
+            "records": [
+                {
+                    "id": "DEC-2026-040",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "New pending card",
+                    "pr_markdown": "---\nid: DEC-2026-040\n---",
+                },
+                {
+                    "id": "DEC-2026-041",
+                    "type": "decision",
+                    "status": "proposed",
+                    "pull_request": "https://github.com/acme/app-gitops/pull/42 (#42)",
+                },
+            ],
+        })
+        queried_repos = []
+
+        def fake_run(cmd, **kw):
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=35)
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            queried_repos.append((verb, repo))
+            if verb == "proposal-list":
+                return {"proposals": []}
+            return {
+                "proposal": {
+                    "number": 42,
+                    "state": "merged",
+                    "source": "platform-agent/memory/DEC-2026-041",
+                    "sourceRepo": "acme/app-gitops",
+                    "url": "https://github.com/acme/app-gitops/pull/42",
+                }
+            }
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/hub-gitops", "acme/app-gitops"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch.object(
+                 forge,
+                 "open_memory_proposal_pr",
+                 return_value={"url": "https://github.com/acme/hub-gitops/pull/40", "number": 40, "revision": "abc"},
+             ) as open_pr:
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        open_pr.assert_called_once()
+        self.assertIn(("proposal-view", "acme/app-gitops"), queried_repos)
+
+    def test_detect_human_modification_treats_install_commit_email_as_ours(self):
+        pending_base = {
+            "id": "DEC-2026-050",
+            "type": "decision",
+            "status": "proposed",
+            "title": "Enforce PDB on web deployments",
+            "guard_rule": "PDB minAvailable must be >= 1.",
+            "pull_request": "https://github.com/acme/infra/pull/350 (#350)",
+        }
+
+        def run_case(commits_payload):
+            pending_json = json.dumps({"repo": "acme/infra", "records": [pending_base]})
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+            def fake_forge_call(verb, payload, repo, **kw):
+                if verb == "proposal-view" and not payload.get("diff"):
+                    return {
+                        "proposal": {
+                            "number": 350,
+                            "state": "merged",
+                            "source": "platform-agent/memory/DEC-2026-050",
+                            "sourceRepo": "acme/infra",
+                            "url": "https://github.com/acme/infra/pull/350",
+                        },
+                        "comments": [],
+                    }
+                if verb == "proposal-commits":
+                    return {"commits": commits_payload}
+                return {"diff": ""}
+
+            rec = dict(pending_base)
+            prop = {"number": 350, "state": "merged"}
+            view_ans = {"proposal": prop, "comments": []}
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                mod = gate._detect_human_modification(
+                    rec, prop, view_ans, "kube-agents", provider=bp_cls.return_value, repo="acme/infra", pr_num=350
+                )
+                gate.sweep_memory_proposals()
+            return mod, calls
+
+        agent_only_mod, agent_calls = run_case(
+            [{"author": "platform-agent", "email": "platform-agent@kube-agents.invalid", "bot": False}]
+        )
+        self.assertIsNone(agent_only_mod)
+        self.assertEqual(len(agent_calls), 2)
+        self.assertIn("approved", agent_calls[1])
+        self.assertNotIn("modified-merged", agent_calls[1])
+
+        human_mod, human_calls = run_case(
+            [
+                {"author": "platform-agent", "email": "platform-agent@kube-agents.invalid", "bot": False},
+                {"author": "alice", "email": "alice@example.com", "bot": False},
+            ]
+        )
+        self.assertIsNotNone(human_mod)
+        self.assertEqual(len(human_calls), 2)
+        self.assertIn("modified-merged", human_calls[1])
+
+    def test_stale_post_merge_row_with_same_finding_id_does_not_poison_new_pr(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-051",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Add PDB for checkout",
+                    "path": "knowledge/lessons/LES-2026-051.md",
+                    "branch": "platform-agent/memory/LES-2026-051",
+                    "pull_request": "https://github.com/acme/infra/pull/205 (#205)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/205 (#205)",
+                    "finding_id": "no-pdb.prod.shop.Deployment/checkout",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-view":
+                return {
+                    "proposal": {
+                        "number": 205,
+                        "state": "open",
+                        "url": "https://github.com/acme/infra/pull/205",
+                    }
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=200,
+                finding_id="no-pdb.prod.shop.Deployment/checkout",
+                merged_at="2026-11-01T12:00:00Z",
+                reverted_at="2026-11-02T12:00:00Z",
+                outcome="still_broken",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_path)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                self.assertIsNone(gate._read_post_merge_record("acme/infra", 205))
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(calls), 1)  # only `curator pending`, open PR #205 untouched
+
+    def test_remediation_pr_fallback_soak_without_post_merge_record_or_applied_not_rechecked(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-052",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Raise memory limit on worker",
+                    "path": "knowledge/lessons/LES-2026-052.md",
+                    "branch": "platform-agent/memory/LES-2026-052",
+                    "pull_request": "https://github.com/acme/infra/pull/410 (#410)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/410 (#410)",
+                    "finding_id": "oom.prod.shop.Deployment/worker",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call_clean(verb, payload, repo, **kw):
+            if verb == "proposal-view" and not payload.get("diff"):
+                return {
+                    "proposal": {
+                        "number": 410,
+                        "state": "merged",
+                        "mergedAt": "2026-11-01T12:00:00Z",
+                        "url": "https://github.com/acme/infra/pull/410",
+                    },
+                    "comments": [],
+                }
+            if verb == "proposal-commits":
+                return {
+                    "commits": [
+                        {
+                            "author": "platform-agent",
+                            "email": "platform-agent@kube-agents.invalid",
+                            "bot": False,
+                        }
+                    ]
+                }
+            return {"diff": ""}
+
+        with tempfile.TemporaryDirectory() as td:
+            missing_db = Path(td) / "missing.db"
+            # (i) No post_merge_records row (non-no-pdb lesson): soaks before 24h, resolves after 24h.
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(missing_db)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_clean):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 1, 18, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 1)
+                calls.clear()
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("resolved-merged", calls[1])
+                self.assertIn("--soak-window", calls[1])
+                self.assertIn("--finding-id", calls[1])
+
+            # (i-b) Human-edited fallback soak emits modified-merged after soak elapses.
+            calls.clear()
+
+            def fake_forge_call_human(verb, payload, repo, **kw):
+                if verb == "proposal-commits":
+                    return {"commits": [{"author": "alice", "email": "alice@example.com", "bot": False}]}
+                return fake_forge_call_clean(verb, payload, repo, **kw)
+
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(missing_db)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_human):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("modified-merged", calls[1])
+
+            # (ii) pm_row with KUBEAGENTS_POST_MERGE_CHECK=silent and outcome="" waits in soaking.
+            calls.clear()
+            db_pending = Path(td) / "pending.db"
+            self._seed_post_merge_db(
+                db_pending,
+                number=410,
+                finding_id="oom.prod.shop.Deployment/worker",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="",
+                human_edited=0,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "NATS_URL": "nats://localhost:4222",
+                    "SESSION_KV_DB_PATH": str(db_pending),
+                    "KUBEAGENTS_POST_MERGE_CHECK": "silent",
+                },
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_clean):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 1)
+
+            # (iii) pm_row with outcome="applied_not_rechecked" resolves after soak window.
+            calls.clear()
+            db_recheck = Path(td) / "recheck.db"
+            self._seed_post_merge_db(
+                db_recheck,
+                number=410,
+                finding_id="oom.prod.shop.Deployment/worker",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="applied_not_rechecked",
+                human_edited=None,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_recheck)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_clean):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertEqual(len(calls), 2)
+                self.assertIn("resolved-merged", calls[1])
+
+            # (iv) pm_row with outcome="verified_fixed" and human_edited=None runs proposal-view rather than fast-pathing.
+            calls.clear()
+            db_null_edited = Path(td) / "null_edited.db"
+            self._seed_post_merge_db(
+                db_null_edited,
+                number=410,
+                finding_id="oom.prod.shop.Deployment/worker",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=None,
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(db_null_edited)},
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call_human) as forge_call:
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+                self.assertGreaterEqual(forge_call.call_count, 1)
+                self.assertEqual(len(calls), 2)
+                self.assertIn("modified-merged", calls[1])
+
+    def test_unrecognized_post_merge_switch_normalizes_to_off_and_falls_back_to_forge_soak(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-053",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Add PDB for checkout",
+                    "path": "knowledge/lessons/LES-2026-053.md",
+                    "branch": "platform-agent/memory/LES-2026-053",
+                    "pull_request": "https://github.com/acme/infra/pull/411 (#411)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/411 (#411)",
+                    "finding_id": "no-pdb.prod.shop.Deployment/checkout",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-view" and not payload.get("diff"):
+                return {
+                    "proposal": {
+                        "number": 411,
+                        "state": "merged",
+                        "mergedAt": "2026-11-01T12:00:00Z",
+                        "url": "https://github.com/acme/infra/pull/411",
+                    },
+                    "comments": [],
+                }
+            if verb == "proposal-commits":
+                return {
+                    "commits": [
+                        {
+                            "author": "Platform Agent",
+                            "email": "platform-agent@users.noreply.github.com",
+                            "bot": False,
+                        }
+                    ]
+                }
+            return {"diff": ""}
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "pending_on.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=411,
+                finding_id="no-pdb.prod.shop.Deployment/checkout",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="",
+                human_edited=0,
+            )
+            missing = Path(td) / "absent"
+            import kubeagents_switches
+            with mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", missing), \
+                 mock.patch.object(kubeagents_switches, "SWITCH_DIR", missing), \
+                 mock.patch.dict(
+                     "os.environ",
+                     {
+                         "NATS_URL": "nats://localhost:4222",
+                         "SESSION_KV_DB_PATH": str(db_path),
+                         "KUBEAGENTS_POST_MERGE_CHECK": "on",
+                     },
+                 ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call):
+                bp_cls.return_value.viewer_login.return_value = "kube-agents"
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("resolved-merged", calls[1])
+
+    def test_detect_human_modification_ignores_workspace_noreply_emails_for_github_and_self_managed(self):
+        for repo_name, noreply_email in (
+            ("acme/infra", "platform-agent@users.noreply.github.com"),
+            ("ghe.example.com/acme/infra", "platform-agent@users.noreply.ghe.example.com"),
+        ):
+            with self.subTest(repo=repo_name, email=noreply_email):
+                rec = {
+                    "id": "DEC-2026-054",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Enforce PDB",
+                    "guard_rule": "PDB minAvailable >= 1.",
+                    "pull_request": f"https://forge.example/acme/infra/pull/412 (#412)",
+                }
+                prop = {"number": 412, "state": "merged"}
+                view_ans = {
+                    "proposal": prop,
+                    "comments": [],
+                    "commits": [
+                        {
+                            "author": "Platform Agent",
+                            "email": noreply_email,
+                            "bot": False,
+                        }
+                    ],
+                }
+                mod = gate._detect_human_modification(
+                    rec,
+                    prop,
+                    view_ans,
+                    "kube-agents",
+                    provider=mock.Mock(),
+                    repo=repo_name,
+                    pr_num=412,
+                )
+                self.assertIsNone(mod)
+
+    def test_already_soaked_remediation_with_gitops_prs_disabled_skips_before_proposal_view(self):
+        for outcome in ("resolved-merged", "pr-merged-persists", "modified-merged"):
+            with self.subTest(outcome=outcome):
+                pending_json = json.dumps({
+                    "repo": "acme/infra",
+                    "records": [
+                        {
+                            "id": "LES-2026-060",
+                            "type": "lesson",
+                            "status": "proposed",
+                            "outcome": outcome,
+                            "title": "Raise checkout memory limit",
+                            "path": "knowledge/lessons/LES-2026-060.md",
+                            "branch": "platform-agent/memory/LES-2026-060",
+                            "pull_request": "https://github.com/acme/infra/pull/297 (#297)",
+                            "remediation_pr": "https://github.com/acme/infra/pull/297 (#297)",
+                            "finding_id": "checkout/Deployment/checkout:OOMKilled",
+                        }
+                    ],
+                })
+                calls = []
+
+                def fake_run(cmd, **kw):
+                    calls.append(cmd)
+                    return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+                with mock.patch.dict(
+                    "os.environ",
+                    {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "false"},
+                ), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("subprocess.run", side_effect=fake_run), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                     mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                     mock.patch.object(forge, "call") as forge_call_mock:
+                    bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                    res = gate.sweep_memory_proposals()
+
+                self.assertEqual(res.cards, [])
+                forge_call_mock.assert_not_called()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][1], "pending")
+
+    def test_human_modified_remediation_pr_without_finding_id_passes_remediation_pr_and_soak_window(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-061",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Fix OOM on worker",
+                    "path": "knowledge/lessons/LES-2026-061.md",
+                    "branch": "platform-agent/memory/LES-2026-061",
+                    "pull_request": "https://github.com/acme/infra/pull/450 (#450)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/450 (#450)",
+                    "soak_window": "7d",
+                    "guard_rule": "memory >= 512Mi",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "proposal-view" and payload.get("diff"):
+                return {
+                    "diff": "--- a/clusters/prod/worker.yaml\n+++ b/clusters/prod/worker.yaml\n+  rule: memory >= 1Gi\n"
+                }
+            if verb == "proposal-view":
+                return {
+                    "proposal": {
+                        "number": 450,
+                        "state": "merged",
+                        "source": "platform-agent/fix-worker-oom",
+                        "sourceRepo": "acme/infra",
+                        "mergedAt": "2026-11-01T12:00:00Z",
+                        "url": "https://github.com/acme/infra/pull/450",
+                    },
+                    "comments": [],
+                }
+            if verb == "proposal-commits":
+                return {"commits": [{"author": "alice", "email": "alice@example.com", "bot": False}]}
+            return {}
+
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            "os.environ",
+            {"NATS_URL": "nats://localhost:4222", "SESSION_KV_DB_PATH": str(Path(td) / "missing.db")},
+        ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            gate.sweep_memory_proposals(now=datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("modified-merged", emit_cmd)
+        self.assertNotIn("--knowledge-pr", emit_cmd)
+        self.assertIn("--remediation-pr", emit_cmd)
+        self.assertEqual(emit_cmd[emit_cmd.index("--remediation-pr") + 1], "https://github.com/acme/infra/pull/450 (#450)")
+        self.assertIn("--soak-window", emit_cmd)
+        self.assertEqual(emit_cmd[emit_cmd.index("--soak-window") + 1], "7d")
+        self.assertNotIn("--finding-id", emit_cmd)
+
+    def test_extract_rule_handles_yaml_block_scalars_and_detects_human_modification(self):
+        folded_md = (
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-062\n"
+            "guard:\n"
+            "  rule: >-\n"
+            "    Never drop checkout memory\n"
+            "    below 1Gi in production.\n"
+            "  severity: block\n"
+            "---\n"
+        )
+        literal_md = (
+            "---\n"
+            "type: decision\n"
+            "id: DEC-2026-063\n"
+            "guard:\n"
+            "  rule: | # preserve line breaks\n"
+            "    Line one.\n"
+            "    Line two.\n"
+            "---\n"
+        )
+        self.assertEqual(
+            gate._extract_rule_from_markdown(folded_md),
+            "Never drop checkout memory below 1Gi in production.",
+        )
+        self.assertEqual(
+            gate._extract_rule_from_markdown(literal_md),
+            "Line one.\nLine two.",
+        )
+        self.assertEqual(gate._extract_rule_from_markdown("---\nguard:\n  rule: >-\n---\n"), "")
+
+        folded_diff = (
+            "--- a/knowledge/decisions/DEC-2026-062.md\n"
+            "+++ b/knowledge/decisions/DEC-2026-062.md\n"
+            "+  rule: >-\n"
+            "+    Never drop checkout memory\n"
+            "+    below 2Gi in production.\n"
+            "+  severity: block\n"
+        )
+        literal_diff = (
+            "--- a/knowledge/decisions/DEC-2026-063.md\n"
+            "+++ b/knowledge/decisions/DEC-2026-063.md\n"
+            "+  rule: |\n"
+            "+    Line one.\n"
+            "+    Line three.\n"
+        )
+        self.assertEqual(
+            gate._extract_rule_from_diff(folded_diff),
+            "Never drop checkout memory below 2Gi in production.",
+        )
+        self.assertEqual(
+            gate._extract_rule_from_diff(literal_diff),
+            "Line one.\nLine three.",
+        )
+        self.assertEqual(gate._extract_rule_from_diff("+  rule: >-\n+  severity: block\n"), "")
+
+        mod = gate._detect_human_modification(
+            {"id": "DEC-2026-062", "pr_markdown": folded_md},
+            {"number": 62, "state": "merged", "initial_sha": "aaa", "head_sha": "bbb"},
+            {"proposal": {}, "diff": folded_diff, "comments": []},
+            "kage-bot",
+            provider=mock.Mock(),
+            repo="acme/infra",
+            pr_num=62,
+        )
+        self.assertIsNotNone(mod)
+        self.assertEqual(mod["initial_proposal"], "Never drop checkout memory below 1Gi in production.")
+        self.assertEqual(mod["rule"], "Never drop checkout memory below 2Gi in production.")
+
+    def test_authority_checks_reject_rogue_branch_fork_and_self_or_bot_closes(self):
+        # 1. Sandbox opens PR from rogue branch or fork and closes/merges it -> ignored.
+        for bad_proposal in (
+            {
+                "number": 701,
+                "state": "closed",
+                "source": "platform-agent/rogue-branch",
+                "sourceRepo": "acme/infra",
+                "url": "https://github.com/acme/infra/pull/701",
+            },
+            {
+                "number": 702,
+                "state": "merged",
+                "source": "platform-agent/memory/DEC-2026-007",
+                "sourceRepo": "stranger/infra",
+                "url": "https://github.com/acme/infra/pull/702",
+            },
+            {
+                "number": 703,
+                "state": "closed",
+                "source": "platform-agent/memory/DEC-2026-007",
+                "sourceRepo": "",
+                "url": "https://github.com/acme/infra/pull/703",
+            },
+        ):
+            with self.subTest(bad_proposal=bad_proposal["number"]):
+                pending_json = json.dumps({
+                    "repo": "acme/infra",
+                    "records": [
+                        {
+                            "id": "DEC-2026-007",
+                            "type": "decision",
+                            "status": "proposed",
+                            "branch": "platform-agent/memory/DEC-2026-007",
+                            "pull_request": f"{bad_proposal['url']} (#{bad_proposal['number']})",
+                        }
+                    ],
+                })
+                calls = []
+                with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                     mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                     mock.patch.object(forge, "call", return_value={"proposal": bad_proposal, "comments": [{"author": "alice", "body": "Reject."}]}):
+                    bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                    bp_cls.return_value._has_write.return_value = True
+                    gate.sweep_memory_proposals()
+                self.assertEqual(len(calls), 1)
+
+        # 2. Sandbox closes its own knowledge PR (self/bot/empty/error) -> ignored.
+        for closer_resp in (
+            {"actor": "kage-bot[bot]", "bot": False},
+            {"actor": "other-bot", "bot": True},
+            {"actor": "", "bot": False},
+            RuntimeError("closer lookup failed"),
+        ):
+            with self.subTest(closer_resp=repr(closer_resp)):
+                pending_json = json.dumps({
+                    "repo": "acme/infra",
+                    "records": [
+                        {
+                            "id": "DEC-2026-007",
+                            "type": "decision",
+                            "status": "proposed",
+                            "branch": "platform-agent/memory/DEC-2026-007",
+                            "pull_request": "https://github.com/acme/infra/pull/704 (#704)",
+                        }
+                    ],
+                })
+                calls = []
+
+                def fake_call(verb, payload, repo, **kw):
+                    if verb == "proposal-closer":
+                        if isinstance(closer_resp, Exception):
+                            raise closer_resp
+                        return closer_resp
+                    return {
+                        "proposal": {
+                            "number": 704,
+                            "state": "closed",
+                            "source": "platform-agent/memory/DEC-2026-007",
+                            "sourceRepo": "acme/infra",
+                            "url": "https://github.com/acme/infra/pull/704",
+                        },
+                        "comments": [{"author": "alice", "body": "Do not add this policy."}],
+                    }
+
+                with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"}), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                     mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                     mock.patch.object(forge, "call", side_effect=fake_call):
+                    bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                    bp_cls.return_value._has_write.return_value = True
+                    gate.sweep_memory_proposals()
+                self.assertEqual(len(calls), 1)
+
+    def test_fallback_soak_enforces_24h_floor_even_when_soak_window_is_10m(self):
+        rec = {"id": "LES-2026-064", "type": "lesson", "soak_window": "10m"}
+        t_merge = "2026-11-01T12:00:00Z"
+        state_early, _ = gate._evaluate_remediation_from_post_merge_record(
+            rec,
+            None,
+            prop_merged_at=t_merge,
+            now=datetime(2026, 11, 1, 12, 20, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(state_early, "soaking")
+        state_ready, reason_ready = gate._evaluate_remediation_from_post_merge_record(
+            rec,
+            None,
+            prop_merged_at=t_merge,
+            now=datetime(2026, 11, 2, 13, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(state_ready, "resolved")
+        self.assertIn("24h", reason_ready)
+
+    def test_gitops_prs_unset_default_skips_knowledge_pr_creation_but_runs_remediation_soak(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-070",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Unset env must not open GitOps PR",
+                    "path": "knowledge/decisions/DEC-2026-070.md",
+                    "branch": "platform-agent/memory/DEC-2026-070",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-070\nstatus: active\n---\n\nKeep proposed.",
+                },
+                {
+                    "id": "LES-2026-070",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Raise checkout memory limit",
+                    "path": "knowledge/lessons/LES-2026-070.md",
+                    "branch": "platform-agent/memory/LES-2026-070",
+                    "pull_request": "https://github.com/acme/infra/pull/470 (#470)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/470 (#470)",
+                    "finding_id": "checkout/Deployment/checkout:OOMKilled",
+                    "soak_window": "24h",
+                },
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _completed(pending_json if cmd[1] == "pending" else "{}")
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "session_kv.db"
+            self._seed_post_merge_db(
+                db_path,
+                number=470,
+                finding_id="checkout/Deployment/checkout:OOMKilled",
+                merged_at="2026-11-01T12:00:00Z",
+                outcome="verified_fixed",
+                human_edited=0,
+            )
+            env_copy = dict(os.environ)
+            env_copy.pop("DECISION_MEMORY_GITOPS_PRS", None)
+            env_copy["NATS_URL"] = "nats://localhost:4222"
+            env_copy["SESSION_KV_DB_PATH"] = str(db_path)
+            with mock.patch.dict("os.environ", env_copy, clear=True), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call") as forge_call, \
+                 mock.patch.object(forge, "open_memory_proposal_pr") as open_pr:
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                self.assertFalse(gate._gitops_prs_enabled())
+                gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+
+        forge_call.assert_not_called()
+        open_pr.assert_not_called()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("resolved-merged", calls[1])
+        self.assertIn("LES-2026-070", calls[1])
+
+    def test_remediation_soak_rejects_non_remediation_or_junk_pr(self):
+        for rem_pr in ("", "https://github.com/acme/infra/pull/297 (#297)"):
+            for pr_state in ("merged", "closed"):
+                with self.subTest(remediation_pr=rem_pr, state=pr_state):
+                    pending_json = json.dumps({
+                        "repo": "acme/infra",
+                        "records": [
+                            {
+                                "id": "LES-2026-071",
+                                "type": "lesson",
+                                "status": "proposed",
+                                "title": "Bump memory limit",
+                                "path": "knowledge/lessons/LES-2026-071.md",
+                                "branch": "platform-agent/memory/LES-2026-071",
+                                "pull_request": "https://github.com/acme/infra/pull/999 (#999)",
+                                "remediation_pr": rem_pr,
+                                "finding_id": "checkout/Deployment/checkout:OOMKilled",
+                                "soak_window": "24h",
+                            }
+                        ],
+                    })
+                    calls = []
+
+                    def fake_call(verb, payload, repo, **kw):
+                        if verb == "proposal-closer":
+                            return {"actor": "alice", "bot": False}
+                        return {
+                            "proposal": {
+                                "number": 999,
+                                "state": pr_state,
+                                "source": "junk-branch",
+                                "sourceRepo": "acme/infra",
+                                "mergedAt": "2026-11-01T12:00:00Z",
+                                "url": "https://github.com/acme/infra/pull/999",
+                            },
+                            "comments": [{"author": "alice", "body": "Rejecting junk PR."}],
+                        }
+
+                    with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                         mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                         mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+                         mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                         mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                         mock.patch.object(forge, "call", side_effect=fake_call):
+                        bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                        bp_cls.return_value._has_write.return_value = True
+                        gate.sweep_memory_proposals(now=datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc))
+
+                    self.assertEqual(len(calls), 1)
+
+    def test_closed_pr_holds_fail_closed_when_viewer_login_unknown(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-072",
+                    "type": "decision",
+                    "status": "proposed",
+                    "branch": "platform-agent/memory/DEC-2026-072",
+                    "pull_request": "https://github.com/acme/infra/pull/720 (#720)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_call(verb, payload, repo, **kw):
+            if verb == "proposal-closer":
+                return {"actor": "kage-bot", "bot": False}
+            return {
+                "proposal": {
+                    "number": 720,
+                    "state": "closed",
+                    "source": "platform-agent/memory/DEC-2026-072",
+                    "sourceRepo": "acme/infra",
+                    "url": "https://github.com/acme/infra/pull/720",
+                },
+                "comments": [{"author": "alice", "body": "Rejecting this policy."}],
+            }
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_call):
+            bp_cls.return_value.viewer_login.side_effect = RuntimeError("viewer lookup failed")
+            bp_cls.return_value._has_write.return_value = True
+            gate.sweep_memory_proposals()
+
+        self.assertEqual(len(calls), 1)
+
+    def test_proposal_list_filters_unmatched_branch_and_fork_before_opening_pr(self):
+        for bad_num, bad_source, bad_source_repo in (
+            (998, "other-branch", "acme/infra"),
+            (999, "platform-agent/memory/DEC-2026-010", "mallory/infra"),
+        ):
+            with self.subTest(bad_num=bad_num, source=bad_source, sourceRepo=bad_source_repo):
+                pending_json = json.dumps({
+                    "repo": "acme/infra",
+                    "records": [
+                        {
+                            "id": "DEC-2026-010",
+                            "type": "decision",
+                            "status": "proposed",
+                            "title": "Require ttl-hours annotation",
+                            "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                            "branch": "platform-agent/memory/DEC-2026-010",
+                            "pr_markdown": "---\ntype: decision\nid: DEC-2026-010\nstatus: active\n---\n\nRequire ttl-hours.",
+                        }
+                    ],
+                })
+                calls = []
+
+                def fake_call(verb, payload, repo, **kw):
+                    if verb == "proposal-list":
+                        return {
+                            "proposals": [
+                                {
+                                    "number": bad_num,
+                                    "state": "open",
+                                    "source": bad_source,
+                                    "sourceRepo": bad_source_repo,
+                                    "url": f"https://github.com/acme/infra/pull/{bad_num}",
+                                }
+                            ]
+                        }
+                    return {}
+
+                with mock.patch.dict(
+                    "os.environ",
+                    {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"},
+                ), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("subprocess.run", side_effect=lambda cmd, **kw: (calls.append(cmd), _completed(pending_json if cmd[1] == "pending" else "{}"))[1]), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                     mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                     mock.patch.object(forge, "call", side_effect=fake_call), \
+                     mock.patch.object(
+                         forge,
+                         "open_memory_proposal_pr",
+                         return_value={
+                             "url": "https://github.com/acme/infra/pull/295",
+                             "number": 295,
+                             "revision": "deadbeef1234",
+                         },
+                     ) as open_pr:
+                    bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                    gate.sweep_memory_proposals()
+
+                open_pr.assert_called_once()
+                self.assertEqual(len(calls), 2)
+                self.assertIn("https://github.com/acme/infra/pull/295 (#295)", calls[1])
+                self.assertNotIn(f"#{bad_num}", " ".join(calls[1]))
+
+    def test_skips_backfilled_records_even_when_gitops_prs_enabled(self):
+        pending_json = json.dumps({
+            "repo": "acme/infra",
+            "records": [
+                {
+                    "id": "LES-2026-081",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "outcome": "backfill",
+                    "title": "Backfilled revert lesson without PR",
+                    "path": "knowledge/lessons/LES-2026-081.md",
+                    "branch": "platform-agent/memory/LES-2026-081",
+                    "pr_markdown": "---\nid: LES-2026-081\nstatus: active\n---\n",
+                },
+                {
+                    "id": "LES-2026-082",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "outcome": "backfill",
+                    "title": "Backfilled fix lesson with historical PR",
+                    "path": "knowledge/lessons/LES-2026-082.md",
+                    "branch": "platform-agent/memory/LES-2026-082",
+                    "pull_request": "https://github.com/acme/infra/pull/182 (#182)",
+                    "remediation_pr": "https://github.com/acme/infra/pull/182 (#182)",
+                },
+            ],
+        })
+        calls = []
+        with mock.patch.dict(
+            "os.environ",
+            {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "true"},
+        ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     calls.append(cmd),
+                     _completed(pending_json if cmd[1] == "pending" else "{}"),
+                 )[1],
+             ), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch.object(forge, "call") as forge_call, \
+             mock.patch.object(forge, "open_memory_proposal_pr") as open_pr:
+            res = gate.sweep_memory_proposals()
+
+        self.assertEqual(res.cards, [])
+        self.assertEqual(res.warnings, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], "pending")
+        forge_call.assert_not_called()
+        open_pr.assert_not_called()
+
+
+def _build_tar_base64(members: list[dict]) -> str:
+    """Build a base64-encoded tar archive from synthetic member specifications."""
+    import base64 as _b64
+    import tarfile as _tarfile
+
+    buf = io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w") as tf:
+        for spec in members:
+            info = _tarfile.TarInfo(name=spec["name"])
+            mtype = spec.get("type", "file")
+            if mtype == "dir":
+                info.type = _tarfile.DIRTYPE
+                info.mode = 0o755
+                tf.addfile(info)
+            elif mtype == "symlink":
+                info.type = _tarfile.SYMTYPE
+                info.linkname = spec.get("linkname", "target")
+                tf.addfile(info)
+            elif mtype == "hardlink":
+                info.type = _tarfile.LNKTYPE
+                info.linkname = spec.get("linkname", "target")
+                tf.addfile(info)
+            elif mtype == "fifo":
+                info.type = _tarfile.FIFOTYPE
+                tf.addfile(info)
+            else:
+                raw = spec.get("data", b"")
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8")
+                info.type = _tarfile.REGTYPE
+                info.size = spec.get("size", len(raw))
+                info.mode = 0o644
+                tf.addfile(info, io.BytesIO(raw))
+    return _b64.b64encode(buf.getvalue()).decode("ascii")
+
+
+class RepoMemorySweepTest(unittest.TestCase):
+    """Test `sweep_repo_memory` document index updates and incremental history backfill."""
+
+    def test_clean_noop_when_unconfigured_or_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            base_env = {"PLATFORM_AGENT_HOME": td}
+            # 1. Missing curator binary -> zero broker calls.
+            with mock.patch.dict("os.environ", {**base_env, "NATS_URL": "nats://localhost:4222"}, clear=True), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value=""), \
+                 mock.patch.object(forge, "call") as forge_call:
+                res = gate.sweep_repo_memory()
+                self.assertEqual((res.cards, res.warnings), ([], []))
+                forge_call.assert_not_called()
+
+            # 2. Curator present, neither NATS nor Hindsight configured -> zero broker calls.
+            with mock.patch.dict("os.environ", base_env, clear=True), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch.object(forge, "call") as forge_call:
+                res = gate.sweep_repo_memory()
+                self.assertEqual((res.cards, res.warnings), ([], []))
+                forge_call.assert_not_called()
+
+            # 3. Explicitly disabled via DECISION_MEMORY_REPO_SCAN=false -> zero broker calls.
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    **base_env,
+                    "NATS_URL": "nats://localhost:4222",
+                    "DECISION_MEMORY_REPO_SCAN": "false",
+                },
+                clear=True,
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch.object(forge, "call") as forge_call:
+                res = gate.sweep_repo_memory()
+                self.assertEqual((res.cards, res.warnings), ([], []))
+                forge_call.assert_not_called()
+
+    def test_managed_and_context_indexing_and_revision_cursor_fast_skip(self):
+        managed_tar = _build_tar_base64([
+            {"name": ".kube-agents/intent.yaml", "data": "paths:\n  - knowledge\n"},
+            {"name": "knowledge/decisions/DEC-2026-001.md", "data": "---\nid: DEC-2026-001\n---\n"},
+            {"name": "docs/decisions/0002-network.md", "data": "# ADR 2\n"},
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+        ])
+        context_tar = _build_tar_base64([
+            {"name": "docs/runbooks/oom-triage.md", "data": "# OOM Triage\n"},
+            {"name": "runbooks/node-drain.md", "data": "# Node Drain\n"},
+        ])
+
+        snap_calls = []
+        index_runs = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            snap_calls.append((verb, dict(payload), repo))
+            if repo == "acme/gitops":
+                return {"revision": "sha-managed-1", "archiveBase64": managed_tar}
+            return {"revision": "sha-context-1", "archiveBase64": context_tar}
+
+        def fake_subproc(cmd, **kw):
+            repo_dir = Path(cmd[cmd.index("--repo") + 1])
+            extracted = sorted(
+                str(p.relative_to(repo_dir))
+                for p in repo_dir.rglob("*")
+                if p.is_file()
+            )
+            index_runs.append((list(cmd), extracted))
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_dir = Path(td) / "hindsight"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.json").write_text(
+                json.dumps({"api_url": "http://hindsight.local:8888"}), encoding="utf-8"
+            )
+            t1 = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+            t2 = datetime(2026, 11, 24, 12, 10, tzinfo=timezone.utc)
+            with mock.patch.dict("os.environ", {"PLATFORM_AGENT_HOME": td}, clear=True), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+                 mock.patch(
+                     "gitops_workspace.get_context_repo_specs",
+                     return_value=[{"repo": "gitlab.com/acme/standards", "ref": "curated"}],
+                 ), \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+                 mock.patch("subprocess.run", side_effect=fake_subproc):
+                # Tick 1: indexes both managed and context repos.
+                gate.sweep_repo_memory(now=t1)
+                self.assertEqual(len(index_runs), 2)
+
+                m_cmd, m_files = index_runs[0]
+                self.assertIn("--role", m_cmd)
+                self.assertEqual(m_cmd[m_cmd.index("--role") + 1], "managed")
+                self.assertEqual(m_cmd[m_cmd.index("--repo-id") + 1], "acme/gitops")
+                self.assertEqual(
+                    m_cmd[m_cmd.index("--hindsight-url") + 1], "http://hindsight.local:8888"
+                )
+                self.assertEqual(
+                    m_files,
+                    [
+                        ".kube-agents/intent.yaml",
+                        "docs/decisions/0002-network.md",
+                        "knowledge/decisions/DEC-2026-001.md",
+                    ],
+                )
+
+                c_cmd, c_files = index_runs[1]
+                self.assertIn("--repo", c_cmd)
+                self.assertEqual(c_cmd[c_cmd.index("--role") + 1], "context")
+                self.assertEqual(
+                    c_cmd[c_cmd.index("--repo-id") + 1], "gitlab.com/acme/standards"
+                )
+                self.assertEqual(
+                    c_cmd[c_cmd.index("--hindsight-url") + 1], "http://hindsight.local:8888"
+                )
+                self.assertEqual(
+                    c_files, ["docs/runbooks/oom-triage.md", "runbooks/node-drain.md"]
+                )
+                # Verify context ref pin travelled in snapshot payload without paths.
+                ctx_snap = [p for _, p, r in snap_calls if r == "gitlab.com/acme/standards"][0]
+                self.assertEqual(ctx_snap.get("ref"), "curated")
+                self.assertNotIn("paths", ctx_snap)
+
+                state_file = Path(td) / "memory" / "repo_scan_state.json"
+                self.assertTrue(state_file.is_file())
+                self.assertEqual(state_file.stat().st_mode & 0o777, 0o600)
+                saved = json.loads(state_file.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    saved["repos"]["acme/gitops"]["indexed_revision"], "sha-managed-1"
+                )
+                self.assertEqual(
+                    saved["repos"]["gitlab.com/acme/standards"]["indexed_revision"],
+                    "sha-context-1",
+                )
+
+                # Tick 2: revisions unchanged -> fast skip, zero curator index calls!
+                index_runs.clear()
+                gate.sweep_repo_memory(now=t2)
+                self.assertEqual(index_runs, [])
+
+    def test_snapshot_too_large_entries_fallback_and_path_not_found(self):
+        narrowed_tar = _build_tar_base64([
+            {"name": "docs/adr/0001-cells.md", "data": "# Cells\n"},
+        ])
+        calls_by_repo = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            calls_by_repo.append((repo, dict(payload)))
+            if repo == "acme/monorepo":
+                if "paths" not in payload:
+                    raise forge.ForgeError(
+                        "SNAPSHOT_TOO_LARGE",
+                        "over ceiling",
+                        revision="rev-mono-1",
+                        entries=[
+                            {"path": "frontend", "type": "tree"},
+                            {"path": "docs", "type": "tree"},
+                            {"path": "knowledge", "type": "tree"},
+                        ],
+                    )
+                return {"revision": "rev-mono-1", "archiveBase64": narrowed_tar}
+            if repo == "acme/code-only":
+                raise forge.ForgeError(
+                    "SNAPSHOT_TOO_LARGE",
+                    "over ceiling",
+                    revision="rev-code-1",
+                    entries=[{"path": "cmd", "type": "tree"}, {"path": "pkg", "type": "tree"}],
+                )
+            if repo == "acme/missing-doc-path":
+                if "paths" not in payload:
+                    raise forge.ForgeError(
+                        "SNAPSHOT_TOO_LARGE",
+                        "over ceiling",
+                        revision="rev-miss-1",
+                        entries=[{"path": "docs", "type": "tree"}],
+                    )
+                raise forge.ForgeError(
+                    "PATH_NOT_FOUND",
+                    "no path",
+                    revision="rev-miss-1",
+                )
+            return {"revision": "rev-other", "archiveBase64": ""}
+
+        indexed = []
+
+        def fake_subproc(cmd, **kw):
+            repo_dir = Path(cmd[cmd.index("--repo") + 1])
+            files = sorted(
+                str(p.relative_to(repo_dir)) for p in repo_dir.rglob("*") if p.is_file()
+            )
+            indexed.append((cmd[cmd.index("--repo-id") + 1], files))
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "HINDSIGHT_API_URL": "http://hs:8888"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch(
+                 "gitops_workspace.get_managed_repos",
+                 return_value=["acme/monorepo", "acme/code-only", "acme/missing-doc-path"],
+             ), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch("subprocess.run", side_effect=fake_subproc):
+            gate.sweep_repo_memory()
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+        mono_calls = [p for r, p in calls_by_repo if r == "acme/monorepo"]
+        self.assertEqual(len(mono_calls), 2)
+        self.assertNotIn("paths", mono_calls[0])
+        self.assertEqual(mono_calls[1]["paths"], ["docs", "knowledge"])
+
+        # Code-only repo had zero SNAPSHOT_DOC_ROOTS in entries -> no second snapshot call!
+        code_calls = [p for r, p in calls_by_repo if r == "acme/code-only"]
+        self.assertEqual(len(code_calls), 1)
+
+        self.assertEqual(
+            indexed,
+            [
+                ("acme/monorepo", ["docs/adr/0001-cells.md"]),
+                ("acme/code-only", []),
+                ("acme/missing-doc-path", []),
+            ],
+        )
+        self.assertEqual(saved["repos"]["acme/monorepo"]["indexed_revision"], "rev-mono-1")
+        self.assertEqual(saved["repos"]["acme/code-only"]["indexed_revision"], "rev-code-1")
+        self.assertEqual(saved["repos"]["acme/missing-doc-path"]["indexed_revision"], "rev-miss-1")
+
+    def test_strict_tar_member_rejections_prevent_indexing_and_cursor_advance(self):
+        bad_cases = {
+            "tar_slip": [{"name": "knowledge/../../evil.md", "data": "bad"}],
+            "absolute_path": [{"name": "/etc/passwd", "data": "bad"}],
+            "symlink": [{"name": "knowledge/decisions/link.md", "type": "symlink", "linkname": "/etc/passwd"}],
+            "hardlink": [{"name": "knowledge/decisions/hard.md", "type": "hardlink", "linkname": "other"}],
+            "fifo": [{"name": "knowledge/decisions/pipe.md", "type": "fifo"}],
+            "dotgit": [{"name": ".git/config", "data": "[core]\n"}],
+            "oversize": [{"name": "knowledge/decisions/huge.md", "data": b"x" * (4 * 1024 * 1024 + 1)}],
+        }
+        for case_name, spec in bad_cases.items():
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as td:
+                bad_b64 = _build_tar_base64(spec)
+                subproc_calls = []
+                with mock.patch.dict(
+                    "os.environ",
+                    {"PLATFORM_AGENT_HOME": td, "HINDSIGHT_API_URL": "http://hs:8888"},
+                    clear=True,
+                ), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                     mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+                     mock.patch.object(
+                         forge,
+                         "call",
+                         return_value={"revision": "bad-rev", "archiveBase64": bad_b64},
+                     ), \
+                     mock.patch("subprocess.run", side_effect=lambda cmd, **kw: subproc_calls.append(cmd)):
+                    gate.sweep_repo_memory()
+
+                self.assertEqual(subproc_calls, [])
+                self.assertFalse((Path(td) / "memory" / "repo_scan_state.json").exists())
+
+    def test_paginated_history_backfill_triage_and_zero_git_prs(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/deployment.yaml", "data": "kind: Deployment\n"},
+            {"name": "clusters/prod/quota.yaml", "data": "kind: ResourceQuota\n"},
+        ])
+
+        # Page 1: 30 items (1 revert PR #35, 1 fix PR #34 on live file, 1 fix PR #33 on deleted file,
+        # 1 agent PR #32, 1 eval-noise PR #31, plus 25 routine merged PRs) -> truncated=True.
+        routine_page1 = [
+            {
+                "number": 100 + i,
+                "state": "merged",
+                "title": f"chore: routine bump {i}",
+                "body": "",
+                "author": "dev",
+                "source": f"chore-{i}",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-10T10:00:00Z",
+                "url": f"https://github.com/acme/infra/pull/{100 + i}",
+            }
+            for i in range(25)
+        ]
+        page1_proposals = [
+            {
+                "number": 35,
+                "state": "merged",
+                "title": 'Revert "feat: lower checkout memory"',
+                "body": "Reverts #29. Mitigates #10.",
+                "author": "sre-alice",
+                "source": "revert-29",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-20T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/35",
+            },
+            {
+                "number": 34,
+                "state": "merged",
+                "title": "fix(prod): pin replica floor",
+                "body": "Fixes #11",
+                "author": "sre-bob",
+                "source": "fix-replicas",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-19T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/34",
+            },
+            {
+                "number": 33,
+                "state": "merged",
+                "title": "fix(legacy): patch removed workload",
+                "body": "Fixes #9",
+                "author": "sre-bob",
+                "source": "fix-legacy",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-18T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/33",
+            },
+            {
+                "number": 32,
+                "state": "merged",
+                "title": "fix(agent): automated remediation",
+                "body": "Fixes #8",
+                "author": "kage-bot",
+                "source": "platform-agent/fix-8",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-17T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/32",
+            },
+            {
+                "number": 31,
+                "state": "merged",
+                "title": "[withdrawn-eval-probe] fix(test): probe",
+                "body": "Fixes #7",
+                "author": "sre-bob",
+                "source": "probe-1",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-16T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/31",
+            },
+            *routine_page1,
+        ]
+        # Page 2: closed-unmerged PRs (#25 maintainer technical rejection, #24 self-close by author,
+        # #23 situational stale close) -> truncated=False.
+        page2_proposals = [
+            {
+                "number": 25,
+                "state": "closed",
+                "title": "feat: raise namespace quota to 128Gi",
+                "body": "Increase quota.",
+                "author": "contributor-dan",
+                "source": "raise-quota",
+                "sourceRepo": "acme/infra",
+                "updated": "2026-11-05T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/25",
+            },
+            {
+                "number": 24,
+                "state": "closed",
+                "title": "feat: test draft",
+                "body": "",
+                "author": "contributor-dan",
+                "source": "draft-1",
+                "sourceRepo": "acme/infra",
+                "updated": "2026-11-04T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/24",
+            },
+            {
+                "number": 23,
+                "state": "closed",
+                "title": "feat: old experiment",
+                "body": "",
+                "author": "contributor-dan",
+                "source": "old-exp",
+                "sourceRepo": "acme/infra",
+                "updated": "2026-11-03T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/23",
+            },
+        ]
+
+        proposal_list_pages = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-live-1", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {
+                    "issues": [
+                        {
+                            "number": 10,
+                            "title": "Checkout OOM outage",
+                            "url": "https://github.com/acme/infra/issues/10",
+                        },
+                        {
+                            "number": 11,
+                            "title": "Replica drop during drain",
+                            "url": "https://github.com/acme/infra/issues/11",
+                        },
+                    ]
+                }
+            if verb == "proposal-list":
+                pg = payload.get("page", 1)
+                proposal_list_pages.append(pg)
+                if pg == 1:
+                    return {"proposals": page1_proposals, "truncated": True}
+                return {"proposals": page2_proposals, "truncated": False}
+            if verb == "proposal-closer":
+                num = payload["number"]
+                if num == 25:
+                    return {"actor": "maintainer-carol", "bot": False}
+                if num == 24:
+                    return {"actor": "contributor-dan", "bot": False}
+                if num == 23:
+                    return {"actor": "maintainer-carol", "bot": False}
+            if verb == "proposal-view":
+                num = payload["number"]
+                if num == 35:
+                    return {
+                        "proposal": page1_proposals[0],
+                        "diff": "--- a/clusters/prod/deployment.yaml\n+++ b/clusters/prod/deployment.yaml\n",
+                    }
+                if num == 34:
+                    return {
+                        "proposal": page1_proposals[1],
+                        "diff": "--- a/clusters/prod/deployment.yaml\n+++ b/clusters/prod/deployment.yaml\n",
+                    }
+                if num == 33:
+                    return {
+                        "proposal": page1_proposals[2],
+                        "diff": "--- a/clusters/legacy/deleted.yaml\n+++ b/clusters/legacy/deleted.yaml\n",
+                    }
+                if num == 25:
+                    return {
+                        "proposal": page2_proposals[0],
+                        "diff": "--- a/clusters/prod/quota.yaml\n+++ b/clusters/prod/quota.yaml\n",
+                        "comments": [
+                            {
+                                "author": "maintainer-carol",
+                                "body": "Rejecting this change: do not raise multi-tenant quota above 32Gi.",
+                                "bot": False,
+                            }
+                        ],
+                    }
+                if num == 23:
+                    return {
+                        "proposal": page2_proposals[2],
+                        "diff": "--- a/clusters/prod/quota.yaml\n+++ b/clusters/prod/quota.yaml\n",
+                        "comments": [
+                            {
+                                "author": "maintainer-carol",
+                                "body": "Closing stale pull request due to merge conflict.",
+                                "bot": False,
+                            }
+                        ],
+                    }
+            return {}
+
+        subproc_cmds = []
+
+        def fake_subproc(cmd, **kw):
+            subproc_cmds.append(list(cmd))
+            return _completed("{}")
+
+        cur_now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch.object(forge, "open_memory_proposal_pr") as open_pr, \
+             mock.patch("subprocess.run", side_effect=fake_subproc):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.side_effect = (
+                lambda repo, login, bot=False: login == "maintainer-carol"
+            )
+
+            # Tick 1: indexes snapshot + scans page 1 (emits #35 revert and #34 live fix; skips #33 deleted file).
+            gate.sweep_repo_memory(now=cur_now)
+            state_after_t1 = json.loads(
+                (Path(td) / "memory" / "repo_scan_state.json").read_text()
+            )
+            hist_t1 = state_after_t1["repos"]["acme/infra"]["history"]
+            self.assertFalse(hist_t1["completed_initial"])
+            self.assertEqual(hist_t1["next_page"], 2)
+
+            emit_t1 = [c for c in subproc_cmds if c[1] == "emit"]
+            self.assertEqual(len(emit_t1), 2)
+            # Revert PR #35 -> proposed, backfill, warn, cites #29 and issue #10.
+            self.assertIn("--outcome", emit_t1[0])
+            self.assertEqual(emit_t1[0][emit_t1[0].index("--outcome") + 1], "backfill")
+            self.assertEqual(emit_t1[0][emit_t1[0].index("--kind") + 1], "proposed")
+            self.assertEqual(emit_t1[0][emit_t1[0].index("--guard-severity") + 1], "warn")
+            self.assertIn("#35", emit_t1[0][emit_t1[0].index("--pr") + 1])
+            self.assertIn(
+                "Reverted breaking proposal #29 in",
+                emit_t1[0][emit_t1[0].index("--summary") + 1],
+            )
+            self.assertIn("#10", emit_t1[0][emit_t1[0].index("--summary") + 1])
+
+            # Live fix PR #34 -> proposed, backfill, warn, paths=clusters/prod/deployment.yaml.
+            self.assertEqual(emit_t1[1][emit_t1[1].index("--outcome") + 1], "backfill")
+            self.assertIn("#34", emit_t1[1][emit_t1[1].index("--pr") + 1])
+            self.assertEqual(
+                emit_t1[1][emit_t1[1].index("--paths") + 1],
+                "clusters/prod/deployment.yaml",
+            )
+
+            # Tick 2: skips snapshot index (SHA unchanged) and resumes backfill at page 2!
+            subproc_cmds.clear()
+            gate.sweep_repo_memory(now=cur_now)
+            self.assertEqual(proposal_list_pages, [1, 2])
+            state_after_t2 = json.loads(
+                (Path(td) / "memory" / "repo_scan_state.json").read_text()
+            )
+            hist_t2 = state_after_t2["repos"]["acme/infra"]["history"]
+            self.assertTrue(hist_t2["completed_initial"])
+            self.assertEqual(hist_t2["next_page"], 1)
+
+            # Only PR #25 (maintainer technical rejection) emits `refused`; #24 self-close and #23 stale close ignored!
+            self.assertEqual([c for c in subproc_cmds if c[1] == "index"], [])
+            emit_t2 = [c for c in subproc_cmds if c[1] == "emit"]
+            self.assertEqual(len(emit_t2), 1)
+            self.assertEqual(emit_t2[0][emit_t2[0].index("--kind") + 1], "refused")
+            self.assertEqual(emit_t2[0][emit_t2[0].index("--outcome") + 1], "backfill")
+            self.assertEqual(emit_t2[0][emit_t2[0].index("--guard-severity") + 1], "warn")
+            self.assertIn("#25", emit_t2[0][emit_t2[0].index("--pr") + 1])
+            self.assertIn("do not raise", emit_t2[0][emit_t2[0].index("--reason") + 1])
+
+            open_pr.assert_not_called()
+
+    def test_dry_run_leaves_zero_disk_state_and_zero_curator_writes(self):
+        tar_b64 = _build_tar_base64([
+            {"name": "knowledge/decisions/DEC-2026-001.md", "data": "---\nid: DEC-2026-001\n---\n"},
+        ])
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-dry", "archiveBase64": tar_b64}
+            if verb == "proposal-list":
+                return {
+                    "proposals": [
+                        {
+                            "number": 50,
+                            "state": "merged",
+                            "title": "Reverts #49",
+                            "body": "Reverts #49",
+                            "author": "alice",
+                            "source": "revert-49",
+                            "sourceRepo": "acme/infra",
+                            "mergedAt": "2026-11-22T12:00:00Z",
+                            "url": "https://github.com/acme/infra/pull/50",
+                        }
+                    ],
+                    "truncated": False,
+                }
+            if verb == "proposal-view":
+                return {"proposal": {}, "diff": "--- a/app.yaml\n+++ b/app.yaml\n"}
+            return {}
+
+        subproc_cmds = []
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch.object(forge, "open_memory_proposal_pr") as open_pr, \
+             mock.patch("subprocess.run", side_effect=lambda cmd, **kw: subproc_cmds.append(cmd)):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            res = gate.sweep_repo_memory(
+                dry_run=True,
+                now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual((res.cards, res.warnings), ([], []))
+        self.assertEqual(subproc_cmds, [])
+        open_pr.assert_not_called()
+        self.assertFalse((Path(td) / "memory" / "repo_scan_state.json").exists())
+
+    def test_scan_priority_orders_unindexed_first_then_oldest_and_caps_per_tick(self):
+        snap_repos = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            snap_repos.append(repo)
+            return {"revision": f"rev-{repo}", "archiveBase64": ""}
+
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / "memory"
+            state_dir.mkdir(parents=True)
+            (state_dir / "repo_scan_state.json").write_text(
+                json.dumps(
+                    {
+                        "repos": {
+                            "acme/recent": {
+                                "role": "managed",
+                                "ref": None,
+                                "indexed_revision": "old-rev-recent",
+                                "indexed_at": "2026-11-24T14:00:00Z",
+                                "history": {},
+                            },
+                            "acme/oldest": {
+                                "role": "managed",
+                                "ref": None,
+                                "indexed_revision": "old-rev-oldest",
+                                "indexed_at": "2026-11-20T10:00:00Z",
+                                "history": {},
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"PLATFORM_AGENT_HOME": td, "HINDSIGHT_API_URL": "http://hs:8888"},
+                clear=True,
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch(
+                     "gitops_workspace.get_managed_repos",
+                     return_value=["acme/recent", "acme/oldest", "acme/new-one"],
+                 ), \
+                 mock.patch(
+                     "gitops_workspace.get_context_repo_specs",
+                     return_value=[{"repo": "acme/new-ctx", "ref": None}],
+                 ), \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+                 mock.patch("subprocess.run", return_value=_completed("{}")):
+                gate.sweep_repo_memory()
+
+        # Capped at MAX_REPO_SCANS_PER_TICK=3: 2 unindexed first, then oldest indexed!
+        self.assertEqual(snap_repos, ["acme/new-one", "acme/new-ctx", "acme/oldest"])
+
+    def test_incremental_backfill_and_indeterminate_write_access_hold(self):
+        proposals = [
+            {
+                "number": 60,
+                "state": "closed",
+                "title": "feat: disable network policy",
+                "body": "",
+                "author": "contributor-dan",
+                "source": "disable-np",
+                "sourceRepo": "acme/infra",
+                "updated": "2026-11-24T14:30:00Z",
+                "url": "https://github.com/acme/infra/pull/60",
+            },
+            {
+                "number": 40,
+                "state": "merged",
+                "title": "Reverts #39",
+                "body": "Reverts #39",
+                "author": "alice",
+                "source": "rev-39",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-10T10:00:00Z",
+                "url": "https://github.com/acme/infra/pull/40",
+            },
+        ]
+        write_answer = [None]
+        emits = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-same", "archiveBase64": ""}
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-closer":
+                return {"actor": "maintainer-carol", "bot": False}
+            if verb == "proposal-view":
+                return {
+                    "proposal": proposals[0],
+                    "diff": "--- a/policy/np.yaml\n+++ b/policy/np.yaml\n",
+                    "comments": [
+                        {
+                            "author": "maintainer-carol",
+                            "body": "Rejected: must not disable default-deny policy.",
+                            "bot": False,
+                        }
+                    ],
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / "memory"
+            state_dir.mkdir(parents=True)
+            (state_dir / "repo_scan_state.json").write_text(
+                json.dumps(
+                    {
+                        "repos": {
+                            "acme/infra": {
+                                "role": "managed",
+                                "ref": None,
+                                "indexed_revision": "sha-same",
+                                "indexed_at": "2026-11-24T14:00:00Z",
+                                "history": {
+                                    "completed_initial": True,
+                                    "next_page": 1,
+                                    "max_pr_number": 50,
+                                    "high_water_pr_seen": 50,
+                                    "cursor_updated_at": "2026-11-20T00:00:00Z",
+                                    "processed_prs": [40],
+                                    "window_since": "90d",
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                clear=True,
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+                 mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+                 mock.patch(
+                     "subprocess.run",
+                     side_effect=lambda cmd, **kw: (emits.append(list(cmd)), _completed("{}"))[1],
+                 ):
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
+                bp_cls.return_value._has_write.side_effect = (
+                    lambda repo, login, bot=False: write_answer[0]
+                )
+
+                # Tick 1: indeterminate write lookup (`None`) holds PR #60 out of processed_prs.
+                gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+                self.assertEqual(emits, [])
+                st1 = json.loads((state_dir / "repo_scan_state.json").read_text())
+                self.assertNotIn(
+                    60, st1["repos"]["acme/infra"]["history"]["processed_prs"]
+                )
+
+                # Tick 2: write lookup recovers (`True`) -> PR #60 emits `refused`; PR #40 remains skipped.
+                write_answer[0] = True
+                gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 10, tzinfo=timezone.utc))
+                self.assertEqual(len(emits), 1)
+                self.assertEqual(emits[0][emits[0].index("--kind") + 1], "refused")
+                self.assertEqual(emits[0][emits[0].index("--outcome") + 1], "backfill")
+                self.assertEqual(emits[0][emits[0].index("--repo") + 1], "acme/infra")
+                self.assertIn("#60", emits[0][emits[0].index("--pr") + 1])
+
+    def test_snapshot_too_large_none_entries_fails_closed_and_multipath_toctou_retries_per_root(self):
+        surviving_tar = _build_tar_base64([
+            {"name": "knowledge/decisions/DEC-2026-001.md", "data": "---\nid: DEC-2026-001\n---\n"},
+        ])
+        calls_by_repo = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            calls_by_repo.append((repo, dict(payload)))
+            if repo == "acme/clone-over-ceiling":
+                # Broker omitted `entries` (e.g. max_clone_bytes / ls-tree truncation / tar ceiling).
+                raise forge.ForgeError(
+                    "SNAPSHOT_TOO_LARGE",
+                    "pack over clone ceiling",
+                    revision="rev-huge-1",
+                    entries=None,
+                )
+            if repo == "acme/toctou-roots":
+                paths = payload.get("paths")
+                if paths is None:
+                    raise forge.ForgeError(
+                        "SNAPSHOT_TOO_LARGE",
+                        "over ceiling",
+                        revision="rev-toctou-1",
+                        entries=[
+                            {"path": "docs", "type": "tree"},
+                            {"path": "knowledge", "type": "tree"},
+                        ],
+                    )
+                if paths == ["docs", "knowledge"]:
+                    raise forge.ForgeError(
+                        "PATH_NOT_FOUND",
+                        "docs deleted in concurrent commit",
+                        revision="rev-toctou-2",
+                    )
+                if paths == ["docs"]:
+                    raise forge.ForgeError(
+                        "PATH_NOT_FOUND",
+                        "docs absent",
+                        revision="rev-toctou-2",
+                    )
+                if paths == ["knowledge"]:
+                    return {"revision": "rev-toctou-2", "archiveBase64": surviving_tar}
+            return {"revision": "rev-other", "archiveBase64": ""}
+
+        indexed = []
+
+        def fake_subproc(cmd, **kw):
+            repo_dir = Path(cmd[cmd.index("--repo") + 1])
+            files = sorted(
+                str(p.relative_to(repo_dir)) for p in repo_dir.rglob("*") if p.is_file()
+            )
+            indexed.append((cmd[cmd.index("--repo-id") + 1], files))
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / "memory"
+            state_dir.mkdir(parents=True)
+            (state_dir / "repo_scan_state.json").write_text(
+                json.dumps(
+                    {
+                        "repos": {
+                            "acme/clone-over-ceiling": {
+                                "role": "managed",
+                                "ref": None,
+                                "indexed_revision": "rev-prev-ok",
+                                "indexed_at": "2026-11-20T00:00:00Z",
+                                "history": {},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                "os.environ",
+                {"PLATFORM_AGENT_HOME": td, "HINDSIGHT_API_URL": "http://hs:8888"},
+                clear=True,
+            ), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch(
+                     "gitops_workspace.get_managed_repos",
+                     return_value=["acme/clone-over-ceiling", "acme/toctou-roots"],
+                 ), \
+                 mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+                 mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+                 mock.patch("subprocess.run", side_effect=fake_subproc):
+                gate.sweep_repo_memory()
+                saved = json.loads((state_dir / "repo_scan_state.json").read_text())
+
+        # `entries=None` failed closed: zero `curator index` calls on empty dir, prior revision preserved!
+        self.assertEqual(indexed, [("acme/toctou-roots", ["knowledge/decisions/DEC-2026-001.md"])])
+        self.assertEqual(
+            saved["repos"]["acme/clone-over-ceiling"]["indexed_revision"], "rev-prev-ok"
+        )
+        self.assertEqual(
+            saved["repos"]["acme/toctou-roots"]["indexed_revision"], "rev-toctou-2"
+        )
+
+    def test_backfill_queries_closed_state_handles_gitlab_short_pages_and_anchors_cursor_to_page1(self):
+        proposal_payloads = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-1", "archiveBase64": ""}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                proposal_payloads.append(dict(payload))
+                pg = payload.get("page", 1)
+                if pg == 1:
+                    # Short filtered page (<30 items) with truncated=True, plus a stray open item.
+                    return {
+                        "proposals": [
+                            {
+                                "number": 999,
+                                "state": "open",
+                                "title": "WIP open PR",
+                                "author": "dev",
+                                "updated": "2026-11-24T14:59:00Z",
+                            },
+                            {
+                                "number": 80,
+                                "state": "merged",
+                                "title": "chore: routine bump",
+                                "author": "dev",
+                                "mergedAt": "2026-11-22T10:00:00Z",
+                            },
+                        ],
+                        "truncated": True,
+                    }
+                if pg == 2:
+                    # Empty GitLab closed page (all 30 MRs on page 2 were open) with truncated=True.
+                    return {"proposals": [], "truncated": True}
+                return {
+                    "proposals": [
+                        {
+                            "number": 45,
+                            "state": "merged",
+                            "title": "Reverts #44",
+                            "body": "Reverts #44",
+                            "author": "alice",
+                            "source": "revert-44",
+                            "sourceRepo": "gitlab.com/acme/infra",
+                            "mergedAt": "2026-11-05T08:00:00Z",
+                            # Even if an old PR got a late comment on page 3, cursor stays anchored to page 1!
+                            "updated": "2026-11-24T14:50:00Z",
+                            "url": "https://gitlab.com/acme/infra/-/merge_requests/45",
+                        }
+                    ],
+                    "truncated": False,
+                }
+            if verb == "proposal-view":
+                return {"proposal": {}, "diff": "--- a/app.yaml\n+++ b/app.yaml\n"}
+            return {}
+
+        emits = []
+
+        def fake_subproc(cmd, **kw):
+            if cmd[1] == "emit":
+                emits.append(list(cmd))
+            return _completed("{}")
+
+        cur_now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["gitlab.com/acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch("subprocess.run", side_effect=fake_subproc):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            # Tick 1 (page 1 -> short page, truncated=True) -> advances to page 2.
+            gate.sweep_repo_memory(now=cur_now)
+            # Tick 2 (page 2 -> empty filtered page, truncated=True) -> advances to page 3.
+            gate.sweep_repo_memory(now=cur_now)
+            # Tick 3 (page 3 -> emits revert !45, truncated=False) -> completes initial backfill!
+            gate.sweep_repo_memory(now=cur_now)
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+        self.assertEqual([p["state"] for p in proposal_payloads], ["closed", "closed", "closed"])
+        self.assertEqual([p["page"] for p in proposal_payloads], [1, 2, 3])
+        self.assertEqual(len(emits), 1)
+        hist = saved["repos"]["gitlab.com/acme/infra"]["history"]
+        self.assertTrue(hist["completed_initial"])
+        # Open PR #999 ignored; high_water_pr=80 and cursor_updated_at anchored to page 1's terminal timestamp!
+        self.assertEqual(hist["max_pr_number"], 80)
+        self.assertEqual(hist["cursor_updated_at"], "2026-11-22T10:00:00Z")
+
+    def test_non_doc_symlinks_allowed_while_compressed_tar_and_symlinked_doc_parents_refused(self):
+        import base64 as _b64
+        import gzip as _gzip
+
+        valid_with_repo_symlink = _build_tar_base64([
+            {"name": ".claude/rules", "type": "symlink", "linkname": "../.agents/rules"},
+            {"name": "knowledge/decisions/DEC-2026-001.md", "data": "---\nid: DEC-2026-001\n---\n"},
+        ])
+        with tempfile.TemporaryDirectory() as td:
+            count, tracked = gate._extract_snapshot_docs(valid_with_repo_symlink, Path(td))
+            self.assertEqual(count, 1)
+            self.assertEqual(tracked, {"knowledge/decisions/DEC-2026-001.md"})
+            self.assertTrue((Path(td) / "knowledge" / "decisions" / "DEC-2026-001.md").is_file())
+            self.assertFalse((Path(td) / ".claude" / "rules").exists())
+
+        # Compressed `.tar.gz` stream must be refused (`mode="r:"` only).
+        raw_plain = _b64.b64decode(valid_with_repo_symlink)
+        compressed_b64 = _b64.b64encode(_gzip.compress(raw_plain)).decode("ascii")
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(gate._SnapshotArchiveError):
+            gate._extract_snapshot_docs(compressed_b64, Path(td))
+
+        # Symlink parent prefix for an extracted doc must fail in both member orders.
+        for members in (
+            [
+                {"name": "knowledge/decisions", "type": "symlink", "linkname": "/etc"},
+                {"name": "knowledge/decisions/DEC-2026-001.md", "data": "bad"},
+            ],
+            [
+                {"name": "knowledge/decisions/DEC-2026-001.md", "data": "bad"},
+                {"name": "knowledge/decisions", "type": "symlink", "linkname": "/etc"},
+            ],
+        ):
+            bad_b64 = _build_tar_base64(members)
+            with tempfile.TemporaryDirectory() as td, self.assertRaises(gate._SnapshotArchiveError):
+                gate._extract_snapshot_docs(bad_b64, Path(td))
+
+    def test_closed_unmerged_non_write_closer_and_truncated_comments_mark_processed_without_refused(self):
+        proposals = [
+            {
+                "number": 71,
+                "state": "closed",
+                "title": "feat: widen ingress",
+                "author": "contributor-dan",
+                "source": "widen-ingress",
+                "sourceRepo": "acme/infra",
+                "updated": "2026-11-24T14:00:00Z",
+                "url": "https://github.com/acme/infra/pull/71",
+            },
+            {
+                "number": 72,
+                "state": "closed",
+                "title": "feat: huge discussion thread",
+                "author": "contributor-dan",
+                "source": "huge-thread",
+                "sourceRepo": "acme/infra",
+                "updated": "2026-11-24T14:05:00Z",
+                "url": "https://github.com/acme/infra/pull/72",
+            },
+        ]
+        closer_calls = []
+        view_calls = []
+        emits = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-1", "archiveBase64": ""}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-closer":
+                closer_calls.append(payload["number"])
+                if payload["number"] == 71:
+                    return {"actor": "triage-eve", "bot": False}
+                return {"actor": "maintainer-carol", "bot": False}
+            if verb == "proposal-view":
+                view_calls.append(payload["number"])
+                if payload["number"] == 72:
+                    return {
+                        "proposal": proposals[1],
+                        "commentsTruncated": True,
+                        "comments": [],
+                        "diff": "",
+                    }
+                return {
+                    "proposal": proposals[0],
+                    "comments": [
+                        {
+                            "author": "maintainer-carol",
+                            "body": "Rejected: do not widen public ingress.",
+                            "bot": False,
+                        }
+                    ],
+                    "diff": "--- a/net.yaml\n+++ b/net.yaml\n",
+                }
+            return {}
+
+        cur_now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.side_effect = (
+                lambda repo, login, bot=False: login == "maintainer-carol"
+            )
+
+            # Tick 1: #71 rejected at closer write check (without proposal-view); #72 skipped on commentsTruncated.
+            gate.sweep_repo_memory(now=cur_now)
+            self.assertEqual(emits, [])
+            self.assertEqual(closer_calls, [71, 72])
+            self.assertEqual(view_calls, [72])
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+            self.assertEqual(
+                sorted(saved["repos"]["acme/infra"]["history"]["processed_prs"]),
+                [71, 72],
+            )
+
+            # Tick 2: neither #71 nor #72 re-fetches proposal-closer or proposal-view!
+            closer_calls.clear()
+            view_calls.clear()
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 10, tzinfo=timezone.utc))
+            self.assertEqual(closer_calls, [])
+            self.assertEqual(view_calls, [])
+
+    def test_resolve_hindsight_url_prefers_decision_memory_env_over_generic_env(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            "os.environ",
+            {
+                "PLATFORM_AGENT_HOME": td,
+                "DECISION_MEMORY_HINDSIGHT_URL": "http://decision-bank:8888",
+                "HINDSIGHT_API_URL": "http://generic-bank:8888",
+            },
+            clear=True,
+        ):
+            self.assertEqual(gate._resolve_hindsight_url(), "http://decision-bank:8888")
+
+    def test_decision_memory_external_doc_dirs_cover_docs_decisions_and_decisions(self):
+        import importlib.util
+
+        dm_path = (
+            Path(__file__).resolve().parent.parent
+            / "skills"
+            / "decision-memory"
+            / "scripts"
+            / "decision_memory.py"
+        )
+        spec = importlib.util.spec_from_file_location("decision_memory_under_test", dm_path)
+        dm_mod = importlib.util.module_from_spec(spec)
+        sys.modules["decision_memory_under_test"] = dm_mod
+        spec.loader.exec_module(dm_mod)
+
+        for prefix in gate.SNAPSHOT_DOC_DIR_PREFIXES:
+            self.assertIn(prefix.rstrip("/"), dm_mod.EXTERNAL_DOC_DIRS)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "docs" / "decisions").mkdir(parents=True)
+            (root / "decisions").mkdir(parents=True)
+            (root / "docs" / "decisions" / "0003-ingress.md").write_text(
+                "# Ingress Policy\n\nUse internal load balancers.\n", encoding="utf-8"
+            )
+            (root / "decisions" / "0005-egress.md").write_text(
+                "# Egress Policy\n\nDeny public egress by default.\n", encoding="utf-8"
+            )
+            records = dm_mod.load_external_doc_records(root, extra_repos=[])
+            by_id = {r.id: r for r in records}
+            self.assertIn("ADR-0003", by_id)
+            self.assertIn("ADR-0005", by_id)
+            self.assertEqual(by_id["ADR-0003"].type, "decision")
+            self.assertEqual(by_id["ADR-0005"].type, "decision")
+
+    def test_revert_quoted_title_extracts_body_pr_number_and_preserves_cross_repo_qualifier(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+        ])
+        proposals = [
+            {
+                "number": 91,
+                "state": "merged",
+                "title": 'Revert "feat: bad limit"',
+                "body": "Reverts #42",
+                "author": "sre-alice",
+                "source": "revert-42",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-22T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/91",
+            },
+            {
+                "number": 90,
+                "state": "merged",
+                "title": 'Revert "feat: upstream contract bump"',
+                "body": "Reverts other-org/other-repo#42",
+                "author": "sre-alice",
+                "source": "revert-upstream",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-21T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/90",
+            },
+        ]
+        emits = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-1", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-view":
+                return {
+                    "proposal": next(p for p in proposals if p["number"] == payload["number"]),
+                    "diff": "--- a/clusters/prod/app.yaml\n+++ b/clusters/prod/app.yaml\n",
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(emits), 2)
+        summary_91 = emits[0][emits[0].index("--summary") + 1]
+        summary_90 = emits[1][emits[1].index("--summary") + 1]
+        self.assertIn("Reverted breaking proposal #42 in", summary_91)
+        self.assertIn("Reverted breaking proposal other-org/other-repo#42 in", summary_90)
+        self.assertNotIn("Reverted breaking proposal #42 in", summary_90)
+
+    def test_cross_repo_fixes_issue_does_not_resolve_against_local_issues(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+        ])
+        proposals = [
+            {
+                "number": 88,
+                "state": "merged",
+                "title": "fix(prod): raise upstream rpc timeout",
+                "body": "Fixes other-org/other-repo#10",
+                "author": "sre-bob",
+                "source": "fix-rpc-timeout",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-22T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/88",
+            },
+            {
+                "number": 87,
+                "state": "merged",
+                "title": "fix(prod): local dns retry",
+                "body": "Fixes acme/infra#10",
+                "author": "sre-bob",
+                "source": "fix-dns",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-21T12:00:00Z",
+                "url": "https://github.com/acme/infra/pull/87",
+            },
+        ]
+        emits = []
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                return {"revision": "sha-1", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {
+                    "issues": [
+                        {
+                            "number": 10,
+                            "title": "Unrelated local DNS outage",
+                            "url": "https://github.com/acme/infra/issues/10",
+                        }
+                    ]
+                }
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-view":
+                return {
+                    "proposal": next(p for p in proposals if p["number"] == payload["number"]),
+                    "diff": "--- a/clusters/prod/app.yaml\n+++ b/clusters/prod/app.yaml\n",
+                }
+            return {}
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(emits), 2)
+        # PR #88 (cross-repo `other-org/other-repo#10`): preserves PR title and verbatim cross-repo ref.
+        title_88 = emits[0][emits[0].index("--title") + 1]
+        summary_88 = emits[0][emits[0].index("--summary") + 1]
+        self.assertEqual(title_88, "fix(prod): raise upstream rpc timeout")
+        self.assertIn("Linked issue: other-org/other-repo#10.", summary_88)
+        self.assertNotIn("Unrelated local DNS outage", summary_88)
+        self.assertNotIn("https://github.com/acme/infra/issues/10", summary_88)
+
+        # PR #87 (same-repo `acme/infra#10`): resolves local issue #10 title and URL.
+        title_87 = emits[1][emits[1].index("--title") + 1]
+        summary_87 = emits[1][emits[1].index("--summary") + 1]
+        self.assertEqual(title_87, "Unrelated local DNS outage")
+        self.assertIn(
+            "Linked issue: https://github.com/acme/infra/issues/10 (#10) (Unrelated local DNS outage).",
+            summary_87,
+        )
+
+    def test_page2_and_deferred_repo_prune_deleted_file_fixes_when_revision_unchanged(self):
+        live_tar = _build_tar_base64([
+            {"name": "clusters/prod/live.yaml", "data": "kind: Deployment\n"},
+        ])
+        page1 = [
+            {
+                "number": 200 + i,
+                "state": "merged",
+                "title": f"chore: bump {i}",
+                "body": "",
+                "author": "dev",
+                "source": f"b-{i}",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-20T10:00:00Z",
+                "url": f"https://github.com/acme/infra/pull/{200 + i}",
+            }
+            for i in range(30)
+        ]
+        page2 = [
+            {
+                "number": 150,
+                "state": "merged",
+                "title": "fix(legacy): tune removed deployment",
+                "body": "Fixes #5",
+                "author": "sre-alice",
+                "source": "fix-removed",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-10T10:00:00Z",
+                "url": "https://github.com/acme/infra/pull/150",
+            },
+            {
+                "number": 149,
+                "state": "merged",
+                "title": "fix(prod): keep live workload floor",
+                "body": "Fixes #6",
+                "author": "sre-alice",
+                "source": "fix-live",
+                "sourceRepo": "acme/infra",
+                "mergedAt": "2026-11-09T10:00:00Z",
+                "url": "https://github.com/acme/infra/pull/149",
+            },
+        ]
+        emits = []
+        snap_count = [0]
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                snap_count[0] += 1
+                return {"revision": "sha-unchanged", "archiveBase64": live_tar}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                pg = payload.get("page", 1)
+                return {
+                    "proposals": page1 if pg == 1 else page2,
+                    "truncated": pg == 1,
+                }
+            if verb == "proposal-view":
+                num = payload["number"]
+                if num == 150:
+                    return {
+                        "proposal": page2[0],
+                        "diff": "--- a/clusters/legacy/deleted.yaml\n+++ b/clusters/legacy/deleted.yaml\n",
+                    }
+                return {
+                    "proposal": page2[1],
+                    "diff": "--- a/clusters/prod/live.yaml\n+++ b/clusters/prod/live.yaml\n",
+                }
+            return {}
+
+        cur_now = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
+             mock.patch("gitops_workspace.get_context_repo_specs", return_value=[]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            # Tick 1: indexes snapshot + processes page 1 (advances to page 2).
+            gate.sweep_repo_memory(now=cur_now)
+            cache_file = gate._repo_tree_cache_path("acme/infra")
+            self.assertTrue(cache_file.is_file())
+            self.assertEqual(cache_file.stat().st_mode & 0o777, 0o600)
+
+            # Tick 2 (`page=2`, `revision == indexed_revision`): deleted-file PR #150 is pruned!
+            gate.sweep_repo_memory(now=cur_now)
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+        self.assertEqual(len(emits), 1)
+        self.assertIn("#149", emits[0][emits[0].index("--pr") + 1])
+        self.assertIn(150, saved["repos"]["acme/infra"]["history"]["processed_prs"])
+
+        # Also verify lazy snapshot fetch when `_backfill_one_managed_repo` runs with `tracked_files=None`
+        # (e.g. a repository deferred past `MAX_REPO_SCANS_PER_TICK` with no prior cache file).
+        emits.clear()
+        snap_count[0] = 0
+        with tempfile.TemporaryDirectory() as td2, \
+             mock.patch.dict("os.environ", {"PLATFORM_AGENT_HOME": td2}, clear=True), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch(
+                 "subprocess.run",
+                 side_effect=lambda cmd, **kw: (
+                     emits.append(list(cmd)) if cmd[1] == "emit" else None,
+                     _completed("{}"),
+                 )[1],
+             ):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            hist = {"completed_initial": False, "next_page": 2, "processed_prs": []}
+            changed = gate._backfill_one_managed_repo(
+                "acme/infra",
+                hist,
+                curator_bin="/usr/local/bin/curator",
+                tracked_files=None,
+                cutoff_dt=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                since_spec="90d",
+                cur_now=cur_now,
+                dry_run=False,
+            )
+            self.assertTrue(changed)
+            self.assertEqual(snap_count[0], 1)
+            self.assertEqual(len(emits), 1)
+            self.assertIn("#149", emits[0][emits[0].index("--pr") + 1])
+            self.assertIn(150, hist["processed_prs"])
+
+    def test_rejection_reason_keeps_later_technical_rejection_after_earlier_rebase_comment(self):
+        provider = mock.Mock()
+        provider._has_write.side_effect = lambda repo, login, bot=False: login == "maintainer-carol"
+
+        # Earlier rebase/conflict note followed by a technical policy rejection -> emits `ok`.
+        status, reason = gate._extract_backfill_rejection_reason(
+            [
+                {
+                    "author": "maintainer-carol",
+                    "body": "Needs rebase after merge conflict",
+                    "bot": False,
+                },
+                {
+                    "author": "maintainer-carol",
+                    "body": "Closing — pods in prod must not run without memory limits",
+                    "bot": False,
+                },
+            ],
+            viewer="kage-bot",
+            pr_author="contributor-dan",
+            provider=provider,
+            repo="acme/infra",
+        )
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            reason, "Closing — pods in prod must not run without memory limits"
+        )
+
+        # Earlier technical objection superseded by a later situational close -> suppressed (`none`).
+        status2, reason2 = gate._extract_backfill_rejection_reason(
+            [
+                {
+                    "author": "maintainer-carol",
+                    "body": "We cannot merge this without limits.",
+                    "bot": False,
+                },
+                {
+                    "author": "maintainer-carol",
+                    "body": "Closing stale pull request after merge conflict.",
+                    "bot": False,
+                },
+            ],
+            viewer="kage-bot",
+            pr_author="contributor-dan",
+            provider=provider,
+            repo="acme/infra",
+        )
+        self.assertEqual((status2, reason2), ("none", None))
+
+    def test_nats_and_hindsight_url_coexist_on_index_and_every_backfill_emit_stamps_provenance(self):
+        managed_tar = _build_tar_base64([
+            {"name": "clusters/prod/app.yaml", "data": "kind: Deployment\n"},
+            {"name": "knowledge/decisions/DEC-2026-001.md", "data": "---\nid: DEC-2026-001\n---\n"},
+        ])
+        context_tar = _build_tar_base64([
+            {"name": "docs/runbooks/oom.md", "data": "# OOM Runbook\n"},
+        ])
+        proposals = [
+            {
+                "number": 103,
+                "state": "merged",
+                "title": 'Revert "feat: lower floor"',
+                "body": "Reverts #100",
+                "author": "sre-alice",
+                "source": "revert-100",
+                "sourceRepo": "acme/gitops",
+                "mergedAt": "2026-11-23T12:00:00Z",
+                "url": "https://github.com/acme/gitops/pull/103",
+            },
+            {
+                "number": 102,
+                "state": "merged",
+                "title": "fix(prod): pin memory request",
+                "body": "Fixes #12",
+                "author": "sre-bob",
+                "source": "fix-mem",
+                "sourceRepo": "acme/gitops",
+                "mergedAt": "2026-11-22T12:00:00Z",
+                "url": "https://github.com/acme/gitops/pull/102",
+            },
+            {
+                "number": 101,
+                "state": "closed",
+                "title": "feat: disable limits",
+                "body": "",
+                "author": "contributor-dan",
+                "source": "no-limits",
+                "sourceRepo": "acme/gitops",
+                "updated": "2026-11-21T12:00:00Z",
+                "url": "https://github.com/acme/gitops/pull/101",
+            },
+        ]
+
+        def fake_forge_call(verb, payload, repo, **kw):
+            if verb == "snapshot":
+                if repo == "acme/gitops":
+                    return {"revision": "rev-m1", "archiveBase64": managed_tar}
+                return {"revision": "rev-c1", "archiveBase64": context_tar}
+            if verb == "issue-list":
+                return {"issues": []}
+            if verb == "proposal-list":
+                return {"proposals": proposals, "truncated": False}
+            if verb == "proposal-closer":
+                return {"actor": "maintainer-carol", "bot": False}
+            if verb == "proposal-view":
+                pr_obj = next(p for p in proposals if p["number"] == payload["number"])
+                return {
+                    "proposal": pr_obj,
+                    "diff": "--- a/clusters/prod/app.yaml\n+++ b/clusters/prod/app.yaml\n",
+                    "comments": [
+                        {
+                            "author": "maintainer-carol",
+                            "body": "Rejected: must not disable memory limits.",
+                            "bot": False,
+                        }
+                    ],
+                }
+            return {}
+
+        seen_cmds = []
+
+        def fake_subproc(cmd, **kw):
+            seen_cmds.append(list(cmd))
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {
+                     "PLATFORM_AGENT_HOME": td,
+                     "NATS_URL": "nats://localhost:4222",
+                     "DECISION_MEMORY_HINDSIGHT_URL": "http://hindsight.local:8888",
+                 },
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+             mock.patch(
+                 "gitops_workspace.get_context_repo_specs",
+                 return_value=[{"repo": "acme/standards", "ref": "main"}],
+             ), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", side_effect=fake_forge_call), \
+             mock.patch("subprocess.run", side_effect=fake_subproc):
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
+            bp_cls.return_value._has_write.side_effect = (
+                lambda repo, login, bot=False: login == "maintainer-carol"
+            )
+            gate.sweep_repo_memory(now=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc))
+
+            # Guardrail check: `_run_curator_emit_ok` refuses calls missing `--outcome backfill` or `--repo`.
+            before_count = len(seen_cmds)
+            self.assertFalse(
+                gate._run_curator_emit_ok(
+                    "/usr/local/bin/curator",
+                    ["--kind", "proposed", "--repo", "acme/gitops"],
+                    "acme/gitops#1",
+                )
+            )
+            self.assertFalse(
+                gate._run_curator_emit_ok(
+                    "/usr/local/bin/curator",
+                    ["--kind", "proposed", "--outcome", "backfill"],
+                    "acme/gitops#1",
+                )
+            )
+            self.assertEqual(len(seen_cmds), before_count)
+
+        index_cmds = [c for c in seen_cmds if c[1] == "index"]
+        self.assertEqual(len(index_cmds), 2)
+        for cmd, expected_repo, expected_role in (
+            (index_cmds[0], "acme/gitops", "managed"),
+            (index_cmds[1], "acme/standards", "context"),
+        ):
+            self.assertIn("--repo", cmd)
+            self.assertTrue(cmd[cmd.index("--repo") + 1].strip())
+            self.assertEqual(cmd[cmd.index("--repo-id") + 1], expected_repo)
+            self.assertEqual(cmd[cmd.index("--role") + 1], expected_role)
+            self.assertEqual(cmd[cmd.index("--hindsight-url") + 1], "http://hindsight.local:8888")
+
+        emit_cmds = [c for c in seen_cmds if c[1] == "emit"]
+        self.assertEqual(len(emit_cmds), 3)
+        self.assertEqual(
+            [c[c.index("--kind") + 1] for c in emit_cmds],
+            ["proposed", "proposed", "refused"],
+        )
+        for emit_cmd in emit_cmds:
+            self.assertEqual(emit_cmd[emit_cmd.index("--outcome") + 1], "backfill")
+            self.assertEqual(emit_cmd[emit_cmd.index("--repo") + 1], "acme/gitops")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,6 @@ Subject: Drop the unused NAMESPACE variable
 Why: find-scale-down-blockers.sh sets NAMESPACE but never reads it (the -n flag works through NS_FLAG), which shellcheck reports as SC2034 now that make shellcheck lints the gke-* skills. The patch drops the two dead lines; the script behaves the same.
 Local-Issue: none (#2867)
 Eval-Case: none (lint fix; the script's commands and output are unchanged)
-Upstream-Issue: none filed yet
 Retire-When: upstream drops or uses the NAMESPACE variable
 
 diff --git a/assets/find-scale-down-blockers.sh b/assets/find-scale-down-blockers.sh

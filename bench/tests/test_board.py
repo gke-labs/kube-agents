@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from kube_agents_bench import board, parsing
@@ -273,6 +274,34 @@ def local_shell(root: Path, monkeypatch: pytest.MonkeyPatch, on_read=None):
     return shell
 
 
+
+def test_each_card_carries_its_creation_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wait tells an earlier run's card handed back by its key from its own by this (#4794)."""
+    build_session_store(tmp_path, created=[FRONT, CHILD])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET created_at = 1764000000 WHERE id = ?", (FRONT,))
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
+    assert read is not None
+    assert read.cards[FRONT]["created_at"] == 1764000000
+    assert read.cards[CHILD]["created_at"] is None
+
+
+def test_a_board_without_created_at_reads_each_cards_creation_time_as_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("ALTER TABLE tasks DROP COLUMN created_at")
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
+    assert read is not None and read.cards[FRONT]["created_at"] is None
+
+
+@pytest.mark.parametrize("raw,want", [
+    (1764000000, 1764000000), (1764000000.7, 1764000000), (True, None), ("1764000000", None), (None, None),
+])
+def test_a_creation_time_is_a_whole_number_or_none(raw: Any, want: int | None) -> None:
+    assert board._epoch(raw) == want
+
 def test_the_api_session_id_matches_the_bridge() -> None:
     """Mirrors apiSessionID's verbatim half; an id the bridge would hash (unsafe,
     or over the cap) names no session here rather than a guessed one."""
@@ -292,7 +321,9 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
     # Without ``want`` a read carries statuses alone.
     plain = board.read_session_cards(shell, SESSION, 5)
     assert plain is not None
-    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None, "block": None}
+    assert plain.cards[FRONT] == {
+        "status": "done", "result": None, "summary": None, "block": None, "created_at": None,
+    }
     read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
     assert read is not None and read.session_found
     assert read.total == 2
@@ -303,12 +334,14 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
         "result": "three clusters, all healthy",
         "summary": None,
         "block": None,
+        "created_at": None,
     }
     assert read.cards[CHILD] == {
         "status": "done",
         "result": None,
         "summary": "node pool resized",
         "block": None,
+        "created_at": None,
     }
     shown = json.loads(read.as_shown(CHILD)["result"])
     assert shown == {
@@ -667,7 +700,7 @@ def test_a_board_without_events_reads_a_blocked_card_with_no_block(
     set_card(tmp_path, FRONT, "blocked")
     read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT], max_want=32)
     assert read is not None
-    assert read.cards[FRONT] == {"status": "blocked", "result": None, "summary": None, "block": None}
+    assert read.cards[FRONT] == {"status": "blocked", "result": None, "summary": None, "block": None, "created_at": None}
     assert "block" not in json.loads(read.as_shown(FRONT)["result"])["task"]
 
 

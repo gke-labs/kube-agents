@@ -569,6 +569,34 @@ class StoppedAsksTest(unittest.TestCase):
                     self.assertIn(f"{name} leftovers:", lines[1])
                     self.assertFalse(any(other in line for line in lines), lines)
 
+    def test_the_leftovers_listing_does_not_read_an_inherited_token_file(self):
+        """A shell that exports BENCH_GITHUB_TOKEN_FILE must not hand the listing
+        that file: the checks read it in preference to BENCH_GITHUB_TOKEN, which
+        holds the token the report minted for itself."""
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                constants(),
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'BENCH_GITOPS_REPO="acme/infra"',
+                'EVAL_RUN_STARTED_AT="2026-01-01T00:00:00Z"',
+                "unset EVAL_FORGE EVAL_FORGE_KIND",
+                "mint_ledger_token() { export BENCH_GITHUB_TOKEN=tok-leftovers; }",
+                'uv() { echo "LISTING_TOKEN=${BENCH_GITHUB_TOKEN:-} LISTING_TOKEN_FILE=${BENCH_GITHUB_TOKEN_FILE:-}"; }',
+                lifted_block(r"^report_github_leftovers\(\) \{.*?^\}$"),
+                "report_github_leftovers",
+            ]
+        )
+        result = subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "BENCH_GITHUB_TOKEN_FILE": "/inherited/from/the/shell"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LISTING_TOKEN=tok-leftovers LISTING_TOKEN_FILE=\n", result.stdout)
+
     def test_the_lane_file_is_the_path_the_roster_module_names(self):
         self.assertIn(f'readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/{eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.name}"', constants())
 

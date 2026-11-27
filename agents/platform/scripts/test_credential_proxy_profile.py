@@ -885,6 +885,57 @@ class ProfileRouteTest(unittest.TestCase):
         status, body = self.post({"argv": ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"]})
         self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
 
+    def test_a_profile_write_the_flag_rule_refuses_is_a_write_refusal(self):
+        # The flag rule runs before the read-only rule, so most profile writes
+        # with a flag meet it first. A refused write is refused outright, so
+        # it carries the mark and the verb words the record names.
+        for argv, verb in (
+            (["kubectl", "scale", "deploy/kube-dns", "-n", "kube-system", "--replicas=3"], ["scale"]),
+            (["kubectl", "apply", "-f", "/tmp/manifest.yaml"], ["apply"]),
+        ):
+            with self.subTest(argv=argv):
+                self.executor.calls.clear()
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
+                self.assertIs(True, body[credential_proxy.WRITE_REFUSAL_KEY], body)
+                self.assertEqual(verb, body["verb"])
+
+    def test_a_profile_read_the_flag_rule_refuses_is_not_a_write_refusal(self):
+        for argv in (
+            ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"],
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml", "--output-watch-events"],
+            # The verb parser stops at -f, but kubectl runs view-last-applied, a read.
+            ["kubectl", "apply", "-f", "m.yaml", "view-last-applied"],
+            # A help letter in a short cluster only prints help.
+            ["kubectl", "delete", "pod", "x", "-hv=9"],
+        ):
+            with self.subTest(argv=argv):
+                self.executor.calls.clear()
+                status, body = self.post({"argv": argv})
+                self.assert_refused(status, body, credential_proxy.RULE_CALLER_KUBECTL_FLAG)
+                self.assertIs(False, body[credential_proxy.WRITE_REFUSAL_KEY], body)
+
+    def test_a_busy_or_pressure_answer_is_never_a_write_refusal(self):
+        # Only a policy rule's refusal of a write is marked. A write never
+        # reaches the slot (the policy refuses it first, marked); a call that
+        # does reach it and meets a capacity answer (no free command slot,
+        # resource pressure) gets no mark.
+        status, body = self.post({"argv": ["kubectl", "annotate", "deploy/x", "a=b"]})
+        self.assertEqual(403, status, body)
+        self.assertIs(True, body[credential_proxy.WRITE_REFUSAL_KEY])
+        write = {"argv": ["kubectl", "get", "pods"]}
+        for refusal in (
+            credential_proxy.CommandSlotUnavailable("at the profile share", bound="profile"),
+            credential_proxy.ResourcePressure("memory pressure; retry in 5 s", 5),
+        ):
+            def refusing_slot(handler, role, refusal=refusal):
+                raise refusal
+
+            with self.subTest(refusal=type(refusal).__name__), mock.patch.object(CredentialProxyHandler, "_session_slot", refusing_slot):
+                status, body = self.post(write)
+                self.assertIn(status, (429, 503), body)
+                self.assertNotIn(credential_proxy.WRITE_REFUSAL_KEY, body)
+
     def test_git_is_not_a_profile_executable(self):
         routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
@@ -2082,6 +2133,8 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 status, body = self.vcs_post(verb, None)
                 self.assert_permit_refused(verb, status, body)
                 self.assertIn("needs a task credential", body["error"])
+                # A version-control refusal never carries the write-refusal mark.
+                self.assertNotIn(credential_proxy.WRITE_REFUSAL_KEY, body)
 
     def test_a_refused_credential_is_refused_whole(self):
         status, body = self.vcs_post("publish", CASES["permits on the nats audience"]["token"])
@@ -2099,6 +2152,9 @@ class ProfileVcsRouteTest(unittest.TestCase):
                     status, body = self.vcs_post(spelling, VALID["token"])
                     self.assert_permit_refused(verb, status, body)
                     self.assertIn(credential_proxy.VCS_PROPOSAL_CREATE_PERMIT, body["error"])
+                    # Not marked: the permit refusal's answer is the patch the
+                    # version-control skill gives, so it must not stop the task.
+                    self.assertNotIn(credential_proxy.WRITE_REFUSAL_KEY, body)
 
     def test_a_refused_write_with_a_large_body_still_reads_its_403(self):
         """The refusal comes before the body is read; the broker drains it first,
@@ -2761,6 +2817,65 @@ class ReportCredentialTest(unittest.TestCase):
         self.set_gate()
         status, body = self.request("GET", "/v1/a-route-added-later", token=VALID["token"])
         self.assertNotEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
+
+
+UNATTENDED = CASES["the unattended permit, a builtin schedule trigger with a stream"]
+UNATTENDED_REPORT = CASES["the unattended permit on a report credential"]
+
+
+class UnattendedPermitIsInertTest(unittest.TestCase):
+    """vcs:unattended-write, which the verifiers know before the broker's gate reads it.
+
+    Until the gate reads the permit (docs/designs/unattended-write-permit.md,
+    row 6), a credential that carries it reaches what the same credential
+    reaches without it: no version-control write, and for a report credential
+    the audit-report routes alone.
+    """
+
+    _restore = staticmethod(ProfileRouteTest._restore)
+    set_gate = ProfileRouteTest.set_gate
+    request = ReportCredentialTest.request
+    assert_report_refused = ReportCredentialTest.assert_report_refused
+
+    def setUp(self):
+        ProfileRouteTest.setUp(self)
+
+    def admit(self, case, tier):
+        self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", tier)}
+        self.set_gate()
+        return CredentialProxyHandler.profile_gate.admit(self.principal, case["token"])
+
+    def test_the_permit_alone_opens_no_gated_write(self):
+        unattended = self.admit(UNATTENDED, "read")
+        self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), unattended.task.permits)
+        confirmed = self.admit(PERMIT, "read")
+        for verb in sorted(credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.assertIsNotNone(credential_proxy.profile_vcs_refusal(unattended, verb))
+                self.assertIsNone(credential_proxy.profile_vcs_refusal(confirmed, verb))
+
+    def test_a_report_credential_with_the_permit_reaches_the_report_routes_alone(self):
+        principal = self.admit(UNATTENDED_REPORT, "unattended")
+        self.assertTrue(principal.task.report_only)
+        self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), principal.task.permits)
+
+        def verdict(case, method, path):
+            status, body = self.request(method, path, token=case["token"])
+            return status, body.get("rule"), body.get("code")
+
+        gated = [f"/v1/vcs/{verb}" for verb in sorted(credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS)]
+        for path in broker_route_paths() + gated:
+            for method in ("GET", "POST"):
+                with self.subTest(method=method, path=path):
+                    # The same answer as the report credential with no permit.
+                    got = verdict(UNATTENDED_REPORT, method, path)
+                    self.assertEqual(verdict(REPORT, method, path), got)
+                    if not credential_proxy.report_credential_permits(method, path):
+                        self.assertEqual(403, got[0])
+        for path in gated:
+            with self.subTest(path=path):
+                self.assert_report_refused(*self.request("POST", path, token=UNATTENDED_REPORT["token"]))
+        self.assertEqual([], self.executor.calls)
 
 
 class ReportCredentialRoutesTest(unittest.TestCase):

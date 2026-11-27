@@ -100,6 +100,15 @@ type AgentProfileSpec struct {
 	// +optional
 	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 
+	// Delegates lets this profile's tasks hand tasks on to other profiles.
+	// The gateway refuses a delegation from a task of a profile without it.
+	// Profile workers have no delegate tool yet (the pool sets
+	// A2A_DELEGATE_TOOL=off); when they do, it will be offered only with
+	// this set. A child it starts is held to the gateway's delegation checks
+	// (tier, scope, chain, the target's allow-lists) whatever this says.
+	// +optional
+	Delegates bool `json:"delegates,omitempty"`
+
 	// Lifecycle bounds one task's wall clock and how long the finished Job
 	// lingers.
 	// +required
@@ -266,7 +275,23 @@ type AgentProfileHarness struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxTurns int32 `json:"maxTurns,omitempty"`
+
+	// Type is the harness the worker image runs. Absent is claude-code. The
+	// operator passes it to the worker as A2A_HARNESS, which the worker
+	// adapter's harness selector reads to pick its stream driver, argv and
+	// env, and persona adapter. It is passed only when set, so a profile that
+	// leaves it out renders as it did before the field existed. It is pod
+	// configuration only: it is not on the profile's card, and no bus
+	// subject or permission depends on it. claude-code is the only value
+	// accepted today.
+	// +kubebuilder:validation:Enum=claude-code
+	// +optional
+	Type string `json:"type,omitempty"`
 }
+
+// AgentProfileHarnessClaudeCode is the AgentProfile harness type for Claude
+// Code, and what an absent type means.
+const AgentProfileHarnessClaudeCode = "claude-code"
 
 // AgentProfileBus holds the profile's blackboard grants, written without the
 // a2a.topics. prefix.

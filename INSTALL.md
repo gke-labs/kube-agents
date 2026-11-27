@@ -99,10 +99,13 @@ Five behaviours worth knowing before the first run:
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone, autoscaling to two. The module's
-  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
-  installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
-  `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
-  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it;
+  `install.sh` writes none of the explicit `standard_*` or `gvisor_*` inputs, and sets or offers
+  `TF_VAR_sizing_profile=fleet` on a fresh Standard install with 25 or more visible clusters when
+  runtime sizing is `auto` or `fleet` and `TF_VAR_sizing_profile` / `TF_VAR_standard_machine_type`
+  are unset (and accepts an exported `TF_VAR_sizing_profile`). Set other inputs as `TF_VAR_` lines in
+  `install.env`, which Terraform reads where the generated tfvars
+  is silent, and keep them there for every later run: `lifecycle.sh` refuses an apply that would
   resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
   no explicit input decided at the last apply, a profile other than the one that apply recorded),
   the shape a lost line would otherwise plan. Pass
@@ -160,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### What `--generate-only` Does:
 
-1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it only appends a chat key a chat flag gave that the file lacks) and `terraform/examples/full-install/terraform.tfvars`.
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent; over an existing one it updates only the keys listed in [The install configuration](scripts/installer/README.md#the-install-configuration-installenv)) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools`, or one that enforces no NetworkPolicy and was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and, for GitHub only, Cloud KMS key creation for GitHub App private key signing).
@@ -1165,7 +1168,7 @@ AGENT_NAME="$(kubectl get platformagents -n kubeagents-system -o jsonpath='{.ite
   kubectl rollout restart deployment/"${AGENT_NAME}-gateway" statefulset/"${AGENT_NAME}-shell" -n kubeagents-system
 ```
 
-Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
+Vertex AI needs no entry here: `MODEL_PROVIDER=vertex_ai` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
 
 ### Step 3: Build & Push the Operator Image
@@ -1660,7 +1663,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
      `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record doesn't decode (logged first as `notify: session record unreadable`). A record that couldn't be read in time gets `the conversation's record couldn't be read in time; not posted` instead, which the sender retries.
-  2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
+  2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`. The bridge retries the session store for two minutes when it isn't listening, so `connection refused` in that line means session-kv, a background process in the `platform-agent` container, wasn't listening for longer. Nothing restarts it, so it can be gone while the container shows no restarts: check its log, `/opt/data/logs/session_kv_server.log`, with `kubectl exec` as in step 3, and the container's restarts. When the bridge gives up on the store it logs `the session store refused connections for the whole retry window`. With the agent's API server answering, session-kv is gone while the container runs on, and each later request tries once until the bridge logs `the session store is answering again`. With the API server refusing too, the container is restarting: the line says so, and the next request retries in full (`the agent container is restarting; retrying the session store`). `grep -E 'conversation route|session store'` shows them all.
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'
      ```

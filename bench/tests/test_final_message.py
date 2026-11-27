@@ -175,7 +175,10 @@ def _kanban_smoke_specialist_patterns() -> list[str]:
         (Path(__file__).resolve().parent.parent / "tasks" / _KANBAN_SMOKE_CASE / "task.yaml").read_text()
     )
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == _SPECIALIST_CHECK]
-    return check["check"]["required_patterns"]
+    # The delivered-result branch of the check's any-of (the other branch is
+    # the session route's own live read, #6860).
+    (relay,) = [c for c in check["check"]["checks"] if c["type"] == "report_contains"]
+    return relay["required_patterns"]
 
 
 def test_a_card_result_the_router_relayed_verbatim_keeps_its_header():

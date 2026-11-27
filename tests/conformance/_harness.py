@@ -207,8 +207,8 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/kube_proxy_manifests.go",
         ("func buildKubeProxyDeployment(", "CREDENTIAL_PROXY_SESSION_AUDIENCE", "CREDENTIAL_PROXY_SESSION_CALLERS"),
     ),
-    "k8s_api_proxy_main_go": Source(
-        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+    "k8s_api_proxy_server_go": Source(
+        "k8s-api-proxy/pkg/proxyserver/server.go",
         ("sessionAudienceEnv", "sessionCallersEnv", "func parseSessionAudienceCallers("),
     ),
     "manifest_helpers_go": Source(
@@ -476,6 +476,13 @@ SOURCES: dict[str, Source] = {
         "agents/platform/scripts/audit_report_store.py",
         ("ALLOWED_SUBJECT_ENV", "DEFAULT_API_SERVER", "DEFAULT_REPORTS_DIR"),
     ),
+    # The task-credential verifier, read as text for the same reason
+    # (cryptography). The A3 permit row spells this permit as a literal; a
+    # rename in the verifier turns the anchor check red.
+    "task_credential_verifier": Source(
+        "agents/platform/scripts/task_credential.py",
+        ('PERMIT_VCS_UNATTENDED_WRITE = "vcs:unattended-write"',),
+    ),
     "operator_metrics_peer": Source(
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("operatorPodNameLabel", "operatorPodNameValue"),
@@ -503,6 +510,7 @@ SOURCES: dict[str, Source] = {
             "A2A_KUBE_PROXY_URL",
             "A2A_KUBE_PROXY_CA_CONFIGMAP",
             "A2A_KUBE_PROXY_HOST_CONTEXT",
+            "A2A_KUBE_PROXY_MODE",
         ),
     ),
     # The platform agent's allowlists as the gateway reads them: the per-target

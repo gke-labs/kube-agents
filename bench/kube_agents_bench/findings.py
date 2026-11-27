@@ -35,7 +35,7 @@ from typing import Any
 
 from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
-__all__ = ["FINDINGS_READ", "SESSION_KV_URL", "read_project"]
+__all__ = ["FINDINGS_READ", "SESSION_KV_URL", "SNAPSHOT_READ", "read_project", "read_snapshot"]
 
 # platform_mcp_server.py: _findings_request's base URL.
 SESSION_KV_URL = "http://127.0.0.1:8699"
@@ -110,3 +110,75 @@ def read_project(shell: Callable[[str, float], str], project: str, timeout: floa
     if not isinstance(parsed.get("findings"), list):
         return None
     return {"findings": parsed["findings"], "error": None}
+
+
+# The queue as a snapshot: per row, its id, `source` and `check_slug`, and the
+# SHA-256 of the whole row as the route returns it (every column, sorted keys),
+# so any write to a row (a registration, a verification, an absence downgrade,
+# a patch, a surfacing mark) changes its hash. One JSON object after
+# SNAPSHOT_READ: `rows` (id -> {source, check_slug, hash}), `count`, and
+# `error`. bench/tf/prebuilt/builtin-schedule-run-now/run_now.py carries a copy
+# of this script, which the stack runs before it fires a run; the tests hold
+# the two equal.
+SNAPSHOT_READ = "__FINDINGS_QUEUE_SNAPSHOT__"
+SNAPSHOT_SCRIPT = r"""
+import hashlib, json, os, sys, urllib.error, urllib.parse, urllib.request
+base, limit, timeout, sentinel = sys.argv[1:5]
+out = {"rows": None, "count": 0, "error": None}
+token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+if not token:
+    out["error"] = "SESSION_KV_API_KEY is not set in the agent container"
+else:
+    query = urllib.parse.urlencode({"limit": limit})
+    request = urllib.request.Request(base + "/v1/findings?" + query, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
+            rows = json.loads(response.read().decode("utf-8")).get("findings")
+        if not isinstance(rows, list):
+            out["error"] = "GET /v1/findings returned no list of findings"
+        else:
+            out["count"] = len(rows)
+            out["rows"] = {
+                str(row.get("id")): {
+                    "source": row.get("source"),
+                    "check_slug": row.get("check_slug"),
+                    "hash": hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
+                }
+                for row in rows
+                if isinstance(row, dict)
+            }
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        out["error"] = "GET /v1/findings: %s" % exc
+print(sentinel + json.dumps(out))
+"""
+
+
+def snapshot_argv() -> list[str]:
+    """The script's arguments after the interpreter's ``-c <script>``."""
+    return [SESSION_KV_URL, str(ROW_LIMIT), str(REQUEST_TIMEOUT_SEC), SNAPSHOT_READ]
+
+
+def snapshot_command() -> str:
+    """The ``sh -c`` line that prints the queue's snapshot in the agent container."""
+    args = " ".join(shlex.quote(a) for a in snapshot_argv())
+    return (
+        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(SNAPSHOT_SCRIPT)} {args}'
+    )
+
+
+def parse_snapshot(reply: str) -> dict[str, Any] | None:
+    """The snapshot object a reply carries after SNAPSHOT_READ, or None when it carries none."""
+    marker = reply.find(SNAPSHOT_READ)
+    if marker < 0:
+        return None
+    try:
+        parsed = json.loads(reply[marker + len(SNAPSHOT_READ):].strip().splitlines()[0])
+    except (IndexError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def read_snapshot(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The queue's snapshot, or None when the pod gave none."""
+    return parse_snapshot(shell(snapshot_command(), timeout))

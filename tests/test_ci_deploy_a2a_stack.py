@@ -1,13 +1,13 @@
 """The smoke pipeline deploys the A2A stack on every run.
 
-`hack/ci-deploy.sh` has one path: section 4 names the six A2A images (the
+`hack/ci-deploy.sh` has one path: section 4 names the seven A2A images (the
 pull request's own builds, or the candidate's published ones on the
 release-candidate path) and fills the operator.extraEnv values the release
 expands (the five image overrides, the inject door's flag, and two settings of
 the bridge the operator renders: its image and its concurrency; its executor is
 left to the bridge's default, api, which the start-line wait requires; and the
 card stop), the Cloud Build's `a2a` and `a2a-bridge` steps run with `docker`
-stubbed build and push those six in order with the bridge FROM this build's
+stubbed build and push those seven in order with the bridge FROM this build's
 platform image, and the concurrency guard runs against the values it refuses
 and admits. EVAL_MODE_NEXT, the flag that once chose this path, is read
 nowhere: the build section runs the same with it unset and in every spelling,
@@ -68,6 +68,7 @@ _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
 _A2A_GATEWAY_LEASE = _CONTROLLER / "platformagent_a2a_gateway_lease.go"
 _A2A_DISPATCHER = _CONTROLLER / "platformagent_a2a_dispatcher.go"
+_A2A_TEAMS_INBOUND = _CONTROLLER / "platformagent_teams_inbound.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
@@ -85,11 +86,13 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_CONSOLE_URI",
     "_A2A_BRIDGE_URI",
     "_A2A_DISPATCHER_URI",
+    "_A2A_TEAMS_INBOUND_URI",
     "_PERSONA_CLUSTER_URI",
     "_PERSONA_TSE_URI",
+    "_PERSONA_FLEET_AUDIT_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "persona-cluster", "persona-tse")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher", "a2a-teams-inbound", "persona-cluster", "persona-tse", "persona-fleet-audit")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher", "teams-inbound")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 # The retired flag, in the spellings a job environment could still carry.
 _FLAG_SPELLINGS = (None, "", "0", "1", "true", "yes")
@@ -251,6 +254,9 @@ def helm_args(result: subprocess.CompletedProcess) -> list[str]:
     return [line.partition("=")[2] for line in result.stdout.splitlines() if line.startswith("HELM=")]
 
 
+_DOCKER_HUB_MIRROR = yaml.safe_load(text(_CLOUDBUILD))["substitutions"]["_DOCKER_HUB_MIRROR"]
+
+
 def build_step(step_id: str) -> dict:
     steps = yaml.safe_load(text(_CLOUDBUILD))["steps"]
     for step in steps:
@@ -263,6 +269,9 @@ def run_build_step(step_id: str, subs: dict[str, str], docker_stub: str) -> subp
     """Run a step's script as Cloud Build would: `$$` collapsed to `$` and
     each `$_NAME` replaced by its substitution, with `docker` stubbed."""
     script = build_step(step_id)["args"][1].replace("$$", "$")
+    # The Docker Hub mirror takes its declared default unless a test passes it,
+    # as Cloud Build fills an unset substitution (#7033).
+    subs = {"_DOCKER_HUB_MIRROR": _DOCKER_HUB_MIRROR, **subs}
     for name, value in subs.items():
         script = script.replace(f"${name}", value)
     return run_bash(f"{docker_stub}\n{script}")
@@ -401,6 +410,8 @@ class A2AStackTest(unittest.TestCase):
             ("profiles.cluster.harness", "a2a-worker"),
             ("profiles.tse.persona", "persona-tse"),
             ("profiles.tse.harness", "a2a-worker"),
+            ("profiles.fleetAudit.persona", "persona-fleet-audit"),
+            ("profiles.fleetAudit.harness", "a2a-worker"),
         ):
             expected += [
                 "--set-string",
@@ -423,6 +434,15 @@ class A2AStackTest(unittest.TestCase):
             f"operator.extraEnv[12].name={go_constant(_A2A_MANIFESTS, 'a2aNATSDebugEnvVar')}",
             "--set-string",
             "operator.extraEnv[12].value=true",
+        ]
+        # The Teams inbound receiver's image, at this build, under the name
+        # the operator reads it by; the receiver runs only when a CR enables
+        # it, so the override costs nothing on a lane that does not (#1034).
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[13].name={go_constant(_A2A_TEAMS_INBOUND, 'a2aTeamsInboundImageEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[13].value={_AR_REPO}/a2a-teams-inbound:{_TAG}",
         ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
@@ -582,7 +602,9 @@ class A2AStackTest(unittest.TestCase):
         self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
         self.assertEqual(values[11], "operator.extraEnv[11].value=true")
         self.assertEqual(values[12], "operator.extraEnv[12].value=true")
-        self.assertEqual(len(values), 13, values)
+        # The Teams inbound receiver, at the candidate's published image (#1034).
+        self.assertEqual(values[13], f"operator.extraEnv[13].value={_RC_REGISTRY_PREFIX}/a2a-teams-inbound:{_RC_COMMIT_SHA}")
+        self.assertEqual(len(values), 14, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -891,6 +913,27 @@ class TasksBudgetSizingTest(unittest.TestCase):
         self.assertIn('"DependencyNotFound"', (root / "k8s-operator/cmd/k8s-event-watcher/filter.go").read_text())
         self.assertIn("DependencyNotFound", (root / "deploy/shared/start-services.sh").read_text())
 
+    def test_every_lane_excludes_the_fleets_pending_pod_namespace_from_the_event_watcher(self) -> None:
+        """The seeded fleet holds one pod Pending for ever in seeded-reservation
+        (role missing-reservation-autoscaled), and FailedScheduling is on the
+        watcher's list. Every lane's install excludes that namespace, by the
+        name the catalogue and the stack use."""
+        script = _CI_DEPLOY.read_text()
+        self.assertIn('readonly EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE="seeded-reservation"', script)
+        release = re.search(r"helm upgrade --install.*?--wait --timeout", script, re.DOTALL)
+        assert release is not None
+        self.assertIn(
+            '--set-string "platformAgent.harness.eventWatcher.alertExclude[1].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE}"',
+            release.group(0),
+        )
+        root = _CI_DEPLOY.parent.parent
+        catalog = json.loads((root / "bench/tf/fleet/fixtures.json").read_text())
+        self.assertEqual(catalog["roles"]["missing-reservation-autoscaled"]["namespace"], "seeded-reservation")
+        self.assertIn('name   = "seeded-reservation"', (root / "bench/tf/fleet/defects-a.tf").read_text())
+        reasons = re.search(r"^readonly EVENT_WATCHER_REASONS=.*$", (root / "deploy/shared/start-services.sh").read_text(), re.MULTILINE)
+        assert reasons is not None
+        self.assertIn("FailedScheduling", reasons.group(0).split("=", 1)[1].split(","))
+
     def test_the_install_carries_the_sized_max_sessions_and_step_6b_changes_nothing(self) -> None:
         consts = constants()
         self.assertEqual(consts["MAX_SESSIONS_HELM_VALUE"], "platformAgent.harness.tuning.maxSessions")
@@ -966,10 +1009,26 @@ class FrontDoorSwitchTest(unittest.TestCase):
         ask = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayAsk")
         manifests = text(_A2A_MANIFESTS)
         self.assertRegex(manifests, re.compile(r"^\s*a2aTasksReplaySessionAsks\s*=\s*a2aTasksReplayTailFactor \* a2aTasksReplayAsk$", re.MULTILINE))
+        # The session route's per-session count is the named consumers plus
+        # the replay asks, and the per-route count returns it only there.
         self.assertRegex(
             manifests,
-            r"if resolveA2ADefaultRoute\(agent\) == agentv1alpha1\.DefaultRouteSession \{\s*"
-            r"return a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks",
+            re.compile(
+                r"^\s*a2aTasksConsumersPerSessionOnSessionRoute\s*=\s*a2aSessionConsumersPerSession \+ a2aTasksReplaySessionAsks$",
+                re.MULTILINE,
+            ),
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSessionOn\(route string\) int \{\s*"
+            r"if route == agentv1alpha1\.DefaultRouteSession \{\s*"
+            r"return a2aTasksConsumersPerSessionOnSessionRoute\s*\}\s*"
+            r"return a2aSessionConsumersPerSession\s*\}",
+        )
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksConsumersPerSession\(agent \*agentv1alpha1\.PlatformAgent\) int \{\s*"
+            r"return a2aTasksConsumersPerSessionOn\(resolveA2ADefaultRoute\(agent\)\)",
         )
         self.assertEqual(int(consts["A2A_SESSION_REPLAY_ASKS"]), tail * ask)
 
@@ -1861,28 +1920,32 @@ class BridgeImageBuildTest(unittest.TestCase):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")
 
-    def test_the_a2a_step_starts_at_once_and_builds_the_six_in_order(self) -> None:
-        """The six A2A images do not depend on the platform image, so their
+    def test_the_a2a_step_starts_at_once_and_builds_the_seven_in_order(self) -> None:
+        """The seven A2A images do not depend on the platform image, so their
         step must not queue behind it; only the bridge does."""
         self.assertEqual(build_step("a2a")["waitFor"], ["-"])
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, (*_A2A_IMAGES[:5], "a2a-dispatcher"), strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, (*_A2A_IMAGES[:5], "a2a-dispatcher", "a2a-teams-inbound"), strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
             # The worker's Dockerfile copies the credential broker's shim client
             # from agents/platform/scripts, so it builds from the repository
             # root; the gateway and the callout stay on the a2a/ module root.
             context = "." if suffix == "worker" else "a2a"
-            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} {context}")
+            expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.{suffix} --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node {context}")
             expected.append(f"docker push {uri}")
         # The cluster persona, from its own directory, as the ghcr workflow builds it.
         uri = f"{_AR_REPO}/persona-cluster:{_TAG}"
-        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster agents/cluster/persona")
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-cluster --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node agents/cluster/persona")
         expected.append(f"docker push {uri}")
         # The tse persona, the same way (#3842).
         uri = f"{_AR_REPO}/persona-tse:{_TAG}"
-        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse agents/tse/persona")
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-tse --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node agents/tse/persona")
+        expected.append(f"docker push {uri}")
+        # The fleet-audit persona, the same way (#5623).
+        uri = f"{_AR_REPO}/persona-fleet-audit:{_TAG}"
+        expected.append(f"docker build --platform linux/amd64 -t {uri} -f a2a/Dockerfile.persona-fleet-audit --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang --build-arg NODE_IMAGE={_DOCKER_HUB_MIRROR}/library/node agents/fleet-audit/persona")
         expected.append(f"docker push {uri}")
         self.assertEqual(result.stdout.splitlines(), expected)
 
@@ -1896,7 +1959,8 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertEqual(
             result.stdout.splitlines(),
             [
-                f"docker build --platform linux/amd64 -t {uri} --build-arg PLATFORM_AGENT_IMAGE={_PLATFORM_URI} -f a2a/Dockerfile.hermes-bridge a2a",
+                f"docker build --platform linux/amd64 -t {uri} --build-arg PLATFORM_AGENT_IMAGE={_PLATFORM_URI}"
+                f" --build-arg GOLANG_IMAGE={_DOCKER_HUB_MIRROR}/library/golang -f a2a/Dockerfile.hermes-bridge a2a",
                 f"docker push {uri}",
             ],
         )
@@ -1952,5 +2016,112 @@ class CrStatusReportTest(unittest.TestCase):
             self.assertIn("secret-model-name", artifact.read_text())
 
 
+def _front_door_record(tmp: str) -> str:
+    return pathlib.Path(tmp, "front-door.txt").read_text(encoding="utf-8")
+
+
+def verify_front_door_run(
+    asked: str, rendered: str | None, tmp: str, fail_first: int = 0, empty_first: int = 0, warn: bool = False
+) -> subprocess.CompletedProcess:
+    """ci-deploy's verify_front_door over a stub kubectl. The stub answers
+    only the read the function should make (the gateway Deployment, in the
+    namespace, filtered to A2A_DEFAULT_ADDRESSEE), failing its first
+    `fail_first` calls, and renders `rendered` (None: every read fails)."""
+    answer = "return 1" if rendered is None else f'printf "\\n{rendered}\\n"'
+    stub = "\n".join(
+        [
+            # kubectl runs in a command substitution (a subshell), so the
+            # call count lives in a file.
+            f'_calls_file="{tmp}/kubectl-calls"; : >"${{_calls_file}}"',
+            "kubectl() {",
+            '  case "$*" in',
+            '    *"get deployment/platform-agent-a2a-gateway -n kubeagents-system"*\'@.name=="A2A_DEFAULT_ADDRESSEE"\'*) ;;',
+            '    *) echo "unexpected kubectl call: $*" >&2; return 2 ;;',
+            "  esac",
+            '  echo x >>"${_calls_file}"',
+            f'  if [ "$(wc -l <"${{_calls_file}}")" -le {fail_first} ]; then echo "connection refused" >&2; return 1; fi',
+            f'  if [ "$(wc -l <"${{_calls_file}}")" -le {fail_first + empty_first} ]; then return 0; fi',
+            # A warning on stderr, as a version skew or an auth plugin prints
+            # on a read that still succeeds.
+            '  echo "W1123 20:10:09 memcache.go:265] couldn\'t get current server API group list" >&2' if warn else "  :",
+            f"  {answer}",
+            "}",
+            "sleep() { :; }",
+        ]
+    )
+    return run_bash(
+        "\n".join(
+            [
+                stub,
+                f'EVAL_FRONT_DOOR="{asked}"',
+                'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                'NAMESPACE="kubeagents-system"',
+                "BRIDGE_TEMPLATE_READ_ATTEMPTS=3",
+                "MODE_NEXT_POLL_SECONDS=0",
+                f'DEPLOY_ARTIFACT_DIR="{tmp}"',
+                lifted_to_line("verify_front_door() {", "}", "verify_front_door"),
+                "verify_front_door",
+            ]
+        )
+    )
+
+
+class FrontDoorVerifiedTest(unittest.TestCase):
+    """#6942: the deploy checks the route the install resolved against
+    EVAL_FRONT_DOOR, records both, and fails on a mismatch, so a run that asked
+    for session but routes plain turns to platform never grades as the
+    session run."""
+
+    def test_a_matching_route_passes_and_records_both(self) -> None:
+        for route in ("platform", "session"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as tmp:
+                result = verify_front_door_run(route, route, tmp)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(_front_door_record(tmp), f"requested={route}\nresolved={route}\n")
+
+    def test_a_route_the_install_resolved_differently_fails_the_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "platform", tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("asked for session, but the install resolved platform", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=platform\n")
+
+    def test_a_read_that_fails_once_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "session", tmp, fail_first=1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("attempt 1 of 3", result.stderr)
+            self.assertIn("connection refused", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=session\n")
+
+    def test_a_warning_on_a_good_read_is_not_the_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", "session", tmp, warn=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=session\nresolved=session\n")
+
+    def test_an_empty_read_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("platform", "platform", tmp, empty_first=2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("has no A2A_DEFAULT_ADDRESSEE yet (attempt 2 of 3)", result.stderr)
+            self.assertEqual(_front_door_record(tmp), "requested=platform\nresolved=platform\n")
+
+    def test_an_unreadable_route_fails_the_deploy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_front_door_run("session", None, tmp)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not read A2A_DEFAULT_ADDRESSEE", result.stderr)
+            self.assertIn("attempt 3 of 3", result.stderr)
+            self.assertIn("resolved=unknown", _front_door_record(tmp))
+
+    def test_the_deploy_fails_on_it_after_the_gates(self) -> None:
+        deploy = text(_CI_DEPLOY)
+        call = deploy.index("if ! verify_front_door; then")
+        self.assertLess(deploy.index("\ngate_web_console\n"), call)
+        self.assertIn("exit 1", deploy[call : deploy.index("\nfi\n", call)])
+
+
 if __name__ == "__main__":
     unittest.main()
+

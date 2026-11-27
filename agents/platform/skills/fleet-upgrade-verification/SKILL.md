@@ -255,7 +255,7 @@ backend, GKE's own URL-backed ones included, as a blocker.
   start-up path in Kubernetes 1.17, and its successor retries. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
-  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
+  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`; a fail-closed webhook whose backend answered is named under `answered`, by its identity keys alone. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
   GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`), and so is a fail-closed webhook with no `rules` (`no_rules`): it matches no request, so the server never calls it and a dead backend behind it fails nothing now.
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
@@ -446,15 +446,16 @@ is no, with the outage named; do not re-grade by hand. An exclusion in effect wh
 the target is `yes` whatever the aside says about automatic versus manual upgrades: the table
 graded the member `blocked` on it, and that is the verdict; the automatic-only qualification
 belongs in the prose beside the line, never in the yes/no. Name a webhook by its configuration,
-the part of the table's `configuration/webhook` cell before the slash; the webhook's own name may
+the part of the table's `configuration/webhook` cell before the slash (for one under `answered`,
+its `config`); the webhook's own name may
 follow it after a slash, never stand in for it.
 The per-object lines are for the objects the table and the JSON name, and for no others. Write a
-line for each webhook under `blocking` and `outage`: the report names a fail-closed webhook only
-when its backend is unreachable. A member's `readiness.webhooks.evaluated` counts the fail-closed
-webhooks with a Service backend the run checked; give the ones that answered as a count, that
-number less the two lists, with no line for them, also when the user asks for a line for every
-webhook whose backend was checked: say that the report names only the unreachable ones (where
-`webhooks` is null there is no count: say the webhooks were not graded). For a readiness answer,
+line for each webhook under `blocking` and `outage`, the fail-closed ones whose backend is
+unreachable. The ones whose backend answered are named under a member's
+`readiness.webhooks.answered` (`evaluated` counts the three lists together). When the user asks
+which webhooks the check tested, or for each one's backend, name every one of them from that list,
+with the backend ready; in any other answer give their count, with no line for them
+(where `webhooks` is null there are no names: say the webhooks were not graded). For a readiness answer,
 do not read budgets, webhook configurations, Services or EndpointSlices with `kubectl`, before
 the run or after it, to fill in names, confirm a cell or add detail: that is the hand survey as
 much as one made in the run's place. A run that exits 1 with the tables printed is still the

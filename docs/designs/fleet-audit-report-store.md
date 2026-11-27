@@ -62,7 +62,9 @@ repository's store. With no public body to check it against, the next no-forge r
 `current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
 that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
 envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
-counted as resolved, as the ledger holds it. Over a gap, so is a previous id on a target the run did
+counted as resolved, as the ledger holds it; so is a previous id on an object a target's note
+names (`noted_objects`) — the collector read it but could not see the result, so the run did not
+see the finding go away. Over a gap, so is a previous id on a target the run did
 not check ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 
 Two runs have a repository setting but take the no-forge path, and they store marked envelopes. A run
@@ -113,7 +115,8 @@ in the run record, read as `finish` begins, else the in-flight note's, else null
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
 dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
-run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
+run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), the ids of
+its noted objects (`scheduled_noted_ids`), and the
 ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
 The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an
 on-demand run copies them from the record before it. A run that `precheck` closed from the stored
@@ -257,22 +260,26 @@ The sandbox's own file store holds every run from before the switch, and the bro
 empty. So the first time a script touches a stream through the broker (a read, or a write) while the
 pod's local root holds it with no `.seeded-to-broker` marker, the script copies it in. It holds an
 flock on the local stream directory throughout, and looks for the marker again once it has it, so two
-seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. When the
-broker's ring is empty, or holds only stamps the local ring holds (a seed that stopped part way), the
-local entries it lacks and that are newer than its newest go oldest first. Then `latest.json` goes,
-only when it is a byte copy of the newest local entry and, checked again just before the write, the
-broker's newest ring entry is that same run and it has no other `latest`: a run that landed through
-the broker meanwhile (a profile worker takes no local lock) keeps its own, so a seed never rolls
+seeds on the pod, or a seed and a `finish` there (whose writes seed first), take turns. Each attempt
+copies every local ring entry the broker's ring lacks, oldest first, whatever other runs the broker
+holds: a profile worker's, or this shell's own `finish`, that wrote the stream before the seed began
+or while it copied. The one exception is an entry the listener would prune at once: with the broker's
+ring already at its 14 entries, a local entry older than its oldest is skipped and counted as done.
+Then `latest.json` goes, only when it is a byte copy of the newest local entry and, checked just
+before the write, the broker's newest ring entry is that same run and it has no `latest`: a run that
+landed through the broker (a profile worker takes no local lock) keeps its own, so a seed never rolls
 `latest` back. Then the script leaves the marker so the copy never repeats, and logs one line for the
-stream. When the broker's ring holds a run the local one does not, a run has written the stream since:
-nothing is copied, and the marker is left only when every local entry is already in the broker. A
-stream the broker refuses to take (a 403: a repository the install does not register) is skipped and
-logged with no marker, so a later registration can still seed it. A store that cannot be used now
-fails the read or write that started the seed, as an outage, and the next touch in the same process
-seeds again: a run's write never lands on a stream half copied, where the broker's ring would then hold
-a stamp the local one lacks and the rest of the local history would never be copied. Any other
-failure leaves no marker, so the next run resumes where it stopped. The copy is idempotent and never deletes or changes
-a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
+stream. The marker is left exactly when every local entry is on the broker or skipped as above,
+including when nothing needed copying. A stream the broker refuses to take (a 403: a repository the
+install does not register) is skipped and logged with no marker, so a later registration can still
+seed it, and so is a stream whose run write it answers 409 (the store path, not the entry: a symlink, a
+full directory). An entry it refuses alone (a 400 or 413) is skipped and the rest still copy. A store
+that cannot be used now fails the read or write that started the seed, as an outage, and the next
+touch in the same process seeds again, so a run never reads a stream half copied as a first run. Any
+other failure (another refusal, a local file that cannot be read) is logged, leaves no marker, and
+lets the read or write go on; the next process's seed copies what is still missing and marks the
+stream, whatever the broker was written in between. A `PUT` of a stamp the listener already holds
+rewrites it, so the copy is idempotent. It never deletes or changes a local envelope, so a rollback to the file store finds the history as it was at the seed. A profile
 worker has no local store, so nothing is seeded there. The known limit: the copied envelopes are as
 trustworthy as today's file store, which the agent can write; the seed is not attested.
 
@@ -396,6 +403,18 @@ human or an external tool recovers a run's id set with no pod access. The identi
 remediation pull request bodies keeps both its write and its read, because reconciliation has to
 work from the live pull request list, which humans change between runs.
 
+### Shadow streams
+
+A shadow run (`start` and `finish` with `--store-only`, #5623) is a canary beside the job it may
+replace. It writes its report to the store and nothing else: no ledger, no forge or git write, no
+remediation and no chat. Its envelopes go to a stream of their own, so two runs of one audit never
+move each other's baseline: the triggering schedule's name when the worker exports it
+(`PROFILE_TRIGGER_STREAM`), or `<audit>-shadow` for a run started by hand. They are stored under the
+install's own store key, which is the one key the broker lets a profile write to, and the stream is
+the trigger's stream, as the broker also requires. A shadow envelope carries `shadow: true`, the
+stream, and `shadow_summary`, the summary a live run would have posted. The store is a shadow run's
+only output, so a write that fails fails the run.
+
 ## 5. Liveness
 
 Whether a run is in flight comes from the lease `start` takes — the in-flight note
@@ -440,6 +459,14 @@ directory, so one the stream stopped publishing to keeps its last row, unflagged
 deletes `<audit-id>/<owner>/<name>/` from the store. `report_status.py` therefore imports nothing outside the standard
 library and references no `__file__`; `report_query.py` imports its reading helpers so the two do
 not grow two parsers of the same files.
+
+A shadow run's stream (#5623) holds a canary's results, not a live audit's. `report_status.project`
+leaves it out and counts it as `shadow_hidden`, so the board snapshot and the status view never show
+it, and `report_query.py` leaves it out of `streams` and refuses a question about one of its runs,
+unless `--include-shadow` asks for it. That flag is for the canary's comparison and its eval, never
+for an answer to a person. A stream is a shadow run's when its newest envelope carries `shadow: true`,
+which is enough because a shadow run never writes to a live audit's stream. The broker's raw routes
+don't filter; a reader that goes around these two must check the key itself.
 
 ## 7. Rejected alternatives
 

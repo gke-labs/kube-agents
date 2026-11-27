@@ -74,7 +74,7 @@ def is_bare(path: Path | str) -> bool:
     return (Path(path) / "HEAD").is_file() and (Path(path) / "refs").is_dir()
 
 
-def git(cwd: Path | str, *args: str, check: bool = True):
+def git(cwd: Path | str, *args: str, check: bool = True, env_override: dict[str, str] | None = None):
     # A bare repository is named, as `safe.bareRepository=explicit` asks.
     named = [vcs_broker.GIT_DIR_IS_CWD] if is_bare(cwd) else []
     return subprocess.run(
@@ -83,7 +83,7 @@ def git(cwd: Path | str, *args: str, check: bool = True):
         capture_output=True,
         text=True,
         check=check,
-        env={**os.environ, **GIT_ENV},
+        env={**os.environ, **GIT_ENV, **(env_override or {})},
     )
 
 
@@ -2480,6 +2480,17 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("proposal-claim", vcs_broker.VCS_VERBS)
         self.assertNotIn("proposal-claim", vcs_broker.WRITE_VERBS)
 
+    def test_proposal_claim_confirms_a_proposal_already_merged(self):
+        # A repository's auto-merge workflow can merge the fix before the hook
+        # presents the token; refusing it left the fix without a post-merge
+        # record (#6947).
+        merged = (datetime.now(timezone.utc) - timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        broker, _ = self.broker(self.CLAIM_STATUS, self._claim_node(state="closed", merged_at=merged))
+        answer = broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(
+            {"url": "https://github.com/acme/infra/pull/7", "number": 7, "title": "Bump replicas"}, answer
+        )
+
     def test_write_mode_reads_the_two_tier_values_and_fails_closed(self):
         env = vcs_broker.WRITE_MODE_ENV
         self.assertEqual("KUBEAGENTS_WRITE_MODE", env)
@@ -2683,7 +2694,6 @@ class CollaborationTest(unittest.TestCase):
         ahead = (datetime.now(timezone.utc) + timedelta(seconds=vcs_broker.CLAIM_CLOCK_SKEW_SECONDS + 120))
         for case, node in (
             ("closed", self._claim_node(state="closed")),
-            ("merged", self._claim_node(state="closed", merged_at="2026-11-03T00:00:00Z")),
             ("too old", self._claim_node(created_at=old.strftime("%Y-%m-%dT%H:%M:%SZ"))),
             ("from the future", self._claim_node(created_at=ahead.strftime("%Y-%m-%dT%H:%M:%SZ"))),
             ("no created time", self._claim_node(created_at="")),
@@ -5069,6 +5079,82 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         self.assertEqual(caught_lock.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
         self.assertIn("DEC-2026-003", str(caught_lock.exception))
 
+    def test_publish_invokes_on_decision_memory_check_callback(self):
+        verdicts: list[str] = []
+        self.broker.on_decision_memory_check = verdicts.append
+
+        # Repo without knowledge/ or .kube-agents/intent.yaml -> callback must NOT fire.
+        work_nok, cloned_nok = self.clone_locally("dm-cb-noknowledge")
+        git(work_nok, "checkout", "--quiet", "-b", "platform-agent/dm-cb-nok")
+        (work_nok / "readme.txt").write_text("no knowledge\n", encoding="utf-8")
+        git(work_nok, "add", "-A")
+        git(work_nok, "commit", "--quiet", "-m", "no knowledge change")
+        self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/dm-cb-nok",
+            "target": "main",
+            "baseRevision": cloned_nok["revision"],
+            "bundleBase64": self.bundle_of(work_nok, "platform-agent/dm-cb-nok", cloned_nok["revision"]),
+        })
+        self.assertEqual(verdicts, [])
+
+        self._seed_guard_on_main()
+
+        # Clean unrelated file -> allow
+        work_clean, cloned_clean = self.clone_locally("dm-cb-clean")
+        git(work_clean, "checkout", "--quiet", "-b", "platform-agent/dm-cb-clean")
+        (work_clean / "docs.txt").write_text("unrelated\n", encoding="utf-8")
+        git(work_clean, "add", "-A")
+        git(work_clean, "commit", "--quiet", "-m", "unrelated change")
+        self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/dm-cb-clean",
+            "target": "main",
+            "baseRevision": cloned_clean["revision"],
+            "bundleBase64": self.bundle_of(work_clean, "platform-agent/dm-cb-clean", cloned_clean["revision"]),
+        })
+
+        # Consistent guarded file returning markdown -> warn
+        work_warn, cloned_warn = self.clone_locally("dm-cb-warn")
+        git(work_warn, "checkout", "--quiet", "-b", "platform-agent/dm-cb-warn")
+        (work_warn / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n",
+            encoding="utf-8",
+        )
+        git(work_warn, "add", "-A")
+        git(work_warn, "commit", "--quiet", "-m", "compliant memory raise")
+        self.broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": "platform-agent/dm-cb-warn",
+            "target": "main",
+            "baseRevision": cloned_warn["revision"],
+            "bundleBase64": self.bundle_of(work_warn, "platform-agent/dm-cb-warn", cloned_warn["revision"]),
+        })
+
+        # Violating guarded file -> block
+        work_block, cloned_block = self.clone_locally("dm-cb-block")
+        git(work_block, "checkout", "--quiet", "-b", "platform-agent/dm-cb-block")
+        (work_block / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n",
+            encoding="utf-8",
+        )
+        git(work_block, "add", "-A")
+        git(work_block, "commit", "--quiet", "-m", "violating memory drop")
+        with self.assertRaises(WorkspaceError):
+            self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/dm-cb-block",
+                "target": "main",
+                "baseRevision": cloned_block["revision"],
+                "bundleBase64": self.bundle_of(work_block, "platform-agent/dm-cb-block", cloned_block["revision"]),
+            })
+
+        self.assertEqual(verdicts, ["allow", "warn", "block"])
+
     def test_build_vcs_broker_publish_passes_executor_vcs_git_subcommand_gate(self):
         import credential_proxy
 
@@ -5142,7 +5228,19 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
             encoding="utf-8",
         )
         git(work_ok, "add", "-A")
-        git(work_ok, "commit", "--quiet", "-m", "raise memory to 4Gi")
+        git(
+            work_ok,
+            "commit",
+            "--quiet",
+            "-m",
+            "raise memory to 4Gi",
+            env_override={
+                "GIT_AUTHOR_NAME": "kube-agents",
+                "GIT_AUTHOR_EMAIL": "kube-agents@users.noreply.invalid",
+                "GIT_COMMITTER_NAME": "kube-agents",
+                "GIT_COMMITTER_EMAIL": "kube-agents@users.noreply.invalid",
+            },
+        )
         bundle_ok = self.bundle_of(work_ok, "platform-agent/exec-ok", cloned["revision"])
 
         ans = broker.publish({
@@ -5165,7 +5263,19 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
             encoding="utf-8",
         )
         git(work_bad, "add", "-A")
-        git(work_bad, "commit", "--quiet", "-m", "drop memory to 256Mi")
+        git(
+            work_bad,
+            "commit",
+            "--quiet",
+            "-m",
+            "drop memory to 256Mi",
+            env_override={
+                "GIT_AUTHOR_NAME": "kube-agents",
+                "GIT_AUTHOR_EMAIL": "kube-agents@users.noreply.invalid",
+                "GIT_COMMITTER_NAME": "kube-agents",
+                "GIT_COMMITTER_EMAIL": "kube-agents@users.noreply.invalid",
+            },
+        )
         bundle_bad = self.bundle_of(work_bad, "platform-agent/exec-bad", cloned["revision"])
 
         with self.assertRaises(WorkspaceError) as caught_bad:
@@ -5179,6 +5289,150 @@ class DecisionMemoryBrokerPublishTest(unittest.TestCase):
         self.assertEqual(caught_bad.exception.status, 409)
         self.assertEqual(caught_bad.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
         self.assertIn("DEC-2026-001", str(caught_bad.exception))
+
+    def test_proposal_closer_verb_dispatches_to_forge(self):
+        class CloserForge(LocalForge):
+            verbs = (*LocalForge.verbs, "proposal-closer")
+
+            def proposal_closer(self, api, repo, payload):
+                del api, repo
+                return {"actor": "alice", "bot": False, "number": payload["number"]}
+
+        self.broker.registry.hosts["local.test"] = CloserForge(self.forges, set())
+        ans = self.broker.proposal_closer({"repository": self.REPOSITORY, "number": 17})
+        self.assertEqual(ans["actor"], "alice")
+        self.assertFalse(ans["bot"])
+        self.assertEqual(route_table(self.broker)["proposal-closer"]({"repository": self.REPOSITORY, "number": 17})["actor"], "alice")
+
+    def test_publish_enforces_install_commit_identities_and_allows_advancing_human_pr(self):
+        import credential_proxy
+
+        install_env = {
+            "GIT_AUTHOR_NAME": "kube-agents",
+            "GIT_COMMITTER_NAME": "kube-agents",
+        }
+        state_dir = Path(self.tmp.name) / "executor-identity-state"
+        executor = credential_proxy.CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=1 << 20,
+            state_dir=str(state_dir),
+        )
+        executor.environment["GIT_ALLOW_PROTOCOL"] = "https:file"
+        broker = credential_proxy.build_vcs_broker(executor)
+        broker.registry.hosts["local.test"] = self.forge
+
+        # 1. Spoofed human email is refused with 403 FORBIDDEN_COMMIT_IDENTITY before pushing.
+        work_spoof, cloned_spoof = self.clone_locally("spoof")
+        git(work_spoof, "checkout", "--quiet", "-b", "platform-agent/spoof")
+        (work_spoof / "note.txt").write_text("spoofed\n", encoding="utf-8")
+        git(work_spoof, "add", "-A")
+        git(
+            work_spoof,
+            "commit",
+            "--quiet",
+            "-m",
+            "spoofed commit",
+            env_override={
+                "GIT_AUTHOR_NAME": "Alice Reviewer",
+                "GIT_AUTHOR_EMAIL": "reviewer@company.com",
+                "GIT_COMMITTER_NAME": "Alice Reviewer",
+                "GIT_COMMITTER_EMAIL": "reviewer@company.com",
+            },
+        )
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/spoof",
+                "target": "main",
+                "baseRevision": cloned_spoof["revision"],
+                "bundleBase64": self.bundle_of(work_spoof, "platform-agent/spoof", cloned_spoof["revision"]),
+            })
+        self.assertEqual(caught.exception.status, 403)
+        self.assertEqual(caught.exception.fields.get("code"), "FORBIDDEN_COMMIT_IDENTITY")
+
+        # 2. Install commit email succeeds and advancing on top of a human commit on existing_head succeeds.
+        for label, email in (
+            ("noreply", "kube-agents@users.noreply.invalid"),
+            ("platform", "platform-agent@kube-agents.invalid"),
+        ):
+            with self.subTest(email=email):
+                work_ok, cloned_ok = self.clone_locally(f"ok-{label}")
+                branch = f"platform-agent/ok-{label}"
+                git(work_ok, "checkout", "--quiet", "-b", branch)
+                (work_ok / f"{label}.txt").write_text("ok\n", encoding="utf-8")
+                git(work_ok, "add", "-A")
+                git(
+                    work_ok,
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "install commit",
+                    env_override={**install_env, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_EMAIL": email},
+                )
+                ans = broker.publish({
+                    "repository": self.REPOSITORY,
+                    "branch": branch,
+                    "target": "main",
+                    "baseRevision": cloned_ok["revision"],
+                    "bundleBase64": self.bundle_of(work_ok, branch, cloned_ok["revision"]),
+                })
+                self.assertEqual(ans["branch"], branch)
+
+        # Simulate a human reviewer pushing a commit onto an existing branch, then agent advancing with install email.
+        human_branch = "platform-agent/human-followup"
+        work_h, _ = self.clone_locally("human-base")
+        git(work_h, "checkout", "--quiet", "-b", human_branch)
+        (work_h / "step1.txt").write_text("human edit\n", encoding="utf-8")
+        git(work_h, "add", "-A")
+        git(
+            work_h,
+            "commit",
+            "--quiet",
+            "-m",
+            "human push to PR branch",
+            env_override={
+                "GIT_AUTHOR_NAME": "Alice Reviewer",
+                "GIT_AUTHOR_EMAIL": "reviewer@company.com",
+                "GIT_COMMITTER_NAME": "Alice Reviewer",
+                "GIT_COMMITTER_EMAIL": "reviewer@company.com",
+            },
+        )
+        remote_repo = self.origin
+        git(work_h, "push", "--quiet", str(remote_repo), f"refs/heads/{human_branch}:refs/heads/{human_branch}")
+        human_tip = git(work_h, "rev-parse", "HEAD").stdout.strip()
+        broker.registry.hosts["local.test"] = ProposingLocalForge(
+            self.forges, self.refreshed, open_sources={human_branch}, author="alice"
+        )
+
+        # Now agent advances on top of existing_head with an install email -> passes!
+        work_adv = Path(self.tmp.name) / "adv-copy"
+        git(self.tmp.name, "clone", "--quiet", "--branch", human_branch, str(remote_repo), str(work_adv))
+        (work_adv / "step2.txt").write_text("agent followup\n", encoding="utf-8")
+        git(work_adv, "add", "-A")
+        git(
+            work_adv,
+            "commit",
+            "--quiet",
+            "-m",
+            "agent followup",
+            env_override={
+                **install_env,
+                "GIT_AUTHOR_EMAIL": "platform-agent@kube-agents.invalid",
+                "GIT_COMMITTER_EMAIL": "platform-agent@kube-agents.invalid",
+            },
+        )
+        adv_bundle_path = Path(self.tmp.name) / "adv.bundle"
+        git(work_adv, "bundle", "create", str(adv_bundle_path), f"{human_tip}..refs/heads/{human_branch}")
+        adv_ans = broker.publish({
+            "repository": self.REPOSITORY,
+            "branch": human_branch,
+            "target": "main",
+            "baseRevision": human_tip,
+            "clonedFrom": human_branch,
+            "advance": True,
+            "bundleBase64": base64.b64encode(adv_bundle_path.read_bytes()).decode("ascii"),
+        })
+        self.assertEqual(adv_ans["branch"], human_branch)
 
 
 if __name__ == "__main__":

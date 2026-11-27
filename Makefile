@@ -17,8 +17,8 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 # make command line only: the golang image exports an environment variable of
 # the same name (a bare version, no `-alpine`), and a build inside such a
 # container must not take its builder tag from there.
-ifeq ($(origin GOLANG_VERSION),environment)
-GOLANG_VERSION :=
+ifneq ($(filter environment%,$(origin GOLANG_VERSION)),)
+override GOLANG_VERSION :=
 endif
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE GOLANG_VERSION
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
@@ -45,7 +45,7 @@ HERMES_BRIDGE_IMAGE_ARGS := $(foreach v,$(HERMES_BRIDGE_IMAGE_VARS),$(if $($(v))
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help gosec docker-build docker-build-agents docker-build-credential-proxy docker-build-hermes-bridge docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check recipe-new recipe-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check sqlite-plan-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance persona-manifests
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -217,6 +217,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
+	$(wildcard agents/platform/scripts/fix_recipes/*/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard agents/*/plugins/*/test_*.py) \
 	$(wildcard agents/*/defaults/hooks/*/test_*.py) \
@@ -884,15 +885,29 @@ scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the targ
 # scripts/test_task_registration.py (the tree-level scans, the sanitizer and
 # the run-record guard, as assertions of their own there); this target is the
 # fast path to them. One rule loads each check entry with the harness's own
-# parser, which is in the bench package (`make test-bench-deps`): without the
-# package it does not run and the last line of the output says so, and its
-# gate in CI is bench/tests/test_case_entries_load.py.
+# parser, which is in the bench package (`make test-bench-deps`): without this
+# checkout's package, or with one whose installed data is behind
+# bench/pyproject.toml, it does not run and the last line of the output says
+# so, and its gate in CI is bench/tests/test_case_entries_load.py.
 bench-case-check: ## Validate every bench task.yaml against the case-format contract (no cluster).
 	@python3 -c "import yaml" 2>/dev/null || { \
 		echo "bench-case-check needs PyYAML: python3 -m pip install pyyaml (or make test-python-deps)"; \
 		exit 1; \
 	}
 	@python3 scripts/validate_bench_cases.py
+
+# The fix recipes (agents/platform/scripts/fix_recipes/). recipe-check flags a
+# change that edits a recipe and the shared plumbing beside it when given
+# RECIPE_CHECK_BASE, the commit to compare against; CI passes the pull
+# request's base.
+RECIPE_CHECK_BASE ?=
+recipe-new: ## Scaffold a fix recipe: make recipe-new KIND=<audit check id>.
+	@test -n "$(KIND)" || { echo "usage: make recipe-new KIND=<audit check id>"; exit 1; }
+	@python3 scripts/recipe_new.py "$(KIND)"
+
+recipe-check: ## Validate every fix recipe: it loads, its eval case names it back, no scaffold line is left.
+	@python3 -c "import yaml" 2>/dev/null || { echo "recipe-check needs PyYAML: python3 -m pip install pyyaml"; exit 1; }
+	@python3 scripts/check_recipes.py $(if $(RECIPE_CHECK_BASE),--base "$(RECIPE_CHECK_BASE)")
 
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
@@ -904,8 +919,12 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # Install a Go toolchain before trusting a green run here: the injector seam
 # compiles the real Go client, and without `go` on PATH it skips itself rather
 # than failing, which reads exactly like a pass.
+#
+# The tests run with KUBECONFIG set to an empty file, as each file of the
+# test-python sweep does, so an unstubbed kubectl or helm call finds no cluster.
 test-integration: ## Run just the integration seam tests; CI reaches them through the PYTHON_TEST_DIRS sweep.
-	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
+	@kubeconfig=$$(mktemp) && trap 'rm -f "$$kubeconfig"' EXIT INT TERM && \
+	cd tests/integration && KUBECONFIG="$$kubeconfig" PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona
 # that cites a renamed skill or an SOP that names a moved script merges clean
@@ -940,7 +959,7 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line, and every shipped skill document fits skill_view.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, every patch header carries a valid Eval-Case line and a Retire-When line in one of its three forms, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
 	@python3 scripts/check_skill_size.py
 
@@ -955,9 +974,21 @@ skills-verify-upstream: ## Compare each upstream copy with google/skills at its 
 # <!-- BEGIN GENERATED --> regions.
 # The SOP line numbers each governance cron prompt cites are recomputed first,
 # so the cron-job-example regions below render the prompt with them current.
-docs-generate: ## Regenerate the generated doc regions and files from their sources.
+docs-generate: persona-manifests ## Regenerate the generated doc regions and files from their sources, and the shipped personas' content manifests.
 	@python3 scripts/generate_sop_geography.py
 	@python3 scripts/generate_docs.py
+
+# A shipped persona's skills_manifest.sha256 is committed beside it, because a
+# persona image's Dockerfile is only FROM and COPY (hack/check-image-inventory.sh);
+# a2a/cmd/persona's tests fail while one doesn't match its persona. --git
+# covers only the files a clean checkout holds, which is what CI builds the
+# image from, so an ignored local file (a __pycache__) is left out and left
+# alone.
+PERSONA_DIRS := $(wildcard agents/*/persona)
+persona-manifests: ## Rewrite each shipped persona's content manifest (agents/*/persona/skills_manifest.sha256).
+	@for d in $(PERSONA_DIRS); do \
+		go -C a2a run ./cmd/persona manifest --git --in "../$$d" || exit 1; \
+	done
 
 # Everything CI enforces about the docs, in one command.
 docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases docs-check-cron-inventory ## Run every documentation check CI runs.
