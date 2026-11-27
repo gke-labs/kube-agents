@@ -341,7 +341,7 @@ echo '{"type":"result","text":"ok"}'
 
 // TestACoreAgentProfileWorkerWithoutAUsableGrantStops: a core-agent profile
 // worker with no persona, or one whose grant won't render, stops before it
-// takes a task rather than run on the session grant.
+// takes a task rather than run with the empty grant it started with.
 func TestACoreAgentProfileWorkerWithoutAUsableGrantStops(t *testing.T) {
 	url := startServer(t)
 	for name, pw := range map[string]ProfileWorkerConfig{

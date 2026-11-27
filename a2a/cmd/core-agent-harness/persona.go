@@ -87,9 +87,8 @@ func (s baseDirSource) LoadInstructions(ctx context.Context, name string) (strin
 	base := filepath.Join(s.base, name)
 	header := skillBaseDirPrefix + base + "\n"
 	if scripts := s.scripts(name); len(scripts) > 0 {
-		// The shell runs a skill's script only by its absolute path, with
-		// no interpreter word in front, so say so where the skill's own text
-		// may say otherwise.
+		// The skill's own text may name its scripts by a relative path, so
+		// list each by the absolute path the shell finds it at.
 		header += skillScriptsNote
 		for _, rel := range scripts {
 			header += "- " + filepath.Join(base, rel) + "\n"
@@ -98,8 +97,11 @@ func (s baseDirSource) LoadInstructions(ctx context.Context, name string) (strin
 	return header + "\n" + text, nil
 }
 
-// skillScriptsNote introduces the list of a skill's scripts.
-const skillScriptsNote = "Run this skill's scripts directly by these absolute paths, with their arguments after them; a command that starts with an interpreter such as python3 or sh is refused:\n"
+// skillScriptsNote introduces the list of a skill's scripts. A persona that
+// ships scripts grants the shell, and a persona's shell runs any command
+// (toolgrant.CoreAgentGrant.AnyShellCommand), so the note names no form the
+// shell refuses.
+const skillScriptsNote = "Run this skill's scripts by these absolute paths, with their arguments after them:\n"
 
 // scripts are the executable files of skill name, relative to its directory.
 func (s baseDirSource) scripts(name string) []string { return s.exec[name] }

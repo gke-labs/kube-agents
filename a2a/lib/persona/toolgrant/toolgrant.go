@@ -1,7 +1,7 @@
 // Package toolgrant is a worker's tool grant in harness-neutral terms, and
 // its rendering for the core-agent harness (github.com/go-steer/core-agent):
-// which built-in tools are registered, the allow-mode permission rules the
-// gate applies, the MCP tools each server may expose, and whether Gemini's
+// which built-in tools are registered, the permission rules the gate
+// applies, the MCP tools each server may expose, and whether Gemini's
 // server-side search is on.
 //
 // The grant is enforced at three layers, each fail-closed on its own:
@@ -9,16 +9,20 @@
 //     registered, so the model is never told it exists (Builtins, MCP); a
 //     persona's three read-only skill tools are the one fixed addition;
 //   - the gate, in allow mode: a call no allow rule matches is refused, and
-//     deny rules win (CoreAgentGrant.Allow, Deny);
+//     deny rules win (CoreAgentGrant.Allow, Deny). A grant with Shell runs
+//     in core-agent's mode that refuses no unmatched call instead
+//     (CoreAgentGrant.AnyShellCommand), where the deny rules, core-agent's
+//     shell denylist and its sandbox and search checks still hold;
 //   - the before-tool check: the harness's plugin re-checks every call
 //     against the grant's tools as it happens (plus the read-only skill
 //     tools), so a tool that reaches the model by some other path is still
 //     refused. Permits is the same check, for code outside the harness.
 //
 // The shell's boundary stays the sandbox, the credential broker and the
-// verb allowlist; the gate narrows it. core-agent auto-allows a bash prefix
-// rule only for a single simple command with a literal argv (no chaining,
-// pipes, redirections or expansions), and deny rules match broadly.
+// verb allowlist; the gate narrows it. In allow mode core-agent auto-allows
+// a bash prefix rule only for a single simple command with a literal argv
+// (no chaining, pipes, redirections or expansions), which is why Shell
+// leaves allow mode; deny rules match broadly.
 package toolgrant
 
 import (
@@ -41,11 +45,13 @@ type Policy struct {
 	WebSearch bool
 	// Shell: the shell may run any command, compound ones included (a
 	// persona's `shell`, which Claude Code grants as an unrestricted Bash):
-	// the harness skips core-agent's single-command check for it
-	// (CoreAgentGrant.AnyShellCommand), keeping deny rules and core-agent's
-	// built-in denylist. Its boundary is the sandbox and the credential
-	// broker, as on Claude Code. A session's shell is ShellPrefixes, never
-	// this.
+	// the harness runs the turn in core-agent's mode that refuses no
+	// unmatched call (CoreAgentGrant.AnyShellCommand), keeping deny rules,
+	// core-agent's built-in denylist and its sandbox and search checks.
+	// That mode also drops the read tools' workspace scope, so the harness
+	// refuses a grant that pairs Shell with a file write. Its boundary is
+	// the sandbox and the credential broker, as on Claude Code. A session's
+	// shell is ShellPrefixes, never this.
 	Shell bool
 	// ShellPrefixes are the only commands the shell may run, each a binary
 	// with optional subcommands ("kubectl", "gh pr list"). Empty, with no
@@ -72,8 +78,9 @@ type MCPGrant struct {
 	Tools  []string
 }
 
-// CoreAgentMode is the only permission mode a core-agent worker runs in:
-// non-interactive, allowlist only. A call no rule allows is refused.
+// CoreAgentMode is the permission mode a core-agent worker runs in unless
+// its grant has Shell (CoreAgentGrant.AnyShellCommand): non-interactive,
+// allowlist only. A call no rule allows is refused.
 const CoreAgentMode = "allow"
 
 // coreAgentClass is how a core-agent built-in maps to a grant.
@@ -158,6 +165,7 @@ type CoreAgentGrant struct {
 	// Builtins are the built-in tools to register, sorted.
 	Builtins []string
 	// Allow and Deny are gate rules, "<tool>:<glob>", for CoreAgentMode.
+	// With AnyShellCommand only Deny refuses a call.
 	Allow, Deny []string
 	// MCP maps a server to the tools it may expose (its tool allowlist).
 	MCP map[string][]string
@@ -167,7 +175,8 @@ type CoreAgentGrant struct {
 	// code execution are never on.
 	GeminiGoogleSearch bool
 	// AnyShellCommand is Policy.Shell as the harness runs it: any command,
-	// compound ones included (coreagentwire.Policy.AnyShellCommand).
+	// compound ones included, in the mode that refuses no unmatched call
+	// rather than CoreAgentMode (coreagentwire.Policy.AnyShellCommand).
 	AnyShellCommand bool
 }
 
@@ -220,8 +229,9 @@ func (p Policy) CoreAgent(workspace string) (CoreAgentGrant, error) {
 	// env prefixes or expansions); a command needs both to run with and
 	// without arguments.
 	if p.Shell {
-		// An open prefix: any command, still only as one simple literal
-		// command (above).
+		// An open prefix. In allow mode it would pass only one simple
+		// literal command (above); the harness runs a Shell grant outside
+		// allow mode (AnyShellCommand), where a compound command passes too.
 		g.Allow = append(g.Allow, "bash:*")
 	}
 	for _, prefix := range p.ShellPrefixes {

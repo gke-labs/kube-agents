@@ -290,13 +290,16 @@ func TestTheGateRunsExactlyTheGrantedShell(t *testing.T) {
 	}
 }
 
-// TestAPersonaShellIsInEffectUnrestricted: a persona's shell grant
-// (toolgrant.Policy.Shell, which Claude Code grants as an unrestricted Bash)
-// through core-agent's real gate. Top-level composition is refused and the
-// verb checks hold, but a single command may be an interpreter that
-// composes anything (`bash -c`, `python3 -c`), and passes: the grant is in
-// effect an unrestricted shell, as on Claude Code, bounded by the sandbox
-// and the broker. Pinned both ways so neither is misread.
+// TestAPersonaShellIsInEffectUnrestricted: the allow rule of a persona's
+// shell grant (toolgrant.Policy.Shell, which Claude Code grants as an
+// unrestricted Bash) through core-agent's real gate in allow mode, the
+// policy built here without AnyShellCommand. Top-level composition is
+// refused and the verb checks hold, but a single command may be an
+// interpreter that composes anything (`bash -c`, `python3 -c`), and passes:
+// even in allow mode the rule is in effect an unrestricted shell, as on
+// Claude Code, bounded by the sandbox and the broker. Pinned both ways so
+// neither is misread. The harness runs the grant itself with
+// AnyShellCommand (TestAPersonaShellRunsAnyCommand).
 func TestAPersonaShellIsInEffectUnrestricted(t *testing.T) {
 	g, err := toolgrant.Policy{Shell: true}.CoreAgent("/scratch")
 	if err != nil {
