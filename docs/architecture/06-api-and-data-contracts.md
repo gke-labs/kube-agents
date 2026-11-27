@@ -315,8 +315,9 @@ kube-agents integrates with the customer's existing pipeline and IaC rather than
 
 OKF ([Open Knowledge Format](https://github.com/GoogleCloudPlatform/open-knowledge-format), v0.2
 [`SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)) =
-markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (a dedicated repo stays
-optional for later). It lives outside the paths the pipeline deploys (`clusters/<cluster>/`,
+markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (a dedicated repo,
+external read-only sources, and a separate agent output store are proposed in
+[`docs/designs/pluggable-knowledge-backend.md`](../designs/pluggable-knowledge-backend.md)). It lives outside the paths the pipeline deploys (`clusters/<cluster>/`,
 `fleet/`), so it is never applied to a cluster. Required frontmatter field: `type`. Convention for
 kube-agents knowledge types:
 
