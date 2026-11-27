@@ -901,7 +901,10 @@ const (
 	a2aProvisionReportHeldKey                  = "held"
 	a2aProvisionReportSafeKey                  = "safe"
 	a2aProvisionReportMissingKey               = "missing"
+	a2aUpgradeReadinessSubject                 = "a2a.topics.agent.platform.upgrade-readiness"
 	a2aTopologySkewSubject                     = "a2a.topics.agent.platform.topology-skew"
+	a2aSharedBlueprintSubject                  = "a2a.topics.shared.blueprint"
+	a2aSharedProbeSubject                      = "a2a.topics.shared.probe"
 	// a2aProvisionContainerName is the Job pod's one container, named because
 	// the report reader looks its termination state up by name.
 	a2aProvisionContainerName = "provision"
@@ -965,6 +968,11 @@ const (
 		"this render creates the stream with it and provisioning does not change an existing stream's subjects, so nothing can publish to that topic " +
 		"until an operator appends it to the stream's current subject list (read it with nats stream info TOPICS-STATE): " +
 		"nats stream edit TOPICS-STATE --subjects=\"<current subjects>,%s\""
+	reasonTopicsStateSubjectsAppended       = "TopicsStateSubjectsAppended"
+	topicsStateSubjectsAppendedEventMessage = "provision Job %s found the TOPICS-STATE stream without subject(s) %s; " +
+		"the operator appended the missing subject(s) to TOPICS-STATE without changing retention, limits, existing subjects or RePublish"
+	topicsStateAppendFailedLogMsg = "could not append the missing TOPICS-STATE subjects; recording the finding Event"
+	topicsStateSubjectsJoinSep    = ", "
 
 	// The condition that reports the verifier, and the reason it is a
 	// condition rather than a Ready row.
@@ -4985,9 +4993,20 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 			outcome = a2aProvisionReportOutcomeReported
 		}
 		if findings.topicsStateSubjectMissing {
-			r.recordEvent(agent, corev1.EventTypeWarning, reasonTopicsStateSubjectMissing,
-				fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
-			outcome = a2aProvisionReportOutcomeReported
+			if added, checked, err := r.appendTopicsStateSubjects(ctx, agent); err == nil && checked {
+				if len(added) > 0 {
+					r.recordEvent(agent, corev1.EventTypeNormal, reasonTopicsStateSubjectsAppended,
+						fmt.Sprintf(topicsStateSubjectsAppendedEventMessage, job.Name, strings.Join(added, topicsStateSubjectsJoinSep)))
+					outcome = a2aProvisionReportOutcomeReported
+				}
+			} else {
+				if err != nil {
+					log.Error(err, topicsStateAppendFailedLogMsg)
+				}
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonTopicsStateSubjectMissing,
+					fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
+				outcome = a2aProvisionReportOutcomeReported
+			}
 		}
 		for _, f := range []*streamCapFinding{findings.tasksMaxBytes, findings.topicsJournalMaxBytes} {
 			if f == nil {

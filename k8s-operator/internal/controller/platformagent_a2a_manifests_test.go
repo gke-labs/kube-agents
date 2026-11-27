@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	sigsyaml "sigs.k8s.io/yaml"
 
@@ -53,6 +54,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"k8s.io/client-go/tools/record"
 )
 
@@ -3337,6 +3341,196 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 				t.Errorf("provision identity holds %q for %q, which a2aProvisionedStreams does not name", grant, stream)
 			}
 		}
+	}
+}
+
+// TestProvisionCannotUpdateTopicsStateOnARealServer runs the rendered
+// provisionIdentity grants on an embedded NATS server (#6397): provision stays
+// create-only and is refused STREAM.UPDATE on TOPICS-STATE, TASKS, and
+// TOPICS-JOURNAL as well as STREAM.DELETE, STREAM.PURGE, and direct publish to
+// a2a.tasks.>. It then proves on the same server why STREAM.UPDATE.TOPICS-STATE
+// is withheld from provision (the server permits a holder of STREAM.UPDATE to
+// alter limits, remove subjects, and configure RePublish from a starter topic
+// onto TASKS), and shows that the operator's busmigrate.AppendMissingSubjects
+// appends only the missing rendered subject while refusing any other change.
+func a2aWithStaticTrustedUser(t *testing.T, conf string, id a2aIdentity, pw string) string {
+	t.Helper()
+	trusted := strings.Index(conf, "\n  TRUSTED {\n")
+	if trusted < 0 {
+		t.Fatal("no TRUSTED account in the rendered nats.conf")
+	}
+	const usersOpen = "\n    users [\n"
+	users := strings.Index(conf[trusted:], usersOpen)
+	if users < 0 {
+		t.Fatal("no users list in the TRUSTED account")
+	}
+	at := trusted + users + len(usersOpen)
+	block := renderA2AStaticUser(id, func(string) string { return pw })
+	conf = conf[:at] + block + conf[at:]
+	const bypass = "auth_users: [ "
+	if strings.Count(conf, bypass) != 1 {
+		t.Fatal("no single auth_users list in the rendered nats.conf")
+	}
+	return strings.Replace(conf, bypass, bypass+id.user+", ", 1)
+}
+
+func TestProvisionCannotUpdateTopicsStateOnARealServer(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	op, ok := operatorIdentity()
+	if !ok {
+		t.Fatal("operatorIdentity() not configured")
+	}
+	creds := a2aFullCreds("p", "1")
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
+	const operatorPW = "pw-operator-stand-in"
+	conf = a2aWithStaticTrustedUser(t, conf, op, operatorPW)
+
+	s, log := a2aStartRenderedServer(t, conf)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Seed TOPICS-STATE in its pre-upgrade shape (without topology-skew) and
+	// seed the remaining streams as the provision script creates them.
+	preUpgradeSubjects := []string{
+		a2aUpgradeReadinessSubject,
+		a2aSharedBlueprintSubject,
+		a2aSharedProbeSubject,
+	}
+	_, seedJS := a2aConnectAs(t, s.ClientURL(), "seed", string(creds.Data["seed-password"]))
+	for _, cfg := range a2aSeedStreamConfigs() {
+		if cfg.Name == a2aTopicsStateStream {
+			cfg.Subjects = slices.Clone(preUpgradeSubjects)
+		}
+		if _, err := seedJS.CreateStream(ctx, cfg); err != nil {
+			t.Fatalf("seed CreateStream(%s): %v", cfg.Name, err)
+		}
+	}
+
+	provisionNC, provisionJS := a2aConnectAs(t, s.ClientURL(), "provision", a2aProvisionStandInPW)
+
+	st, err := provisionJS.Stream(ctx, a2aTopicsStateStream)
+	if err != nil {
+		t.Fatalf("reading %s as provision: %v", a2aTopicsStateStream, err)
+	}
+	before := st.CachedInfo().Config
+	if slices.Contains(before.Subjects, a2aTopologySkewSubject) {
+		t.Fatalf("pre-upgrade %s unexpectedly already carries %q: %v", a2aTopicsStateStream, a2aTopologySkewSubject, before.Subjects)
+	}
+
+	// Refused for provision: STREAM.UPDATE on TOPICS-STATE, TASKS, and
+	// TOPICS-JOURNAL, STREAM.DELETE and STREAM.PURGE on TOPICS-STATE, and
+	// direct publish to a2a.tasks.>.
+	for _, tc := range []struct {
+		subject string
+		body    string
+	}{
+		{"$JS.API.STREAM.UPDATE." + a2aTopicsStateStream, `{"name":"TOPICS-STATE","subjects":["a2a.topics.agent.platform.upgrade-readiness","a2a.topics.agent.platform.topology-skew","a2a.topics.shared.blueprint","a2a.topics.shared.probe"]}`},
+		{"$JS.API.STREAM.UPDATE." + a2aTasksStream, `{"name":"TASKS","subjects":["a2a.tasks.>"]}`},
+		{"$JS.API.STREAM.UPDATE." + a2aTopicsJournalStream, `{"name":"TOPICS-JOURNAL","subjects":["a2a.topics.shared.annotations"]}`},
+		{"$JS.API.STREAM.DELETE." + a2aTopicsStateStream, ""},
+		{"$JS.API.STREAM.PURGE." + a2aTopicsStateStream, ""},
+	} {
+		if msg, err := provisionNC.Request(tc.subject, []byte(tc.body), 300*time.Millisecond); err == nil {
+			t.Errorf("provision %s succeeded (%s); expected refusal", tc.subject, string(msg.Data))
+		}
+		if !log.refusedPublish("provision", tc.subject) {
+			t.Errorf("provision %s got no reply, but the server logged no publish violation for it", tc.subject)
+		}
+	}
+	const directTaskSubject = "a2a.tasks.platform.direct.in"
+	if err := provisionNC.Publish(directTaskSubject, []byte("direct")); err != nil {
+		t.Fatalf("publish %s: %v", directTaskSubject, err)
+	}
+	_ = provisionNC.Flush()
+	if !log.refusedPublish("provision", directTaskSubject) {
+		t.Errorf("direct publish from provision to %s was not refused by the server", directTaskSubject)
+	}
+
+	stAfterRefusal, err := provisionJS.Stream(ctx, a2aTopicsStateStream)
+	if err != nil {
+		t.Fatalf("re-reading %s as provision: %v", a2aTopicsStateStream, err)
+	}
+	if !reflect.DeepEqual(stAfterRefusal.CachedInfo().Config, before) {
+		t.Fatalf("%s config changed after refused provision update: got %+v, want %+v",
+			a2aTopicsStateStream, stAfterRefusal.CachedInfo().Config, before)
+	}
+
+	// The operator's subject-append path (busmigrate.AppendMissingSubjects with
+	// a2aTopicsStatePolicy under operatorIdentity's rendered grants) appends
+	// the missing topology-skew subject and refuses any other change.
+	operatorNC, operatorJS := a2aConnectAs(t, s.ClientURL(), a2aOperatorBusUser, operatorPW)
+	policy, ok := a2aTopicsStatePolicy(a2aTestAgent())
+	if !ok {
+		t.Fatalf("no stream policy for %s", a2aTopicsStateStream)
+	}
+	added, err := busmigrate.AppendMissingSubjects(ctx, operatorNC, policy)
+	if err != nil {
+		t.Fatalf("busmigrate.AppendMissingSubjects(%s): %v", a2aTopicsStateStream, err)
+	}
+	if !slices.Equal(added, []string{a2aTopologySkewSubject}) {
+		t.Errorf("added subjects = %v, want [%s]", added, a2aTopologySkewSubject)
+	}
+	stConverged, err := provisionJS.Stream(ctx, a2aTopicsStateStream)
+	if err != nil {
+		t.Fatalf("reading converged %s: %v", a2aTopicsStateStream, err)
+	}
+	wantSubjects := append(slices.Clone(preUpgradeSubjects), a2aTopologySkewSubject)
+	got := stConverged.CachedInfo().Config
+	if !slices.Equal(got.Subjects, wantSubjects) {
+		t.Errorf("%s subjects after operator append = %v, want %v", a2aTopicsStateStream, got.Subjects, wantSubjects)
+	}
+	gotCheck := got
+	gotCheck.Subjects = before.Subjects
+	if !reflect.DeepEqual(gotCheck, before) {
+		t.Errorf("%s config changed outside subjects:\n got: %+v\nwant: %+v", a2aTopicsStateStream, gotCheck, before)
+	}
+
+	// Pin what raw $JS.API.STREAM.UPDATE.TOPICS-STATE permits on nats-server
+	// (and why provision does not hold it): the server does not narrow
+	// STREAM.UPDATE to subject additions, so a raw STREAM.UPDATE holder can
+	// alter limits, remove subjects, and configure RePublish from a starter
+	// topic (a2a.topics.shared.blueprint) onto a2a.tasks.> in TASKS, which
+	// policy.CheckSubjectAppend refuses.
+	republishCfg := got
+	republishCfg.Subjects = []string{a2aSharedBlueprintSubject}
+	republishCfg.MaxMsgsPerSubject = 1
+	republishCfg.RePublish = &jetstream.RePublish{
+		Source:      a2aSharedBlueprintSubject,
+		Destination: "a2a.tasks.platform.republished.in",
+	}
+	if err := policy.CheckSubjectAppend(
+		nats.StreamConfig{Name: a2aTopicsStateStream, Subjects: got.Subjects},
+		nats.StreamConfig{
+			Name:              a2aTopicsStateStream,
+			Subjects:          republishCfg.Subjects,
+			MaxMsgsPerSubject: republishCfg.MaxMsgsPerSubject,
+			RePublish: &nats.RePublish{
+				Source:      republishCfg.RePublish.Source,
+				Destination: republishCfg.RePublish.Destination,
+			},
+		},
+	); err == nil {
+		t.Fatal("policy.CheckSubjectAppend accepted a RePublish/limit/subject-removal edit")
+	}
+	republished, err := operatorJS.UpdateStream(ctx, republishCfg)
+	if err != nil {
+		t.Fatalf("raw UpdateStream(%s) with RePublish/limit/subject-removal: %v", a2aTopicsStateStream, err)
+	}
+	if republished.CachedInfo().Config.RePublish == nil ||
+		republished.CachedInfo().Config.MaxMsgsPerSubject != 1 ||
+		!slices.Equal(republished.CachedInfo().Config.Subjects, []string{a2aSharedBlueprintSubject}) {
+		t.Fatalf("unexpected %s config after raw RePublish update: %+v", a2aTopicsStateStream, republished.CachedInfo().Config)
+	}
+	if _, err := provisionJS.Publish(ctx, a2aSharedBlueprintSubject, []byte("via-republish")); err != nil {
+		t.Fatalf("publishing starter topic %s as provision: %v", a2aSharedBlueprintSubject, err)
+	}
+	tasksAfter, err := provisionJS.Stream(ctx, a2aTasksStream)
+	if err != nil {
+		t.Fatalf("reading %s info as provision: %v", a2aTasksStream, err)
+	}
+	if gotMsgs := tasksAfter.CachedInfo().State.Msgs; gotMsgs != 1 {
+		t.Errorf("%s message count after TOPICS-STATE RePublish = %d, want 1", a2aTasksStream, gotMsgs)
 	}
 }
 

@@ -1,6 +1,10 @@
 package busmigrate
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -162,5 +166,253 @@ func TestSubjectsMustBeExactlyAmongThePolicys(t *testing.T) {
 	}
 	if m := p.MissingSubjects(cfg("a2a.topics.y", "a2a.topics.x")); len(m) != 0 {
 		t.Errorf("MissingSubjects of the full set = %v", m)
+	}
+}
+
+// Appending missing subjects refuses any change other than added policy
+// subjects: no removed subject, no changed limit or retention, no RePublish.
+func TestSubjectAppendRefusesEveryNonSubjectChange(t *testing.T) {
+	f, err := LoadFreshStreams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := f.Streams["TOPICS-STATE"]
+	p := policyOf(full)
+	p.MaxConsumers = full.MaxConsumers
+
+	const skewSubject = "a2a.topics.agent.platform.topology-skew"
+	before := full
+	before.Subjects = slices.DeleteFunc(slices.Clone(full.Subjects), func(s string) bool {
+		return s == skewSubject
+	})
+	if len(before.Subjects) != len(full.Subjects)-1 {
+		t.Fatalf("TOPICS-STATE reference does not carry %s: %v", skewSubject, full.Subjects)
+	}
+
+	after, added, err := p.AppendMissingSubjects(before)
+	if err != nil {
+		t.Fatalf("AppendMissingSubjects on pre-upgrade TOPICS-STATE: %v", err)
+	}
+	if !slices.Equal(added, []string{skewSubject}) {
+		t.Errorf("added = %v, want [%s]", added, skewSubject)
+	}
+	wantSubjects := append(slices.Clone(before.Subjects), skewSubject)
+	if !slices.Equal(after.Subjects, wantSubjects) {
+		t.Errorf("after.Subjects = %v, want %v", after.Subjects, wantSubjects)
+	}
+	if _, addedAgain, err := p.AppendMissingSubjects(after); err != nil || len(addedAgain) != 0 {
+		t.Errorf("AppendMissingSubjects when complete: added=%v, err=%v", addedAgain, err)
+	}
+
+	for name, mutate := range map[string]func(b, a *nats.StreamConfig){
+		"removed subject": func(_, a *nats.StreamConfig) {
+			a.Subjects = a.Subjects[1:]
+		},
+		"replaced subject": func(_, a *nats.StreamConfig) {
+			a.Subjects[0] = skewSubject
+		},
+		"added unrendered subject": func(_, a *nats.StreamConfig) {
+			a.Subjects = append(a.Subjects, "a2a.topics.other")
+		},
+		"added wildcard subject": func(_, a *nats.StreamConfig) {
+			a.Subjects = append(a.Subjects, "a2a.topics.>")
+		},
+		"duplicate subject": func(_, a *nats.StreamConfig) {
+			a.Subjects = append(a.Subjects, a.Subjects[0])
+		},
+		"empty subjects": func(_, a *nats.StreamConfig) {
+			a.Subjects = nil
+		},
+		"republish on after": func(_, a *nats.StreamConfig) {
+			a.RePublish = &nats.RePublish{Source: ">", Destination: "a2a.tasks.platform.t1.in"}
+		},
+		"republish on before": func(b, _ *nats.StreamConfig) {
+			b.RePublish = &nats.RePublish{Source: ">", Destination: "a2a.tasks.platform.t1.in"}
+		},
+		"sources on after": func(_, a *nats.StreamConfig) {
+			a.Sources = []*nats.StreamSource{{Name: "TASKS"}}
+		},
+		"mirror on after": func(_, a *nats.StreamConfig) {
+			a.Mirror = &nats.StreamSource{Name: "TASKS"}
+		},
+		"changed retention": func(_, a *nats.StreamConfig) {
+			a.Retention = nats.InterestPolicy
+		},
+		"changed storage": func(_, a *nats.StreamConfig) {
+			a.Storage = nats.MemoryStorage
+		},
+		"changed max_bytes": func(_, a *nats.StreamConfig) {
+			a.MaxBytes = before.MaxBytes / 2
+		},
+		"changed max_age": func(_, a *nats.StreamConfig) {
+			a.MaxAge = time.Hour
+		},
+		"changed discard": func(_, a *nats.StreamConfig) {
+			a.Discard = nats.DiscardNew
+		},
+		"changed max_msgs_per_subject": func(_, a *nats.StreamConfig) {
+			a.MaxMsgsPerSubject = 1
+		},
+		"changed max_msgs": func(_, a *nats.StreamConfig) {
+			a.MaxMsgs = 100
+		},
+		"changed max_msg_size": func(_, a *nats.StreamConfig) {
+			a.MaxMsgSize = 1024
+		},
+		"changed max_consumers": func(_, a *nats.StreamConfig) {
+			a.MaxConsumers = before.MaxConsumers + 1
+		},
+		"changed num_replicas": func(_, a *nats.StreamConfig) {
+			a.Replicas = 3
+		},
+		"changed allow_rollup_hdrs": func(_, a *nats.StreamConfig) {
+			a.AllowRollup = !before.AllowRollup
+		},
+		"changed deny_delete": func(_, a *nats.StreamConfig) {
+			a.DenyDelete = !before.DenyDelete
+		},
+		"changed deny_purge": func(_, a *nats.StreamConfig) {
+			a.DenyPurge = !before.DenyPurge
+		},
+		"changed allow_direct": func(_, a *nats.StreamConfig) {
+			a.AllowDirect = !before.AllowDirect
+		},
+		"changed duplicate_window": func(_, a *nats.StreamConfig) {
+			a.Duplicates = 5 * time.Minute
+		},
+		"changed description": func(_, a *nats.StreamConfig) {
+			a.Description = "tampered"
+		},
+		"changed name": func(_, a *nats.StreamConfig) {
+			a.Name = "TASKS"
+		},
+	} {
+		b := before
+		b.Subjects = slices.Clone(before.Subjects)
+		a := after
+		a.Subjects = slices.Clone(after.Subjects)
+		mutate(&b, &a)
+		if err := p.CheckSubjectAppend(b, a); !errors.Is(err, ErrSubjectAppendRefused) {
+			t.Errorf("%s: CheckSubjectAppend = %v, want ErrSubjectAppendRefused", name, err)
+		}
+	}
+}
+
+func TestAppendMissingSubjectsOnARealServer(t *testing.T) {
+	f, err := LoadFreshStreams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := f.Streams["TOPICS-STATE"]
+	policy := policyOf(full)
+	policy.MaxConsumers = full.MaxConsumers
+
+	const skewSubject = "a2a.topics.agent.platform.topology-skew"
+	preUpgrade := full
+	preUpgrade.Subjects = slices.DeleteFunc(slices.Clone(full.Subjects), func(s string) bool {
+		return s == skewSubject
+	})
+
+	srv := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(srv)
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AddStream(&preUpgrade); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish("a2a.topics.shared.blueprint", []byte("starter")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	updates := 0
+	sub, err := nc.Subscribe("$JS.API.STREAM.UPDATE.>", func(*nats.Msg) { updates++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	added, err := AppendMissingSubjects(ctx, nc, policy)
+	if err != nil {
+		t.Fatalf("AppendMissingSubjects: %v", err)
+	}
+	if !slices.Equal(added, []string{skewSubject}) {
+		t.Errorf("added = %v, want [%s]", added, skewSubject)
+	}
+	if updates != 1 {
+		t.Errorf("STREAM.UPDATE count = %d, want 1", updates)
+	}
+	info, err := js.StreamInfo("TOPICS-STATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSubjects := append(slices.Clone(preUpgrade.Subjects), skewSubject)
+	if !slices.Equal(info.Config.Subjects, wantSubjects) {
+		t.Errorf("live subjects = %v, want %v", info.Config.Subjects, wantSubjects)
+	}
+	if info.State.Msgs != 1 {
+		t.Errorf("live messages = %d, want 1 preserved", info.State.Msgs)
+	}
+	if _, err := js.Publish(skewSubject, []byte("skew")); err != nil {
+		t.Errorf("publishing %s after append: %v", skewSubject, err)
+	}
+
+	// A second pass when no subject is missing sends no STREAM.UPDATE.
+	addedAgain, err := AppendMissingSubjects(ctx, nc, policy)
+	if err != nil || len(addedAgain) != 0 {
+		t.Errorf("second AppendMissingSubjects: added=%v, err=%v", addedAgain, err)
+	}
+	if updates != 1 {
+		t.Errorf("STREAM.UPDATE count after no-op pass = %d, want 1", updates)
+	}
+
+	// Forward restore of a pre-upgrade TOPICS-STATE snapshot also appends the
+	// missing subject, while rollback restores the snapshot's own subject list.
+	if err := js.DeleteStream("TOPICS-STATE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AddStream(&preUpgrade); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish("a2a.topics.shared.blueprint", []byte("starter")); err != nil {
+		t.Fatal(err)
+	}
+	var snap bytes.Buffer
+	meta, err := Snapshot(ctx, nc, "TOPICS-STATE", &snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.DeleteStream("TOPICS-STATE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, opener(snap.Bytes()), Digest(snap.Bytes()), policy); err != nil {
+		t.Fatalf("RestoreVerified on pre-upgrade TOPICS-STATE: %v", err)
+	}
+	restoredInfo, err := js.StreamInfo("TOPICS-STATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(restoredInfo.Config.Subjects, wantSubjects) {
+		t.Errorf("forward-restored subjects = %v, want %v", restoredInfo.Config.Subjects, wantSubjects)
+	}
+	if err := js.DeleteStream("TOPICS-STATE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreAsItWas(ctx, nc, meta.Config, meta.State, opener(snap.Bytes()), Digest(snap.Bytes()), policy); err != nil {
+		t.Fatalf("RestoreAsItWas on pre-upgrade TOPICS-STATE: %v", err)
+	}
+	rollbackInfo, err := js.StreamInfo("TOPICS-STATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rollbackInfo.Config.Subjects, preUpgrade.Subjects) {
+		t.Errorf("rollback-restored subjects = %v, want %v", rollbackInfo.Config.Subjects, preUpgrade.Subjects)
 	}
 }
