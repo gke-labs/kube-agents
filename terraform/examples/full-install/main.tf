@@ -31,7 +31,7 @@ locals {
   chat_project               = var.chat_project_id != "" ? var.chat_project_id : var.project_id
   chat_cross_project         = local.chat_project != var.project_id
   manage_chat_project        = var.enable_google_chat && var.chat_manage_project
-  chat_service_account_id    = local.chat_cross_project ? "kubeagents-chat-gsa" : ""
+  chat_service_account_id    = local.chat_cross_project ? var.chat_service_account_id : ""
   chat_service_account_email = var.enable_google_chat ? module.chat_pubsub[0].chat_service_account_email : ""
 
   pubsub_apis = ((var.enable_google_chat && !local.chat_cross_project && var.chat_manage_project) || var.enable_pubsub_platform || var.enable_stockout_investigator || var.enable_drift_pubsub) ? [

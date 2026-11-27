@@ -268,11 +268,11 @@ plans the whole composition as new and reads as total drift. A gitignored
 installs in one project keep separate state. State is only half of the
 second-install story: every service account the composition creates has one
 fixed default name per project, so the second install must name its own —
-`agent_service_account_id`, and `github_minter_service_account_id` or
-`litellm_service_account_id` when it enables the minter or serves from Vertex —
+`agent_service_account_id`, and `github_minter_service_account_id`,
+`litellm_service_account_id` or `chat_service_account_id` when it enables the minter, serves from Vertex or shares a cross-project Google Chat project —
 or its first apply stops on the account the first install owns. Through the
 installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
-`GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
+`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME` and `CHAT_GSA_NAME` in `install.env`, which every
 front door regenerates `terraform.tfvars` from; every front door that applies
 (`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
 names the key to set. The minter's KSA (`github_minter_ksa_name`,

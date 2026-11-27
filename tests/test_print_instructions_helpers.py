@@ -399,6 +399,19 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
         self.assertIn("CHAT_PROJECT_NUMBER is unavailable;", out_unreadable)
         self.assertNotIn("111111111111", out_unreadable)
 
+        out_custom_gsa = self._run(
+            env + "CHAT_GSA_NAME=custom-chat-two-gsa\n",
+            {"PROJECT_NUMBER": "111111111111", "CHAT_PROJECT_NUMBER": "222222222222"},
+        )
+        self.assertIn(
+            "gcloud iam service-accounts create custom-chat-two-gsa --project=workspace-chat-proj",
+            out_custom_gsa,
+        )
+        self.assertIn(
+            "member=\"serviceAccount:custom-chat-two-gsa@workspace-chat-proj.iam.gserviceaccount.com\" --role=\"roles/pubsub.subscriber\"",
+            out_custom_gsa,
+        )
+
 
 class ChatSetupChecklistsTest(unittest.TestCase):
     """print_chat_setup_checklists, which install.sh calls after its apply and
@@ -444,6 +457,7 @@ class ChatSetupChecklistsTest(unittest.TestCase):
 
     _CHAT = {"GOOGLE_CHAT_ENABLED": "true", "GOOGLE_CHAT_HOME_CHANNEL": "", "ALLOWED_USERS": "a@example.com",
              "CHAT_PROJECT_ID": "chat-proj", "CHAT_MANAGE_PROJECT": "false", "CHAT_PROJECT_NUMBER": "987654321098",
+             "CHAT_GSA_NAME": "custom-chat-gsa",
              "CHAT_TOPIC_NAME": "t", "CHAT_SUB_NAME": "t-sub", "PROJECT_NUMBER": "123456789012",
              "NAMESPACE": "custom-ns"}
 
@@ -457,6 +471,7 @@ class ChatSetupChecklistsTest(unittest.TestCase):
                      "GCHAT_STEPS_CHAT_PROJECT_ID=chat-proj",
                      "GCHAT_STEPS_CHAT_MANAGE_PROJECT=false",
                      "GCHAT_STEPS_CHAT_PROJECT_NUMBER=987654321098",
+                     "GCHAT_STEPS_CHAT_GSA_NAME=custom-chat-gsa",
                      "GCHAT_STEPS_HOME_CHANNEL=\n", "GCHAT_STEPS_ALLOWED_USERS=a@example.com",
                      "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012"):
             with self.subTest(line=line):

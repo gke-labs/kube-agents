@@ -945,10 +945,11 @@ main() {
   # value, and the destroy removes the two serving-project resources in state
   # whichever way the key renders.
   export VERTEX_MANAGE_SERVING_PROJECT=""
-  # The Chat project and its management switch, likewise: the generator refuses
-  # a misspelt CHAT_MANAGE_PROJECT and the composition validates chat_project_id,
-  # and the destroy removes the Chat resources in state whichever way they render.
-  export CHAT_PROJECT_ID="" CHAT_MANAGE_PROJECT=""
+  # The Chat project and its management switch and service account name,
+  # likewise: the generator refuses a misspelt CHAT_MANAGE_PROJECT and the
+  # composition validates chat_project_id and chat_service_account_id, and the
+  # destroy removes the Chat resources in state whichever way they render.
+  export CHAT_PROJECT_ID="" CHAT_MANAGE_PROJECT="" CHAT_GSA_NAME=""
   # The release's upgrade_install switch, likewise: the generator refuses a
   # misspelt value, and the destroy removes the release however it renders.
   export HELM_UPGRADE_INSTALL=""

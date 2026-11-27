@@ -379,6 +379,18 @@ variable "litellm_service_account_id" {
   default     = "kubeagents-litellm-gsa"
 }
 
+variable "chat_service_account_id" {
+  description = "IAM service account ID for the dedicated Google Chat service account created in chat_project_id when enable_google_chat is true and chat_project_id differs from project_id. One fixed name per Chat project, so a second install targeting the same Chat project must set its own (CHAT_GSA_NAME in install.env, or TF_VAR_chat_service_account_id / chat_service_account_id in terraform.tfvars)."
+  type        = string
+  default     = "kubeagents-chat-gsa"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.chat_service_account_id))
+    error_message = "chat_service_account_id must be 6–30 lowercase letters, digits, or hyphens, starting with a letter and ending with a letter or digit."
+  }
+}
+
 variable "image_tag" {
   description = "Image tag for both the operator and the platform agent. Required because a checkout's Chart.yaml carries an appVersion placeholder that never matches a published image tag, so the chart's tag defaulting cannot work from a checkout. `latest` is fine for evaluation; set an `X.Y.Z` release tag for production."
   type        = string
@@ -655,7 +667,7 @@ variable "enable_google_chat" {
 }
 
 variable "chat_project_id" {
-  description = "GCP project hosting the Google Workspace Chat app and its Pub/Sub topic and subscription when enable_google_chat is true. Empty (default) uses project_id. When set to a different project (including one in another GCP organization), the composition enables the Chat, Workspace Add-ons, and Pub/Sub APIs there, creates a dedicated Chat service account (kubeagents-chat-gsa) in that project, grants the Platform Agent GSA roles/iam.serviceAccountTokenCreator on it, and binds the Pub/Sub subscription to it unless chat_manage_project is false."
+  description = "GCP project hosting the Google Workspace Chat app and its Pub/Sub topic and subscription when enable_google_chat is true. Empty (default) uses project_id. When set to a different project (including one in another GCP organization), the composition enables the Chat, Workspace Add-ons, and Pub/Sub APIs there, creates a dedicated Chat service account (chat_service_account_id, default kubeagents-chat-gsa) in that project, grants the Platform Agent GSA roles/iam.serviceAccountTokenCreator on it, and binds the Pub/Sub subscription to it unless chat_manage_project is false."
   type        = string
   default     = ""
   nullable    = false

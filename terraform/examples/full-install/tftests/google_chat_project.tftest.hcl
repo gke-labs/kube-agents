@@ -109,3 +109,18 @@ run "cross_project_unmanaged_creates_nothing_in_chat_project_and_keeps_chart_val
     error_message = "chat_manage_project = false must still populate googleChat.projectId, serviceAccountEmail, topicName, and subscriptionName in chart values"
   }
 }
+
+run "cross_project_custom_chat_service_account_id_reaches_chart_values" {
+  command = plan
+
+  variables {
+    chat_project_id         = "workspace-chat-proj"
+    chat_manage_project     = false
+    chat_service_account_id = "custom-chat-two-gsa"
+  }
+
+  assert {
+    condition     = local.platform_agent_integration.googleChat.serviceAccountEmail == "custom-chat-two-gsa@workspace-chat-proj.iam.gserviceaccount.com"
+    error_message = "custom chat_service_account_id must reach googleChat.serviceAccountEmail in chart values"
+  }
+}

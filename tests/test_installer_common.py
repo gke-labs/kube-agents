@@ -952,6 +952,49 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("LITELLM_GSA_NAME", proc.stderr)
 
+    def test_service_account_ownership_covers_the_chat_gsa_in_the_chat_project(self):
+        stub = '[[ "$*" == *"kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"* && "$*" == *"--project workspace-chat-proj"* ]] && exit 0; exit 1'
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_exit=1, sa_describe_stub=stub,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_exit=1, sa_describe_stub=stub,
+            env={
+                "GOOGLE_CHAT_ENABLED": "true",
+                "CHAT_PROJECT_ID": "workspace-chat-proj",
+                "CHAT_MANAGE_PROJECT": "false",
+            },
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        proc = self._run(
+            self._SHOW_REMEDY,
+            gcloud_exit=1, sa_describe_stub=stub,
+            env={
+                "GOOGLE_CHAT_ENABLED": "true",
+                "CHAT_PROJECT_ID": "workspace-chat-proj",
+            },
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("CHAT_GSA_NAME", proc.stderr)
+        self.assertIn("already exists in project 'workspace-chat-proj'", proc.stderr)
+        self.assertIn("--project workspace-chat-proj", proc.stderr)
+        custom_stub = '[[ "$*" == *"custom-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"* && "$*" == *"--project workspace-chat-proj"* ]] && exit 0; exit 1'
+        proc = self._run(
+            self._SHOW_REMEDY,
+            gcloud_exit=1, sa_describe_stub=custom_stub,
+            env={
+                "GOOGLE_CHAT_ENABLED": "true",
+                "CHAT_PROJECT_ID": "workspace-chat-proj",
+                "CHAT_GSA_NAME": "custom-chat-gsa",
+            },
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("custom-chat-gsa", proc.stderr)
+        self.assertIn("CHAT_GSA_NAME", proc.stderr)
+
     # A `service-accounts list` stub that answers only a filter carrying this
     # install's marker, the way the real API applies the --filter: a member
     # whose description names another install's agent is never listed.
@@ -3583,6 +3626,7 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('chat_project_id           = ""', content)
             self.assertIn("chat_manage_project       = true", content)
+            self.assertNotIn("chat_service_account_id", content)
 
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
@@ -3590,12 +3634,14 @@ class InstallerCommonTest(unittest.TestCase):
                     "API_SERVER_KEY": "k",
                     "CHAT_PROJECT_ID": "workspace-chat-proj",
                     "CHAT_MANAGE_PROJECT": "false",
+                    "CHAT_GSA_NAME": "custom-chat-two-gsa",
                 },
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             content = dest.read_text()
             self.assertIn('chat_project_id           = "workspace-chat-proj"', content)
             self.assertIn("chat_manage_project       = false", content)
+            self.assertIn('chat_service_account_id          = "custom-chat-two-gsa"', content)
 
     def test_tfvars_refuse_a_misspelt_chat_manage_project(self):
         with tempfile.TemporaryDirectory() as out_dir:

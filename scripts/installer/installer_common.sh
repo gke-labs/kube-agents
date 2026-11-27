@@ -1626,6 +1626,7 @@ print_chat_setup_checklists() {
       GCHAT_STEPS_CHAT_PROJECT_ID="${CHAT_PROJECT_ID:-}" \
       GCHAT_STEPS_CHAT_MANAGE_PROJECT="${CHAT_MANAGE_PROJECT:-}" \
       GCHAT_STEPS_CHAT_PROJECT_NUMBER="${CHAT_PROJECT_NUMBER:-}" \
+      GCHAT_STEPS_CHAT_GSA_NAME="${CHAT_GSA_NAME:-}" \
       GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
       GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
       GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
@@ -4213,15 +4214,21 @@ minter_name_defaults() {
 # tell a healthy install to delete its own account, so the check stands down
 # and says so. Caller defines print_error / print_info / print_warning.
 check_service_account_ownership() {
-  local in_state line label key account_id email state_rc=0 agent_id marker members
+  local in_state line label key account_id target_project email state_rc=0 agent_id marker members
   local -a candidates=() foreign=()
   agent_id="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
-  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${agent_id}")
+  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${agent_id}	${PROJECT_ID}")
   if [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ]; then
-    candidates+=("the GitHub token minter	GITHUB_MINTER_GSA_NAME	${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")
+    candidates+=("the GitHub token minter	GITHUB_MINTER_GSA_NAME	${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}	${PROJECT_ID}")
   fi
   if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "vertex_ai" ]; then
-    candidates+=("the LiteLLM gateway	LITELLM_GSA_NAME	${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")
+    candidates+=("the LiteLLM gateway	LITELLM_GSA_NAME	${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}	${PROJECT_ID}")
+  fi
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
+     && is_truthy "${CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}" \
+     && [ -n "${CHAT_PROJECT_ID:-}" ] \
+     && [ "$CHAT_PROJECT_ID" != "$PROJECT_ID" ]; then
+    candidates+=("the Google Chat integration	CHAT_GSA_NAME	${CHAT_GSA_NAME:-$DEFAULT_CHAT_GSA_NAME}	${CHAT_PROJECT_ID}")
   fi
   in_state="$(tf_state_service_account_ids)" || state_rc=$?
   if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
@@ -4229,15 +4236,15 @@ check_service_account_ownership() {
     return 0
   fi
   for line in "${candidates[@]}"; do
-    IFS=$'\t' read -r label key account_id <<<"$line"
+    IFS=$'\t' read -r label key account_id target_project <<<"$line"
     if grep -Fxq "$account_id" <<<"$in_state"; then
       continue
     fi
-    email="${account_id}@${PROJECT_ID}.iam.gserviceaccount.com"
+    email="${account_id}@${target_project}.iam.gserviceaccount.com"
     # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
     # miss is the ordinary fresh-install answer, not an abort.
-    if (trap - ERR; gcloud iam service-accounts describe "$email" --project "${PROJECT_ID}" >/dev/null 2>&1); then
-      foreign+=("${label}	${key}	${account_id}	${email}")
+    if (trap - ERR; gcloud iam service-accounts describe "$email" --project "${target_project}" >/dev/null 2>&1); then
+      foreign+=("${label}	${key}	${account_id}	${email}	${target_project}")
     fi
   done
   # The scoped pool's members (scoped_pool.tf) are derived from the agent's id
@@ -4260,24 +4267,24 @@ check_service_account_ownership() {
     fi
     # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
     # agent's, so renaming the agent is what un-collides them.
-    foreign+=("a scoped pool member	PLATFORM_AGENT_GSA_NAME	${account_id}	${email}")
+    foreign+=("a scoped pool member	PLATFORM_AGENT_GSA_NAME	${account_id}	${email}	${PROJECT_ID}")
   done <<<"$members"
   [ "${#foreign[@]}" -eq 0 ] && return 0
 
   for line in ${foreign[@]+"${foreign[@]}"}; do
-    IFS=$'\t' read -r label key account_id email <<<"$line"
-    print_error "Service account '${account_id}' (${label}) already exists in project '${PROJECT_ID}' and is not managed by this install's Terraform state (gs://$(tf_state_bucket)/$(tf_state_prefix))."
+    IFS=$'\t' read -r label key account_id email target_project <<<"$line"
+    print_error "Service account '${account_id}' (${label}) already exists in project '${target_project}' and is not managed by this install's Terraform state (gs://$(tf_state_bucket)/$(tf_state_prefix))."
     # A minter GSA names the install that owns it in its description (#3504);
     # say whose it is when it does. A describe that fails says nothing extra.
     if [ "$key" = "GITHUB_MINTER_GSA_NAME" ]; then
       local owner
-      owner="$(trap - ERR; gcloud iam service-accounts describe "$email" --project "${PROJECT_ID}" \
+      owner="$(trap - ERR; gcloud iam service-accounts describe "$email" --project "${target_project}" \
         --format='value(description)' 2>/dev/null)" || owner=""
       if [[ "$owner" == *"for install "* ]]; then
         print_info "Its description names its owner: ${owner}."
       fi
     fi
-    print_info "Applying would stop on a 409 creating it. If another kube-agents install in this project owns it, give this install its own name: set ${key}=<a-different-name> in install.env, or on a first install, which has no install.env yet, run ${key}=<a-different-name> ./install.sh ... and the name is recorded in the install.env it creates. If it is left over from an install removed without uninstall.sh, delete it first: gcloud iam service-accounts delete ${email} --project ${PROJECT_ID}"
+    print_info "Applying would stop on a 409 creating it. If another kube-agents install in this project owns it, give this install its own name: set ${key}=<a-different-name> in install.env, or on a first install, which has no install.env yet, run ${key}=<a-different-name> ./install.sh ... and the name is recorded in the install.env it creates. If it is left over from an install removed without uninstall.sh, delete it first: gcloud iam service-accounts delete ${email} --project ${target_project}"
   done
   return 1
 }
@@ -6019,6 +6026,9 @@ write_tfvars_from_state() {
     echo "agent_service_account_id         = $(hcl_str "${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")"
     echo "github_minter_service_account_id = $(hcl_str "${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")"
     echo "litellm_service_account_id       = $(hcl_str "${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")"
+    if [ -n "${CHAT_GSA_NAME:-}" ]; then
+      echo "chat_service_account_id          = $(hcl_str "$CHAT_GSA_NAME")"
+    fi
     echo "# The minter's KSA, the other half of its Workload Identity binding."
     echo "github_minter_ksa_name           = $(hcl_str "${GITHUB_MINTER_KSA_NAME:-$DEFAULT_GITHUB_MINTER_KSA_NAME}")"
     echo ""

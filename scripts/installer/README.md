@@ -39,6 +39,7 @@ their own copies:
 | `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below                                                                              |
 | `DEFAULT_GITHUB_MINTER_KSA_NAME`                                          | Existing installs' minter KSA (`kubeagents-github-minter`); see below                                                                                  |
 | `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project                                                                 |
+| `DEFAULT_CHAT_GSA_NAME`                                                   | The cross-project Google Chat service account id (`kubeagents-chat-gsa`); one per Chat project                                                         |
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)                                                                              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                                                                                |
 | `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`; interactive `install.sh` prompts for the stockout investigator and defaults `y` with an enabled chat home channel) |
@@ -328,7 +329,7 @@ describe` and `KMS_LOCATION` from `derive_kms_location`. `create_cluster` and th
 **effective** `CLUSTER_MODE` come from `write_tfvars_from_state`'s own probe of the live
 cluster. `NO_CONFIRM` describes an invocation, not an install, and comes from
 `-y`/`--non-interactive`. The identity keys (`PLATFORM_AGENT_GSA_NAME`,
-`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME`, `GKE_DB_KMS_KEYRING`, `GKE_DB_KMS_KEY`) are
+`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME`, `CHAT_GSA_NAME`, `GKE_DB_KMS_KEYRING`, `GKE_DB_KMS_KEY`) are
 written into a new `install.env` only when the run set them — a default copied in
 would freeze at that release, and a custom name that went missing would replace the
 account — and `NAMESPACE` is never copied in from the environment.

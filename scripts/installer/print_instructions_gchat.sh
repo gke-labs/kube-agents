@@ -37,7 +37,6 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # which terraform/modules/chat-pubsub/main.tf grants publisher on the events topic.
 readonly WORKSPACE_ADDONS_SA_DOMAIN="gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
 readonly CHAT_API_PUSH_SA="chat-api-push@system.gserviceaccount.com"
-readonly CROSS_PROJECT_CHAT_GSA_NAME="kubeagents-chat-gsa"
 readonly GSUITEADDONS_API="gsuiteaddons.googleapis.com"
 readonly CHAT_API="chat.googleapis.com"
 readonly PUBSUB_API="pubsub.googleapis.com"
@@ -66,6 +65,9 @@ if [ -n "${GCHAT_STEPS_CHAT_MANAGE_PROJECT+set}" ]; then
 fi
 if [ -n "${GCHAT_STEPS_CHAT_PROJECT_NUMBER+set}" ]; then
   CHAT_PROJECT_NUMBER="${GCHAT_STEPS_CHAT_PROJECT_NUMBER:-}"
+fi
+if [ -n "${GCHAT_STEPS_CHAT_GSA_NAME+set}" ]; then
+  CHAT_GSA_NAME="${GCHAT_STEPS_CHAT_GSA_NAME:-}"
 fi
 # An empty subscription name is one the tfvars generator derives from the
 # topic, as an install.env that turned Google Chat on in the Day-2 menu has.
@@ -115,9 +117,10 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
 
   chat_project="${CHAT_PROJECT_ID:-${PROJECT_ID:-}}"
   chat_manage="${CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}"
+  chat_gsa_name="${CHAT_GSA_NAME:-$DEFAULT_CHAT_GSA_NAME}"
   agent_gsa_email="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID:-<PROJECT_ID>}.iam.gserviceaccount.com"
   if [ -n "${CHAT_PROJECT_ID:-}" ] && [ "${CHAT_PROJECT_ID}" != "${PROJECT_ID:-}" ]; then
-    subscriber_sa_email="${CROSS_PROJECT_CHAT_GSA_NAME}@${chat_project}.iam.gserviceaccount.com"
+    subscriber_sa_email="${chat_gsa_name}@${chat_project}.iam.gserviceaccount.com"
     chat_project_number="${CHAT_PROJECT_NUMBER:-}"
   else
     subscriber_sa_email="$agent_gsa_email"
@@ -131,7 +134,7 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
     echo -e "  gcloud beta services identity create --service=${GSUITEADDONS_API} --project=${chat_project:-<CHAT_PROJECT_ID>}"
     echo -e "  gcloud beta services identity create --service=${CHAT_API} --project=${chat_project:-<CHAT_PROJECT_ID>}"
     if [ "$subscriber_sa_email" != "$agent_gsa_email" ]; then
-      echo -e "  gcloud iam service-accounts create ${CROSS_PROJECT_CHAT_GSA_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --display-name=\"Platform Agent Google Chat Service Account\""
+      echo -e "  gcloud iam service-accounts create ${chat_gsa_name} --project=${chat_project:-<CHAT_PROJECT_ID>} --display-name=\"Platform Agent Google Chat Service Account\""
       echo -e "  gcloud iam service-accounts add-iam-policy-binding ${subscriber_sa_email} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${agent_gsa_email}\" --role=\"${ROLE_TOKEN_CREATOR}\""
     fi
     echo -e "  gcloud pubsub topics create ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>}"

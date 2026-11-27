@@ -6655,14 +6655,16 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
 
     def test_a_configured_name_is_recorded(self):
         out = self._bootstrap({"PLATFORM_AGENT_GSA_NAME": "agent-two-gsa",
+                               "CHAT_GSA_NAME": "chat-two-gsa",
                                "GKE_DB_KMS_KEYRING": "ring-two"})
         self.assertIn("PLATFORM_AGENT_GSA_NAME=agent-two-gsa\n", out)
+        self.assertIn("CHAT_GSA_NAME=chat-two-gsa\n", out)
         self.assertIn("GKE_DB_KMS_KEYRING=ring-two\n", out)
 
     def test_an_unset_name_is_not_frozen_as_a_default(self):
         out = self._bootstrap({})
         for key in ("PLATFORM_AGENT_GSA_NAME", "GITHUB_MINTER_GSA_NAME", "LITELLM_GSA_NAME",
-                    "GKE_DB_KMS_KEYRING", "GKE_DB_KMS_KEY", "NAMESPACE"):
+                    "CHAT_GSA_NAME", "GKE_DB_KMS_KEYRING", "GKE_DB_KMS_KEY", "NAMESPACE"):
             with self.subTest(key=key):
                 # re.MULTILINE, or `^` anchors at offset 0 only -- which is the
                 # file's comment header, so the assertion could never fail.
