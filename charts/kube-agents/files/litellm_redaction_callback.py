@@ -22,11 +22,11 @@ output that is a whole JSON object or array (a chat tool message's string
 content, an Anthropic tool result's string or text parts, a Responses function
 call output, up to 64 top-level strings of a Gemini function response's
 response) is decoded the same way, up to 256 KiB and 64 levels deep, and so is
-whole JSON inside it, two levels in and 32 strings at most. It still gets the text rules over its string
-too, and a string the structure rules mask whole where it sits is not opened,
-so decoding only adds to what is masked. One with a repeated key, with a `\\u`
-escape for whitespace or a value-ending character, past the bounds, or not
-whole JSON is matched as text. A changed one keeps its indent
+whole JSON inside it, two levels in and 32 strings at most. The text rules
+run first, over the string as it came, and what is decoded is their result,
+so decoding only adds to what is masked; a string the structure rules mask
+whole where it sits is not opened. One with a repeated key, past the bounds,
+or not whole JSON is matched as text. A changed one keeps its indent
 width and compact or spaced separators; numbers, escapes and other spacing are
 normalised.
 
@@ -190,12 +190,6 @@ TOOL_OUTPUT_MAX_FIELDS = 64
 # Stands in for a string while asking whether the structure rules would mask
 # it whole where it sits (a credential key, a Secret's data, an env value).
 MASK_PROBE = "kube-agents-redaction-probe"
-# A \u escape in raw JSON text: one that decodes to whitespace or to a
-# character that ends a value (a quote, a comma, a bracket) keeps the output
-# text, since the text rules mask a bare value through the escape and would
-# stop at the decoded character.
-UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
-VALUE_ENDING_CHARACTERS = frozenset("\"',;:=(){}[]\\")
 TOOL_ROLE = "tool"
 TEXT_TYPE = "text"
 TEXT_KEY = "text"
@@ -541,21 +535,14 @@ class KubeAgentsRedactionCallback(CustomLogger):
         # Innermost first: a document decoded inside another goes back to its
         # string before the outer one is compared, so an unchanged inner one
         # leaves the outer one unchanged too.
-        paths = [path for path, _, _, _ in arguments]
         for path, source, document, style in reversed(arguments):
             walked = self._get(redacted, path)
             # Compared, not counted: a substitution that swaps one marker for
             # another nets zero on the counts but still changed the payload.
             keep = source is not None and walked == document
+            # For a tool output, source is already the text rules' result
+            # over the string it came as (see _decode_output).
             text = source if keep else self._encode(walked, style)
-            # A tool output also gets the text rules over its string, as it
-            # did before it was decoded, so decoding only ever adds to what
-            # is masked (a number under a credential key, say, which the
-            # structure walk leaves alone).
-            if style is not None and not any(other != path and path[: len(other)] == other for other in paths):
-                text, made = AuditRedactor.redact_counted(text, self._rules)
-                for name, count in made.items():
-                    counts[name] = counts.get(name, 0) + count
             self._put(redacted, path, text)
         for path, original in kept:
             self._put(redacted, path, original)
@@ -698,7 +685,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
         except (KeyError, IndexError, TypeError):
             return True
 
-    def _decode_output(self, path: tuple, value: Any, found: List[tuple], level: int = 0, budget: Optional[List[int]] = None) -> None:
+    def _decode_output(self, path: tuple, value: Any, found: List[tuple], counts: Dict[str, int], level: int = 0, budget: Optional[List[int]] = None) -> None:
         """Note value as a document to walk when it is a whole JSON object or
         array within the bounds, then the same for whole-JSON strings inside
         it. Anything else is left a string and matched as text."""
@@ -707,10 +694,12 @@ class KubeAgentsRedactionCallback(CustomLogger):
         body = value.strip()
         if not body or body[0] not in "{[" or len(value.encode("utf-8", "replace")) > TOOL_OUTPUT_MAX_BYTES:
             return
-        for match in UNICODE_ESCAPE.finditer(value):
-            character = chr(int(match.group(1), 16))
-            if character.isspace() or character in VALUE_ENDING_CHARACTERS:
-                return
+        # The text rules run first, over the string as it came, exactly as
+        # they would without decoding; what is decoded is their result. The
+        # structure rules can then only add to it, whatever the escapes or
+        # layout of the original, and a re-encode only reformats text that
+        # is already masked.
+        masked, made = AuditRedactor.redact_counted(value, self._rules)
         repeated = False
 
         def pairs(items: List[tuple]) -> Dict[str, Any]:
@@ -720,7 +709,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
             return dict(items)
 
         try:
-            document = json.loads(value, object_pairs_hook=pairs)
+            document = json.loads(masked, object_pairs_hook=pairs)
         except (ValueError, RecursionError):
             return
         if not isinstance(document, (dict, list)) or not self._depth(document, TOOL_OUTPUT_MAX_DEPTH):
@@ -730,7 +719,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
         # and gets the text rules only, as before.
         if repeated:
             return
-        found.append((path, value, document, self._style(value)))
+        found.append((path, masked, document, self._style(masked)))
+        for name, count in made.items():
+            counts[name] = counts.get(name, 0) + count
         if level + 1 >= TOOL_OUTPUT_MAX_NESTING:
             return
         # One budget per tool output, shared down the nesting.
@@ -746,11 +737,11 @@ class KubeAgentsRedactionCallback(CustomLogger):
                         continue
                     budget[0] -= 1
                     if not self._masked_whole(document, rel + (key,)):
-                        self._decode_output(path + rel + (key,), child, found, level + 1, budget)
+                        self._decode_output(path + rel + (key,), child, found, counts, level + 1, budget)
                 elif isinstance(child, (dict, list)):
                     stack.append((rel + (key,), child))
 
-    def _tool_outputs(self, data: Dict[str, Any]) -> List[tuple]:
+    def _tool_outputs(self, data: Dict[str, Any], counts: Dict[str, int]) -> List[tuple]:
         """(path, string, document, style) for each tool output that is a
         whole JSON object or array: a chat tool message's content, an
         Anthropic tool result's content (a string or its text parts), a
@@ -763,20 +754,20 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 continue
             content = message.get(CONTENT_KEY)
             if message.get(ROLE_KEY) == TOOL_ROLE:
-                self._decode_output((MESSAGES_KEY, i, CONTENT_KEY), content, found)
+                self._decode_output((MESSAGES_KEY, i, CONTENT_KEY), content, found, counts)
             for j, part in enumerate(content if isinstance(content, list) else []):
                 if not isinstance(part, dict) or part.get(TYPE_KEY) != TOOL_RESULT_TYPE:
                     continue
                 inner = part.get(CONTENT_KEY)
                 where = (MESSAGES_KEY, i, CONTENT_KEY, j, CONTENT_KEY)
-                self._decode_output(where, inner, found)
+                self._decode_output(where, inner, found, counts)
                 for k, sub in enumerate(inner if isinstance(inner, list) else []):
                     if isinstance(sub, dict) and sub.get(TYPE_KEY) == TEXT_TYPE:
-                        self._decode_output(where + (k, TEXT_KEY), sub.get(TEXT_KEY), found)
+                        self._decode_output(where + (k, TEXT_KEY), sub.get(TEXT_KEY), found, counts)
         items = data.get(RESPONSES_INPUT_KEY)
         for i, item in enumerate(items if isinstance(items, list) else []):
             if isinstance(item, dict) and item.get(TYPE_KEY) == RESPONSES_FUNCTION_CALL_OUTPUT_TYPE:
-                self._decode_output((RESPONSES_INPUT_KEY, i, RESPONSES_OUTPUT_KEY), item.get(RESPONSES_OUTPUT_KEY), found)
+                self._decode_output((RESPONSES_INPUT_KEY, i, RESPONSES_OUTPUT_KEY), item.get(RESPONSES_OUTPUT_KEY), found, counts)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):
             parts = content.get(PARTS_KEY) if isinstance(content, dict) else None
             for j, part in enumerate(parts if isinstance(parts, list) else []):
@@ -796,7 +787,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
                         # sits stays a string.
                         if self._masked_whole(body, (name,)):
                             continue
-                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found)
+                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found, counts)
         return found
 
     @staticmethod
@@ -826,8 +817,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
         """
         self._check_shape(data)
         kept = self._carve(data)
-        arguments = self._tool_arguments(data) + self._tool_outputs(data)
+        # The text rules' counts for each decoded tool output are taken when
+        # it is masked before decoding.
         counts: Dict[str, int] = {}
+        arguments = self._tool_arguments(data) + self._tool_outputs(data, counts)
         for key in list(data):
             if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
                 continue

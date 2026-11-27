@@ -717,6 +717,29 @@ class TestCallback(unittest.TestCase):
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
         self.assertNotIn("opaque-value-xyz", out)
 
+    def test_escapes_and_split_values_in_tool_output_stay_masked(self) -> None:
+        # The text rules run over the output as it came, before it is decoded,
+        # so a match that needs the escaped form (a URL password through an
+        # escape, a value through \\f, a key id before an escaped letter, a
+        # private key across strings) masks what it masked before.
+        cases = [
+            ('{"u":"postgres://app:s3cr\\u003cetzz@10.0.0.5:5432/app"}', "etzz"),
+            ('{"u":"redis://default:ab\\/cdzz@cache:6379","e":"bob@example.com"}', "cdzz"),
+            ('{"u": "postgres://admin:hunter2\\"zzqqsecret@db.internal.example.com/x", "e": "bob@example.com"}', "hunter2"),
+            ('{"log":"API_TOKEN=abcd1234\\fwxyz9876"}', "wxyz9876"),
+            ('{"k": "AKIAIOSFODNN7EXAMPL5\\u005f", "e": "bob@example.com"}', "AKIAIOSFODNN7EXAMPL5"),
+            ('{"stdout_lines": ["secret=-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEAbodybodybody", "-----END RSA PRIVATE KEY-----"]}', "bodybodybody"),
+            ('{"cmd":"mysql --password=abc\\u0020opaqueBBB"}', "opaqueBBB"),
+        ]
+        for text, secret in cases:
+            for req, get, call in (
+                ({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]}, lambda r: r["messages"][0]["content"], "completion"),
+                ({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {"output": text}}}]}]},
+                 lambda r: json.dumps(r["contents"][0]["parts"][0]["functionResponse"]["response"]), "agenerate_content"),
+            ):
+                with self.subTest(text=text[:40], call=call):
+                    self.assertNotIn(secret, get(self._run(req, call)))
+
     def test_a_tool_output_with_a_repeated_key_gets_the_text_rules_only(self) -> None:
         # The decoder would keep one value; what the text says is what counts.
         text = '{"kind":"Secret","kind":"Other","data":{"k":"opaque-value-xyz"}}'
