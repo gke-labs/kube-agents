@@ -475,6 +475,26 @@ artifact, and nine names are reserved so renderers and audit tooling can rely on
 | `handoff`  | The task handed work to kanban cards, which report into its conversation themselves: one TextPart, `cards`. The Hermes bridge's API executor publishes it ahead of the terminal of such a task whenever the conversation route was recorded (Slack or Google Chat). Never rendered; a delegated child's wake reads it as the cards-pending signal beside the terminal's mark, which the bridge sets only on Slack with `KAGE_SLACK_UX` on (#3258). Reserved 10/16 |
 | `usage`    | What the task's turns cost: one `data` part per finished turn, published by the executor before the turn's answer settles and never after the terminal. The object carries `model`, `inputTokens`, `outputTokens`, `costUsd` and `durationMs`, every one optional (below). Readers tolerate its absence and sum a task's parts; a reserved-name validator takes a part only when it is a usage object. Reserved 10/20                                             |
 
+**The session's tool-call capture (instrumentation, not an artifact).** A session pod's worker
+adapter also keeps every tool call its harness makes, as the driver decodes it, for the evals:
+the tool's name and its input, which the `activity` artifact may not carry. It is not published.
+It isn't on the TASKS stream, in any artifact, on a chat surface, or on disk; it stays in the
+adapter's memory and goes with the pod. Each input is scrubbed with the answer scrub's inline
+secret rules, on every string value and then on the whole input, and a secret-looking key's
+whole value is replaced. The task's seen values join once the session tracks them. An input is
+cut past 2000 bytes, a task keeps at most 2000 calls and 4 MB, and the pod keeps the last 8
+tasks within 16 MB. It is
+served read-only on the pod's loopback (`127.0.0.1:7346`, in no Service and no container port)
+and read with `kubectl exec <pod> -c worker -- worker-adapter trajectory <task>`. It's in memory
+rather than a file because the harness and every shell the agent runs share the adapter's uid, so
+a file could be rewritten and a graded trajectory forged. The adapter is marked not dumpable, so
+those processes can't reach its memory or file descriptors through `/proc` either. One residual
+remains, the same one the `activity` artifact and the answer have: a process with the agent's uid
+can write to the harness's own stdout pipe, and the adapter would decode what it wrote as the
+harness's. Only separate uids would close that. The agent in that pod can read its own
+session's scrubbed calls through the port: it made them, so nothing in it is private from the
+agent. If the port can't be bound, the session runs without a capture, and a reader sees none.
+
 Artifact names are data, so the set can grow without touching the envelope; only these
 nine carry reserved semantics. A `usage` part is one turn's figures as its producer had them:
 `model` is the model the executor asked for or was told it ran; `inputTokens` is every token the
@@ -905,6 +925,57 @@ unchanged, and a worker that predates the part ignores it.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 
+**Scope clusters.** Beside its `delegateTargets` part, a delegating profile's own task (the same
+gate: a card that says it delegates, no `via`, a route set) carries
+`{"scopeClusters": {"count", "clusters": [{"project", "location", "cluster"}, …], "truncated", "cursor", "unknown"?, "unlistedProjects"?, "unlistedCount"?, "oldestListing"?, "parentScoped"?, "unbounded"?}}`:
+one page of the clusters a `cluster` child delegation from that task would be accepted for, as far as
+the install's scope decides it. Both a task started from a turn and a scheduled run carry it. The
+source is the resolved scope document's `clusters` map, which the scope publisher writes for member
+projects (`{project: {at, clusters: [[location, name], …]}}`, `scope_publisher.py`) and the gateway
+already reads with its own ServiceAccount. Each cluster is held to the delegation's own scope check
+(exclusions, the declaration, the resolved rows) and to the parent's scope, so the page offers
+nothing the delegation refuses on scope. It is checked on scope only, by design: a profile's own
+checks (its tiers, a pinned profile's tiers on its cluster, the lists) stay with `delegateTargets`
+and are run when the delegation arrives, so a cluster on the page can still be refused for the
+profile it is sent to. A parent the delegation refuses outright, or an install whose scope file
+can't be read, gets an empty page with a known `count` of 0.
+
+- The page is the first `min(A2A_DELEGATION_WIDTH_MAX, 16)` accepted clusters in (project, location,
+  cluster) order, so it is one batch of targets. `count` is every accepted cluster with a published
+  listing, and `truncated` is `count` past the page.
+- `cursor` is reserved for a later paging contract and is always empty; a reader ignores it.
+- `unknown` is set when the document has no `clusters` map to count from: no document, one that
+  isn't `ok`, or one the publisher wrote without the map (it drops the map first when the document
+  would pass its 900 KiB budget, and writes none when it has nothing listed). `count` is then only
+  the clusters the gateway knows of, and `truncated` is always set. The map's entries are read one by
+  one, as the publisher reads a previous document's: an entry that isn't whole (an `at` not in the
+  publisher's time format, a pair that isn't two strings) is left out, and its project reads as one
+  no probe has listed.
+- `unlistedProjects` names the projects in scope whose clusters no map entry carries, "listed
+  elsewhere": a member no probe has listed yet, and, from a publisher that predates #7107, an
+  explicitly declared project and the management project, which it never probes (from #7107 the
+  publisher lists those in the map too). Without a map every project in scope is one. At most
+  16 are named, sorted; `unlistedCount` is the total. A delegation to one is checked as it arrives.
+- `unbounded` is set when the install's scope declares no boundary, so any project not excluded is
+  in scope and no list can be complete: `unknown` is set too, and no project is named as listed
+  elsewhere.
+- `parentScoped` is set for a parent scoped to one cluster, which the delegation holds to that
+  cluster: the page is that cluster when the install's scope admits it, and empty otherwise, with
+  `count` 0 or 1; the map isn't used.
+- `oldestListing` is the oldest `at` among the projects the counted clusters came from. A probe that
+  fails keeps its previous entry and its `at`, so this is how stale the page may be. A stamp ahead
+  of the gateway's clock gives no age, and `oldestListing` is then left out: clusters counted with
+  no `oldestListing` have an unknown age.
+- Every name is a subject token and the part encodes to at most 8 KiB, so the session pod hands it to
+  its tool server in one environment variable (`A2A_SCOPE_CLUSTERS`), beside the targets. The
+  delegate tool names the page once, at the end of its own description, when an agent on the list
+  takes a cluster (declares `project`, `location` and `cluster`), as plain facts: the count of
+  clusters with a published listing (or that it is unknown, and why), the page, how many are off
+  it, the oldest listing, the projects listed elsewhere, and that a profile's tiers and pins are
+  checked when a task is delegated. A reader that finds a part breaking these bounds ignores it
+  (`lib.ScopeClustersOf`), and a worker that predates the part ignores it too: it reads text parts
+  and its own data keys only.
+
 **Reply to.** A turn that answers a card's report carries `{"replyTo": {"taskId": "<task>"}}`: the
 gateway task whose turn filed the card, which the report's console frame named as `replyTo` (the
 root of its chain when a delegated child filed it, so that card's row, keyed by the child's task, is
@@ -1261,7 +1332,12 @@ Lifecycle:
     violation counter has to know it: per-subject CAS cannot span two subjects, so the
     janitor's terminal on `…supervisor` is no longer serialized against the executor's own
     terminal on `…events`. A genuine race produces exactly one counted post-final drop, and
-    the counter does not distinguish it from a forged one. The one exception to "exactly
+    the counter does not distinguish it from a forged one. A second expected case: the
+    dispatcher's terminal on a profile task's `…supervisor` written twice, identical (a
+    dispatcher restart between its publish and its settle, or, on the six-token form, a
+    send whose ack was lost: its envelope id is drawn again after a failed send, #6883);
+    readers take the first, and the second is one counted post-final drop on every read
+    of the task. The one exception to "exactly
     one" is a profile task on a latched install settled with the reason
     `terminal-unpublished` (#5301): the dispatcher's six-token terminal was refused for its
     whole retry bound, so no terminal is written.

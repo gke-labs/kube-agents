@@ -243,6 +243,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",
+            "gce-rotated-console-notes",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
             "fleet-audit-manifest-fix-names-stalled-config-connector",
@@ -668,7 +669,7 @@ EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EV
         self.assertIn('cat "${block}" >> "${EVAL_GRADING_LOG}"', lifted("finish_case"))
         self.assertIn('--json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?', src)
         self.assertIn('sed "s/^/Ledger reset (${label}): /" >> "${EVAL_GRADING_LOG}"', lifted("reset_audit_ledgers"))
-        self.assertIn('expires ${minted##* }${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
+        self.assertIn('expires ${expires}${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
         self.assertEqual(src.count("uv run bench-gate case"), 1, "grade_case is the one caller; both of its call sites redirect")
         # The table pointer is printed only when the table exists; a suite
         # that died before writing it says so instead.

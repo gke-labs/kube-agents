@@ -3,6 +3,7 @@ package dispatch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -234,9 +235,8 @@ func refusedErr() error {
 
 // Only a latched install gives up: an unlatched one (the five-token form)
 // keeps retrying a refused terminal for as long as it takes, as it did before
-// the six-token form, and a duplicate that isn't the task's terminal gives up
-// at once whatever the bound. Only a permission refusal counts: a timeout
-// with no refusal heard is retried, latched or not.
+// the six-token form. Only a permission refusal counts: a timeout with no
+// refusal heard is retried, latched or not.
 func TestOnlyALatchedInstallGivesUpOnARefusedTerminal(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
@@ -248,7 +248,6 @@ func TestOnlyALatchedInstallGivesUpOnARefusedTerminal(t *testing.T) {
 		{"unlatched", "", refusedErr(), []bool{false, false, false}},
 		{"latched", lib.ProfileSupervisorFormProfile, refusedErr(), []bool{false, true}},
 		{"latched, a timeout with no refusal", lib.ProfileSupervisorFormProfile, context.DeadlineExceeded, []bool{false, false, false}},
-		{"planted duplicate", lib.ProfileSupervisorFormProfile, errTerminalUnpublished, []bool{true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testDispatchConfig(6, testProfile("tse", 2))
@@ -273,31 +272,34 @@ func TestOnlyALatchedInstallGivesUpOnARefusedTerminal(t *testing.T) {
 	}
 }
 
-// allowDirect turns on direct gets on TASKS, as the provision Job creates it
-// (--allow-direct).
-func (b *bus) allowDirect() {
+// sixTokenTerminalIDs is the envelope ids of the messages stored on a
+// six-token supervisor subject, oldest first.
+func (b *bus) sixTokenTerminalIDs(subject string) []string {
 	b.t.Helper()
-	s, err := b.js.Stream(b.ctx, "TASKS")
+	cons, err := b.js.OrderedConsumer(b.ctx, "TASKS", jetstream.OrderedConsumerConfig{FilterSubjects: []string{subject}})
 	if err != nil {
 		b.t.Fatal(err)
 	}
-	c := s.CachedInfo().Config
-	c.AllowDirect = true
-	if _, err := b.js.UpdateStream(b.ctx, c); err != nil {
-		b.t.Fatal(err)
+	var ids []string
+	for range b.storedOn(subject) {
+		m, err := cons.Next(jetstream.FetchMaxWait(5 * time.Second))
+		if err != nil {
+			b.t.Fatal(err)
+		}
+		ids = append(ids, m.Headers().Get(jetstream.MsgIDHeader))
 	}
+	return ids
 }
 
-// The terminal's envelope id is predictable, and the TASKS duplicate window
-// is keyed on the id alone, whatever the subject. A message stored first
-// under that id on the five-token subject, which readers past the cutoff
-// don't take as a profile task's terminal, must not swallow the real one: the
-// duplicate ack is checked against the six-token subject, and with no
-// terminal there the terminal is published again under a fresh id.
+// The TASKS duplicate window is keyed on the envelope id alone, whatever the
+// subject. A message stored first under the old fixed id, on the five-token
+// subject that readers past the cutoff don't take as a profile task's
+// terminal, no longer swallows the real one: the six-token terminal goes out
+// under a random id no other writer can predict, with no read-back (TASKS
+// here has no direct gets) (#6883).
 func TestAPlantedTerminalIDDoesNotSwallowTheSixTokenTerminal(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
-	b.allowDirect()
 	ti := oneProfile("tse", 2, "tse-0")
 	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
 	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
@@ -314,72 +316,61 @@ func TestAPlantedTerminalIDDoesNotSwallowTheSixTokenTerminal(t *testing.T) {
 		t.Fatalf("the terminal after a planted id: %v", err)
 	}
 	six := lib.ProfileSupervisorSubject("tse", "task-planted")
-	if n := b.storedOn(six); n != 1 {
-		t.Fatalf("%d terminals on %s, want the real one", n, six)
-	}
-	stored, err := d.storedTerminal(b.ctx, d.busFor("tse"), hk, six, r.freshID)
-	if err != nil || !stored {
-		t.Errorf("the six-token subject holds no dispatcher terminal: stored %v, err %v", stored, err)
-	}
-	// The terminal published again in the same retry loop (a retry after a
-	// lost ack) is the dispatcher's own duplicate: confirmed on the subject
-	// under the loop's fresh id, not stored twice.
-	if err := d.publishTerminal(b.ctx, &r, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
-		t.Fatal(err)
-	}
-	if n := b.storedOn(six); n != 1 {
-		t.Errorf("%d terminals on %s after a repeat, want 1", n, six)
+	ids := b.sixTokenTerminalIDs(six)
+	if len(ids) != 1 || ids[0] != r.id || ids[0] == terminalEnvelopeID(hk) || !strings.HasPrefix(ids[0], terminalEnvelopePrefix) {
+		t.Fatalf("terminals on %s under %q, want the real one under the loop's random id %q", six, ids, r.id)
 	}
 }
 
-// An ordinary repeat of a six-token terminal (a retry after a lost ack) is
-// confirmed by the direct get and stores nothing more.
-func TestARepeatSixTokenTerminalIsConfirmedNotRepublished(t *testing.T) {
+// The six-token terminal's id is kept while sends succeed: a repeat after a
+// send that landed is the stream's duplicate and stores nothing more, while
+// a second loop (a dispatcher that restarted between the
+// publish and the settle) stores a second identical final status under its
+// own id, which readers fold past. That is the cost the random id carries.
+func TestTheSixTokenTerminalIDIsOnePerRetryLoop(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
-	b.allowDirect()
 	ti := oneProfile("tse", 2, "tse-0")
 	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
 	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-repeat"}
 	sub := submissionEnv(t, "tse", "task-repeat", "", map[string]string{})
+	six := lib.ProfileSupervisorSubject("tse", "task-repeat")
+	var r terminalRefusal
+	for range 2 {
+		if err := d.publishTerminal(b.ctx, &r, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := b.storedOn(six); n != 1 {
+		t.Fatalf("%d terminals after a repeat in one loop, want 1", n)
+	}
+	if err := d.publishTerminal(b.ctx, nil, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
+		t.Fatal(err)
+	}
+	ids := b.sixTokenTerminalIDs(six)
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("terminals after a second loop under %q, want two under their own ids", ids)
+	}
+}
+
+// The five-token form keeps its fixed id: on an unlatched install a
+// terminal re-published after a redelivery is still the stream's duplicate.
+func TestTheFiveTokenTerminalKeepsItsFixedID(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	ti := oneProfile("tse", 2, "tse-0")
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-five"}
+	sub := submissionEnv(t, "tse", "task-five", "", map[string]string{})
 	for range 2 {
 		if err := d.publishTerminal(b.ctx, nil, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-repeat")); n != 1 {
-		t.Errorf("%d terminals stored, want 1", n)
-	}
-}
-
-// A duplicate the dispatcher can't check (here TASKS has no direct gets; in
-// production, a missing grant) is never taken as landed: the terminal is
-// published again under a fresh id, so a planted id still doesn't swallow
-// it.
-func TestAnUncheckableDuplicateIsRepublishedNotTakenAsLanded(t *testing.T) {
-	b := newBus(t, "tse-0")
-	b.ensure("tse", 2, 0, "read")
-	ti := oneProfile("tse", 2, "tse-0")
-	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
-	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
-	hk := holdKey{"tse", "read", lib.SubmitKindTop, "task-blind"}
-	sub := submissionEnv(t, "tse", "task-blind", "", map[string]string{})
-	six := lib.ProfileSupervisorSubject("tse", "task-blind")
-	if _, err := d.storedTerminal(b.ctx, d.busFor("tse"), hk, six, ""); err == nil {
-		t.Fatal("the direct get worked; this test needs it to fail")
-	}
-	plant := nats.NewMsg(lib.TaskSupervisorSubject("tse", "task-blind"))
-	plant.Header.Set(jetstream.MsgIDHeader, terminalEnvelopeID(hk))
-	plant.Data = []byte(`{}`)
-	if _, err := b.js.PublishMsg(b.ctx, plant); err != nil {
-		t.Fatal(err)
-	}
-	if err := d.publishTerminal(b.ctx, nil, hk, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
-		t.Fatalf("the terminal after a planted id with no direct get: %v", err)
-	}
-	if n := b.storedOn(six); n != 1 {
-		t.Fatalf("%d terminals on %s, want the real one re-published", n, six)
+	five := lib.TaskSupervisorSubject("tse", "task-five")
+	if ids := b.sixTokenTerminalIDs(five); len(ids) != 1 || ids[0] != terminalEnvelopeID(hk) {
+		t.Fatalf("five-token terminals under %q, want one under %q", ids, terminalEnvelopeID(hk))
 	}
 }
 
@@ -572,41 +563,38 @@ func (l *lockedBuffer) String() string {
 }
 
 // The six-token subject carries no tier or kind, so two tasks sharing a task
-// id under one profile (another tier, or the other kind) share it. The
-// read-back confirms a duplicate only by this terminal's own envelope id:
-// another tier's terminal for the same task id is not this one landing.
-func TestAnotherTiersTerminalDoesNotConfirmThisOne(t *testing.T) {
+// id under one profile (another tier, or the other kind) share it. Each
+// terminal is its own message under its own random id: one tier's never
+// stands in for the other's.
+func TestAnotherTiersTerminalIsItsOwnMessage(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read", "write")
-	b.allowDirect()
 	ti := oneProfile("tse", 2, "tse-0")
 	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
 	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
-	read := holdKey{"tse", "read", lib.SubmitKindTop, "task-shared"}
-	write := holdKey{"tse", "write", lib.SubmitKindTop, "task-shared"}
 	sub := submissionEnv(t, "tse", "task-shared", "", map[string]string{})
-	if err := d.publishTerminal(b.ctx, nil, read, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
-		t.Fatal(err)
+	for _, tier := range []string{"read", "write"} {
+		if err := d.publishTerminal(b.ctx, nil, holdKey{"tse", tier, lib.SubmitKindTop, "task-shared"}, sub, lib.StateRejected, ReasonVerifierRefused, ""); err != nil {
+			t.Fatal(err)
+		}
 	}
-	six := lib.ProfileSupervisorSubject("tse", "task-shared")
-	if stored, err := d.storedTerminal(b.ctx, d.busFor("tse"), read, six, ""); err != nil || !stored {
-		t.Fatalf("the read tier's own terminal is not confirmed: stored %v, err %v", stored, err)
-	}
-	if stored, err := d.storedTerminal(b.ctx, d.busFor("tse"), write, six, ""); err != nil || stored {
-		t.Errorf("the read tier's terminal confirmed the write tier's: stored %v, err %v", stored, err)
+	if ids := b.sixTokenTerminalIDs(lib.ProfileSupervisorSubject("tse", "task-shared")); len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("terminals under %q, want each tier's own", ids)
 	}
 }
 
-// A re-publish under a fresh id (after a duplicate the dispatcher can't
-// check) that fails transiently is an ordinary retry, not a give-up, and the
-// retry re-publishes under the same fresh id: whether the failed send was
-// stored (its ack lost) or not, exactly one terminal lands on the six-token
-// subject, with no give-up and no Error log.
-func TestATransientRepublishErrorRetriesUnderTheSameFreshID(t *testing.T) {
+// A six-token publish that fails is an ordinary retry, not a give-up, and the
+// retry goes out under a new id: the failed send may have reached the
+// subject's subscribers unstored, so its id is never reused. A failed send
+// that was never stored leaves one terminal; one stored with its ack lost
+// leaves a second identical one, which readers fold past. Neither gives up or
+// logs at Error.
+func TestAFailedPublishRetriesUnderANewID(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		stored bool // the failed re-publish was stored, its ack lost
-	}{{"not stored", false}, {"ack lost", true}} {
+		stored bool // the failed publish was stored, its ack lost
+		want   uint64
+	}{{"not stored", false, 1}, {"ack lost", true, 2}} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newBus(t, "tse-0")
 			b.ensure("tse", 2, 0, "read")
@@ -619,18 +607,12 @@ func TestATransientRepublishErrorRetriesUnderTheSameFreshID(t *testing.T) {
 				t.Fatal(err)
 			}
 			h := &holding{profile: "tse", tier: "read", kind: lib.SubmitKindTop, taskID: "task-flaky"}
-			hk := h.key()
 			var mu sync.Mutex
-			var freshIDs []string
-			failed := false
+			var ids []string
 			d.publishAck = func(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error) {
-				if env.EnvelopeID == terminalEnvelopeID(hk) {
-					return c.PublishAck(ctx, subject, env)
-				}
 				mu.Lock()
-				freshIDs = append(freshIDs, env.EnvelopeID)
-				first := !failed
-				failed = true
+				ids = append(ids, env.EnvelopeID)
+				first := len(ids) == 1
 				mu.Unlock()
 				if first {
 					if tc.stored {
@@ -642,34 +624,99 @@ func TestATransientRepublishErrorRetriesUnderTheSameFreshID(t *testing.T) {
 				}
 				return c.PublishAck(ctx, subject, env)
 			}
-			// TASKS has no direct gets, so the planted id's duplicate can't
-			// be checked and takes the re-publish.
-			plant := nats.NewMsg(lib.TaskSupervisorSubject("tse", "task-flaky"))
-			plant.Header.Set(jetstream.MsgIDHeader, terminalEnvelopeID(hk))
-			plant.Data = []byte(`{}`)
-			if _, err := b.js.PublishMsg(b.ctx, plant); err != nil {
-				t.Fatal(err)
-			}
 			del := &envDelivery{env: submissionEnv(t, "tse", "task-flaky", "", map[string]string{})}
 			ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 			defer cancel()
 			if !d.publishTerminalRetry(ctx, log, del, h, lib.StateFailed, ReasonLeaseExpired, "") {
 				t.Fatal("the terminal never landed")
 			}
-			if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-flaky")); n != 1 {
-				t.Errorf("%d terminals on the six-token subject, want 1", n)
+			if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-flaky")); n != tc.want {
+				t.Errorf("%d terminals on the six-token subject, want %d", n, tc.want)
 			}
 			if n := d.Health().SupervisorGiveUps; n != 0 {
 				t.Errorf("supervisorGiveUps = %d, want 0", n)
 			}
 			if out := logs.String(); out != "" {
-				t.Errorf("Error logs on a transient re-publish error:\n%s", out)
+				t.Errorf("Error logs on a failed publish:\n%s", out)
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if len(freshIDs) != 2 || freshIDs[0] != freshIDs[1] {
-				t.Errorf("re-publish ids %v, want the same fresh id twice", freshIDs)
+			if len(ids) != 2 || ids[0] == ids[1] {
+				t.Errorf("publish ids %v, want a new id on the retry", ids)
 			}
 		})
+	}
+}
+
+// A send that reached the subject's subscribers but wasn't stored shows its
+// id to anyone listening, who could store a message under it on another
+// subject before the retry. The retry's new id isn't that one, so the real
+// terminal still lands.
+func TestAnIDSeenOnAnUnstoredSendDoesNotSwallowTheRetry(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	ti := oneProfile("tse", 2, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	h := &holding{profile: "tse", tier: "read", kind: lib.SubmitKindTop, taskID: "task-seen"}
+	calls := 0
+	d.publishAck = func(ctx context.Context, c *lib.Client, subject string, env *lib.Envelope) (uint64, bool, error) {
+		calls++
+		if calls == 1 {
+			// The send went out unstored; a listener plants its id.
+			plant := nats.NewMsg(lib.TaskSupervisorSubject("tse", "task-seen"))
+			plant.Header.Set(jetstream.MsgIDHeader, env.EnvelopeID)
+			plant.Data = []byte(`{}`)
+			if _, err := b.js.PublishMsg(ctx, plant); err != nil {
+				t.Error(err)
+			}
+			return 0, false, nats.ErrTimeout
+		}
+		return c.PublishAck(ctx, subject, env)
+	}
+	del := &envDelivery{env: submissionEnv(t, "tse", "task-seen", "", map[string]string{})}
+	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	defer cancel()
+	if !d.publishTerminalRetry(ctx, quietLog(), del, h, lib.StateFailed, ReasonLeaseExpired, "") {
+		t.Fatal("the terminal never landed")
+	}
+	if n := b.storedOn(lib.ProfileSupervisorSubject("tse", "task-seen")); n != 1 {
+		t.Fatalf("%d terminals on the six-token subject, want the real one", n)
+	}
+}
+
+// A give-up is an install fault with no other carrier (#6884): it logs one
+// Error line starting with the fixed ALERT prefix a log-based alert matches,
+// naming the profile, tier and task and the terminal-unpublished settle. The
+// prefix is pinned literally: the docs' log filter quotes it.
+func TestAGiveUpLogsTheAlertLineANamedFilterMatches(t *testing.T) {
+	var buf lockedBuffer
+	base := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := testDispatchConfig(6, testProfile("tse", 2))
+	cfg.ProfileSupervisorForm = lib.ProfileSupervisorFormProfile
+	clock := time.Now()
+	d := &Dispatcher{cfg: testConfig(), src: NewStaticSource(cfg), log: base, now: func() time.Time { return clock }}
+	log := base.With("profile", "tse", "tier", "read", "kind", lib.SubmitKindTop, "task", "task-alert")
+	var r terminalRefusal
+	for range 2 {
+		d.terminalGivenUp(log, &r, refusedErr(), lib.StateFailed, ReasonLeaseExpired)
+		clock = clock.Add(time.Hour)
+	}
+	var alerts []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if msg, _ := rec["msg"].(string); strings.HasPrefix(msg, "ALERT dispatcher_terminal_unpublished") {
+			alerts = append(alerts, rec)
+		}
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("%d alert lines, want one for the give-up:\n%s", len(alerts), buf.String())
+	}
+	a := alerts[0]
+	if a["level"] != "ERROR" || a["profile"] != "tse" || a["tier"] != "read" || a["task"] != "task-alert" || a["settle"] != ReasonTerminalUnpublished {
+		t.Errorf("alert line = %v, want an Error naming the profile, tier, task and the terminal-unpublished settle", a)
 	}
 }

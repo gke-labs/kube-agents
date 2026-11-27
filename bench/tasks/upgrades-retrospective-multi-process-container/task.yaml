@@ -24,8 +24,8 @@
 # the Deployment under 15 today. The case lands marked `expected_fail: true`
 # (.agents/rules/eval_driven_development.md, "When the fix is not yours"): the
 # nightly records EXPECTED_FAIL, not FAILED, and passing every repetition reds the
-# job until the marker comes off. #2717 is the open gap, the after-upgrade case
-# for this entry; what closes it is a risk shape that reads the container's
+# job until the marker comes off. #4545 is the open gap for this entry (#2717
+# closed with it open); what closes it is a risk shape that reads the container's
 # command for a supervisor program or a shell script that forks a background job
 # on a cgroup v2 pool at kubelet 1.28 or later (the readiness report's
 # group-oom-kill rule is the heuristic's source of truth), and the pull request
@@ -94,7 +94,7 @@ infrastructure:
 validated: false
 
 # Red until the collector carries an entry-15 shape: see "Red on the retrospective
-# job" above (#2717). The pull request that lands the shape removes this marker.
+# job" above (#4545). The pull request that lands the shape removes this marker.
 expected_fail: true
 
 # Slug per docs/designs/domains.yaml.

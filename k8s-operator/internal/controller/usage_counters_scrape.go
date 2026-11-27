@@ -149,6 +149,11 @@ const (
 	a2aPeopleWindowLabel = "window"
 	a2aPeopleWindowShort = "7d"
 	a2aPeopleWindowLong  = "30d"
+	// a2aSlackConnectedSeries is the A2A gateway's gauge of the Slack Socket
+	// Mode connection: 1 while connected, 0 while disconnected or failing
+	// auth.test, and absent on standby replicas or when Slack is not running.
+	a2aSlackConnectedSeries = "kubeagents_a2a_gateway_slack_connected"
+	a2aSlackConnectedUp     = 1
 	// proposalsOpenedSeries is the chat plugin's count of the pull requests
 	// the agent opened, by the origin of the work and, for chat, its platform:
 	// a gauge it reads from the pod's proposals ledger at scrape time, served
@@ -672,6 +677,10 @@ type usageReading struct {
 	// nil for any other. Not folded: the poll sums it across the broker pods
 	// read and projects the top rows as they stand (usageTopToolsForPoll).
 	ToolPairs map[usageToolPair]usageToolCounts
+	// SlackConnected is the A2A gateway's kubeagents_a2a_gateway_slack_connected
+	// gauge reading (true when >= a2aSlackConnectedUp, false when 0); nil when
+	// the body is not an A2A gateway's or does not export the series.
+	SlackConnected *bool
 }
 
 // usageDispatcherReading is the kanban dispatcher's failing boards in one
@@ -894,6 +903,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	var dispatcher *usageDispatcherReading
 	// dispatcherAges is each board's streak age, joined to its ticks after the body.
 	var dispatcherAges map[string]int64
+	// slackConnected is the A2A gateway's Slack Socket Mode gauge when exported.
+	var slackConnected *bool
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -922,6 +933,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			dispatcherAges = map[string]int64{}
 			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries, kanbanDispatcherStuckSecondsSeries)
 		}
+		if family == a2aAnswerFeedbackSeries && !slices.Contains(wanted, a2aSlackConnectedSeries) {
+			wanted = append(wanted, a2aSlackConnectedSeries)
+		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
 	// of the kinds asked for, whether a sample resolved it, and the readings
@@ -943,6 +957,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				wanted = append(wanted, family)
 			}
 		}
+	}
+	if slices.Contains(kinds, usageReadingPeople) && !slices.Contains(wanted, a2aSlackConnectedSeries) {
+		wanted = append(wanted, a2aSlackConnectedSeries)
 	}
 	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
 	for {
@@ -999,6 +1016,13 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 					if name == processStartTimeSeries {
 						captured := value
 						start = &captured
+						continue
+					}
+					if name == a2aSlackConnectedSeries {
+						up := value >= a2aSlackConnectedUp
+						if slackConnected == nil || up {
+							slackConnected = &up
+						}
 						continue
 					}
 					if name == dataVolumeSeries {
@@ -1102,7 +1126,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		clusters = nil
 		volume = nil
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher, SlackConnected: slackConnected}
 	if readings != nil {
 		var ok bool
 		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {

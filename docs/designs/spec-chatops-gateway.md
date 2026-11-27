@@ -947,9 +947,8 @@ chain's end, delegated or not. A stop while the child runs cancels the child and
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
 `{"v":1,"taskId":…}` on `a2a.stop.<profile>.<task>` in the `DISPATCH_STOPS` stream, for the
 dispatcher, which has no read on `.in`. The gateway is the record's one writer, and a task
-addressed to platform or a session gets none. The stream and the dispatcher's reader aren't
-built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
-queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
+addressed to platform or a session gets none. The dispatcher ends a task it still holds queued
+when it finds the record. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
@@ -965,7 +964,14 @@ and nobody for a parent refused outright, such as one at the depth cap. The chec
 the cluster the worker picks for a profile that takes a target (that it is in scope, and a profile
 pinned to it: its tier, its `unattended` listing and its allow-lists) wait for the delegation, which
 still refuses there. A scheduled run of a delegating profile carries the list too, built
-the same way when the trigger ingress submits it. Any other profile submission is unchanged. The
+the same way when the trigger ingress submits it. Beside the list, under the same gate, rides the
+`scopeClusters` part (`spec-a2a-payloads.md`): one page of the clusters a `cluster` child would be
+accepted for, from the resolved scope's `clusters` map, each held to the delegation's own scope check
+and the parent's scope (a profile's tiers and pins are left to the delegation), with the count, a
+reserved empty cursor, the projects in scope whose clusters are listed elsewhere (explicit and
+management projects, members not yet listed), and `unknown` with `truncated` when the document
+isn't `ok` or carries no map (dropped for its 900 KiB budget, or absent), or when the scope draws no boundary. The
+delegate tool names the page once in its own description when an agent on the list takes a cluster. Any other profile submission is unchanged. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
 bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
 delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
@@ -1558,7 +1564,7 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`), whom the chain delegated to (`childAddressees`, each child task's addressee once in the order delegated, the profile its address resolved to or `platform`, from the record: `[]` when nothing was delegated and `null` when the read had no task to look at; the inject door's alone), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
+  and the progress artifact's latest line (`progress`), whom the chain delegated to (`childAddressees`, each child task's addressee once in the order delegated, the profile its address resolved to or `platform`, from the record: `[]` when nothing was delegated and `null` when the read had no task to look at; the inject door's alone), how many child tasks the chain minted (`childCount`, every delegation counted, so a repeated addressee counts each time: `0` when nothing was delegated and `null` when the read had no task to look at, also the inject door's alone), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
   child tasks' usage artifacts summed; `usagePartial` when a link's stream could not be read, so
   the sums are short of it; and `usage`, the usage
   artifact's parts summed over the task and, for a delegation chain's root, every wake that
@@ -1639,7 +1645,8 @@ The gateway tells the adapter a task's ends through an optional `TaskObserver` i
 Discord and Google Chat do not implement: a human reads the chat, so the rendered message is their
 whole interface, while a program must not have to parse `✅ **completed**` to know a task is
 over. (The Slack adapter implements it for one reason of its own, given in its section: a task
-starting or ending in a thread is what its session-thread cache keys on.) The
+starting or ending in a thread is what its session-thread cache keys on. The Teams adapter
+implements it for its typing indicator, in its section.) The
 start and the accept are separate calls because the id and the submission are different facts,
 as the refusal above turns on. The terminal says who declared it, which is the difference between
 an executor that failed, a task that never reached the bus, the supervisor's word about an
@@ -1650,7 +1657,7 @@ terminal status message the bridge and the worker adapter write as `reason: <tok
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
-`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+`hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `internal-panic`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-cli-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
@@ -2446,10 +2453,12 @@ by the operator upgrade that brings the arm: the broker is no longer handed the 
 gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
 not exit: the console is the mux's essential backend, so the Slack backend is contained and
 retried on a backoff, the pod stays Running and Ready, and Slack has no consumer until the
-Secret holds one workspace's token or Slack is turned off. Nothing in the CR's
-`.status` says why, since no `A2AGateway` condition is written for a gateway the arm called
-configured; the gateway pod's log carries the cause, and its events do for a missing Secret
-or key. Reading the Secret in the arm would catch it, at the cost of a
+Secret holds one workspace's token or Slack is turned off. No `A2AGateway` condition is written
+for a gateway the arm called configured, though after two consecutive five-minute usage polls
+reading `kubeagents_a2a_gateway_slack_connected` as `0` the usage poller surfaces the outage in
+`.status` as `SlackConnected=False` (`ConnectionFailed`) and `Degraded=True`
+(`SlackConnectionFailed`) without changing `Ready` or `phase`; the gateway pod's log carries the
+specific `invalid_auth` cause, and its events carry a missing Secret or key. Reading the Secret in the arm would catch it, at the cost of a
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
 CR-only arm was kept and the limitation documented instead (2026-10-06). The installer
 checks the applies it makes (#2812). `install.sh`, its menu's apply and a full `upgrade.sh`
@@ -2864,8 +2873,8 @@ nothing out. A result recovered by replaying the stream after a restart arrives 
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
-them posts exactly what it posted before chat messages existed; Slack and Google Chat lay the
-message out ("Chat messages on Google Chat" under the Google Chat adapter). The relay never hands the
+them posts exactly what it posted before chat messages existed; Slack, Google Chat and Teams lay the
+message out ("Chat messages on Google Chat" under the Google Chat adapter, "Chat messages on Teams" under the Teams adapter), and Teams with its cards off answers `ErrTextOnly` too. The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
 refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
 the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
@@ -3015,7 +3024,7 @@ one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the 
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
 (`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
-escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat adapter draws it too (below); Discord and the console ignore it. A tap is never a turn,
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat and Teams adapters draw it too (below, and "The Teams adapter"); Discord and the console ignore it. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -3045,7 +3054,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
+member id, Google Chat email or Teams sender id, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -3167,6 +3176,9 @@ turns it off with `spec.integration.googleChat.answerFeedback: false` (default `
 operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. Either name is
 one switch for every backend the gateway holds (`AnswerFeedbackOff`); a tap or note
 click on a Google Chat message already posted is logged and acked and changes nothing.
+Teams has no CR field yet: `A2A_TEAMS_ANSWER_FEEDBACK=false` on the controller-manager Deployment
+is carried to a gateway that holds Teams under the same name (`a2aTeamsAnswerFeedbackEnvVar`),
+and is the same one switch.
 
 ## The Teams adapter (added 11/16)
 
@@ -3255,6 +3267,78 @@ and the answer on the line are the ones "Who may press Stop" and "The Stop butto
 plain text (`adaptiveCards` off, or a line too large for a card) has none, and a typed `stop`
 is the way to stop there. A typed `stop` on a task with a line is answered on the line as a
 press is (`isChatTypedStop`), so a line never keeps a live button beside a posted "cancel sent".
+
+An answer the relay marked for feedback carries its rating controls on the same card
+(`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. A post the agent made on
+its own (an alert, kept through the triage that edits it, or a report) carries them under the
+id the notifier marked it with, and a press on one is recorded under that id. 👍 is an `Action.Submit`
+like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
+alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
+the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
+give, nor Google Chat's private card; so a 👎 is recorded when it
+is sent, with a note or without one, and has no Cancel. The adapter checks the presser as the
+gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the pull loop, and
+redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
+rating because the card is the conversation's; a card the line would push past the activity
+budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
+The form's kept-for line is drawn before any press, so on an answer it always names the
+question; on an alert or a report it says only the post is kept. It remembers a bounded number of rated messages
+(`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
+recorded without the answer's text and without the redraw, and a re-rating that carries no
+answer keeps the answer already kept. A triage edit of a rated alert draws it without the
+recorded line, which the next rating adds again.
+
+**Chat messages on Teams.** With cards on, a `kube-agents.chat/v1` message is laid out as the
+same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the
+schema's order as the markdown the card builder reads (headline in bold with the note, detail,
+the plan with a status mark per item and a tick or an open mark per step, or the rows as
+bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
+the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
+carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
+line's Stop button and the rating controls. A row's Retry and Drop are not drawn. A home post
+goes through `PostNotifyMessage`, laid out the same way. A card that fits one activity only
+without the rating controls is posted without them. A
+layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
+(`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
+`ErrTextOnly` as before. The shared cases lay out as the golden files in
+`a2a/gateway/testdata/teams-chat/` say (`TestTeamsChatGolden`).
+
+A press of a choice (`teams_clicks.go`) arrives as the Stop press does and becomes the turn its
+reply spells, marked a click, from the presser, so the allowlist decides as for a typed
+message. Teams acknowledges a Submit with nothing and leaves the buttons pressable, so the
+adapter keeps the Google Chat adapter's bookkeeping: one press waits on the gateway's verdict
+at a time, the first verified answer stands (`InboundVerified`), and the card is edited to its
+text with `✓ name: choice` under it, its choices gone and its other buttons kept. A typed reply
+in the conversation of an open question answers it the same way, unless it is a command; a
+next step takes no typed reply. The line stays through a later edit that lays out no choices,
+and an edit that lays choices out asks anew. An update replaces the whole card and a press
+carries none of it, so a question the adapter no longer remembers (posted before a restart, or
+past its `uxCap` remembered cards) is answered by a post of the line in the conversation, named by
+the label the button carried, unless the button is a next step's, which answered no question; the same post follows an edit that fails or a card the line
+would push past the budget.
+
+While card work is open in a conversation with nothing on screen that shows it, the adapter
+keeps Teams's typing indicator on there (`teams_typing.go`): a `typing` activity posted through
+the passthrough, and again every three seconds. Teams draws no reaction and no Working… status,
+and an acknowledgement or a plan sitting unchanged does not read as work. The indicator is
+wanted while the conversation's session mark has an open ask that is not blocked
+(`MarkObserver`), which is how card work the gateway cannot see is known, as it is for Slack's
+Working… status (`slackSession.wanted`); a blocked settle (the work waits on the person) stops
+it. It is not posted while a chain the gateway started is running there (`TaskObserver`), nor
+within one interval of that chain's end. A live run showed why: Teams leaves the indicator on
+screen for about twenty seconds after the last post unless a new message from the bot clears
+it, and a chain's answer is an edit of its line, so typing beside a running chain sat under its
+answer. The hand-off's answer is a new message, and each new message the adapter posts holds the
+indicator off for one interval, since a card's answer is posted before its mark settles. The
+indicator stops ten minutes after the ask opened, the newest chain started or ended, or the
+adapter last posted or edited a message in the conversation, whichever is latest
+(`teamsTypingMax`), since only a notify settles an older ask; a later chain, or an edit of a
+message one interval on, starts it again, and a new message does not, since it is usually the
+answer. A post that fails is dropped and the next
+one tries again. Teams accepts the post in every conversation and draws it only in some: a
+live run showed the indicator in a one-to-one chat with the bot and nothing in a channel
+thread, so a channel has the line and the plan alone.
 
 The operator arms it behind its own switch, `A2A_TEAMS_BACKEND=true` on the controller-manager
 Deployment (`a2aTeamsArmed`), not on the CR alone: `spec.mode` is `next` on every stored object
@@ -3685,7 +3769,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_api_rate_limited_total`                | `method`: as above                                                                                                                                                                                       | Each Chat API call the Chat API answered 429, which the relay carries under `chat` in a 502 after its own retries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_teams_events_received_total`                 | none                                                                                                                                                                                                     | Microsoft Teams activities pulled from the broker's Teams queue, before parsing or classification.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_teams_pulls_total`                           | `outcome`: `events`, `empty`, `failed`                                                                                                                                                                   | Pulls of the broker's Teams queue: one that carried an activity, one that came back empty, one that failed (the broker refused or did not answer, or the pull was never made or could not be read).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `kubeagents_a2a_gateway_teams_api_request_duration_seconds`          | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `kubeagents_a2a_gateway_teams_api_request_duration_seconds`          | `method`: `conversations.activities.create`, `conversations.activities.update`, `other`; `outcome`: `ok`, `rate_limited`, `error`                                                                        | A histogram of each Bot Framework call the Teams adapter made through the broker's passthrough, by the operation its HTTP method and endpoint spell; a typing indicator's post counts as `other`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `kubeagents_a2a_gateway_teams_api_rate_limited_total`                | `method`: as above                                                                                                                                                                                       | Each Bot Framework call Microsoft answered 429, as the broker carries its status under `teams.status`; the identity provider's 429 on the token the call needed arrives the same way and counts too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `kubeagents_a2a_gateway_teams_ingress_lag_seconds`                   | none                                                                                                                                                                                                     | A histogram of the time from an activity's own `timestamp` to the gateway's receipt of it, for an activity it takes as a turn; a negative lag is observed as 0 and an activity with no parseable `timestamp` is not observed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_chat_messages_total`                         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                                                                                 | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |

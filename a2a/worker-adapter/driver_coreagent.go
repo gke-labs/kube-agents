@@ -24,8 +24,10 @@ import (
 // starting over at each compaction summary, and the next turn's envelope
 // carries them back.
 type coreAgentDriver struct {
-	// Policy and MCP are the turn's tool policy and MCP servers, set from
-	// the persona grant.
+	// Policy and MCP are the turn's tool policy and MCP servers, set by
+	// NewCoreAgentDriver from the worker's grant: the session allowlist on a
+	// session pod, the persona's on a profile worker (WithPolicy). MCP is
+	// none until the persona's servers are wired.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 	// Instructions are the session pod's system-prompt lines, sent in each
@@ -52,6 +54,13 @@ func newCoreAgentDriver() coreAgentDriver {
 const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure reason token, not a credential
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
+
+// WithPolicy is the driver with p in its envelopes; the conversation history
+// it holds is shared.
+func (d coreAgentDriver) WithPolicy(p coreagentwire.Policy) Driver {
+	d.Policy = p
+	return d
+}
 
 // WithInstructions is d with the worker's system-prompt lines for core-agent,
 // which reads them from each turn's envelope; any other driver is returned as
@@ -116,9 +125,18 @@ func (coreAgentDriver) ConfiguresMCP([]string) bool { return false }
 // ConfigDirEnv is empty: the harness reads no config directory.
 func (coreAgentDriver) ConfigDirEnv(string) string { return "" }
 
-// PrepareTurn checks nothing yet; the persona directory check before each
-// spawn comes with the persona render (#6713).
-func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return nil }
+// PrepareTurn runs before every core-agent process starts, the first
+// included: the adapter is the container's init and nothing an earlier turn
+// started is still alive (checkTurnBoundary). Each process exits at its
+// turn's end and killLeftovers ends whatever it left, so a process still
+// alive here is one that kill could not reach.
+func (coreAgentDriver) PrepareTurn(context.Context, TurnDirs) error { return checkTurnBoundary() }
+
+// RestartsPerTurn is true: core-agent runs one user turn per process. A
+// steer held during a turn starts a fresh process that resumes the
+// conversation from the history the adapter holds, after the last process
+// and everything it started are gone.
+func (coreAgentDriver) RestartsPerTurn() bool { return true }
 
 // HoldsSteers: a steer waits for the turn to end; core-agent has no way in
 // mid-turn short of interrupting it.
@@ -186,7 +204,7 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	case coreagentwire.TypeText:
 		return []Event{{Kind: EventProgress, Text: ln.Text}}, nil
 	case coreagentwire.TypeToolCall:
-		return []Event{{Kind: EventActivity, Tool: ln.Tool, Input: ln.Input}}, nil
+		return []Event{{Kind: EventActivity, Tool: ln.Tool, Input: ln.Input, CallID: ln.ID}}, nil
 	case coreagentwire.TypeToolResult:
 		return []Event{{Kind: EventToolResult, Tool: ln.Tool, Text: ln.Text, Failed: ln.Failed}}, nil
 	case coreagentwire.TypeResult:
@@ -227,4 +245,16 @@ func (d *coreAgentDecoder) Decode(line []byte) ([]Event, error) {
 	// An event type this decoder doesn't know is skipped, so a newer
 	// harness can add one.
 	return nil, nil
+}
+
+// NewCoreAgentDriver is the core-agent driver carrying a turn's tool
+// policy and MCP servers, which every turn's envelope sends to the
+// harness. DriverFor's driver carries none: no built-in or MCP tool is
+// offered (the persona's read-only skill tools still are).
+func NewCoreAgentDriver(p coreagentwire.Policy, mcp []coreagentwire.MCPServer) Driver {
+	// Built from newCoreAgentDriver, so the conversation history store is
+	// there: a driver without it would drop history between turns.
+	d := newCoreAgentDriver()
+	d.Policy, d.MCP = p, mcp
+	return d
 }

@@ -67,6 +67,13 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   PlatformAgent's `spec.deployment.env` directly, because a chart apply can replace it. These
   variables reach the credential broker container: its GitLab API client and the git commands that
   it runs use them.
+
+  Literal proxy entries there also forward to `<name>-a2a-gateway` ([Guarantee and
+  limitation](/kube-agents/reference/credential-isolation/#guarantee-and-limitation)); `valueFrom`
+  entries are ignored. The gateway's in-cluster Kubernetes API and Google Chat/Teams relay clients
+  bypass proxy variables; admit the proxy host and port with a NetworkPolicy selecting
+  `app: <name>-a2a-gateway` where the CNI enforces egress policies.
+
 - **The installer host.** `install.sh` never connects to GitLab. The machine that runs it needs
   no route to the GitLab host and no trust for its certificate.
 - **The certificate.** On a self-managed instance, the broker must trust the certificate. A

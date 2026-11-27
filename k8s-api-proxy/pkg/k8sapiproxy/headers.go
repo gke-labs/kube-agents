@@ -1,6 +1,7 @@
 package k8sapiproxy
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -15,6 +16,10 @@ const (
 	// subprotocolAuthPrefix starts a WebSocket subprotocol the API server reads as a bearer
 	// token, for clients that cannot set Authorization.
 	subprotocolAuthPrefix = "base64url.bearer.authorization.k8s.io."
+
+	// headerNameSymbols are the characters, besides letters and digits, of an HTTP field
+	// name (RFC 9110 section 5.6.2, tchar).
+	headerNameSymbols = "!#$%&'*+-.^_`|~"
 )
 
 // callerHeaders never reach the API server: the caller's own credentials, Audit-ID, which the
@@ -25,6 +30,70 @@ var callerHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie", "
 // identityHeaderPrefixes start the headers an API server reads as the requesting identity:
 // impersonation, and the X-Remote-* headers of an authenticating front proxy.
 var identityHeaderPrefixes = []string{"impersonate-", "x-remote-"}
+
+// reservedCallerHeaders cannot be named in Config.ExtraCallerHeaders. Host, Content-Length
+// and Transfer-Encoding frame the request and net/http carries them outside the header
+// map, so listing one would strip nothing; Connection and Upgrade are the handler's to
+// drop or keep, by whether the policy admits the upgrade.
+var reservedCallerHeaders = map[string]struct{}{
+	"host":              {},
+	"content-length":    {},
+	"transfer-encoding": {},
+	"connection":        {},
+	"upgrade":           {},
+}
+
+// newExtraCallerHeaders validates Config.ExtraCallerHeaders and returns the names in lower
+// case, the form sanitizeRequestHeaders matches a header key against; nil for no names.
+func newExtraCallerHeaders(names []string) (map[string]struct{}, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	if err := ValidateCallerHeaderNames(names); err != nil {
+		return nil, fmt.Errorf("k8sapiproxy: Config.ExtraCallerHeaders %w", err)
+	}
+	extra := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		extra[strings.ToLower(name)] = struct{}{}
+	}
+	return extra, nil
+}
+
+// ValidateCallerHeaderNames reports the first of names that Config.ExtraCallerHeaders
+// would not take: one that is not an HTTP header name, or one the proxy needs to forward
+// the request (Host, Content-Length, Transfer-Encoding, Connection, Upgrade). An
+// authenticator that reads a caller's identity from configured headers checks them with
+// it, so every name it accepts can be stripped. The error starts with "entry", for the
+// caller to put the name of its own field in front.
+func ValidateCallerHeaderNames(names []string) error {
+	for _, name := range names {
+		if !validHeaderName(name) {
+			return fmt.Errorf("entry %q is not an HTTP header name", name)
+		}
+		if _, reserved := reservedCallerHeaders[strings.ToLower(name)]; reserved {
+			return fmt.Errorf("entry %q cannot be stripped: the proxy needs it to forward the request", name)
+		}
+	}
+	return nil
+}
+
+// validHeaderName reports whether name is a non-empty HTTP field name: letters, digits and
+// headerNameSymbols, so no spaces or colons.
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte(headerNameSymbols, c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // HasUpgradeHeader reports whether r asks for a protocol upgrade (SPDY or WebSocket), through
 // either an Upgrade header or an `upgrade` token in Connection.
@@ -43,11 +112,13 @@ func HasUpgradeHeader(r *http.Request) bool {
 }
 
 // sanitizeRequestHeaders removes from h what must not reach the API server: the caller's
-// credentials, a bearer token in Sec-WebSocket-Protocol, Audit-ID, identity headers, the headers the caller named in Connection, Connection
+// credentials, a bearer token in Sec-WebSocket-Protocol, Audit-ID, identity headers, the
+// headers extra names (Config.ExtraCallerHeaders, in lower case), the headers the caller
+// named in Connection, Connection
 // itself, and Upgrade unless preserveUpgrade. It runs before the handler sets any header of
 // its own: the reverse proxy drops every header Connection names, so a caller listing one
 // the handler sets could otherwise make it disappear.
-func sanitizeRequestHeaders(h http.Header, preserveUpgrade bool) {
+func sanitizeRequestHeaders(h http.Header, extra map[string]struct{}, preserveUpgrade bool) {
 	for _, v := range h.Values(headerConnection) {
 		for _, token := range strings.Split(v, ",") {
 			name := strings.TrimSpace(token)
@@ -64,6 +135,10 @@ func sanitizeRequestHeaders(h http.Header, preserveUpgrade bool) {
 	stripBearerProtocols(h)
 	for key := range h {
 		lower := strings.ToLower(key)
+		if _, strip := extra[lower]; strip {
+			delete(h, key)
+			continue
+		}
 		for _, prefix := range identityHeaderPrefixes {
 			if strings.HasPrefix(lower, prefix) {
 				delete(h, key)

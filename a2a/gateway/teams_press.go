@@ -33,10 +33,20 @@ const (
 )
 
 // teamsPress is a pressed button's data: which button, and the task it
-// names.
+// names; a rating press carries the rating too, and the note typed into
+// the form a 👎 unfolds (teams_feedback.go).
 type teamsPress struct {
 	Action string `json:"kageAction"`
 	Task   string `json:"task"`
+	Rating string `json:"rating"`
+	Note   string `json:"note"`
+	// Reply, Choice, Label and Next are a choice press's: the turn's text,
+	// the choice's index among its message's choices, its label, and
+	// whether it is a next step (teams_chat.go).
+	Reply  string `json:"reply"`
+	Choice *int   `json:"choice"`
+	Label  string `json:"label"`
+	Next   bool   `json:"next"`
 }
 
 // teamsCardPress reads a message activity's value as a press of one of the
@@ -65,6 +75,14 @@ func teamsStopActions(task string) []map[string]any {
 // it is not one. The caller (classify) has checked the conversation, the
 // service URL, the tenant and that the sender has an id.
 func (a *TeamsAdapter) classifyPress(act *teamsActivity, press teamsPress, conversation, kind string) (InboundMessage, string) {
+	if press.Action == teamsPressActionRate {
+		// A rating is never a turn: it is recorded off the pull loop, and
+		// what it answers is the reason the press is acked away.
+		return InboundMessage{}, a.feedbackPress(act, press, conversation)
+	}
+	if press.Action == teamsPressActionChoice {
+		return a.choicePress(act, press, conversation, kind)
+	}
 	if press.Action != teamsPressActionStop {
 		return InboundMessage{}, "press of a button this adapter does not draw (" + press.Action + ")"
 	}

@@ -191,7 +191,7 @@ from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import slack_transport as slack
-from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, burst_reads, card_wake, chat_shape, delegating_profile, fleet, github_writes, gitops, idle_reply, profile_hook, pushed_report, session_cap, session_trajectory, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -1310,6 +1310,37 @@ _MAX_SILENT_TURNS = 3
 # abandoned. An idle keepalive dropping between turns is not a broken agent, and
 # retrying costs one poll interval against the whole delegated result.
 _MAX_TRANSPORT_FAILURES = 3
+
+
+def _predates_run(created_at: int | None, floor: int | None) -> bool:
+    """Whether a card was filed before the run started (``created_at`` under the pod-clock ``floor``).
+
+    Such a card is not this run's: its create was handed an existing card by
+    its idempotency key, most likely an earlier repetition's (#4794), so the
+    repetition that waits on it is not independent.
+    """
+    return created_at is not None and floor is not None and created_at < floor
+
+
+def _vanished_card_error(task_id: str, created_at: int | None, floor: int | None) -> str:
+    """The error for an awaited card the board stopped having a row for.
+
+    For a card that predates the run (:func:`_predates_run`) it says what was
+    checked, and only names the likely cause: a purge that owed an earlier
+    repetition's card deletes it once it stops running, possibly before this
+    wait reads it settled.
+    """
+    message = (
+        f"card {task_id} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+        "dropped from the delegation wait, nothing graded for it"
+    )
+    if _predates_run(created_at, floor):
+        message += (
+            "; it was filed before this run started, so this run did not file it and this repetition "
+            "is not independent (most likely an earlier repetition's card, handed back by its "
+            "idempotency key and deleted by the purge that owed it)"
+        )
+    return message
 
 
 def _append_final(result: AgentResult, sections: list[str]) -> None:
@@ -3112,6 +3143,8 @@ def _bound_stray(task: inject.InjectTask, exchange: inject.Exchange) -> tuple[bo
             )
         if timed_out and settled is not None and settled.fold.child_addressees is not None:
             exchange.fold.child_addressees = settled.fold.child_addressees
+        if timed_out and settled is not None and settled.fold.child_count is not None:
+            exchange.fold.child_count = settled.fold.child_count
     return timed_out, stop_pending
 
 
@@ -3355,6 +3388,57 @@ def _inject_tokens(
     return tokens
 
 
+def _fill_session_args(exchange: inject.Exchange) -> None:
+    """Fill the turn's inputless activity parts from its session pod's capture.
+
+    Only when a call part arrived without ``input`` (a gateway that strips
+    them), and only for a turn that delegated nothing (the probe's
+    ``childCount`` is ``0``). After a delegation the door reads the trace of
+    the chain's last task, the wake, while it reports the root task's id, and
+    the capture is kept by the id of the turn that ran: the capture this
+    could ask for belongs to another turn, so the parts keep their empty args
+    rather than another turn's. A door that can't say (``None``) is not read
+    either.
+
+    The pod is the one whose session-key annotation is the conversation; when
+    none carries it (a pod claimed from the warm pool), the live pods with no
+    such annotation are tried, and the capture taken from the one that holds
+    the task (:func:`session_trajectory.unbound_pods`). The platform route has
+    no session pod and reads nothing. A pod whose adapter has no capture, or a
+    capture that disagrees with the parts, fills nothing
+    (:mod:`session_trajectory`).
+    """
+    fold = exchange.fold
+    parts = fold.call_parts()
+    if not exchange.task_id or not any(part.get(inject.ACTIVITY_INPUT_KEY) is None for _, part in parts):
+        return
+    if fold.child_count != 0:
+        _log.info(
+            "session trajectory for %s not read: the turn delegated (childCount %s), so its trace is another turn's",
+            exchange.task_id,
+            fold.child_count,
+        )
+        return
+    for pod in _capture_pods(exchange.conversation):
+        captured = session_trajectory.capture(_kubectl_target(f"pod/{pod}"), exchange.task_id, _EXEC_TIMEOUT)
+        if captured is not None and captured.known:
+            fold.fill_inputs(session_trajectory.merge(parts, captured))
+            return
+
+
+def _capture_pods(conversation: str) -> list[str]:
+    """The session pods to look for a turn's capture on, in order: the one
+    annotated with ``conversation``, or else the live pods with no
+    conversation's annotation (:func:`_fill_session_args`)."""
+    pods = _kubectl_read(
+        ["get", "pods", "-l", idle_reply.SESSION_POD_SELECTOR, "-o", "json"], f"the session pods for {conversation}"
+    )
+    bound = idle_reply.session_pod(pods, conversation)
+    if bound:
+        return [bound]
+    return session_trajectory.unbound_pods(pods, idle_reply.SESSION_KEY_ANNOTATION)
+
+
 def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
     """Map a folded conversation onto the canonical result.
 
@@ -3370,7 +3454,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     trace at all (``inject_transport.EVENT_ENTRY_ACTIVITY``; a door that
     cannot show it writes neither, and the scorer sets router-scope
     ``tool_called`` checks with no ``result`` pattern aside then, or when
-    the marker reports a loss).
+    the marker reports a loss). On the session route a call part that
+    arrived without its input takes it from the session pod's own capture
+    (:func:`_fill_session_args`).
     Tokens are the front door's usage as the probe reported it, null when
     the harness holds none (:func:`_inject_tokens`), and ``metadata`` says which
     buckets mean what and why they are null (:func:`_inject_tokens_note`).
@@ -3379,6 +3465,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     stored beside the task id so the record joins to the gateway's ingress
     log.
     """
+    _fill_session_args(exchange)
     fold = exchange.fold
     return AgentResult(
         output=fold.deliverable,
@@ -3388,6 +3475,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
         metadata={
             "transport": TRANSPORT_INJECT,
             "child_addressees": None if fold.child_addressees is None else list(fold.child_addressees),
+            "child_count": fold.child_count,
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
@@ -3748,6 +3836,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
             child_addressees=result.metadata.get("child_addressees"),
+            child_count=result.metadata.get("child_count"),
         )
         _write_chat_shape(result)
         return result
@@ -5871,7 +5960,9 @@ class KubeAgentsHarness(AgentHarness):
         :data:`_MAX_AWAITED_TASKS`, and lets a card the session files later
         join the wait. A card the board has no row for on
         :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
-        wait with a line on ``errors``, and nothing is graded for it.
+        wait with a line on ``errors`` (:func:`_vanished_card_error`), and
+        nothing is graded for it. A card filed before the run started
+        (:func:`_predates_run`) is logged as a warning when first read.
 
         Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
         running. Returns ``False``, having changed nothing else, when the store
@@ -5949,6 +6040,14 @@ class KubeAgentsHarness(AgentHarness):
         missing: list[str] = []
         awaited: list[str] = []
         capped = False
+        # Each awaited card's ``created_at`` from the last read that had its row,
+        # and the awaited cards already logged as filed before the run started
+        # (_predates_run): this run did not file them, so it is not independent
+        # whether they settle or leave the board mid-wait (#4794). Logged, not put
+        # on errors, which the scorer reads: what such a run counts for is
+        # #4658's call. A dropped one also gets its errors line.
+        created: dict[str, int | None] = {}
+        predating: set[str] = set()
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(
@@ -5982,14 +6081,21 @@ class KubeAgentsHarness(AgentHarness):
                 None if capped else result,
             )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            # Every card the read has a row for, awaited or past the cap: a card the
+            # cap held back can be deleted before a freed slot promotes it.
+            for t, card in read.cards.items():
+                created[t] = card.get("created_at")
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
+                if t not in predating and _predates_run(created.get(t), self._pod_floor):
+                    predating.add(t)
+                    _log.warning(
+                        "awaited card %s was filed before this run started, so this run did not "
+                        "file it and this repetition is not independent", t,
+                    )
             gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
             for t in gone:
-                result.errors.append(
-                    f"card {t} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
-                    "dropped from the delegation wait, nothing graded for it"
-                )
+                result.errors.append(_vanished_card_error(t, created.get(t), self._pod_floor))
             missing.extend(gone)
             awaited = [t for t in awaited if t not in gone]
             return [t for t in awaited if not _is_terminal(t)]

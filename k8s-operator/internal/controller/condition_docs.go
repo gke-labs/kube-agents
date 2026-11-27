@@ -27,10 +27,10 @@ type conditionDoc struct {
 
 // degradedConditionReasons are the reasons the Degraded condition carries,
 // for its row, in the order updateStatusReady ranks them. A parked pass reads
-// the ones ahead of A2ABusStreamsMissing as ranked above it
-// (degradedRanksAboveBusStreams), so a new reason goes where the chain puts
-// it. Listed by constant, so a renamed reason fails to compile; a
-// new reason has to be added here by hand (the writer passes it as a value,
+// this order (degradedRanksAbove) when following poller-owned Degraded reasons
+// (A2ABusStreamsMissing and SlackConnectionFailed), so a new reason goes where
+// the chain puts it. Listed by constant, so a renamed reason fails to compile;
+// a new reason has to be added here by hand (the writer passes it as a value,
 // which the completeness test cannot follow).
 var degradedConditionReasons = []string{
 	conditionReasonInvalidGitRepoURL,
@@ -38,6 +38,7 @@ var degradedConditionReasons = []string{
 	conditionReasonMinterPruningHeld,
 	conditionReasonA2ABusStreamsMissing,
 	conditionReasonA2AGatewayWaitingForTasks,
+	conditionReasonSlackConnectionFailed,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
@@ -105,6 +106,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "`status: False`, `Reason: WaitingForReplica`. Every install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.",
 	},
 	{
+		Type:    slackConnectedConditionType,
+		Written: "While Slack is enabled on the A2A gateway and any scraped gateway pod exports `kubeagents_a2a_gateway_slack_connected` (first poll 30 seconds after operator leader election, then every five minutes); removed when Slack is disabled or after two consecutive polls with no pod exporting the gauge",
+		Meaning: "`True`, `SocketModeConnected`: the A2A gateway's Slack Socket Mode connection is up (maximum reading across reporting replicas is `1`; set on the first poll reading `1`). `False`, `ConnectionFailed`: two consecutive polls read `0` across reporting replicas (Slack `auth.test` or Socket Mode is failing); projects onto `Degraded=True` (`Reason: SlackConnectionFailed`) without changing `Ready` or `phase` so an external Slack outage does not take down the console, A2A doors, or gateway PodDisruptionBudget.",
+	},
+	{
 		Type:    busProvisionedConditionType,
 		Written: "From the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs",
 		Meaning: "`status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.",
@@ -112,7 +118,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    a2aProfileSupervisorFormCondition,
 		Written: "`True` once, from the first pass that finds every profile-task reader (the A2A gateway, the agent pod and, with its door on, the MCP server) on this release's image and fully rolled out and the bus provisioning Job that adds the gateway relay's third filter complete; never removed. `False` while this install renders a reader on an image other than this release's (a pinned `spec.deployment.image`)",
-		Meaning: "`status: True`, `Reason: SixTokenSupervisorSubject`. The dispatcher writes a profile task's terminal on the six-token supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`) instead of the five-token one, and the gateway relay filters both. It is a latch: a later upgrade that rolls a reader again keeps the dispatcher on the six-token form rather than moving it back for the length of the roll. One pass after it is written, the operator renders `A2A_PROFILE_SUPERVISOR_CUTOFF` on the A2A gateway and the MCP server, set to this condition's `lastTransitionTime` plus ten minutes (on an install that latched earlier, that time may already be in the past at the upgrade), and mounts the `<agent>-a2a-profile-names` ConfigMap on both, which rolls each once: past that time they no longer take a five-token terminal as the end of a task addressed to a profile that ConfigMap lists. From the latch the dispatcher no longer falls back to the five-token form when the six-token one is refused, and settles the task without a terminal after its retry bound (`terminal-unpublished`). Until it is written, the dispatcher writes the five-token form, which every reader watches. `status: False`, `Reason: ReaderNotOnReleaseImage`: the operator renders the reader the message names on an image other than this release's, the hermes-bridge of a pinned `spec.deployment.image`, so the install stays on the five-token form. A later release that drops that form keeps it for this install while this holds. Setting the pin to this release's tag, or removing it, clears it. A reader still on an older release's image, before or during its rollout, writes nothing.",
+		Meaning: "`status: True`, `Reason: SixTokenSupervisorSubject`. The dispatcher writes a profile task's terminal on the six-token supervisor subject (`a2a.tasks.p.<profile>.<task>.supervisor`) instead of the five-token one, and the gateway relay filters both. It is a latch: a later upgrade that rolls a reader again keeps the dispatcher on the six-token form rather than moving it back for the length of the roll. One pass after it is written, the operator renders `A2A_PROFILE_SUPERVISOR_CUTOFF` on the A2A gateway and the MCP server, set to this condition's `lastTransitionTime` plus ten minutes (on an install that latched earlier, that time may already be in the past at the upgrade), and mounts the `<agent>-a2a-profile-names` ConfigMap on both, which rolls each once: past that time they no longer take a five-token terminal as the end of a task addressed to a profile that ConfigMap lists. From the latch the dispatcher no longer falls back to the five-token form when the six-token one is refused, and settles the task without a terminal after its retry bound (`terminal-unpublished`). Each such give-up is logged on the dispatcher container as an `ALERT dispatcher_terminal_unpublished` line naming the profile, tier and task; a log-based alert matches it with `resource.type=\"k8s_container\" resource.labels.container_name=\"dispatcher\" jsonPayload.msg:\"ALERT dispatcher_terminal_unpublished\"`. It means a profile's six-token grant never reached the dispatcher's connection, an install fault, and the requester sees no end until a stop: the gateway ends a task with no events as never started and holds one with executor events as working. Until it is written, the dispatcher writes the five-token form, which every reader watches. `status: False`, `Reason: ReaderNotOnReleaseImage`: the operator renders the reader the message names on an image other than this release's, the hermes-bridge of a pinned `spec.deployment.image`, so the install stays on the five-token form. A later release that drops that form keeps it for this install while this holds. Setting the pin to this release's tag, or removing it, clears it. A reader still on an older release's image, before or during its rollout, writes nothing.",
 	},
 	{
 		Type:    busStreamsPresentConditionType,
@@ -207,8 +213,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    sizingCappedByQuotaConditionType,
-		Written: "Only while `spec.deployment.sizingProfile` is `auto` and the cluster count earns a higher tier than the namespace's ResourceQuota has room for, or than a LimitRange bound admits, or after a quota refused the pod a step recreated",
-		Meaning: "`status: True`, `Reason: ResourceQuotaShort` or `LimitRangeShort`. The message names the tier earned, the tier the step was measured from, the tier that stays, and the short quota and key or the LimitRange, bound, resource and container; the figures go in the Warning event. Not `Degraded`: the running tier keeps running. Written before the render, so an earlier refusal neither writes nor clears it. Cleared by the pass that finds room or whose count no longer earns the step; a pass with no reading leaves it, so a gateway outage neither clears nor re-records it. The event watcher switched off by spec clears it. Raise the quota or the bound, or name the tier in `sizingProfile`.",
+		Written: "Only while `spec.deployment.sizingProfile` is `auto` and a tier transition is blocked by a namespace `ResourceQuota`, a `LimitRange` bound, an unschedulable `credential-proxy` surge pod (`SurgeUnschedulable`), or after admission refused a surged or recreated pod",
+		Meaning: "`status: True`, `Reason: ResourceQuotaShort`, `LimitRangeShort`, or `SurgeUnschedulable`. The message names the desired tier, the running tier, and the blocking quota key, LimitRange bound, or pending surge pod; `ResourceQuotaShort` and `LimitRangeShort` record numeric details in their Warning event, while `SurgeUnschedulable` carries the pending pod and scheduling reason directly in both the condition and Warning event. Not `Degraded`: the running tier keeps serving safely during an unschedulable surge without dropping the active broker. Cleared once capacity, quota, or bounds allow the step or utilization no longer requires it. Raise the quota, adjust cluster capacity/LimitRange, or name the tier explicitly in `sizingProfile`.",
 	},
 	{
 		Type:    sessionCapFittedConditionType,

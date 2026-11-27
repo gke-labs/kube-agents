@@ -42,9 +42,23 @@ func TestTheClaudeDecoderMapsEachLine(t *testing.T) {
 			}},
 		{"assistant with no message", `{"type":"assistant"}`, nil},
 		{"one tool result", `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"exit status 77"}]}}`,
-			[]Event{{Kind: EventToolResult}}},
+			[]Event{{Kind: EventToolResult, CallID: "t1"}}},
 		{"two parallel tool results", `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"},{"type":"text","text":"x"},{"type":"tool_result","tool_use_id":"t2"}]}}`,
-			[]Event{{Kind: EventToolResult}, {Kind: EventToolResult}}},
+			[]Event{{Kind: EventToolResult, CallID: "t1"}, {Kind: EventToolResult, CallID: "t2"}}},
+		{"tool calls with their ids, one of them a skill call", `{"type":"assistant","message":{"content":[` +
+			`{"type":"tool_use","id":"t1","name":"Bash","input":{"skill":"not-a-skill-call"}},` +
+			`{"type":"tool_use","id":"t2","name":"Skill","input":{"skill":"triage","args":"x"}},` +
+			`{"type":"tool_use","id":7,"name":"Skill","input":{"skill":7}}]}}`,
+			[]Event{
+				{Kind: EventActivity, Tool: "Bash", Input: json.RawMessage(`{"skill":"not-a-skill-call"}`), CallID: "t1"},
+				{Kind: EventActivity, Tool: "Skill", Input: json.RawMessage(`{"skill":"triage","args":"x"}`), CallID: "t2", SkillCall: true, Skill: "triage"},
+				{Kind: EventActivity, Tool: "Skill", Input: json.RawMessage(`{"skill":7}`), SkillCall: true},
+			}},
+		{"tool results with their error flags", `{"type":"user","message":{"content":[` +
+			`{"type":"tool_result","tool_use_id":"t1","content":"x","is_error":true},` +
+			`{"type":"tool_result","tool_use_id":"t2","content":"x","is_error":false},` +
+			`{"type":"tool_result","tool_use_id":["t3"],"content":"x","is_error":"true"}]}}`,
+			[]Event{{Kind: EventToolResult, CallID: "t1", Failed: true}, {Kind: EventToolResult, CallID: "t2"}, {Kind: EventToolResult}}},
 		{"a user line with no tool result", `{"type":"user","message":{"content":[{"type":"text","text":"steer"}]}}`, nil},
 		{"user with no message", `{"type":"user"}`, nil},
 		{"success", `{"type":"result","subtype":"success","result":"done"}`,
@@ -141,6 +155,10 @@ func TestTheClaudeDriverKeepsTheHarnessContract(t *testing.T) {
 // "A <tool>", "OK <text>" and "ERR <token> <text>".
 type toyDriver struct {
 	hold bool
+	// restart makes it a driver that takes one user turn per process
+	// (turnRestarter), and budget one with a wall-clock bound
+	// (turnBudgeter, as --left <duration>).
+	restart, budget bool
 	// prepare, if set, runs for each PrepareTurn call, numbered from 1.
 	prepare func(n int, dirs TurnDirs) error
 
@@ -183,6 +201,15 @@ func (d *toyDriver) PrepareTurn(_ context.Context, dirs TurnDirs) error {
 }
 
 func (d *toyDriver) HoldsSteers() bool { return d.hold }
+
+func (d *toyDriver) RestartsPerTurn() bool { return d.restart }
+
+func (d *toyDriver) WithTurnBudget(argv []string, left time.Duration) []string {
+	if !d.budget {
+		return argv
+	}
+	return append(append([]string(nil), argv...), "--left", left.Round(time.Second).String())
+}
 
 func (d *toyDriver) prepared() (int, []TurnDirs) {
 	d.mu.Lock()

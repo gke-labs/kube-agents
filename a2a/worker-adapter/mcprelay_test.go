@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,7 +15,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
@@ -340,7 +343,7 @@ func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
 		Harness:    persona.ClaudeCode,
 		Relay:      ProfileRelay("/usr/local/bin/worker-adapter", func(k string) string { return env[k] }),
 	}
-	out, err := renderPersona(pw, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	out, _, err := renderPersona(pw, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +382,7 @@ func TestTheClusterPersonaRendersItsServerThroughTheBridge(t *testing.T) {
 	}
 
 	pw.Relay = persona.Relay{}
-	bare, err := renderPersona(pw, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	bare, _, err := renderPersona(pw, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,5 +439,157 @@ func TestTheRelayClientUsesNoProxy(t *testing.T) {
 	tr, ok := newRelayClient().Transport.(*http.Transport)
 	if !ok || tr.Proxy != nil {
 		t.Fatalf("relay transport = %#v, want one with no proxy", newRelayClient().Transport)
+	}
+}
+
+func TestRelayRetriesPreAdmissionDrainingBusy(t *testing.T) {
+	var attempts atomic.Int32
+	b := newRelayBroker(t)
+	b.reply = func(w http.ResponseWriter, _ []byte) {
+		n := attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n <= 2 {
+			w.Header().Set("Retry-After", "4")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"draining","bound":"draining","before_admission":true}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`)
+	}
+	relayEnv(t, b.URL, "a.b.c")
+	var sleeps []time.Duration
+	var out bytes.Buffer
+	err := serveMCPRelayWith(
+		context.Background(),
+		b.URL+"/v1/mcp/developer_knowledge",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`+"\n"),
+		&out,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			return nil
+		},
+		func(lo, hi float64) float64 { return lo },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out.String()) != `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}` {
+		t.Fatalf("out = %q", out.String())
+	}
+	if len(sleeps) != 2 || sleeps[0] != 2*time.Second || sleeps[1] != 2*time.Second {
+		t.Fatalf("sleeps = %v, want [2s 2s]", sleeps)
+	}
+}
+
+func TestRelayDoesNotRetryUnsafe503(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing before_admission",
+			body: `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"draining","bound":"draining"}`,
+		},
+		{
+			name: "non-draining slot busy",
+			body: `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"slot","bound":"slot","before_admission":true}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newRelayBroker(t)
+			b.reply = func(w http.ResponseWriter, _ []byte) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, tc.body)
+			}
+			relayEnv(t, b.URL, "a.b.c")
+			var sleeps []time.Duration
+			var out bytes.Buffer
+			err := serveMCPRelayWith(
+				context.Background(),
+				b.URL+"/v1/mcp/developer_knowledge",
+				strings.NewReader(`{"jsonrpc":"2.0","id":7,"method":"ping"}`+"\n"),
+				&out,
+				slog.New(slog.NewTextHandler(io.Discard, nil)),
+				func(_ context.Context, d time.Duration) error {
+					sleeps = append(sleeps, d)
+					return nil
+				},
+				func(lo, hi float64) float64 { return hi },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(sleeps) != 0 {
+				t.Fatalf("sleeps = %v, want 0", sleeps)
+			}
+			if len(b.bodies) != 1 {
+				t.Fatalf("requests = %d, want 1", len(b.bodies))
+			}
+			assertRelayError(t, strings.TrimSpace(out.String()), 7, "HTTP 503")
+		})
+	}
+}
+
+func TestRelayRetriesOpensFreshConnectionAfterDraining503(t *testing.T) {
+	type ctxKey struct{}
+	var connCount atomic.Int32
+	var seenConns []int32
+	var mu sync.Mutex
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, ctxKey{}, connCount.Add(1))
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			id := r.Context().Value(ctxKey{}).(int32)
+			mu.Lock()
+			seenConns = append(seenConns, id)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if id == 1 {
+				// First TCP socket stays open (HTTP/1.1 keep-alive) and keeps
+				// answering as the draining old broker Pod until the client
+				// drops its pooled idle connection and redials.
+				w.Header().Set("Retry-After", "4")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"draining","bound":"draining","before_admission":true}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":11,"result":{"redialed":true}}`)
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	baseURL := "http://" + ln.Addr().String()
+	relayEnv(t, baseURL, "a.b.c")
+	var out bytes.Buffer
+	err = serveMCPRelayWith(
+		context.Background(),
+		baseURL+"/v1/mcp/developer_knowledge",
+		strings.NewReader(`{"jsonrpc":"2.0","id":11,"method":"ping"}`+"\n"),
+		&out,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_ context.Context, _ time.Duration) error { return nil },
+		func(lo, _ float64) float64 { return lo },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out.String()) != `{"jsonrpc":"2.0","id":11,"result":{"redialed":true}}` {
+		t.Fatalf("out = %q", out.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenConns) != 2 || seenConns[0] != 1 || seenConns[1] != 2 {
+		t.Fatalf("seen TCP connection IDs = %v, want [1 2] (fresh connection per retry)", seenConns)
 	}
 }
