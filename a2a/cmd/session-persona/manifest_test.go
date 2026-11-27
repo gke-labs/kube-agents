@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -198,5 +199,54 @@ func TestBothLayoutsShipTheSameSkills(t *testing.T) {
 	}
 	if len(core) != len(sessionSkills) {
 		t.Errorf("%d skills shipped, want the %d sessionSkills names", len(core), len(sessionSkills))
+	}
+}
+
+// claudeOnlyToolNames are Claude Code's tool names as the session text could
+// refer to them; none may reach the core-agent tree, whose tools are named
+// otherwise (the skills come through load_skill, the shell is the harness's).
+var claudeOnlyToolNames = regexp.MustCompile(`\b(Skill|Bash|Read|Glob|Grep|Task|TodoWrite|WebFetch|WebSearch|Edit|Write) tool\b|\bBash\(`)
+
+// The core-agent tree names core-agent's tools, and the Claude Code tree is
+// the source as it was: the persona's skill instruction is rewritten only in
+// the core-agent layout.
+func TestTheCoreAgentTreeCarriesNoClaudeToolNames(t *testing.T) {
+	coreAgent := filepath.Join(t.TempDir(), "core-agent-session")
+	if err := buildLayout(repoSkillsDir, repoPersona, coreAgent, coreAgentLayout); err != nil {
+		t.Fatal(err)
+	}
+	err := filepath.WalkDir(coreAgent, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		body, err := os.ReadFile(p) // #nosec G304 -- a test's own temp tree
+		if err != nil {
+			return err
+		}
+		if m := claudeOnlyToolNames.Find(body); m != nil {
+			t.Errorf("%s names a Claude Code tool: %q", strings.TrimPrefix(p, coreAgent+"/"), m)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instructions, err := os.ReadFile(filepath.Join(coreAgent, coreagent.InstructionsFile)) // #nosec G304 -- a test's own temp tree
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(instructions), "with `load_skill`") {
+		t.Error("the core-agent persona doesn't name load_skill for loading a skill")
+	}
+	source, err := os.ReadFile(repoPersona) // #nosec G304 -- the repository's persona source
+	if err != nil {
+		t.Fatal(err)
+	}
+	shipped, err := os.ReadFile(filepath.Join(buildShipped(t), personaFile)) // #nosec G304 -- a test's own temp tree
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(shipped) != string(source) {
+		t.Error("the Claude Code persona differs from its source")
 	}
 }

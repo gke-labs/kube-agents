@@ -27,6 +27,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	personafmt "github.com/gke-labs/kube-agents/a2a/lib/persona"
@@ -96,6 +97,10 @@ func main() {
 // tree's root.
 type layout struct {
 	personaFile, skillsDir string
+	// toolNames rewrites the source's tool references (written for Claude
+	// Code) to this harness's names, in the persona and every skill. Empty
+	// for Claude Code, whose tree is the source as it is.
+	toolNames *strings.Replacer
 }
 
 var (
@@ -103,8 +108,22 @@ var (
 	claudeLayout = layout{personaFile: personaFile, skillsDir: skillsDir}
 	// coreAgentLayout is a core-agent rendering: instructions.md and skills/,
 	// the names coreagent.Snapshot and coreagent.VerifyRendering accept.
-	coreAgentLayout = layout{personaFile: coreagent.InstructionsFile, skillsDir: coreagent.SkillsDir}
+	coreAgentLayout = layout{
+		personaFile: coreagent.InstructionsFile,
+		skillsDir:   coreagent.SkillsDir,
+		// core-agent surfaces skills through list_skills, load_skill and
+		// load_skill_resource (toolgrant.CoreAgentSkillTools).
+		toolNames: strings.NewReplacer("with the Skill tool", "with `load_skill`"),
+	}
 )
+
+// rename applies the layout's tool-name rewrites to text.
+func (l layout) rename(text []byte) []byte {
+	if l.toolNames == nil {
+		return text
+	}
+	return []byte(l.toolNames.Replace(string(text)))
+}
 
 // build writes the persona and every session skill under out, then the
 // tree's content manifest (personafmt.IntegrityManifestFile), which the worker
@@ -123,6 +142,7 @@ func buildLayout(skillsSrc, personaSrc, out string, l layout) error {
 	if err := mkdirOut(out); err != nil {
 		return err
 	}
+	persona = l.rename(persona)
 	if err := writeFile(filepath.Join(out, l.personaFile), persona); err != nil {
 		return err
 	}
@@ -136,6 +156,7 @@ func buildLayout(skillsSrc, personaSrc, out string, l layout) error {
 		if err != nil {
 			return err
 		}
+		adapted = l.rename(adapted)
 		dir := filepath.Join(out, l.skillsDir, name)
 		if err := mkdir(filepath.Join(out, l.skillsDir)); err != nil {
 			return err
