@@ -184,6 +184,29 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
                 decision = command_policy.evaluate(argv)
                 self.assertFalse(decision.allowed, f"{argv} reached the cluster")
 
+    def test_B1_the_broker_marks_only_a_refused_write_as_one(self) -> None:
+        """A profile worker stops its task at the first refusal the broker marks
+        ``write_refusal``, as the in-pod client recorded it, and reads no tool
+        output for it. The mark is the broker's, from its own policy reads: a
+        refused mutating kubectl verb is marked, and a read, a local render and
+        a gcloud refusal (whose rule also refuses unlisted reads) are not.
+        """
+        enforced = h.credential_proxy.CredentialProxyHandler.enforce_read_only
+        h.credential_proxy.CredentialProxyHandler.enforce_read_only = True
+        self.addCleanup(setattr, h.credential_proxy.CredentialProxyHandler, "enforce_read_only", enforced)
+        key = h.credential_proxy.WRITE_REFUSAL_KEY
+        for argv in (["kubectl", "delete", "namespace", "prod"], ["kubectl", "rollout", "undo", "deployment/web"]):
+            with self.subTest(argv=argv):
+                self.assertIs(True, h.credential_proxy.read_only_refusal(argv)[0][key])
+        for argv in (
+            ["kubectl", "apply", "-f", "m.yaml", "--dry-run=client"],
+            ["kubectl", "exec", "web-0", "--", "sh"],
+            ["gcloud", "container", "clusters", "delete", "prod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(h.credential_proxy.read_only_refusal(argv)[0].get(key, False))
+        self.assertIsNone(h.credential_proxy.read_only_refusal(["kubectl", "get", "pods"]))
+
     def test_B1_ordinary_reads_still_work(self) -> None:
         """A read-only gate nobody can work behind gets switched off.
 
@@ -632,7 +655,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Seven workflows hold it, and none can give an approval:
+        Eight workflows hold it, and none can give an approval:
 
         - auto-enqueue: `schedule`, `workflow_dispatch` and
           `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
@@ -662,6 +685,15 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           write is one comment on a pull request whose smoke run went red,
           edited in place on later runs. It explains a red; it cannot approve,
           label, or merge anything.
+        - merge-gate: its `dropped-push` job alone, on `pull_request_target:
+          closed` for a merged pull request; `permissions: {}` at the top,
+          job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`,
+          the pull request number passed through the environment. Its one
+          write is a comment on a pull request that is already merged, which
+          says that the merge queue did not merge its last commits. It reports a
+          merge; it cannot approve, label, or merge anything. The two gate
+          jobs hold `pull-requests: read`.
         - retest-actions: `issue_comment` on a `/retest` that opens the
           comment, from an owner, member or collaborator; `permissions: {}`
           at the top, the grant job-scoped, checkout of the default branch
@@ -673,8 +705,8 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
-        a capability, and this asserts membership rather than absence so an
-        eighth holder is a red test and a conversation rather than a silent
+        a capability, and this asserts membership rather than absence so a
+        ninth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -697,6 +729,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                 "ci-health.yml",
                 "coverage-comment.yml",
                 "hold-unresolved-threads.yml",
+                "merge-gate.yml",
                 "retest-actions.yml",
                 "risk_classify.yml",
             ],

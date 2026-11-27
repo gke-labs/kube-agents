@@ -993,7 +993,7 @@ variable "enable_pubsub_platform" {
 }
 
 variable "enable_stockout_investigator" {
-  description = "Enable the GKE Stockout Investigator AgentPlugin (diagnoses autoscaler capacity failures and proposes GitOps PRs). Automatically enables pubsub_platform for alert ingress."
+  description = "Enable the GKE Stockout Investigator AgentPlugin (diagnoses autoscaler capacity failures and proposes GitOps PRs). Automatically enables the `pubsub-platform` adapter (`AgentPlugin/pubsubplatform`) for alert ingress."
   type        = bool
   default     = false
 }
@@ -1014,6 +1014,39 @@ variable "stockout_pubsub_sink" {
   description = "Log sink name for GKE stockout alerts. Only used when enable_stockout_investigator is true."
   type        = string
   default     = "gke-stockout-alerts-sink"
+}
+
+variable "stockout_pubsub_sink_writer_identity_override" {
+  description = "The principal to grant roles/pubsub.publisher on the stockout topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com derived for the sink. Include the \"serviceAccount:\" prefix. Only used when enable_stockout_investigator is true. Because the publish grant precedes the sink, a project where Logging reports some other writer identity fails the sink's postcondition until this override moves the grant and check onto the identity Logging reported (data.google_project.stockout omits depends_on on required APIs so the derived identity stays known at plan time across API changes, and setting this override pins member statically too). Through the install.sh / upgrade.sh front doors, set it as TF_VAR_stockout_pubsub_sink_writer_identity_override in install.env rather than in terraform.tfvars (the front doors regenerate terraform.tfvars wholesale on every run). A hand-driven apply sets it in terraform.tfvars instead. Leave null unless an apply has told you to set it."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.stockout_pubsub_sink_writer_identity_override == null || var.stockout_pubsub_sink_writer_identity_override == "" || can(regex("^serviceAccount:.+@.+$", var.stockout_pubsub_sink_writer_identity_override))
+    error_message = "stockout_pubsub_sink_writer_identity_override must carry the \"serviceAccount:\" prefix, as writer_identity does. Leave it unset, or empty, to use the derived identity."
+  }
+}
+
+variable "stockout_pubsub_sink_drain_duration" {
+  description = "How long a destroy waits, after deleting the stockout sink, before removing the topic and the sink's publish grant. Only used when enable_stockout_investigator is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The 120s default is a chosen margin rather than a measured convergence time; raise it if the mail still arrives (apply first so time_sleep records the new destroy_duration in state before running destroy)."
+  type        = string
+  default     = "120s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(\\.[0-9]+)?(ms|s|m|h)$", var.stockout_pubsub_sink_drain_duration))
+    error_message = "stockout_pubsub_sink_drain_duration must be a number followed by one of ms, s, m or h, e.g. 120s or 2m. time_sleep does not accept the multi-unit form (2m30s). An empty value is not the default: remove a blank TF_VAR_ line rather than exporting \"\"."
+  }
+}
+
+variable "stockout_pubsub_logging_identity_propagation_duration" {
+  description = "How long the apply waits, after asking Service Usage to mint the project's Logging service agent, before granting it publisher on the stockout topic. Only used when enable_stockout_investigator is true. A project that did not already have the agent cannot bind it the instant the call returns, so the wait is a timer keyed on both the minted identity and this duration. The 60s default is a chosen margin; raise it if the grant still fails with a missing service account, or lower it before the first apply that carries the wait on a project whose Logging agent already exists."
+  type        = string
+  default     = "60s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(\\.[0-9]+)?(ms|s|m|h)$", var.stockout_pubsub_logging_identity_propagation_duration))
+    error_message = "stockout_pubsub_logging_identity_propagation_duration must be a number followed by one of ms, s, m or h, e.g. 60s or 2m. time_sleep does not accept the multi-unit form (1m30s). An empty value is not the default: remove a blank TF_VAR_ line rather than exporting \"\"."
+  }
 }
 
 variable "enable_drift_pubsub" {
@@ -1111,6 +1144,18 @@ variable "platform_agent_storage_size" {
   validation {
     condition     = try(tonumber(regex("^[0-9]+", var.platform_agent_storage_size)) * lookup({ Mi = 1, Gi = 1024, Ti = 1048576 }, regex("[MGT]i$", var.platform_agent_storage_size)) <= 67108864, true)
     error_message = "platform_agent_storage_size must be at most 64Ti, the largest persistent disk size."
+  }
+}
+
+variable "platform_agent_sizing_profile" {
+  description = "The PlatformAgent's spec.deployment.sizingProfile preset: \"small\", \"medium\", \"fleet\", \"auto\" (promotes at 10 and 25 clusters under namespace ResourceQuota and LimitRange admission checks), or \"\" (passes nothing, which leaves small in effect). Default is \"auto\" so Terraform- and installer-managed installs scale runtime pods automatically as clusters grow. Separate from var.sizing_profile, which sizes Standard node pools. Mirrors PLATFORM_AGENT_SIZING_PROFILE in install.env, and its default is DEFAULT_PLATFORM_AGENT_SIZING_PROFILE in install.defaults.env."
+  type        = string
+  default     = "auto"
+  nullable    = false
+
+  validation {
+    condition     = var.platform_agent_sizing_profile == "" || contains(["small", "medium", "fleet", "auto"], var.platform_agent_sizing_profile)
+    error_message = "platform_agent_sizing_profile must be \"\", \"small\", \"medium\", \"fleet\", or \"auto\"."
   }
 }
 

@@ -64,7 +64,9 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 const (
@@ -204,12 +206,12 @@ const (
 	ActivityStatusError       = "error"
 	ActivityStatusInterrupted = "interrupted"
 
-	redactedValue = "[redacted]"
+	redactedValue = answerscrub.Redacted
 )
 
 // What of an input reaches the bus does not depend on the executor mode,
 // because this stream is retained for days and copied into eval records.
-// First, redactedKeyPattern and its siblings name input keys whose values
+// First, answerscrub.SecretLookingKey names input keys whose values
 // never go on the bus, so the trace still says a secret-looking key was
 // there. Then every remaining string value becomes its shape (shapeValue):
 // the graders on the inject lane read tool names (an entry's tool, a
@@ -222,7 +224,7 @@ const (
 // for, and, on a kanban_create that made a card, the card's id. A title is
 // the one place a value taken from the arguments is published, and it is a
 // short identifier the renderer needs (a cluster, a file's tail, a search
-// query, a card's title), passed through scrubInlineSecrets as a net. The
+// query, a card's title), passed through answerscrub.ScrubInline as a net. The
 // model's reasoning is read for the step boundary it marks and is not
 // published: a model that has read a secret may restate it, and a scrubber
 // is not a contract.
@@ -259,33 +261,6 @@ var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // writeScopeFile writes one file of a child scope; a variable only so a
 // test can observe the order the two files are written in.
 var writeScopeFile = os.WriteFile
-
-var (
-	// A key is secret-looking when one of the words is a whole component of
-	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key, private_key, and in camelCase
-	// accessToken, clientSecret, dbPassword), not a substring (tokenizer,
-	// secretName): the latter are names, and blanking them would put
-	// "[redacted]" where the worker adapter's trace carries the value.
-	// A count or a path that ends in the word (max_tokens, credentials_file,
-	// accessTokenExpiry) is blanked too; that is the accepted price of
-	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
-	// starts a component when any letter or digit precedes its capital (so
-	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
-	// ends one at the end, a separator or the next capital. A key that opens
-	// with the word is handled apart (redactedCamelHeadPattern below).
-	redactedKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|cookie|set-cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:$|[_.-])`)
-	// An all-caps key with the word as an unseparated suffix (PGPASSWORD,
-	// DBPASSWORD, MYSQLPASSWORD): the libpq spelling, not an exotic one.
-	redactedUpperSuffixPattern = regexp.MustCompile(`[A-Z0-9](?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|COOKIE|CREDENTIAL)S?$`)
-	redactedCamelKeyPattern    = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Cookie|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
-	// A camelCase key that opens with the word and goes on in another
-	// component (secretAccessKey, SecretKey, tokenValue, passwordHash) is a
-	// credential unless the next component says it is a name, a reference
-	// or a location of one: secretName, SecretRef, tokenPath, credentialsFile,
-	// passwordId stay.
-	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?[A-Z]`)
-	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
-)
 
 // schemaKeyPattern is what an object key must look like to be published
 // under shape mode: a tool schema's key, letters, digits, underscore or dash,
@@ -546,9 +521,9 @@ type activityState struct {
 	stepRefused atomic.Bool
 
 	// secrets is the secret values this task's tool results carried
-	// (answer_scrub.go), redacted out of its answer and cleared when it
+	// (answerscrub.Seen), redacted out of its answer and cleared when it
 	// finalizes.
-	secrets seenSecrets
+	secrets answerscrub.Seen
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -848,7 +823,7 @@ const debugErrorTextCap = 320
 // debugErrorText is a failed call's error text for its activity entry: ""
 // unless BRIDGE_DEBUG_ERROR_TEXT is true, else the first line of hermes's
 // error_message (or of the result, when hermes gave none), run through
-// scrubInlineSecrets and capped.
+// answerscrub.ScrubInline and capped.
 func debugErrorText(d hookDelivery) string {
 	if !debugErrorTextOn() {
 		return ""
@@ -862,7 +837,7 @@ func debugErrorText(d hookDelivery) string {
 			text = string(d.Extra.Result)
 		}
 	}
-	return oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap)
+	return oneLinePreview(answerscrub.ScrubInline(text), debugErrorTextCap)
 }
 
 // debugErrorTextOn reports whether the BRIDGE_DEBUG_ERROR_TEXT switch is on.
@@ -903,16 +878,6 @@ func durationMillis(n json.Number) int64 {
 		return int64(f)
 	}
 	return 0
-}
-
-// secretLookingKey says whether a value under this key never goes on the
-// bus: a secret word as a whole component in any spelling, or a camelCase
-// key that opens with the word and goes on in something other than a name.
-func secretLookingKey(k string) bool {
-	if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) || redactedUpperSuffixPattern.MatchString(k) {
-		return true
-	}
-	return redactedCamelHeadPattern.MatchString(k) && !camelHeadNamePattern.MatchString(k)
 }
 
 // redactInput returns the tool input fit for the bus: the structure with
@@ -1071,7 +1036,7 @@ func redactKeys(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			if secretLookingKey(k) {
+			if answerscrub.SecretLookingKey(k) {
 				t[k] = redactedValue
 			} else {
 				t[k] = redactKeys(val)
@@ -1342,8 +1307,9 @@ func (b *Bridge) closeActivity() {
 
 // handleActivity is the door. Every answer past the method check is 204:
 // hermes retries connection errors and 5xx and warns on 4xx, and a delivery
-// the door cannot use (unsigned, unmatched, unparseable) is not the sender's
-// problem to hear about per call. An entry is published on this request,
+// the door cannot use (unsigned, unmatched, unparseable, or one whose
+// handling panicked: takeDelivery) is not the sender's problem to hear
+// about per call. An entry is published on this request,
 // under run.mu: hermes delivers from one background thread in order, so
 // the trace keeps call order, a publish costs the tool call nothing, and
 // there is no queue for finalize to race.
@@ -1373,6 +1339,27 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	b.takeDelivery(run, body, decoded)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// takeDelivery is the door's work for a delivery routed to run, under
+// taskguard.Guard: a panic anywhere in it, the decode and the tool result's
+// secret collection included, is recovered, logged and counted once, and
+// marks the run panicked (markPanicked), so it ends failed with no answer
+// (panic.go) rather than publish one whose scrub missed a value. The
+// delivery is dropped, and the sender still gets the door's 204: the run
+// is already marked, and a 5xx would only make hermes retry it.
+func (b *Bridge) takeDelivery(run *taskRun, body []byte, decoded *hookDelivery) {
+	if taskguard.Guard(b.cfg.Logger, "activity delivery", []any{"task", run.origin.TaskID}, func() {
+		b.takeDeliveryUnguarded(run, body, decoded)
+	}) != nil {
+		markPanicked(run)
+	}
+}
+
+// takeDeliveryUnguarded is takeDelivery's work.
+func (b *Bridge) takeDeliveryUnguarded(run *taskRun, body []byte, decoded *hookDelivery) {
 	var d hookDelivery
 	if decoded != nil {
 		d = *decoded
@@ -1384,7 +1371,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		// trace either way and the marker does not count it. Said in the
 		// log.
 		b.cfg.Logger.Warn("activity delivery unparseable", "task", run.origin.TaskID, "err", err)
-		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	// observe under run.mu: it closes the call, and a finalize slipping in
@@ -1397,10 +1383,54 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// would hold the heartbeat and a finalize behind it. A value that lands
 	// after the answer was published scrubs nothing; the answer is out.
 	if d.Event == hookPostToolCall {
-		act.secrets.collectToolResult(d.Extra.Result)
+		b.collectToolResult(act, d.Extra.Result)
 	}
+	b.observeDelivery(run, act, d)
+}
+
+// collectToolResult reads a tool result's secret values into the task's
+// seen set, for the answer's scrub; b.collectResult when a test set it.
+func (b *Bridge) collectToolResult(act *activityState, result json.RawMessage) {
+	if b.collectResult != nil {
+		b.collectResult(act, result)
+		return
+	}
+	act.secrets.CollectToolResult(result)
+}
+
+// markPanicked marks run touched by a recovered panic, under run.mu, so a
+// finalize that takes mu after it publishes no answer. A finalize already
+// past its check has published what it had, as for a secret value that
+// lands after the answer.
+func markPanicked(run *taskRun) {
 	run.mu.Lock()
-	entry, ok, steps := act.observe(d)
+	defer run.mu.Unlock()
+	run.panicked.Store(true)
+}
+
+// observeDelivery is the door's critical section: under run.mu, released by
+// defer, it observes the delivery and publishes what it closed. A panic in
+// it is recovered here, still under run.mu, and marks the run panicked
+// before the lock is released, so a finalize that takes mu next already
+// sees the mark and publishes no answer.
+func (b *Bridge) observeDelivery(run *taskRun, act *activityState, d hookDelivery) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if taskguard.Guard(b.cfg.Logger, "activity observation", []any{"task", run.origin.TaskID}, func() {
+		b.observeDeliveryLocked(run, act, d)
+	}) != nil {
+		run.panicked.Store(true)
+	}
+}
+
+// observeDeliveryLocked observes the delivery and publishes what it
+// closed. Caller holds run.mu.
+func (b *Bridge) observeDeliveryLocked(run *taskRun, act *activityState, d hookDelivery) {
+	observe := b.observe
+	if observe == nil {
+		observe = (*activityState).observe
+	}
+	entry, ok, steps := observe(act, d)
 	b.publishSteps(run, act, steps)
 	if ok {
 		if run.state == stateRunning {
@@ -1413,8 +1443,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
 		}
 	}
-	run.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // runForSignature finds the in-flight task a delivery belongs to: the CLI
@@ -1476,8 +1504,21 @@ func (b *Bridge) collectCardWorkerSecrets(runs []*taskRun, d *hookDelivery) {
 	if d.Event != hookPostToolCall || d.SessionID == "" {
 		return
 	}
-	if run := cardWorkerRun(runs, *d); run != nil {
-		run.act.Load().secrets.collectToolResult(d.Extra.Result)
+	// Matching the delivery to a run comes first, guarded on its own: no
+	// task is known yet, and a panic there leaves the delivery unused, as
+	// a delivery that matched nothing.
+	var run *taskRun
+	if taskguard.Guard(b.cfg.Logger, "card worker match", nil, func() {
+		run = cardWorkerRun(runs, *d)
+	}) != nil || run == nil {
+		return
+	}
+	// A panic in the collection marks the run, as takeDelivery does: that
+	// run's answer folds the card's report in. The record names its task.
+	if taskguard.Guard(b.cfg.Logger, "card worker delivery", []any{"task", run.origin.TaskID}, func() {
+		b.collectToolResult(run.act.Load(), d.Extra.Result)
+	}) != nil {
+		markPanicked(run)
 	}
 }
 
@@ -1500,12 +1541,25 @@ func (b *Bridge) runActivity(run *taskRun) {
 		case <-a.stop:
 			return
 		case <-tick:
-			run.mu.Lock()
-			if run.state == stateRunning && a.heartbeatUnderBudget() {
-				b.publishProgress(run, a.progressLine(time.Now()))
-			}
-			run.mu.Unlock()
+			// A panicking tick is logged and counted and skipped; the
+			// heartbeat goes on (panic.go).
+			_ = taskguard.Guard(b.cfg.Logger, "heartbeat", []any{"task", run.origin.TaskID}, func() {
+				b.heartbeatTick(run, a)
+			})
 		}
+	}
+}
+
+// heartbeatTick is one heartbeat publish, under run.mu, released by defer.
+func (b *Bridge) heartbeatTick(run *taskRun, a *activityState) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state == stateRunning && a.heartbeatUnderBudget() {
+		line := b.progressLine
+		if line == nil {
+			line = (*activityState).progressLine
+		}
+		b.publishProgress(run, line(a, time.Now()))
 	}
 }
 

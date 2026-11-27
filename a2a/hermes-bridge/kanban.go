@@ -19,6 +19,7 @@ import (
 	"time"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -282,7 +283,7 @@ func (k *kanbanTracker) ensureMapsLocked() {
 func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.Step {
 	// The title is model-written too (the coordinator names the card when it
 	// files it), so it passes the scrubber as a net, like an argument value.
-	title := scrubInlineSecrets(strings.TrimSpace(c.Title))
+	title := answerscrub.ScrubInline(strings.TrimSpace(c.Title))
 	shortTitle := shortCardClusterOrTitle(title)
 	if shortTitle == "" {
 		shortTitle = c.ID
@@ -697,11 +698,11 @@ func cardAnswerText(c kanbanCardRow) string {
 		if text == "" {
 			text = strings.TrimSpace(formatKanbanCardOutput(c))
 		}
-		if out := oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap); out != "" {
+		if out := oneLinePreview(answerscrub.ScrubInline(text), debugErrorTextCap); out != "" {
 			return out
 		}
 	}
-	title := shortCardClusterOrTitle(scrubInlineSecrets(strings.TrimSpace(c.Title)))
+	title := shortCardClusterOrTitle(answerscrub.ScrubInline(strings.TrimSpace(c.Title)))
 	if title == "" {
 		return fmt.Sprintf("Kanban card `%s` finished with status `%s`.", c.ID, st)
 	}
@@ -930,14 +931,16 @@ poll:
 					st := cardStep(c, settledCount, totalCount, "")
 					progText := fmt.Sprintf("Kanban specialist checks: %d/%d settled (%d running) — latest: %s (%s)",
 						settledCount, totalCount, totalCount-settledCount, st.Subtask.Title, st.Subtask.Verdict)
-					run.mu.Lock()
-					if act != nil {
-						b.publishSteps(run, act, []stepmsg.Step{st})
-						if run.state == stateRunning && act.heartbeatUnderBudget() {
-							b.publishProgress(run, progText)
+					func() {
+						run.mu.Lock()
+						defer run.mu.Unlock()
+						if act != nil {
+							b.publishSteps(run, act, []stepmsg.Step{st})
+							if run.state == stateRunning && act.heartbeatUnderBudget() {
+								b.publishProgress(run, progText)
+							}
 						}
-					}
-					run.mu.Unlock()
+					}()
 				}
 
 				if settledCount == totalCount {
@@ -953,17 +956,19 @@ poll:
 						if turnFiledCards && !sawUnsettled {
 							synthAck = ackText
 						}
-						run.mu.Lock()
-						// Only a synthesis that runs is announced: one card, or
-						// an answer of the turn's own, stands in as it is.
-						if act != nil && cardSynthesisRuns(run, turn, synthAck, relevant) {
-							b.publishSteps(run, act, []stepmsg.Step{{
-								Kind:    stepmsg.KindSynthesis,
-								Title:   fmt.Sprintf("Synthesizing findings across %d specialist card(s).", len(relevant)),
-								Thought: "Combining specialist reports into unified fleet response.",
-							}})
-						}
-						run.mu.Unlock()
+						func() {
+							run.mu.Lock()
+							defer run.mu.Unlock()
+							// Only a synthesis that runs is announced: one card, or
+							// an answer of the turn's own, stands in as it is.
+							if act != nil && cardSynthesisRuns(run, turn, synthAck, relevant) {
+								b.publishSteps(run, act, []stepmsg.Step{{
+									Kind:    stepmsg.KindSynthesis,
+									Title:   fmt.Sprintf("Synthesizing findings across %d specialist card(s).", len(relevant)),
+									Thought: "Combining specialist reports into unified fleet response.",
+								}})
+							}
+						}()
 						if !turnFiledCards {
 							cardReport := b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, "", relevant, parts)
 							if act != nil {

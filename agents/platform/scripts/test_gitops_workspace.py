@@ -2386,5 +2386,132 @@ class TestGetGitopsRepo(WorkspaceTestCase):
         self.assertIsNone(self.read())
 
 
+class TestGetContextRepoSpecs(WorkspaceTestCase):
+    """Test `get_context_repo_specs` across VCS providers, pins, and deduplication."""
+
+    def state(self, managed, context, github_host=None):
+        (self.tmp_path / "managed_repos").write_text(
+            json.dumps(managed), encoding="utf-8"
+        )
+        (self.tmp_path / "context_repos").write_text(
+            json.dumps(context), encoding="utf-8"
+        )
+        if github_host is not None:
+            (self.tmp_path / "github_host").write_text(github_host, encoding="utf-8")
+
+    def read_specs(self):
+        env = {"GITOPS_STATE_PATH": str(self.tmp_path / "managed_repos")}
+        with patch.dict(os.environ, env):
+            return gitops_workspace.get_context_repo_specs()
+
+    def test_returns_specs_in_configmap_order_across_vcs_providers(self):
+        self.state(
+            managed=[{"type": "github", "url": "https://github.com/acme/gitops"}],
+            context=[
+                {
+                    "type": "gitlab",
+                    "url": "https://gitlab.com/acme/platform/standards.git",
+                    "ref": "curated",
+                },
+                {
+                    "type": "github",
+                    "url": "https://github.com/acme/architecture",
+                },
+                {
+                    "type": "gitea",
+                    "url": "http://gitea-http.gitea.svc.cluster.local:3000/demo/docs",
+                    "ref": "release/2026",
+                },
+                {
+                    "type": "bitbucket",
+                    "url": "https://bitbucket.org/acme/runbooks",
+                },
+                {
+                    "type": "bitbucket-datacenter",
+                    "url": "https://bitbucket.example.com/scm/plat/rfcs.git",
+                    "ref": "approved",
+                },
+            ],
+        )
+        self.assertEqual(
+            self.read_specs(),
+            [
+                {"repo": "gitlab.com/acme/platform/standards", "ref": "curated"},
+                {"repo": "acme/architecture", "ref": None},
+                {
+                    "repo": "gitea-http.gitea.svc.cluster.local/demo/docs",
+                    "ref": "release/2026",
+                },
+                {"repo": "bitbucket.org/acme/runbooks", "ref": None},
+                {"repo": "bitbucket.example.com/scm/plat/rfcs", "ref": "approved"},
+            ],
+        )
+
+    def test_skips_refused_ref_and_excludes_managed_repos(self):
+        self.state(
+            managed=[
+                {"type": "github", "url": "https://github.com/Acme/GitOps"},
+                {"type": "gitlab", "url": "https://gitlab.com/acme/managed-infra"},
+            ],
+            context=[
+                # Duplicate of managed GitHub repo (different case) -> excluded.
+                {"type": "github", "url": "https://github.com/acme/gitops"},
+                # Same path on another VCS host -> kept (and qualifies GitHub names).
+                {"type": "gitlab", "url": "https://gitlab.com/acme/gitops"},
+                # Duplicate of managed GitLab repo -> excluded.
+                {"type": "gitlab", "url": "https://gitlab.com/acme/managed-infra"},
+                # Refused branch pin -> skipped; later duplicate cannot bypass the refusal.
+                {
+                    "type": "github",
+                    "url": "https://github.com/acme/bad-pin",
+                    "ref": "--upload-pack=evil",
+                },
+                {
+                    "type": "github",
+                    "url": "https://github.com/acme/bad-pin",
+                    "ref": "main",
+                },
+                # Valid context repo -> kept.
+                {
+                    "type": "github",
+                    "url": "https://github.com/acme/shared-docs",
+                    "ref": "curated",
+                },
+            ],
+        )
+        with self.assertLogs(gitops_workspace.LOGGER, level="WARNING"):
+            specs = self.read_specs()
+        self.assertEqual(
+            specs,
+            [
+                {"repo": "gitlab.com/acme/gitops", "ref": None},
+                {"repo": "acme/shared-docs", "ref": "curated"},
+            ],
+        )
+
+    def test_supports_github_enterprise_server_host(self):
+        self.state(
+            managed=[{"type": "github", "url": "https://ghe.example.com/acme/gitops"}],
+            context=[
+                {
+                    "type": "github",
+                    "url": "https://ghe.example.com/acme/runbooks",
+                    "ref": "prod",
+                }
+            ],
+            github_host="ghe.example.com",
+        )
+        self.assertEqual(
+            self.read_specs(),
+            [{"repo": "ghe.example.com/acme/runbooks", "ref": "prod"}],
+        )
+
+    def test_raises_runtime_error_when_state_is_unreadable(self):
+        missing_state = self.tmp_path / "missing-dir" / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(missing_state)}):
+            with self.assertRaises(RuntimeError):
+                gitops_workspace.get_context_repo_specs()
+
+
 if __name__ == "__main__":
     unittest.main()

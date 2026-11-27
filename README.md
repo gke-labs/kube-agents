@@ -10,7 +10,7 @@
 | Drift discovered during incidents            | Scheduled compliance & blueprint audits ([autonomous watchdogs](agents/platform/cron/jobs.json))             |
 | Hand-rolled RBAC and tenancy reviews         | Automated RBAC & boundary enforcement, [credential isolation by design](docs/credential-isolation-design.md) |
 | Patch Tuesdays and CVE spreadsheets          | Daily vulnerability & patch scans with staggered rollout orchestration                                       |
-| One human, one terminal                      | ChatOps with the agent over Google Chat & Slack                                                              |
+| One human, one terminal                      | ChatOps with the agent over Google Chat, Slack & Microsoft Teams                                             |
 
 📗 **Full documentation: [gke-labs.github.io/kube-agents](https://gke-labs.github.io/kube-agents/)**
 
@@ -34,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 _Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`; a GitLab install needs `0.9.0` or later, a Bitbucket install `0.29.0` or later)._
 
-This interactive installer (recommended for initial setup) guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials. Sensible defaults are detected from your `gcloud` context, requiring minimal input.
+This interactive installer (recommended for initial setup) guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials. Sensible defaults are detected from your `gcloud` context, requiring minimal input. Microsoft Teams is turned on after the install: see [Microsoft Teams app setup](https://gke-labs.github.io/kube-agents/install/teams-app/).
 
 ### 🤖 AI Agent & Automation Usage
 
@@ -130,7 +130,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Observability | `gke-alert-configuration`, `gke-basics`, `gke-observability`, `kube-agents-observability` |
 | Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades`, `topology-drift`, `upgrade-readiness-brief` |
 | Manifests and remediation | `gcp-config-connector`, `gcp-terraform`, `gitops-helm-chart`, `gke-manifest-generation`, `submit-suggestion` |
-| Meta | `alert-history`, `decision-memory`, `first-run-report`, `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
+| Meta | `alert-history`, `chat-delivery`, `decision-memory`, `first-run-report`, `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
 | Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `pod-container-creating`, `pod-crashloop-oom`, `pod-pending-scheduling`, `service-connectivity`, `topology-drift`, `workload-triage-scan` |
 | GKE Support Agent (tse) | `support-escalation-bundle` |
 
@@ -179,7 +179,7 @@ flowchart TB
 
     subgraph integration["🔀 Integration & Routing Layer"]
         LLM["LiteLLM Gateway<br/>Gemini · Vertex AI · OpenAI · Anthropic · OpenAI-compatible"]
-        CHAT["Messaging bridges<br/>Google Chat (Pub/Sub) · Slack (Socket Mode)"]
+        CHAT["Messaging bridges<br/>Google Chat (Pub/Sub) · Slack (Socket Mode) · Microsoft Teams (Bot Framework)"]
         GH["Minty — GitHub App<br/>token minter (KMS)"]
     end
 

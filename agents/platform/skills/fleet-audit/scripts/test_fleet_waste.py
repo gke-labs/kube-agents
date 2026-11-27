@@ -2034,6 +2034,65 @@ class OverrequestTest(unittest.TestCase):
         peaks = {("default", "api-1"): (11.0, 40000.0)}
         self.assertEqual(fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False), [])
 
+    # A model of a window's usage, as a fraction of the request in each of 75
+    # buckets. The burst profile sits at 10% and reaches 85% in 2 buckets: the
+    # mean is 12% of the request, and the 99th percentile is 85%. The burst is
+    # in the middle, so the first bucket and the last bucket are quiet.
+    BURST_WINDOW = (0.10,) * 40 + (0.85,) * 2 + (0.10,) * 33
+    QUIET_WINDOW = (0.10,) * 75
+
+    def peaks_over(self, cpu_window, mem_window):
+        """What `fetch_usage_peaks` reads for `deployment_pod` (12 vCPU / 48Gi)
+        over a window with these buckets.
+
+        Monitoring takes the maximum over the window and answers with one
+        point per series. The fake session does not: it hands over the
+        buckets, and the collector's maximum over the points stands in. So
+        the query must ask for that maximum, or the stand-in is not the
+        answer that Monitoring gives."""
+        session = FakeSession(
+            cpu=[series_of("default", "api-1", *(12 * level for level in cpu_window))],
+            mem=[series_of("default", "api-1", *(48 * 1024 * MIB * level for level in mem_window))],
+        )
+        peaks, available, _ = fw.fetch_usage_peaks("acme", "prod-usc1", session=session, now=NOW)
+        self.assertTrue(available)
+        for call in session.calls:
+            self.assertEqual(call["secondaryAggregation.perSeriesAligner"], fw.ALIGN_MAX)
+        return peaks
+
+    def test_the_burst_profile_gets_no_cut(self):
+        """Mean at 12% of the request, 99th percentile at 85%. A rule that
+        reads the mean cuts this request. The check reads the peak of the
+        window, and no percentile is above the peak, so it files nothing."""
+        self.assertAlmostEqual(sum(self.BURST_WINDOW) / len(self.BURST_WINDOW), 0.12)
+        # More than 1 bucket in 100 is at 85%, so the 99th percentile is 85%.
+        self.assertGreater(self.BURST_WINDOW.count(0.85) / len(self.BURST_WINDOW), 0.01)
+        context = {"pods": [self.deployment_pod()]}
+        burst = self.peaks_over(self.BURST_WINDOW, self.BURST_WINDOW)
+        self.assertEqual(fw.check_overrequest(context, burst, now=NOW, autopilot=False), [])
+        # Control: the same window with no burst bucket is reported on both
+        # dimensions, so the two burst buckets are what keeps the request.
+        quiet = self.peaks_over(self.QUIET_WINDOW, self.QUIET_WINDOW)
+        [hit] = fw.check_overrequest(context, quiet, now=NOW, autopilot=False)
+        self.assertIn("Over-requested on both dimensions", hit["excerpt"])
+
+    def test_a_burst_on_one_dimension_keeps_that_request(self):
+        """The finding is for the quiet dimension alone: its text says that
+        the other one is in use, and the resize names no figure for it."""
+        context = {"pods": [self.deployment_pod()]}
+        for bursty, quiet, cpu_window, mem_window in (
+            ("cpu", "memory", self.BURST_WINDOW, self.QUIET_WINDOW),
+            ("memory", "cpu", self.QUIET_WINDOW, self.BURST_WINDOW),
+        ):
+            with self.subTest(bursty=bursty):
+                peaks = self.peaks_over(cpu_window, mem_window)
+                [hit] = fw.check_overrequest(context, peaks, now=NOW, autopilot=False)
+                self.assertIn(f"Over-requested on {quiet} only (10% of request)", hit["excerpt"])
+                self.assertIn(f"{bursty} is in use and must not be resized", hit["excerpt"])
+                resize = hit["excerpt"].split("Resize to ")[1]
+                self.assertTrue(resize.startswith(f"{quiet} "), resize)
+                self.assertNotIn(bursty, resize)
+
     def test_an_unmeasured_controller_is_not_reported(self):
         """Absent is not idle, and here absent reads as *maximally* idle.
 
@@ -3948,6 +4007,342 @@ class ReplacedPodPeaksTest(unittest.TestCase):
         self.assertIn("100m / 400Mi per replica", hits[0]["excerpt"])
 
 
+class CutPodNameTest(unittest.TestCase):
+    """A replaced pod whose name Kubernetes cut at 63 characters.
+
+    The name generator keeps at most 58 characters of `<replicaset>-` and adds
+    five of its own. So the pod of a long-named controller carries part of the
+    hash, or none of it; the two-segment pattern never matched it, and such a
+    controller was sized on its live pods alone. Every name here is built by
+    that rule (`pod_name`), not typed.
+    """
+
+    NS = "shop"
+    HASH = "4b5c6d7f89"  # each character a hash can hold, once
+    LIVE, GONE = "2456x", "7z8w9"
+    # Deployment name lengths, by where the cut lands with a ten-character
+    # hash: 38 is not cut; at 47 only the hyphen before the suffix goes; at 53
+    # four characters of the hash stay, at 54 three, which is too few to tell a
+    # sibling by; at 57 none; at 58 the name's own hyphen goes too; at 70 part
+    # of the name.
+    NOT_CUT, HYPHEN_CUT, HASH_CUT, HASH_SHORT, HASH_GONE, NAME_HYPHEN_CUT, NAME_CUT = 38, 47, 53, 54, 57, 58, 70
+    OWN_ALONE = (HYPHEN_CUT, 50, HASH_CUT)
+    SHARED = (HASH_SHORT, HASH_GONE - 1, HASH_GONE, NAME_HYPHEN_CUT, NAME_CUT)
+    IDLE_PEAK, BUSY_PEAK = (0.9, 3072.0), (11.0, 40000.0)
+    MEMORY = {"requests": {"cpu": "100m", "memory": "512Mi"}, "limits": {"cpu": "500m", "memory": "2Gi"}}
+    # What a sibling is called after this controller's name and a hyphen.
+    TAILS = (
+        "db", "worker", "canary", "proxy", "web", "backend", "frontend", "cron", "job", "sync", "migrate",
+        "staging", "preview", "grpc", "v2", "blue", "green", "redis", "cache", "stable", "scheduler", "bff", "c5", "b",
+    )
+
+    def name(self, length, tail=""):
+        return ("checkout-" + "a" * 80)[: length - len(tail)] + tail
+
+    def pod_name(self, base, suffix):
+        """`names.SimpleNameGenerator`: 58 characters of the base, then five."""
+        return base[:58] + suffix
+
+    def deployment_pod_name(self, deployment, suffix, hash_=HASH):
+        return self.pod_name(f"{deployment}-{hash_}-", suffix)
+
+    def pod(self, name, owner, *, hash_=HASH, resources=None):
+        resources = {"requests": {"cpu": "12", "memory": "48Gi"}} if resources is None else resources
+        return obj(
+            "Pod", name, ns=self.NS,
+            **{
+                "spec.containers": [{"name": "main", "resources": resources}],
+                "status.startTime": "2026-07-31T15:00:00Z",
+                "status.phase": "Running",
+                "metadata.labels": {"pod-template-hash": hash_} if hash_ else {},
+                "metadata.ownerReferences": [{"kind": "ReplicaSet", "name": owner}],
+            },
+        )
+
+    def deployment(self, name, *, hash_=HASH, resources=None):
+        """`(context, live pod's key, replaced pod's key)` for one Deployment."""
+        live, gone = (self.deployment_pod_name(name, suffix, hash_) for suffix in (self.LIVE, self.GONE))
+        ctx = {
+            "pods": [self.pod(live, f"{name}-{hash_}", hash_=hash_, resources=resources)],
+            "deployments": [obj("Deployment", name, ns=self.NS, **{"metadata.creationTimestamp": "2026-07-01T00:00:00Z"})],
+            "services": [],
+        }
+        return ctx, (self.NS, live), (self.NS, gone)
+
+    def over(self, ctx, peaks):
+        return fw.check_overrequest(ctx, peaks, now=NOW, autopilot=False)
+
+    def under(self, ctx, means):
+        return fw.check_underrequest(ctx, {key: (0.05, mean) for key, mean in means.items()}, means, now=NOW)
+
+    def assert_sized_on_the_live_pod(self, hits):
+        self.assertEqual(len(hits), 1)
+        self.assertIn("0.90 vCPU", hits[0]["excerpt"])
+        self.assertNotIn("replaced", hits[0]["excerpt"])
+
+    def uncut_pattern_claims(self, name, pod):
+        """The hole the uncut pattern has on any name length: a pod of a sibling
+        whose tail has no vowel, such as `<name>-db-<five>`. Not a cut name."""
+        chars = fw.K8S_GENERATED_CHARS
+        return bool(fw.re.fullmatch(rf"{fw.re.escape(name)}-{chars}+-{chars}{{5}}", pod))
+
+    def siblings_gone_pods(self, name):
+        """Each sibling's gone pod, as a Deployment's and as a hook Job's, that
+        only a cut form of `name` could claim."""
+        for tail in self.TAILS:
+            for pod in (self.deployment_pod_name(f"{name}-{tail}", self.GONE), self.pod_name(f"{name}-{tail}-", self.GONE)):
+                if not self.uncut_pattern_claims(name, pod):
+                    yield tail, pod
+
+    # -- the forms of a Deployment's pod name ------------------------------- #
+
+    def test_a_deployments_replaced_pod_is_read_wherever_the_cut_lands(self):
+        lengths = (self.NOT_CUT, *self.OWN_ALONE, *self.SHARED)
+        for length in lengths:
+            with self.subTest(deployment_name_length=length):
+                ctx, live, gone = self.deployment(self.name(length))
+                self.assertEqual(len(gone[1]), 55 if length == self.NOT_CUT else 63)
+                self.assertEqual(gone[1].count("-", length), 2 if length == self.NOT_CUT else int(length < self.NAME_HYPHEN_CUT))
+                self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK}))
+                self.assertEqual(self.over(ctx, {live: self.IDLE_PEAK, gone: self.BUSY_PEAK}), [])
+
+    def test_every_name_length_and_every_hash_length_is_read(self):
+        """A pod-template-hash is the decimal form of a 32-bit number, re-encoded
+        one character for one: ten characters at most, nearly always eight to ten."""
+        for length in range(1, 81):
+            for hash_length in range(1, 11):
+                with self.subTest(deployment_name_length=length, hash_length=hash_length):
+                    ctx, live, gone = self.deployment(self.name(length), hash_=self.HASH[:hash_length])
+                    self.assertEqual(self.over(ctx, {live: self.IDLE_PEAK, gone: self.BUSY_PEAK}), [])
+
+    def test_the_excerpt_counts_the_cut_named_pod_as_replaced(self):
+        ctx, live, gone = self.deployment(self.name(self.HASH_CUT))
+        [hit] = self.over(ctx, {live: self.IDLE_PEAK, gone: (1.1, 4000.0)})
+        self.assertIn("1 pod it has replaced since", hit["excerpt"])
+        self.assertIn("1.10 vCPU", hit["excerpt"])
+
+    def test_the_hash_left_in_a_cut_name_is_made_of_hash_characters(self):
+        """`g` to `z` and `2` are in the generator's alphabet, and no hash holds
+        them: the ten digits map to `4` to `9` and `b`, `c`, `d`, `f`."""
+        ctx, live, gone = self.deployment(self.name(self.HASH_CUT))
+        stranger = (self.NS, gone[1][:-6] + "g" + self.GONE)
+        self.assertEqual(len(stranger[1]), 63)
+        self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK}))
+
+    # -- a bare ReplicaSet -------------------------------------------------- #
+
+    def replicaset(self, name):
+        live, gone = ((self.NS, self.pod_name(f"{name}-", suffix)) for suffix in (self.LIVE, self.GONE))
+        return {"pods": [self.pod(live[1], name, hash_="")]}, live, gone
+
+    def test_a_bare_replicasets_replaced_pod_is_read_wherever_the_cut_lands(self):
+        """`<name>-` is the whole base, so the cut starts at 58 characters of name."""
+        for length in (self.HASH_GONE, self.NAME_HYPHEN_CUT, self.NAME_CUT):
+            with self.subTest(replicaset_name_length=length):
+                ctx, live, gone = self.replicaset(self.name(length))
+                self.assertEqual(len(gone[1]), 63)
+                self.assertEqual(len(self.over(ctx, {live: self.IDLE_PEAK})), 1)
+                self.assertEqual(self.over(ctx, {live: self.IDLE_PEAK, gone: self.BUSY_PEAK}), [])
+
+    def test_a_bare_replicaset_has_no_form_with_a_hash_in_it(self):
+        """Its pods are `<name>-<five>`; `<name>-<part of a hash><five>` is the
+        pod of a Deployment's ReplicaSet with a longer name."""
+        name = self.name(self.HASH_CUT)
+        ctx, live, _ = self.replicaset(name)
+        stranger = (self.NS, self.deployment_pod_name(name, self.GONE))
+        hits = self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK})
+        self.assertEqual([hit["object"] for hit in hits], [f"ReplicaSet/{name}"])
+        self.assert_sized_on_the_live_pod(hits)
+
+    # -- the other checks that size on the join ----------------------------- #
+
+    def unsized(self, length, gone_peak=(0.050, 200.0)):
+        ctx, live, gone = self.deployment(self.name(length), resources={})
+        [hit] = fw.check_unsized(ctx, {live: (0.010, 40.0), gone: gone_peak}, now=NOW, autopilot=False)
+        return hit["excerpt"]
+
+    def test_unsized_sizes_off_a_cut_name_that_is_the_controllers_own_alone(self):
+        for length in self.OWN_ALONE:
+            with self.subTest(deployment_name_length=length):
+                self.assertIn("100m / 400Mi per replica", self.unsized(length))
+
+    def test_unsized_does_not_size_off_a_cut_name_another_controller_can_carry(self):
+        """This check writes the figure into a manifest, and a Job's peak read as
+        this Deployment's would write a request no node can hold."""
+        for length in self.SHARED:
+            with self.subTest(deployment_name_length=length):
+                excerpt = self.unsized(length, gone_peak=self.BUSY_PEAK)
+                self.assertIn("20m / 80Mi per replica", excerpt)
+                self.assertNotIn("replaced", excerpt)
+
+    FLOOR = {"requests": {"cpu": "50m", "memory": "64Mi"}}
+    UNUSED_PEAK = (0.0021, 6.0)
+
+    def idle(self, length):
+        ctx, live, gone = self.deployment(self.name(length), resources=self.FLOOR)
+        ctx["pods"][0]["status"]["startTime"] = "2026-07-25T00:00:00Z"
+        return ctx, live, gone
+
+    def test_idle_reads_a_cut_named_replaced_pod(self):
+        for length in (self.HASH_CUT, self.NAME_HYPHEN_CUT):
+            with self.subTest(deployment_name_length=length):
+                ctx, live, gone = self.idle(length)
+                self.assertEqual(len(fw.check_idle_workload(ctx, {live: self.UNUSED_PEAK}, now=NOW)), 1)
+                self.assertEqual(fw.check_idle_workload(ctx, {live: self.UNUSED_PEAK, gone: (0.045, 60.0)}, now=NOW), [])
+
+    def test_underrequest_reads_a_cut_name_that_is_the_controllers_own_alone(self):
+        for length in self.OWN_ALONE:
+            with self.subTest(deployment_name_length=length):
+                ctx, live, gone = self.deployment(self.name(length), resources=self.MEMORY)
+                self.assertEqual(self.under(ctx, {live: 300.0}), [])
+                [hit] = self.under(ctx, {live: 300.0, gone: 973.0})
+                self.assertIn("190% of request", hit["excerpt"])
+
+    def test_underrequest_does_not_read_a_cut_name_a_sibling_can_carry(self):
+        """The other checks read such a pod for both, where a higher peak
+        withholds a shrink or enlarges a figure a person applies. Here a
+        sibling's mean would make the finding, and a `critical` one is promoted
+        with no person in the loop."""
+        for length in self.SHARED:
+            with self.subTest(deployment_name_length=length):
+                ctx, live, gone = self.deployment(self.name(length), resources=self.MEMORY)
+                self.assertEqual(self.under(ctx, {live: 300.0, gone: 973.0}), [])
+        ctx, live, gone = self.replicaset(self.name(self.NAME_HYPHEN_CUT))
+        ctx["pods"][0]["spec"]["containers"][0]["resources"] = self.MEMORY
+        self.assertEqual(self.under(ctx, {live: 300.0, gone: 973.0}), [])
+
+    # -- what the cut form must not claim ----------------------------------- #
+
+    def test_underrequest_makes_no_finding_from_the_pod_of_a_sibling_with_a_common_tail(self):
+        """`<name>-worker` and hook Job `<name>-migrate`, at every length a cut
+        form exists for. Where four characters of hash are left, none of these
+        tails passes for them; where fewer are, this check does not read. A
+        tail that starts with four hash characters (`c5d9`) is the hole left."""
+        for length in range(self.HYPHEN_CUT, self.NAME_CUT + 1):
+            name = self.name(length)
+            ctx, live, _ = self.deployment(name, resources=self.MEMORY)
+            for tail, pod in self.siblings_gone_pods(name):
+                with self.subTest(deployment_name_length=length, sibling=tail, pod=pod):
+                    self.assertEqual(self.under(ctx, {live: 300.0, (self.NS, pod): 973.0}), [])
+
+    def test_a_siblings_pod_is_not_claimed_where_the_cut_name_is_the_controllers_own(self):
+        for length in range(self.HYPHEN_CUT, self.HASH_SHORT):
+            name = self.name(length)
+            ctx, live, _ = self.deployment(name)
+            for tail, pod in self.siblings_gone_pods(name):
+                with self.subTest(deployment_name_length=length, sibling=tail, pod=pod):
+                    self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, (self.NS, pod): self.BUSY_PEAK}))
+
+    def test_a_short_name_has_no_cut_form(self):
+        """A hash is ten characters at most, so `web-<59 characters>` is no pod of `web`."""
+        ctx, live, _ = self.deployment("web")
+        stranger = (self.NS, "web-" + self.HASH * 5 + self.HASH[:4] + self.GONE)
+        self.assertEqual(len(stranger[1]), 63)
+        self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK}))
+
+    def test_room_for_more_than_a_whole_hash_gives_no_cut_form(self):
+        """One character short of the first cut, the base `<name>-<hash>-` is 58
+        characters with a ten-character hash, so no pod name of the Deployment
+        is cut. A 63-character name with eleven hash characters behind
+        `<name>-` is no pod of it; one character more in the name, and the
+        ten-character form is its own."""
+        name = self.name(self.HYPHEN_CUT - 1)
+        ctx, live, gone = self.deployment(name)
+        self.assertEqual((len(gone[1]), gone[1].count("-", len(name))), (63, 2))
+        self.assertIsNone(fw._cut_pod_pattern("Deployment", name))
+        self.assertIsNotNone(fw._cut_pod_pattern("Deployment", self.name(self.HYPHEN_CUT)))
+        stranger = (self.NS, f"{name}-{self.HASH}{self.HASH[:1]}{self.GONE}")
+        self.assertEqual(len(stranger[1]), 63)
+        self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK}))
+        # Control: its own replaced pod, which has the ordinary name, is read.
+        self.assertEqual(self.over(ctx, {live: self.IDLE_PEAK, gone: self.BUSY_PEAK}), [])
+
+    def test_the_last_five_of_a_cut_name_are_generated_characters(self):
+        """`a` is no character the name generator draws."""
+        for length in (self.HASH_CUT, self.NAME_CUT):
+            with self.subTest(deployment_name_length=length):
+                ctx, live, gone = self.deployment(self.name(length))
+                stranger = (self.NS, gone[1][:-1] + "a")
+                self.assert_sized_on_the_live_pod(self.over(ctx, {live: self.IDLE_PEAK, stranger: self.BUSY_PEAK}))
+
+    def test_a_cut_form_is_63_characters_and_no_other_length(self):
+        for length in (self.HASH_CUT, self.NAME_CUT):
+            ctx, live, gone = self.deployment(self.name(length))
+            for stranger in (gone[1][:-1], gone[1] + "b"):
+                with self.subTest(deployment_name_length=length, pod_name_length=len(stranger)):
+                    peaks = {live: self.IDLE_PEAK, (self.NS, stranger): self.BUSY_PEAK}
+                    self.assert_sized_on_the_live_pod(self.over(ctx, peaks))
+
+    # -- a name that a sibling's pod can carry too -------------------------- #
+
+    def shared(self, *, resources=None):
+        """A Deployment, and the gone pod of another whose name shares 58 characters."""
+        ours, theirs = self.name(self.NAME_CUT, "-api"), self.name(self.NAME_CUT, "-job")
+        ctx, live, _ = self.deployment(ours, resources=resources)
+        return ours, theirs, ctx, live, (self.NS, self.deployment_pod_name(theirs, self.GONE))
+
+    def test_a_live_pod_with_a_matching_cut_name_is_not_claimed(self):
+        """The sibling's pod is in the dump, so the cluster says whose it is and
+        the name does not."""
+        ours, theirs, ctx, live, theirs_pod = self.shared()
+        ctx["pods"].append(self.pod(theirs_pod[1], f"{theirs}-{self.HASH}"))
+        ctx["deployments"].append(obj("Deployment", theirs, ns=self.NS))
+        hits = self.over(ctx, {live: self.IDLE_PEAK, theirs_pod: self.BUSY_PEAK})
+        self.assertEqual([hit["object"] for hit in hits], [f"Deployment/{ours}"])
+        self.assert_sized_on_the_live_pod(hits)
+
+    def test_a_gone_pod_with_a_shared_name_is_read_for_each_controller_it_fits(self):
+        """Nothing in the name tells the two apart once the pod is gone. Beside
+        a controller's own series the borrowed peak can only be the higher one,
+        so a shrink is withheld or made smaller, for the pod's owner and for
+        the other one alike."""
+        ours, theirs, ctx, live, theirs_gone = self.shared()
+        theirs_live = (self.NS, self.deployment_pod_name(theirs, "b4c5d"))
+        self.assertEqual(len({live, theirs_live, theirs_gone}), 3)
+        ctx["pods"].append(self.pod(theirs_live[1], f"{theirs}-{self.HASH}"))
+        ctx["deployments"].append(obj("Deployment", theirs, ns=self.NS, **{"metadata.creationTimestamp": "2026-07-01T00:00:00Z"}))
+        idle = {live: self.IDLE_PEAK, theirs_live: self.IDLE_PEAK}
+        self.assertEqual(sorted(hit["object"] for hit in self.over(ctx, idle)), [f"Deployment/{ours}", f"Deployment/{theirs}"])
+        self.assertEqual(self.over(ctx, {**idle, theirs_gone: self.BUSY_PEAK}), [])
+        hits = self.over(ctx, {**idle, theirs_gone: (1.1, 4000.0)})
+        self.assertEqual([("1.10 vCPU" in hit["excerpt"]) for hit in hits], [True, True])
+
+    def test_a_shared_name_does_not_widen_the_window_the_excerpt_claims(self):
+        """Whose pod it was is not known. A Deployment that never rolled, beside
+        a Job whose pods share its 58 characters, was watched for the nine hours
+        its pod has lived, and the excerpt keeps saying so."""
+        _, _, ctx, live, theirs_gone = self.shared()
+        [hit] = self.over(ctx, {live: self.IDLE_PEAK, theirs_gone: (0.1, 100.0)})
+        self.assertIn("0.90 vCPU", hit["excerpt"])
+        self.assertIn("oldest pod started 9h ago", hit["excerpt"])
+        self.assertNotIn("replaced", hit["excerpt"])
+
+    def test_a_shared_name_is_never_the_only_measurement(self):
+        """The controller's own pod has no series, or half of one. The sibling's
+        idle pod would then supply the figure, and a controller that was skipped
+        as unmeasured would be told to shrink, or to stand down."""
+        _, _, ctx, live, theirs_gone = self.shared()
+        for own in ({}, {live: (0.9, None)}, {live: (None, 3072.0)}):
+            with self.subTest(own_series=own):
+                self.assertEqual(self.over(ctx, own), [])
+                self.assertEqual(self.over(ctx, {**own, theirs_gone: self.IDLE_PEAK}), [])
+        _, _, ctx, live, theirs_gone = self.shared(resources=self.FLOOR)
+        ctx["pods"][0]["status"]["startTime"] = "2026-07-25T00:00:00Z"
+        self.assertEqual(fw.check_idle_workload(ctx, {theirs_gone: self.UNUSED_PEAK}, now=NOW), [])
+
+    def test_live_pods_that_are_measured_between_them_let_a_shared_name_count(self):
+        """Two replicas, one with a CPU series and one with a memory series: the
+        controller is measured on both dimensions, so its replaced pod's peak
+        is read beside them."""
+        ours, _, ctx, live, _ = self.shared()
+        second = (self.NS, self.deployment_pod_name(ours, "b4c5d"))
+        ctx["pods"].append(self.pod(second[1], f"{ours}-{self.HASH}"))
+        own = {live: (0.9, None), second: (None, 3072.0)}
+        self.assertEqual(len(self.over(ctx, own)), 1)
+        ours_gone = (self.NS, self.deployment_pod_name(ours, self.GONE))
+        self.assertEqual(self.over(ctx, {**own, ours_gone: (22.0, 80000.0)}), [])
+
+
 class GeneratedNameFamilyTest(unittest.TestCase):
     """Deployments a spawner names `<stem>-<uuid>` are one controller to the sizing checks.
 
@@ -4021,6 +4416,20 @@ class GeneratedNameFamilyTest(unittest.TestCase):
         [hit] = self.over([self.pod(self.member(self.U1))])
         self.assertEqual(hit["object"], "Deployment/calibration")
         self.assertIn("stands for 1 generated-name Deployment `calibration-<uuid>`", hit["excerpt"])
+
+    def test_a_family_takes_no_cut_form_by_its_stem(self):
+        """A single Deployment with a long name reads its pods' cut names. A
+        family's `object` is its stem, and the cut form by that name is the
+        pod of a Deployment named as the stem, here one that is gone. The
+        family does not read it."""
+        stem = "notebook-" + "a" * 38
+        self.assertEqual(len(stem), 47)
+        live = self.pod(self.member(self.U1, stem))
+        stranger = (self.NS, f"{stem}-4b5c6d7f89-"[:58] + "7z8w9")
+        [hit] = self.over([live], self.idle([live], {stranger: (0.9, 400.0)}))
+        self.assertEqual(hit["object"], f"Deployment/{stem}")
+        self.assertIn("Resize to memory 64Mi", hit["excerpt"])
+        self.assertNotIn("replaced", hit["excerpt"])
 
     def test_a_name_that_is_not_a_uuid_stays_as_it_is(self):
         names = [
@@ -4531,7 +4940,7 @@ class GeneratedNameFamilyTest(unittest.TestCase):
 
         [hit] = self.over(pods, deployments=[deployment(name) for name in members])
         self.assertEqual(hit["object"], "Deployment/calibration")
-        self.assertIn("owned by `CalibrationPool/lab-pool`", hit["excerpt"])
+        self.assertIn("Each member is owned by `CalibrationPool/lab-pool`", hit["excerpt"])
         self.assertIn("`app.kubernetes.io/managed-by: spawner`", hit["excerpt"])
         self.assertIn("`app.kubernetes.io/part-of: calibration`", hit["excerpt"])
         # A value that one member does not carry is not named, and neither is
@@ -4545,6 +4954,14 @@ class GeneratedNameFamilyTest(unittest.TestCase):
         for owners in ((f"run-{self.U3}", f"run-{self.U3}"), ("pool-a", "pool-b")):
             [hit] = self.over(pods, deployments=[deployment(name, owner=owner) for name, owner in zip(members, owners)])
             self.assertNotIn("owned by", hit["excerpt"])
+        # A member that the dump names only through its pod (its Deployment was
+        # gone when the audit read the Deployments, after the pod read) says
+        # nothing on what it carries. What the listed members share is still
+        # named, and the sentence says that it speaks for those.
+        [hit] = self.over(pods + [self.pod(self.member(self.U3))], deployments=[deployment(name) for name in members])
+        self.assertIn("stands for 3 generated-name Deployments", hit["excerpt"])
+        self.assertIn("Each member whose Deployment this audit read is owned by `CalibrationPool/lab-pool`", hit["excerpt"])
+        self.assertIn("`app.kubernetes.io/part-of: calibration`", hit["excerpt"])
 
     def test_a_family_finding_takes_no_declaration_by_its_name(self):
         """A file that declares `Deployment/calibration` declares another

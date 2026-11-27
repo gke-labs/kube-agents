@@ -51,6 +51,18 @@ class RecordingResponse(io.BytesIO):
         return False
 
 
+def a_parser_fault_for(body, fault):
+    """A patch: the client's `json.load` raises `fault` when it reads `body`, and works for each other source."""
+    real_load = json.load
+
+    def load(source, *args, **kwargs):
+        if source is body:
+            raise fault
+        return real_load(source, *args, **kwargs)
+
+    return patch.object(credential_proxy_client.json, "load", load)
+
+
 # A well-formed GKE context name, which is the only thing the broker accepts.
 GKE_CONTEXT = "gke_acme-prod_us-central1_ka-cluster-a"
 
@@ -445,6 +457,114 @@ class TestAContextLessGetCredentialsLandsAFile(ContextLessTestCase):
         self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
         files = [p for p in self.expected_file.parent.iterdir() if p.is_file()]
         self.assertEqual([self.expected_file], files)
+
+
+class PerTargetKubeconfigFolderOwnerTest(ContextLessTestCase):
+    """A get-credentials with no destination writes its file and its shell's pin only in a
+    `.kubeconfigs` that its caller owns. Root in the shell pod has the agent's home as its own
+    default: a folder that root made there was one the agent could not write its file in."""
+
+    ROOT = 0
+    ANOTHER_USER = os.geteuid() + 1
+    SHELL = "100-5"
+
+    def setUp(self):
+        super().setUp()
+        self.folder = self.home / ".kubeconfigs"
+        self.shells = self.folder / "shells"
+        self.pin = self.shells / f"{self.SHELL}.context"
+
+    @contextlib.contextmanager
+    def owned_by(self, uid, *folders):
+        """Report `uid` as the owner of `folders`. Only root can change a folder's owner, so the
+        owner is a stand-in."""
+
+        def with_the_owner(real):
+            def stand_in(path, *args, **kwargs):
+                info = real(path, *args, **kwargs)
+                if not isinstance(path, (str, os.PathLike)) or Path(path) not in folders:
+                    return info
+                fields = list(info)
+                fields[4] = uid  # index 4 of a stat result is st_uid
+                return os.stat_result(fields)
+            return stand_in
+
+        with patch.object(os, "stat", with_the_owner(os.stat)), \
+                patch.object(os, "lstat", with_the_owner(os.lstat)):
+            self.assertEqual(uid, folders[0].stat().st_uid, "the stand-in owner is in force")
+            yield
+
+    def fetch_in_a_shell(self, **environ):
+        with self.in_shell(self.SHELL):
+            return self.fetch(self.environ(**environ))
+
+    def test_no_folder_is_made_in_a_home_that_another_user_owns(self):
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([], list(self.home.iterdir()))
+        self.assertEqual(0, captured["exit_code"], "gcloud succeeded")
+        self.assertIn(
+            f"could not write {self.expected_file}: {self.home} belongs to uid {self.ANOTHER_USER}", stderr
+        )
+        self.assertNotIn("export KUBECONFIG", stderr)
+
+    def test_a_refused_caller_is_told_the_explicit_way_and_not_the_context_flag(self):
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            _, stderr = self.fetch_in_a_shell()
+        self.assertIn("KUBECONFIG=<a file of your own> gcloud container clusters get-credentials", stderr)
+        self.assertIn("KUBECONFIG=<the same file> kubectl", stderr)
+        self.assertNotIn("--context", stderr)
+
+    def test_no_file_and_no_pin_land_in_a_folder_that_another_user_owns(self):
+        self.shells.mkdir(parents=True)
+        with self.owned_by(self.ANOTHER_USER, self.home, self.folder, self.shells):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([self.shells], list(self.folder.iterdir()))
+        self.assertEqual([], list(self.shells.iterdir()))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertIn(f"could not write {self.expected_file}: {self.folder} belongs to uid", stderr)
+        self.assertIn(f"could not record the shell's context in {self.pin}: {self.folder} belongs to uid", stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root is the caller, so the folder would be its own")
+    def test_no_pin_lands_below_a_folder_of_root_that_has_no_shells_folder(self):
+        # A `.kubeconfigs` that root made before this rule, in a home that the caller owns.
+        self.folder.mkdir()
+        with self.owned_by(self.ROOT, self.folder):
+            captured, stderr = self.fetch_in_a_shell()
+        self.assertEqual([], list(self.folder.iterdir()))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertIn(
+            f"could not record the shell's context in {self.pin}: {self.folder} belongs to uid {self.ROOT}", stderr
+        )
+
+    def test_after_a_refused_caller_the_owner_writes_its_file_and_its_pin(self):
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            self.fetch_in_a_shell()
+        _, stderr = self.fetch_in_a_shell()
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+        self.assertEqual(SEEDED_CONTEXT, self.pin.read_text(encoding="utf-8"))
+        self.assertIn(f"export KUBECONFIG={self.expected_file}", stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root is the caller, so the home would be its own")
+    def test_a_caller_whose_home_root_owns_still_gets_its_file_and_its_pin(self):
+        # A session pod's home can be a mount that root made for the pod's user.
+        with self.owned_by(self.ROOT, self.home):
+            _, stderr = self.fetch_in_a_shell()
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+        self.assertEqual(SEEDED_CONTEXT, self.pin.read_text(encoding="utf-8"))
+        self.assertIn(f"export KUBECONFIG={self.expected_file}", stderr)
+
+    def test_a_home_that_is_missing_is_made_under_a_folder_of_the_caller(self):
+        home = self.home / "profiles" / "cluster-a"
+        self.fetch_in_a_shell(HERMES_HOME=str(home))
+        self.assertTrue((home / ".kubeconfigs" / self.expected_file.name).is_file())
+
+    def test_an_explicit_destination_is_written_as_before_in_a_folder_of_another_user(self):
+        destination = self.home / "mine.yaml"
+        with self.owned_by(self.ANOTHER_USER, self.home):
+            captured, _ = self.fetch_in_a_shell(KUBECONFIG=str(destination))
+        self.assertEqual(0, captured["exit_code"])
+        self.assertEqual([destination], list(self.home.iterdir()))
 
 
 class TestKubectlContextFlagNamesTheCluster(ContextLessTestCase):
@@ -1220,6 +1340,50 @@ class VcsCallErrorTest(unittest.TestCase):
                 credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
         self.assertIsInstance(caught.exception.__cause__, RecursionError)
 
+    # The three tests below hold the clause for a 2xx body nested too deep to RecursionError.
+
+    def test_a_2xx_body_that_is_not_json_keeps_the_error_of_the_parser(self):
+        with self._no_token_file, self._answer(b"<html>busy</html>"), self.assertRaises(json.JSONDecodeError):
+            credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+
+    def test_a_2xx_body_that_breaks_while_it_is_read_is_a_dropped_connection(self):
+        for fault in (http.client.IncompleteRead(b"{"), ConnectionResetError("reset by peer")):
+
+            class Breaks(io.BytesIO):
+                def read(self, *args, fault=fault):
+                    raise fault
+
+            def answer(request, *args, **kwargs):
+                return Breaks()
+
+            with self.subTest(fault=type(fault).__name__), self._no_token_file:
+                with patch.object(credential_proxy_client, "open_broker_request", answer):
+                    with self.assertRaises(credential_proxy_client.BrokerDisconnected) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                self.assertIs(caught.exception.__cause__, fault)
+
+    def test_a_fault_of_the_2xx_parse_of_another_type_gets_out(self):
+        """RecursionError is a RuntimeError: the parent type is not taken. The refusal's parse takes
+        TypeError; this one does not."""
+        for fault in (RuntimeError("another fault of the parser"), TypeError("another fault of the parser")):
+            body = io.BytesIO(b"{}")
+            with self.subTest(fault=type(fault).__name__), self._no_token_file:
+                with patch.object(credential_proxy_client, "open_broker_request", lambda request: body):
+                    with a_parser_fault_for(body, fault), self.assertRaises(type(fault)) as caught:
+                        credential_proxy_client.vcs_call(self.endpoint, "capabilities", {})
+                self.assertIs(caught.exception, fault)
+
+    def test_a_fault_of_the_refusal_parse_of_the_parent_type_gets_out_and_the_refusal_is_closed(self):
+        """The clause for a refusal body nested too deep names RecursionError, and not its parent RuntimeError."""
+        stream = io.BytesIO(b"{}")
+        error = self._held_refusal(502, stream)
+        fault = RuntimeError("another fault of the parser")
+        with patch.object(credential_proxy_client, "open_broker_request", side_effect=error), a_parser_fault_for(error, fault):
+            with self.assertRaises(RuntimeError) as caught:
+                credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+        self.assertIs(caught.exception, fault)
+        self.assertTrue(stream.closed, "vcs_call left the refusal open")
+
     def test_a_refusal_nested_too_deep_for_the_parser_is_the_status_alone(self):
         for status in (404, 502):
             with self.subTest(status=status):
@@ -1361,6 +1525,68 @@ class VcsCallErrorTest(unittest.TestCase):
         for answer in ({}, {"baseBranch": "main", "entries": [1, 2]}):
             with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
                 self.assertEqual(credential_proxy_client.vcs_call(self.endpoint, "capabilities", {}), answer)
+
+    def test_a_draining_503_refusal_is_retried(self):
+        draining = json.dumps(
+            {
+                "status": "busy",
+                "code": "CREDENTIAL_PROXY_BUSY",
+                "bound": "draining",
+                "before_admission": True,
+                "error": "draining",
+            }
+        ).encode()
+        ok_body = json.dumps({"baseBranch": "main"}).encode()
+        calls = 0
+
+        def open_req(request, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "Service Unavailable", {"Retry-After": "1"}, io.BytesIO(draining)
+                )
+            return io.BytesIO(ok_body)
+
+        sleeps = []
+        with self._no_token_file, patch.object(credential_proxy_client, "open_broker_request", open_req):
+            answer = credential_proxy_client.vcs_call(
+                self.endpoint,
+                "capabilities",
+                {},
+                clock=lambda: 0.0,
+                sleep_fn=sleeps.append,
+                rng=type("R", (), {"uniform": staticmethod(lambda a, b: b)})(),
+            )
+        self.assertEqual({"baseBranch": "main"}, answer)
+        self.assertEqual(2, calls)
+        self.assertEqual(1, len(sleeps))
+
+    def test_a_forge_429_rate_limit_is_not_retried(self):
+        rate_limited = json.dumps({"error": "rate limited", "code": "FORGE_RATE_LIMITED"}).encode()
+        calls = 0
+
+        def open_req(request, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", {"Retry-After": "1"}, io.BytesIO(rate_limited)
+            )
+
+        sleeps = []
+        with self._no_token_file, patch.object(credential_proxy_client, "open_broker_request", open_req):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                credential_proxy_client.vcs_call(
+                    self.endpoint,
+                    "proposal-claim",
+                    {},
+                    clock=lambda: 0.0,
+                    sleep_fn=sleeps.append,
+                )
+        self.assertEqual(429, caught.exception.status)
+        self.assertEqual("FORGE_RATE_LIMITED", caught.exception.payload.get("code"))
+        self.assertEqual(1, calls)
+        self.assertEqual([], sleeps)
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -2125,6 +2351,19 @@ class TestExecTierRouting(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual(1, len(calls))
         self.assertIn("the connection dropped while the refusal was read", stderr)
+
+    def test_a_fault_of_the_refusal_parse_of_the_parent_type_gets_out_and_the_refusal_is_closed(self):
+        """The clause for a refusal body nested too deep names RecursionError, and not its parent RuntimeError."""
+        stream = io.BytesIO(b"{}")
+        refusal = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=503, msg="Service Unavailable", hdrs=http.client.HTTPMessage(), fp=stream,
+        )
+        self.addCleanup(refusal.close)
+        fault = RuntimeError("another fault of the parser")
+        with a_parser_fault_for(refusal, fault), self.assertRaises(RuntimeError) as caught:
+            self.run_shim([refusal])
+        self.assertIs(caught.exception, fault)
+        self.assertTrue(stream.closed, "the refusal was left open")
 
     def test_a_second_refusal_is_retried_again_until_the_count_is_spent(self):
         code, calls, stderr = self.run_shim([busy_error("slot"), busy_error("slot"), self.OK])
@@ -3397,6 +3636,24 @@ class RetriesAdmissionRefusalsTest(unittest.TestCase):
         self.assertIn("the connection dropped after the request was sent", err.getvalue())
         self.assertNotIn("HTTP 200", err.getvalue())
 
+    def test_a_fault_of_the_2xx_parse_of_the_parent_type_gets_out_of_execute(self):
+        """The clause for a 2xx body that is not JSON names RecursionError, and not its parent RuntimeError."""
+
+        class Answer(RecordingResponse):
+            status = 200
+
+        body = Answer(b"{}")
+        fault = RuntimeError("another fault of the parser")
+        with patch.object(credential_proxy_client, "open_broker_request", lambda _request: body), \
+                a_parser_fault_for(body, fault), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(RuntimeError) as caught:
+                credential_proxy_client.execute(
+                    "http://broker.invalid:8765", ["kubectl", "get", "ns"], sleep_fn=self.sleeps.append, rng=self.rng
+                )
+        self.assertIs(caught.exception, fault)
+        self.assertEqual([], self.sleeps)
+
     def test_a_2xx_object_with_a_field_of_a_wrong_type_is_one_line_and_exit_1_and_nothing_of_it_is_printed(self):
         """The fields are checked before anything is written. The line names the field and the type, never a value."""
         whole = {"stdout": "NAME STATUS\n", "stderr": "a warning\n", "exitCode": 0}
@@ -3971,6 +4228,22 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
                 self.assertIs(refused, session.get(self.URL, timeout=30))
                 self.assertEqual(1, len(http_.calls))
                 self.assertEqual([], self.sleeps)
+
+    def test_an_error_of_json_of_another_type_gets_out_of_the_read(self):
+        """The session reads three errors of `json()` as a body that is not JSON: ValueError, AttributeError
+        and RecursionError. Another error is not hidden as one. RuntimeError is the parent of RecursionError."""
+        for fault in (TypeError("a fault of the reply object"), RuntimeError("another fault"), OSError("the read broke")):
+
+            class Broken(self.Response):
+                def json(self, fault=fault):
+                    raise fault
+
+            with self.subTest(fault=type(fault).__name__):
+                http_, session = self.session([Broken(503, None), self.Response(200, {"timeSeries": []})])
+                with self.assertRaises(type(fault)) as caught:
+                    session.get(self.URL, timeout=30)
+                self.assertIs(caught.exception, fault)
+                self.assertEqual(1, len(http_.calls))
 
     def test_a_real_reply_with_a_document_that_the_parser_refuses_has_no_json_body(self):
         """The same through a reply object of `requests` and a document that the parser of this run refuses."""
@@ -4733,6 +5006,212 @@ class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
         sent = self.run_shim(self.BASE + self.FULL, env={credential_proxy_client.TASK_TOKEN_FILE_ENV: str(token)})
         sent["broker"].assert_called_once()
         sent["relay"]._get_once.assert_not_called()
+
+
+class KubectlWriteAttemptRecordTest(unittest.TestCase):
+    """A session pod's kubectl write attempt, recorded by the kubectl wrapper
+    after a non-zero exit while kube-proxy is read-only (deploy/sandbox/
+    session-kubectl.sh); the worker adapter stops the turn on it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.record = self.tmp / "write-refusals"
+        self.record.write_bytes(b"")
+
+    def run_record(self, argv, code, mode="read-only-dry-run", record=True, task="task-s1"):
+        env = {credential_proxy_client.KUBE_PROXY_MODE_ENV: mode,
+               credential_proxy_client.REFUSAL_FILE_ENV: str(self.record) if record else "",
+               credential_proxy_client.REFUSAL_TASK_ENV: task}
+        with patch.dict("os.environ", env, clear=False), patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.record_kubectl_write_attempt(list(argv), code)
+        text = self.record.read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    def test_a_failed_write_under_a_read_only_proxy_appends_one_record(self):
+        records = self.run_record(["kubectl", "scale", "deploy/x", "--replicas=3"], 1)
+        self.assertEqual(1, len(records), records)
+        self.assertEqual(
+            {"write_refusal": True, "rule": "kube-proxy.write-attempt", "verb": "scale", "route": "kube-proxy", "task": "task-s1"},
+            {k: v for k, v in records[0].items() if k != "time"},
+        )
+
+    def test_nothing_is_recorded_without_every_condition(self):
+        write = ["kubectl", "delete", "pod", "p"]
+        for name, kwargs in (
+            ("exit 0", {"argv": write, "code": 0}),
+            ("a read", {"argv": ["kubectl", "get", "pods"], "code": 1}),
+            ("a local render", {"argv": ["kubectl", "apply", "-f", "x", "--dry-run=client"], "code": 1}),
+            ("a server dry run the proxy allows", {"argv": ["kubectl", "apply", "-f", "x", "--dry-run=server"], "code": 1}),
+            ("a writable proxy", {"argv": write, "code": 1, "mode": "read-write"}),
+            ("no mode from the gateway", {"argv": write, "code": 1, "mode": ""}),
+            ("no record file", {"argv": write, "code": 1, "record": False}),
+        ):
+            with self.subTest(name):
+                self.assertEqual([], self.run_record(**kwargs))
+
+    def test_the_command_line_entry_reads_the_code_then_kubectls_arguments(self):
+        env = {credential_proxy_client.KUBE_PROXY_MODE_ENV: "read-only-dry-run",
+               credential_proxy_client.REFUSAL_FILE_ENV: str(self.record),
+               credential_proxy_client.REFUSAL_TASK_ENV: "task-s2"}
+        argv = ["credential-proxy-exec", "--record-kubectl-write-attempt", "1", "rollout", "restart", "deploy/x"]
+        with patch.dict("os.environ", env, clear=False), patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as done:
+            credential_proxy_client.main()
+        self.assertEqual(0, done.exception.code)
+        records = [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(["rollout restart"], [r["verb"] for r in records])
+        bad = ["credential-proxy-exec", "--record-kubectl-write-attempt", "not-a-number", "delete", "pod", "p"]
+        with patch.dict("os.environ", env, clear=False), patch.object(sys, "argv", bad), self.assertRaises(SystemExit) as done:
+            credential_proxy_client.main()
+        self.assertEqual(0, done.exception.code)
+        self.assertEqual(1, len(self.record.read_text(encoding="utf-8").splitlines()))
+
+
+class WriteRefusalRecordTest(unittest.TestCase):
+    """The client's out-of-band record of a definitive write refusal, which a
+    profile worker stops its task on (a2a/worker-adapter/refusal.go)."""
+
+    endpoint = "http://proxy"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.token_path = self.tmp / "token"
+        self.token_path.write_text("valid-token\n")
+        self.record = self.tmp / "write-refusals"
+        self.record.write_bytes(b"")
+
+    def environ(self, record=None, task="task-1"):
+        env = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+            credential_proxy_client.REFUSAL_FILE_ENV: str(self.record if record is None else record),
+        }
+        if task:
+            env[credential_proxy_client.REFUSAL_TASK_ENV] = task
+        return patch.dict("os.environ", env, clear=False)
+
+    def records(self, path=None):
+        text = (path or self.record).read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    @staticmethod
+    def _answer(status, body, headers=None):
+        def answer(request, *args, **kwargs):
+            if status == 200:
+                return contextlib.nullcontext(io.BytesIO(json.dumps(body).encode()))
+            raise urllib.error.HTTPError(request.full_url, status, "refused", headers or {}, io.BytesIO(json.dumps(body).encode()))
+
+        return patch.object(credential_proxy_client, "open_broker_request", answer)
+
+    def run_exec(self, status, body, argv=("kubectl", "scale", "deploy/x", "--replicas=3"), **env):
+        stderr = io.StringIO()
+        with self.environ(**env), self._answer(status, body), patch("sys.stderr", new=stderr), patch("sys.stdout", new=io.StringIO()):
+            code = credential_proxy_client.execute(self.endpoint, list(argv), sleep_fn=lambda _: None)
+        return code, stderr.getvalue()
+
+    @staticmethod
+    def write_refusal(**extra):
+        return {
+            "status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "message": "refused however it is attempted",
+            "rule": "kubernetes.read-only", "verb": ["rollout", "restart"], "local_render": False,
+            "write_refusal": True, **extra,
+        }
+
+    def test_a_broker_write_refusal_appends_one_record(self):
+        code, _ = self.run_exec(403, self.write_refusal())
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.run_exec(403, self.write_refusal(verb=["delete"]))
+        records = self.records()
+        self.assertEqual(2, len(records), records)
+        first = records[0]
+        self.assertEqual(
+            {"write_refusal": True, "rule": "kubernetes.read-only", "verb": "rollout restart", "route": "/v1/exec", "task": "task-1"},
+            {k: v for k, v in first.items() if k != "time"},
+        )
+        self.assertRegex(first["time"], r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+        self.assertEqual("delete", records[1]["verb"])
+
+    def test_the_record_carries_the_brokers_words_not_the_callers(self):
+        self.run_exec(403, self.write_refusal(verb=["scale\npolicy rule: x", "a", "b", "c"]), task="bad task id")
+        record = self.records()[0]
+        self.assertEqual("scale_policy_rule:_x a b", record["verb"])
+        self.assertNotIn("task", record)
+
+    def test_no_record_for_a_refusal_that_is_not_a_write(self):
+        cases = {
+            "unmarked read refusal": (403, self.write_refusal(write_refusal=False, verb=["exec"])),
+            "a broker without the mark": (403, {k: v for k, v in self.write_refusal().items() if k != "write_refusal"}),
+            "a mark that is not true": (403, self.write_refusal(write_refusal="true")),
+            "a session bound": (403, {"code": "BROKER_LOOP_BREAKER", "rule": "broker.loop-breaker", "message": "stop"}),
+            "an unshaped rule": (403, self.write_refusal(rule="Kubernetes Read Only")),
+            "not a 403": (400, self.write_refusal()),
+            "an executable refusal": (403, {"error": "no", "code": "EXECUTABLE_NOT_ALLOWED", "write_refusal": True}),
+            "a server error": (500, {"error": "boom"}),
+        }
+        for name, (status, body) in cases.items():
+            with self.subTest(name):
+                self.run_exec(status, body)
+                self.assertEqual([], self.records())
+
+    def test_no_record_for_a_read_that_ran(self):
+        code, _ = self.run_exec(200, {"exitCode": 0, "stdout": "policy rule: kubernetes.read-only\n", "stderr": ""}, argv=("kubectl", "get", "pods"))
+        self.assertEqual(0, code)
+        self.assertEqual([], self.records())
+
+    def test_no_record_for_an_admission_refusal(self):
+        busy = {"error": "busy", "code": credential_proxy_client.BUSY_CODE, "bound": "session", "write_refusal": True}
+        self.run_exec(503, busy)
+        self.assertEqual([], self.records())
+
+    def test_a_missing_or_unwritable_file_is_a_logged_no_op(self):
+        directory = self.tmp / "a-directory"
+        directory.mkdir()
+        target = self.tmp / "target"
+        target.write_bytes(b"")
+        link = self.tmp / "a-link"
+        link.symlink_to(target)
+        fifo = self.tmp / "a-fifo"
+        os.mkfifo(fifo)
+        for name, record in (("missing", self.tmp / "gone" / "write-refusals"), ("a directory", directory),
+                             ("a symlink", link), ("a FIFO", fifo)):
+            with self.subTest(name):
+                code, err = self.run_exec(403, self.write_refusal(), record=record)
+                self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+                self.assertIn("policy rule: kubernetes.read-only", err)
+                self.assertIn("the write refusal was not recorded", err)
+        self.assertFalse((self.tmp / "gone").exists(), "the client created the record file")
+        self.assertEqual(b"", target.read_bytes(), "the client followed a symlink")
+
+    def test_an_unset_file_writes_nothing(self):
+        stderr = io.StringIO()
+        env = {"CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path), "KUBECONFIG": "", "HERMES_HOME": str(self.tmp)}
+        with patch.dict("os.environ", env, clear=False):
+            os.environ.pop(credential_proxy_client.REFUSAL_FILE_ENV, None)
+            with self._answer(403, self.write_refusal()), patch("sys.stderr", new=stderr):
+                code = credential_proxy_client.execute(self.endpoint, ["kubectl", "scale", "deploy/x"])
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual([], self.records())
+        self.assertNotIn("not recorded", stderr.getvalue())
+
+    def test_a_version_control_refusal_is_never_recorded(self):
+        # Even one carrying the mark: the permit refusal's answer is the patch
+        # the version-control skill gives, so it must not stop the task.
+        cases = (
+            (403, {"error": "no permit", "code": "CALLER_PERMIT_REQUIRED", "rule": "caller.vcs-permit", "write_refusal": True}),
+            (403, {"error": "no credential", "code": "CALLER_PERMIT_REQUIRED", "rule": "caller.vcs-permit", "write_refusal": False}),
+            (403, {"error": "explain-only", "code": "WRITE_MODE_NONE", "rule": "vcs.write-mode"}),
+            (409, {"error": "the base branch moved", "code": "BASE_MOVED", "write_refusal": True}),
+        )
+        for status, refusal in cases:
+            with self.subTest(refusal["code"]), self.environ(), self._answer(status, refusal):
+                with self.assertRaises(credential_proxy_client.WorkspaceRequestError):
+                    credential_proxy_client.vcs_call(self.endpoint, "publish", {})
+                self.assertEqual([], self.records())
+        with self.environ(), self._answer(200, {"ok": True}):
+            credential_proxy_client.vcs_call(self.endpoint, "proposal-view", {})
+        self.assertEqual([], self.records())
 
 
 if __name__ == "__main__":

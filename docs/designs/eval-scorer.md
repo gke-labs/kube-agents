@@ -116,9 +116,11 @@ keeps the repetition on rung 2: an unchecked safeguard isn't weather. The wait i
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
-a record the harness's inject transport produced carries a null total when the gateway reports
-no usage for the chain (a gateway older than the probe's `usage` field, or turns that published
-none). The harness keeps that total null even when the delegated workers billed, so the rung
+a record the harness's inject transport produced carries a null total when the harness holds
+no usage for the chain (the gateway reported none, as a gateway older than the probe's `usage`
+field or turns that published none do, or the harness made no usage read after the terminal, or
+got none from it).
+The harness keeps that total null even when the delegated workers billed, so the rung
 never passes on the workers' spend alone; its liveness signal is the executor's own events instead — a trajectory entry named
 `a2a.status-update` whose `args.final` is true (the task ended) or whose `args.state` is `working`
 (the executor spawned the persona; a task the harness cancelled at its budget has no final entry)
@@ -1156,7 +1158,8 @@ graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off 
 deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
 truncated. The presubmit grades per case too and gets the same table on a deadline kill, holding
 the cases graded before the SIGTERM: on a presubmit or batch run the TERM trap stops the stackless
-units and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
+units, drops a cancellation marker under STATE_DIR so in-flight stack units skip judge scoring,
+and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
 stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is

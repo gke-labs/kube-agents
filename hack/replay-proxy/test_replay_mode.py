@@ -169,8 +169,37 @@ class SlotPointerTest(SlotCacheCase):
         self.assertEqual((hit[0]["content"], hit[3]), ("done", "answer_slots"))
 
 
+def tag(run, rep, case="case-a"):
+    """An eval run tag, `<run>/<case>/<rep>`, as the agent sends it."""
+    return f"{run}/{case}/{rep}"
+
+
+# Seeds for the statistical draws below: sha256-seeded, so every run of the
+# suite draws exactly the same, and the tolerances are about the weights, not luck.
+DRAWS = 3000
+SHARE_TOLERANCE = 0.03
+
+
+class FinishReasonTest(AnalyzeCase):
+    """Record mode stores only a finished reply."""
+
+    BODY = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"}]}
+    ANSWER = {"role": "assistant", "content": "Looking at the card."}
+
+    def test_a_reply_cut_off_or_filtered_is_not_stored_and_a_finished_one_is(self):
+        for finish, stored in (("length", False), ("content_filter", False), ("other", False), (None, True),
+                               ("stop", True), ("tool_calls", True)):
+            with self.subTest(finish_reason=finish):
+                shutil.rmtree(self.cache_dir, ignore_errors=True)
+                upstream = dict(self.upstream(self.ANSWER), finish_reason=finish)
+                line = self.proxy("record", "x").analyze(self.BODY, time.time(), upstream)
+                self.assertEqual(line["recorded"], stored)
+                self.assertEqual("unfinished_reply" in line["unstorable"], not stored)
+                self.assertEqual(line["finish_reason"], finish, "the raw value, so it can be counted")
+
+
 class SeveralAnswersTest(SlotCacheCase):
-    """Every distinct answer to a key is kept, and replay hands a key's answers out in turn."""
+    """Every distinct answer to a key is kept, and replay picks among them by a seeded weighted draw."""
 
     BODY = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"}]}
     LOOKING = {"role": "assistant", "content": "Looking at the card."}
@@ -229,17 +258,48 @@ class SeveralAnswersTest(SlotCacheCase):
         self.assertEqual(self.recorded(self.BODY, again)["stored_answer_hash"], first["stored_answer_hash"],
                          "a signature is opaque: the same answer delivered again shares the name")
 
-    def test_replay_hands_the_answers_out_in_turn_and_wraps(self):
+    def pick(self, replay, eval_run, body=None):
+        """The served answer's name for one lookup carrying `eval_run`."""
+        hit, refused = replay.lookup(body or self.BODY, time.time(), eval_run=eval_run)
+        self.assertIsNone(refused)
+        return hit[4]
+
+    def test_the_same_run_rep_and_key_always_draw_the_same_answer(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
         self.recorded(self.BODY, self.ON_IT)
-        order = self.contents(fingerprint)
         names = [name for name, _ in self.saved(fingerprint)]
-        replay = self.proxy()
-        hits = [replay.lookup(self.BODY, time.time()) for _ in range(5)]
-        self.assertEqual([refused for _, refused in hits], [None] * 5)
-        self.assertEqual([hit[0]["content"] for hit, _ in hits], [order[0], order[1], order[0], order[1], order[0]])
-        self.assertEqual([hit[4] for hit, _ in hits], [names[0], names[1], names[0], names[1], names[0]])
-        self.assertEqual({hit[5] for hit, _ in hits}, {2})
+        first, second = self.proxy(), self.proxy()  # another pod draws alike
+        for run in ("night-1", "night-2", "retest-7"):
+            self.assertEqual(self.pick(first, tag(run, 1)), self.pick(second, tag(run, 1)), run)
+        hit, _ = first.lookup(self.BODY, time.time(), eval_run=tag("night-9", 1))
+        self.assertEqual((hit[5], hit[8]), (2, "eval_run"))
+        self.assertEqual({self.pick(first, tag(f"run-{i}", 1)) for i in range(40)}, set(names),
+                         "another run id (a /retest) draws again")
+        self.assertEqual({self.pick(first, tag("night-1", rep)) for rep in range(1, 41)}, set(names),
+                         "another repetition draws again")
+
+    def test_a_repeated_lookup_under_one_tag_draws_again_reproducibly(self):
+        # A client re-sending the same request in one repetition gets a fresh
+        # draw, as live; a fresh pod given the same lookups draws the same.
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        names = [name for name, _ in self.saved(fingerprint)]
+        runs = [[self.pick(replay, tag("night-1", 1)) for _ in range(40)] for replay in (self.proxy(), self.proxy())]
+        self.assertEqual(runs[0], runs[1])
+        self.assertEqual(set(runs[0]), set(names), "repeats of one key under one tag can differ")
+
+    def test_untagged_lookups_draw_by_the_pods_count_reproducibly(self):
+        fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
+        self.recorded(self.BODY, self.ON_IT)
+        names = [name for name, _ in self.saved(fingerprint)]
+        runs = []
+        for _ in range(2):
+            replay = self.proxy()
+            runs.append([replay.lookup(self.BODY, time.time())[0] for _ in range(40)])
+        self.assertEqual([hit[4] for hit in runs[0]], [hit[4] for hit in runs[1]],
+                         "a fresh pod given the same lookups draws the same answers")
+        self.assertEqual({hit[4] for hit in runs[0]}, set(names))
+        self.assertEqual({hit[8] for hit in runs[0]}, {"turn"})
 
     def test_a_key_with_one_answer_serves_it_every_time(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
@@ -312,27 +372,29 @@ class SeveralAnswersTest(SlotCacheCase):
         replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, dict(zip(names, weights)))
         return names
 
-    def test_answers_are_served_in_proportion_to_their_weights_in_a_fixed_order(self):
+    def assertShare(self, served, name, expected):
+        self.assertAlmostEqual(served.count(name) / len(served), expected, delta=SHARE_TOLERANCE)
+
+    def test_answers_are_drawn_in_proportion_to_their_weights(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
         self.recorded(self.BODY, self.ON_IT)
         names = self.weigh(fingerprint, 9, 1)
-        runs = []
-        for _ in range(2):  # a second pod turns the same way
-            replay = self.proxy()
-            runs.append([replay.lookup(self.BODY, time.time())[0] for _ in range(20)])
-        served = [hit[4] for hit in runs[0]]
-        self.assertEqual(served, [hit[4] for hit in runs[1]], "the order is reproducible")
-        for cycle in (served[:10], served[10:]):
-            self.assertEqual((cycle.count(names[0]), cycle.count(names[1])), (9, 1), "9 of every 10 turns")
-        self.assertEqual({(hit[4], hit[6], hit[7]) for hit in runs[0]}, {(names[0], 9, 10), (names[1], 1, 10)})
+        replay = self.proxy()
+        hits = [replay.lookup(self.BODY, time.time(), eval_run=tag(f"run-{i}", 1))[0] for i in range(DRAWS)]
+        self.assertShare([hit[4] for hit in hits], names[1], 0.1)
+        self.assertEqual({(hit[4], hit[6], hit[7]) for hit in hits}, {(names[0], 9, 10), (names[1], 1, 10)})
 
-    def test_weights_two_to_one_interleave(self):
+    def test_every_repetition_sometimes_takes_a_one_in_three_answer(self):
+        # Live, an answer the model gives a third of the time is taken by all
+        # three repetitions about 1 run in 27; a rotation never did that.
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
         self.recorded(self.BODY, self.ON_IT)
         names = self.weigh(fingerprint, 2, 1)
         replay = self.proxy()
-        self.assertEqual([replay.lookup(self.BODY, time.time())[0][4] for _ in range(6)],
-                         [names[0], names[1], names[0]] * 2, "the rarer answer is spread, not bunched")
+        all_three = sum(all(self.pick(replay, tag(f"run-{i}", rep)) == names[1] for rep in (1, 2, 3))
+                        for i in range(DRAWS))
+        self.assertAlmostEqual(all_three / DRAWS, 1 / 27, delta=SHARE_TOLERANCE / 2)
+        self.assertGreater(all_three, 0)
 
     def test_an_answer_the_weights_do_not_name_weighs_one(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
@@ -340,11 +402,10 @@ class SeveralAnswersTest(SlotCacheCase):
         names = [name for name, _ in self.saved(fingerprint)]
         replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, {names[0]: 3})
         replay = self.proxy()
-        served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(4)]
-        self.assertEqual((served.count(names[0]), served.count(names[1])), (3, 1))
+        self.assertShare([self.pick(replay, tag(f"run-{i}", 1)) for i in range(DRAWS)], names[0], 0.75)
 
-    def served_with_one_refused(self, weights, refused, turns):
-        """What `turns` lookups serve when the key's answers weigh `weights` and answer `refused` is always refused."""
+    def served_with_one_refused(self, weights, refused):
+        """What lookups under DRAWS run ids serve when the answers weigh `weights` and `refused` is always refused."""
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
         self.recorded(self.BODY, self.ON_IT)
         self.recorded(self.BODY, self.DONE)
@@ -352,17 +413,16 @@ class SeveralAnswersTest(SlotCacheCase):
         replay_cache.AnswerCache(self.cache_dir).save_weights(fingerprint, dict(zip(names, weights)))
         self.break_answer(fingerprint, dict(self.saved(fingerprint))[names[refused]]["answer"]["content"])
         replay = self.proxy()
-        served = [replay.lookup(self.BODY, time.time())[0][4] for _ in range(turns)]
-        return names, served
+        return names, [self.pick(replay, tag(f"run-{i}", 1)) for i in range(DRAWS)]
 
-    def test_a_refused_answers_turns_are_shared_by_the_remaining_weights(self):
-        names, served = self.served_with_one_refused((1, 1, 8), 2, 10)
-        self.assertEqual((served.count(names[0]), served.count(names[1])), (5, 5), "1:1, not by cycle position")
-        self.assertEqual(served, [names[i] for i in (0, 1, 0, 0, 1, 0, 1, 1, 0, 1)], "in a fixed order")
+    def test_a_refused_answers_share_falls_to_the_remaining_weights(self):
+        names, served = self.served_with_one_refused((1, 1, 8), 2)
+        self.assertNotIn(names[2], served)
+        self.assertShare(served, names[0], 0.5)
 
-    def test_a_refused_answers_turns_follow_uneven_remaining_weights(self):
-        names, served = self.served_with_one_refused((3, 1, 6), 2, 40)
-        self.assertEqual((served.count(names[0]), served.count(names[1])), (30, 10))
+    def test_a_refused_answers_share_follows_uneven_remaining_weights(self):
+        names, served = self.served_with_one_refused((3, 1, 6), 2)
+        self.assertShare(served, names[0], 0.75)
 
     def test_the_older_layout_weighs_one(self):
         fingerprint = self.recorded(self.BODY, self.LOOKING)["fingerprint"]
@@ -372,7 +432,7 @@ class SeveralAnswersTest(SlotCacheCase):
         hit, _ = self.proxy().lookup(self.BODY, time.time())
         self.assertEqual((hit[4], hit[5], hit[6], hit[7]), (replay_cache.LEGACY_ANSWER, 1, 1, 1))
 
-    def test_a_slot_hands_its_keys_answers_out_in_turn(self):
+    def test_a_slot_draws_among_its_keys_answers(self):
         body = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"},
                                            {"role": "assistant", "content": "Yes."},
                                            {"role": "user", "content": "ticket Latte"}]}
@@ -383,9 +443,11 @@ class SeveralAnswersTest(SlotCacheCase):
                        + body["messages"][2:])
         self.record(dict(changed, messages=changed["messages"][:1]), {"role": "assistant", "content": "Sure."})
         replay = self.proxy()
-        hits = [replay.lookup(changed, time.time()) for _ in range(3)]
-        self.assertEqual([(hit[0]["content"], hit[3]) for hit, _ in hits],
-                         [(order[0], "answer_slots"), (order[1], "answer_slots"), (order[0], "answer_slots")])
+        hits = [replay.lookup(changed, time.time(), eval_run=tag(f"run-{i}", 1))[0] for i in range(40)]
+        self.assertEqual({hit[3] for hit in hits}, {"answer_slots"})
+        self.assertEqual({hit[0]["content"] for hit in hits}, set(order))
+        again = self.proxy().lookup(changed, time.time(), eval_run=tag("run-0", 1))[0]
+        self.assertEqual(again[0]["content"], hits[0][0]["content"], "seeded by the slot's key, reproducibly")
 
 
 class SlotCheckCostTest(SlotCacheCase):
@@ -1335,7 +1397,7 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(line["served_from"]["build"], "7")
         self.assertNotIn("miss", line)
 
-    def test_reps_are_served_the_keys_answers_in_turn_and_the_line_says_which(self):
+    def test_reps_draw_the_keys_answers_by_their_eval_run_tag_and_the_line_says_which(self):
         self.record(chat("t_11111111", stream=False))
         fingerprint = self.lines(1, self.record_out)[0]["fingerprint"]
         recorded, = Path(self.cache_dir, replay_cache.ALTS_DIR, fingerprint).iterdir()
@@ -1344,16 +1406,24 @@ class ReplayTest(ProxyTestCase):
         names = sorted([recorded.stem, "f" * 64])
         _, port, out = self.replay()
         calls = len(FakeLiteLLM.calls)
-        bodies = []
-        for _ in range(3):
-            status, headers, payload = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
+        tags = [f"night-{i}/case-a/1" for i in range(8)]
+        for count, run in enumerate(tags, 1):
+            status, headers, _ = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port,
+                                              headers={"X-Kube-Agents-Eval-Run": run})
             self.assertEqual((status, headers["x-replay-served"]), (200, "true"))
-            bodies.append(json.loads(payload)["choices"][0]["message"])
+            # Each request queues its line after its response, so wait for it before the next request
+            # or two lines can be written in either order.
+            self.lines(count, out)
         self.assertEqual(len(FakeLiteLLM.calls), calls, "every rep is served")
-        self.assertEqual(bodies[0], bodies[2])
-        self.assertNotEqual(bodies[0], bodies[1])
-        lines = self.lines(3, out)
-        self.assertEqual([line["served_alternate"] for line in lines], [names[0], names[1], names[0]])
+        lines = self.lines(len(tags), out)
+        served = {line["eval_run"]: line["served_alternate"] for line in lines}
+        self.assertEqual(set(served), set(tags), "the tag is read before it is dropped")
+        # Each a first lookup under its tag: seeded by the tag, the key and count 0.
+        expected = {run: names[replay_proxy.seeded_order((1, 1), "\n".join(("eval_run", run, fingerprint, "0")))[0]]
+                    for run in tags}
+        self.assertEqual(served, expected, "each tag's pick is the seeded one")
+        self.assertEqual(set(served.values()), set(names), "different tags draw differently")
+        self.assertEqual({line["served_seed"] for line in lines}, {"eval_run"})
         self.assertEqual({line["served_key"] for line in lines}, {fingerprint}, "an exact hit: its own key")
         self.assertEqual({line["alternates"] for line in lines}, {2})
         self.assertEqual({(line["served_weight"], line["alternates_weight"]) for line in lines}, {(1, 2)},

@@ -26,10 +26,12 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "a2a-worker",
     "persona-cluster",
     "persona-tse",
+    "persona-fleet-audit",
     "a2a-authcallout",
     "a2a-verifier",
     "a2a-dispatcher",
     "a2a-console",
+    "a2a-teams-inbound",
     "hermes-bridge",
     "web-console",
 ]
@@ -308,6 +310,84 @@ exit {manifest_status}
     )
     curl_path.chmod(0o755)
     return curl_path, log_path
+
+
+MOCK_AR_REGISTRY_PREFIX = "us-docker.pkg.dev/mock-project/mock-candidates"
+MOCK_AR_ACCESS_TOKEN = "mock-google-access-token"
+MOCK_AR_CURL_LOG = "ar_curl.log"
+MOCK_AR_CURL_STDIN_LOG = "ar_curl_stdin.log"
+
+
+def create_mock_gcloud_token_binary(bin_dir, token=MOCK_AR_ACCESS_TOKEN, exit_code=0):
+    """Creates a mock gcloud answering `gcloud auth print-access-token` and nothing else.
+
+    `token=""` is an identity with no credential and `exit_code` a gcloud that
+    fails outright: the two ways common.sh's Artifact Registry probe ends up
+    with no token to ask with.
+    """
+    bin_path = pathlib.Path(bin_dir)
+    bin_path.mkdir(parents=True, exist_ok=True)
+    gcloud_path = bin_path / "gcloud"
+    gcloud_path.write_text(
+        f"""#!/bin/sh
+if [ "$*" != "auth print-access-token" ]; then
+  echo "mock gcloud: unexpected arguments: $*" >&2
+  exit {MOCK_GHCR_CURL_UNEXPECTED_EXIT}
+fi
+printf '%s' '{token}'
+exit {exit_code}
+"""
+    )
+    gcloud_path.chmod(0o755)
+    return gcloud_path
+
+
+def create_mock_ar_curl_binary(bin_dir, manifest_http_status=200, curl_exit=0):
+    """Creates a mock curl answering common.sh's Artifact Registry probe.
+
+    Like the GHCR mock it asserts the request rather than answering anything:
+    the call has to carry `/v2/<repo>/manifests/<ref>`, the OCI `Accept`
+    header, and `-H @-`, and its argv must hold no bearer token, because the
+    token is a live Google credential there and argv is readable by any
+    process on the machine. What arrived on stdin is written to its own log
+    for the test to read. `manifest_http_status` is what `-w '%{http_code}'`
+    prints; `curl_exit` is a registry that could not be reached.
+
+    Returns (curl path, argv log path, stdin log path).
+    """
+    bin_path = pathlib.Path(bin_dir)
+    bin_path.mkdir(parents=True, exist_ok=True)
+    curl_path = bin_path / "curl"
+    log_path = bin_path / MOCK_AR_CURL_LOG
+    stdin_log_path = bin_path / MOCK_AR_CURL_STDIN_LOG
+
+    curl_path.write_text(
+        f"""#!/bin/sh
+echo "mock curl: $*" >> "{log_path}"
+cat >> "{stdin_log_path}"
+case "$*" in
+  *'Bearer '*)
+    echo "mock curl: the access token is in argv: $*" >&2
+    exit {MOCK_GHCR_CURL_UNEXPECTED_EXIT}
+    ;;
+esac
+for required in '/v2/' '/manifests/' '-H @-' \\
+  'Accept: application/vnd.oci.image.index.v1+json'; do
+  case "$*" in
+    *"$required"*) ;;
+    *)
+      echo "mock curl: manifest probe missing '$required': $*" >&2
+      exit {MOCK_GHCR_CURL_UNEXPECTED_EXIT}
+      ;;
+  esac
+done
+if [ {curl_exit} -ne 0 ]; then exit {curl_exit}; fi
+printf '%s' '{manifest_http_status}'
+exit 0
+"""
+    )
+    curl_path.chmod(0o755)
+    return curl_path, log_path, stdin_log_path
 
 
 def create_mock_cosign_binary(bin_dir, log_file=None, fail_sign=False):

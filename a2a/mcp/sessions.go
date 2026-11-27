@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 // ToolManageSession names, lists and forgets this server's conversations, and
@@ -154,7 +156,7 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 			case actionDelete:
 				return deleteConversation(convs, a)
 			default:
-				return "", fmt.Errorf("unknown action %s; use %s, %s, %s, %s, %s or %s", cell(a.Action),
+				return "", fmt.Errorf("unknown action %s; use %s, %s, %s, %s, %s or %s", inerttext.Cell(a.Action),
 					actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionHelp)
 			}
 		},
@@ -188,7 +190,7 @@ func newConversation(convs *Conversations, a manageSessionArgs) (string, error) 
 		return "", err
 	}
 	return fmt.Sprintf("Created conversation %s (token `%s`). Name it with `conversation` on later calls, "+
-		"or resume it by the token after this server restarts.\n", cell(alias), token), nil
+		"or resume it by the token after this server restarts.\n", inerttext.Cell(alias), token), nil
 }
 
 func deleteConversation(convs *Conversations, a manageSessionArgs) (string, error) {
@@ -200,13 +202,13 @@ func deleteConversation(convs *Conversations, a manageSessionArgs) (string, erro
 	name, ok := convs.Forget(a.Conversation, a.ConversationToken)
 	if !ok {
 		if a.ConversationToken != "" {
-			return "", fmt.Errorf("no name here holds the conversation with token %s; delete forgets a name, and there is none to forget", cell(a.ConversationToken))
+			return "", fmt.Errorf("no name here holds the conversation with token %s; delete forgets a name, and there is none to forget", inerttext.Cell(a.ConversationToken))
 		}
-		return "", fmt.Errorf("no conversation named %s", cell(a.Conversation))
+		return "", fmt.Errorf("no conversation named %s", inerttext.Cell(a.Conversation))
 	}
 	return fmt.Sprintf("Forgot the name %s. This only forgets the name: the conversation's history stays on the bus, "+
 		"and a /session worker for it idles out by itself (to end one now, stop its running task and send session_off first). "+
-		"A later call with this name starts a new conversation.\n", cell(name)), nil
+		"A later call with this name starts a new conversation.\n", inerttext.Cell(name)), nil
 }
 
 // formatConversations renders list's table. Names and descriptions are the
@@ -226,8 +228,8 @@ func formatConversations(convs []ConversationInfo) string {
 	}
 	sb.WriteString("| Name | Token | Description | Last used |\n| :--- | :--- | :--- | :--- |\n")
 	for _, c := range shown {
-		fmt.Fprintf(&sb, "| %s | `%s%s` | %s | %s |\n", cell(c.Alias), consoleConversationPrefix, c.Token,
-			cell(c.Description), c.LastUsed.UTC().Format(lastUsedLayout))
+		fmt.Fprintf(&sb, "| %s | `%s%s` | %s | %s |\n", inerttext.Cell(c.Alias), consoleConversationPrefix, c.Token,
+			inerttext.Cell(c.Description), c.LastUsed.UTC().Format(lastUsedLayout))
 	}
 	if omitted := len(convs) - len(shown); omitted > 0 {
 		fmt.Fprintf(&sb, "\n(+%d older omitted)\n", omitted)

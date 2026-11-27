@@ -398,6 +398,8 @@ func assertA2AGatewayFence(t *testing.T, ctx context.Context, cl client.Client, 
 		t.Errorf("%s governs %v, want Ingress alone: an Egress type would cut the gateway off the bus", np.Name, np.Spec.PolicyTypes)
 	}
 	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
+	// Its egress policy renders with it (#6553).
+	assertA2AGatewayEgress(t, ctx, cl, agent)
 }
 
 // TestTheA2AGatewayFenceComesAndGoesWithTheGateway: the gateway's metrics
@@ -497,6 +499,9 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 			t.Errorf("the gateway is held and its fence %s rendered anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
 		}
+		if err := cl.Get(ctx, a2aGatewayEgressKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway is held and its egress policy %s rendered anyway (err=%v)", a2aGatewayEgressKey(agent).Name, err)
+		}
 	})
 
 	// A gateway whose last backend goes stays at one replica (on the
@@ -553,6 +558,15 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Update(ctx, tampered); err != nil {
 			t.Fatal(err)
 		}
+		// And the egress policy opened to everything, for the same reason.
+		openEgress := &networkingv1.NetworkPolicy{}
+		if err := cl.Get(ctx, a2aGatewayEgressKey(agent), openEgress); err != nil {
+			t.Fatal(err)
+		}
+		openEgress.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{{}}
+		if err := cl.Update(ctx, openEgress); err != nil {
+			t.Fatal(err)
+		}
 		t.Setenv(a2aInjectBackendEnvVar, "")
 		gatewayKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 		r.APIReader = cl
@@ -596,6 +610,9 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 			t.Errorf("the gateway is held and its fence %s survived the pass (err=%v)", a2aGatewayFenceKey(agent).Name, err)
 		}
+		if err := cl.Get(ctx, a2aGatewayEgressKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("the gateway is held and its egress policy %s survived the pass (err=%v)", a2aGatewayEgressKey(agent).Name, err)
+		}
 	})
 
 	// The refusal path: reconcileAgentNetworkGuardrails reaches the fences
@@ -614,6 +631,9 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
 			t.Fatalf("precondition: the fence was not there to delete: %v", err)
 		}
+		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayEgressKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
+			t.Fatalf("precondition: the egress policy was not there to delete: %v", err)
+		}
 		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
@@ -630,6 +650,9 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		}
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 			t.Errorf("no gateway exists and the fences rendered %s anyway (err=%v)", a2aGatewayFenceKey(agent).Name, err)
+		}
+		if err := cl.Get(ctx, a2aGatewayEgressKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+			t.Errorf("no gateway exists and the fences rendered %s anyway (err=%v)", a2aGatewayEgressKey(agent).Name, err)
 		}
 	})
 }

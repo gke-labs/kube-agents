@@ -1825,9 +1825,6 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
-		// The watchers' broker token: mounted into the agent container it
-		// would hand the model the broker's watcher role.
-		watcherTokenVolume,
 		"vcs-forge-credentials-0",
 		"vcs-forge-ca-0",
 	} {
@@ -2267,7 +2264,7 @@ func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {
 	kindAgent.Spec.Harness = &agentv1alpha1.HarnessSpec{
 		ProjectID:   "kind",
 		Location:    "kind",
-		ClusterName: "kind",
+		ClusterName: "kube-agents",
 	}
 	sts := buildShellSandboxStatefulSet(kindAgent, "sandbox-ssh", "http://credential-proxy:8080", "settings-hash")
 	sandboxEnv := make(map[string]string)

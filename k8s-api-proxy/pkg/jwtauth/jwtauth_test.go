@@ -6,13 +6,19 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -211,8 +217,18 @@ func TestNewAuthenticatorValidatesConfig(t *testing.T) {
 		t.Fatalf("valid config: %v", err)
 	}
 	for name, mutate := range map[string]func(*Config){
-		"no issuer":      func(c *Config) { c.Issuer = "" },
-		"no key set URL": func(c *Config) { c.KeySetURL = "" },
+		"no issuer": func(c *Config) { c.Issuer = "" },
+		"no key set URL and an issuer that is not a URL": func(c *Config) { c.Issuer, c.KeySetURL = "issuer-name", "" },
+		"no key set URL and an http issuer":              func(c *Config) { c.Issuer, c.KeySetURL = "http://issuer.test", "" },
+		"no key set URL and an issuer with a query":      func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test?tenant=a", "" },
+		"no key set URL and an issuer with a bare ?":     func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test/a?", "" },
+		"no key set URL and an issuer with a fragment":   func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test/a#keys", "" },
+		"no key set URL and an issuer with a bare #":     func(c *Config) { c.Issuer, c.KeySetURL = "https://issuer.test/a#", "" },
+		"allowed partitions with only empty entries":     func(c *Config) { c.PartitionClaim, c.AllowedPartitions = "tenant", []string{"", "  "} },
+		"one empty allowed partition":                    func(c *Config) { c.AllowedPartitions = []string{""} },
+		"empty key in a claim path":                      func(c *Config) { c.UsernameClaim = "a..b" },
+		"claim path ending in a separator":               func(c *Config) { c.PartitionClaim = "a." },
+		"allowed partitions without a partition claim":   func(c *Config) { c.AllowedPartitions = []string{"team-a"} },
 		"non-http URL":   func(c *Config) { c.KeySetURL = "file:///etc/keys" },
 		"no audience":    func(c *Config) { c.Audiences = nil },
 		"blank audience": func(c *Config) { c.Audiences = []string{" "} },
@@ -685,5 +701,92 @@ func TestHandlerWithJWTAuthenticator(t *testing.T) {
 	}
 	if got := upstream.calls.Load(); got != 1 {
 		t.Errorf("upstream calls = %d, want 1 (only the valid token)", got)
+	}
+}
+
+// writeCertPEM writes cert as a PEM bundle in a temporary directory and returns its path.
+func writeCertPEM(t *testing.T, cert *x509.Certificate) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// unrelatedCA is a self-signed CA that signed nothing the tests serve.
+func unrelatedCA(t *testing.T) *x509.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "unrelated-ca"},
+		NotBefore:             testNow.Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert
+}
+
+// With CAFile, the key set's server is verified against that bundle rather than the
+// system roots: the issuer's CA lets the fetch through, and any other CA refuses it.
+func TestAuthenticatorVerifiesTheKeySetServerAgainstCAFile(t *testing.T) {
+	is := newIssuer(t)
+	cfg := is.config()
+	cfg.HTTPClient = nil
+	cfg.CAFile = writeCertPEM(t, is.srv.Certificate())
+	if _, err := newAuth(t, cfg).AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil))); err != nil {
+		t.Fatalf("key set server signed by CAFile: %v", err)
+	}
+
+	cfg.CAFile = writeCertPEM(t, unrelatedCA(t))
+	_, err := newAuth(t, cfg).AuthenticateRequest(bearer(is.sign(testKeyID, jose.RS256, nil)))
+	if !errors.Is(err, k8sapiproxy.ErrAuthenticationUnavailable) {
+		t.Errorf("key set server not signed by CAFile: err = %v, want ErrAuthenticationUnavailable", err)
+	}
+}
+
+func TestNewAuthenticatorValidatesCAFile(t *testing.T) {
+	is := newIssuer(t)
+	cfg := is.config()
+	cfg.CAFile = writeCertPEM(t, is.srv.Certificate())
+	if _, err := NewAuthenticator(cfg); err == nil {
+		t.Error("NewAuthenticator accepted CAFile with an HTTPClient that sets its own Transport")
+	}
+
+	cfg.HTTPClient = &http.Client{Timeout: testWaitLimit}
+	if _, err := NewAuthenticator(cfg); err != nil {
+		t.Errorf("CAFile with an HTTPClient without a Transport: %v", err)
+	}
+
+	empty := filepath.Join(t.TempDir(), "empty.crt")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"missing": filepath.Join(t.TempDir(), "absent.crt"),
+		"empty":   empty,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := is.config()
+			cfg.HTTPClient = nil
+			cfg.CAFile = path
+			if _, err := NewAuthenticator(cfg); err == nil {
+				t.Error("NewAuthenticator accepted an unusable CAFile")
+			}
+		})
 	}
 }

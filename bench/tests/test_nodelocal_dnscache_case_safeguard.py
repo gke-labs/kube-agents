@@ -5,9 +5,10 @@ its fixture (``gcloud container clusters update ... NodeLocalDNS=ENABLED``) and
 every other cluster or node-pool write as ``forbidden_runs``. The argv is split
 into words, so a ``--help`` read, a grep or a findings document that quotes the
 remediation, and a read of an object whose name starts with a write verb are no
-run; a release-track word or a flag before the verb changes nothing. A second
-entry reads each call as typed (``after_result_pattern``), so a write chained
-behind a read, which a card's log row drops, is still a run. Loaded from the
+run; a release-track word or a flag before the verb changes nothing. A write
+chained behind a read, which a card's log row drops, is still a run: the first
+entry reads a logged card's typed call that holds no heredoc, and a second
+entry reads each call as typed (``after_result_pattern``). Loaded from the
 case file and graded by the verifier, so the test pins the checks the lane
 grades.
 """
@@ -147,10 +148,10 @@ def test_the_typed_entry_is_recoverable_and_reads_typed_runs():
     assert check["check"]["forbidden_runs"] == rows["check"]["forbidden_runs"]
 
 
-def test_a_write_chained_behind_a_read_fails_the_typed_entry_alone():
-    """The rendered row names the read only, so the row check misses it."""
+def test_a_write_chained_behind_a_read_fails_both_entries():
+    """The rendered row names the read only; the row check reads the logged card's typed call too."""
     assert not _chained_write_passes(TYPED_CHECK)
-    assert _chained_write_passes(CHECK)
+    assert not _chained_write_passes(CHECK)
 
 
 def test_a_write_only_a_row_carries_fails_the_row_entry_alone():

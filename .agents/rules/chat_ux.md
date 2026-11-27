@@ -8,9 +8,11 @@ paths:
   - "agents/platform/scripts/*_presenter.py"
   - "a2a/gateway/slack_*.go"
   - "a2a/gateway/gchat*.go"
+  - "a2a/gateway/teams*.go"
   - "a2a/gateway/*chat*.go"
   - "a2a/gateway/relay*.go"
   - "a2a/gateway/busy.go"
+  - "a2a/gateway/child_waiting.go"
   - "a2a/gateway/stopgate.go"
   - "a2a/hermes-bridge/chat*.go"
   - "a2a/lib/chatmsg/**"
@@ -119,7 +121,8 @@ Why: a button is one tap on a phone, and a typed reply is a guess at the expecte
 Today: `choices` in [`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md) ("Chat
 messages"); `answerChoices` and `nextStep` in `a2a/hermes-bridge/chat_choices.go` turn an answer's
 options and next step into choices; `slackChatButtonsPerRow` in `a2a/gateway/slack_chat.go` and
-`BUTTONS_PER_ROW` in `slack_presenter.py` cap a row at 5. The agent's side is the `[next: …]` line
+`BUTTONS_PER_ROW` in `slack_presenter.py` cap a row at 5; `teamsChoiceActions` in
+`a2a/gateway/teams_chat.go` draws them on a Microsoft Teams card, which lays out its own rows. The agent's side is the `[next: …]` line
 in [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 5.
 
 ## A failure is one plain line
@@ -175,13 +178,15 @@ cluster.
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
 them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
 gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press its Stop
-button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated. A refused
+button, Slack's native one or the one drawn on Google Chat or on Microsoft Teams; a typed `stop` is not gated. A refused
 press on Google Chat tells the presser alone, in the thread, by a post only they see
 (`refusedPressNotice`, `tellsRefusedPresser`): the drawn button stays until the gateway edits the
 line, so silence there is a frozen control, and a line nobody else is notified of keeps "Speak up
 only when it matters"; it names the typed word rather than offering a button, since a button is
 what the gate refuses, so "Choices are buttons" does not apply. Slack's refused press stays silent:
-its button is Slack's own and settles on its own.
+its button is Slack's own and settles on its own. A refused press on Microsoft Teams, which has
+no post only one member sees, is said on the running task's status line until the task's next
+update replaces it (`tellRefusedOnLine`): an edit notifies nobody, and the line names nobody.
 
 ## Renderers never compose
 
@@ -198,5 +203,6 @@ Google Chat disagree and hides emitter bugs.
 
 Today: "The emitter composes, the renderer lays out" and "The gateway renders, it doesn't compose"
 in [`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md) ("Chat messages");
-`a2a/lib/chatmsg` validates; the header comments of `a2a/gateway/slack_chat.go` and
-`a2a/gateway/gchat_chat.go` state the same contract for each renderer.
+`a2a/lib/chatmsg` validates; the header comments of `a2a/gateway/slack_chat.go`,
+`a2a/gateway/gchat_chat.go` and `a2a/gateway/teams_chat.go` state the same contract for each
+renderer.

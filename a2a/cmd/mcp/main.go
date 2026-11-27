@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/mcp"
 )
 
@@ -179,6 +180,10 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	s.bus.Logger = log
+	// The profile supervisor gate (#5301): the cutoff and the profile names,
+	// both unset until the operator renders them from the latched profile
+	// supervisor form. A malformed cutoff reads as latched at this start.
+	s.bus.ProfileSupervisorGate = lib.ProfileSupervisorGateFromEnv(ctx, getenv, log)
 	bus, err := dialWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*mcp.NATSBus, error) {
 		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 		defer cancel()
@@ -208,7 +213,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		log.Error("mcp listen", "addr", s.listen, "err", err)
 		return err
 	}
-	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log, mcp.WithSwarm(bus, convs)))
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log, mcp.WithSwarm(bus, convs), mcp.WithProfileSupervisorHealth(bus.ProfileSupervisorHealth)))
 }
 
 // toolsFor is the tools this pod offers: inspect_pr only when it has a

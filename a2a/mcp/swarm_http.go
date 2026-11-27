@@ -546,6 +546,7 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 		if md, err := msg.Metadata(); err == nil {
 			at, seq = md.Timestamp, md.Sequence.Stream
 		}
+		storedAt := at
 		ref := TaskRef{Addressee: addressee, TaskID: taskID}
 		if !at.IsZero() && at.Before(since) {
 			*sawOlder = true
@@ -571,6 +572,12 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 			rd.firstAt = at
 		}
 		if class != lib.TaskClassIn {
+			// The supervisor cutoff (#5301): a five-token supervisor
+			// message on a profile's addressee, as the operator's profile
+			// names say, stored after the cutoff, is not folded.
+			if !b.client.AcceptSupervisorEvent(msg.Subject(), storedAt) {
+				return
+			}
 			noteQuestion(rd, env, seq)
 			rd.events = append(rd.events, env)
 			return

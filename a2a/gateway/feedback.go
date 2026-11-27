@@ -236,7 +236,7 @@ func (d *feedbackDesk) lockKey(key string) func() {
 // calls retryFeedback after the bind when it did not.
 func (g *Gateway) startFeedback(ctx context.Context) bool {
 	if g.cfg.AnswerFeedbackOff {
-		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback or googleChat.answerFeedback)")
+		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback, googleChat.answerFeedback or A2A_TEAMS_ANSWER_FEEDBACK)")
 		return true
 	}
 	return g.tryFeedback(ctx, false)
@@ -469,6 +469,12 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 		if contextID == "" {
 			contextID = rec.ContextID
 		}
+		// And a re-rating that carries no answer (Teams holds an answer's
+		// text in memory, so one after a restart has none) keeps the answer.
+		answer := r.Answer
+		if answer == "" {
+			answer = rec.Answer
+		}
 		askKept = strings.TrimSpace(ask) != ""
 		*rec = FeedbackRecord{
 			Rating:       rating,
@@ -481,7 +487,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 			Kind:         kind,
 			ContextID:    contextID,
 			Ask:          truncateRunes(ask, feedbackAskMax),
-			Answer:       truncateRunes(r.Answer, feedbackAnswerMax),
+			Answer:       truncateRunes(answer, feedbackAnswerMax),
 			RatedAt:      time.Now().UTC(),
 		}
 		return true

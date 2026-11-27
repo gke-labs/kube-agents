@@ -21,10 +21,10 @@
 # scripts/test_ci_eval_nightly.py holds the four shards' stack time
 # (unit_cost_hint in the script, summed per shard) to within one case's
 # worth of each other, fails on a line that names no stack-bearing main case
-# or that another list also names, and fails when a stack case outside the
-# onboarding chain is on no list. Adding a stack case to the nightly
-# therefore fails that test until the case is listed. The onboarding cases
-# stay in main-a whatever the lists say.
+# or that another list also names, and fails when a stack case that takes
+# lock-infra, outside the onboarding chain, is on no list. Adding such a
+# case to the nightly therefore fails that test until the case is listed.
+# The onboarding cases stay in main-a whatever the lists say.
 #
 # Dealt on 2026-11-06 (#4238) by unit_cost_hint, largest first into the
 # shortest chain: 6600s here.
@@ -38,6 +38,9 @@ gitops-drift-out-of-band-triage
 upgrades-rollout-family-held-by-canary-gate
 # Added 2026-11-10 when the case joined the nightly (#5261): the shortest chain then.
 first-install-hello-filed
+# Added with the case (#5880), a full drift audit priced at 900s: the
+# shortest chain then.
+fleet-audit-remediation-right-and-not-stale
 # profile-configmap-read-keeps-no-credential: a ConfigMap plant on the host
 # cluster, 200s default, into the shortest chain at the time.
 profile-configmap-read-keeps-no-credential

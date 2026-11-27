@@ -23,6 +23,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/utils/ptr"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 // kubernetesDefaultTerminationGraceSeconds is what the kubelet waits between
@@ -30,10 +32,10 @@ import (
 const kubernetesDefaultTerminationGraceSeconds = 30
 
 // TestTheBrokerPodHoldsItsDrain pins the grace period that lets the broker's
-// SIGTERM drain finish, and the Recreate strategy it is sized for: the drain
-// runs while no other broker serves, so it is bounded, not as long as the
-// longest command. tests/test_credential_proxy_drain_budget.py holds the
-// drain's own terms under this value.
+// SIGTERM drain finish, and the Recreate strategy it uses for default/fixed
+// profiles versus active-standby RollingUpdate (maxSurge=1, maxUnavailable=0)
+// under sizingProfile: auto: tests/test_credential_proxy_drain_budget.py holds
+// the drain's own terms under this value.
 func TestTheBrokerPodHoldsItsDrain(t *testing.T) {
 	dep := buildCredentialProxyDeployment(brokerPodAgent(), brokerTestPolicyHash)
 
@@ -48,7 +50,20 @@ func TestTheBrokerPodHoldsItsDrain(t *testing.T) {
 		t.Errorf("terminationGracePeriodSeconds = %d, not above the %ds default the drain outlasts", *grace, kubernetesDefaultTerminationGraceSeconds)
 	}
 	if got := dep.Spec.Strategy.Type; got != appsv1.RecreateDeploymentStrategyType {
-		t.Errorf("strategy = %q, want Recreate: the bounded drain is sized for a pod no other broker serves beside", got)
+		t.Errorf("default strategy = %q, want Recreate: the bounded drain is sized for a pod no other broker serves beside", got)
+	}
+
+	autoAgent := brokerPodAgent()
+	if autoAgent.Spec.Deployment == nil {
+		autoAgent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	}
+	autoAgent.Spec.Deployment.SizingProfile = sizingProfileAuto
+	autoDep := buildCredentialProxyDeployment(autoAgent, brokerTestPolicyHash)
+	if got := autoDep.Spec.Strategy.Type; got != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("auto strategy = %q, want RollingUpdate: active-standby surge brings up the replacement before draining the active broker", got)
+	}
+	if ru := autoDep.Spec.Strategy.RollingUpdate; ru == nil || ru.MaxSurge == nil || ru.MaxSurge.IntValue() != int(credentialProxyMaxSurge) || ru.MaxUnavailable == nil || ru.MaxUnavailable.IntValue() != int(credentialProxyMaxUnavailable) {
+		t.Errorf("rollingUpdate = %#v, want maxSurge=%d maxUnavailable=%d", ru, credentialProxyMaxSurge, credentialProxyMaxUnavailable)
 	}
 }
 

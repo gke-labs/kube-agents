@@ -67,6 +67,10 @@ install without the interview.
   sandbox's. A raise grows both claims where the StorageClass allows it, and a
   lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
   in `install.env`.
+  `platform_agent_sizing_profile` (default `"auto"`, or `""` to omit
+  `spec.deployment.sizingProfile`) sets the runtime sizing profile (`small`,
+  `medium`, `fleet`, or `auto`); `install.sh` and `upgrade.sh` wire it from
+  `PLATFORM_AGENT_SIZING_PROFILE` in `install.env`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that
@@ -378,10 +382,16 @@ front door: it renders the tfvars an upgrade would apply and then calls this.
 
 ### Recovering from an interrupted apply
 
-An apply killed part-way — Ctrl-C, a dropped connection, a laptop lid — leaves
-state locked, and the next command fails with `Error acquiring the state lock`.
-`terraform force-unlock` is the release, and it works here; what trips people up
-is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
+An apply that stops before Terraform can shut down — a second Ctrl-C, a dropped
+SSH session, a `kill -9`, a lost machine — leaves remote state locked, and the
+next command fails with `Error acquiring the state lock`.
+
+One Ctrl-C at `lifecycle.sh apply`, run directly or through `install.sh` or
+`upgrade.sh`, is a graceful stop: Terraform shuts down in order, saves state and
+releases the lock, which can take minutes, so wait for it.
+
+For a lock that was left, `terraform force-unlock` is the release, and it works
+here; what trips people up is which identifier it wants. On the `gcs` backend the lock ID is the **GCS
 generation number** of the lock object, not a UUID, and it is the `ID:` in the
 error Terraform just printed:
 
@@ -918,7 +928,33 @@ purely configuration — the Slack app itself is a manual step (below).
   (`stockout_pubsub_topic`), pull subscription (`stockout_pubsub_subscription`),
   and Log Router sink (`stockout_pubsub_sink`), and deploys the
   `AgentPlugin/gkestockoutinvestigator` resource targeting the `platform` profile
-  with tuned execution limits. Requires `enable_pubsub_platform = true`.
+  with tuned execution limits. The composition mints the project's Logging service
+  agent up front, waits (`stockout_pubsub_logging_identity_propagation_duration`,
+  `60s` by default), grants `roles/pubsub.publisher` on the topic from the derived
+  identity (`stockout_pubsub_sink_writer_identity_override` to override), waits on
+  destroy (`stockout_pubsub_sink_drain_duration`, `120s` by default), and creates
+  the sink last so Cloud Logging avoids exporting to an ungranted or deleted topic
+  during apply and normal teardown propagation. `data.google_project.stockout`
+  deliberately omits `depends_on = [google_project_service.required]` so
+  unrelated API changes never defer the project-number read until apply and plan
+  a `ForceNew` replacement of `stockout_sink_writer` while the sink stays live
+  (existing GKE projects normally already have `cloudresourcemanager.googleapis.com`
+  active; callers on a blank project without Resource Manager enabled rely on
+  the caller's ADC quota project or enabling Resource Manager before running
+  Terraform). Like the drift ingress in
+  [`drift-pubsub`](../../modules/drift-pubsub/README.md#why-the-sink-is-created-last-and-destroyed-first)
+  and [Drift audit-log ingress](#drift-audit-log-ingress), these timers narrow the
+  window rather than bounding unbounded Log Router propagation, and `gke_cluster`
+  takes the drain, grant, and topic in `create_after` so the cluster stops emitting
+  before they are destroyed. Raising `TF_VAR_stockout_pubsub_sink_drain_duration`
+  also requires an apply (`upgrade.sh` or `lifecycle.sh apply`) before teardown so
+  `time_sleep` records the new `destroy_duration` in state. Because `install.sh` and
+  `upgrade.sh` regenerate `terraform.tfvars` wholesale, set
+  `TF_VAR_stockout_pubsub_sink_writer_identity_override`,
+  `TF_VAR_stockout_pubsub_sink_drain_duration`, or
+  `TF_VAR_stockout_pubsub_logging_identity_propagation_duration` in `install.env`
+  rather than editing `terraform.tfvars` directly. Automatically enables the
+  `pubsub-platform` adapter (`AgentPlugin/pubsubplatform`) for alert ingress.
 
 If a plugin was previously installed using the standalone `agentplugins/*/install.sh` scripts,
 uninstall its standalone release before setting these variables (`helm uninstall pubsubplatform -n <namespace>`,

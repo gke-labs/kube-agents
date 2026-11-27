@@ -59,8 +59,9 @@ readonly VALIDATED_CAPABILITIES_PART_KEY='suite_part'
 readonly VALIDATED_CAPABILITIES_PART_LINE_RE="^${VALIDATED_CAPABILITIES_PART_KEY}: [1-9][0-9]*$"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
-# (#3384, #4238): a stack-bearing case on no list runs in main-a, which
-# otherwise holds only the onboarding cases' chain (unit_state_lock).
+# (#3384, #4238): a stack-bearing case that takes the infra lock and is on
+# no list runs in main-a, which otherwise holds only the onboarding cases'
+# chain (unit_state_lock).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
 readonly EVAL_NIGHTLY_MAIN_C_FILE="eval/nightly-main-c.txt"
 readonly EVAL_NIGHTLY_MAIN_D_FILE="eval/nightly-main-d.txt"
@@ -240,6 +241,17 @@ readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The agent's own Secret and the key of its API token.
+readonly EVAL_AGENT_TOKEN_SECRET="platform-agent-secrets"
+readonly EVAL_AGENT_TOKEN_SECRET_KEY="API_SERVER_KEY"
+# How many times section 4 tries the read of a Secret, and the wait between two
+# tries. A connection error to the API server is a failure of the read, not a
+# state of the install, and the run has built and deployed the install by then.
+# Four tries with five seconds between them outlast an API server that does not
+# answer for fifteen seconds and the time of the failed calls; a longer loss
+# is not a blip, and the run ends.
+readonly EVAL_SECRET_READ_ATTEMPTS=4
+readonly EVAL_SECRET_READ_RETRY_SECONDS=5
 # The A2A door's token Secret (k8s-operator platformagent_a2a_manifests.go),
 # rendered because hack/ci-deploy.sh turns the door on for every eval install. Only
 # the card-wait stopped ask (#5407) goes through the door.
@@ -259,6 +271,7 @@ readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 # long enough for a slow API server, short against the 5m grace period.
 readonly EVAL_CANCEL_CUTS_MODEL_JOB_TYPES="presubmit batch"
 readonly EVAL_CANCEL_SCALE_REQUEST_TIMEOUT="30s"
+readonly EVAL_CANCEL_MARKER="cancelled"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -346,6 +359,8 @@ readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
+# A first-run audit's pause comes after one more read of the roster and the
+# runs' ledger, bounded at 10s by the ledger's busy timeout.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
@@ -393,6 +408,10 @@ readonly EVAL_SCOPE_RECONCILE_TIMEOUT_SECONDS=600
 readonly EVAL_SCOPE_RECONCILE_ATTEMPTS=5
 readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
 readonly EVAL_SCOPE_READ_ATTEMPTS=3
+# scope_hold_apply (the per-case cluster hold): the exit of
+# kube_agents_bench.scope_hold apply (EXIT_UNSUPPORTED there) for an install
+# whose PlatformAgent API has no spec.hold, which patched nothing.
+readonly EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run: 600 s, plus the
 # GitHub rate-limit waits the unit may spend while it holds the lock (#6105),
@@ -654,7 +673,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
     exit 1
   fi
   if ! openssl x509 -noout -text -in "${EVAL_FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
-    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh (kube-agents#3682)." >&2
     exit 1
   fi
 fi
@@ -967,6 +986,7 @@ profile_and_dump_on_exit() {
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
   declare -F scope_exclude_restore >/dev/null && scope_exclude_restore "exit"
+  declare -F scope_hold_restore >/dev/null && scope_hold_restore "exit"
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -1039,6 +1059,9 @@ stop_model_calls_on_cancel() {
   done
   [ -n "${cuts}" ] || return 0
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cancelled (JOB_TYPE=${JOB_TYPE}): stopping the fan-out and the model gateway before collecting artifacts ==="
+  if [ -n "${STATE_DIR:-}" ] && [ -d "${STATE_DIR}" ]; then
+    : > "${STATE_DIR}/${EVAL_CANCEL_MARKER}"
+  fi
   # Only the units still in this shell's job table: a finished unit's PID may
   # since belong to some other process.
   local pid frozen="" running
@@ -1108,11 +1131,7 @@ echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR
 profile_begin "cluster-auth: gcloud get-credentials"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gke_dns_endpoint_flag "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
-# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
-# shellcheck disable=SC2086
-gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
-  $GKE_DNS_ENDPOINT_FLAG
+get_cluster_credentials "$HOST_CLUSTER_NAME" "$REGION" "$PROJECT_ID"
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # 2b. Seeded-fleet credentials, one kubeconfig per fixture ROLE.
@@ -1264,7 +1283,7 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # fleet reader's token), a `gcloud container clusters describe` on this job's
 # own credential, which already lists the same clusters above, a `gcloud
 # compute ... list` of a project-scoped role's objects or of the project's
-# reservations (the missing-reservation-pool role), a `gcloud compute
+# reservations (the two reservation roles), a `gcloud compute
 # instances get-serial-port-output` of the startup-fail VM, on the same
 # credential, or one GET of the leased repository's declared-intent note
 # (the catalog's `repository/...` assertions, #5827) with the grading read
@@ -1498,8 +1517,8 @@ LEDGER_RESET_MINT_RETRY_DELAY=2
 # (start_ledger_token_renewal): well inside the hour an installation token
 # lasts, with room for the mint's own retry ladder.
 LEDGER_TOKEN_RENEW_SECONDS=2400
-# The renewer's sleep step. Short, so the sleep a stopped renewer leaves
-# behind ends within seconds rather than holding the unit's output open.
+# The renewer's sleep step. Short, so a renewer whose unit was killed before
+# its stop notices within seconds rather than holding the job's output open.
 LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
@@ -1579,7 +1598,8 @@ mint_ledger_token() { # <label>
     return 0
   fi
   # The token never reaches argv, where ps would show it: python writes it to
-  # stdout and command substitution keeps it in this shell.
+  # stdout, redirected into a mode-0700 directory for read to take back into
+  # this shell without a command substitution.
   #
   # Retried because a short outage should not cost the repetition at all. A
   # unit that cannot mint releases its locks and returns without a run, and
@@ -1592,44 +1612,60 @@ mint_ledger_token() { # <label>
   # The ladder stays at LEDGER_MINT_ATTEMPTS whatever GitHub is doing: an
   # incident lasts longer than any wait a unit holding its locks can afford,
   # and the not-run record is what keeps that from reading as a red.
-  local minted rc attempt=1 delay=2 diagnostics
+  local token expires line rc attempt=1 delay=2 scratch minted diagnostics minted_ok=""
   LEDGER_MINT_LAST_FAILURE=""
-  # The mint's stderr goes through a file so its last line can name the
-  # failure in the record; it is echoed to this shell's stderr as before.
-  diagnostics="$(mktemp)"
-  while :; do
+  # The mint's stdout and stderr go through files in a mode-0700 directory
+  # rather than command substitutions so start_ledger_token_renewal can call
+  # this function while its TERM trap is armed; stderr is echoed to this
+  # shell's stderr as before.
+  scratch="${LEDGER_TOKEN_RENEW_SCRATCH:-${TMPDIR:-/tmp}/ledger-mint.$$.${BASHPID:-0}.${RANDOM:-0}}"
+  rm -rf "${scratch}"
+  mkdir -m 0700 "${scratch}" || return 1
+  minted="${scratch}/out"
+  diagnostics="${scratch}/err"
+  while [ -z "${minted_ok}" ]; do
     rc=0
-    minted="$(LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint 2>"${diagnostics}")" || rc=$?
+    LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint >"${minted}" 2>"${diagnostics}" || rc=$?
     cat "${diagnostics}" >&2
     if [ "${rc}" -eq 0 ]; then
       LEDGER_MINT_LAST_FAILURE=""
-      break
-    fi
-    LEDGER_MINT_LAST_FAILURE="$(tail -n 1 "${diagnostics}")"
-    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
-      rm -f "${diagnostics}"
-      echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
-           "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
-      echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
-      if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
-        return "${LEDGER_MINT_RETRYABLE}"
+      minted_ok=1
+    else
+      while IFS= read -r line; do
+        LEDGER_MINT_LAST_FAILURE="${line}"
+      done <"${diagnostics}"
+      if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
+        rm -rf "${scratch}"
+        echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
+             "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
+        echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
+        if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
+          return "${LEDGER_MINT_RETRYABLE}"
+        fi
+        return 1
       fi
-      return 1
+      echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
+      sleep "${delay}"
+      attempt=$((attempt + 1))
+      delay=$((delay * 4))
     fi
-    echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
-    sleep "${delay}"
-    attempt=$((attempt + 1))
-    delay=$((delay * 4))
   done
+  read -r token expires <"${minted}" || true
   # The installation's hourly budget as the mint read it (LEDGER_BUDGET_PREFIX
   # in hack/ledger_token_mint.py; empty when that read failed), kept beside
   # the mint so a day of runs shows how much of the shard one run spends
   # (#6240). Taken from the file, so a renewal's discarded stderr keeps it.
-  local budget
-  budget="$(grep -m 1 "^${LEDGER_BUDGET_PREFIX}" "${diagnostics}" || true)"
-  rm -f "${diagnostics}"
-  export BENCH_GITHUB_TOKEN="${minted%% *}"
-  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"
+  local budget=""
+  while IFS= read -r line; do
+    case "${line}" in
+      "${LEDGER_BUDGET_PREFIX}"*)
+        [ -n "${budget}" ] || budget="${line}"
+        ;;
+    esac
+  done <"${diagnostics}"
+  rm -rf "${scratch}"
+  export BENCH_GITHUB_TOKEN="${token}"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${expires}${budget:+; ${budget}}" >> "${EVAL_GRADING_LOG}"
 }
 
 # Keeps a unit's grading token alive for as long as its devops-bench runs.
@@ -1664,41 +1700,56 @@ start_ledger_token_renewal() { # <label> <file>
   (
     waited=0
     failures=0
+    LEDGER_TOKEN_RENEW_SCRATCH="${file}.mint"
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends it by job spec (`kill %%`) without a command substitution,
+    # and removes any scratch directory a mint in progress left behind.
+    trap 'kill %% 2>/dev/null || true; rm -rf "${LEDGER_TOKEN_RENEW_SCRATCH}"; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
-      kill -0 "${owner}" 2>/dev/null || exit 0
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      wait $! 2>/dev/null || true
+      kill -0 "${owner}" 2>/dev/null || { rm -rf "${LEDGER_TOKEN_RENEW_SCRATCH}"; exit 0; }
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
-      [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
-      if mint_ledger_token "${label} renewal" 2>/dev/null \
-        && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
-        && mv -f "${file}.next" "${file}"; then
-        if [ "${failures}" -gt 0 ]; then
-          echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+      if [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ]; then
+        if mint_ledger_token "${label} renewal" 2>/dev/null \
+          && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
+          && mv -f "${file}.next" "${file}"; then
+          if [ "${failures}" -gt 0 ]; then
+            echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+          fi
+          failures=0
+          waited=0
+        else
+          failures=$((failures + 1))
+          if [ "${failures}" -eq 1 ]; then
+            echo "WARNING: ${label}: could not renew the ledger read token" \
+                 "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
+                 "stays in ${file} until it expires, and renewal is retried every" \
+                 "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+          fi
+          waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
         fi
-        failures=0
-        waited=0
-      else
-        failures=$((failures + 1))
-        if [ "${failures}" -eq 1 ]; then
-          echo "WARNING: ${label}: could not renew the ledger read token" \
-               "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
-               "stays in ${file} until it expires, and renewal is retried every" \
-               "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
-        fi
-        waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
       fi
     done
   ) &
   LEDGER_TOKEN_RENEWER=$!
 }
 
+# Ends the renewer and removes the file. The renewer traps TERM, and bash runs a
+# trap only once the foreground command returns, so the wait below outlasts the
+# one command under way and the renewer runs nothing after it: the rm is final.
+# Killed outright, the renewer would leave that command running to write a live
+# token after the rm. A mint under way here is abandoned after its current
+# command (a mint call or a retry sleep), and both the trap and the rm below
+# clean up mint_ledger_token's "${file}.mint" scratch directory.
 stop_ledger_token_renewal() { # <file>
   if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
     kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
     wait "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
   fi
   LEDGER_TOKEN_RENEWER=""
-  rm -f "$1" "$1.next"
+  rm -rf "$1" "$1.next" "$1.mint"
   unset BENCH_GITHUB_TOKEN_FILE
 }
 
@@ -1771,25 +1822,34 @@ start_gitops_write_token() { # <label> <file>
   (
     waited=0
     failures=0
+    LEDGER_RESET_MINT_SCRATCH="${file}.mint"
+    # See stop_ledger_token_renewal: TERM ends a nap at once and a renewal
+    # command only once it has returned. The nap is the renewer's only job, so
+    # the trap ends it by job spec (`kill %%`) without a command substitution,
+    # and removes any scratch directory a mint in progress left behind.
+    trap 'kill %% 2>/dev/null || true; rm -rf "${LEDGER_RESET_MINT_SCRATCH}"; exit 0' TERM
     while :; do
-      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
-      kill -0 "${owner}" 2>/dev/null || exit 0
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}" &
+      wait $! 2>/dev/null || true
+      kill -0 "${owner}" 2>/dev/null || { rm -rf "${LEDGER_RESET_MINT_SCRATCH}"; exit 0; }
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
-      [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
-      if fresh="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" 2>/dev/null)" \
-        && (umask 077 && printf '%s\n' "${fresh}" > "${file}.next") \
-        && mv -f "${file}.next" "${file}"; then
-        if [ "${failures}" -gt 0 ]; then
-          echo "GitOps write token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+      if [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ]; then
+        if (umask 077 && forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" > "${file}.next" 2>/dev/null) \
+          && [ -s "${file}.next" ] \
+          && mv -f "${file}.next" "${file}"; then
+          if [ "${failures}" -gt 0 ]; then
+            echo "GitOps write token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+          fi
+          failures=0
+          waited=0
+        else
+          rm -f "${file}.next"
+          failures=$((failures + 1))
+          if [ "${failures}" -eq 1 ]; then
+            echo "WARNING: ${label}: could not renew the GitOps write token; the previous token stays in ${file} until it expires, and renewal is retried every ${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+          fi
+          waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
         fi
-        failures=0
-        waited=0
-      else
-        failures=$((failures + 1))
-        if [ "${failures}" -eq 1 ]; then
-          echo "WARNING: ${label}: could not renew the GitOps write token; the previous token stays in ${file} until it expires, and renewal is retried every ${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
-        fi
-        waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
       fi
     done
   ) &
@@ -1797,7 +1857,8 @@ start_gitops_write_token() { # <label> <file>
   echo "GitOps write token (${label}): minted from App ${EVAL_LEDGER_APP_ID}, narrowed to ${EVAL_LEDGER_REPO} and contents, pull_requests and issues write, in ${file}"
 }
 
-# Ends the renewer and removes the file. A developer's own
+# Ends the renewer, as stop_ledger_token_renewal does and for its reason, and
+# removes the file. A developer's own
 # TF_VAR_bench_gitops_write_token_file (start_gitops_write_token minted nothing) stays as
 # the environment set it.
 stop_gitops_write_token() { # <file>
@@ -1806,7 +1867,7 @@ stop_gitops_write_token() { # <file>
     wait "${GITOPS_WRITE_TOKEN_RENEWER}" 2>/dev/null || true
   fi
   GITOPS_WRITE_TOKEN_RENEWER=""
-  rm -f "$1" "$1.next"
+  rm -rf "$1" "$1.next" "$1.mint"
   if [ -n "${GITOPS_WRITE_TOKEN_MINTED:-}" ]; then
     unset TF_VAR_bench_gitops_write_token_file
   fi
@@ -2034,15 +2095,25 @@ forge_write_token() { # <owner/repo> [permissions JSON]
 # first attempt and means the grant is missing. Returns as mint_ledger_token
 # does: LEDGER_MINT_RETRYABLE when the last attempt was transient, 1 otherwise.
 ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omitted]
-  local body minted rc attempt=1 permissions='{"issues":"write"}'
+  local body token scratch minted rc attempt=1 permissions='{"issues":"write"}'
   [ -n "${2:-}" ] && permissions="$2"
   body="{\"repositories\":[\"${1##*/}\"],\"permissions\":${permissions}}"
+  scratch="${LEDGER_RESET_MINT_SCRATCH:-${TMPDIR:-/tmp}/ledger-reset-mint.$$.${BASHPID:-0}.${RANDOM:-0}}"
+  rm -rf "${scratch}"
+  mkdir -m 0700 "${scratch}" || return 1
+  minted="${scratch}/out"
   while :; do
     # `&&` rather than `if`: the status of a failed `if` test is 0 by the
     # time the body would read it, and this needs the mint's own.
-    minted="$(LEDGER_MINT_BODY="${body}" _ledger_token_mint)" && { printf '%s\n' "${minted%% *}"; return 0; }
+    LEDGER_MINT_BODY="${body}" _ledger_token_mint >"${minted}" && {
+      read -r token _ <"${minted}" || true
+      rm -rf "${scratch}"
+      printf '%s\n' "${token}"
+      return 0
+    }
     rc=$?
     if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_RESET_MINT_ATTEMPTS}" ]; then
+      rm -rf "${scratch}"
       if [ "${rc}" -eq "${LEDGER_MINT_RETRYABLE}" ]; then
         return "${LEDGER_MINT_RETRYABLE}"
       fi
@@ -2930,6 +3001,56 @@ scope_exclude_restore() { # <label> [settle|repair]
   done
 }
 
+# The per-case cluster hold. A case that declares `scope_hold:` grades an install
+# whose spec.hold holds the agent's own cluster or every cluster, which
+# refuses every Kubernetes API request to it, so the fan-out runs its repetitions
+# alone, after every other unit (unit_phase 2). bench/kube_agents_bench/scope_hold.py
+# does the work: it patches the CR, saving the hold it replaced on the CR for
+# the EXIT trap's and the next lease's restore, and waits until the operator's
+# <agent>-hold ConfigMap carries the hold and the kubelet has had time to
+# refresh the pods' copies. A hold restarts nothing, so no settle runs. It
+# exits EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED, having patched nothing, on an install
+# whose CRD has no spec.hold; the case then runs on the install as it is
+# and goes red for the behaviour it lacks rather than being recorded as
+# infrastructure. Pinned to AGENT_CLUSTER_CONTEXT as the scope exclusion is.
+
+# A bare python3, as scope_exclude_helper: apply and restore need only the
+# standard library.
+scope_hold_helper() { # <subcommand> [args]
+  PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -m kube_agents_bench.scope_hold "$@" \
+    --context "${AGENT_CLUSTER_CONTEXT}" --namespace "${TARGET_NAMESPACE}" --name "${AGENT_SERVICE_NAME}"
+}
+
+# Hold what the case declares (one line of JSON, from `scope_hold.py cases`)
+# and wait until the hold is in effect. Non-zero means the case must not run.
+scope_hold_apply() { # <case> <hold-json>
+  local name="$1" hold="$2" rc=0
+  scope_exclude_target "${name}" || return 1
+  scope_hold_helper apply --hold "${hold}" || rc=$?
+  case "${rc}" in
+    0) return 0 ;;
+    "${EVAL_SCOPE_HOLD_EXIT_UNSUPPORTED}")
+      echo "Scope hold (${name}): the install's PlatformAgent API has no spec.hold; the case runs on the install as it is and is graded"
+      return 0 ;;
+  esac
+  echo "WARNING: Scope hold (${name}): the hold ${hold} did not take effect on platformagent/${AGENT_SERVICE_NAME}" >&2
+  return 1
+}
+
+# Put back the hold a patch saved, when one is saved. With `wait` (the lease
+# preflight) it also waits for the lifted hold to reach the pods, so no case
+# that reads the held cluster starts under it. A CR that cannot be read or
+# patched is a warning: the next lease's preflight tries again.
+scope_hold_restore() { # <label> [wait]
+  local label="$1" args=()
+  scope_exclude_target "${label}" 2>/dev/null || return 0
+  [ "${2:-}" != wait ] || args=(--wait)
+  if ! scope_hold_helper restore ${args[@]+"${args[@]}"}; then
+    echo "WARNING: Scope hold (${label}): could not restore the hold on platformagent/${AGENT_SERVICE_NAME}; the next lease's preflight tries again" >&2
+    return 1
+  fi
+}
+
 if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 else
@@ -2954,6 +3075,12 @@ probe_gitlab_ledger_path "lease" || exit 1
 # case on the excluded slots would grade an install without their Cluster Agent.
 scope_exclude_restore "lease" repair || {
   echo "ERROR: Scope exclusion (lease): an earlier run's exclusion could not be undone; stopping the run (infrastructure, not a case result)" >&2
+  exit 1
+}
+# A hold a killed run left on (scope_hold_restore, above), lifted and waited
+# out first: under it every case that reads the held cluster would be refused.
+scope_hold_restore "lease" wait || {
+  echo "ERROR: Scope hold (lease): an earlier run's hold could not be lifted; stopping the run (infrastructure, not a case result)" >&2
   exit 1
 }
 scheduled_audits pause "lease"
@@ -3107,7 +3234,41 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
-PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+
+# read_secret_data SECRET KEY [KUBECTL_FLAG...]: the encoded .data.KEY of SECRET
+# in TARGET_NAMESPACE, on stdout. A read that fails is tried again, with the
+# error of kubectl on stderr each time. Returns 1 when each try failed.
+read_secret_data() {
+  local secret="$1" key="$2" attempt data
+  shift 2
+  for attempt in $(seq 1 "${EVAL_SECRET_READ_ATTEMPTS}"); do
+    # Captured for each try, so that output of a failed try is not joined to a later one.
+    if data="$(kubectl get secret "${secret}" -n "${TARGET_NAMESPACE}" "$@" -o jsonpath="{.data.${key}}")"; then
+      printf '%s' "${data}"
+      return 0
+    fi
+    echo "WARNING: the read of Secret ${secret} in ${TARGET_NAMESPACE} failed (try ${attempt} of ${EVAL_SECRET_READ_ATTEMPTS})." >&2
+    if [ "${attempt}" -lt "${EVAL_SECRET_READ_ATTEMPTS}" ]; then
+      sleep "${EVAL_SECRET_READ_RETRY_SECONDS}"
+    fi
+  done
+  return 1
+}
+
+# secret_read_failed SECRET KEY: ends the run when each try of a read failed. The
+# message names no cause of its own: the error of kubectl has it.
+secret_read_failed() {
+  echo "ERROR: the read of Secret $1 (key $2) in ${TARGET_NAMESPACE} failed ${EVAL_SECRET_READ_ATTEMPTS} times." >&2
+  echo "       The error of kubectl above gives the cause." >&2
+  exit 1
+}
+
+# No --ignore-not-found here: an absent Secret must stay the end of the run, and
+# with the flag it is a read with no value, which goes on with an empty token.
+
+PLATFORM_AGENT_TOKEN_DATA="$(read_secret_data "${EVAL_AGENT_TOKEN_SECRET}" "${EVAL_AGENT_TOKEN_SECRET_KEY}")" \
+  || secret_read_failed "${EVAL_AGENT_TOKEN_SECRET}" "${EVAL_AGENT_TOKEN_SECRET_KEY}"
+PLATFORM_AGENT_TOKEN="$(printf '%s' "${PLATFORM_AGENT_TOKEN_DATA}" | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
 # The deploy armed the inject door and declared the bridge; the matrix goes
 # through the door. The agent token above is still fetched: the transport
@@ -3115,7 +3276,11 @@ export PLATFORM_AGENT_TOKEN
 # the install. Everything about the door the harness needs beyond these two
 # it derives from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
 EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
-if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+# --ignore-not-found: an absent Secret is then a read that succeeded with no
+# value, so "missing or empty" below is never the message for a failed read.
+AGENT_INJECT_TOKEN_DATA="$(read_secret_data "${EVAL_INJECT_TOKEN_SECRET}" "${EVAL_INJECT_TOKEN_SECRET_KEY}" --ignore-not-found)" \
+  || secret_read_failed "${EVAL_INJECT_TOKEN_SECRET}" "${EVAL_INJECT_TOKEN_SECRET_KEY}"
+if ! AGENT_INJECT_TOKEN="$(printf '%s' "${AGENT_INJECT_TOKEN_DATA}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
   echo "ERROR: the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
   echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does on every install." >&2
   exit 1
@@ -4118,7 +4283,17 @@ infra_lock_exempt() { # <task-name>
     # on the host cluster, through a kubeconfig of its own. In the install it
     # writes one daemon session, with the ledger row and card that its event
     # produces, which no other stack rewrites, so it needs no state lock.
-    oobe-first-run-audits | autoops-warning-event-no-action-triage) return 0 ;;
+    # fleet-audit-scheduled-run-files-the-finding waits out one full scheduled
+    # audit inside its stack's apply, for up to its run_wait, which is past
+    # INFRA_LOCK_LONGEST_HOLD_SECONDS. In the install its stack moves one
+    # stream's stored report and digest record aside and puts them back, which
+    # its stream lock (audit_streams) keeps to one unit at a time, and it
+    # writes that stream's entry in the Platform Agent's cron roster.
+    # oobe-first-run-audits' and unchanged-manifest-digest's stacks write
+    # that roster too: the nightly's main part runs their cases in other
+    # shards, on other installs (scripts/test_ci_eval_nightly.py holds that),
+    # and a run of every case on one install has no lock between them.
+    oobe-first-run-audits | autoops-warning-event-no-action-triage | fleet-audit-scheduled-run-files-the-finding) return 0 ;;
   esac
   return 1
 }
@@ -4126,7 +4301,11 @@ infra_lock_exempt() { # <task-name>
 # rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
 # markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
 # Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
-# from the others, so this lock does.
+# from the others, so this lock does. One state has no lock: the Platform
+# Agent's cron roster, which the stacks infra_lock_exempt's comment names
+# each write an entry of. Their cases run in different shards of the
+# nightly's main part instead (scripts/test_ci_eval_nightly.py), and a run
+# of every case on one install has no lock between them.
 unit_state_lock() { # <task-name>
   case "$1" in
     oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-discovery-capped | bootstrap-inventory-ranking-delivery | bootstrap-inventory-posture-scope) echo "onboarding" ;;
@@ -4823,6 +5002,10 @@ unit_cost_hint() {
     # early, and the presubmit wall estimate in
     # scripts/eval_rosters.py (#3987) is priced from these hints.
     consistency-drift-outlier) echo 600 ;;
+    # The same full drift audit as consistency-drift-outlier, graded on
+    # another finding of the same ledger. Priced with it, not measured on a
+    # lane yet.
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 600 ;;
     # On the blocking roster since 2026-11-02 (#4095), the presubmit's one
     # stack case: its tofu stack plants one alert policy, about 2s to apply
     # and 1s to destroy, so the unit is the agent turn. Measured on the
@@ -4845,13 +5028,28 @@ unit_cost_hint() {
     # waits out: a full audit on an image without the gate, a collector and a
     # precheck with it. Unmeasured; priced at the band plus the plant.
     fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
+    # One real scheduled compliance audit the stack fires and waits out, with
+    # the stream's stored report and digest record moved aside, so a full
+    # audit every time. The fired run took 11 to 13 minutes on two dev
+    # installs; unmeasured on a lane. Off the infra lock (infra_lock_exempt),
+    # so it is in none of the stack chains this hint prices; priced as the
+    # case above, over compliance-rbac-overgrant's requested run, so it
+    # launches early.
+    fleet-audit-scheduled-run-files-the-finding) echo 1200 ;;
+    # The stack of fleet-audit-unchanged-finding-keeps-wording and the same
+    # full drift audit, with another plant state. Unmeasured on the lane.
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 900 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
+    # The same full audit after a plant that waits eleven minutes, so that
+    # the failed pulls it plants are older than the check's ten (3.28).
+    # Unmeasured: the audit band plus the wait.
+    obtainability-image-pull-failing) echo 1600 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
     # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
     # kustomize case runs in the second phase (writes_alone), so its hint
     # orders it only among that phase's units.
-    gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
+    gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10
     # unmeasured, plus a stack that plants one Config Connector object and
@@ -4990,6 +5188,11 @@ unit_cost_hint() {
     # priced in that band so a deadline cut does not take it first.
     # Unmeasured until its first nights.
     chat-stop-halts-delegated-remediation) echo 1100 ;;
+    # Nightly only. The harness waits idle_seconds=480 between the opening
+    # and the reply (idle_reply.py), so a repetition is never under 480s,
+    # plus two turns. Priced above that so a deadline cut does not take it
+    # first.
+    session-recalls-context-after-idle-reap) echo 700 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -5101,10 +5304,12 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
+    consistency-boot-disk-pool-outlier | consistency-kubelet-config-pool-outlier) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
+    fleet-audit-remediation-right-and-not-stale | fleet-audit-wrong-kept-remediation-gives-way) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
-    obtainability-planted-orphan-service) echo 3000 ;;
-    gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
+    obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
+    gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took
@@ -5147,6 +5352,17 @@ if ! SCOPE_EXCLUDE_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_be
 fi
 SCOPE_EXCLUDE_NAMES="$(printf '%s\n' "${SCOPE_EXCLUDE_CASES}" | awk 'NF { printf "%s%s", sep, $1; sep = "," }')"
 [ -z "${SCOPE_EXCLUDE_NAMES}" ] || echo "cases that exclude seeded slots from the install's scope, run alone after every other unit: ${SCOPE_EXCLUDE_NAMES}"
+# The cases that hold a cluster (scope_hold_apply), one `<case> <hold-json>` line
+# each, in the same phase after the scope-excluding ones. Read with this
+# checkout's reader by path, under the grader's environment for PyYAML: a grader
+# pinned to a base without the module would otherwise stop every run, and -I
+# keeps the reader's own directory off the import path.
+if ! SCOPE_HOLD_CASES="$(cd "${BENCH_DIR}" && uv run python -I "${SCRIPT_DIR}/../bench/kube_agents_bench/scope_hold.py" cases "${TASKS[@]}")"; then
+  echo "ERROR: could not read the matrix's scope_hold (kube_agents_bench.scope_hold, above); the fan-out cannot tell which cases hold a cluster, so the run does not start." >&2
+  exit 1
+fi
+SCOPE_HOLD_NAMES="$(printf '%s\n' "${SCOPE_HOLD_CASES}" | awk 'NF { printf "%s%s", sep, $1; sep = "," }')"
+[ -z "${SCOPE_HOLD_NAMES}" ] || echo "cases that hold a cluster, run alone after every other unit: ${SCOPE_HOLD_NAMES}"
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_NAMES+=("${TASK_NAME}")
@@ -5201,6 +5417,7 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # verification wholesale (evalharness/default.py, "skipped_no_infra") and
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
+export STATE_DIR
 
 # The units the card fence could not run before (fence_live_cards): one reason
 # file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
@@ -5253,7 +5470,9 @@ fi
 #                 and same-task reps share a tofu stack directory and cluster
 #                 name. Serial reps are also what keeps them comparable.
 #   per state  -- cases whose stacks rewrite the same agent-install state
-#                 (unit_state_lock) never overlap. A unit off the infra lock
+#                 (unit_state_lock) never overlap; the cron roster is the
+#                 state with no such lock (unit_state_lock's comment). A unit
+#                 off the infra lock
 #                 takes it after its streams and wait_platform_runs; a
 #                 stack-bearing unit takes it only while it holds the infra
 #                 lock, in one try, giving the infra lock back when it is
@@ -5262,7 +5481,9 @@ fi
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
 #                 consistency-no-environment-label,
-#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unchanged-finding-keeps-wording,
+#                 fleet-audit-remediation-right-and-not-stale,
+#                 fleet-audit-wrong-kept-remediation-gives-way, and
 #                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
@@ -6015,9 +6236,11 @@ start_chain_audits_watch
 # is phase 2, run after both and alone, each case between its own scope edit and
 # restore (scope_exclude_apply); it takes 2 even when it also writes, and then
 # keeps the writer pause but not run_one_unit's per-repetition repository reset,
-# which no scope-excluding case needs today: each of them is read-only.
-unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request, a stopped ask or a writes_alone case, 0 otherwise
-  case ",${SCOPE_EXCLUDE_NAMES:-}," in
+# which no scope-excluding case needs today: each of them is read-only. A case
+# that holds a cluster (SCOPE_HOLD_NAMES) is phase 2 the same way, between its
+# hold and the restore (scope_hold_apply), after the scope-excluding cases.
+unit_phase() { # <task-name> -> 2 for a scope-excluding or cluster-holding case, 1 for a case that requests a pull request, a stopped ask or a writes_alone case, 0 otherwise
+  case ",${SCOPE_EXCLUDE_NAMES:-},${SCOPE_HOLD_NAMES:-}," in
     *",$1,"*) echo 2; return ;;
   esac
   case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
@@ -6195,7 +6418,11 @@ SCOPE_EXCLUDE_LINES=()
 while IFS= read -r SCOPE_LINE; do
   [ -z "${SCOPE_LINE}" ] || SCOPE_EXCLUDE_LINES+=("${SCOPE_LINE}")
 done <<<"${SCOPE_EXCLUDE_CASES:-}"
-SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
+SCOPE_HOLD_LINES=()
+while IFS= read -r SCOPE_LINE; do
+  [ -z "${SCOPE_LINE}" ] || SCOPE_HOLD_LINES+=("${SCOPE_LINE}")
+done <<<"${SCOPE_HOLD_CASES:-}"
+SCOPE_TOTAL=$(( (${#SCOPE_EXCLUDE_LINES[@]} + ${#SCOPE_HOLD_LINES[@]}) * EVAL_REPETITIONS ))
 
 profile_begin "task fan-out: $((LIVE_TOTAL + UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 # The cards fence_live_cards may archive are the ones filed from here on (the
@@ -6246,6 +6473,35 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   scope_exclude_restore "${SCOPE_CASE}" settle \
     || echo "WARNING: Scope exclusion (${SCOPE_CASE}): the restore did not settle; the next lease's preflight repeats it" >&2
 done
+# The cluster-holding cases, each alone between its hold and the restore. A hold
+# that does not take effect records the repetitions as infrastructure; one the
+# install's API cannot express runs them on the install as it is
+# (scope_hold_apply). A hold replaces no pod, so the gateway log is the EXIT
+# trap's as usual.
+for SCOPE_LINE in ${SCOPE_HOLD_LINES[@]+"${SCOPE_HOLD_LINES[@]}"}; do
+  read -r SCOPE_CASE SCOPE_HOLD <<<"${SCOPE_LINE}"
+  SCOPE_IDX=""
+  for i in "${!TASK_NAMES[@]}"; do
+    [ "${TASK_NAMES[i]}" = "${SCOPE_CASE}" ] && SCOPE_IDX="${i}" && break
+  done
+  [ -n "${SCOPE_IDX}" ] || continue
+  SCOPE_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
+    *",${SCOPE_CASE},"*) SCOPE_PAUSE="${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" ;;
+  esac
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, under the hold ${SCOPE_HOLD}"
+  if scope_hold_apply "${SCOPE_CASE}" "${SCOPE_HOLD}"; then
+    launch_units "$(for REP in $(seq 1 "${EVAL_REPETITIONS}"); do printf '%s 0 %s\n' "${REP}" "${SCOPE_IDX}"; done)" 1 "${SCOPE_PAUSE}"
+    wait
+  else
+    for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+      skip_unit "${TASKS[SCOPE_IDX]}" "${SCOPE_CASE}" "${REP}" "" "" "not run: its cluster hold did not take effect" \
+        "scope-hold: the hold ${SCOPE_HOLD} could not be put on the install"
+    done
+  fi
+  scope_hold_restore "${SCOPE_CASE}" \
+    || echo "WARNING: Scope hold (${SCOPE_CASE}): the restore failed; the next lease's preflight repeats it" >&2
+done
 stop_chain_audits_watch
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
@@ -6276,6 +6532,12 @@ report_github_leftovers() {
     echo "WARNING: ${forge} leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
+  # A unit's token file is exported for that unit alone and unset at its stop
+  # (stop_ledger_token_renewal), so a BENCH_GITHUB_TOKEN_FILE set here is the
+  # caller's shell's, and the listing would read it in preference to
+  # BENCH_GITHUB_TOKEN: the token minted above, or the mounted one when there
+  # is no App key. The units drop it the same way (start_ledger_token_renewal).
+  unset BENCH_GITHUB_TOKEN_FILE
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
     echo "WARNING: ${forge} leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."

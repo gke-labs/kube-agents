@@ -20,7 +20,9 @@
 # scripts/test_ci_eval_nightly.py holds the three counts to within one of
 # each other, and fails on a line that names no writer, or a case on both
 # lists. A new writer lands in writers-a; when the counts drift apart, list
-# a case here or in nightly-writers-c.txt until they balance.
+# a case here or in nightly-writers-c.txt until they balance. The two sides
+# of a permit pair (permit-pairs.txt) stay in one third:
+# scripts/test_task_registration.py fails on a list that splits them.
 #
 # Balanced on the night of 2026-11-06 (build
 # 2117406650204688384; the 14-case roster at 292 unit-minutes): writers-b
@@ -33,4 +35,4 @@ stop-on-permission-refusal
 vcs-review-feedback-read-back
 scale-request-proposes-pr
 provisioning-cluster-request-never-creates
-post-merge-verified-fixed
+cluster-profile-finds-the-managed-repository

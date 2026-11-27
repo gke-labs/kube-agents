@@ -127,7 +127,8 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
   `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, on a
-  scheduled run the same published ids as the last scheduled run (§7.5), and no
+  scheduled run the same published ids and the same set of noted objects as the last scheduled
+  run (§7.5), and no
   collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md)). If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
@@ -765,7 +766,10 @@ Exit contract — the keys below on every line:
 - `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[],"unaccounted":[],"publish_s":41.2}`
 
 `postures_withheld` is the ids of the posture findings `finish` took out of the document because it
-recorded no complete declared-intent search (§7.4); empty on every other run.
+recorded no complete declared-intent search (§7.4); empty on every other run. `notes` is on the line,
+on every status, only when a target carries a note: a list of `{target, note}` (§7.2), with
+`report_notes` beside it — the same entries as ready-made lines, one per noted target, which the
+worker ends its report with, copied verbatim.
 
 When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_checks` and
 `uncorroborated_findings` join the line; they are absent on every other run
@@ -1081,8 +1085,8 @@ lose and anything present is debris from a run that did not finish.
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`; on a scoped install `<human name> (<scope name>)` (§2). Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation (`manifest` links fill the `fileUrl` template from the forge's `capabilities` response at the repository commit when the forge supplies one and the file exists at that commit, and keep the bare path for a newly written file or when `fileUrl` is absent), PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered, the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)) and the ids under _Not re-checked this run_ (§7.4), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1). |
-| Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                                                               |
-| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. On a findings run over a gap, with or without a manifest: rows under _Not re-checked this run_ (§7.4). Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                                                                                                                                                                                                                |
+| Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations` and `notes` (a Notes column, §7.2), `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                            |
+| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. A previous finding on a noted object (collector design §3.3) is held here too, with its own sentence and detail line: the collector could not see the result. The held comment marks it _not visible to the collector_. On a findings run over a gap, with or without a manifest: rows under _Not re-checked this run_ (§7.4). Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                        |
 | Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Clean-close comment   | Date and the targets covered (counted by kind: clusters, subnets, projects), then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -1225,6 +1229,15 @@ The SOPs now state one question, and the schema has one answer for each branch o
 The validator enforces both halves: the two lists must be disjoint, and a finding whose `cluster`
 names a skipped entry is rejected. The rendered scope table carries a `limitations` column only when
 at least one cluster has one, so the common case stays two columns wide.
+
+`scope.clusters[]` also takes an optional `notes` string: what a check read on that target but could
+not see, such as a GCE serial console that rotated past the last startup-script run. It is not a
+coverage gap. The scope table carries a Notes column only when at least one target has a note, and
+clips each cell as it clips `limitations`. The clean comment and the held comment list each note in
+full, and the body carries its own capped "Read but not visible" list of the full notes, because
+the clipped cell ends before a rotated-serial note reaches its instance names. The JSON line of
+`finish` carries them under `notes`, and as ready-made report lines under `report_notes`
+([collector design](fleet-audit-collector-manifest.md)).
 
 `limitations` closed the false all-clear that came from mis-filing a cluster. It did not close the
 one that comes from not checking it, because it is optional and an audit that ran nothing has no
@@ -1568,7 +1581,9 @@ applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
 moved nothing an operator needs to hear about — nothing new, nothing resolved, nothing retired
-unread (§2), no new or changed coverage gap, no
+unread (§2), no new or changed coverage gap, no change in the set of noted objects (a scheduled
+run whose set differs from the last scheduled run's carries `noted_changed: true` and speaks; an
+unchanged noted object does not wake the channel), no
 held close, no remediation PR opened or closed, and, on a run that passed `--manifest-file`, no
 collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md))
 — and it is computed from the numbers `finish` is
@@ -1612,7 +1627,8 @@ last scheduled run published (`scheduled_published_ids`: with a ledger, its find
 it withheld, the held ids and the ids under _Not re-checked this run_, or for a clean run that left
 the body untouched, the ids that body still lists; with the ledger in the report store, the same ids
 as with a ledger, and no value when it held a ledger it could not read; with no forge, its findings,
-the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`), its gaps (`scheduled_coverage_gaps`, §7.4), and the ids of its
+noted objects (`scheduled_noted_ids`). A scheduled run writes its own
 values there, and an on-demand run copies them from the record before it. A scheduled run whose
 published ids differ from `scheduled_published_ids` is not silent, also when its delta against
 the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
@@ -1955,7 +1971,8 @@ makes no edit when the close fails, adds no second banner, and keeps the old bod
 fails.
 
 **Silence cases** (§7.5): on a run that passed `--scheduled`, `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
-`false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, or a
+`false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, a
+changed set of noted objects (§7.5), or a
 remediation PR opened or closed, and `true` again over a gap that did not change — asserted on both `finish` branches, since each prints its own
 JSON. The same quiet runs without `--scheduled` give `false`, on both branches and with no
 forge, and a scheduled run after an on-demand run that first saw a gap still reports the gap.

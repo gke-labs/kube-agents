@@ -818,7 +818,13 @@ start_credential_runtime() {
   # The role reaches the runtime as the environment variable it already reads
   # (resolve_role), not as a flag: one spelling, and a container that sets the
   # variable without going through this script still gets the role it asked for.
-  "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py &
+  #
+  # Envoy is already running (it starts first), and its pid goes to the runtime
+  # here, set by this script alone and over any value the environment carries:
+  # the runtime believes a Unix-socket peer's address header only from that pid
+  # (EnvoyPeerCheck in credential_proxy.py), and refuses every socket request
+  # when it is empty, as it is in the api-proxy role, which runs no Envoy.
+  CREDENTIAL_PROXY_ENVOY_PID="${envoy_pid}" "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py &
   runtime_pid=$!
 }
 
@@ -1310,10 +1316,13 @@ start_audit_report_store() {
 }
 
 write_wif_credentials
-start_credential_runtime
+# Envoy before the runtime, so the runtime starts knowing Envoy's pid. Envoy
+# connects to the runtime's socket per request, so a request in the moment
+# before the socket exists is answered 503 and retried, as any other.
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
+start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "exec" ]]; then
   # The same guard as the watcher, and for the same reason: both post to the
   # Session KV server on this pod's loopback, which the broker and exec pods do

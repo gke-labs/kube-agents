@@ -35,9 +35,19 @@ import re
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import (
+    RENEWAL_AFTER_STALL_SECONDS,
+    RENEWAL_NAP_SETTLE_SECONDS,
+    RENEWAL_NAP_STOP_BOUND_SECONDS,
+    RENEWAL_NAP_TICK_SECONDS,
+    RENEWAL_WRITE_STALL_SECONDS,
+    STALLED_RENEWAL_WRITE,
+    find_renewal_trap_offenders,
+    get_isolated_test_env,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -56,6 +66,7 @@ _TERMINAL_RC = 1
 # ran one file per CPU in three shards.
 _RENEWAL_POLLS = 40
 _RENEWAL_POLL_SECONDS = 0.5
+_SUBPROCESS_TIMEOUT_SECONDS = 60
 
 
 def _extract(pattern, what):
@@ -137,6 +148,7 @@ class LedgerMintRetryTest(unittest.TestCase):
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(
                 overrides={
                     "COUNT_FILE": str(count_file),
@@ -235,6 +247,7 @@ class LedgerMintRetryTest(unittest.TestCase):
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(overrides={"BENCH_GITHUB_TOKEN": "the-mounted-pat"}),
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
@@ -338,7 +351,7 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=log,
                 text=True,
-                timeout=60,
+                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
                 env=get_isolated_test_env(overrides=overrides),
             )
         proc.stderr = log_file.read_text(encoding="utf-8")
@@ -372,6 +385,92 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertIn("FILE=removed", out)
         self.assertIn("UNSET=\n", out + "\n")
         self.assertNotIn("tok-renewed", proc.stderr, "a renewal never prints the token")
+
+    def test_a_stop_during_a_nap_returns_at_once_and_leaves_no_nap(self):
+        # With the real sleep and a long tick: a stop that waited the nap out,
+        # or a nap left running with the run's output open, takes the tick.
+        began = time.monotonic()
+        proc = self._run(
+            """\
+            unset -f sleep
+            LEDGER_TOKEN_RENEW_TICK_SECONDS="${NAP_TICK_SECONDS}"
+            start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+            sleep "${NAP_SETTLE_SECONDS}"
+            stop_ledger_token_renewal "${TOKEN_FILE}"
+            [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+            """,
+            NAP_TICK_SECONDS=str(RENEWAL_NAP_TICK_SECONDS),
+            NAP_SETTLE_SECONDS=str(RENEWAL_NAP_SETTLE_SECONDS),
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertLess(elapsed, RENEWAL_NAP_STOP_BOUND_SECONDS)
+
+    def test_a_stop_during_a_renewal_write_leaves_no_token_behind(self):
+        # The stop used to kill the renewer outright: its write went on without
+        # it and left a live token in the .next file after the stop's rm.
+        proc = self._run(
+            STALLED_RENEWAL_WRITE
+            + textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                : > "${STALL}"
+                wait_until test -e "${STALLED}"
+                [ -e "${STALLED}" ] && echo "WRITE=stalled" || echo "WRITE=never"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                command sleep "${AFTER_STALL_SECONDS}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+                """
+            ),
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(RENEWAL_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(RENEWAL_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("WRITE=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
+
+    def test_a_stop_during_a_renewal_mint_leaves_no_scratch_token_behind(self):
+        # A SIGTERM that arrives while _ledger_token_mint is running triggers the
+        # renewer's TERM trap as soon as _ledger_token_mint returns, before
+        # mint_ledger_token reaches its own rm -rf "${scratch}".
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                _ledger_token_mint() {
+                  local n=$(( $(cat "${COUNT_FILE}") + 1 ))
+                  echo "${n}" > "${COUNT_FILE}"
+                  if [ -e "${STALL}" ]; then
+                    : > "${STALLED}"
+                    command sleep "${WRITE_STALL_SECONDS}"
+                  fi
+                  echo "tok-renewed 2026-10-17T09:00:00Z"
+                }
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                : > "${STALL}"
+                wait_until test -e "${STALLED}"
+                [ -e "${STALLED}" ] && echo "MINT=stalled" || echo "MINT=never"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                command sleep "${AFTER_STALL_SECONDS}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                [ -e "${TOKEN_FILE}.next" ] && echo "NEXT=left" || echo "NEXT=removed"
+                [ -e "${TOKEN_FILE}.mint" ] && echo "SCRATCH=left" || echo "SCRATCH=removed"
+                """
+            ),
+            STALL=str(self.tmp / "stall"),
+            STALLED=str(self.tmp / "stalled"),
+            WRITE_STALL_SECONDS=str(RENEWAL_WRITE_STALL_SECONDS),
+            AFTER_STALL_SECONDS=str(RENEWAL_AFTER_STALL_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("MINT=stalled", proc.stdout)
+        self.assertIn("FILE=removed", proc.stdout)
+        self.assertIn("NEXT=removed", proc.stdout)
+        self.assertIn("SCRATCH=removed", proc.stdout)
 
     def test_a_failed_renewal_is_retried_soon_rather_than_a_period_later(self):
         # Two refusals, then a mint. The renewer sleeps one tick per second:
@@ -447,9 +546,12 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 ( start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
                   echo "${LEDGER_TOKEN_RENEWER}" > "${TOKEN_FILE}.pid" )
                 renewer="$(cat "${TOKEN_FILE}.pid")"
-                gone() { ! kill -0 "$1" 2>/dev/null; }
+                gone() {
+                  ! kill -0 "$1" 2>/dev/null && return 0
+                  grep -qs '^State:[[:space:]]*Z' "/proc/$1/status"
+                }
                 wait_until gone "${renewer}"
-                kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
+                gone "${renewer}" && echo "RENEWER=gone" || echo "RENEWER=alive"
                 kill "${renewer}" 2>/dev/null || true
                 """
             )
@@ -484,6 +586,41 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertLess(unit.index('mint_ledger_token "${name} rep ${rep}"'), start)
         self.assertLess(start, bench)
         self.assertLess(bench, stop)
+
+    def test_no_command_substitution_or_loop_jump_while_the_trap_is_armed(self):
+        # bash 5.2 can drop a trapped signal during a loop jump (`continue` /
+        # `break`) or re-enter the parser when a signal lands inside `$(...)`,
+        # leaving `stop_ledger_token_renewal`'s `wait` blocked forever.
+        start_fn = _lift_function("start_ledger_token_renewal")
+        subshell = re.search(r"^\s*\(\n\s*waited=0.*?^\s*\) &$", start_fn, re.S | re.M)
+        self.assertIsNotNone(subshell, "could not find the renewer subshell in start_ledger_token_renewal")
+        offenders = find_renewal_trap_offenders(
+            (
+                ("start_ledger_token_renewal subshell", subshell.group(0)),
+                ("mint_ledger_token", _lift_function("mint_ledger_token")),
+                ("_ledger_token_mint", _lift_function("_ledger_token_mint")),
+            )
+        )
+        self.assertEqual(offenders, [], "unsafe construct under an armed trap:\n" + "\n".join(offenders))
+
+    def test_stop_returns_promptly_when_sleep_is_a_noop(self):
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                [ -n "${BASHPID:-}" ] || { echo "SKIP=no BASHPID"; exit 0; }
+                sleep() { :; }
+                for _ in $(seq 1 20); do
+                  start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                  stop_ledger_token_renewal "${TOKEN_FILE}"
+                done
+                echo "STOPPED=ok"
+                """
+            )
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        if "SKIP=" in proc.stdout:
+            self.skipTest("this bash has no BASHPID; the Prow image's does")
+        self.assertIn("STOPPED=ok", proc.stdout)
 
 
 def _lift_function(name):
@@ -608,7 +745,7 @@ class UnitNotRunTest(unittest.TestCase):
                 '    *) echo "GitHub answered HTTP 401 (Unauthorized) minting for App 4739812 installation 157029058" >&2; return 1 ;;',
                 "  esac",
                 "}",
-                "sleep() { :; }",
+                "sleep() { command sleep 0.05; }",
                 "lock_acquire() { return 0; }",
                 "lock_release() { :; }",
                 "ledger_audit_id_for_task() { :; }",
@@ -635,6 +772,7 @@ class UnitNotRunTest(unittest.TestCase):
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(
                 overrides={
                     "STATE_DIR": str(self.state),
@@ -859,7 +997,10 @@ class LedgerMintRequestTest(unittest.TestCase):
         self.key = self.tmp / "throwaway.pem"
         try:
             gen = subprocess.run(
-                ["openssl", "genrsa", "-out", str(self.key), "2048"], capture_output=True, text=True
+                ["openssl", "genrsa", "-out", str(self.key), "2048"],
+                capture_output=True,
+                text=True,
+                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             )
         except FileNotFoundError:  # pragma: no cover - a machine without openssl
             self.skipTest("openssl is not on PATH, and the mint signs its JWT with it")
@@ -903,6 +1044,7 @@ class LedgerMintRequestTest(unittest.TestCase):
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(
                 overrides={
                     "PYTHONPATH": str(self.tmp),
@@ -1061,7 +1203,10 @@ class LedgerMintRefusalTest(unittest.TestCase):
         self.key = self.tmp / "throwaway.pem"
         try:
             gen = subprocess.run(
-                ["openssl", "genrsa", "-out", str(self.key), "2048"], capture_output=True, text=True
+                ["openssl", "genrsa", "-out", str(self.key), "2048"],
+                capture_output=True,
+                text=True,
+                timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             )
         except FileNotFoundError:  # pragma: no cover - a machine without openssl
             self.skipTest("openssl is not on PATH, and the mint signs its JWT with it")
@@ -1074,6 +1219,7 @@ class LedgerMintRefusalTest(unittest.TestCase):
             ["python3", str(_LEDGER_MINT), str(_retryable_rc())],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(
                 overrides={
                     "PYTHONPATH": str(self.tmp),
@@ -1171,6 +1317,7 @@ class LedgerReaderSelectionTest(unittest.TestCase):
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(overrides=env, absent=[n for n in names if n not in env]),
         )
 
@@ -1295,6 +1442,7 @@ class LedgerReaderSelectionTest(unittest.TestCase):
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             env=get_isolated_test_env(
                 overrides={"EVAL_LEDGER_APP_KEY_FILE": "/mine/key.pem", "EVAL_LEDGER_APP_KEY_FILES": "/k/0.pem /k/1.pem /k/2.pem"},
                 absent=["EVAL_LEDGER_APP_ID", "EVAL_LEDGER_INSTALLATION_ID"],

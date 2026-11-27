@@ -355,13 +355,13 @@ preflight_project_pieces() {
   echo "✓ Project pieces present: ${FORGE_ADDRESS_NAME}=${FORGE_IP}, ${EVAL_FORGE_HOST}. in ${FORGE_DNS_ZONE}, ${FORGE_FIREWALL_RULE}, ${FORGE_DENY_RULE}, ${FORGE_VM_SERVICE_ACCOUNT}"
 }
 
-# ─── up: certificates, from the repo's own helper, Linux only ────────────────
+# ─── up: certificates, from the repo's own helper ────────────────────────────
 make_certificates() {
   FORGE_CERT_DIR="$(mktemp -d "${FORGE_SCRATCH_DIR}/forge-certs.XXXXXX")" # 0700; make-certs.sh takes an empty directory
   bash "${SCRIPT_DIR}/ghes-proxy/make-certs.sh" "${EVAL_FORGE_HOST}" "${FORGE_CERT_DIR}" "${FORGE_CERT_DAYS}"
   # The deploy's gate would refuse this later; refuse it here, before a VM.
   if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CERT_DIR}/ca.crt" 2>/dev/null)"; then
-    echo "ERROR: ${FORGE_CERT_DIR}/ca.crt is not a CA certificate; make-certs.sh needs OpenSSL (Linux), not LibreSSL (kube-agents#3682)." >&2
+    echo "ERROR: ${FORGE_CERT_DIR}/ca.crt is not a CA certificate (its basicConstraints lack CA:TRUE); make-certs.sh made it with $(openssl version 2>/dev/null) (kube-agents#3682)." >&2
     exit 1
   fi
   echo "✓ Certificates for ${EVAL_FORGE_HOST} made, valid ${FORGE_CERT_DAYS} day(s); the CA key is gone"
@@ -657,10 +657,7 @@ check_from_cluster() {
   fi
   local pod code
   pod="forge-check-$(date +%s)"
-  gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
-  # shellcheck disable=SC2086
-  gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet \
-    ${GKE_DNS_ENDPOINT_FLAG} >/dev/null || {
+  get_cluster_credentials "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" >/dev/null || {
     echo "ERROR: could not fetch credentials for ${CLUSTER_NAME} in ${PROJECT_ID}; not running the in-cluster check against another context (FORGE_SKIP_CLUSTER_CHECK=1 for a project with no host cluster yet)." >&2
     return 1
   }
@@ -684,9 +681,7 @@ check_from_cluster() {
 open_tunnel() {
   local code deadline
   if [ "${FORGE_SKIP_CLUSTER_CHECK:-}" = "1" ]; then
-    gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet ${GKE_DNS_ENDPOINT_FLAG} >/dev/null || {
+    get_cluster_credentials "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" >/dev/null || {
       echo "ERROR: could not fetch credentials for ${CLUSTER_NAME} in ${PROJECT_ID}; the gitlab-ce row needs the host cluster for its tunnel." >&2
       return 1
     }

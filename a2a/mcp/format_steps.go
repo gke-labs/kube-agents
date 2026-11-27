@@ -518,7 +518,7 @@ func collapseInlineWhitespace(s string) string {
 
 // dropFormatChars removes Unicode format characters (bidi overrides and
 // isolates, zero-width marks), which could hide or reorder what the caller is
-// shown, as cell and inertBlock do.
+// shown, as inerttext.Cell and inertBlock do.
 func dropFormatChars(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.Is(unicode.Cf, r) {

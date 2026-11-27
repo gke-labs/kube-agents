@@ -3,7 +3,6 @@ Subject: Route new clusters to a pull request in the repository format instead o
 Why: in this repository a new cluster reaches a project only as a pull request in the GitOps repository's own format (SOUL.md §3, items 6 and 7). The agent's gke MCP server offers no create tool and the broker refuses `gcloud container clusters create`, so step 6, the confirmation step and the template labels must not present either as the way to create a cluster. The templates keep their settings as API-field references and lose every runnable create command, because a model copies a fenced command (#2937's green run did).
 Local-Issue: #2937
 Eval-Case: provisioning-cluster-request-never-creates
-Upstream-Issue: none (specific to this repository)
 Retire-When: never; upstream's skill is written for a user who creates clusters directly
 
 diff --git a/SKILL.md b/SKILL.md

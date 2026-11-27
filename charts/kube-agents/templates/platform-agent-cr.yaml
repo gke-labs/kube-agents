@@ -275,7 +275,7 @@ spec:
       dropped (kube-agents.resourcesOverrideQuantities). */}}
     {{- include "kube-agents.sessionResourcesCheck" (dict "resources" $tuning.sessionResources "prefix" "platformAgent.harness.tuning.sessionResources") }}
     {{- $sessionQuantities := include "kube-agents.resourcesOverrideQuantities" $tuning.sessionResources | fromJson }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $sessionQuantities (hasKey $tuning "busReplicas") $tuning.defaultRoute $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $sessionQuantities (hasKey $tuning "busReplicas") $tuning.defaultRoute (hasKey $tuning "warmSessions") (hasKey $tuning "sessionIdleMinutes") (hasKey $tuning "dmSessionIdleMinutes") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
@@ -344,6 +344,49 @@ spec:
       {{- end }}
       {{- end }}
       defaultRoute: {{ $tuning.defaultRoute | quote }}
+      {{- end }}
+      {{- if hasKey $tuning "warmSessions" }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it: a warmSessions: 0 meant
+        to turn the warm pool off would leave the operator's default of one
+        warm session pod running while the release says otherwise.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "warmSessions") }}
+      {{- fail "platformAgent.harness.tuning.warmSessions is set, but the installed PlatformAgent CRD predates spec.harness.tuning.warmSessions and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      warmSessions: {{ $tuning.warmSessions }}
+      {{- end }}
+      {{- /*
+        The session idle times (#2371). A CRD that predates them prunes them on
+        write and the release record keeps them, so the gateway would keep its
+        defaults while the release says otherwise.
+      */}}
+      {{- range $key := list "sessionIdleMinutes" "dmSessionIdleMinutes" }}
+      {{- if hasKey $tuning $key }}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps $key) }}
+      {{- fail (printf "platformAgent.harness.tuning.%s is set, but the installed PlatformAgent CRD predates spec.harness.tuning.%s and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" $key $key) }}
+      {{- end }}
+      {{- end }}
+      {{ $key }}: {{ index $tuning $key | int }}
+      {{- end }}
       {{- end }}
       {{- with $tuning.default }}
       default:
@@ -680,9 +723,9 @@ spec:
            small one, as the operator admits it. A request set without its limit
            is checked against the ceiling row's limit
            (kube-agents.credentialProxyCeilingRow): the same row, and under auto
-           the fleet row, since the operator renders the latched tier, which the
+           the fleet row, since the operator renders `status.effectiveSizingTier`, which the
            chart cannot read, and a request under the fleet row's limit is one
-           the webhook admits at a latch that has reached it. */}}
+           the webhook admits when the agent reaches it. */}}
     {{- $proxyDefaults := include "kube-agents.credentialProxyRow" . | fromJson }}
     {{- $proxyCeiling := include "kube-agents.credentialProxyCeilingRow" . | fromJson }}
     {{- $proxyAuto := eq (((.Values.platformAgent.deployment | default dict).sizingProfile) | default "") "auto" }}
@@ -1252,6 +1295,11 @@ spec:
       {{- end }}
       {{- if hasKey $integ.teams "adaptiveCards" }}
       adaptiveCards: {{ $integ.teams.adaptiveCards }}
+      {{- end }}
+      {{- if dig "inbound" "enabled" false $integ.teams }}
+      {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.integration.teams.inbound.enabled" "path" (list "integration" "teams") "field" "inbound") }}
+      inbound:
+        enabled: true
       {{- end }}
     {{- end }}
   {{- end }}

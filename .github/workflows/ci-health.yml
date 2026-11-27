@@ -127,7 +127,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the issues it filed that tick. Armed, it counts the ticks it held for an
 # untrusted issue listing in nightly-bugs-state.json beside health.json, and
 # the digest says so once the hold has lasted about two hours. With
-# NIGHTLY_TRIAGE_LIVE `true` as well, it files domain and group bugs for the
+# NIGHTLY_TRIAGE_LIVE `true` as well and a model named in
+# NIGHTLY_TRIAGE_MODEL (a repository secret, so no step header prints it),
+# it files domain and group bugs for the
 # nightly-triage job below to assign, which comments on them in the issues
 # repository (docs/ci-health.md, "Nightly triage"). The section
 # turns owners' GitHub logins into Chat mentions through the
@@ -217,9 +219,14 @@ env:
   # docs/ci-health.md "Nightly triage"): anything but `true` leaves the filer
   # assigning as before and the triage in dry run. Its model and the project
   # the model call is billed to (which must grant CI_HEALTH_SA
-  # roles/aiplatform.user); repository variables override both.
+  # roles/aiplatform.user) is a repository variable too. The model is a
+  # repository SECRET with no default here: the file is public, and a
+  # variable's value would print in every step header of this public log,
+  # where a secret prints as ***. Unset, triage stays unarmed: the filer
+  # assigns by its rule, the job dry-runs by the rule, and the backstop's
+  # comment says so.
   NIGHTLY_TRIAGE_LIVE: ${{ vars.NIGHTLY_TRIAGE_LIVE || 'false' }}
-  NIGHTLY_TRIAGE_MODEL: ${{ vars.NIGHTLY_TRIAGE_MODEL || 'gemini-4-argon' }}
+  NIGHTLY_TRIAGE_MODEL: ${{ secrets.NIGHTLY_TRIAGE_MODEL }}
   NIGHTLY_TRIAGE_PROJECT: ${{ vars.NIGHTLY_TRIAGE_PROJECT || 'kube-agents-prow' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
@@ -804,7 +811,7 @@ jobs:
         id: issues_token
         if: steps.issues_repo.outputs.valid == 'true'
         continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ secrets.ISSUES_APP_ID }}
           private-key: ${{ secrets.ISSUES_APP_PRIVATE_KEY }}
@@ -899,16 +906,17 @@ jobs:
           # Armed triage: domain and group bugs are filed for the
           # nightly-triage job to assign (--triage-pending), not to a person;
           # only into a separate (private) issues repository, the only place
-          # the triage comment may go.
+          # the triage comment may go, and only with a model named.
           triage=()
-          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ -n "$KUBE_AGENTS_ISSUES_REPO" ] && [ "$KUBE_AGENTS_ISSUES_REPO" != "gke-labs/kube-agents" ]; then triage=(--triage-pending); fi
+          if [ "$mode" = "--live" ] && [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ -n "$NIGHTLY_TRIAGE_MODEL" ] && [ -n "$KUBE_AGENTS_ISSUES_REPO" ] && [ "$KUBE_AGENTS_ISSUES_REPO" != "gke-labs/kube-agents" ]; then triage=(--triage-pending); fi
           python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode" "${triage[@]}" --filed-out work/nightly-filed.json
           filed=$(python3 -c 'import json; print(" ".join(str(n) for n in json.load(open("work/nightly-filed.json"))))' 2>/dev/null || true)
           echo "filed=$filed" >> "${GITHUB_OUTPUT:-/dev/null}"
 
       # The backstop for issues waiting on the nightly triage: with triage
-      # switched off, every one; with it on, those still waiting two hours
-      # after filing (the triage job failing before it routes, every tick).
+      # switched off or no model named, every one; with it on, those still
+      # waiting two hours after filing (the triage job failing before it
+      # routes, every tick).
       # Each is routed by the filer's own rule, without a model call, so none
       # stays unassigned (docs/ci-health.md, "Nightly triage"). One issue
       # listing when there are none. Same token, repository and bound as the
@@ -923,7 +931,7 @@ jobs:
           SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
           stale=()
-          if [ "$NIGHTLY_TRIAGE_LIVE" = "true" ]; then stale=(--stale-only); fi
+          if [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ -n "$NIGHTLY_TRIAGE_MODEL" ]; then stale=(--stale-only); fi
           python3 scripts/eval_dashboard/nightly_triage.py route --no-model --live "${stale[@]}"
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
@@ -1064,7 +1072,8 @@ jobs:
   # ---- The nightly triage (docs/ci-health.md, "Nightly triage") ----------
   # After the tick, in a job of its own so a slow model call can never hold
   # the tick's post or run it into its timeout. Armed (NIGHTLY_TRIAGE_LIVE
-  # and NIGHTLY_BUGS_LIVE both `true`), it triages every issue the filer left
+  # and NIGHTLY_BUGS_LIVE both `true`, a model named in the
+  # NIGHTLY_TRIAGE_MODEL secret), it triages every issue the filer left
   # waiting (`triage:pending`); unarmed, it dry-runs on the issues the filer
   # filed this tick, or on a dispatch's triage_issues, and prints one line
   # each with no case name in it (the log is public). Two identities, as in
@@ -1116,7 +1125,7 @@ jobs:
               exit 1
             fi
             numbers="$TRIAGE_ISSUES"
-          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$private" = "true" ]; then
+          elif [ "$NIGHTLY_TRIAGE_LIVE" = "true" ] && [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ -n "$NIGHTLY_TRIAGE_MODEL" ] && [ "$private" = "true" ]; then
             mode=--live
           else
             numbers="$FILED"
@@ -1177,7 +1186,7 @@ jobs:
         id: issues_token
         if: steps.issues_repo.outputs.valid == 'true'
         continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ secrets.ISSUES_APP_ID }}
           private-key: ${{ secrets.ISSUES_APP_PRIVATE_KEY }}

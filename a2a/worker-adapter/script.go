@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -31,9 +33,12 @@ import (
 //     names this task and this pod, and carries a trigger whose script is the
 //     confirm's (so neither the confirm nor the credential alone decides);
 //   - the path resolves to a regular file under the script root, owned by
-//     root and writable by no one else, in directories that are the same on
-//     both the named path and the resolved one; the file itself may be a
-//     symlink within the root, and no directory on the named path may be.
+//     root and writable by no one else, neither setuid nor setgid, in
+//     directories that are the same on both the named path and the resolved
+//     one; the file itself may be one symlink within the root whose target,
+//     as written, is where it resolves (so not to another link, and not
+//     through a symlinked directory that changes where it leads), and no
+//     directory on the named path may be a symlink.
 //
 // The script gets a cleared environment: the worker's own PATH and HOME and
 // the broker hand-off (all rendered by the operator), plus the task's
@@ -41,6 +46,14 @@ import (
 // capped, is the task's text result; its stderr is read, capped, and only its
 // size is logged.
 // Exit 0 completes the task, and anything else fails it.
+//
+// The script starts in its own session, so its session and process group ids
+// are its pid. Its kill (at its bound, at the worker's end, on abandon or
+// cancel, and once more after it exits) SIGKILLs its process group and every
+// process /proc lists in its session (no /proc, as on macOS, skips that
+// sweep); and where the worker is the container's init (pid 1), every other
+// process in the pid namespace too, which reaches a process that left the
+// session, after which the worker reaps what it killed.
 
 const (
 	// scriptStdoutCap bounds the text result; past it the output is cut and
@@ -51,12 +64,20 @@ const (
 	// scriptParamPrefix is the only way a task's input reaches a script's
 	// environment.
 	scriptParamPrefix = "KA_PARAM_"
-	// scriptKillGrace is how long a script's process group has between the
+	// scriptKillGrace is how long a script's processes have between the
 	// kill and the worker giving up on its pipes.
 	scriptKillGrace = 5 * time.Second
 	// scriptTruncated marks a result cut at scriptStdoutCap.
 	scriptTruncated = "\n[output truncated]"
+	// sessionSweepPasses bounds how many times killSession lists the
+	// session, and sessionSweepPoll is the pause between passes: a process
+	// can fork while a pass runs, and a killed one is listed until it dies.
+	sessionSweepPasses = 20
+	sessionSweepPoll   = 10 * time.Millisecond
 )
+
+// procRoot is where killSession lists processes.
+const procRoot = "/proc"
 
 // scriptParamName is a parameter's name as a script reads it, after
 // KA_PARAM_: upper case, at most 32 characters.
@@ -95,12 +116,15 @@ func (c scriptFileCheck) withDefaults() scriptFileCheck {
 
 // resolve is the real path of the script at path, or why it can't run. The
 // path has ScriptPath's shape under the root; its real path lies under the
-// root too; every directory from the root down to it, and down to the named
-// path (where none may be a symlink), and the file itself,
-// is owned by the owner and writable by no group or other; the file is a
-// regular file; and the worker isn't the owner, so it can't have written
-// it. The root's own ancestors are image layers, which the build-time check
-// (deploy/docker/test_script_root_ownership.py) keeps root-owned.
+// root too; a named path that is a symlink names its real path as written,
+// so it is one link with no symlink, file or directory, on the way to the
+// file; every directory from the root down to the real path, and down to
+// the named path (where none may be a symlink), and the file itself, is
+// owned by the owner and writable by no group or other; the file is a
+// regular file, neither setuid nor setgid; and the worker isn't the owner,
+// so it can't have written it. The root's own ancestors are image layers,
+// which the build-time check (deploy/docker/test_script_root_ownership.py)
+// keeps root-owned.
 func (c scriptFileCheck) resolve(path string) (string, error) {
 	c = c.withDefaults()
 	root := strings.TrimSuffix(c.root, "/") + "/"
@@ -118,6 +142,12 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 	if !strings.HasPrefix(real, root) {
 		return "", fmt.Errorf("%s resolves to %s, outside %s", path, real, root)
 	}
+	// One link at most: the checks below cover the named path's directories and the real path's, so
+	// a second link, or a symlinked directory in the link's target, would leave a directory between
+	// them unchecked.
+	if err := oneLinkAtMost(path, real); err != nil {
+		return "", err
+	}
 	// Both chains: the resolved file's, and the named path's, so a directory on the way that is a
 	// symlink or writable by someone else is refused even when the file it leads to passes.
 	for _, d := range append(dirChain(root, path), dirChain(root, real)...) {
@@ -129,6 +159,31 @@ func (c scriptFileCheck) resolve(path string) (string, error) {
 		return "", err
 	}
 	return real, nil
+}
+
+// oneLinkAtMost refuses a named path that is a symlink whose target, as
+// written and taken from the link's own directory, isn't where it resolves:
+// a link to a link, or a link through a symlinked directory that changes
+// where it leads.
+func oneLinkAtMost(path, real string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return fmt.Errorf("reading the link %s: %w", path, err)
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	if filepath.Clean(target) != real {
+		return fmt.Errorf("%s links to %s, which is itself a symlink or reached through one (it resolves to %s); a script may be one link to its file", path, target, real)
+	}
+	return nil
 }
 
 // dirChain is every directory from root (which ends in "/") down to file's
@@ -158,6 +213,8 @@ func (c scriptFileCheck) ownedAndUnwritable(path string, dir bool) error {
 		return fmt.Errorf("%s is not a directory", path)
 	case !dir && !fi.Mode().IsRegular():
 		return fmt.Errorf("%s is not a regular file", path)
+	case !dir && fi.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0:
+		return fmt.Errorf("%s is setuid or setgid (%v)", path, fi.Mode())
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
@@ -295,25 +352,113 @@ type scriptSignals struct {
 	cancel    <-chan struct{}
 }
 
-// execScript runs sr with no shell, in its own process group, which is
-// killed whole at its timeout, at ctx's end, on abandon or cancel, and once
-// more after the script exits, so nothing it started outlives it.
+// killSession SIGKILLs every process but the worker that procRoot lists in
+// session sid, pass after pass until a pass finds one it can signal no
+// longer. A session's id is its leader's pid, and the kernel doesn't hand out
+// a pid still in use as a session's id, so the session itself can't be
+// mistaken; a member's own pid can be reused in the moment between reading
+// procRoot and the kill. As pid 1 that can only be one of the script's own
+// descendants, and the namespace kill follows anyway. Where procRoot can't
+// be read it does nothing.
+func killSession(procRoot string, sid int) {
+	self := os.Getpid()
+	for range sessionSweepPasses {
+		found := false
+		for _, pid := range sessionMembers(procRoot, sid) {
+			if pid == self {
+				continue
+			}
+			// Only a member it could signal keeps the sweep going: one it
+			// may not signal (EPERM) would make it spin to the pass limit.
+			if syscall.Kill(pid, syscall.SIGKILL) == nil {
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+		time.Sleep(sessionSweepPoll)
+	}
+}
+
+// sessionMembers is every live (not zombie) process procRoot lists whose
+// /proc/<pid>/stat session field (the sixth) is sid.
+func sessionMembers(procRoot string, sid int) []int {
+	// Reads are scoped to procRoot (os.Root), so a name can't lead outside it.
+	root, err := os.OpenRoot(procRoot)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		b, err := root.ReadFile(filepath.Join(e.Name(), "stat"))
+		if err != nil {
+			continue // it exited
+		}
+		if got, live, ok := statSession(string(b)); ok && live && got == sid {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// statSession is the session id in a /proc/<pid>/stat line, and whether the
+// process is live (neither zombie nor dead). The command name, in
+// parentheses, can hold spaces and parentheses itself, so the fields are
+// read after its last ")": state, ppid, pgrp, session.
+func statSession(stat string) (sid int, live, ok bool) {
+	i := strings.LastIndexByte(stat, ')')
+	if i < 0 {
+		return 0, false, false
+	}
+	f := strings.Fields(stat[i+1:])
+	if len(f) < 4 {
+		return 0, false, false
+	}
+	sid, err := strconv.Atoi(f[3])
+	if err != nil {
+		return 0, false, false
+	}
+	return sid, f[0] != "Z" && f[0] != "X", true
+}
+
+// execScript runs sr with no shell, in its own session, which is killed
+// whole at its timeout, at ctx's end, on abandon or cancel, and once more
+// after the script exits, so nothing it started outlives it (see the
+// comment at the top of this file for what the kill reaches).
 func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptResult {
-	runCtx, cancel := context.WithTimeout(ctx, sr.timeout)
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, sr.path) // #nosec G204 -- an allowlisted, resolved and ownership-checked path; no shell, no arguments
 	cmd.Env = sr.env
 	if cmd.Env == nil {
 		cmd.Env = []string{}
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	killGroup := func() error {
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return err
+	// Setsid makes the script a session leader, so its session id and its
+	// process group id are both its pid.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	killAll := func() error {
+		_ = cmd.Process.Kill()
+		groupErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killSession(procRoot, cmd.Process.Pid)
+		if adapterPID() == containerInitPID {
+			killEveryoneButMe()
+		}
+		if groupErr != nil && !errors.Is(groupErr, syscall.ESRCH) {
+			return groupErr
 		}
 		return os.ErrProcessDone
 	}
-	cmd.Cancel = killGroup
+	cmd.Cancel = killAll
 	cmd.WaitDelay = scriptKillGrace
 	stdout := &cappedBuffer{max: scriptStdoutCap}
 	stderr := &tailBuffer{max: scriptStderrCap}
@@ -321,9 +466,20 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 
 	var res scriptResult
 	if err := cmd.Start(); err != nil {
-		res.startErr = err
+		res.exitCode = -1
+		if ctx.Err() != nil {
+			res.stopped = true
+		} else {
+			res.startErr = err
+		}
 		return res
 	}
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(sr.timeout, func() {
+		timedOut.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
 	// The watcher ends before res is read, so an abandon it took is
 	// always seen; one it didn't take stays on the channel for the
 	// adapter's own check.
@@ -345,7 +501,14 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 		}
 	}()
 	err := cmd.Wait()
-	_ = killGroup()
+	timer.Stop()
+	_ = killAll()
+	if adapterPID() == containerInitPID {
+		// Only now, with the script itself reaped by Wait: as init the
+		// worker inherits every orphan the kill left, and an unreaped one
+		// stays a zombie.
+		reapKilledChildren(leftoverReapBound)
+	}
 	close(stopWatch)
 	<-watchDone
 	res.abandoned, res.canceled = watchedAbandon, watchedCancel
@@ -358,7 +521,7 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	case res.abandoned, res.canceled:
 	case ctx.Err() != nil:
 		res.stopped = true
-	case errors.Is(runCtx.Err(), context.DeadlineExceeded) && !exitedOnItsOwn:
+	case timedOut.Load() && !exitedOnItsOwn:
 		res.timedOut = true
 	}
 	var exitErr *exec.ExitError
@@ -366,8 +529,8 @@ func execScript(ctx context.Context, sr *scriptRun, sig scriptSignals) scriptRes
 	case err == nil:
 	case errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil:
 		// The script exited, and something it started held its pipes
-		// past the grace: the exit is the script's, and the group is
-		// killed above.
+		// past the grace: the exit is the script's, and what it started
+		// is killed above.
 		res.exitCode = cmd.ProcessState.ExitCode()
 	case errors.As(err, &exitErr):
 		res.exitCode = exitErr.ExitCode()

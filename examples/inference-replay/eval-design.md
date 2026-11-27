@@ -61,9 +61,9 @@ Three properties make this sound for grading:
   kernel, and the others listed there). That includes settings like temperature, max tokens,
   reasoning settings and tool choice; only fields that change how the answer is delivered
   (`stream`) or who is asking (`user`, `metadata`) are left out. A stored answer is a real sample from the model for
-  that exact input. What serving it loses is independence between samples, and under pass-only
-  recordings (below) it is also a sample drawn only from runs that passed, which biases a replayed
-  run towards passing.
+  that exact input. What serving it loses is independence between samples. The shared nightly
+  cache keeps answers from failing runs as well as passing ones (below), so it is not biased
+  towards passing; a pull request's own answers and the merge copy stay pass-only.
 - **Tools still run.** Only model calls are replayed. `kubectl`, `gcloud`, scripts and GitHub
   writes execute live, and the verifiers grade the live state and the delivered report. A tool
   result that differs from the recording changes the next request, which misses, and from there
@@ -535,8 +535,8 @@ writer be a different account that runs outside the cluster: the nightly uploads
 inside the cluster, the job copies them out while it runs, and only these two can put them in the
 shared cache:
 
-- **The nightly.** It runs `main`'s code as `eval-baseline-recorder` and uploads answers from runs
-  that passed. It streams them out of the cluster as it goes, the way it already streams its
+- **The nightly.** It runs `main`'s code as `eval-baseline-recorder` and uploads the answers its
+  graded runs gave. It streams them out of the cluster as it goes, the way it already streams its
   results, instead of keeping them there until the end. Its eval cluster is a pool project too, so a
   pull request job could reach in and change answers left sitting there for hours.
 - **A copy job that runs when a pull request merges.** It runs as a trusted account and copies the
@@ -579,7 +579,7 @@ is read.
 ```mermaid
 flowchart LR
     subgraph trusted["Trusted writers (outside the eval cluster)"]
-        nightly["Nightly run<br/>(saves passing runs, never replays)"]
+        nightly["Nightly run<br/>(saves graded runs, never replays)"]
         copy["Merge copy job<br/>(copies a merged PR's answers)"]
     end
     pre["Pull request run<br/>(uses the pull request's code)"]
@@ -597,8 +597,8 @@ flowchart LR
 
 Protecting writes isn't enough. The proxy decides when two requests match, so whoever controls it
 controls what gets replayed. If a pull request could change the normalizer, it could make its
-requests match `main`'s passing recordings, by accident or on purpose (say, by swapping every tool
-result for the same placeholder). The old passing answers would be replayed, and a broken pull
+requests match `main`'s recordings, by accident or on purpose (say, by swapping every tool
+result for the same placeholder). The old answers would be replayed, and a broken pull
 request would pass without anything being written to the cache. So:
 
 - the proxy and its normalizer are built from the base branch (`PULL_BASE_SHA`), the same way the
@@ -711,14 +711,21 @@ flowchart TD
     own -- "no" --> model --> save
 ```
 
-### Only save answers from runs that passed
+### Save every real answer from graded runs
 
-A replayed answer leads to the same result as the run it came from. If we saved answers from a run
-that failed by bad luck, every pull request that hit those answers would fail too, until a prompt
-change cleared them. So we only keep answers from runs that passed. That way a pull request that
-doesn't touch a case replays a passing run, and a pull request that does touch it changes the
-requests and runs live. The writers above apply that rule: the nightly uploads only passing runs,
-and the merge copy takes only the merged pull request's last passing presubmit.
+The nightly publishes every answer a graded run got, whether that run passed or failed. Keeping
+only passing runs' answers made a model-driven flaky case look healthier on replay than live: a
+night that passed a case once in three runs left one recording, and every replayed run followed
+it. Serving an answer from a failing run is safe for the same reason serving any answer is: the
+key covers the whole conversation, every tool result included, so an answer from a run that broke
+for an infrastructure reason is served only when the same inputs recur. The merge copy, not built,
+still takes only the merged pull request's last passing presubmit, since there one failed sample
+is the problem.
+
+Only real answers are stored: record mode refuses a non-200 response, a stream cut short, a client
+that went away, an answer with no content and no tool calls, a fallback's answer, and a reply whose
+`finish_reason` names anything but `stop` or `tool_calls` (cut off at the token limit, filtered). A
+reply naming none is stored and served as `stop`; every line logs the raw value.
 
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
@@ -726,39 +733,40 @@ some of those runs fail. Most requests can be tied to their run after the fact w
 have, and the rest carry a run tag (below). A worker's request names the card it's working on (its first
 message is "work kanban task t\_…"), and a front door's request names the cards it created (what
 its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
-and whether it passed. So the copy job can match each saved answer to its card, the card to its
-run, and the run to pass or fail, and copy only the passing ones. A front door's first request
+and whether it passed. So the nightly's publisher can match each saved answer to its card and the
+card to a graded run, and copy what graded runs gave. Only bench-gate's grading says which attempt
+of a repetition counted, so an answer waits for its case to be graded, though not for a pass. The
+merge copy, not built, would match the same way and still take only the passing presubmit's. A front door's first request
 names no card at all, only the case's prompt, and the board reads before its first card name none
 either. Those are matched by the run tag instead: on an eval install the agent stamps every model
 request with its run, case and repetition (`X-Kube-Agents-Eval-Run`), the proxy logs it, and the
 harness writes the same tag beside each run's `results.json`. The run part is new on every
 attempt, so a retried attempt's requests never count for the attempt that was graded. A request
 with a card must also agree with its tag; when they name different runs, its answer isn't copied.
-A request with neither a card nor a tag isn't copied at all.
+A request with neither a card nor a tag isn't copied at all, nor is one from traffic no graded run
+owns.
 
-**Every passing answer is kept, and handed out in turn.** Each case runs three times, and the runs
-often answer the same request differently. If the cache kept only the first answer to each request,
-a failing run that happened to answer first would cost the request its passing answers, and every
-replayed run of the case would follow that one recording, so three runs would be one sample
-counted three times. So the cache keeps every distinct answer to a request, each under a name made
-of the request's fingerprint and a hash of the answer exactly as it is stored and served, written
-once like every other object; only those a passing run gave are published, decided answer by
-answer, so two runs that gave the same answer share one file and two that differed in any served
-word or action never do. The replay proxy hands a request's answers out in turn, each as often as
-passing runs gave it: a request whose passing runs answered one way nine times and another way once
-is served the second answer one time in ten, in a fixed order, rather than every other time.
-Identical answers share one file, so without the count a rare answer would be served as often as
-the common one. Once a run is served one answer, its next request holds that answer, so it only
-matches what followed that answer in a recording. Each proxy pod keeps its own count, and two runs that ask at
-once can take turns in either order, so this spreads runs across recordings rather than giving each
-run its own. Giving each run exactly one recording would mean serving by the run tag above, which
-the proxy logs but does not serve by yet.
+**Every answer is kept, and picked by a seeded weighted draw.** Each case runs three times, and the
+runs often answer the same request differently. If the cache kept only the first answer to each
+request, every replayed run of the case would follow that one recording, so three runs would be one
+sample counted three times. So the cache keeps every distinct answer to a request, each under a
+name made of the request's fingerprint and a hash of the answer exactly as it is stored and served,
+written once like every other object, so two runs that gave the same answer share one file and two
+that differed in any served word or action never do. The replay proxy picks among a request's
+answers at random in proportion to how often graded runs gave each, with a seed made from the run
+tag above (run id, case, repetition), the key and how often this pod already looked that pair up. A rotation would spread repetitions more evenly
+than the model does: if one answer leads to failure a third of the time, live runs all take it
+about one run in 27 and the case goes red, which a rotation over three repetitions never does. The
+draw keeps that, and stays reproducible: the same run makes the same picks, and a `/retest` (a new
+run id) draws again, as a live re-run would, and so does a run re-sending the same request. A refused answer falls through to a draw over the rest
+by their weights; the request goes live only when every answer is refused. An untagged request
+seeds from the key and the proxy pod's count of untagged lookups of it.
 
-The lane loads only answers that a passing run of a night inside its 30-hour window produced
-(older-layout answers aside). A
-night's record lists the answers its passing runs gave, so an older object that a later night only
-found already in the bucket never comes in on that night's record. The record also counts how many
-requests from passing runs got each answer, and the lane adds the counts of the nights in its window.
+The lane loads only answers that a graded run of a night inside its 30-hour window produced
+(older-layout answers aside). A night's record lists the answers its graded runs gave, so an older
+object that a later night only found already in the bucket never comes in on that night's record.
+The record also counts how many requests from graded runs got each answer, and the lane adds the
+counts of the nights in its window.
 
 ### Prompts change often
 
@@ -810,10 +818,10 @@ shadow mode or the lane shows that happens often, keeping one run live is the ch
 
 ## What changes for the gate
 
-When runs replay, the three runs of a case are no longer independent. And because we only save
-passing runs, a case a pull request didn't touch will pass on replay. So the "all three runs failed"
-rule can only be triggered by the parts of a run that ran live. That's what we want for a pull
-request that didn't cause the failure. But it raises three things the eval crew needs to decide
+When runs replay, the three runs of a case are no longer independent. The cache keeps failing
+runs' answers too, so a case that is flaky on `main` can go red on replay, as it can live; a case
+`main` passes reliably will pass on replay, and the "all three runs failed" rule is then triggered
+by the parts of a run that ran live or by the model's own odds on `main`. But it raises three things the eval crew needs to decide
 before stage 3 of the rollout (turning replay on):
 
 - **Comparisons with `main` get biased.** Two checks compare a pull request with `main`'s numbers
@@ -822,8 +830,10 @@ before stage 3 of the rollout (turning replay on):
   both. One option is to count only runs that went live before the part of the case that gets
   checked; another is to compare against a `main` baseline that was also replayed. Caching the judge
   (open questions) would make this worse.
-- **Flaky cases look stable.** A case that's flaky on `main` stops showing its flakiness on unrelated
-  pull requests. The nightly still shows it.
+- **Flaky cases look steadier on a pull request's own answers.** The shared nightly cache serves a
+  flaky case's failing answers too, so it stays as flaky on replay as live. A pull request's own
+  answers and the merge copy keep only passing runs' answers, so where those serve, a case flaky on
+  `main` can look steadier than it is. The nightly still shows it.
 - **Token counts look like the model ran.** A replayed answer comes with the token counts from the
   original run. So the eval record's token numbers, and rung 3's check that the run really called a
   model, both act as if the model was called. To show real savings per run, we match the proxy's log
@@ -906,10 +916,11 @@ before stage 3 of the rollout (turning replay on):
    recording night ran. Its results
    don't block anything and aren't written to the evidence store. For this the nightly saves its
    answers, every distinct answer to each fingerprint, as the trusted writer in "Who can write to
-   the cache"; the lane only reads them, and hands a request's answers out in turn ("Only save
-   answers from runs that passed"). For each conversation it records
+   the cache"; the lane only reads them, and picks among a request's answers by a seeded weighted
+   draw ("Save every real answer from graded runs"). For each conversation it records
    how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
-   short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
+   short cleaned-up snippets of both sides), and whether the replayed run passed; each case's
+   replayed verdicts sit beside the newest recording night's on the same commit. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
    runs live after its first miss, each one tells us its first miss only, which is what replay would
    actually save.
@@ -920,8 +931,8 @@ before stage 3 of the rollout (turning replay on):
    **Built:** the dev-install runs ("Replay lane trials"), the CI wiring
    ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane))
    and the bucket ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)). A nightly running
-   as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
-   that account can write. It works out which run each answer came from using the cards each
+   as `eval-baseline-recorder` records, and uploads the answers graded runs gave, passing or
+   failing, to a bucket only that account can write. It works out which run each answer came from using the cards each
    request and each run's results name, or, for a request with no card, from the run tag the agent
    stamps on it, and a request whose tag and card name different runs is not published ("Telling
    the runs in a build apart"). A periodic at 06:00 UTC replays the previous nights' complete
@@ -930,9 +941,9 @@ before stage 3 of the rollout (turning replay on):
    it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
    mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
    served before each first miss, the miss causes, and each case's verdicts beside the newest recording night's on the same commit.
-   Only passing runs' answers are published, so replay could push a flaky case toward passing; the
-   lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) therefore run live before the
-   cache is seeded and then replayed, and the report sets the two pass rates side by side.
+   The lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) run live before the cache is
+   seeded and then replayed, and the report sets the two pass rates side by side, which shows
+   whether replay keeps a flaky case as flaky as live.
    The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
    into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
    behind it, with the Prow runner's `roles/container.admin`, and the nightly then publishes what
@@ -976,9 +987,9 @@ request, so the gate stays fair, and we add cases as each one's lane results hol
 ## Open questions
 
 - **Serving by run, for one recording per run.** Every request already carries its run tag, and
-  the proxy logs it. Serving each of the three runs its own recording means choosing among a key's
-  answers by that tag rather than in turn. Worth doing only if shadow mode shows replay is worth
-  turning on.
+  the proxy seeds its pick among a key's answers with it. Serving each of the three runs its own
+  whole recording (every key from one recorded run) would go further. Worth doing only if shadow
+  mode shows replay is worth turning on.
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
