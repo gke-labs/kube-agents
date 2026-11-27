@@ -81,8 +81,9 @@ type Config struct {
 	// unauthorized callers cannot rely on the hook for it.
 	//
 	// The hook is called on the request's goroutine and must be safe for concurrent use. It
-	// runs before the request is counted for CallerLimits or takes a MaxInFlight slot and gets no deadline beyond the
-	// request's context, so a hook that does I/O must bound it itself.
+	// runs before the request is counted for CallerLimits or takes a MaxInFlight slot and
+	// gets no deadline beyond the request's context, so a hook that does I/O must bound it
+	// itself.
 	Authorize func(AuthorizeAttributes) error
 	// ExtraCallerHeaders names request headers the handler strips before forwarding, on
 	// every path (plain, watch and upgrade), besides the ones it always strips: headers
@@ -108,11 +109,14 @@ type Config struct {
 	MaxInFlight int
 	// CallerLimits bounds what one caller may have open at once, so that a single caller can
 	// neither fill MaxInFlight, which every caller shares, nor open watches without end,
-	// which MaxInFlight does not count. It is asked on every request that reaches the
-	// MaxInFlight check, and a caller at the limit for the request's kind is answered 429
-	// with Retry-After, as MaxInFlight answers, audited as throttled with the rejection
-	// reason ReasonCallerInFlightLimit or ReasonCallerLongRunningLimit. Nil limits no
-	// caller, and so does a zero CallerLimits for the callers it is returned for.
+	// which MaxInFlight does not count; and, through CallerLimits.Group, what a set of
+	// callers may have open between them. It is asked on every request that reaches the
+	// MaxInFlight check, and a caller that is at the limit for the request's kind, or whose
+	// group is, is answered 429 with Retry-After, as MaxInFlight answers, audited as
+	// throttled with the rejection reason ReasonCallerInFlightLimit,
+	// ReasonCallerLongRunningLimit, ReasonCallerGroupInFlightLimit or
+	// ReasonCallerGroupLongRunningLimit. Nil limits no caller, and so does a zero
+	// CallerLimits for the callers it is returned for.
 	//
 	// The check runs after Authorize and Policy, so a request they refuse counts for
 	// nothing, and before the MaxInFlight slot, so a caller at its own limit never takes a
@@ -121,11 +125,12 @@ type Config struct {
 	// upgraded connection closes. One answered from the response cache or joined to
 	// another's fetch is counted like any other, as MaxInFlight counts it.
 	//
-	// Callers are told apart by CallerIdentity.Username alone. The partition is left out:
-	// it names an upstream credential, usually one many callers share, and a caller whose
-	// requests fall in several partitions would get the limit once for each. An embedder
-	// whose authenticators can give two principals one username must make the usernames
-	// distinct.
+	// Callers are told apart by CallerLimits.Key, which is CallerIdentity.Username unless
+	// the func sets it. The partition is not part of the default: it names an upstream
+	// credential, usually one many callers share, and a caller whose requests fall in
+	// several partitions would get the limit once for each. An embedder whose authenticators
+	// can give two principals one username, or that wants a count per pod of one
+	// ServiceAccount, sets the Key.
 	//
 	// The func runs on the request's goroutine with the authenticated caller, which it must
 	// not modify. It must be safe for concurrent use, must not block and must not panic. Its
@@ -428,11 +433,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	releaseCaller, reason, ok := h.callers.acquire(caller, longRunning)
 	if !ok {
 		ev.Outcome, ev.Reason = OutcomeThrottled, reason
-		message := callerThrottledMessage
-		if longRunning {
-			message = callerLongRunningMessage
-		}
-		writeThrottled(w, message)
+		writeThrottled(w, callerLimitMessage(reason))
 		return
 	}
 	defer releaseCaller()

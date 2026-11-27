@@ -154,9 +154,10 @@ type Options struct {
 	// CallerLimits is k8sapiproxy.Config.CallerLimits, for an embedder that limits some
 	// callers and not others; nil leaves the limits to --max-in-flight-per-caller and
 	// --max-long-running-per-caller, which the stock binary leaves off. The flags are the
-	// limits of a caller this func does not answer for: a field it returns as zero takes
-	// the flag's value, and a negative field is no limit for that caller whatever the flag
-	// says.
+	// limits of a caller this func does not answer for: a MaxInFlight or MaxLongRunning it
+	// returns as zero takes the flag's value, and a negative one is no limit for that caller
+	// whatever the flag says. Its Key and its group fields are the handler's as returned;
+	// no flag sets them.
 	CallerLimits func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits
 }
 
@@ -700,9 +701,10 @@ func buildHandler(
 
 // callerLimitsFunc is the k8sapiproxy.Config.CallerLimits the flags and the embedder ask
 // for: nil when neither sets a limit, the flags' limits for every caller when the embedder
-// has no func, and otherwise the embedder's answer with each field it leaves zero taken
-// from the flags. A negative flag is an error; a negative field from the embedder passes
-// through, and the handler reads it as no limit.
+// has no func, and otherwise the embedder's answer with a MaxInFlight or MaxLongRunning it
+// leaves zero taken from the flags, and its Key and group fields untouched. A negative flag
+// is an error; a negative field from the embedder passes through, and the handler reads it
+// as no limit.
 func callerLimitsFunc(cfg proxyConfig) (func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits, error) {
 	if cfg.maxInFlightPerCaller < 0 {
 		return nil, fmt.Errorf("--%s %d is negative", maxInFlightPerCallerFlag, cfg.maxInFlightPerCaller)

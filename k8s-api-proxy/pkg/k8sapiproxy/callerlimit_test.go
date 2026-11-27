@@ -7,10 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +31,9 @@ const (
 	limitLogPath     = "/api/v1/namespaces/default/pods/web/log?follow=true"
 	limitExecPath    = "/api/v1/namespaces/default/pods/web/exec?command=sh"
 	limitWritePath   = "/api/v1/namespaces/default/configmaps"
+
+	// testPodExtra is the CallerIdentity.Extra key a test's limits func reads a pod from.
+	testPodExtra = "test/pod-name"
 
 	limitTestBody = `{"kind":"PodList","apiVersion":"v1","items":[]}`
 )
@@ -194,7 +196,7 @@ func TestCallerInFlightLimit(t *testing.T) {
 	if rec := <-held; rec.Code != http.StatusOK {
 		t.Fatalf("held request: code = %d, want 200", rec.Code)
 	}
-	if got := hh.callers.callers(); got != 0 {
+	if got := hh.callers.entries(); got != 0 {
 		t.Errorf("%d callers still counted after the last request finished, want 0", got)
 	}
 	if got := len(hh.slots); got != 0 {
@@ -230,8 +232,8 @@ func TestCallerLimitsDoNotCountRefusedRequests(t *testing.T) {
 	if rec := getAs(h, unlimitedCaller, limitPodsPath); rec.Code != http.StatusForbidden {
 		t.Fatalf("caller Authorize refuses: code = %d, want 403", rec.Code)
 	}
-	if asked != 0 || hh.callers.callers() != 0 {
-		t.Errorf("limits asked %d times and %d callers counted for refused requests, want neither", asked, hh.callers.callers())
+	if asked != 0 || hh.callers.entries() != 0 {
+		t.Errorf("limits asked %d times and %d callers counted for refused requests, want neither", asked, hh.callers.entries())
 	}
 }
 
@@ -253,7 +255,7 @@ func TestCallerLimitReleasedWhenTheSharedCapRefuses(t *testing.T) {
 	if ev := lastEvent(t, sink); ev.Outcome != OutcomeThrottled || ev.Reason != ReasonNone {
 		t.Errorf("audit = (%q, %q), want throttled with no reason", ev.Outcome, ev.Reason)
 	}
-	if got := hh.callers.callers(); got != 0 {
+	if got := hh.callers.entries(); got != 0 {
 		t.Errorf("%d callers counted after the shared cap refused the request, want 0", got)
 	}
 	up.release()
@@ -288,7 +290,7 @@ func TestCallerLongRunningLimit(t *testing.T) {
 		if rec := <-held; rec.Code != http.StatusOK {
 			t.Fatalf("held watch: code = %d, want 200", rec.Code)
 		}
-		if got := hh.callers.callers(); got != 0 {
+		if got := hh.callers.entries(); got != 0 {
 			t.Errorf("%d callers counted after the watch ended, want 0", got)
 		}
 		if rec := getAs(h, limitedCaller, limitWatchPath); rec.Code != http.StatusOK {
@@ -305,7 +307,7 @@ func TestCallerLongRunningLimit(t *testing.T) {
 
 		disconnect()
 		<-held
-		if got := hh.callers.callers(); got != 0 {
+		if got := hh.callers.entries(); got != 0 {
 			t.Errorf("%d callers counted after the caller disconnected, want 0", got)
 		}
 		if rec := getAs(h, limitedCaller, limitWatchPath); rec.Code != http.StatusOK {
@@ -370,96 +372,248 @@ func TestCallerLongRunningLimitHoldsAnUpgradedConnection(t *testing.T) {
 		_ = callerSide.Close()
 		<-done
 		_ = proxySide.Close()
-		if got := hh.callers.callers(); got != 0 {
+		if got := hh.callers.entries(); got != 0 {
 			t.Fatalf("round %d: %d callers counted after the upgraded connection closed, want 0", round, got)
 		}
 	}
 }
 
-// Many goroutines for one limited caller: the upstream never sees more of its requests at
-// once than its limits allow, of either kind, every answer is a 200 or a 429, an unlimited
-// caller is never throttled, and nothing is left counted.
-func TestCallerLimitsUnderConcurrency(t *testing.T) {
+// Many goroutines at once against an upstream that keeps every admitted request open: the
+// limiter admits exactly as many as the limit and refuses every other, for a caller's own
+// limit and for a group's, for requests in flight and for long-running ones, and when the
+// held requests end nothing is left counted. Three rounds, so a round's releases are what
+// admit the next.
+func TestCallerLimitsAdmitExactlyTheLimitUnderConcurrency(t *testing.T) {
 	const (
-		maxInFlight    = 3
-		maxLongRunning = 2
-		goroutines     = 48
-		requestsEach   = 40
+		limit      = 5
+		goroutines = 64
+		rounds     = 3
+		// roomy is a limit no round reaches, for the count that is not under test.
+		roomy = goroutines * 2
+		group = "workers"
 	)
-	var inFlight, longRunning, peakInFlight, peakLongRunning atomic.Int64
-	peak := func(p *atomic.Int64, n int64) {
-		for {
-			old := p.Load()
-			if n <= old || p.CompareAndSwap(old, n) {
-				return
-			}
-		}
+	// The caller's own limit: every goroutine is the same caller. The group's: every
+	// goroutine is a caller of its own, with room of its own, in one group.
+	ownLimit := func(*CallerIdentity) CallerLimits {
+		return CallerLimits{MaxInFlight: limit, MaxLongRunning: limit, Group: group, GroupMaxInFlight: roomy, GroupMaxLongRunning: roomy}
 	}
-	upstream := &fakeUpstream{handler: func(_ string, req *http.Request) (*http.Response, error) {
-		if req.Header.Get(testCallerHeader) == limitedCaller {
-			count, top := &inFlight, &peakInFlight
-			if req.URL.Query().Has("watch") {
-				count, top = &longRunning, &peakLongRunning
-			}
-			peak(top, count.Add(1))
-			runtime.Gosched()
-			count.Add(-1)
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{contentTypeJSON}},
-			Body:       io.NopCloser(strings.NewReader(limitTestBody)),
-		}, nil
-	}}
-	h, _ := newTestHandler(t, Config{
-		Authenticator: headerAuthenticator{},
-		Upstream:      upstream,
-		CallerLimits:  limitsFor(CallerLimits{MaxInFlight: maxInFlight, MaxLongRunning: maxLongRunning}),
-	})
-	hh := h.(*handler)
+	groupLimit := func(*CallerIdentity) CallerLimits {
+		return CallerLimits{MaxInFlight: roomy, MaxLongRunning: roomy, Group: group, GroupMaxInFlight: limit, GroupMaxLongRunning: limit}
+	}
+	sameCaller := func(int) string { return limitedCaller }
+	ownCaller := func(g int) string { return limitedCaller + "-" + strconv.Itoa(g) }
 
-	var served, throttled, unexpected, unlimitedThrottled atomic.Int64
-	var wg sync.WaitGroup
-	for g := range goroutines {
-		wg.Go(func() {
-			caller, path := limitedCaller, limitNSPath
-			if g%2 == 1 {
-				path = limitWatchPath
-			}
-			if g%8 == 0 {
-				caller = unlimitedCaller
-			}
-			for range requestsEach {
-				switch code := getAs(h, caller, path).Code; {
-				case code == http.StatusOK:
-					served.Add(1)
-				case code == http.StatusTooManyRequests && caller == limitedCaller:
-					throttled.Add(1)
-				case code == http.StatusTooManyRequests:
-					unlimitedThrottled.Add(1)
-				default:
-					unexpected.Add(1)
+	for _, tc := range []struct {
+		name   string
+		limits func(*CallerIdentity) CallerLimits
+		caller func(int) string
+		path   string
+		reason RejectionReason
+	}{
+		{"a caller's requests in flight", ownLimit, sameCaller, limitPodsPath, ReasonCallerInFlightLimit},
+		{"a caller's long-running requests", ownLimit, sameCaller, limitWatchPath, ReasonCallerLongRunningLimit},
+		{"a group's requests in flight", groupLimit, ownCaller, limitPodsPath, ReasonCallerGroupInFlightLimit},
+		{"a group's long-running requests", groupLimit, ownCaller, limitWatchPath, ReasonCallerGroupLongRunningLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for round := range rounds {
+				up := &holdingUpstream{entered: make(chan struct{}, goroutines), gate: make(chan struct{})}
+				up.release = sync.OnceFunc(func() { close(up.gate) })
+				t.Cleanup(up.release)
+				sink := &recordingSink{}
+				h, _ := newTestHandler(t, Config{Authenticator: headerAuthenticator{}, Upstream: up, Audit: sink, CallerLimits: tc.limits})
+				hh := h.(*handler)
+
+				answers := make(chan int, goroutines)
+				start := make(chan struct{})
+				for g := range goroutines {
+					req := callerRequest(context.Background(), tc.caller(g), http.MethodGet, tc.path)
+					req.Header.Set(testHoldHeader, "1")
+					go func() {
+						<-start
+						answers <- serve(h, req).Code
+					}()
+				}
+				close(start)
+
+				// Every request either reaches the upstream, where it is held, or is answered.
+				admitted, refused := 0, 0
+				for range goroutines {
+					select {
+					case <-up.entered:
+						admitted++
+					case code := <-answers:
+						if code != http.StatusTooManyRequests {
+							t.Errorf("round %d: a request not admitted was answered %d, want 429", round, code)
+						}
+						refused++
+					}
+				}
+				if admitted != limit || refused != goroutines-limit {
+					t.Fatalf("round %d: %d admitted and %d refused, want exactly %d and %d", round, admitted, refused, limit, goroutines-limit)
+				}
+				sink.mu.Lock()
+				for _, ev := range sink.events {
+					if ev.Outcome != OutcomeThrottled || ev.Reason != tc.reason {
+						t.Errorf("round %d: audit = (%q, %q), want (%q, %q)", round, ev.Outcome, ev.Reason, OutcomeThrottled, tc.reason)
+					}
+				}
+				sink.mu.Unlock()
+
+				up.release()
+				for range admitted {
+					if code := <-answers; code != http.StatusOK {
+						t.Errorf("round %d: an admitted request was answered %d, want 200", round, code)
+					}
+				}
+				if got := hh.callers.entries(); got != 0 {
+					t.Fatalf("round %d: %d keys and groups still counted with nothing open, want 0", round, got)
 				}
 			}
 		})
 	}
-	wg.Wait()
+}
 
-	if got := peakInFlight.Load(); got > maxInFlight {
-		t.Errorf("the upstream saw %d of the caller's requests at once, want at most %d", got, maxInFlight)
+// A request must have room under its caller's key and under its group: callers of one group
+// share the group's count whatever their keys, the refusal names the limit that was hit,
+// the key first, and each request is held to the group limits its own caller returned.
+func TestCallerGroupLimit(t *testing.T) {
+	const (
+		group      = "workers"
+		firstPod   = limitedCaller + "/pod-a"
+		secondPod  = limitedCaller + "/pod-b"
+		laxCaller  = "system:serviceaccount:agents:lax"
+		groupLimit = 2
+	)
+	limits := func(caller *CallerIdentity) CallerLimits {
+		switch caller.Username {
+		case unlimitedCaller:
+			return CallerLimits{}
+		case laxCaller:
+			// The same group with a higher limit of its own.
+			return CallerLimits{Group: group, GroupMaxInFlight: groupLimit + 1, GroupMaxLongRunning: groupLimit + 1}
+		}
+		// One username, counted per pod: the key the embedder chose.
+		return CallerLimits{Key: caller.Username + "/" + caller.Extra[testPodExtra][0], MaxInFlight: 1, MaxLongRunning: 1,
+			Group: group, GroupMaxInFlight: groupLimit, GroupMaxLongRunning: groupLimit}
 	}
-	if got := peakLongRunning.Load(); got > maxLongRunning {
-		t.Errorf("the upstream saw %d of the caller's watches at once, want at most %d", got, maxLongRunning)
+	pod := func(name string) *CallerIdentity {
+		return &CallerIdentity{Username: limitedCaller, Extra: map[string][]string{testPodExtra: {name}}}
 	}
-	if served.Load() == 0 || unexpected.Load() != 0 || unlimitedThrottled.Load() != 0 {
-		t.Errorf("served %d, throttled %d, other answers %d, unlimited caller throttled %d; want some served and only 200s and the limited caller's 429s",
-			served.Load(), throttled.Load(), unexpected.Load(), unlimitedThrottled.Load())
+	for name, longRunning := range map[string]bool{"in flight": false, "long-running": true} {
+		t.Run(name, func(t *testing.T) {
+			keyReason, groupReason := ReasonCallerInFlightLimit, ReasonCallerGroupInFlightLimit
+			if longRunning {
+				keyReason, groupReason = ReasonCallerLongRunningLimit, ReasonCallerGroupLongRunningLimit
+			}
+			l := newCallerLimiter(limits)
+			first, _, ok := l.acquire(pod("pod-a"), longRunning)
+			if !ok {
+				t.Fatal("the first pod's request was refused")
+			}
+			if _, reason, ok := l.acquire(pod("pod-a"), longRunning); ok || reason != keyReason {
+				t.Errorf("the first pod's second request = (ok %t, %q), want refused with %q", ok, reason, keyReason)
+			}
+			second, _, ok := l.acquire(pod("pod-b"), longRunning)
+			if !ok {
+				t.Fatal("the second pod's request was refused: pods of one username are counted apart")
+			}
+			// Both the key and the group are full: the key answers.
+			if _, reason, ok := l.acquire(pod("pod-b"), longRunning); ok || reason != keyReason {
+				t.Errorf("the second pod's second request = (ok %t, %q), want refused with %q", ok, reason, keyReason)
+			}
+			if _, reason, ok := l.acquire(pod("pod-c"), longRunning); ok || reason != groupReason {
+				t.Errorf("a third pod's request = (ok %t, %q), want refused with %q: the group is full", ok, reason, groupReason)
+			}
+			if got, want := l.entries(), len([]string{firstPod, secondPod, group}); got != want {
+				t.Errorf("%d keys and groups counted, want %d: a refused request leaves no entry", got, want)
+			}
+			// The other kind has room of its own, for the key and for the group.
+			other, _, ok := l.acquire(pod("pod-a"), !longRunning)
+			if !ok {
+				t.Fatal("the first pod's request of the other kind was refused")
+			}
+			other()
+			// The limits in force are the request's own caller's: a caller that returns a
+			// higher limit for the group is admitted against the same count, once.
+			lax, _, ok := l.acquire(&CallerIdentity{Username: laxCaller}, longRunning)
+			if !ok {
+				t.Fatal("a caller with a higher limit for the group was refused under it")
+			}
+			if _, reason, ok := l.acquire(&CallerIdentity{Username: laxCaller}, longRunning); ok || reason != groupReason {
+				t.Errorf("that caller's second request = (ok %t, %q), want refused with %q", ok, reason, groupReason)
+			}
+			if release, _, ok := l.acquire(&CallerIdentity{Username: unlimitedCaller}, longRunning); !ok {
+				t.Error("a caller outside the group was refused")
+			} else {
+				release()
+			}
+			lax()
+
+			// One release gives back the key and the group together.
+			first()
+			first()
+			third, _, ok := l.acquire(pod("pod-a"), longRunning)
+			if !ok {
+				t.Fatal("the first pod was refused after its request ended")
+			}
+			for _, release := range []func(){second, third} {
+				release()
+			}
+			if got := l.entries(); got != 0 {
+				t.Errorf("%d keys and groups counted with nothing open, want 0", got)
+			}
+		})
 	}
-	if got := served.Load() + throttled.Load(); got != goroutines*requestsEach {
-		t.Errorf("%d requests answered, want %d", got, goroutines*requestsEach)
+}
+
+// Through the handler: a group refusal is the same 429, with the group's reason and message
+// in the audit record, the Status and the rejection metric, and it takes no shared slot.
+func TestCallerGroupLimitThroughTheHandler(t *testing.T) {
+	metrics := NewMetrics()
+	h, hh, up, sink := newLimitedHandler(t, Config{
+		Metrics:     metrics,
+		MaxInFlight: 4,
+		CallerLimits: func(caller *CallerIdentity) CallerLimits {
+			if caller.Username == unlimitedCaller {
+				return CallerLimits{}
+			}
+			return CallerLimits{MaxInFlight: 4, MaxLongRunning: 4, Group: "workers", GroupMaxInFlight: 1, GroupMaxLongRunning: 1}
+		},
+	})
+	const otherWorker = "system:serviceaccount:agents:other-worker"
+	heldList := up.hold(context.Background(), h, otherWorker, limitPodsPath)
+	heldWatch := up.hold(context.Background(), h, otherWorker, limitWatchPath)
+
+	wantCallerThrottled(t, getAs(h, limitedCaller, limitNSPath), sink, ReasonCallerGroupInFlightLimit, callerGroupThrottledMessage)
+	wantCallerThrottled(t, getAs(h, limitedCaller, limitWatchPath), sink, ReasonCallerGroupLongRunningLimit, callerGroupLongRunningMessage)
+	if got := len(hh.slots); got != 1 {
+		t.Errorf("%d shared slots taken, want 1: a caller refused for its group takes none", got)
 	}
-	if got := hh.callers.callers(); got != 0 {
-		t.Errorf("%d callers still counted with nothing in flight, want 0", got)
+	scraped := scrapeMetricsText(t, metrics)
+	for _, want := range []string{
+		`reason="caller_group_in_flight_limit",resource="namespaces",subresource="none",verb="list"} 1`,
+		`reason="caller_group_long_running_limit",resource="namespaces",subresource="none",verb="watch"} 1`,
+	} {
+		if !strings.Contains(scraped, want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+	if rec := getAs(h, unlimitedCaller, limitNSPath); rec.Code != http.StatusOK {
+		t.Errorf("a caller outside the group: code = %d, want 200", rec.Code)
+	}
+
+	up.release()
+	for _, held := range []<-chan *httptest.ResponseRecorder{heldList, heldWatch} {
+		if rec := <-held; rec.Code != http.StatusOK {
+			t.Errorf("held request: code = %d, want 200", rec.Code)
+		}
+	}
+	if got := hh.callers.entries(); got != 0 {
+		t.Errorf("%d keys and groups counted with nothing open, want 0", got)
+	}
+	if rec := getAs(h, limitedCaller, limitNSPath); rec.Code != http.StatusOK {
+		t.Errorf("after the group emptied: code = %d, want 200", rec.Code)
 	}
 }
 
@@ -480,7 +634,7 @@ func TestCallerLimitsUnset(t *testing.T) {
 			first := up.hold(context.Background(), h, limitedCaller, limitPodsPath)
 			second := up.hold(context.Background(), h, limitedCaller, limitPodsPath)
 			watch := up.hold(context.Background(), h, limitedCaller, limitWatchPath)
-			if got := hh.callers.callers(); got != 0 {
+			if got := hh.callers.entries(); got != 0 {
 				t.Errorf("%d callers counted, want 0", got)
 			}
 			rec := getAs(h, limitedCaller, limitNSPath)
@@ -531,7 +685,7 @@ func TestCallerLimiter(t *testing.T) {
 	// A release called twice gives back one count, not two.
 	release()
 	release()
-	if got := l.callers(); got != 1 {
+	if got := l.entries(); got != 1 {
 		t.Errorf("%d callers counted with a stream open, want 1", got)
 	}
 	again, _, ok := l.acquire(caller, false)
@@ -543,7 +697,7 @@ func TestCallerLimiter(t *testing.T) {
 	}
 	again()
 	stream()
-	if got := l.callers(); got != 0 {
+	if got := l.entries(); got != 0 {
 		t.Errorf("%d callers counted with nothing open, want 0", got)
 	}
 }

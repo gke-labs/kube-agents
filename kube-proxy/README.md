@@ -86,32 +86,48 @@ here reaches one.
 ## Worker limits
 
 Every caller shares the proxy's in-flight cap (`--max-in-flight`, 24 requests per replica), and a
-watch or a log follow is outside it. So that one worker can neither hold the shared slots nor open
-streams without end, the binary gives each caller the identity map names two limits of its own
-(`proxyserver.Options.CallerLimits`), per replica:
+watch or a log request is outside it. So that workers can neither hold the shared slots nor open
+streams without end, the binary limits the callers the identity map names
+(`proxyserver.Options.CallerLimits`), each pod on its own and all of them together, per replica:
 
-| Limit                                                | Default | Variable                              |
-| ---------------------------------------------------- | ------- | ------------------------------------- |
-| Requests in flight                                   | 8       | `KUBE_PROXY_PROFILE_MAX_IN_FLIGHT`    |
-| Watches, log follows and other long-running requests | 8       | `KUBE_PROXY_PROFILE_MAX_LONG_RUNNING` |
+| Limit                                         | One worker pod                            | All worker pods together                         |
+| --------------------------------------------- | ----------------------------------------- | ------------------------------------------------ |
+| Requests in flight                            | 8 (`KUBE_PROXY_PROFILE_MAX_IN_FLIGHT`)    | 16 (`KUBE_PROXY_PROFILE_GROUP_MAX_IN_FLIGHT`)    |
+| Watches, logs and other long-running requests | 8 (`KUBE_PROXY_PROFILE_MAX_LONG_RUNNING`) | 32 (`KUBE_PROXY_PROFILE_GROUP_MAX_LONG_RUNNING`) |
+
+Against the shared cap of 24, with the defaults: one worker pod takes at most 8 slots, all worker
+pods together at most 16, and 8 are always left to the shell and session pods, however many
+workers are busy and whatever they send. Two pods at their limit fill the workers' share, and a
+third then waits on the group. The group is what makes the reserve hold: per-pod limits alone
+would let three busy pods fill the cap. It is also the shape of the broker's control, which is one
+count for every profile caller (`CREDENTIAL_PROXY_PROFILE_SLOTS`, four commands). That variable is
+not reused: it counts whole `kubectl` commands, and these count HTTP requests, of which a command
+has several. Lowering `--max-in-flight` without lowering the group's limit shrinks the reserve.
+
+Long-running requests take none of the shared slots; their limits bound the connections and
+upstream watches workers keep open. Eight for a pod covers one `kubectl logs -f` over a selector,
+which follows up to five pods, beside a few watches, and 32 is four pods at that limit. Every `log`
+request counts as long-running, followed or not, as do `exec`, `attach`, `portforward` and `proxy`.
+
+A pod's limits are counted under its ServiceAccount username and the pod name its TokenReview
+carries, so pods of one profile and tier do not share them; a worker whose TokenReview names no
+pod, which the proxy's pod check does not admit, would be counted under the username. Eight in
+flight is less than a cold `kubectl` sends at once against an API server without aggregated
+discovery, about thirty requests, one for each group version. That discovery completes through
+client-go's retries of the `429`s. It is rare: aggregated discovery is two requests, and the
+proxy's discovery cache answers repeats quickly.
 
 A worker at a limit is answered `429 Too Many Requests` with `Retry-After: 1`, as the shared cap
 answers, which `kubectl` waits out and retries. The audit record's `rejection_reason` is
-`caller_in_flight_limit` or `caller_long_running_limit`. The two counts are separate, a request
-the gate or the policy refuses counts for neither, and a stream counts until it closes. The
+`caller_in_flight_limit` or `caller_long_running_limit` for the pod's own limit, and
+`caller_group_in_flight_limit` or `caller_group_long_running_limit` for the workers' together. The
+in-flight and long-running counts are separate, a request the gate or the policy refuses counts
+for neither, and a stream counts until it closes. The
 [`k8s-api-proxy` README](../k8s-api-proxy/README.md) owns the mechanics.
 
-The limits belong to the worker's ServiceAccount username, so the pods of one profile and tier
-share them. Callers outside the map, the shell and session pods, get no limit from this binary;
-`--max-in-flight-per-caller` and `--max-long-running-per-caller` set one for them.
-
-Eight requests in flight is a third of the shared 24, so two workers at their limit leave the
-other callers a third of the slots. It is twice the four concurrent commands the broker allows the
-profile role (`CREDENTIAL_PROXY_PROFILE_SLOTS`), because one `kubectl` command is several requests:
-against an API server without aggregated discovery it fetches every group version at once, and a
-request answered `429` ten times fails. The broker's variable is not reused, since it counts
-commands across all profile callers and these count requests per ServiceAccount. Eight streams
-cover one `kubectl logs -f` over a selector, which follows up to five pods, beside a few watches.
+Callers outside the map, the shell and session pods, get no limit from this binary;
+`--max-in-flight-per-caller` and `--max-long-running-per-caller` set one for them. Those flags do
+not apply to a worker: a worker limit set to `0` is no limit for workers, whatever the flags say.
 
 ## Configuration
 
@@ -124,15 +140,18 @@ The gate reads four environment variables, the ones the broker reads, in the sam
 | `A2A_TASK_SIGNING_PUBLIC_KEYS`        | The task-signing public keys, comma separated: one, or two during a key rotation.                                                         |
 | `A2A_TASK_CREDENTIAL_MAX_LIFETIME`    | The longest lifetime a credential may have, as a Go duration (`6h` when unset, at most `168h`).                                           |
 
-The worker limits are two more, which only this binary reads:
+The worker limits are four more, which only this binary reads. Each is a non-negative integer;
+unset or blank is the default shown, and `0` removes that limit:
 
-| Variable                              | Value                                                                                                |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `KUBE_PROXY_PROFILE_MAX_IN_FLIGHT`    | Requests one worker ServiceAccount may have in flight: an integer, `8` when unset, `0` for no limit. |
-| `KUBE_PROXY_PROFILE_MAX_LONG_RUNNING` | Long-running requests it may have open: an integer, `8` when unset, `0` for no limit.                |
+| Variable                                    | Value                                                                       |
+| ------------------------------------------- | --------------------------------------------------------------------------- |
+| `KUBE_PROXY_PROFILE_MAX_IN_FLIGHT`          | Requests one worker pod may have in flight. Default `8`.                    |
+| `KUBE_PROXY_PROFILE_MAX_LONG_RUNNING`       | Long-running requests one worker pod may have open. Default `8`.            |
+| `KUBE_PROXY_PROFILE_GROUP_MAX_IN_FLIGHT`    | Requests all worker pods together may have in flight. Default `16`.         |
+| `KUBE_PROXY_PROFILE_GROUP_MAX_LONG_RUNNING` | Long-running requests all worker pods together may have open. Default `32`. |
 
 The gate is off by default: with `CREDENTIAL_PROXY_PROFILE_IDENTITIES` unset, blank or `{}`, the
-binary behaves as `k8s-api-proxy` does and reads none of the other five, so a profile audience set
+binary behaves as `k8s-api-proxy` does and reads none of the other seven, so a profile audience set
 on its own adds no audience and a worker limit set on its own limits nobody. A malformed identity
 map, key list, lifetime or worker limit stops the binary at startup, and so does an identity map that names a worker with the profile audience unset or blank:
 the proxy would admit none of the workers it is asked to gate. The broker starts in that state,

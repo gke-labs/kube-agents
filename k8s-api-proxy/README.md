@@ -241,59 +241,45 @@ no slot.
 That cap does not stop one caller from holding all of it, or from opening watches without end.
 `Config.CallerLimits` does. It returns, for a caller, a `CallerLimits`: `MaxInFlight`, the most
 requests of the kind the shared cap counts that the caller may have in flight, and
-`MaxLongRunning`, the most watches and long-running subresource requests it may have open. The two
-are counted apart, so a caller that follows a watch for an hour keeps its whole in-flight limit,
-and a zero or negative field is no limit. The binary applies one pair of limits to every caller:
+`MaxLongRunning`, the most watches and long-running subresource requests it may have open (a `log`
+request counts as one whether or not it follows). The two are counted apart, so a caller that
+follows a watch for an hour keeps its whole in-flight limit, and a zero or negative field is no
+limit. The binary has one pair of limits, for every caller an embedder's func does not give limits
+of its own:
 
-| Flag                            | Environment variable                     | Meaning                                                                        |
-| ------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------ |
-| `--max-in-flight-per-caller`    | `KUBE_PROXY_MAX_IN_FLIGHT_PER_CALLER`    | `CallerLimits.MaxInFlight` for every caller. `0`, the default, is no limit.    |
-| `--max-long-running-per-caller` | `KUBE_PROXY_MAX_LONG_RUNNING_PER_CALLER` | `CallerLimits.MaxLongRunning` for every caller. `0`, the default, is no limit. |
+| Flag                            | Environment variable                     | Meaning                                                                                               |
+| ------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `--max-in-flight-per-caller`    | `KUBE_PROXY_MAX_IN_FLIGHT_PER_CALLER`    | `CallerLimits.MaxInFlight` for a caller the embedder sets none for. `0`, the default, is no limit.    |
+| `--max-long-running-per-caller` | `KUBE_PROXY_MAX_LONG_RUNNING_PER_CALLER` | `CallerLimits.MaxLongRunning` for a caller the embedder sets none for. `0`, the default, is no limit. |
+
+A `CallerLimits` can also put the caller in a group: `Group` names it, and `GroupMaxInFlight` and
+`GroupMaxLongRunning` are the same two limits for every caller that returns that name, counted
+together. A request is admitted only when its caller and its group both have room, counts for both,
+and gives both back when it ends. That bounds a set of callers in aggregate, which per-caller
+limits cannot: enough callers, each under its own limit, still fill the shared cap. When callers of
+one group return different limits, each request is held to the limits its own caller returned,
+against the one count. No flag sets a group.
 
 A caller at a limit gets the shared cap's answer, the same `429` with `Retry-After`, audited as
-`throttled` with `rejection_reason` `caller_in_flight_limit` or `caller_long_running_limit` and
-counted under that reason in `kubeagents_kube_proxy_rejected_requests_total`; the shared cap's
-`429` has no reason. The check runs after `Config.Authorize` and the policy, so a request they
-refuse counts for nothing, and before the shared slot is taken, so a caller at its own limit never
+`throttled` with one of four values of `rejection_reason` and counted under it in
+`kubeagents_kube_proxy_rejected_requests_total`: `caller_in_flight_limit` or
+`caller_long_running_limit` for the caller's own limit, which is checked first, and
+`caller_group_in_flight_limit` or `caller_group_long_running_limit` for its group's. The shared
+cap's `429` has no reason. The check runs after `Config.Authorize` and the policy, so a request
+they refuse counts for nothing, and before the shared slot is taken, so a caller at a limit never
 holds one. A request counts until the handler has finished it: when the response is copied, when a
 watch or a log follow ends or its caller disconnects, and when an upgraded connection closes. A
 request answered from the response cache, or joined to another caller's fetch, counts like any
 other, as it does for the shared cap.
 
-Callers are told apart by username alone, not by partition. Pods that share a ServiceAccount
-share its limits, and under `--auth-mode=none` every caller is `unauthenticated`, so the limits
-are then one more shared cap. Each replica counts for itself. Set the in-flight limit well under
-`--max-in-flight`, and no lower than the clients' own parallelism allows: against an API server
-without aggregated discovery, `kubectl` fetches every group version at once, and a request
-answered `429` ten times fails.
-
-The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
-and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
-empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
-give its path to both flags. Files without a matching certificate and key stop the proxy at
-startup. The files are reloaded
-without a restart (`pkg/certreload`): at most once a second, a TLS handshake checks their size,
-modification time, device and inode (so a Secret or projected volume's `..data` symlink swap is
-seen), and a change whose bytes differ is parsed for the next handshakes. A changed file that does
-not load, such as one read mid-rotation, is logged, counted in
-`kubeagents_kube_proxy_certificate_reload_failures_total` (which also counts a changed
-`--upstream-ca-file` that does not load), and the last good certificate keeps
-being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
-`Transport` verifies each new connection against the current bundle, with hostname and IP SAN
-checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
-`certreload.NewCAPoolUnion` pools several bundles, such as the client CAs a listener advertises
-for more than one authenticator; each file reloads on its own, and one that stops loading keeps
-its last good certificates in the pool while the others follow their files.
-
-Cached responses and coalesced fetches are shared across callers, which is safe while the
-`UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
-transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
-authenticated caller is part of the cache and coalescing keys, so requests share a response or a
-fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
-the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
-partition needs the cache off (`Config.Cache` nil). A write evicts the resource's entries
-in every partition, since the data changed for every caller; a `401` or `403` evicts them in the
-caller's partition only, since only that credential's access changed.
+A caller's own limits are counted under `CallerLimits.Key`, which is the username unless the func
+sets it; the partition is not part of it. With the default, pods that share a ServiceAccount share
+its limits, and an embedder that wants a count per pod puts the pod in the key. Under
+`--auth-mode=none` every caller is `unauthenticated`, so the flags' limits are then one more
+shared cap. Each replica counts for itself. Set an in-flight limit well under `--max-in-flight`,
+and know what a low one costs: against an API server without aggregated discovery a cold `kubectl`
+asks for every group version at once, some thirty requests, so under a smaller limit it completes
+only through client-go's retries of the `429`s, and a request answered `429` ten times fails.
 
 An embedder with a rule of its own about who may ask what sets `Config.Authorize`. The handler
 calls it for every request that names a cluster and classifies as an API request, after the
@@ -344,9 +330,9 @@ and `Options.Version` is what `--version` and the startup log report after the n
 `k8s-api-proxy`.
 
 `Options.CallerLimits` is `Config.CallerLimits` for an embedder that limits some callers and not
-others. The two per-caller flags stay the limits of a caller it does not answer for: a field it
-returns as zero takes the flag's value, and a negative field is no limit for that caller whatever
-the flag says.
+others. The two per-caller flags stay the limits of a caller it does not answer for: a
+`MaxInFlight` or `MaxLongRunning` it returns as zero takes the flag's value, and a negative one is
+no limit for that caller whatever the flag says. Its key and group fields are used as returned.
 
 `Options.AudienceCallers` maps a TokenReview audience to the caller usernames admitted for it, and
 adds those entries to the audiences the flags and the environment configure. A caller admitted this

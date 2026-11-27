@@ -184,6 +184,9 @@ var (
 		ReasonAuthorizeRefused:         {},
 		ReasonCallerInFlightLimit:      {},
 		ReasonCallerLongRunningLimit:   {},
+
+		ReasonCallerGroupInFlightLimit:    {},
+		ReasonCallerGroupLongRunningLimit: {},
 	}
 
 	knownOutcomes = map[string]struct{}{

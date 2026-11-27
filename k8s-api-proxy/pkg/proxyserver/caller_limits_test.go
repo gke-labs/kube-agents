@@ -16,6 +16,7 @@ const (
 	testLimitedCaller = "system:serviceaccount:agents:worker"
 	testOtherCaller   = "system:serviceaccount:agents:shell"
 	testRetryAfter    = "Retry-After"
+	testOtherListPath = "/api/v1/namespaces/default/configmaps"
 )
 
 func limitsOf(t *testing.T, cfg proxyConfig, username string) k8sapiproxy.CallerLimits {
@@ -63,6 +64,14 @@ func TestCallerLimitsFunc(t *testing.T) {
 	}
 	if got, want := limitsOf(t, flagged, testOtherCaller), (k8sapiproxy.CallerLimits{MaxInFlight: 6, MaxLongRunning: 3}); got != want {
 		t.Errorf("embedder and flags: limits = %+v for a caller the embedder does not limit, want the flags' %+v", got, want)
+	}
+
+	// The key and the group are the embedder's alone: the flags fill in neither.
+	grouped := k8sapiproxy.CallerLimits{Key: "pod-a", Group: "workers", GroupMaxInFlight: 9, GroupMaxLongRunning: 7}
+	flagged.embedder.CallerLimits = func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits { return grouped }
+	grouped.MaxInFlight, grouped.MaxLongRunning = 6, 3
+	if got := limitsOf(t, flagged, testLimitedCaller); got != grouped {
+		t.Errorf("embedder's key and group with flags: limits = %+v, want %+v", got, grouped)
 	}
 
 	for _, arg := range []string{"--max-in-flight-per-caller=-1", "--max-long-running-per-caller=-1"} {
@@ -132,6 +141,58 @@ func TestCallerLimitsThroughTheBuiltHandler(t *testing.T) {
 			}
 			if rec := getPods(h, testCallerToken); rec.Code != http.StatusOK {
 				t.Errorf("after the held request finished: code = %d, want 200", rec.Code)
+			}
+		})
+	}
+}
+
+// An embedder's "no limit" for a caller holds against the flag: with
+// --max-in-flight-per-caller=1, a caller the embedder answers with a negative limit holds
+// one request and is served another, where a caller it does not answer for is refused.
+func TestEmbedderNoLimitOverridesTheFlag(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	for name, tc := range map[string]struct {
+		embedder k8sapiproxy.CallerLimits
+		want     int
+	}{
+		"a negative answer is no limit":  {k8sapiproxy.CallerLimits{MaxInFlight: -1, MaxLongRunning: -1}, http.StatusOK},
+		"a zero answer takes the flag's": {k8sapiproxy.CallerLimits{}, http.StatusTooManyRequests},
+	} {
+		t.Run(name, func(t *testing.T) {
+			entered, gate := make(chan struct{}, 1), make(chan struct{})
+			release := sync.OnceFunc(func() { close(gate) })
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Only the pod list is held; the second request's path is answered at once.
+				if r.URL.Path == testPodsPath {
+					entered <- struct{}{}
+					<-gate
+				}
+				w.Header().Set("Content-Type", testContentJSON)
+				_, _ = io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","items":[]}`)
+			}))
+			t.Cleanup(upstream.Close)
+			t.Cleanup(release)
+
+			cfg := embedderConfig(t, upstream.URL, Options{CallerLimits: func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits {
+				return tc.embedder
+			}})
+			cfg.maxInFlightPerCaller = 1
+			h := buildTestHandler(t, cfg, logger)
+			held := make(chan *httptest.ResponseRecorder, 1)
+			go func() { held <- getPods(h, testCallerToken) }()
+			<-entered
+
+			// Another path than the held request's, so it is a fetch of its own.
+			req := httptest.NewRequest(http.MethodGet, testOtherListPath, nil)
+			req.Header.Set("Authorization", "Bearer "+testCallerToken)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Errorf("a second request with one held: code = %d, want %d; body = %s", rec.Code, tc.want, rec.Body.String())
+			}
+			release()
+			if rec := <-held; rec.Code != http.StatusOK {
+				t.Fatalf("held request: code = %d, want 200", rec.Code)
 			}
 		})
 	}
