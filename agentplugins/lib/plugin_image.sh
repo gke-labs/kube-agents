@@ -54,13 +54,17 @@ PLUGIN_AR_LOCATION="${AR_LOCATION:-}"
 PLUGIN_AR_PROJECT="${AR_PROJECT:-}"
 PLUGIN_AR_REPOSITORY="${AR_REPOSITORY:-}"
 # Used only when there is no agent image to copy — a first install, or an agent running
-# from somewhere that is not Artifact Registry. REGION and GCP_ARTIFACT_REGISTRY_REPO_NAME
+# from somewhere that is not Artifact Registry or from the published release repository
+# below. REGION and GCP_ARTIFACT_REGISTRY_REPO_NAME
 # are the variables the provisioning scripts put the fleet's region and repository in, so
 # they are better guesses than hardcoded ones. They are fallbacks and not pins: an
 # exported GCP_ARTIFACT_REGISTRY_REPO_NAME left over from `dev_rebuild_agent.sh` must not
 # quietly outrank the repository the agent is demonstrably being pulled from.
 PLUGIN_AR_LOCATION_FALLBACK="${REGION:-us-central1}"
 PLUGIN_AR_REPOSITORY_FALLBACK="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-kube-agents}"
+# The project's published release repository in Artifact Registry. An agent installed from
+# it says nothing about where a plugin image should go: an install cannot push to it.
+PLUGIN_PUBLISHED_RELEASE_REPOSITORY="us-docker.pkg.dev/kube-agents-release/kube-agents"
 # GKE nodes are linux/amd64. On an arm64 laptop a `docker build` without this produces an
 # arm64 manifest, which the kubelet declines to mount rather than mounting wrongly.
 PLUGIN_TARGET_PLATFORM="${TARGET_PLATFORM:-linux/amd64}"
@@ -464,6 +468,9 @@ plugin_image_content_tag() {
 # satisfies none of the reasoning above, points at a repository that does not exist, and
 # has plugin_image_ensure_repository create it with no reader binding on it. Set
 # AR_PROJECT to publish somewhere else deliberately.
+#
+# One Artifact Registry repository is not copied: the published release repository
+# (PLUGIN_PUBLISHED_RELEASE_REPOSITORY), which an install cannot push to.
 plugin_image_discover_registry() {
     local context="$1" namespace="$2" agent_ref="$3" agent_image host rest proj repo
 
@@ -475,6 +482,18 @@ plugin_image_discover_registry() {
 
     agent_image="$(kubectl --context="$context" -n "$namespace" \
         get platformagent "$agent_ref" -o jsonpath='{.spec.deployment.image}' 2>/dev/null || echo "")"
+
+    # An agent on the published release repository is the same case as one on ghcr.io: a
+    # registry the project publishes to and an install cannot push to. Whatever the reader
+    # did not pin falls back, and it is said, because the agent's image no longer tells the
+    # reader where the plugin image went.
+    case "$agent_image" in
+        "${PLUGIN_PUBLISHED_RELEASE_REPOSITORY}"/*)
+            echo "  NOTE: the agent runs from the published release repository, which an install cannot push to."
+            echo "        Its registry is not copied; AR_LOCATION, AR_PROJECT and AR_REPOSITORY choose where the plugin image goes."
+            return 0
+            ;;
+    esac
 
     host="${agent_image%%/*}"
     case "$host" in

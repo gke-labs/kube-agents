@@ -35,6 +35,7 @@ import tempfile
 import unittest
 
 LIB = pathlib.Path(__file__).resolve().parents[1] / "plugin_image.sh"
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 # Resolved once, and invoked by absolute path: several tests hand the library a PATH with
 # no image builder on it, and looking bash itself up on that PATH would fail to start.
@@ -805,6 +806,75 @@ class DiscoverRegistryTests(unittest.TestCase):
 
     def test_no_agent_deployed_discovers_nothing(self):
         self.assertEqual(self.discover(None), ["", "", ""])
+
+    def test_an_agent_from_the_published_release_repository_discovers_nothing_and_says_so(self):
+        # An install from the release repository cannot write it, so its project and
+        # repository are not the plugin image's; the fallbacks apply, as for ghcr.io.
+        result = run_lib(
+            "plugin_image_discover_registry ctx ns agent\n"
+            'printf "|%s|%s|%s" "$PLUGIN_AR_LOCATION" "$PLUGIN_AR_PROJECT" "$PLUGIN_AR_REPOSITORY"',
+            env={
+                "PATH": "%s:%s" % (self.bin_dir, BASE_ENV["PATH"]),
+                "KUBECTL_CALLS": str(self.calls),
+                "AGENT_IMAGE": "us-docker.pkg.dev/kube-agents-release/kube-agents/platform-agent:1.2.3",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        note, _, parts = result.stdout.partition("|")
+        self.assertEqual(parts.split("|"), ["", "", ""])
+        self.assertIn("published release repository", note)
+        self.assertIn("AR_PROJECT", note)
+
+    def test_the_untagged_reference_the_chart_writes_is_recognised(self):
+        result = run_lib(
+            "plugin_image_discover_registry ctx ns agent\n"
+            'printf "|%s|%s|%s" "$PLUGIN_AR_LOCATION" "$PLUGIN_AR_PROJECT" "$PLUGIN_AR_REPOSITORY"',
+            env={
+                "PATH": "%s:%s" % (self.bin_dir, BASE_ENV["PATH"]),
+                "KUBECTL_CALLS": str(self.calls),
+                "AGENT_IMAGE": "us-docker.pkg.dev/kube-agents-release/kube-agents/platform-agent",
+            },
+        )
+        self.assertEqual(result.stdout.partition("|")[2].split("|"), ["", "", ""])
+
+    def test_another_repository_in_the_release_project_is_still_copied(self):
+        # Only the published repository is the exception, by its full path.
+        self.assertEqual(
+            self.discover("us-docker.pkg.dev/kube-agents-release/kube-agents-other/platform-agent:1.2.3"),
+            ["us", "kube-agents-release", "kube-agents-other"],
+        )
+
+    def test_a_partial_pin_keeps_the_pin_copies_nothing_and_still_says_so(self):
+        result = run_lib(
+            "plugin_image_discover_registry ctx ns agent\n"
+            'printf "|%s|%s|%s" "$PLUGIN_AR_LOCATION" "$PLUGIN_AR_PROJECT" "$PLUGIN_AR_REPOSITORY"',
+            env={
+                "PATH": "%s:%s" % (self.bin_dir, BASE_ENV["PATH"]),
+                "KUBECTL_CALLS": str(self.calls),
+                "AGENT_IMAGE": "us-docker.pkg.dev/kube-agents-release/kube-agents/platform-agent:1.2.3",
+                "AR_PROJECT": "my-project",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        note, _, parts = result.stdout.partition("|")
+        self.assertEqual(parts.split("|"), ["", "my-project", ""])
+        self.assertIn("is not copied", note)
+
+    def test_the_published_release_repository_is_the_one_the_release_page_names(self):
+        page = REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "deploy" / "release-versioning.md"
+        lib = LIB.read_text()
+        match = re.search(r'^PLUGIN_PUBLISHED_RELEASE_REPOSITORY="([^"]+)"$', lib, re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertIn(f"`{match.group(1)}`", page.read_text())
+
+    def test_a_pin_still_wins_on_an_agent_from_the_published_release_repository(self):
+        self.assertEqual(
+            self.discover(
+                "us-docker.pkg.dev/kube-agents-release/kube-agents/platform-agent:1.2.3",
+                env={"AR_LOCATION": "l", "AR_PROJECT": "p", "AR_REPOSITORY": "r"},
+            ),
+            ["l", "p", "r"],
+        )
 
     def test_a_pin_is_not_overwritten_by_discovery(self):
         self.assertEqual(

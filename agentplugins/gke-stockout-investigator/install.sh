@@ -85,8 +85,8 @@ echo "============================================================"
 # step 5, those failures land after the APIs, the topic, the subscription, the log sink
 # and four IAM bindings already exist, so the run has to be unpicked by hand. The context
 # and namespace go in so the reference lands in the registry the agent already pulls
-# from. It prints the reference it settled on — which is why it runs after the banner
-# and not before it. See agentplugins/lib/plugin_image.sh.
+# from, when an install can push there. It prints the reference it settled on — which is
+# why it runs after the banner and not before it. See agentplugins/lib/plugin_image.sh.
 plugin_image_resolve "gke-stockout-investigator" "$PROJECT_ID" "$SCRIPT_DIR" \
     "${SCRIPT_DIR}/files" "$CONTEXT" "$NAMESPACE" "$AGENT_REF"
 IMAGE="$PLUGIN_IMAGE_REF"
@@ -287,7 +287,9 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 #
 # Built locally — by docker where a daemon is running, by crane where none is — and
 # pushed to the Artifact Registry the agent's own image is in, which is usually but not
-# always this project; the resolve step above says so when it is not. PLUGIN_IMAGE names
+# always this project; the resolve step above says so when it is not. An agent on ghcr.io
+# has none to copy and the published release repository is not copied; the fallbacks
+# then apply. PLUGIN_IMAGE names
 # an image that already exists and skips the build entirely, for a pipeline that builds
 # once and installs many times. The reference itself was settled before step 1.
 echo "Step 5: Building and publishing GKE Stockout Investigator OCI image..."

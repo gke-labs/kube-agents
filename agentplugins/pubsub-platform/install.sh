@@ -65,8 +65,9 @@ echo "============================================================"
 # project, an unreadable source tree or an absent image builder is caught, and catching
 # them here costs nothing — caught after the CRD is applied, they leave the cluster
 # half-changed. The context and namespace go in so the reference lands in the registry
-# the agent is already pulling from. It prints the reference it settled on — which is why
-# it runs after the banner and not before it. See agentplugins/lib/plugin_image.sh.
+# the agent is already pulling from, when an install can push there. It prints the
+# reference it settled on — which is why it runs after the banner and not before it. See
+# agentplugins/lib/plugin_image.sh.
 plugin_image_resolve "pubsub-platform" "$PROJECT_ID" "$SCRIPT_DIR" \
     "${SCRIPT_DIR}/files/platforms/pubsub" "$CONTEXT" "$NAMESPACE" "$AGENT_REF"
 IMAGE="$PLUGIN_IMAGE_REF"
@@ -79,7 +80,9 @@ kubectl --context="$CONTEXT" apply -f "${REPO_ROOT}/k8s-operator/config/crd/base
 #
 # Built locally — by docker where a daemon is running, by crane where none is — and
 # pushed to the Artifact Registry the agent's own image is in, which is usually but not
-# always this project; the resolve step above says so when it is not. PLUGIN_IMAGE names
+# always this project; the resolve step above says so when it is not. An agent on ghcr.io
+# has none to copy and the published release repository is not copied; the fallbacks
+# then apply. PLUGIN_IMAGE names
 # an image that already exists and skips the build entirely, for a pipeline that builds
 # once and installs many times.
 echo "Building and publishing the pubsub-platform OCI image..."

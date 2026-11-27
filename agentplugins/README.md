@@ -98,7 +98,9 @@ Two defaults are load-bearing:
   There is only something to copy when the agent runs from Artifact Registry, which is the
   dev-rebuild path but not the chart's default: `charts/kube-agents` defaults the agent
   to `ghcr.io/gke-labs/kube-agents/platform-agent`, and an agent pulled from ghcr.io says
-  nothing about where a plugin image should go. The fallbacks then apply — `$REGION` or
+  nothing about where a plugin image should go. Neither does one installed from the
+  project's published release repository in Artifact Registry, which an install cannot
+  push to: the installer says so and does not copy it. The fallbacks then apply — `$REGION` or
   `us-central1`, `$GCP_ARTIFACT_REGISTRY_REPO_NAME` or `kube-agents`, the install project —
   and that is a guess, so the repository it names may be one the installer has to create.
   This is the case the reader-binding note above is printed for. Set `AR_LOCATION`,
