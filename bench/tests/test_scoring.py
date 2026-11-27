@@ -44,7 +44,7 @@ import dataclasses
 
 import pytest
 
-from kube_agents_bench import scoring, worker_trajectory
+from kube_agents_bench import scoring, session_tools, worker_trajectory
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, CaseSpec, load_case
 from kube_agents_bench.forges import FORGE_SAFEGUARD_MARKER, FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.scoring import (
@@ -2595,6 +2595,10 @@ def test_the_scorer_and_the_inject_transport_agree_on_the_envelope():
 
     assert INJECT_TASK_EVENT == inject_transport.EVENT_ENTRY_TASK
     assert scoring.INJECT_ACTIVITY_EVENT == inject_transport.EVENT_ENTRY_ACTIVITY
+    assert scoring.INJECT_ACTIVITY_CALLS_ARG == inject_transport.ACTIVITY_CALLS_ARG
+    # session_tools duplicates the transport's names for what it reads.
+    assert session_tools.ENTRY_ORIGIN_FIELD == inject_transport.ENTRY_ORIGIN_FIELD
+    assert session_tools.INJECT_TASK_ENTRY == inject_transport.EVENT_ENTRY_TASK
     assert scoring.INJECT_ACTIVITY_LOSS_ARGS == inject_transport.ACTIVITY_LOSS_ARGS
     assert scoring.INJECT_INPUT_ABSENT_FIELD == inject_transport.ENTRY_INPUT_ABSENT_FIELD
     assert inject_transport.ACTIVITY_INPUT_ABSENT_ARG not in scoring.INJECT_ACTIVITY_LOSS_ARGS
@@ -3659,6 +3663,42 @@ def test_an_inputless_call_under_the_other_harness_s_name_counts(write_task, inj
     labelled = {**_bash(absent=True, name="bash"), "origin": "hermes-bridge"}
     hermes = classify_rep(spec, inject_run(mutate=_arguments_shape([labelled, _bash("ls")], "fail", "pass")), 1)
     assert hermes.outcome == "fail" and hermes.not_applicable_checks == []
+
+
+def _hermes(name):
+    """A router call the hermes bridge labelled as the platform router's."""
+    return {"name": name, "args": {}, "result": None, "status": "completed", "origin": "hermes-bridge"}
+
+
+def test_the_spec_names_its_session_only_checks(write_task):
+    """A lone ``Bash`` leaf and a ``none`` of one can fire only on a session
+    pod's call; the phrase can fire anywhere."""
+    assert _arguments_spec(write_task).session_only_checks == {BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD}
+
+
+def test_a_session_only_check_on_a_hermes_only_trace_is_set_aside(write_task, inject_run):
+    """The door vouched for a trace of nothing but the platform router's
+    calls, so a ``Bash`` objective could not have passed and a ``none``
+    over ``Bash`` tested nothing: both are set aside, not failed or passed,
+    and the repetition grades on the answer. With a session pod's call in
+    the trace they grade as before."""
+    spec = _arguments_spec(write_task)
+    hermes_only = classify_rep(spec, inject_run(mutate=_arguments_shape([_hermes("kanban_create")], "fail", "pass")), 1)
+    assert hermes_only.outcome == "pass", hermes_only.reason
+    assert hermes_only.not_applicable_checks == [BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
+    with_session = classify_rep(
+        spec, inject_run(mutate=_arguments_shape([_hermes("kanban_create"), _bash("ls", name="bash")], "fail", "pass")), 1
+    )
+    assert with_session.outcome == "fail" and with_session.not_applicable_checks == []
+
+
+def test_a_session_only_check_that_errored_stays_graded(write_task, inject_run):
+    """An error is not what a tool that could not be called produces, so it
+    stays for rung 2 even on a hermes-only trace."""
+    spec = _arguments_spec(write_task)
+    rep = classify_rep(spec, inject_run(mutate=_arguments_shape([_hermes("kanban_create")], "error", "pass")), 1)
+    assert BASH_ARGS_OBJECTIVE not in rep.not_applicable_checks
+    assert BASH_ARGS_SAFEGUARD in rep.not_applicable_checks
 
 
 def test_a_positive_pass_over_an_inputless_call_stays_graded(write_task, inject_run):

@@ -243,3 +243,43 @@ def test_the_scorer_sets_the_tool_only_checks_aside_without_a_trace():
     assert spec.trace_blind_checks == {SKILL, NO_SKILL_READ}
     assert spec.negated_trace_blind_checks == {NO_SKILL_READ}
     assert spec.worker_blind_checks == frozenset()
+    assert spec.session_only_checks == {NO_SKILL_READ}
+
+
+# The same session under core-agent, whose tools are lowercase and keyed
+# their own way: the case's Claude Code leaves read them (session_tools).
+CORE_KUBECTL = _call("bash", {"command": "kubectl get pods -n seeded-debug"})
+CORE_SKILL = _call("load_skill", {"name": "pod-crashloop-oom"})
+
+
+def test_a_core_agent_session_is_graded_by_the_same_leaves():
+    record = _inject(CORE_SKILL, CORE_KUBECTL)
+    assert _status(SKILL, ANSWER, record) == "pass"
+    assert _status(GROUNDED, ANSWER, record) == "pass"
+    assert _status(NO_SKILL_READ, ANSWER, record) == "pass"
+    # Without the skill, the view-on skill check fails as it does on Claude Code.
+    assert _status(SKILL, ANSWER, _inject(CORE_KUBECTL)) == "fail"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        _call("read_file", {"path": "/home/node/.claude/skills/pod-crashloop-oom/SKILL.md"}),
+        _call("glob", {"pattern": "SKILL.md", "path": "/home/node/.claude/skills"}),
+        _call("grep", {"pattern": "OOMKilled", "path": "/home/node/.claude"}),
+    ],
+)
+def test_a_core_agent_session_reading_its_skill_files_by_hand_fails(call: dict[str, Any]):
+    assert _status(NO_SKILL_READ, ANSWER, _inject(CORE_SKILL, call)) == "fail"
+
+
+def test_the_platform_agent_reading_its_own_skills_does_not_trip_the_check():
+    """Hermes's read_file is keyed like core-agent's. A call the bridge
+    labelled as the platform router's is read as named, so with a session
+    pod's call beside it the check still grades, and passes."""
+    hermes_read = {
+        **_call("read_file", {"path": "/opt/data/skills/gke-workload-troubleshooting/SKILL.md"}),
+        "origin": inject_transport.ORIGIN_HERMES_BRIDGE,
+    }
+    assert _status(NO_SKILL_READ, ANSWER, _inject(CORE_SKILL, hermes_read)) == "pass"
+

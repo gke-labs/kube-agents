@@ -296,6 +296,9 @@ INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
 INJECT_ACTIVITY_EVENT = "a2a.activity"
 INJECT_ACTIVITY_LOSS_ARGS = ("dropped", "malformed", "input_truncated", "stale")
+#: The marker's count of the call entries written right after it
+#: (``inject_transport.ACTIVITY_CALLS_ARG``), duplicated like the rest.
+INJECT_ACTIVITY_CALLS_ARG = "calls"
 #: The transport's mark on a call entry whose executor sent no input
 #: (``inject_transport.ENTRY_INPUT_ABSENT_FIELD``, duplicated like the names
 #: above): its empty ``args`` say nothing about the arguments it was called
@@ -1173,6 +1176,24 @@ def _inputless_argument_checks(spec: CaseSpec, record: RunRecord) -> set[str]:
     return out
 
 
+def _inject_session_calls_present(trajectory: list[Any]) -> bool:
+    """Whether the trace holds a call the worker adapter published, a
+    session or profile pod's: one of the call entries the transport writes
+    right after each activity marker (as many as its ``calls``) that carries
+    no hermes-bridge origin (:mod:`kube_agents_bench.session_tools`)."""
+    for index, entry in enumerate(trajectory):
+        if not (isinstance(entry, dict) and entry.get("name") == INJECT_ACTIVITY_EVENT):
+            continue
+        args = entry.get("args")
+        count = args.get(INJECT_ACTIVITY_CALLS_ARG) if isinstance(args, dict) else None
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            continue
+        block = trajectory[index + 1 : index + 1 + count]
+        if any(isinstance(call, dict) and session_tools.is_worker_adapter_call(call, True) for call in block):
+            return True
+    return False
+
+
 def _inject_trace_vouched(trajectory: list[Any]) -> bool:
     """Whether the record's activity marker vouches for the delegating turn's
     calls: present, and reporting no loss.
@@ -1404,7 +1425,11 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     ``any`` of the call and a phrase), whose grade goes with it, so when any
     entry is set aside this way every objective is too, and the repetition
     reports not graded rather than passing on what remains. Safeguards the
-    empty args can't flip still grade.
+    empty args can't flip still grade. On a record whose trace the door
+    vouched for and that holds no session or profile pod's call
+    (:func:`_inject_session_calls_present`), an entry in
+    :attr:`CaseSpec.session_only_checks` that passed or failed is set aside:
+    it names only tools no Hermes turn has, so it could not have fired.
 
     None on the api transport, on a record with no blind entry in its report
     (the set is matched by name, so a task with no such check or a report
@@ -1437,6 +1462,16 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
                 for e in record.verification_report
                 if str(e.get("name")) in spec.negated_trace_blind_checks and _entry_failed(e)
             }
+    if spec.session_only_checks and not trace_blind and not _inject_session_calls_present(record.trajectory):
+        # The trace the door vouched for holds no session or profile pod's
+        # call, so a check over tools only such a pod has could not fire:
+        # its fail says nothing and its pass, a ``none`` over them, tested
+        # nothing. Set aside rather than graded; an error stays for rung 2.
+        set_aside |= {
+            str(e.get("name"))
+            for e in record.verification_report
+            if str(e.get("name")) in spec.session_only_checks and (_entry_passed(e) or _entry_failed(e))
+        }
     uncertain = _inputless_argument_checks(spec, record)
     if uncertain:
         # Coarse on purpose: a set-aside entry may have carried the only
