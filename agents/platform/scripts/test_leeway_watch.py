@@ -1642,6 +1642,54 @@ class ChatMessageTests(unittest.TestCase):
                             cluster="p1/us-central1/platform-agent-host", cause="taint_exclusion")
         self.assertNotIn(watch.CHAT_ELLIPSIS, watch.due_chat_item(gateway))
 
+    def test_a_platform_managed_workload_says_gke_reverts_edits(self) -> None:
+        # leeway v0.1.7 marks a workload GKE's addon manager reconciles as
+        # remediation.kind platform_managed; "no clear cause found" would send
+        # the reader to investigate a Deployment they can't change.
+        def managed(cause: str, remediation: object = None) -> dict:
+            item = chat_item(name="kube-dns", namespace="kube-system", cause=cause)
+            item["remediation"] = {"kind": "platform_managed"} if remediation is None else remediation
+            return item
+
+        self.assertEqual(
+            watch.due_chat_item(managed("unknown")),
+            "kube-dns (kube-system) on prod-east: 100% of its pods in one zone; managed by GKE, which reverts direct edits",
+        )
+        self.assertEqual(
+            watch.due_chat_item(managed("constraint_ignored")),
+            "kube-dns (kube-system) on prod-east: 100% of its pods in one zone; "
+            "its zone spread rule is not being kept; managed by GKE, which reverts direct edits",
+        )
+        for other in ({"kind": "manifest_patch"}, {"kind": ""}, {}, "platform_managed", []):
+            text = watch.due_chat_item(managed("unknown", other))
+            self.assertTrue(text.endswith("; no clear cause found"), (other, text))
+        self.assertNotIn(watch.PLATFORM_MANAGED_PHRASE, watch.due_chat_item(chat_item(cause="unknown")))
+
+    def test_a_long_platform_managed_item_keeps_the_phrase(self) -> None:
+        item = chat_item(name="n" * 60, namespace="s" * 50, cluster="p1/us-central1/" + "c" * 40, cause="unknown")
+        item["remediation"] = {"kind": "platform_managed"}
+        text = watch.due_chat_item(item)
+        self.assertLessEqual(len(text), watch.CHAT_ITEM_MAX_CHARS)
+        self.assertTrue(text.endswith("; managed by GKE, which reverts direct edits"), text)
+
+    def test_leeways_platform_managed_finding_reaches_the_chat_line(self) -> None:
+        # From leeway's own JSON (a v0.1.7 kube-dns finding), through
+        # normalization, to the posted item.
+        raw = {
+            "kind": "leeway.placement_drift",
+            "topologyKey": "topology.kubernetes.io/zone",
+            "suspectedCause": "unknown",
+            "severity": "warning",
+            "subject": {"kind": "Deployment", "namespace": "kube-system", "name": "kube-dns", "replicas": 2},
+            "domains": [{"domain": "us-east4-b", "actual": 2}, {"domain": "us-east4-a", "actual": 0}],
+            "remediation": {"kind": "platform_managed", "summary": "reconciled by the cluster platform"},
+        }
+        norm = watch.normalize_topology_finding("p1/us-east4/alert-sim", raw)
+        self.assertEqual(
+            watch.due_chat_item(norm),
+            "kube-dns (kube-system) on alert-sim: 100% of its pods in one zone; managed by GKE, which reverts direct edits",
+        )
+
     def test_a_zone_cause_on_a_workload_names_the_other_zone(self) -> None:
         # On a workload, taint_exclusion and domain_outage are about the zone
         # its pods could not reach, so the item must not read as its own zone.
