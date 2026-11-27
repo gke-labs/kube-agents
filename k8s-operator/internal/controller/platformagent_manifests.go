@@ -344,6 +344,16 @@ const (
 	driftDetectorClusterNameEnv    = "DRIFT_DETECTOR_CLUSTER_NAME"
 	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
 	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
+	driftDetectorOwnReleaseEnv     = "DRIFT_DETECTOR_OWN_RELEASE"
+
+	// helmReleaseNameAnnotation is, with helmReleaseNamespaceAnnotation, what
+	// Helm stamps on the PlatformAgent it renders; the two name the release
+	// the detector is told is the install's own.
+	helmReleaseNameAnnotation = "meta.helm.sh/release-name"
+
+	// driftDetectorOwnReleaseSeparator joins namespace and name in
+	// DRIFT_DETECTOR_OWN_RELEASE, as the detector's --own-release splits them.
+	driftDetectorOwnReleaseSeparator = "/"
 
 	// driftDetectorProjectNumberDigits is the character set a GCP project number
 	// is made of, and the whole of the test for one: a project ID must start with
@@ -4506,6 +4516,19 @@ func driftDetectorGitopsManagers(agent *agentv1alpha1.PlatformAgent) string {
 	return ""
 }
 
+// driftDetectorOwnRelease names the Helm release that rendered this
+// PlatformAgent, as <namespace>/<name>, or "" when the CR does not carry both
+// of Helm's annotations (a kustomize or hand install) or either is not a name.
+// The detector refuses to start on a malformed value, so one is never passed.
+func driftDetectorOwnRelease(agent *agentv1alpha1.PlatformAgent) string {
+	namespace := agent.Annotations[helmReleaseNamespaceAnnotation]
+	name := agent.Annotations[helmReleaseNameAnnotation]
+	if len(validation.IsDNS1123Label(namespace)) > 0 || len(validation.IsDNS1123Subdomain(name)) > 0 {
+		return ""
+	}
+	return namespace + driftDetectorOwnReleaseSeparator + name
+}
+
 // driftDetectorHarness returns the project, location and cluster name the detector
 // is given, empty when the harness does not name them.
 //
@@ -4649,7 +4672,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// drift-pubsub module is off, so writing these unconditionally would put the
 	// harness triple a second time on a container that does not read it — the same
 	// three values, under different names, on every credential proxy in the fleet,
-	// for a process that is not running. All six names are reserved in
+	// for a process that is not running. All seven names are reserved in
 	// mergeCredentialProxyEnv whether or not this branch writes them, so the CR
 	// cannot supply the ones this skips.
 	//
@@ -4664,6 +4687,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			corev1.EnvVar{Name: driftDetectorClusterNameEnv, Value: driftClusterName},
 			corev1.EnvVar{Name: driftDetectorSubscriptionEnv, Value: driftDetectorSubscription(agent)},
 			corev1.EnvVar{Name: driftDetectorGitopsManagersEnv, Value: driftDetectorGitopsManagers(agent)},
+			corev1.EnvVar{Name: driftDetectorOwnReleaseEnv, Value: driftDetectorOwnRelease(agent)},
 		)
 	}
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"})
@@ -5406,7 +5430,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// These ten are appended by buildAgentAPIAuthSidecar after this merge
+		// These eleven are appended by buildAgentAPIAuthSidecar after this merge
 		// runs, so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
@@ -5423,7 +5447,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		driftDetectorClusterNameEnv,
 		driftDetectorSubscriptionEnv,
 		driftDetectorGitopsManagersEnv,
-		// Not every DRIFT_DETECTOR_* name belongs on this list, and the six
+		driftDetectorOwnReleaseEnv,
+		// Not every DRIFT_DETECTOR_* name belongs on this list, and the seven
 		// above are not here for being drift variables. They are here because
 		// buildAgentAPIAuthSidecar appends each one after this merge, so an
 		// unreserved name would duplicate and stall the apply, as the note

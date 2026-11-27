@@ -357,7 +357,16 @@ worker adapter from the `tool_use` content blocks in the stream of the coding ag
 the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
-`progress` heartbeat. `worker_commands` reads
+`progress` heartbeat. On the session route an entry can arrive without its input. The harness
+then takes the input from the session pod's worker adapter, which keeps each tool call it published
+in memory and prints a task's calls to `worker-adapter trajectory <task id>`, run by `kubectl exec`
+in the pod's `worker` container right after the turn settles, matched to the entries by position
+and checked by tool name (`bench/kube_agents_bench/session_trajectory.py`). An entry that carries
+its own input keeps it; a count or name that disagrees, or a pod with no capture, leaves the
+entry's args empty. A pod claimed from the warm pool carries no session-key annotation, so the
+harness then asks the live unannotated session pods and takes the capture from the one holding the
+task. A turn that delegated isn't filled: the door reads the wake turn's trace under the root
+task's id, and the capture for that id is another turn's. `worker_commands` reads
 the kanban worker logs by card id (for the required checks, for the forbidden runs where a `terminal` entry holds no heredoc, for a card with no log line, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace; a check with `after_result_pattern` and a forbidden set reads those entries alone); on

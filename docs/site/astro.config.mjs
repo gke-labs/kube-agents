@@ -107,6 +107,7 @@ export default defineConfig({
           items: [
             { label: 'Prerequisites', link: '/install/prerequisites/' },
             { label: 'Quick start (GKE)', link: '/install/quickstart-gke/' },
+            { label: 'Enterprise Helm & GitOps', link: '/install/enterprise-gitops/' },
             { label: 'First prompts', link: '/install/first-prompts/' },
             { label: 'Using kube-agents over MCP', link: '/install/mcp/' },
             { label: 'Slack app setup', link: '/install/slack-app/' },

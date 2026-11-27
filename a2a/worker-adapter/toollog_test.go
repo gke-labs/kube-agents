@@ -338,6 +338,40 @@ func TestNoToolLinesWritesNoLine(t *testing.T) {
 	}
 }
 
+// The skill tool has one name in two places: the persona renderer puts it on
+// the harness's allowlist of a persona with skills (lib/persona/claudecode),
+// and the Claude driver reads a call of it as a skill call (claudeSkillTool).
+// So the driver must read exactly one tool of that allowlist as a skill call.
+// With the two names apart, one of two faults follows: a renderer with
+// another name leaves the harness's skill tool off the allowlist, and a
+// driver with another name logs no skill key for a skill call. An allowlist
+// entry can carry a scope in brackets after the tool's name; the name is the
+// part before it.
+func TestTheDriverReadsThePersonasSkillToolAsASkillCall(t *testing.T) {
+	out, skills, err := renderPersona(ProfileWorkerConfig{PersonaDir: examplePersona, Harness: persona.ClaudeCode},
+		slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skills) == 0 {
+		t.Fatal("the example persona has no skill, so its allowlist has no skill tool to read")
+	}
+	var read []string
+	for _, entry := range out.Allowed {
+		tool, _, _ := strings.Cut(entry, "(")
+		evs, err := claudeDecoder{}.Decode([]byte(claudeUse("toolu_1", tool, `{"skill":"triage"}`)))
+		if err != nil || len(evs) != 1 {
+			t.Fatalf("a call of the allowed tool %q decodes to %v, %v; want one event", tool, evs, err)
+		}
+		if evs[0].SkillCall && !slices.Contains(read, tool) {
+			read = append(read, tool)
+		}
+	}
+	if len(read) != 1 {
+		t.Errorf("the driver reads %v of the allowlist %v as a skill call, want exactly the persona's skill tool", read, out.Allowed)
+	}
+}
+
 // End to end: a profile worker's task leaves the two lines on the worker's
 // log, with the task's id and the persona's skill name, and with nothing of
 // the tool's input or result. The activity entry on the bus keeps the tool

@@ -3,6 +3,8 @@ package gateway
 import (
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // teamsCallText is the text of the card the nth passthrough call carried:
@@ -217,9 +219,10 @@ func TestTeamsRatingPressWithFeedbackOffRecordsNothing(t *testing.T) {
 }
 
 // An alert's triage edits it under the alert's own feedback id, which the
-// notifier hands every backend; Teams rates answers only, so the edited
-// alert carries no rating controls, and neither does a post so marked.
-func TestTeamsDrawsNoRatingOnAnAlertItsTriageEdits(t *testing.T) {
+// notifier hands every backend: the edited alert keeps its rating controls,
+// and a home post marked as a report is posted with them, where it lands
+// given back as PostNotify gives it.
+func TestTeamsDrawsTheRatingControlsOnAHomePost(t *testing.T) {
 	relay := newFakeTeamsRelay(t, nil)
 	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
 	a.SetFeedbackRecorder(&fakeRecorder{})
@@ -229,14 +232,36 @@ func TestTeamsDrawsNoRatingOnAnAlertItsTriageEdits(t *testing.T) {
 	if err := editor.EditNotifyMessage(home, "", "act-7", OutMessage{Text: "triage: resolved", Feedback: mark}); err != nil {
 		t.Fatalf("edit: %v", err)
 	}
-	if actions := teamsLineActions(t, relay, 0); len(actions) != 0 {
-		t.Fatalf("an edited alert carries actions: %v", actions)
+	if actions := teamsLineActions(t, relay, 0); len(actions) != 2 {
+		t.Fatalf("an edited alert's actions: %v, want the two rating controls", actions)
 	}
-	if _, err := a.PostMessage(teamsConversationID(home), OutMessage{Text: "report", Feedback: feedbackPostReportPrefix + "r-1"}); err != nil {
+	var poster notifyChatPoster = a
+	report := feedbackPostReportPrefix + "r-1"
+	message, landed, err := poster.PostNotifyMessage(home, "", OutMessage{Text: "the nightly report", Feedback: report})
+	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
-	if actions := teamsLineActions(t, relay, 1); len(actions) != 0 {
-		t.Fatalf("a post marked as a report carries actions: %v", actions)
+	if message == "" || landed != home+teamsThreadToken+message {
+		t.Errorf("a home post landed at %q with message %q, want its own thread", landed, message)
+	}
+	if actions := teamsLineActions(t, relay, 1); len(actions) != 2 {
+		t.Fatalf("a home report's actions: %v, want the two rating controls", actions)
+	}
+	if text := teamsCallText(t, relay, 1); !strings.Contains(text, "the nightly report") {
+		t.Errorf("the home report reads %q", text)
+	}
+	if _, _, err := poster.PostNotifyMessage("spaces/AAA", "", OutMessage{Text: "x", Feedback: report}); err == nil {
+		t.Error("a home that is no Teams conversation id was posted to")
+	}
+	laidOut := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Two things to fix first."}
+	if _, _, err := poster.PostNotifyMessage(home, "", OutMessage{Text: "fallback", Chat: laidOut, Feedback: report}); err != nil {
+		t.Fatalf("laid-out post: %v", err)
+	}
+	if text := teamsCallText(t, relay, 2); !strings.HasPrefix(text, "**Two things to fix first.**") {
+		t.Errorf("a laid-out home report reads %q", text)
+	}
+	if actions := teamsLineActions(t, relay, 2); len(actions) != 2 {
+		t.Fatalf("a laid-out home report's actions: %v, want the two rating controls", actions)
 	}
 }
 
@@ -285,18 +310,123 @@ func TestTeamsDoesNotRedrawARatedCardTheRecordedLineWouldOverflow(t *testing.T) 
 	}
 }
 
-// Teams draws no controls on an alert or a report, so a press that names
-// one is no press this adapter drew: it records nothing.
-func TestTeamsRecordsNoRatingForAPressThatNamesAPost(t *testing.T) {
-	a, _, recorder, id := ratedTeamsAdapter(t)
-	data := map[string]any{teamsPressActionKey: teamsPressActionRate, teamsPressTaskKey: feedbackPostAlertPrefix + "drift-1", teamsPressRatingKey: FeedbackUp}
+// A laid-out post that opens a thread in a channel home files its question
+// under that thread, where its presses come from: a press of one of its
+// choices is a turn. A card the rating controls would push past the budget
+// is posted without them and keeps its layout.
+func TestTeamsHomeCardTakesAPressFromItsThread(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.SetFeedbackRecorder(&fakeRecorder{})
+	home, _, _ := strings.Cut(testTeamsChannel, teamsThreadToken)
+	mark := feedbackPostAlertPrefix + "drift-1"
+	id, landed, err := a.PostNotifyMessage(home, "", OutMessage{Text: "fallback", Chat: testTeamsQuestion(), Feedback: mark})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	q := a.uxLocked().questions[id]
+	a.mu.Unlock()
+	a.mu.Lock()
+	open, stale := a.uxLocked().open[teamsConversationID(landed)], a.uxLocked().open[teamsConversationID(home)]
+	a.mu.Unlock()
+	if want := teamsConversationID(landed); q.conversation != want || open != id || stale != "" {
+		t.Fatalf("the home card's question is filed under %q (open there %q, open under the channel %q), want its thread %q alone", q.conversation, open, stale, want)
+	}
+	// A keyed edit of the post, which names the thread, agrees with it.
+	if err := a.EditNotifyMessage(home, landed, id, OutMessage{Text: "fallback", Chat: testTeamsQuestion(), Feedback: mark}); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	q, open = a.uxLocked().questions[id], a.uxLocked().open[teamsConversationID(landed)]
+	a.mu.Unlock()
+	if want := teamsConversationID(landed); q.conversation != want || open != id {
+		t.Fatalf("after a keyed edit the question is filed under %q (open %q), want %q", q.conversation, open, want)
+	}
+	press := testTeamsPress("f:80", id, teamsChoice("yes, restart it", 0, "Yes"))
+	press["conversation"] = map[string]any{"id": landed, "conversationType": "channel", "tenantId": testTeamsTenant}
+	if _, reason := a.classify(decodeTeamsActivity(t, press)); reason != "" {
+		t.Fatalf("a press from the home card's thread was not a turn: %s", reason)
+	}
+	// The largest detail whose card still fits without the controls.
+	sized := func(n int) OutMessage {
+		m := testTeamsQuestion()
+		m.Detail = strings.Repeat("x", n)
+		return OutMessage{Text: "fallback", Chat: m}
+	}
+	lo, hi := 0, teamsMaxActivityBytes
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if _, err := a.chatCard("", sized(mid)); err == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	plain, err := a.chatCard("", sized(lo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tight := sized(lo)
+	tight.Feedback = mark
+	if _, _, err := a.PostNotifyMessage(home, "", tight); err != nil {
+		t.Fatalf("a card the rating controls do not fit beside was refused: %v", err)
+	}
+	if actions := teamsLineActions(t, relay, 2); len(actions) != len(plain.actions()) {
+		t.Errorf("the tight card's actions: %d, want its own %d and no rating controls", len(actions), len(plain.actions()))
+	}
+}
+
+// A reply typed in the thread a home card started answers its question: the
+// card is drawn again with the answered line.
+func TestTeamsHomeCardTakesATypedAnswerFromItsThread(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	home, _, _ := strings.Cut(testTeamsChannel, teamsThreadToken)
+	id, landed, err := a.PostNotifyMessage(home, "", OutMessage{Text: "fallback", Chat: testTeamsQuestion()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typed := testTeamsActivity("f:81", "<at>Kage</at> yes please")
+	typed["conversation"] = map[string]any{"id": landed, "conversationType": "channel", "tenantId": testTeamsTenant}
+	msg, reason := a.classify(decodeTeamsActivity(t, typed))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.rewrites.Wait()
+	if n := teamsCallCount(relay); n != 2 {
+		t.Fatalf("%d calls, want the post and the answered redraw of %s", n, id)
+	}
+	if text := teamsCallText(t, relay, 1); !strings.Contains(text, "✓ hangdng: yes please") {
+		t.Errorf("the answered home card reads %q", text)
+	}
+}
+
+// A rating press on an alert or a report is recorded under the post's own
+// id, as on Slack and Google Chat, and the post gains the recorded line.
+func TestTeamsRecordsARatingPressOnAHomePost(t *testing.T) {
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	recorder := &fakeRecorder{admit: map[string]bool{testTeamsUser: true}}
+	a.SetFeedbackRecorder(recorder)
+	mark := feedbackPostAlertPrefix + "drift-1"
+	id, _, err := a.PostNotifyMessage(testTeamsChannel, "", OutMessage{Text: "checkout-gateway is down", Feedback: mark})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := map[string]any{teamsPressActionKey: teamsPressActionRate, teamsPressTaskKey: mark, teamsPressRatingKey: FeedbackDown}
 	if _, reason := a.classify(decodeTeamsActivity(t, testTeamsPress("f:70", id, data))); reason == "" {
 		t.Fatal("a rating press was a turn")
 	}
 	a.rating.Wait()
 	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
-	if len(recorder.ratings) != 0 {
-		t.Fatalf("ratings %+v, want none for a press that names a post", recorder.ratings)
+	ratings := append([]FeedbackRating(nil), recorder.ratings...)
+	recorder.mu.Unlock()
+	if len(ratings) != 1 || ratings[0].TaskID != mark || ratings[0].Rating != FeedbackDown || ratings[0].Platform != platformTeams {
+		t.Fatalf("ratings %+v, want one 👎 on %s from teams", ratings, mark)
+	}
+	if text := teamsCallText(t, relay, 1); !strings.Contains(text, "checkout-gateway is down") || !strings.Contains(text, "Feedback recorded") {
+		t.Errorf("the rated alert reads %q", text)
 	}
 }

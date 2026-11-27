@@ -236,7 +236,7 @@ The operator's admission webhooks need TLS certificates managed by [cert-manager
 
 Install it by hand only if you are:
 
-- deploying into an existing cluster without the installer or Terraform ([Manual install](/kube-agents/install/manual/)), or
+- deploying into an existing cluster without the installer or Terraform ([Enterprise Helm & GitOps](/kube-agents/install/enterprise-gitops/) or [Manual install](/kube-agents/install/manual/)), or
 - pinning a specific cert-manager version.
 
 The Helm chart on its own is the one path that never installs cert-manager: a chart that shipped a `Certificate` into a cluster without the CRDs would fail at apply time for everyone. It therefore leaves the operator's admission webhooks off (`operator.webhooks.enabled=false`) until you install cert-manager and turn them on. See the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md).
@@ -369,4 +369,5 @@ See [Gitea as the GitOps forge](/kube-agents/install/gitea/) for the token Secre
 ## Ready to install
 
 - [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run the installer end-to-end.
+- [Enterprise Helm & GitOps](/kube-agents/install/enterprise-gitops/) — deploy the official Helm chart via Flux or Argo CD with separate IAM Terraform.
 - [Manual install](/kube-agents/install/manual/) — step-by-step, no wrapper script.

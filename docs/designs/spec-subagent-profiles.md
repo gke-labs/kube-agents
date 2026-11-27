@@ -364,8 +364,11 @@ What the operator renders per profile, as built (amended 10/6):
   it has to land before #3659's tiers stronger than Read go live.
 - Proxy confinement (#3889). A worker's `kubectl` and `gcloud` are the credential-proxy
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
-  ask the metadata server for the broker's Workload Identity token). The broker gives them a
-  role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
+  ask the metadata server for the broker's Workload Identity token). `worker-adapter` also
+  carries a loopback proxy that sends `kubectl` to `<agent>-kube-proxy`; it holds no
+  upstream credential, and it starts only when the worker pod has `KUBE_PROXY_URL`, which
+  no install sets ([the kube-proxy design](kube-proxy.md#11-deployment-topology-in-kube-agents)). The broker gives the
+  worker's `kubectl` and `gcloud` a role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
   route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist; with a
   task credential, the MCP relay for Developer Knowledge's two document reads alone
   (`mcp_policy.PROFILE_SERVER_TOOLS`); the version-control routes under the permit rule
