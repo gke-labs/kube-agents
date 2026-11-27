@@ -12,9 +12,9 @@ import (
 // The typing indicator on Teams (spec-chatops-gateway.md, "The Teams
 // adapter"): while work the person's ask started is going on with nothing
 // on screen that shows it, the adapter keeps Teams's own "is typing" line on
-// in the conversation. Teams draws no reaction on the asker's message and no
-// Working… status, and an acknowledgement or a plan sitting unchanged does
-// not read as work going on.
+// in the conversation. Teams draws no Working… status, the reaction on the
+// asker's message (teams_reactions.go) is easy to miss, and an
+// acknowledgement or a plan sitting unchanged does not read as work going on.
 //
 // That is the hand-off: the first agent's task has ended, its line is an
 // acknowledgement, and a card is working where the gateway cannot see it.
