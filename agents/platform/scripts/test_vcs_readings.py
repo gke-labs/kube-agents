@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import math
 import os
+import dataclasses
 import threading
 import unittest
 from unittest import mock
@@ -105,7 +106,7 @@ class FakeForge:
         # callable of the route that returns one.
         self.quota = None
 
-    def add(self, number, state="open", author=INSTALL_BARE, created=RECENT, updated=None, **events):
+    def add(self, number, state="open", author=INSTALL_BARE, created=RECENT, updated=None, source="", **events):
         self.proposals[number] = {
             "number": number,
             "state": state,
@@ -114,6 +115,7 @@ class FakeForge:
             "created": created,
             "updated": updated or f"2026-10-{number % 28 + 1:02d}T00:00:00Z#{number}",
             "closed": "",
+            "source": source,
         }
         for kind in ("reviews", "comments", "commits"):
             getattr(self, kind)[number] = list(events.get(kind, []))
@@ -139,7 +141,7 @@ class FakeForge:
         items = sorted(self.proposals.values(), key=lambda p: p["updated"], reverse=True)
         served = min(payload["limit"], self.clamp or payload["limit"])
         start = (payload["page"] - 1) * served
-        batch = [dict(p) for p in items[start : start + served]]
+        batch = [{k: v for k, v in p.items() if k != "source"} for p in items[start : start + served]]
         return {
             "proposals": batch,
             "count": len(batch),
@@ -211,12 +213,16 @@ class FakeMetrics:
     def __init__(self):
         self.readings: list[tuple] = []
         self.failures: list[str] = []
+        self.forge_health: list[tuple] = []
 
     def set_readings(self, outcomes, details):
         self.readings.append((outcomes, details))
 
     def record_reading_failure(self, reason):
         self.failures.append(reason)
+
+    def set_forge_health(self, health):
+        self.forge_health.append(tuple(health))
 
 
 class FakeClock:
@@ -1561,6 +1567,277 @@ class GitHubTallyTest(unittest.TestCase):
         self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
         self.assertEqual(3, len(queries), "merged, closed and the one count; open is derived, not searched")
         self.assertFalse(queries[-1].endswith(" "), "the unqualified query carries no trailing space")
+
+
+def refused(code, status=403):
+    return WorkspaceError("refused", status=status, code=code)
+
+
+class ForgeHealthTest(unittest.TestCase):
+    """What each sweep says of the providers its managed repositories live on."""
+
+    def health(self, harness):
+        """The last sweep's report as {provider: {state: repositories}}."""
+        return {f.provider: dict(f.repositories) for f in harness.metrics.forge_health[-1]}
+
+    def test_a_provider_whose_repositories_all_answer_is_connected(self):
+        forge = FakeForge()
+        forge.add(1, "open")
+        harness = Harness({REPO: forge, OTHER_REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        (report,) = harness.metrics.forge_health[-1]
+        self.assertEqual("fake", report.provider)
+        self.assertEqual((("ok", 2),), report.repositories)
+        self.assertTrue(report.connected)
+
+    def test_a_report_names_a_provider_and_carries_no_host(self):
+        """A host is text from configuration or from a managed key: it is not a closed vocabulary."""
+        self.assertEqual(
+            ["provider", "repositories", "checked_at"],
+            [field.name for field in dataclasses.fields(vcs_readings.ForgeHealth)],
+        )
+
+    def test_each_refusal_code_is_its_connection_state(self):
+        cases = {
+            "FORGE_UNAUTHENTICATED": "unauthorized",
+            "FORGE_FORBIDDEN": "unauthorized",
+            "FORGE_CREDENTIAL_UNAVAILABLE": "unauthorized",
+            "FORGE_NOT_FOUND": "not_found",
+            "FORGE_UNAVAILABLE": "unreachable",
+            "FORGE_CALL_FAILED": "unreachable",
+            "FORGE_TLS_UNTRUSTED": "unreachable",
+            "UPSTREAM_TIMEOUT": "unreachable",
+            "FORGE_RATE_LIMITED": "rate_limited",
+            "FORGE_CONFLICT": "other",
+        }
+        for code, state in cases.items():
+            with self.subTest(code=code):
+                self.assertEqual(state, vcs_readings.connection_state(refused(code)))
+        self.assertEqual("unauthorized", vcs_readings.connection_state(PermissionError("not managed")))
+        self.assertEqual("unreachable", vcs_readings.connection_state(TimeoutError("timed out")))
+        self.assertEqual("unreachable", vcs_readings.connection_state(ConnectionRefusedError()))
+        self.assertEqual("other", vcs_readings.connection_state(RuntimeError("bug")))
+        self.assertEqual("other", vcs_readings.connection_state(vcs_readings.ForgeUnsupported("no")))
+
+    def test_a_refused_credential_makes_the_provider_not_connected(self):
+        forge = FakeForge()
+        forge.fail["list"] = refused("FORGE_UNAUTHENTICATED", status=401)
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        (report,) = harness.metrics.forge_health[-1]
+        self.assertEqual((("unauthorized", 1),), report.repositories)
+        self.assertFalse(report.connected)
+
+    def test_one_failing_repository_among_several_is_counted_beside_the_ones_that_answer(self):
+        good = FakeForge()
+        good.add(1, "merged")
+        bad = FakeForge()
+        bad.fail["list"] = refused("FORGE_NOT_FOUND", status=404)
+        harness = Harness({REPO: good, OTHER_REPO: bad}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual({"fake": {"not_found": 1, "ok": 1}}, self.health(harness))
+        self.assertFalse(harness.metrics.forge_health[-1][0].connected)
+
+    def test_two_providers_are_reported_apart(self):
+        github = FakeForge()
+        github.add(1, "open")
+        gitea = FakeForge(host="gitea.example.com", http_user=True)
+        gitea.name = "gitea"
+        gitea.fail["list"] = refused("FORGE_UNAVAILABLE", status=503)
+        harness = Harness({REPO: github, GITEA_REPO: gitea}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual({"fake": {"ok": 1}, "gitea": {"unreachable": 1}}, self.health(harness))
+
+    def test_two_hosts_of_one_provider_are_counted_together(self):
+        cloud = FakeForge(host="gitea.com", http_user=True)
+        cloud.name = "gitea"
+        cloud.add(1, "open")
+        own = FakeForge(host="gitea.example.com", http_user=True)
+        own.name = "gitea"
+        own.fail["list"] = refused("FORGE_UNAVAILABLE", status=503)
+        harness = Harness({"gitea:gitea.com/acme/infra": cloud, GITEA_REPO: own}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual({"gitea": {"ok": 1, "unreachable": 1}}, self.health(harness))
+
+    def test_a_provider_recovers_at_the_next_sweep(self):
+        forge = FakeForge()
+        forge.fail["list"] = refused("FORGE_UNAVAILABLE", status=503)
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertFalse(harness.metrics.forge_health[-1][0].connected)
+        del forge.fail["list"]
+        harness.sweep.run_once()
+        self.assertTrue(harness.metrics.forge_health[-1][0].connected)
+        self.assertEqual(2, len(harness.metrics.forge_health))
+
+    def test_a_reading_that_is_only_incomplete_leaves_the_provider_connected(self):
+        """A cold detail cache and a foreign author are not connection faults."""
+        forge = FakeForge()
+        for number in range(1, 200):
+            forge.add(number, "merged")
+        harness = Harness({REPO: forge})  # the default interval's budget leaves proposals unread
+        harness.sweep.run_once()
+        self.assertIn("warming", harness.metrics.failures)
+        self.assertEqual({"fake": {"ok": 1}}, self.health(harness))
+        foreign = FakeForge()
+        foreign.add(1, "open", author="someone-else")
+        harness = Harness({REPO: foreign}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual(["forge"], harness.metrics.failures)
+        self.assertEqual({"fake": {"ok": 1}}, self.health(harness))
+
+    def test_a_per_proposal_read_that_fails_leaves_the_connection_as_the_listing_found_it(self):
+        """The listing answered with a credential the forge accepted; one proposal's read is not the connection."""
+        for failure in (
+            refused("FORGE_NOT_FOUND", status=404),
+            refused("FORGE_FORBIDDEN"),
+            refused("FORGE_UNAVAILABLE", status=503),
+            RuntimeError("a parse fault"),
+        ):
+            with self.subTest(failure=repr(failure)):
+                forge = FakeForge()
+                forge.add(1, "merged")
+                forge.fail["reviews"] = failure
+                harness = Harness({REPO: forge}, interval=WIDE)
+                harness.sweep.run_once()
+                self.assertEqual(["forge"], harness.metrics.failures, "the reading is still withheld")
+                self.assertEqual({"fake": {"ok": 1}}, self.health(harness))
+                self.assertTrue(harness.metrics.forge_health[-1][0].connected)
+
+    def test_a_rate_limit_in_a_per_proposal_read_is_the_repositorys_state(self):
+        forge = FakeForge()
+        forge.add(1, "merged")
+        forge.fail["reviews"] = rate_limited()
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual({"fake": {"rate_limited": 1}}, self.health(harness))
+
+    def test_a_credential_that_cannot_name_itself_keeps_the_time_it_was_found(self):
+        """Such a repository is not attempted again, so its provider's check does not look fresh."""
+        forge = FakeForge(login="")
+        harness = Harness({REPO: forge}, interval=WIDE)
+        with mock.patch.object(vcs_readings.time, "time", return_value=1000.0):
+            harness.sweep.run_once()
+        self.assertEqual({"fake": {"identity": 1}}, self.health(harness))
+        self.assertEqual(1000.0, harness.metrics.forge_health[-1][0].checked_at)
+        calls = forge.whoami_calls
+        with mock.patch.object(vcs_readings.time, "time", return_value=5000.0):
+            harness.sweep.run_once()
+        self.assertEqual(calls, forge.whoami_calls, "a nameless key is not attempted again")
+        self.assertEqual({"fake": {"identity": 1}}, self.health(harness))
+        self.assertEqual(1000.0, harness.metrics.forge_health[-1][0].checked_at)
+
+    def test_a_provider_with_one_attempted_repository_is_checked_now(self):
+        nameless = FakeForge(login="")
+        good = FakeForge()
+        good.add(1, "open")
+        harness = Harness({REPO: nameless, OTHER_REPO: good}, interval=WIDE)
+        with mock.patch.object(vcs_readings.time, "time", return_value=1000.0):
+            harness.sweep.run_once()
+        with mock.patch.object(vcs_readings.time, "time", return_value=5000.0):
+            harness.sweep.run_once()
+        (report,) = harness.metrics.forge_health[-1]
+        self.assertEqual((("identity", 1), ("ok", 1)), report.repositories)
+        self.assertEqual(5000.0, report.checked_at)
+
+    def test_a_key_no_forge_serves_is_reported_under_the_provider_it_names(self):
+        served = FakeForge()
+        served.add(1, "open")
+        harness = Harness({REPO: served}, interval=WIDE)
+        harness.sweep._managed = lambda: frozenset({REPO, "gitlab:gitlab.example.com/acme/infra"})
+        harness.sweep.run_once()
+        self.assertEqual({"fake": {"ok": 1}, "gitlab": {"other": 1}}, self.health(harness))
+
+    def test_a_key_with_no_provider_is_reported_as_other(self):
+        harness = Harness({}, interval=WIDE)
+        harness.sweep._managed = lambda: frozenset({"nowhere.example.com/acme/infra", ":odd/acme/infra"})
+        harness.sweep.run_once()
+        self.assertEqual({"other": {"other": 2}}, self.health(harness))
+
+    def test_no_text_of_a_managed_key_but_its_provider_reaches_the_report(self):
+        marker = "exfiltrated-text"
+        harness = Harness({}, interval=WIDE)
+        harness.sweep._managed = lambda: frozenset({f"gitlab:{marker}.example.com/{marker}/{marker}"})
+        harness.sweep.run_once()
+        self.assertNotIn(marker, repr(harness.metrics.forge_health[-1]))
+
+    def test_no_managed_repository_reports_no_provider(self):
+        harness = Harness({}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual([()], harness.metrics.forge_health)
+
+    def test_an_unreadable_managed_list_keeps_the_last_report(self):
+        forge = FakeForge()
+        forge.add(1, "open")
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        harness.sweep._managed = mock.Mock(side_effect=OSError("state unreadable"))
+        harness.sweep.run_once()
+        self.assertEqual(1, len(harness.metrics.forge_health))
+
+    def test_the_worst_state_of_one_attempt_is_the_one_kept(self):
+        self.assertEqual("unauthorized", vcs_readings._worse("rate_limited", "unauthorized"))
+        self.assertEqual("unreachable", vcs_readings._worse("unreachable", "ok"))
+        self.assertEqual(set(vcs_readings.CONNECTION_STATES), {
+            "ok", "unauthorized", "not_found", "unreachable", "rate_limited", "identity", "other",
+        })
+
+
+class StockoutProposalsTest(unittest.TestCase):
+    def test_is_stockout_branch_classifies_prefix_and_edge_cases(self):
+        self.assertTrue(vcs_readings.is_stockout_branch("platform-agent/remediate-stockout-frontend"))
+        self.assertTrue(vcs_readings.is_stockout_branch("platform-agent/remediate-stockout-"))
+        self.assertFalse(vcs_readings.is_stockout_branch(""))
+        self.assertFalse(vcs_readings.is_stockout_branch(None))
+        self.assertFalse(vcs_readings.is_stockout_branch("platform-agent/remediate-drift-frontend"))
+        self.assertFalse(vcs_readings.is_stockout_branch("PLATFORM-AGENT/remediate-stockout-frontend"))
+        self.assertFalse(vcs_readings.is_stockout_branch("feature/platform-agent/remediate-stockout-frontend"))
+
+    def test_sweep_counts_stockout_proposals_by_state_without_extra_calls(self):
+        forge = FakeForge()
+        forge.add(1, "open", source="platform-agent/remediate-stockout-api")
+        forge.add(2, "merged", source="platform-agent/remediate-stockout-worker")
+        forge.add(3, "merged", source="platform-agent/remediate-stockout-batch")
+        forge.add(4, "closed", source="platform-agent/remediate-stockout-checkout")
+        forge.add(5, "open", source="platform-agent/fix-hpa-api")
+        forge.add(6, "merged", source="platform-agent/drift-remediation")
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual(1, len(harness.metrics.readings))
+        _, details = harness.metrics.readings[0]
+        self.assertEqual({"open": 1, "merged": 2, "closed": 1}, details.stockout_proposals)
+        # Step 2 only called reviews, view, commits (and closer for closed PR #4) — no extra branch-lookup calls.
+        self.assertEqual(6, forge.calls.count("view"))
+
+    def test_all_forge_proposal_translators_expose_source_for_stockout_classification(self):
+        import json
+        from test_providers_contract import Recorded, fixtures_dir
+
+        stockout_branch = f"{vcs_readings.STOCKOUT_BRANCH_PREFIX}payments"
+        checked = 0
+        for cls in sorted(providers.AVAILABLE, key=lambda c: c.name):
+            directory = fixtures_dir(cls)
+            config_file = directory / "config.json"
+            config = json.loads(config_file.read_text()) if config_file.is_file() else {}
+            raw_text = (directory / "proposal-view.json").read_text()
+            fixture = json.loads(raw_text)
+            for forge in cls.for_config(config):
+                with self.subTest(forge=cls.name):
+                    answer = forge.proposal_view(
+                        Recorded(fixture["responses"]), "acme/infra", dict(fixture["payload"])
+                    )
+                    original_source = answer["proposal"]["source"]
+                    self.assertTrue(original_source, f"{cls.name} proposal_view returned empty source")
+                    self.assertFalse(vcs_readings.is_stockout_branch(original_source))
+
+                    mutated = json.loads(raw_text.replace(original_source, stockout_branch))
+                    mutated_answer = forge.proposal_view(
+                        Recorded(mutated["responses"]), "acme/infra", dict(mutated["payload"])
+                    )
+                    self.assertEqual(stockout_branch, mutated_answer["proposal"]["source"])
+                    self.assertTrue(vcs_readings.is_stockout_branch(mutated_answer["proposal"]["source"]))
+                    checked += 1
+        self.assertGreaterEqual(checked, len(providers.AVAILABLE))
 
 
 if __name__ == "__main__":

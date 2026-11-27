@@ -124,9 +124,27 @@ The gateway checks the key each caller sends. The chart runs LiteLLM with a mast
 - A key listed under the reserved class `gateway-probe` reaches `GET /v1/models` and nothing else. It lets a readiness check confirm that a gateway pod has loaded the current map without sending any caller's key.
 - Any other key is refused with HTTP 401.
 
-An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
+An admitted caller other than the admin reaches the inference routes only: `/v1/chat/completions`, `/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`, `/models`, `/model/info`, `/v1/model/info` and `/health`, and the Gemini-format generation calls `/v1beta/models/<model>:generateContent`, `:streamGenerateContent` and `:countTokens`. Any other route answers 401. The probes (`/health/liveliness`, `/health/readiness`) take no key, and `/metrics` stays open to the managed Prometheus scrape (`litellm_settings.require_auth_for_metrics_endpoint: false`).
 
-`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart. While the Secret is absent the gateway knows no caller key and every caller is `keyless`. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
+`litellm-caller-keys` holds one key, `keys.json`: a JSON object from a key's lowercase hex SHA-256 to its class name, digests only. The gateway mounts it as a directory and re-reads the file when it changes, so adding or removing a key needs no restart.
+
+While the Secret is absent the gateway knows no caller key. A call with no key or a placeholder is still admitted as `keyless`. A caller that sends its class's key is refused until the operator writes the map again on its next pass. The gateway's NetworkPolicy still decides which pods reach it at all. The kustomize dev base mounts the same hook and reads `litellm-master-key` only if you created it; without it, nothing reaches the admin routes.
+
+### Which key each caller sends
+
+The operator mints one key per caller class and gives a class's callers its key once the gateway serves it. When a pass finds `InferenceKeysServed` `True`, the operator marks each class's key Secret, and from the next pass it renders that class's callers with a reference to the Secret:
+
+| Caller                                                                                          | Class         | How it sends the key                                                                                                       |
+| ----------------------------------------------------------------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| The agent pod's `platform-agent` container and the `hermes-bridge` sidecar the operator renders | `agent`       | Env `LITELLM_API_KEY` from `<agent>-inference-key-agent`. The managed config's `model.api_key` reads `${LITELLM_API_KEY}`. |
+| The curator                                                                                     | `curator`     | Env `LITELLM_API_KEY` from `<agent>-inference-key-curator`.                                                                |
+| AgentProfile workers: warm pools, Jobs and scheduled runs                                       | `tier-<tier>` | Env `ANTHROPIC_API_KEY` from `<agent>-inference-key-tier-<tier>` in the profile namespace. `ANTHROPIC_BASE_URL` stays set. |
+
+A2A session pods, the shell sandbox, Hindsight and the web console send no key and are admitted as `keyless`.
+
+Each caller restarts once when it gains its key. It keeps the key when the condition later goes `False` or `Unknown`, as it does when a new tier's key joins the map or the gateway pods roll: an unchanged key stays in every later map. A key the operator rewrites, such as a repaired malformed one, loses its mark, and its callers go back to the placeholder until the map holding the new key is served. Each move restarts the caller once.
+
+The references aren't optional. A caller whose key Secret is deleted fails to start rather than start as another class; the operator creates a new key and the caller goes back to the placeholder until that key is served. Pods already running on a key whose Secret was deleted from outside the operator are refused until they're replaced. While the agent pod restarts, the old pod may already read the new config without the env, and sends `${LITELLM_API_KEY}` unexpanded; the gateway admits that literal as `keyless`.
 
 ### Fallback alias and parameter dropping
 
@@ -210,7 +228,9 @@ router_settings:
         index: -1
 ```
 
-The agent cannot do this itself, and that is the point of putting it here. It asks for `model-default` over the Completions API and never learns what is behind the alias, while the harness only emits its own cache markers when it recognises a Claude-named model — so on an Anthropic backend it caches nothing. Teaching it otherwise would mean naming the model in the agent config, which is exactly the coupling the gateway exists to prevent. A 45-call agent session measured 3.5M input tokens and zero cache reads before this block; the first cron tick after it re-ran the same 83k-token prompt as a cache write, and subsequent ticks read it back.
+The agent cannot do this itself, and that is the point of putting it here. It asks for `model-default` over the Completions API, so the harness never learns what is behind the alias. (Each profile's turn context does get the backing model name from the `model_identity` plugin, but only so it can answer users who ask; the harness does not read it.)
+
+The harness also only emits its own cache markers when it recognises a Claude-named model — so on an Anthropic backend it caches nothing. Teaching it otherwise would mean naming the model in the agent config, which is exactly the coupling the gateway exists to prevent. A 45-call agent session measured 3.5M input tokens and zero cache reads before this block; the first cron tick after it re-ran the same 83k-token prompt as a cache write, and subsequent ticks read it back.
 
 The system prompt takes the 1h tier because it is the largest static span, every profile and cron tick shares it, and a read refreshes the TTL. So a half-hourly cron schedule keeps it warm instead of missing a 5-minute window every time. The two rolling points ride the conversation tail on the default 5-minute tier. Anthropic allows four breakpoints per request; LiteLLM counts any the caller supplied and never overwrites them, so a client with its own layout still wins.
 
@@ -264,14 +284,20 @@ Before LiteLLM calls the provider, the hook rewrites every top-level field of th
 
 Each field is walked whole, so a value is redacted wherever it sits: a tool's input, what a tool returned, or an assistant message's other fields. A tool call's arguments held as JSON in a string are decoded first. A key name such as `password` then counts as it does in a mapping, and the arguments stay valid JSON.
 
-A few fields are left as they came. They are kept only where the provider APIs put them: content parts, a tool result's own content list, the system blocks and Gemini parts. Nothing inside a tool's input or output is kept. The kept fields are:
+A tool's output that is a whole JSON object or array is decoded the same way, so the structure rules apply to it too: key names, a Secret's `data`, and env pairs. That covers a chat tool message's string content, an Anthropic tool result, a Responses function call output and the top-level strings in a Gemini function response (up to 64), plus whole JSON nested up to two levels inside one. The text rules run first, over the output as it came, and what is decoded is their result, so decoding only adds to what is masked.
+
+Output over 256 KiB, more than 64 levels deep, with a repeated key or that isn't whole JSON is matched as text only. At most 32 nested strings of one output are decoded. Output no rule changed goes on as it came. A changed one keeps its indent width and separators; numbers, escapes and other spacing are normalised.
+
+A few fields are left as they came. They are kept only where the provider APIs put them: content parts, a tool result's own content list, the system blocks and Gemini parts. That includes the parts of a Responses `input` item or function call output, and the parts inside a Gemini function response. Beyond those parts, nothing inside a tool's input or output is kept. The kept fields are:
 
 - in the assistant's own turn, a thinking block's text and signature, which the provider checks against each other. The model wrote that text from input the hook had already redacted;
 - redacted thinking and a thought signature, in the same turn;
 - provider-encrypted content, which the provider checks byte for byte. That is a Responses reasoning item's `encrypted_content`, and in the assistant's turn a web search result's `encrypted_content`, the `reasoning_details` data and signature, and the `thought_signature` LiteLLM carries on the message and its tool calls;
 - binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
 
-A request the hook cannot walk is refused. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64. Two payload positions are not among them: the content parts of a Responses `input` item (`input_file`, `input_image`) and the parts inside a Gemini function response. A base64 payload there isn't checked as a payload. The text rules still run over it, and a rule whose pattern happens to appear in the base64 text rewrites it, which corrupts the payload. Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
+A request the hook cannot walk is refused with 400, since the same request is refused every time and a caller shouldn't retry it. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64.
+
+Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 
 The rendered default config does not change while the value is off.
 

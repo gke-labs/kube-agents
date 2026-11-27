@@ -16,8 +16,8 @@
 # listing with five columns and grades the shape it arrives in.
 #
 # What it grades: the reply carries a pipe table (a delimiter row and a row
-# per planted node pool, two of which the prompt does not name), and no row
-# is repeated as a bullet or numbered item: a list item that carries a node
+# per pool that holds nodes, two of which the prompt does not name), and no
+# row is repeated as a bullet or numbered item: a list item that carries a node
 # name and another cell's value (a version, a machine type, a pod count), or
 # a pool name with a version, on the same line. The pool names are the
 # planted nouns; the prompt names one of them to identify the cluster, so
@@ -28,10 +28,11 @@
 # pass.
 #
 # Planted defects required: idle-nodepool (a node pool named idle-batch-pool,
-# held empty by the seeded-role=idle-batch NoSchedule taint), hpa-saturated
-# (whose plant is pinned-inference-pool) and default-pool-headroom (the
-# default pool) -- the three pools of slot a, each a row the table must
-# carry. Isolation class: read-only. Eligible tier: nightly.
+# whose node the seeded-role=idle-batch NoSchedule taint keeps free of
+# workloads), hpa-saturated (whose plant is pinned-inference-pool) and
+# default-pool-headroom (the default pool) -- the pools of slot a that hold
+# nodes, each a row the table must carry. Isolation class: read-only.
+# Eligible tier: nightly.
 id: chat-tabular-answer-keeps-its-table
 name: A per-node listing reaches the chat thread as a pipe table
 # The prompt identifies the cluster by a planted pool name inside the run's
@@ -63,7 +64,7 @@ domain: chat-and-routing
 # cluster: each eval project carries its own fleet and this case has to run
 # unchanged against all of them. Roles are defined in
 # bench/tf/fleet/fixtures.json; the rule is docs/designs/bench-fleet-catalog.md.
-# The three roles are the three node pools of slot a, one table row each:
+# The roles are the pools of slot a that hold nodes, one table row or more each:
 # idle-batch-pool, pinned-inference-pool (hpa-saturated's plant) and
 # default-pool (default-pool-headroom's).
 fixtures:
@@ -92,7 +93,7 @@ verification_spec:
         # or `--- | ---`. The lookahead asks for a pipe, as the gateway does,
         # so a `---` rule on its own line is not a table.
         - '(?m)^(?=[^\n]*\|)[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$'
-        # One per-node row per planted pool: a line that is not a list item,
+        # One per-node row per pool with nodes: a line that is not a list item,
         # holds two or more pipes, and carries a GKE node name, a GKE version
         # (`v1.35.8-gke.1796000` as kubectl spells it, `1.35.8-gke.1796000`
         # as gcloud does) and the pool name. Only a live read produces the

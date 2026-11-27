@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -366,7 +366,7 @@ type podSpawner struct {
 }
 
 func newPodSpawner(cfg *Config, log *slog.Logger) (*podSpawner, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := InClusterRESTConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -770,6 +770,9 @@ func (s *podSpawner) sessionPodSpec(rec *SessionRecord, taskID, primer string, o
 			})
 		}
 	}
+	// Every variable the container takes from a Secret is named to the
+	// worker, which withholds it from the processes a turn's tools start.
+	pod.Spec.Containers[0].Env = withToolWithheldList(pod.Spec.Containers[0].Env)
 	if warm {
 		makeWarm(pod, s.cfg)
 	}
@@ -1669,6 +1672,22 @@ func delegateToolFor(rec *SessionRecord, taskID string) string {
 		}
 	}
 	return "on"
+}
+
+// withToolWithheldList is env with lib.EnvToolWithheld naming every entry
+// sourced from a Secret (secretKeyRef), for the worker to withhold from its
+// tools; env as it was when there is none.
+func withToolWithheldList(env []corev1.EnvVar) []corev1.EnvVar {
+	var names []string
+	for _, e := range env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			names = append(names, e.Name)
+		}
+	}
+	if len(names) == 0 {
+		return env
+	}
+	return append(env, corev1.EnvVar{Name: lib.EnvToolWithheld, Value: strings.Join(names, ",")})
 }
 
 // envHarnessUnisolated is the worker adapter's waiver for running a harness

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
@@ -32,6 +33,49 @@ func writeSessionHome(t *testing.T, withManifest bool) string {
 	return dir
 }
 
+// Another harness's persona is checked against that harness's scope: here
+// one whose persona is instructions.md and skills. A changed file in the scope is
+// refused.
+func TestCheckSessionHomeUsesTheHarnessScope(t *testing.T) {
+	scope := func(rel string) bool {
+		return rel == "instructions.md" || rel == "skills" || strings.HasPrefix(rel, "skills/")
+	}
+	files := map[string][]byte{"instructions.md": []byte("persona\n"), "skills/triage/SKILL.md": []byte("---\nname: triage\n---\n")}
+	dir := t.TempDir()
+	for rel, data := range files {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, persona.IntegrityManifestFile), persona.FormatIntegrityManifest(files), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	if err := CheckSessionHome(dir, scope, log); err != nil {
+		t.Fatalf("an unchanged persona: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "instructions.md"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckSessionHome(dir, scope, log); err == nil || !strings.Contains(err.Error(), "instructions.md") {
+		t.Errorf("a changed instructions.md: err = %v, want it named", err)
+	}
+}
+
+func TestAMissingPersonaDirectoryIsLoggedAsMissing(t *testing.T) {
+	var buf bytes.Buffer
+	if err := CheckSessionHome(filepath.Join(t.TempDir(), "absent"), lib.SessionHomeCovers, slog.New(slog.NewTextHandler(&buf, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "the persona directory is missing") {
+		t.Errorf("log = %q, want the directory named missing", buf.String())
+	}
+}
+
 func TestCheckSessionHome(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -52,7 +96,7 @@ func TestCheckSessionHome(t *testing.T) {
 				}
 			}
 			var buf bytes.Buffer
-			err := CheckSessionHome(dir, slog.New(slog.NewTextHandler(&buf, nil)))
+			err := CheckSessionHome(dir, lib.SessionHomeCovers, slog.New(slog.NewTextHandler(&buf, nil)))
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), "skills/triage/SKILL.md") {
 					t.Errorf("err = %v, want the changed skill named", err)

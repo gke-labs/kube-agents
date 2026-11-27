@@ -70,11 +70,29 @@ const (
 	// (lib.TaskParameters.ChangeRequested), which only a structured confirm
 	// sets.
 	PermitVCSProposalCreate Permit = "vcs:proposal-create"
+
+	// PermitVCSUnattendedWrite is the write permit of a run that a built-in
+	// schedule started with no person to confirm it
+	// (docs/designs/unattended-write-permit.md, rows 1 and 2). A credential
+	// carries it only beside a trigger unattendedWriteTrigger accepts, and
+	// never beside PermitVCSProposalCreate. The verifiers know the name one
+	// release before anything mints it: no caller of Mint passes it yet, and
+	// the broker's gate does not read it.
+	PermitVCSUnattendedWrite Permit = "vcs:unattended-write"
 )
 
 // known reports whether p is a permit this package mints and verifies.
 func (p Permit) known() bool {
-	return p == PermitVCSProposalCreate
+	return p == PermitVCSProposalCreate || p == PermitVCSUnattendedWrite
+}
+
+// unattendedWriteTrigger reports whether t is a trigger a credential may
+// carry PermitVCSUnattendedWrite beside: origin builtin, a stream that is not
+// empty, and the name schedule/<stream>. Trigger.validate already holds a
+// stream to that name and the origin to builtin; this states the permit's own
+// rule whole, so a trigger shape admitted later does not widen it.
+func unattendedWriteTrigger(t *Trigger) bool {
+	return t != nil && t.Origin == TriggerOriginBuiltin && t.Stream != "" && t.Name == lib.TriggerSourceSchedule+"/"+t.Stream
 }
 
 // known reports whether a is an audience this package mints and verifies.
@@ -188,6 +206,32 @@ func UnverifiedTrigger(token string) (*Trigger, error) {
 	return claims.Nats.Trigger, nil
 }
 
+// UnverifiedTarget is the cluster a credential's claims name, read without
+// checking its signature, nil when they name none (a report credential). It
+// is for routing and for messages only: a worker asks it which cluster a
+// task's kubectl should be pointed at and held to on the worker's own side,
+// where a forged claim can only send a request the verifier then refuses.
+// Nothing may authorise on what it returns; Verify is what does.
+func UnverifiedTarget(token string) (*Target, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("a task credential is three dot-separated parts")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't base64url: %w", err)
+	}
+	var claims struct {
+		Nats struct {
+			Target *Target `json:"target"`
+		} `json:"nats"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return nil, fmt.Errorf("the task credential's claims aren't JSON: %w", err)
+	}
+	return claims.Nats.Target, nil
+}
+
 // NewSigningKey generates a task-signing keypair.
 func NewSigningKey() (nkeys.KeyPair, error) {
 	return nkeys.CreateCluster()
@@ -291,8 +335,9 @@ type Claims struct {
 	// without one is the same bytes it was before the claim existed, and
 	// Verify refuses the claim present but empty.
 	Permits []Permit
-	// Trigger is for AudienceCredentialProxy only, and optional there: set
-	// when an unattended trigger started the task.
+	// Trigger is for AudienceCredentialProxy only, and optional there except
+	// beside PermitVCSUnattendedWrite: set when an unattended trigger
+	// started the task.
 	Trigger *Trigger
 
 	// IssuedAt, ID (the jti) and Issuer are set by Mint and read back by
@@ -398,6 +443,8 @@ func Mint(kp nkeys.KeyPair, c Claims) (string, error) {
 //     known permits, none twice; and an AudienceCredentialProxy credential
 //     with no target must be a report credential: tier ReportTier and a
 //     trigger.
+//   - PermitVCSUnattendedWrite needs a builtin schedule/<name> trigger that
+//     binds its stream, and never appears beside PermitVCSProposalCreate.
 func Verify(token string, trusted []string, aud Audience, now time.Time, maxLifetime, skew time.Duration) (Claims, error) {
 	if !aud.known() {
 		return Claims{}, fmt.Errorf("audience %q is not one this package verifies", aud)
@@ -558,6 +605,14 @@ func (c Claims) validate() error {
 		}
 		if err := c.Trigger.validate(); err != nil {
 			return err
+		}
+	}
+	if slices.Contains(c.Permits, PermitVCSUnattendedWrite) {
+		if slices.Contains(c.Permits, PermitVCSProposalCreate) {
+			return fmt.Errorf("a task credential may not carry both %q and %q", PermitVCSUnattendedWrite, PermitVCSProposalCreate)
+		}
+		if !unattendedWriteTrigger(c.Trigger) {
+			return fmt.Errorf("task credential permit %q needs a builtin %s/<name> trigger that binds its stream", PermitVCSUnattendedWrite, lib.TriggerSourceSchedule)
 		}
 	}
 	// A proxy credential with no target confines nothing, so only a report

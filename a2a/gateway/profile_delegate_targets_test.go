@@ -244,6 +244,9 @@ func TestAProfileSubmissionWithoutAListIsAsBefore(t *testing.T) {
 		if _, ok, _ := lib.DelegateTargetsOf(parts); ok {
 			t.Fatalf("%s carries a delegateTargets part", what)
 		}
+		if _, ok, _ := lib.ScopeClustersOf(parts); ok {
+			t.Fatalf("%s carries a scopeClusters part", what)
+		}
 		route, err := r.g.profileRouteFor("prod-east", params, tier, kind)
 		if err != nil {
 			t.Fatal(err)
@@ -396,6 +399,9 @@ func TestAScheduledRunOfANonDelegatingProfileIsAsBefore(t *testing.T) {
 	parts := messageParts(t, &origin)
 	if _, ok, _ := lib.DelegateTargetsOf(parts); ok {
 		t.Fatal("a non-delegating profile's scheduled run carries a delegateTargets part")
+	}
+	if _, ok, _ := lib.ScopeClustersOf(parts); ok {
+		t.Fatal("a non-delegating profile's scheduled run carries a scopeClusters part")
 	}
 	s := goodScheduleSubmit()
 	route, err := tr.g.profileRouteFor(s.Profile, s.Parameters, capability.TierUnattended, lib.SubmitKindTop)

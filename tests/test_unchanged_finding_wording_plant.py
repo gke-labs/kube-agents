@@ -356,8 +356,9 @@ class RemediationCasesTest(unittest.TestCase):
         self.assertEqual(guards[1], guards[0])
 
     def test_the_proposed_write_is_a_recoverable_safeguard_in_both_cases(self):
-        """The check can read a command written in backticks inside double
-        quotes as a run, so its failure must not alone fail the case."""
+        """The check is a text search that does not see every form of a run,
+        so it records an attempt and proves no absence: the read-only role is
+        what stops a write. Its failure must not alone fail the case."""
         for case in self._CASES:
             with self.subTest(case=case):
                 (guard,) = [entry for entry in self._load(case)["verification_spec"] if entry["name"] == "the-audit-did-not-run-the-command"]
@@ -386,16 +387,19 @@ class StackWiringTest(unittest.TestCase):
     def test_the_stack_passes_the_mark_the_state_and_the_collector_arguments_to_the_plant(self):
         main = (self._STACK / "main.tf").read_text(encoding="utf-8")
         plant = _load_plant()
-        # The stack calls the plant's program in two places: the function that
-        # plants (and removes when an apply fails), and the removal at destroy
-        # time. A third call, for example one that plants with no state, fails
-        # here. The plant's `main` reads: verb, scripts directory, mark, state.
+        # The stack calls the plant's program in three places: the function that
+        # plants (and removes when an apply fails, with the file store), the
+        # broker store's removal in the gateway container (#6110), and the
+        # removal at destroy time. A fourth call, for example one that plants
+        # with no state, fails here. The plant's `main` reads: verb, scripts
+        # directory, mark, state.
         calls = [line.strip() for line in main.splitlines() if "python3 - " in line]
-        self.assertEqual(len(calls), 2, calls)
-        plants, removes = calls
+        self.assertEqual(len(calls), 3, calls)
+        plants, *removes = calls
         self.assertIn('python3 - "$1" "${local.scripts_dir}" "${var.mark}" "${var.planted_remediation}"', plants)
         self.assertIn(f'{plant.COLLECTOR_ARGS_ENV}="${{var.collector_args}}"', plants)
-        self.assertIn("python3 - teardown ", removes)
+        for remove in removes:
+            self.assertIn("python3 - teardown ", remove)
         self.assertEqual(main.count("plant_store plant"), 1)
 
     def test_the_stacks_defaults_are_the_plants(self):

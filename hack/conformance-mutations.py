@@ -152,6 +152,16 @@ MUTATIONS: list[Mutation] = [
         "persona rule to keep it from opening an unrequested pull request",
     ),
     Mutation(
+        "A3-profile-write-under-any-permit",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and VCS_PROPOSAL_CREATE_PERMIT not in getattr(task, "permits", ()):\n',
+         '    if verb in PROFILE_PERMIT_GATED_VCS_VERBS and not getattr(task, "permits", ()):\n'),
+        "test_A3_a_profile_caller_publishes_a_change_only_under_the_permit",
+        "read any permit on the task credential as the write permit, since the "
+        "dispatcher mints only one -- while the verifiers accept a second name "
+        "that this gate does not read",
+    ),
+    Mutation(
         "A3-profile-vcs-without-credential",
         "agents/platform/scripts/credential_proxy.py",
         ('    if task is None:\n        return "a profile caller needs a task credential for version control"\n',
@@ -295,6 +305,33 @@ MUTATIONS: list[Mutation] = [
         "test_A3_the_handler_asks_the_role_table_and_the_task_gate_for_a_profile_caller",
         "answer a refused task credential and carry on with the request as a "
         "caller with no task, so a stale credential degrades instead of failing",
+    ),
+    Mutation(
+        "A3-profile-reports-the-dial",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (DIAL_PATH, (CALLER_ROLE_CHAT,)),\n',
+         '    (DIAL_PATH, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "let a profile task report the dial's level, so a scheduled run that "
+        "watches the dial can also set it",
+    ),
+    Mutation(
+        "A3-shell-reports-the-dial",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    (DIAL_PATH, (CALLER_ROLE_CHAT,)),\n',
+         '    (DIAL_PATH, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "let the shell report the dial's level too, so a helper script can "
+        "set it when the gateway's own report is late",
+    ),
+    Mutation(
+        "A3-dial-handler-asks-no-role",
+        "agents/platform/scripts/credential_proxy.py",
+        ('        if getattr(principal, "role", "") != CALLER_ROLE_CHAT:\n',
+         '        if False:\n'),
+        "test_A3_only_the_chat_role_reports_the_dial",
+        "drop the dial handler's own role check as a copy of the role table, "
+        "which admits a caller with no role on every route",
     ),
     Mutation(
         "A3-role-verbs-as-a-string",
@@ -3095,7 +3132,7 @@ Mutation(
     ),
     Mutation(
         "C1-session-audience-env-renamed-in-kube-proxy",
-        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        "k8s-api-proxy/pkg/proxyserver/server.go",
         ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
          'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
         "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",

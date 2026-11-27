@@ -26,6 +26,7 @@ import types
 import unittest
 
 import yaml
+from fastapi import HTTPException
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
@@ -516,8 +517,326 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(self._run(binary, "agenerate_content")["contents"][0]["parts"][0]["inlineData"]["data"], _RULE_MATCHING_BASE64)
         for mime in ("text/plain", "application/json"):
             text = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": "b24gcHJvZC1ldS0x"}}]}]}
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=mime):
+            with self.assertRaises(HTTPException, msg=mime):
                 self._run(text, "agenerate_content")
+
+    def test_a_gemini_function_responses_own_parts_keep_binary_and_refuse_text(self) -> None:
+        for key in ("functionResponse", "function_response"):
+            for inline in ("inlineData", "inline_data"):
+                with self.subTest(key=key, inline=inline):
+                    binary = {"contents": [{"role": "user", "parts": [{key: {
+                        "name": "shot", "response": {"note": "pod 10.0.0.9"},
+                        "parts": [{inline: {"mimeType": "image/png", "data": _RULE_MATCHING_BASE64}}],
+                    }}]}]}
+                    out = self._run(binary, "agenerate_content")["contents"][0]["parts"][0][key]
+                    self.assertEqual(out["parts"][0][inline]["data"], _RULE_MATCHING_BASE64)
+                    # The response object beside the parts is still walked.
+                    self.assertNotIn("10.0.0.9", json.dumps(out["response"]))
+                    text = {"contents": [{"role": "user", "parts": [{key: {
+                        "name": "shot", "parts": [{inline: {"mimeType": "text/plain", "data": "b24gcHJvZC1ldS0x"}}],
+                    }}]}]}
+                    with self.assertRaises(HTTPException) as refused:
+                        self._run(text, "agenerate_content")
+                    self.assertEqual(refused.exception.status_code, 400)
+
+    def test_responses_input_parts_keep_binary_payloads_and_refuse_text_ones(self) -> None:
+        image_url = "data:image/png;base64," + _RULE_MATCHING_BASE64
+        file_data = "data:application/pdf;base64," + _PDF_BASE64
+        data = {"input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "on prod-eu-1"},
+            {"type": "input_image", "image_url": image_url},
+            {"type": "input_file", "filename": "r.pdf", "file_data": file_data},
+        ]}]}
+        text, image, filed = self._run(data, "aresponses")["input"][0]["content"]
+        self.assertNotIn("prod-eu-1", text["text"])
+        self.assertEqual(image["image_url"], image_url)
+        self.assertEqual(filed["file_data"], file_data)
+        refused_parts = [
+            {"type": "input_image", "image_url": "data:image/png;base64,b24gcHJvZC1ldS0x"},
+            {"type": "input_file", "file_data": "data:application/json;base64,e30="},
+            {"type": "input_file", "file_data": "b24gcHJvZC1ldS0x"},
+        ]
+        for part in refused_parts:
+            with self.subTest(part=part), self.assertRaises(HTTPException) as refused:
+                self._run({"input": [{"type": "message", "role": "user", "content": [part]}]}, "aresponses")
+            self.assertEqual(refused.exception.status_code, 400)
+
+    def test_a_responses_function_call_outputs_parts_keep_binary_and_refuse_text(self) -> None:
+        image_url = "data:image/png;base64," + _RULE_MATCHING_BASE64
+        data = {"input": [{"type": "function_call_output", "call_id": "c", "output": [
+            {"type": "input_text", "text": "on prod-eu-1"},
+            {"type": "input_image", "image_url": image_url},
+        ]}]}
+        text, image = self._run(data, "aresponses")["input"][0]["output"]
+        self.assertNotIn("prod-eu-1", text["text"])
+        self.assertEqual(image["image_url"], image_url)
+        refused = {"input": [{"type": "function_call_output", "call_id": "c", "output": [
+            {"type": "input_file", "file_data": "data:text/plain;base64,cHJvZC1ldS0x"},
+        ]}]}
+        with self.assertRaises(HTTPException) as caught:
+            self._run(refused, "aresponses")
+        self.assertEqual(caught.exception.status_code, 400)
+        # A string output is still walked as text.
+        walked = self._run({"input": [{"type": "function_call_output", "call_id": "c", "output": "on prod-eu-1"}]}, "aresponses")
+        self.assertNotIn("prod-eu-1", walked["input"][0]["output"])
+
+    def test_a_payload_takes_whitespace_only_as_line_wraps(self) -> None:
+        import base64 as b64
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 2
+        flat = b64.b64encode(png).decode()
+        wrapped = "\n".join(flat[i:i + 76] for i in range(0, len(flat), 76))
+        crlf = "\r\n".join(flat[i:i + 64] for i in range(0, len(flat), 64)) + "\r\n"
+        for data in (flat, wrapped, crlf):
+            with self.subTest(data=data[:20]):
+                for req, get, call in self._payload_positions(data):
+                    self.assertEqual(get(self._run(req, call)), data)
+        # Words in the base64 alphabet after a real header, with any other
+        # whitespace: refused at every position, never kept as they came.
+        smuggled = [
+            "iVBORw0KGgo the cluster is prod eu one",
+            "iVBORw0KGgo\tAAAA",
+            "iVBORw0KGgo=\nAAAA\nAAAAAAAA",
+            flat[:76] + "\n" + flat[76:100] + "\n" + flat[100:176],
+        ]
+        for data in smuggled:
+            for req, _, call in self._payload_positions(data):
+                with self.subTest(data=data[:24], call=call), self.assertRaises(HTTPException) as refused:
+                    self._run(req, call)
+                self.assertEqual(refused.exception.status_code, 400)
+
+    @staticmethod
+    def _payload_positions(data: str):
+        url = "data:image/png;base64," + data
+        return [
+            ({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": data}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["inlineData"]["data"], "agenerate_content"),
+            ({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]},
+             lambda r: r["messages"][0]["content"][0]["image_url"]["url"][len("data:image/png;base64,"):], "completion"),
+            ({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image", "image_url": url}]}]},
+             lambda r: r["input"][0]["content"][0]["image_url"][len("data:image/png;base64,"):], "aresponses"),
+        ]
+
+    # A value only a key-name rule masks: the text rules don't know "auth".
+    _KEYED = '{"auth":"opaque-value-xyz","name":"web"}'
+    _KEYED_OUT = '{"auth":"[REDACTED_SECRET]","name":"web"}'
+
+    def test_json_tool_output_gets_the_structure_rules_at_each_position(self) -> None:
+        cases = [
+            ({"messages": [{"role": "tool", "tool_call_id": "x", "content": self._KEYED}]},
+             lambda r: r["messages"][0]["content"], "completion"),
+            ({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": self._KEYED}]}]},
+             lambda r: r["messages"][0]["content"][0]["content"], "anthropic_messages"),
+            ({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x",
+                                                         "content": [{"type": "text", "text": self._KEYED}]}]}]},
+             lambda r: r["messages"][0]["content"][0]["content"][0]["text"], "anthropic_messages"),
+            ({"input": [{"type": "function_call_output", "call_id": "c", "output": self._KEYED}]},
+             lambda r: r["input"][0]["output"], "aresponses"),
+            ({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {"output": self._KEYED}}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["functionResponse"]["response"]["output"], "agenerate_content"),
+            ({"contents": [{"role": "user", "parts": [{"function_response": {"name": "t", "response": {"output": self._KEYED}}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["function_response"]["response"]["output"], "agenerate_content"),
+        ]
+        for req, get, call in cases:
+            with self.subTest(call=call, req=json.dumps(req)[:60]):
+                self.assertEqual(get(self._run(req, call)), self._KEYED_OUT)
+
+    def test_a_changed_tool_output_keeps_its_layout_and_an_unchanged_one_its_bytes(self) -> None:
+        secret = {"kind": "Secret", "metadata": {"name": "s"}, "data": {"k": "c2VjcmV0"}}
+        for text in (json.dumps(secret, indent=2) + "\n", json.dumps(secret, indent=4), json.dumps(secret, separators=(",", ":")),
+                     json.dumps(secret, indent="\t")):
+            with self.subTest(text=text[:30]):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                want = json.loads(text)
+                want["data"]["k"] = "[REDACTED_SECRET]"
+                indent = None if "\n" not in text.strip() else ("\t" if "\t" in text else len(text.split("\n")[1]) - len(text.split("\n")[1].lstrip()))
+                separators = (",", ": ") if indent is not None else (",", ":")
+                self.assertEqual(out, json.dumps(want, indent=indent, separators=separators) + ("\n" if text.endswith("\n") else ""))
+        odd = '{"a": "b",   "c": 1}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": odd}]})["messages"][0]["content"]
+        self.assertEqual(out, odd)
+
+    def test_json_inside_a_decoded_tool_output_is_decoded_too(self) -> None:
+        # The nested value only a key-name rule masks: the text rules leave it,
+        # so only the nested decoding catches it, and the changed inner
+        # document keeps its indent.
+        stdout = json.dumps({"auth": "opaque-value-xyz", "name": "web"}, indent=2)
+        output = json.dumps({"exit_code": 0, "stdout": stdout, "stderr": ""})
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
+        out = json.loads(self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]["output"])
+        self.assertEqual(out["exit_code"], 0)
+        self.assertEqual(json.loads(out["stdout"])["auth"], "[REDACTED_SECRET]")
+        self.assertTrue(out["stdout"].startswith('{\n  "auth"'), "the inner document keeps its indent")
+
+    def test_a_gemini_response_secret_with_a_json_data_string_is_masked_whole(self) -> None:
+        response = {"kind": "Secret", "data": json.dumps({"cfg": json.dumps({"v": "opaque-zz"})})}
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": response}}]}]}
+        out = self._run(req, "agenerate_content")
+        self.assertNotIn("opaque-zz", json.dumps(out))
+
+    def test_a_bare_pseudonym_marker_still_lets_the_output_decode(self) -> None:
+        config = dict(_RULES_CONFIG, rules=_RULES_CONFIG["rules"] + [{"name": "acct", "pattern": "4[0-9]{8}", "action": "pseudonym"}])
+        hook = _load_callback_module(config).proxy_handler_instance
+        text = '{"account": 412345678, "auth": "opaque-value-xyz"}'
+        out = asyncio.run(hook.async_pre_call_hook({}, None, {"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]}, "completion"))
+        content = out["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", content)
+        self.assertNotIn("412345678", content)
+        json.loads(content)
+
+    def test_a_number_a_second_text_pass_masks_stays_valid_json(self) -> None:
+        text = '{"token":\n  123456789,\n  "auth": "opaque-value-xyz"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("123456789", out)
+        self.assertNotIn("opaque-value-xyz", out)
+        json.loads(out)
+
+    def test_tool_output_past_the_bounds_or_not_whole_json_is_matched_as_text(self) -> None:
+        big = json.dumps({"auth": "opaque-value-xyz", "pad": "x" * (256 * 1024)})
+        deep = '{"auth":"opaque-value-xyz","d":' + "[" * 64 + "1" + "]" * 64 + "}"
+        prefixed = "result: " + self._KEYED
+        for text in (big, deep, prefixed, "[1, 2"):
+            with self.subTest(text=text[:40]):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertEqual(out, text, "left to the text rules, which don't mask a value only its key names")
+        # Two levels under the bound is decoded.
+        ok = '{"auth":"opaque-value-xyz","d":' + "[" * 62 + "1" + "]" * 62 + "}"
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": ok}]})["messages"][0]["content"]
+        self.assertIn("[REDACTED_SECRET]", out)
+
+    def test_decoding_tool_output_never_masks_less_than_the_text_rules_did(self) -> None:
+        # A JSON string under a credential key, and a number there, are masked
+        # whole as before decoding; decoding must not open them up.
+        cases = [
+            ('{"token": "{\\"v\\":\\"opaque-zz\\"}"}', "opaque-zz"),
+            ('{"token": 123456789, "n":"x"}', "123456789"),
+            ('{"password": 98765432}', "98765432"),
+            ('{"outer": {"token": "[\\"opaque-zz\\"]"}}', "opaque-zz"),
+        ]
+        for text, secret in cases:
+            with self.subTest(text=text):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertNotIn(secret, out)
+        # The same at the Gemini response level, where the response is already
+        # a mapping: a JSON string under a credential key stays a string and is
+        # masked whole.
+        for key in ("token", "password", "apiKey"):
+            with self.subTest(key=key):
+                req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {key: '{"v":"opaque-zz"}'}}}]}]}
+                out = self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]
+                self.assertNotIn("opaque-zz", json.dumps(out))
+        # A Secret's data value that is itself JSON is masked whole, not opened.
+        secret = json.dumps({"kind": "Secret", "data": {"cfg": '{"v":"opaque-zz"}'}})
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": secret}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-zz", out)
+
+    def test_a_tool_output_whose_escapes_end_a_value_stays_text(self) -> None:
+        # The text rules mask a bare value through a \\u escape; decoded, the
+        # escape would end it. Such output keeps the text rules' result.
+        for escape in ("\\u0020", "\\u0022", "\\u002c", "\\u007d", "\\u00a0", "\\u2028"):
+            with self.subTest(escape=escape):
+                text = '{"cmd":"mysql --password=abc' + escape + 'opaqueBBB"}'
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertNotIn("opaqueBBB", out)
+        # An escape for an ordinary character (Go writes < > & this way) still
+        # lets the output be decoded.
+        text = '{"auth":"opaque-value-xyz","html":"\\u003cb\\u003e"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+
+    def test_escapes_and_split_values_in_tool_output_stay_masked(self) -> None:
+        # The text rules run over the output as it came, before it is decoded,
+        # so a match that needs the escaped form (a URL password through an
+        # escape, a value through \\f, a key id before an escaped letter, a
+        # private key across strings) masks what it masked before.
+        cases = [
+            ('{"u":"postgres://app:s3cr\\u003cetzz@10.0.0.5:5432/app"}', "etzz"),
+            ('{"u":"redis://default:ab\\/cdzz@cache:6379","e":"bob@example.com"}', "cdzz"),
+            ('{"u": "postgres://admin:hunter2\\"zzqqsecret@db.internal.example.com/x", "e": "bob@example.com"}', "hunter2"),
+            ('{"log":"API_TOKEN=abcd1234\\fwxyz9876"}', "wxyz9876"),
+            ('{"k": "AKIAIOSFODNN7EXAMPL5\\u005f", "e": "bob@example.com"}', "AKIAIOSFODNN7EXAMPL5"),
+            ('{"stdout_lines": ["secret=-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEAbodybodybody", "-----END RSA PRIVATE KEY-----"]}', "bodybodybody"),
+            ('{"cmd":"mysql --password=abc\\u0020opaqueBBB"}', "opaqueBBB"),
+        ]
+        for text, secret in cases:
+            for req, get, call in (
+                ({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]}, lambda r: r["messages"][0]["content"], "completion"),
+                ({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {"output": text}}}]}]},
+                 lambda r: json.dumps(r["contents"][0]["parts"][0]["functionResponse"]["response"]), "agenerate_content"),
+            ):
+                with self.subTest(text=text[:40], call=call):
+                    self.assertNotIn(secret, get(self._run(req, call)))
+
+    def test_markers_and_plain_strings_do_not_use_the_nested_budget(self) -> None:
+        # Forty IPs become forty [ip:...] markers before decoding; the nested
+        # shell result is still decoded.
+        # The result comes first, so the walk reaches the markers before it.
+        doc = {"result": {"stdout": self._KEYED}, "pods": ["10.0.0.%d" % i for i in range(1, 41)],
+               "logs": ["[INFO] line %d" % i for i in range(40)]}
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": json.dumps(doc)}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+
+    def test_json_nested_under_a_secrets_data_string_is_masked_whole(self) -> None:
+        inner = json.dumps({"cfg": json.dumps({"v": "opaque-zz"})})
+        text = json.dumps({"kind": "Secret", "data": inner})
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-zz", out)
+
+    def test_a_number_under_a_credential_key_leaves_the_rest_to_the_structure_rules(self) -> None:
+        text = '{"token": 123456789, "auth": "opaque-value-xyz", "n": [1, 2]}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("123456789", out)
+        self.assertNotIn("opaque-value-xyz", out)
+        json.loads(out)
+
+    def test_an_operator_rule_matching_the_probe_word_does_not_stop_decoding(self) -> None:
+        config = dict(_RULES_CONFIG, rules=_RULES_CONFIG["rules"] + [{"name": "ours", "literal": "kube-agents"}])
+        hook = _load_callback_module(config).proxy_handler_instance
+        output = json.dumps({"exit_code": 0, "stdout": self._KEYED})
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
+        out = asyncio.run(hook.async_pre_call_hook({}, None, req, "agenerate_content"))
+        self.assertNotIn("opaque-value-xyz", json.dumps(out))
+
+    def test_a_tool_output_with_a_repeated_key_gets_the_text_rules_only(self) -> None:
+        # The decoder would keep one value; what the text says is what counts.
+        text = '{"kind":"Secret","kind":"Other","data":{"k":"opaque-value-xyz"}}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+        self.assertIn('"kind":"Other"', out, "left as text, both keys kept")
+
+    def test_a_changed_tool_output_stays_valid_json_whatever_whitespace_its_strings_hold(self) -> None:
+        for text in ('["nicole,\u00a0x", {"password":"opaque-abc"}, 1]', '{"a\u2028":"b", "password":"opaque-abc"}'):
+            with self.subTest(text=text):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                json.loads(out)
+                self.assertNotIn("opaque-abc", out)
+
+    def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
+        # Forms providers accept: the URL-safe alphabet, no padding, and the
+        # common image/jpg label. Each is kept byte for byte as it came.
+        import base64 as b64
+        png = b"\x89PNG\r\n\x1a\n" + bytes([0xFB, 0xFF, 0xFE]) * 4
+        jpeg = b"\xff\xd8\xff\xe0" + bytes([0xFB, 0xFF]) * 4
+        cases = [
+            ("image/png", b64.urlsafe_b64encode(png).decode()),
+            ("image/png", b64.b64encode(png).decode().rstrip("=")),
+            ("image/png", b64.urlsafe_b64encode(png).decode().rstrip("=")),
+            ("image/jpg", b64.b64encode(jpeg).decode()),
+        ]
+        for mime, data in cases:
+            with self.subTest(mime=mime, data=data):
+                req = {"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime, "data": data}}]}]}
+                out = self._run(req, "agenerate_content")
+                self.assertEqual(out["contents"][0]["parts"][0]["inlineData"]["data"], data)
+        # Normalising doesn't loosen the decode: a length that is 1 mod 4, an
+        # '=' inside the data, and over-padding are still not base64.
+        for bad in ("iVBORw0KGgoAA", "iVBO=Rw0KGgo", "iVBORw0KGgo=AAA", "iVBORw0KGgo==="):
+            with self.subTest(bad=bad), self.assertRaises(HTTPException) as refused:
+                self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": bad}}]}]}, "agenerate_content")
+            self.assertEqual(refused.exception.status_code, 400)
+        # A URL-safe payload that isn't the media it claims is still refused.
+        text = b64.urlsafe_b64encode(b"on prod-eu-1, token here").decode().rstrip("=")
+        with self.assertRaises(HTTPException):
+            self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/png", "data": text}}]}]}, "agenerate_content")
 
     # Provider-opaque fields a provider checks byte for byte: kept as they came
     # at their API positions, even when a rule matches inside them, and
@@ -574,13 +893,32 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(assistant["tool_calls"][0]["provider_specific_fields"]["thought_signature"], self._OPAQUE)
         self.assertNotEqual(out["messages"][1]["provider_specific_fields"]["thought_signature"], self._OPAQUE, "not on a user's message")
 
+    def test_a_refused_request_shape_is_answered_with_400_through_the_hook(self) -> None:
+        # Through the hook LiteLLM calls: a refused shape becomes an
+        # HTTPException with status 400, carrying the refusal text, so a
+        # caller doesn't retry it as it would a 5xx. Other faults stay 500s.
+        data = {"messages": "not a list"}
+        with self.assertRaises(HTTPException) as refused:
+            self._run(data)
+        self.assertEqual(refused.exception.status_code, 400)
+        self.assertIn("refuses a request it cannot walk", str(refused.exception.detail))
+
+    def test_a_fault_in_the_hook_is_not_answered_with_400(self) -> None:
+        # Only a refused shape becomes a 400: any other exception from the
+        # walk surfaces as itself, which LiteLLM answers with a 500.
+        from unittest import mock
+
+        with mock.patch.object(type(self.hook), "redact_request", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._run({"messages": [{"role": "user", "content": "x"}]})
+
     def test_a_refusal_names_a_media_type_only_when_it_is_a_media_type_name(self) -> None:
         def part(media):
             return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{media};base64,AAAA"}}]}]}
-        with self.assertRaises(self.module.UnwalkableRequestError) as named:
+        with self.assertRaises(HTTPException) as named:
             self._run(part("text/plain"))
         self.assertIn("text/plain", str(named.exception))
-        with self.assertRaises(self.module.UnwalkableRequestError) as unnamed:
+        with self.assertRaises(HTTPException) as unnamed:
             self._run(part("deploy key is hunter2-example-pw"))
         self.assertNotIn("hunter2", str(unnamed.exception))
 
@@ -650,9 +988,9 @@ class TestCallback(unittest.TestCase):
             {"type": "image_url", "image_url": {"url": "data:image/png,plain"}},
             {"type": "input_audio", "input_audio": {"format": "wav", "data": "not base64!"}},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
-        with self.assertRaises(self.module.UnwalkableRequestError):
+        with self.assertRaises(HTTPException):
             self._run({"contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": "image/svg+xml", "data": "PHN2Zz4="}}]}]}, "agenerate_content")
 
     def test_thinking_is_exempt_only_in_the_assistants_own_turn(self) -> None:
@@ -678,13 +1016,13 @@ class TestCallback(unittest.TestCase):
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64," + text_as_png}},
             {"type": "image_url", "image_url": {"url": "data:image/png;name=on-prod-eu-1;base64," + _PNG_BASE64}},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo"}},  # bad padding
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo!"}},  # not base64
             {"type": "image", "source": {"type": "base64", "media_type": "video/mp4", "data": text_as_png}},
             {"type": "image", "source": {"type": "base64", "media_type": "image/heic", "data": text_as_png}},
             {"type": "input_audio", "input_audio": {"format": "ogg", "data": text_as_png}},
             {"type": "image", "source": {"type": "base64", "media_type": "audio/x-made-up", "data": _WAV_BASE64}},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
 
     def test_json_in_tool_arguments_is_decoded_and_tool_output_is_redacted(self) -> None:
@@ -740,7 +1078,7 @@ class TestCallback(unittest.TestCase):
 
     def test_a_data_url_is_recognised_whatever_its_case_or_spacing(self) -> None:
         for url in ("DATA:text/plain;base64,dG9rZW49eGEyOQ==", " data:text/plain;base64,dG9rZW49eGEyOQ=="):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=url):
+            with self.assertRaises(HTTPException, msg=url):
                 self._run({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]})
 
     def test_a_json_looking_string_under_a_credential_key_is_masked(self) -> None:
@@ -769,7 +1107,7 @@ class TestCallback(unittest.TestCase):
             {"model": "m", "messages": ["prod-eu-1"]},
             {"model": "m", "contents": ["on prod-eu-1"]},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError) as raised:
+            with self.assertRaises(HTTPException) as raised:
                 self._run(dict(data), "arerank")
             message = str(raised.exception)
             self.assertIn("refuses a request it cannot walk", message)
@@ -831,7 +1169,7 @@ class TestCallback(unittest.TestCase):
             {"type": "file", "file": {"file_data": "data:application/json;base64,e30="}},
             {"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "b24="}},
         ):
-            with self.assertRaises(self.module.UnwalkableRequestError, msg=json.dumps(part)):
+            with self.assertRaises(HTTPException, msg=json.dumps(part)):
                 self._run({"messages": [{"role": "user", "content": [part]}]})
 
     def test_a_bad_rule_file_fails_the_import_rather_than_the_request(self) -> None:

@@ -10,7 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-	"unicode/utf8"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/inerttext"
 )
 
 // ToolInspectPR reads one pull or merge request through the credential
@@ -41,10 +42,6 @@ const (
 	maxListedFiles      = 100
 	maxListedLabels     = 20
 	maxRepositoryLen    = 512
-	// maxFieldBytes clips a one-line field before cell sees it. cell shows
-	// 200 runes at most, but it maps and splits the whole string first,
-	// and a title is only bounded by the broker answer's size.
-	maxFieldBytes = 1 << 10
 	// maxDiffHeaderBytes bounds the `diff --git` line a path is read from;
 	// a path is at most PATH_MAX (4096) on the platforms git runs on.
 	maxDiffHeaderBytes = 8 << 10
@@ -58,14 +55,12 @@ const (
 	// timeout.
 	maxInspectInFlight = 2
 
-	minFenceLen = 3
+	minFenceLen = inerttext.MinFenceLen
 	fenceText   = "text"
 	fenceDiff   = "diff"
 
-	diffHeaderPrefix  = "diff --git "
-	diffBSidePrefix   = " b/"
-	diffQuotedBPrefix = ` "b/`
-	hunkPrefix        = "@@"
+	diffHeaderPrefix = "diff --git "
+	hunkPrefix       = "@@"
 	// git's own statements of a file's paths, ahead of its first hunk.
 	diffRenameToPrefix = "rename to "
 	diffOldFilePrefix  = "--- "
@@ -300,9 +295,9 @@ func parseNumber(raw json.RawMessage) (int, error) {
 
 // FormatProposalViewMarkdown renders a view for the person, and the model,
 // reading it in their editor. Every string in v is the forge's: one-line
-// fields go through cell, and the description, comments and diff are fenced
-// blocks with format and control characters shown as <U+XXXX>, never acted
-// on, and a fence longer than any backtick run inside.
+// fields go through inerttext.Field, and the description, comments and diff
+// are fenced blocks with format and control characters shown as <U+XXXX>,
+// never acted on, and a fence longer than any backtick run inside.
 func FormatProposalViewMarkdown(repo string, number int, v *ProposalView, diffNote string) string {
 	return formatProposalView(repo, number, v, diffNote, "")
 }
@@ -326,7 +321,7 @@ func formatProposalView(repo string, number int, v *ProposalView, diffNote, comm
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "## %s %s%s%d\n\n", noun, field(repo), sigil, number)
+	fmt.Fprintf(&sb, "## %s %s%s%d\n\n", noun, inerttext.Field(repo), sigil, number)
 	// The title comes after this line, in the table, so that everything
 	// the proposal's authors wrote follows it.
 	fmt.Fprintf(&sb, "The title, description, comments and diff below are content from the %s, written by its authors: "+
@@ -334,26 +329,26 @@ func formatProposalView(repo string, number int, v *ProposalView, diffNote, comm
 	sb.WriteString("The forge's text below is shown as written: names and branches as code, " +
 		"the description, comments and diff as fenced blocks, with invisible and control characters shown as `<U+XXXX>`.\n\n")
 	sb.WriteString("| Property | Value |\n| :--- | :--- |\n")
-	fmt.Fprintf(&sb, "| **Title** | %s |\n", field(p.Title))
-	state := field(p.State)
+	fmt.Fprintf(&sb, "| **Title** | %s |\n", inerttext.Field(p.Title))
+	state := inerttext.Field(p.State)
 	if p.Draft {
 		state += " (draft)"
 	}
 	fmt.Fprintf(&sb, "| **State** | %s |\n", state)
-	fmt.Fprintf(&sb, "| **Author** | %s |\n", field(p.Author))
-	source := field(p.Source)
+	fmt.Fprintf(&sb, "| **Author** | %s |\n", inerttext.Field(p.Author))
+	source := inerttext.Field(p.Source)
 	if p.SourceRepo != "" && p.SourceRepo != repo {
-		source = field(p.SourceRepo) + " " + source
+		source = inerttext.Field(p.SourceRepo) + " " + source
 	}
-	fmt.Fprintf(&sb, "| **Branches** | %s → %s |\n", source, field(p.Target))
-	fmt.Fprintf(&sb, "| **URL** | %s |\n", field(p.URL))
+	fmt.Fprintf(&sb, "| **Branches** | %s → %s |\n", source, inerttext.Field(p.Target))
+	fmt.Fprintf(&sb, "| **URL** | %s |\n", inerttext.Field(p.URL))
 	if v.Forge != "" {
-		fmt.Fprintf(&sb, "| **Forge** | %s |\n", field(v.Forge))
+		fmt.Fprintf(&sb, "| **Forge** | %s |\n", inerttext.Field(v.Forge))
 	}
 	if len(p.Labels) > 0 {
 		labels := make([]string, 0, min(len(p.Labels), maxListedLabels))
 		for _, l := range p.Labels[:min(len(p.Labels), maxListedLabels)] {
-			labels = append(labels, field(l))
+			labels = append(labels, inerttext.Field(l))
 		}
 		more := ""
 		if len(p.Labels) > maxListedLabels {
@@ -369,7 +364,7 @@ func formatProposalView(repo string, number int, v *ProposalView, diffNote, comm
 	if strings.TrimSpace(p.Body) == "" {
 		sb.WriteString("_No description._\n")
 	} else {
-		writeBlock(&sb, p.Body, fenceText, maxDescriptionBytes, 0, maxProseLineBytes)
+		inerttext.WriteBlock(&sb, p.Body, fenceText, maxDescriptionBytes, 0, maxProseLineBytes)
 	}
 
 	if commentsNote != "" {
@@ -381,7 +376,7 @@ func formatProposalView(repo string, number int, v *ProposalView, diffNote, comm
 	if files.count > 0 {
 		fmt.Fprintf(&sb, "\n### Changed files (%d)\n\n| File | Added | Removed |\n| :--- | ---: | ---: |\n", files.count)
 		for _, f := range files.listed {
-			fmt.Fprintf(&sb, "| %s | %d | %d |\n", field(f.path), f.additions, f.deletions)
+			fmt.Fprintf(&sb, "| %s | %d | %d |\n", inerttext.Field(f.path), f.additions, f.deletions)
 		}
 		if files.count > len(files.listed) {
 			fmt.Fprintf(&sb, "\n_%d more file(s) not listed._\n", files.count-len(files.listed))
@@ -395,7 +390,7 @@ func formatProposalView(repo string, number int, v *ProposalView, diffNote, comm
 	case strings.TrimSpace(v.Diff) == "":
 		sb.WriteString("_The forge returned an empty diff._\n")
 	default:
-		writeBlock(&sb, v.Diff, fenceDiff, maxDiffBytes, maxDiffLines, maxDiffLineBytes)
+		inerttext.WriteBlock(&sb, v.Diff, fenceDiff, maxDiffBytes, maxDiffLines, maxDiffLineBytes)
 	}
 	return sb.String()
 }
@@ -412,26 +407,26 @@ func writeComments(sb *strings.Builder, v *ProposalView) {
 		sb.WriteString("_No comments._\n")
 	}
 	for i, c := range v.Comments[:shown] {
-		who := field(c.Author)
+		who := inerttext.Field(c.Author)
 		if c.Bot {
 			who += " (bot)"
 		}
-		fmt.Fprintf(sb, "#### %d. %s · %s", i+1, who, field(c.Kind))
+		fmt.Fprintf(sb, "#### %d. %s · %s", i+1, who, inerttext.Field(c.Kind))
 		if c.Path != "" {
-			fmt.Fprintf(sb, " on %s", field(c.Path))
+			fmt.Fprintf(sb, " on %s", inerttext.Field(c.Path))
 			if c.Line != nil {
 				fmt.Fprintf(sb, " line %d", *c.Line)
 			}
 		}
 		if c.Created != "" {
-			fmt.Fprintf(sb, " · %s", field(c.Created))
+			fmt.Fprintf(sb, " · %s", inerttext.Field(c.Created))
 		}
 		sb.WriteString("\n\n")
 		if strings.TrimSpace(c.Body) == "" {
 			sb.WriteString("_Empty._\n\n")
 			continue
 		}
-		writeBlock(sb, c.Body, fenceText, maxCommentBytes, 0, maxProseLineBytes)
+		inerttext.WriteBlock(sb, c.Body, fenceText, maxCommentBytes, 0, maxProseLineBytes)
 		sb.WriteString("\n")
 	}
 	if shown < total {
@@ -440,157 +435,6 @@ func writeComments(sb *strings.Builder, v *ProposalView) {
 	if v.CommentsTruncated {
 		sb.WriteString("_The forge holds more comments than the broker read; read the rest on the forge._\n")
 	}
-}
-
-// writeBlock writes untrusted text as one fenced block, capped at maxBytes
-// and maxLines (0 for none) on line boundaries, each line capped at
-// lineBytes, and says what the caps left out.
-func writeBlock(sb *strings.Builder, s, info string, maxBytes, maxLines, lineBytes int) {
-	kept, lines, bytes := inertPrefix(s, maxBytes, maxLines, lineBytes)
-	fence := strings.Repeat("`", max(minFenceLen, longestRun(kept, '`')+1))
-	sb.WriteString(fence + info + "\n" + kept)
-	if !strings.HasSuffix(kept, "\n") {
-		sb.WriteString("\n")
-	}
-	sb.WriteString(fence + "\n")
-	if lines > 0 {
-		fmt.Fprintf(sb, "\n_Truncated: %d more line(s), %d more byte(s) not shown._\n", lines, bytes)
-	}
-}
-
-// inertPrefix makes the head of untrusted multi-line text inert inside a
-// fence and returns it with how many lines and bytes of s it left out. A line
-// ends at \n alone (a \r just before it is part of the ending) and tabs stay;
-// every other control or format character (ANSI escapes, bidi overrides,
-// zero-width marks, line separators, and any other \r) is shown as <U+XXXX>
-// rather than dropped, so a reviewer sees that it is there, and a \r inside a
-// diff line cannot draw a line the diff does not have. Each line is cut at lineBytes, at a rune boundary, saying
-// how much went; whole lines are kept while they fit in maxBytes and
-// maxLines (0 for no line cap). It never cuts inside a line, the
-// line-anchored counterpart of #3689's line-anchored diff split, so a
-// truncated diff ends on a whole line rather than mid-hunk-header; the one
-// exception is a first line longer than the whole cap, cut at a rune
-// boundary rather than show nothing.
-//
-// It walks s by index and stops at the caps: no copy of s is made, the
-// output is at most maxBytes, and what it leaves out is only counted. s may
-// be as large as the broker's answer; this costs O(maxBytes) memory.
-func inertPrefix(s string, maxBytes, maxLines, lineBytes int) (string, int, int) {
-	out := make([]byte, 0, min(len(s), maxBytes)+utf8.UTFMax)
-	pos, n := 0, 0
-	for pos < len(s) {
-		if maxLines > 0 && n >= maxLines {
-			break
-		}
-		end, next := lineBounds(s, pos)
-		mark := len(out)
-		out, _ = appendInert(out, s[pos:end], lineBytes, true)
-		if next > end {
-			out = append(out, '\n')
-		}
-		if len(out) > maxBytes {
-			out = out[:mark]
-			if n == 0 {
-				var stop int
-				out, stop = appendInert(out, s[pos:end], maxBytes, false)
-				pos += stop
-			}
-			break
-		}
-		pos, n = next, n+1
-	}
-	if pos >= len(s) {
-		return string(out), 0, 0
-	}
-	rest := s[pos:]
-	return string(out), strings.Count(strings.TrimSuffix(rest, "\n"), "\n") + 1, len(rest)
-}
-
-// lineBounds is the line of s starting at pos: end is where its text ends
-// and next where the following line starts, past a \n. A \r just before the
-// \n is left out of the text; any other \r is text, for appendInert to show.
-func lineBounds(s string, pos int) (end, next int) {
-	i := strings.IndexByte(s[pos:], '\n')
-	if i < 0 {
-		return len(s), len(s)
-	}
-	end, next = pos+i, pos+i+1
-	if end > pos && s[end-1] == '\r' {
-		end--
-	}
-	return end, next
-}
-
-// appendInert appends the inert form of one line (no line ending) to dst,
-// at most limit bytes of it. With marker, a line cut short ends in a note of
-// how many of its bytes went and the whole line counts as used; without, it
-// stops at the cap and reports how many bytes of line it used.
-func appendInert(dst []byte, line string, limit int, marker bool) ([]byte, int) {
-	start := len(dst)
-	var esc [16]byte
-	for i, r := range line {
-		var piece []byte
-		switch {
-		case r == utf8.RuneError:
-			piece = append(esc[:0], "\uFFFD"...)
-		case r == '\t':
-			piece = append(esc[:0], '\t')
-		case unicode.IsControl(r), unicode.Is(unicode.Cf, r), unicode.In(r, unicode.Zl, unicode.Zp):
-			piece = appendCodePoint(esc[:0], r)
-		default:
-			piece = utf8.AppendRune(esc[:0], r)
-		}
-		if len(dst)-start+len(piece) > limit {
-			if !marker {
-				return dst, i
-			}
-			return fmt.Appendf(dst, "… [%d bytes cut]", len(line)-i), len(line)
-		}
-		dst = append(dst, piece...)
-	}
-	return dst, len(line)
-}
-
-// appendCodePoint appends r as <U+XXXX> (at least four upper-case hex
-// digits), without fmt, which would move the caller's scratch to the heap.
-func appendCodePoint(dst []byte, r rune) []byte {
-	const hex = "0123456789ABCDEF"
-	dst = append(dst, "<U+"...)
-	if r < 0 || r > utf8.MaxRune {
-		r = utf8.RuneError
-	}
-	u := uint32(r) // #nosec G115 -- clamped to [0, utf8.MaxRune] just above
-	digits := 4
-	for v := u >> 16; v > 0; v >>= 4 {
-		digits++
-	}
-	for i := digits - 1; i >= 0; i-- {
-		dst = append(dst, hex[(u>>(4*uint(i)))&0xF])
-	}
-	return append(dst, '>')
-}
-
-func runeFloor(s string, n int) int {
-	if n >= len(s) {
-		return len(s)
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return n
-}
-
-func longestRun(s string, c byte) int {
-	best, cur := 0, 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			cur++
-			best = max(best, cur)
-		} else {
-			cur = 0
-		}
-	}
-	return best
 }
 
 type diffFile struct {
@@ -655,7 +499,7 @@ func diffFiles(diff string) diffSummary {
 			if len(header) > maxDiffHeaderBytes {
 				header = header[:maxDiffHeaderBytes]
 			}
-			cur, oldPath = diffFile{path: diffHeaderBSidePath(header)}, ""
+			cur, oldPath = diffFile{path: inerttext.DiffHeaderBSidePath(header)}, ""
 			inFile, inHunk = cur.path != "", false
 		case !inFile:
 		case strings.HasPrefix(line, hunkPrefix):
@@ -709,42 +553,4 @@ func diffMetaPath(text, prefix string) string {
 		return ""
 	}
 	return text[len(prefix):]
-}
-
-// field is a one-line forge string as a table cell, clipped first so cell
-// never maps or splits more than maxFieldBytes of it.
-func field(s string) string {
-	return cell(s[:runeFloor(s, maxFieldBytes)])
-}
-
-// diffHeaderBSidePath is the post-image path of a `diff --git a/<p> b/<p>`
-// header line, tolerating git's C-style quoting (`"a/p q" "b/p q"`) for
-// paths with spaces or special characters. Adam Parco's, from #3689.
-func diffHeaderBSidePath(header string) string {
-	line := strings.TrimSpace(header)
-	if idx := strings.LastIndex(line, diffQuotedBPrefix); idx >= 0 {
-		if unquoted, err := strconv.Unquote(line[idx+1:]); err == nil {
-			return strings.TrimPrefix(unquoted, "b/")
-		}
-	}
-	// Git does not quote a path for a space alone, so " b/" may be inside
-	// the path too (`a/docs b/x b/docs b/x`). Outside a rename both sides
-	// are the same path, so the split whose a-side matches its b-side is
-	// the one; a rename has no such split and takes the last " b/".
-	last := -1
-	for from := 0; ; {
-		i := strings.Index(line[from:], diffBSidePrefix)
-		if i < 0 {
-			break
-		}
-		last = from + i
-		if b := line[last+len(diffBSidePrefix):]; line[:last] == "a/"+b {
-			return strings.TrimSpace(b)
-		}
-		from = last + 1
-	}
-	if last >= 0 {
-		return strings.TrimSpace(line[last+len(diffBSidePrefix):])
-	}
-	return ""
 }

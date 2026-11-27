@@ -377,7 +377,8 @@ type Gateway struct {
 	// fanOutReplayHook is an optional test hook, called with the task id each
 	// time a fan-out path replays a task's stream in full (fanOutReplay),
 	// so a test can tell those reads from the direct gets that open no
-	// consumer (#6646). Read under mu.
+	// consumer, but for a profile's five-token supervisor subject on a reader
+	// with a cutoff (lib.Client.LastEnvelopeOn) (#6646). Read under mu.
 	fanOutReplayHook func(taskID string)
 	// fanOutSpotChecks is, per fan-out parent, the running child the heal
 	// replayed in full last (nextFanOutSpotCheck). Read under mu; in memory,
@@ -389,6 +390,9 @@ type Gateway struct {
 	taskSessions map[string]string
 	// relays holds per-task render state for the rolling progress line.
 	relays map[string]*relayState
+	// namesHolds counts the relay's holds of a five-token supervisor event
+	// while the profile names are not loaded (relay.go).
+	namesHolds namesHolds
 	// cardStopTimers holds each in-flight card-stop control's timeout, by
 	// task id, under mu (cardstop.go). Memory only: a restart loses them,
 	// and the next turn on the conversation expires a control past its
@@ -1975,7 +1979,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	// switch's default branch, which only a nil or detached active task
 	// reaches; reading it off the ref keeps the heal from depending on that.
 	addressee := rec.AddresseeFor(active.TaskID)
-	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID, g.profileRead(rec, active.TaskID, addressee))
+	task, terminalSubject, storedAt, err := g.client.TasksGetTerminal(ctx, addressee, active.TaskID)
 	// A profile parent still waiting on its batch has its children healed
 	// first, an end the relay missed or couldn't send going to it now
 	// (healProfileBatch), and is then healed below as any task is: its own
@@ -2448,7 +2452,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 	}
-	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read, g.profileRead(rec, read, addressee))
+	task, terminalSubject, terr := g.client.TasksGetAttributed(ctx, addressee, read)
 	// What the fold shows about a delegate request, for the hand-off rule
 	// below; nil when the read found nothing to fold.
 	var foldEvidence *delegateEvidence
@@ -2525,6 +2529,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
 	state.ChildAddressees = chainChildAddressees(rec, taskID)
+	state.ChildCount = chainChildCount(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2575,7 +2580,7 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 	for i, link := range links {
 		folded := readTask
 		if link.ID != read {
-			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID, g.profileRead(rec, link.ID, link.Addressee))
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
 			switch {
 			case err == nil:
 				folded = t
@@ -2624,6 +2629,30 @@ func chainChildAddressees(rec *SessionRecord, taskID string) []string {
 		out = append(out, t.Addressee)
 	}
 	return out
+}
+
+// chainChildCount is how many child tasks the delegation chain rooted at
+// taskID's root minted: every delegation, so two to the same addressee count
+// two where chainChildAddressees names it once. A child minted without an
+// addressee still counts, since it is a delegation whomever it went to. Zero
+// when the chain delegated nothing; nil only when taskID is unknown, so the
+// wire tells "none" from "unknown" as the addressees do. It counts the
+// children the record still holds: a long-lived conversation whose history
+// trim (trimHistory) dropped old child entries under a live root counts
+// fewer, which a fresh bench conversation never reaches.
+func chainChildCount(rec *SessionRecord, taskID string) *int {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.Role == taskRoleChild && t.rootID() == root {
+			n++
+		}
+	}
+	return &n
 }
 
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.
@@ -3913,6 +3942,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		}
 	}
 	rec.recordSteerAuthor(active.TaskID, author)
+	rec.SteeredSession = rec.BusSession
 	if rec.AddressedToOwnSession() {
 		rec.addSessionAuthor(author)
 	}
@@ -3967,8 +3997,8 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// the task, which is a pod still starting or nothing at all, so no reply
 	// is promised. A read that fails keeps the route's line. The read is
 	// direct gets (taskStreamEmpty), not a replay, so a steer opens no
-	// consumer.
-	empty, emptyErr := g.taskStreamEmpty(ctx, rec, active.TaskID)
+	// consumer, but for the one taskStreamEmpty names.
+	empty, emptyErr := g.taskStreamEmpty(ctx, rec.AddresseeFor(active.TaskID), active.TaskID)
 	noFirstEvent := emptyErr == nil && empty
 	if noFirstEvent {
 		ack := fmt.Sprintf(steerNoFirstEventAck, active.TaskID)
@@ -4118,7 +4148,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 // payoff the payload spec's replay rule promises.
 func (g *Gateway) answerStatusByReplay(ctx context.Context, rec *SessionRecord) {
 	active := rec.ActiveTask
-	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID, g.profileRead(rec, active.TaskID, rec.Addressee))
+	task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
 	if err != nil {
 		if _, ok := err.(*lib.A2AError); ok {
 			g.post(rec.Key, "📭 no events on the stream for this task yet")

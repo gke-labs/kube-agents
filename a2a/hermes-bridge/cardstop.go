@@ -144,6 +144,12 @@ type cardStopCardRef struct {
 // through cancelReq, as they end an API turn's.
 func (b *Bridge) runCardStop(ctx context.Context, run *taskRun) {
 	defer b.wg.Done()
+	// A panic ends this control failed closed, as a task's does (panic.go).
+	b.guardTask("card stop", run, func() { b.cardStop(ctx, run) })
+}
+
+// cardStop is runCardStop's work, under its guard.
+func (b *Bridge) cardStop(ctx context.Context, run *taskRun) {
 	if !b.capabilityPermits(ctx, run) {
 		return
 	}
@@ -195,8 +201,10 @@ func (b *Bridge) runCardStop(ctx context.Context, run *taskRun) {
 		b.finalizeCardStopError(run, fmt.Errorf("the session's turn did not end within %s; no card was stopped", cardStopTurnWait))
 		return
 	}
-	resp, err := b.postCardStop(stopCtx, sessionID, run.origin)
-	release()
+	resp, err := func() (*cardStopResponse, error) {
+		defer release()
+		return b.postCardStop(stopCtx, sessionID, run.origin)
+	}()
 	if err != nil {
 		b.finalizeCardStopError(run, err)
 		return

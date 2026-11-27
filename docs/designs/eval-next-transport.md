@@ -67,8 +67,8 @@ clock read before the agent is invoked, is not this run's and stays, files inclu
 both waits below. When the clock or the board cannot be read, such a card is taken like the run's
 own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
 other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
-fails, is written down in the agent pod, and the next repetition retries it before its agent is
-invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+fails, is written down in the agent pod, and every later purge retries it, the next repetition's
+before its agent is invoked included, each purge under its own start time, so a card an earlier purge owes goes even when a later
 run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
@@ -315,7 +315,8 @@ up on the provider's rate limit or billing, Hermes's exit 75 or the API server's
 `hermes-api-unreachable` (the bridge never got a response from the pod's API server),
 `hermes-api-refused` (the API server answered a 4xx other than 429, before any turn ran) and
 `session-busy` (the task's deadline passed while it waited for its session's previous turn, so
-no request was sent), and the worker adapter's `worker-evicted`
+no request was sent) and `internal-panic` (the bridge or the worker adapter recovered a panic
+while handling the task and ended it with no answer), and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
@@ -356,7 +357,16 @@ worker adapter from the `tool_use` content blocks in the stream of the coding ag
 the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
-`progress` heartbeat. `worker_commands` reads
+`progress` heartbeat. On the session route an entry can arrive without its input. The harness
+then takes the input from the session pod's worker adapter, which keeps each tool call it published
+in memory and prints a task's calls to `worker-adapter trajectory <task id>`, run by `kubectl exec`
+in the pod's `worker` container right after the turn settles, matched to the entries by position
+and checked by tool name (`bench/kube_agents_bench/session_trajectory.py`). An entry that carries
+its own input keeps it; a count or name that disagrees, or a pod with no capture, leaves the
+entry's args empty. A pod claimed from the warm pool carries no session-key annotation, so the
+harness then asks the live unannotated session pods and takes the capture from the one holding the
+task. A turn that delegated isn't filled: the door reads the wake turn's trace under the root
+task's id, and the capture for that id is another turn's. `worker_commands` reads
 the kanban worker logs by card id (for the required checks, for the forbidden runs where a `terminal` entry holds no heredoc, for a card with no log line, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace; a check with `after_result_pattern` and a forbidden set reads those entries alone); on
@@ -634,7 +644,10 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 `kubectl exec` the board read uses. It caps the cards at the harness's one cap, pending first,
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
-line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
+line on the record's errors, and nothing is graded for it. A card created before the run started
+was not filed by this run, so the repetition is not independent: the wait logs a warning for it,
+and its dropped line, if it is dropped, says so; marking a settled one in the record would change
+grading. Then it reads `tasks.result` and the
 newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
 newest block's kind and reason. No status turn is sent, because
 none could carry a result back through the door. Only a terminal card reaches the settle step,
@@ -712,6 +725,10 @@ The dashboard's Trend page keeps a series per mode: it draws `next` by default, 
 its window; its Nightly page reads the main nightly's runs, so it shows `next`.
 
 **The front door (#6539).** `EVAL_FRONT_DOOR` picks which front door a run deploys. `platform`, the default, sends a plain conversation to the platform agent, as every install does today. `session` sets the chart's `platformAgent.harness.tuning.defaultRoute` to `session`, so each new conversation gets a session pod of its own: the default session that the sessions-by-default change (#2371) makes the front door. The door takes the install's route, so the cases run unchanged. On the session route a session costs its conversation's replays too, 7 TASKS consumers rather than 3, and the floor would fit only 2 sessions at 4 parallel conversations. So a session run sizes `maxSessions` to the run's parallelism plus two (`EVAL_FRONT_DOOR_SESSIONS=fair`), and its fresh TASKS is created at that budget. The headroom matters because the gateway doesn't queue at the cap: it evicts the longest-idle pod or refuses the turn, and an eviction between a multi-turn case's turns would cost B for something that isn't the front door. `EVAL_FRONT_DOOR_SESSIONS=shipped` leaves the cap at the install default instead, which is what a customer install gets; an eviction or refusal there is a finding about that default. After its gates, the deploy reads the route the install resolved (the `A2A_DEFAULT_ADDRESSEE` the operator rendered on the gateway), writes the requested and the resolved route to `front-door.txt` in its artifacts, and fails when they differ (#6942). Today a mismatch means the chart or the CR lost the setting; once the operator can hold an explicit `session` back on `platform` (the session cap's guards, #6487), it also catches a run that would grade the wrong door. A session run keeps its records apart from the main nightly's: the gate files them under the version key's `next-session` mode, the dashboard publish skips the run, and it never records into the shared replay cache. `scripts/eval_front_door_ab.py <run A> <run B>` reads the two runs' `case-<name>.json` hand-offs and lists every case B fails where A passed. When both runs carry their `eval-grading.log`, it also compares each case's median answer words, infrastructure repetitions left out, and flags a case whose answer on B runs more than 25% and at least 10 words over A's; `--length-gate` makes that exit 1 too, since answer length is part of front-door parity, and exits 2 when a run has no shapes to compare. It exits 1 on a regression, and 2 when the runs can't be compared: an empty run, swapped front doors, a run whose resolved front door differs from the one it asked for or wasn't recorded, or a B where no case was graded.
+
+**The permit pairs (#6539).** That issue's other comparison, today's platform agent against a
+profile on the same ask, is the same script's `--pairs` mode: two cases, which can run on one
+install. [permit-pairs.md](permit-pairs.md) has the form.
 
 **History.** While `spec.mode: today` existed, `EVAL_MODE_NEXT=1` on a Prow job chose this path:
 the deploy installed `today`, proved it, then flipped the install to `next` through the chart's

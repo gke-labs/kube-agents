@@ -36,6 +36,20 @@ authenticates the pod and applies the broker's tool policy and audit log.
 There is no direct-URL kind: `Load` refuses `url:` in `mcp.yaml`, because
 a server reached around the broker would be outside both.
 
+A persona declares no hook. `persona.yaml` has no `hooks` key, and `Load`
+refuses an unknown top-level key there. A key below `harness.<name>` loads,
+but it makes no hook: the Claude Code adapter ignores it with a warning. A
+skill's frontmatter that carries `hooks` is refused, and the profile worker
+writes each task's `settings.json` itself, as an empty object. The reason is
+the rule of this format: a persona is written once for every harness, so
+nothing in it can depend on a feature of one harness. A hook is a feature of
+Claude Code. This package renders a persona for `claude-code` and for
+`core-agent`, and an AgentProfile's `spec.harness.type` accepts `claude-code`
+only, so a hook could be rendered for one harness only today. Rows 1 and 15
+of [the hooks design](../../../docs/designs/profile-worker-hooks.md) record
+the decision: no hook mechanism is built now, and a later design can open
+one.
+
 `Load` also refuses:
 
 - a persona whose files differ from its `skills_manifest.sha256`, or one
@@ -93,6 +107,7 @@ manifest is left out, because a skill's files are rendered.
 that `scope` selects, for a tree that is not a persona directory. The
 session worker uses it on its Claude Code home, where only `CLAUDE.md` and
 `skills/` are the image's and the harness keeps its own state beside them.
+Another harness's worker runs it over that harness's persona directory.
 Paths outside the scope are not entered, and a manifest entry outside it is
 refused.
 
@@ -111,8 +126,9 @@ one until every worker it can run under accepts the name.
 
 An adapter maps a loaded persona to a harness and reads nothing else: no
 network, no credentials, no environment. Whatever the pod knows, such as
-the relay's address, the worker passes in as a `Target`. What a harness
-cannot express comes back as a warning, never an error.
+the relay's address, the worker passes in as a `Target`. For Claude Code,
+what the harness cannot express comes back as a warning; the `core-agent`
+adapter refuses it instead (below).
 `render.For(harness)` picks the adapter by the harness the worker is started
 with: `A2A_HARNESS`, which the operator sets from the AgentProfile's
 `spec.harness.type` (and the gateway sets on session pods from the
@@ -121,7 +137,7 @@ PlatformAgent's `spec.harness.sessionWorker.type`), or on a profile worker
 `core-agent`). A session pod refuses `antigravity` unless
 `A2A_HARNESS_UNISOLATED=allow` and `A2A_HARNESS_PATH` are set, and `core-agent`
 unless `A2A_HARNESS_UNISOLATED=allow` is set, until #6710 lands. A profile
-worker refuses both, because neither has a persona adapter yet.
+worker refuses `antigravity`, which has no persona adapter yet.
 
 - **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
   tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
@@ -144,8 +160,51 @@ worker refuses both, because neither has a persona adapter yet.
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
-- **`core-agent`**: not written yet (it comes with core-agent's persona
-  render, #6713); `render.For` refuses it by name.
+- **`core-agent`** (`coreagent`): renders `instructions.md` and `skills/`,
+  each skill in the Agent Skills layout (`<name>/SKILL.md` and its files),
+  for a directory a user other than the harness's writes before the harness
+  runs. The harness takes the instructions as a layer above its own system
+  prompt and lists the skills to the model. When the model loads a skill,
+  its instructions open with the skill's directory on disk and its scripts
+  by absolute path, which is how the shell may run them.
+  `coreagent.Snapshot` reads the directory into memory once, beside its
+  integrity manifest, refusing any other top-level name, a symlink or a
+  special file, so a later change on disk doesn't reach the harness.
+  - Each `mcp.yaml` server the manifest grants runs as the worker's relay to
+    the credential broker, the same command and environment as for Claude
+    Code, with its granted tools listed (`Output.MCPServers`); a whole-server
+    grant takes the server's `include` list. The worker sends them in each
+    turn's stdin envelope.
+  - Tools pass through as the manifest names them, for the harness's tool
+    grant to map. `coreagent.ScriptPaths` names the scripts the shell may run.
+  - A profile worker's core-agent tool grant is read from this rendering
+    (`workeradapter.PersonaToolPolicy`) and grants what the Claude Code
+    rendering does: `read_file` the read tools, `shell` any command
+    (compound ones included, as Claude Code's Bash), `web_search` Gemini's
+    server-side Google Search, and each MCP server's listed tools; no
+    file-write tool. A turn whose persona grants the shell runs in
+    core-agent's mode that doesn't refuse an unmatched call, since its allow
+    rules can't express a compound command; registration, the harness's
+    before-tool check, deny rules and core-agent's shell denylist still
+    hold, and the read tools aren't workspace-scoped there (the shell reads
+    anywhere it can reach anyway). The shell's boundary is the sandbox and
+    the broker, as on Claude Code. Without the shell, the read tools stay
+    inside the workspace. Search is server-side and
+    not gated per call, as WebSearch is on Claude Code, and works only where
+    the model endpoint offers it beside function calls (Gemini 3 or later,
+    by model name).
+  - Each `SKILL.md` frontmatter is written back with only the keys the
+    harness reads, read as exactly one YAML document between exact `---`
+    lines.
+  - Refused rather than dropped: a granted server with no relay or no
+    `include` list, a server or tool name the harness would rename, a skill
+    frontmatter key other than `name`, `description`, `license`,
+    `compatibility` and `metadata`, a skill's `allowed-tools`, non-string
+    `metadata` values, a script whose path isn't letters, digits, `.`, `_`,
+    `-` and `/`, and a script when the persona doesn't grant `shell`.
+  - The server name `a2a` is reserved, for every harness, for the worker's
+    own delegate server, which the worker adds per turn (core-agent: once
+    #6789 lands).
 
 ## An example
 

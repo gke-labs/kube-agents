@@ -668,8 +668,9 @@
 # A /session turn that delegates a cluster question ends in one wake's answer,
 # not in the delegation depth bound (#2819). Real only on the inject
 # transport, where the gateway routes /session to a session pod; over
-# the agent API it reaches the platform agent as a plain prompt and its
-# forbidden-phrase check passes without testing anything. deployer: noop.
+# the agent API it reaches the platform agent as a plain prompt, its
+# forbidden-phrase check passes without testing anything, and its child-count
+# check (at most one, #7245) reports an error. deployer: noop.
 ./tasks/session-cluster-question-wake-answers-once/task.yaml
 # gitops-drift-noise-filtered-triage: the drift detector's principal
 # classifier, which nothing else exercises. The sibling
@@ -930,6 +931,15 @@
 # namespace; the incumbent's delivery checks and safeguards.
 ./tasks/autoops-warning-event-triage-state-stamp/task.yaml
 
+# gke-cluster-autoscaler skill probe (#2635): CapacityBuffer placeholder pods
+# exist only inside Cluster Autoscaler memory, so reactive triage lists
+# capacitybuffers.autoscaling.x-k8s.io across namespaces and checks the v1beta1
+# failure triad (ReadyForProvisioning=False, LimitedByQuotas=True,
+# Provisioning=False) plus NotTriggerScaleUp events on the CapacityBuffer
+# object (healthy buffers stay Provisioning=True with no Ready condition).
+# deployer: noop, transcript-only.
+./tasks/autoscaler-capacity-buffer-triage-probe/task.yaml
+
 # gke-cluster-autoscaler skill probe (#2528): Pods with generated names stay
 # Pending with an empty NotTriggerScaleUp reason on a pool below its maximum.
 # Graded on the fix that goes through Git: the answer names the namespace
@@ -959,6 +969,13 @@
 # asymmetric zonal GPU splits are fixed with declarative ComputeClass fallback
 # rules and topology spread rather than custom polling scripts. deployer: noop.
 ./tasks/capacity-gpu-zonal-skew-fallback-chain/task.yaml
+
+# Multi-pool Cluster Autoscaler scan-delay probe (#2900, #3008, #7096):
+# untargeted dynamic `render-<uuid>` workloads across 28 tainted GPU pools force
+# per-pool evaluation across every pool; fixed durably with namespace
+# `cloud.google.com/default-compute-class` and `capacitybuffers.autoscaling.x-k8s.io`.
+# deployer: noop, no fixture.
+./tasks/capacity-multipool-ca-scan-delay-capacitybuffer/task.yaml
 
 # chat-answer-writes-a-table: a direct answer asked for as a table is a
 # markdown pipe table, not "Label: value | Label: value" lines. Red on the
@@ -993,6 +1010,12 @@
 # overlay of its own, and posts no test notification (#3112).
 # `validated: false` until its first observed nightly runs.
 ./tasks/chat-home-channel-answer-names-the-setting/task.yaml
+
+# The front door answers "what model are you running on?" from its
+# [RUNTIME MODEL IDENTITY] block, never with the router alias (model-default,
+# hermes-agent) or the `custom` placeholder, and files no card (#3295).
+# deployer: noop, transcript-only, one front-door turn with no card.
+./tasks/chat-model-identity-truth/task.yaml
 
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
@@ -1072,9 +1095,9 @@
 # A per-node listing (five columns) arrives in the chat thread as a pipe
 # table, not as a bullet per node: the A2A gateway renders a table on Google
 # Chat as a monospace block, and the personas and report stanza no longer tell
-# the worker that Chat drops it. deployer: noop, read-only, the three node-pool
-# fixtures of slot a (idle-nodepool, hpa-saturated, default-pool-headroom), one
-# card.
+# the worker that Chat drops it. deployer: noop, read-only, the node-pool
+# fixtures of slot a whose pools hold nodes (idle-nodepool, hpa-saturated,
+# default-pool-headroom), one card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
 # A presence answer from a Cluster Agent names the missing namespace and the
@@ -1147,8 +1170,9 @@
 # `cluster` profile to open a pull request adding a PodDisruptionBudget for
 # the no-pdb-workload fixture on the job's GitOps repository, graded on that
 # pull request (pull_request_opened, the budget file only) and an unchanged
-# cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
-# (the persona's version-control skill) land; its record shows when they do.
+# cluster. deployer: noop. Red on an install that predates #4457 (the
+# structured confirm) or #6422 (the persona's version-control skill); both
+# have been on main since 2026-11-20.
 ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
 # A cluster profile task that names no repository finds the one it may use
@@ -1159,6 +1183,14 @@
 # behaviour shipped with #6411). Pool installs manage exactly one repository (hack/ci-deploy.sh:
 # one forge and one GitOps repository per leased project).
 ./tasks/cluster-profile-finds-the-managed-repository/task.yaml
+
+# gke-compute-classes pre-flight machine-family migration validator probe
+# (#5733): migrating a legacy N1 node pool (pd-standard, localSsdCount: 2,
+# enableSecureBoot: false, enableVtpm: false) to N4 runs
+# /opt/data/scripts/machine_family_preflight.py and surfaces security, disk, and
+# Local SSD blockers before generating ComputeClass or NodePool YAML.
+# deployer: noop, read-only, no fixture, transcript-only.
+./tasks/compute-class-machine-family-preflight-probe/task.yaml
 
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
@@ -1191,12 +1223,33 @@
 # full audit and band as consistency-drift-outlier.
 ./tasks/consistency-boot-disk-pool-outlier/task.yaml
 
+# Node-pool kubelet cpuCfsQuota=false enforcement probe (#2599, #2799, #7179):
+# disabling cpuCfsQuota turns off kernel CPU limit enforcement for multi-tenant
+# workloads on that pool. deployer: noop, no fixture.
+./tasks/consistency-kcc-kubelet-cfs-quota-drift/task.yaml
+
 # #2800: the drift audit's kubelet-config facet, the second voted by node
 # pool. seeded-c's default-pool sets podPidsLimit where the stack's other
 # pools set no kubelet key the facet reads; graded on the ledger's
 # kubelet-config finding and the pool it names. The same full audit and band
 # as consistency-drift-outlier.
 ./tasks/consistency-kubelet-config-pool-outlier/task.yaml
+
+# #6492: the waste audit reads the CPU peak in buckets of one minute. Over
+# seeded-cpu-cycle (role cpu-burst-and-flat): cpu-burst uses its whole CPU
+# request for 45 seconds in each 10 minutes, which is under the bar of the
+# overrequest check in a bucket of 300 seconds and above it in a bucket of 60.
+# Graded on the cost ledger: no finding id for cpu-burst or for cpu-flat, the
+# control.
+# The same full audit as cost-declared-intent-no-finding. deployer: noop,
+# read-only over the seeded fleet.
+./tasks/cost-cpu-burst-no-overrequest/task.yaml
+
+# Completed generated-name Job family grouping (#2900, #3005, #6955, #7098):
+# expected_fail: true until #6955 groups finished Jobs (`reindex-<uuid>` in
+# `seeded-family`, role `generated-name-job-family`) into one family finding
+# with parent-template `ttlSecondsAfterFinished` cleanup. deployer: noop.
+./tasks/cost-finished-job-family-grouped/task.yaml
 
 # Burst-aware right-sizing probe (#2900, #3005, #6492, #7180): latency-sensitive
 # GPU workloads reject average-based live patches in favour of P95/P99 burst
@@ -1307,7 +1360,8 @@
 # the longest hold the lock plans for, and the stream lock keeps it apart
 # from the other compliance-audit cases. Priced with
 # compliance-rbac-overgrant's 1000s plus the fire and the wait; the fired
-# run took 11 to 13 minutes on two dev installs and is unmeasured on a lane.
+# run took 11 to 13 minutes on two dev installs, and 329 to 539s on the
+# nightlies of 2026-11-25 and 11-26.
 # Placed by its name, as a case without a stack is.
 ./tasks/fleet-audit-scheduled-run-files-the-finding/task.yaml
 
@@ -1352,6 +1406,18 @@
 # entry.
 ./tasks/gce-chat-request-runs-collector/task.yaml
 
+# The GCE compute audit's rotated-console notes over a standing plant
+# (#5389): the rotated-console-vm role's VM floods its own serial console
+# minutes after boot, so the boot's failure lines are gone; the report
+# names the VM as not visible, with no finding filed on it, and the ledger
+# carries no finding for it. deployer: noop, read-only on the project; a
+# full audit, in the band of the other fleet-audit cases. The fixture-state
+# scan of 2026-11-24 reads the role healthy on every pool project, after
+# the daily reconcile of 2026-11-24 converged every project. No stack, so
+# the main part shards it by checksum. Nightly from the merge that removes
+# its FIXTURE_NOT_READY entry.
+./tasks/gce-rotated-console-notes/task.yaml
+
 # The GCE compute audit end to end over the same standing plant (#2483): the
 # collector's gce-startup-script-status check flags the startup-fail-vm role's
 # VM, and the run files the ledger. deployer: noop, read-only on the project;
@@ -1371,7 +1437,9 @@
 # three, which with the other two drift cases' six is over the default
 # ALERT_DAILY_LIMIT_DRIFT of 20, so on a dev install carrying the default the
 # last repetition can lose a card to the ceiling and red as
-# late-edit-not-carded. The eval install runs uncapped. Priced at the drift
+# late-edit-not-carded. Where a person runs the case, the fixture's own seven
+# kubectl writes are carded and counted too, so the default is reached in the
+# second repetition. The eval install runs uncapped. Priced at the drift
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
@@ -1408,6 +1476,20 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# gitops-drift-own-release-digest (#3613): an upgrade's writes to its own Helm
+# release reach the detector while it is pulling, so they are live and the
+# backlog digest does not take them; the detector sends them to the digest by
+# what they name. The fixture names real objects of the install's release and
+# writes nothing to them. Graded on the fixture's read of the ledger and the
+# board: the release writes are digested once the same principal's Helm
+# release record says an upgrade is under way, and a kubectl write to a
+# kube-agents CRD with them, by the principal's count; a kubectl write to a
+# release object, a Helm write outside the release, a burst of three by a
+# principal with no upgrade, and a write after the upgrade's end are carded. Each repetition spends six drift alerts. Holds
+# the infra lock; 900s, the drift band; listed in nightly-main-b.txt to
+# balance the stack chains.
+./tasks/gitops-drift-own-release-digest/task.yaml
+
 # A drift to an object git does not declare (#3972): a namespace created by
 # hand, its Pod Security level loosened, and no GitOps marker on it. Every
 # sibling's object is GitOps-managed, so an agent that offers "revert to what
@@ -1440,6 +1522,11 @@
 # from neither exclusion list; CI nightlies run over inject).
 ./tasks/list-gitops-repos/task.yaml
 
+# #1983: the GCP networking fabric audit's skill points to compliance-audit
+# §2.19 for Istio ServiceEntry collisions; a coverage question is answered
+# with where the check lives. deployer: noop, read-only, graded on the answer.
+./tasks/networking-audit-points-to-serviceentry-check/task.yaml
+
 # The networking stream's declared-intent case (#1408): the project's
 # mtu-peer-declared network at MTU 8896, peered both ways with default at
 # 1460 (role declared-mtu-peering), is the 2.4 peered-MTU posture the same
@@ -1465,8 +1552,8 @@
 # whose image pull the registry refuses, one through the node identity and one
 # through a named pull secret, graded on one finding of the check on each
 # reaching the ledger. The stack waits eleven minutes after the plant, since
-# the check names a pull only once it has failed for ten; priced at the 900s
-# audit band plus that wait. Not on the scored suite for the same wait.
+# the check names a pull only once it has failed for ten; priced at its
+# measured cost (unit_cost_hint). Not on the scored suite for the same wait.
 ./tasks/obtainability-image-pull-failing/task.yaml
 
 # The obtainability audit's sweep opens a pull request for a major finding
@@ -1486,6 +1573,16 @@
 # no pool fixture: its first nightly run is the pool proof of the plant and
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
+
+# Side A of the first permit pair (hack/eval/permit-pairs.txt, #6539): the ask
+# and the checks of cluster-profile-confirmed-pdb-pull-request with no
+# [bench:profile ...] directive, so today's platform agent opens the
+# PodDisruptionBudget pull request with today's authority. Graded as its pair
+# case is: the pull request (pull_request_opened, the budget file only) and an
+# unchanged cluster. deployer: noop. Nightly from its first merge, in the
+# writers part beside its pair case; its record is the platform side that
+# scripts/eval_front_door_ab.py --pairs compares the profile side with.
+./tasks/platform-agent-pdb-pull-request/task.yaml
 
 # The front door is running the plugins its image ships: an exec into the
 # agent container reads each plugin directory under /opt/defaults/plugins
@@ -1560,6 +1657,12 @@
 # have, so here it reports infrastructure naming the cap; its evidence runs
 # come from twins that set the cap to 2. deployer: noop, read-only.
 ./tasks/session-front-door-cap-busy-notice/task.yaml
+# A DM answered after its session pod was reaped idle still has the earlier
+# turn (#2371): the harness sends the opening, waits 480s, past the 5-minute
+# DM idle TTL, then sends the reply on the same conversation, which reaches a
+# pod rehydrated from the transcript primer. deployer: noop, two front-door
+# turns, reads no cluster; needs the inject door.
+./tasks/session-recalls-context-after-idle-reap/task.yaml
 
 # #6816: a chat turn that tries a direct cluster write stops at that first
 # attempt and says the change was not made. Through the session front door the
@@ -1742,6 +1845,11 @@
 # prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
 
+# Managed Cloud Service Mesh (ASM) channel-downgrade guard (#2599, #2797, #7181):
+# switching from rapid to an older stable channel risks control-plane downgrade,
+# sidecar skew, and Envoy xDS NACK loops. deployer: noop, no fixture.
+./tasks/upgrades-managed-mesh-channel-downgrade-guard/task.yaml
+
 # Upgrade-failure catalogue entry 8 through the readiness report's
 # changed-defaults rule: the seeded-defaults namespace on slot a (role
 # moving-admission-default) enforces baseline at enforce-version latest, so
@@ -1877,7 +1985,7 @@
 # plants it: seeded-b's seeded-fail-closed-gate (role readiness-failclosed-webhook),
 # graded on one declared line plus the route check. `expected_fail: true`: the
 # collector's webhook shape skips a hook whose rules do not reach pod creation,
-# and the gate's one rule is on ConfigMaps, so no reading names it today (#2717);
+# and the gate's one rule is on ConfigMaps, so no reading names it today (#4545);
 # the nightly records EXPECTED_FAIL until the shape or the fixture changes.
 # deployer: noop; holds the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-failclosed-webhook/task.yaml
@@ -1895,7 +2003,7 @@
 # plants it: seeded-a's multi-process-worker Deployment (role
 # multi-process-container), graded on one declared line plus the route check.
 # `expected_fail: true`: the collector has no entry-15 shape ("not visible from
-# the spec") and the fixture never OOM-kills (#2717); the nightly records
+# the spec") and the fixture never OOM-kills (#4545); the nightly records
 # EXPECTED_FAIL until the shape lands. deployer: noop; holds the
 # `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-multi-process-container/task.yaml
@@ -1905,7 +2013,7 @@
 # policies nothing enforces, the cluster itself as the object (role
 # no-pdb-workload standing for the slot), graded on one declared line plus the
 # route check. `expected_fail: true`: the collector reads no NetworkPolicies and
-# has no entry-16 shape (#2717); the nightly records EXPECTED_FAIL until the
+# has no entry-16 shape (#4545); the nightly records EXPECTED_FAIL until the
 # shape lands. deployer: noop; holds the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-network-policy-enforcement/task.yaml
 
@@ -1920,7 +2028,7 @@
 # The retrospective's verdict on catalogue entry 10 in the shape the seeded fleet
 # plants it: seeded-a's stale-kubectl-client CronJob (role stale-client-skew),
 # graded on one declared line plus the route check. `expected_fail: true`: the
-# collector has no entry-10 shape or signature and the Job never fails (#2717);
+# collector has no entry-10 shape or signature and the Job never fails (#4545);
 # the nightly records EXPECTED_FAIL until the shape lands. deployer: noop; holds
 # the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-stale-client-skew/task.yaml

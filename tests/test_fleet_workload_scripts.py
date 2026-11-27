@@ -168,7 +168,10 @@ class LongNameCycleScriptTest(unittest.TestCase):
     def test_the_busy_period_fills_one_whole_bucket_of_the_cost_audits_read(self):
         # Check 3.1 reads the CPU rate in buckets. A busy period of two bucket
         # lengths or more holds one whole bucket at each position of its start.
-        bucket_seconds = _collector_constant("USAGE_ALIGNMENT_S")
+        # The audit's CPU bucket is CPU_USAGE_ALIGNMENT_S; an audit of an
+        # earlier release reads the CPU in the longer USAGE_ALIGNMENT_S, and
+        # the fixture must hold for both, so the longer one decides.
+        bucket_seconds = max(_collector_constant("CPU_USAGE_ALIGNMENT_S"), _collector_constant("USAGE_ALIGNMENT_S"))
         self.assertGreaterEqual(self.cycle.BURST_SECONDS, 2 * bucket_seconds)
 
     def test_the_busy_memory_is_above_the_bar_and_under_the_limit(self):
@@ -424,20 +427,23 @@ class CpuCycleScriptTest(unittest.TestCase):
         self.assertEqual(self.loop.seconds_to_next_cycle(cycle - 10), 10)
         self.assertEqual(self.loop.seconds_to_next_cycle(3 * cycle + 45), cycle - 45)
 
-    def test_the_burst_reads_under_the_bar_in_the_audits_bucket_and_above_it_in_one_minute(self):
-        # The rate of a bucket is limit x busy seconds / bucket seconds. With
-        # the audit's bucket the burst must read at most 15% of the request
-        # (a margin under the 20% bar). In a 60-second bucket it must read
-        # 30% or more, also when the burst falls on two such buckets.
-        bucket_seconds = _collector_constant("USAGE_ALIGNMENT_S")
+    def test_the_burst_reads_under_the_bar_in_the_long_bucket_and_above_it_in_the_audits_cpu_bucket(self):
+        # The rate of a bucket is limit x busy seconds / bucket seconds. In
+        # the long bucket (USAGE_ALIGNMENT_S: the memory read's bucket, and the
+        # CPU bucket of an audit of an earlier release) the burst must read at
+        # most 15% of the request (a margin under the 20% bar). In the audit's
+        # CPU bucket (CPU_USAGE_ALIGNMENT_S) it must read 30% or more, also
+        # when the burst falls on two such buckets. So a longer CPU bucket
+        # that puts the burst under the bar again fails here, with no run.
+        long_bucket_seconds = _collector_constant("USAGE_ALIGNMENT_S")
         bar = _collector_constant("IDLE_WORKLOAD_UTILISATION")
         request = _millicores(_locals_value("cpu_burst_request"))
         limit = _millicores(_locals_value("cpu_burst_limit"))
         busy = self.loop.BURST_SECONDS
-        self.assertLessEqual(limit * busy / bucket_seconds, 0.15 * request)
+        self.assertLessEqual(limit * busy / long_bucket_seconds, 0.15 * request)
         self.assertLess(0.15, bar)
-        one_minute = 60
-        self.assertGreaterEqual(limit * (busy / 2) / one_minute, 0.30 * request)
+        cpu_bucket_seconds = _collector_constant("CPU_USAGE_ALIGNMENT_S")
+        self.assertGreaterEqual(limit * (busy / 2) / cpu_bucket_seconds, 0.30 * request)
 
     def test_each_cpu_request_is_on_or_above_the_floor_of_the_check(self):
         floor_millicores = _collector_constant("OVERREQUEST_FLOOR_VCPU") * 1000

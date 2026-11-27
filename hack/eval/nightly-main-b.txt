@@ -41,3 +41,5 @@ first-install-hello-filed
 # Added with the case (#5880), a full drift audit priced at 900s: the
 # shortest chain then.
 fleet-audit-remediation-right-and-not-stale
+# gitops-drift-own-release-digest (#3613): 900s, into the shortest chain when it joined the nightly.
+gitops-drift-own-release-digest

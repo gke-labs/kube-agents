@@ -52,9 +52,9 @@ var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
 	// kindLocation is the spec.harness.location a kind install sets (with
-	// "kind" for projectId and clusterName as well). No GKE location looks like
-	// this. It means: there is no GKE cluster to fetch credentials for, use the
-	// cluster the pod runs in.
+	// "kind" for projectId as well). No GKE location looks like this. It means:
+	// there is no GKE cluster to fetch credentials for, use the cluster the pod
+	// runs in.
 	kindLocation = "kind"
 	// inClusterContextName is the kubectl context the credential proxy and the
 	// agent use on kind.
@@ -91,8 +91,9 @@ const (
 	// it admits from that limit, so the limit is the CR's knob and the admitted
 	// count follows it; the two caps stay the operator's constants, and a CR
 	// override of either would detach them from the limit again.
-	credentialProxyMaxOutputBytes        = "8388608"
-	credentialProxyMaxConcurrentCommands = "8"
+	credentialProxyMaxOutputBytes           = "8388608"
+	credentialProxyMaxConcurrentCommands    = "8"
+	credentialProxyMaxConcurrentCommandsEnv = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS" // #nosec G101 -- Environment variable name, not a credential
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -343,6 +344,16 @@ const (
 	driftDetectorClusterNameEnv    = "DRIFT_DETECTOR_CLUSTER_NAME"
 	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
 	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
+	driftDetectorOwnReleaseEnv     = "DRIFT_DETECTOR_OWN_RELEASE"
+
+	// helmReleaseNameAnnotation is, with helmReleaseNamespaceAnnotation, what
+	// Helm stamps on the PlatformAgent it renders; the two name the release
+	// the detector is told is the install's own.
+	helmReleaseNameAnnotation = "meta.helm.sh/release-name"
+
+	// driftDetectorOwnReleaseSeparator joins namespace and name in
+	// DRIFT_DETECTOR_OWN_RELEASE, as the detector's --own-release splits them.
+	driftDetectorOwnReleaseSeparator = "/"
 
 	// driftDetectorProjectNumberDigits is the character set a GCP project number
 	// is made of, and the whole of the test for one: a project ID must start with
@@ -635,6 +646,12 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
+	return buildConfigMapWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// buildConfigMapWith is buildConfigMap with the managed config's
+// model.api_key set to apiKey (renderConfigYAMLWith).
+func buildConfigMapWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -644,7 +661,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 			Name:      agent.Name + "-config",
 			Namespace: agent.Namespace,
 		},
-		Data: buildConfigMapData(agent, agentPlugins),
+		Data: buildConfigMapDataWith(agent, agentPlugins, apiKey),
 	}
 }
 
@@ -676,8 +693,14 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 // agent could still repoint its own model endpoint and keep that across restarts. Hence
 // the split: immutable keys are pinned, mutable operator-owned keys are merged.
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
+	return buildConfigMapDataWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// buildConfigMapDataWith is buildConfigMapData with the managed config's
+// model.api_key set to apiKey.
+func buildConfigMapDataWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) map[string]string {
 	data := map[string]string{
-		managedConfigKey:  renderConfigYAML(agent, agentPlugins),
+		managedConfigKey:  renderConfigYAMLWith(agent, agentPlugins, apiKey),
 		managedEnvKey:     renderManagedEnvForPlugins(agent, agentPlugins),
 		"leader_elect.py": leaderElectScript,
 	}
@@ -1058,6 +1081,7 @@ var DefaultBuiltInPlugins = []string{
 	"pr_opened",
 	"chat_metrics",
 	"eval_run_tag",
+	"model_identity",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -2270,6 +2294,13 @@ type managedDatabaseConfig struct {
 }
 
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
+	return renderConfigYAMLWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// renderConfigYAMLWith is renderConfigYAML with model.api_key set to apiKey:
+// the placeholder, or agentInferenceKeyConfigRef once the agent sends its
+// inference gateway key (reconcileConfigMap).
+func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 
 	cfg := struct {
@@ -2365,7 +2396,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Model.Default = agentModelName
 	cfg.Model.Model = agentModelName
 	cfg.Model.BaseURL = fmt.Sprintf("http://%s.%s.svc.cluster.local/v1", inferenceGatewayServiceName, agent.Namespace)
-	cfg.Model.APIKey = "none"
+	cfg.Model.APIKey = apiKey
 	// What `provider: custom` against a non-OpenAI base_url already resolves to
 	// (_resolve_plain_custom_api_mode in hermes_cli/runtime_provider.py), so this
 	// changes no behaviour — it only makes the value one the agent cannot rewrite.
@@ -2852,6 +2883,10 @@ type renderOptions struct {
 	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
 	// so the zero value renders byte-identical manifests.
 	enabledProfiles []string
+	// inferenceKeys is the classes whose callers this pass gives their
+	// inference gateway key (inference_key_callers.go). The zero value gives
+	// none, so it renders the agent as an install without keys.
+	inferenceKeys inferenceKeyCallers
 }
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
@@ -3742,6 +3777,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "MEMORY_PROVIDER",
 		Value: resolveMemoryProvider(agent),
 	})
+	// The agent class's inference gateway key, once the gateway serves it: the
+	// managed config's model.api_key expands it (renderConfigYAMLWith), and the
+	// pod's other in-process callers read it by this name. After the plugin
+	// merge, so a plugin's entry of the same name gives way (lastWinsEnv in
+	// buildBaseContainers). The platform-agent container alone: the shell
+	// sandbox stays keyless.
+	if env, ok := opts.inferenceKeys.envVar(inferenceKeyClassAgent, agentInferenceKeyEnv); ok {
+		envVars = append(envVars, env)
+	}
 
 	var runtimeClassName *string
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {
@@ -4472,6 +4516,19 @@ func driftDetectorGitopsManagers(agent *agentv1alpha1.PlatformAgent) string {
 	return ""
 }
 
+// driftDetectorOwnRelease names the Helm release that rendered this
+// PlatformAgent, as <namespace>/<name>, or "" when the CR does not carry both
+// of Helm's annotations (a kustomize or hand install) or either is not a name.
+// The detector refuses to start on a malformed value, so one is never passed.
+func driftDetectorOwnRelease(agent *agentv1alpha1.PlatformAgent) string {
+	namespace := agent.Annotations[helmReleaseNamespaceAnnotation]
+	name := agent.Annotations[helmReleaseNameAnnotation]
+	if len(validation.IsDNS1123Label(namespace)) > 0 || len(validation.IsDNS1123Subdomain(name)) > 0 {
+		return ""
+	}
+	return namespace + driftDetectorOwnReleaseSeparator + name
+}
+
 // driftDetectorHarness returns the project, location and cluster name the detector
 // is given, empty when the harness does not name them.
 //
@@ -4615,7 +4672,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// drift-pubsub module is off, so writing these unconditionally would put the
 	// harness triple a second time on a container that does not read it — the same
 	// three values, under different names, on every credential proxy in the fleet,
-	// for a process that is not running. All six names are reserved in
+	// for a process that is not running. All seven names are reserved in
 	// mergeCredentialProxyEnv whether or not this branch writes them, so the CR
 	// cannot supply the ones this skips.
 	//
@@ -4630,6 +4687,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			corev1.EnvVar{Name: driftDetectorClusterNameEnv, Value: driftClusterName},
 			corev1.EnvVar{Name: driftDetectorSubscriptionEnv, Value: driftDetectorSubscription(agent)},
 			corev1.EnvVar{Name: driftDetectorGitopsManagersEnv, Value: driftDetectorGitopsManagers(agent)},
+			corev1.EnvVar{Name: driftDetectorOwnReleaseEnv, Value: driftDetectorOwnRelease(agent)},
 		)
 	}
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"})
@@ -4892,10 +4950,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
-		// The most brokered commands that run at once; the child memory budget
-		// decides how many of them the limit admits. The broker's own default
-		// is the same figure; setting it here is what makes it the operator's.
-		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
+		// The most brokered commands that run at once: default/fixed profiles
+		// stay pinned at 8, while sizingProfile=auto steps 8 small, 12 medium,
+		// 16 fleet; the child memory budget further caps admission if a custom
+		// override lowers memory. Setting it here pins it as the operator's
+		// value rather than an overridable spec.deployment.env key.
+		{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxySlotCapForAgent(agent, renderedSizingTier(agent))},
 		// The container's own memory limit, for the broker's child memory
 		// budget. See credentialProxyMemoryLimitEnv for why it is a
 		// resourceFieldRef and why it is reserved.
@@ -5370,7 +5430,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// These ten are appended by buildAgentAPIAuthSidecar after this merge
+		// These eleven are appended by buildAgentAPIAuthSidecar after this merge
 		// runs, so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
@@ -5387,7 +5447,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		driftDetectorClusterNameEnv,
 		driftDetectorSubscriptionEnv,
 		driftDetectorGitopsManagersEnv,
-		// Not every DRIFT_DETECTOR_* name belongs on this list, and the six
+		driftDetectorOwnReleaseEnv,
+		// Not every DRIFT_DETECTOR_* name belongs on this list, and the seven
 		// above are not here for being drift variables. They are here because
 		// buildAgentAPIAuthSidecar appends each one after this merge, so an
 		// unreserved name would duplicate and stall the apply, as the note
@@ -5405,10 +5466,14 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	} {
 		reserved[name] = struct{}{}
 	}
-	// The audit-report store's names (auditReportStoreEnvNames).
+	// The audit-report store's names (auditReportStoreEnvNames) and broker
+	// active-standby control env vars.
 	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
+	reserved[credentialProxyStandbyEnv] = struct{}{}
+	reserved[credentialProxyControlFileEnv] = struct{}{}
+	reserved[credentialProxyPeerHealthURLEnv] = struct{}{}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {

@@ -849,23 +849,29 @@ func TestAnswerFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
 	series := make(chan prometheus.Metric, 16)
 	m.answerFeedback.Collect(series)
 	close(series)
-	if got := len(series); got != 8 {
-		t.Errorf("answer_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 answers)", got)
+	if got := len(series); got != 12 {
+		t.Errorf("answer_feedback_total series = %d, want 12 (3 backends x 2 ratings x 2 answers)", got)
+	}
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformTeams, FeedbackDown, answerReply)); got != 0 {
+		t.Errorf("answer_feedback_total{teams,down,reply} = %v, want 0", got)
 	}
 	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp, answerReply)); got != 0 {
 		t.Errorf("answer_feedback_total{googlechat,up,reply} = %v, want 0", got)
 	}
 }
 
-// TestPostFeedbackZeroSeriesCoverBothRatingBackends: the ratings of the
+// TestPostFeedbackZeroSeriesCoverTheRatingBackends: the ratings of the
 // posts the agent made on its own start at zero the same way, per kind.
-func TestPostFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
+func TestPostFeedbackZeroSeriesCoverTheRatingBackends(t *testing.T) {
 	m := NewMetrics()
 	series := make(chan prometheus.Metric, 16)
 	m.postFeedback.Collect(series)
 	close(series)
-	if got := len(series); got != 8 {
-		t.Errorf("post_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 kinds)", got)
+	if got := len(series); got != 12 {
+		t.Errorf("post_feedback_total series = %d, want 12 (3 backends x 2 ratings x 2 kinds)", got)
+	}
+	if got := counterValue(t, m.postFeedback.WithLabelValues(platformTeams, FeedbackUp, postKindAlert)); got != 0 {
+		t.Errorf("post_feedback_total{teams,up,alert} = %v, want 0", got)
 	}
 	m.postRated(platformSlack, FeedbackDown, "unlisted")
 	if got := counterValue(t, m.postFeedback.WithLabelValues(platformSlack, FeedbackDown, metricsLabelOther)); got != 1 {
