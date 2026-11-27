@@ -319,7 +319,7 @@ func TestTheKubeProxyLoopbackListensOnLoopbackOnly(t *testing.T) {
 func TestTheKubeProxyLoopbackReplacesWhoIsCalling(t *testing.T) {
 	f := startKubeLoopback(t)
 	credential := clusterCredential("alpha")
-	end := f.p.BeginTask("task-a", credential)
+	_, end := f.p.BeginTask("task-a", credential)
 	defer end()
 
 	const query = "labelSelector=app%3Dweb&limit=5"
@@ -401,19 +401,19 @@ func TestTheKubeProxyLoopbackRefusesWithoutATaskOrACluster(t *testing.T) {
 	}
 	expectRefusal("no task", http.StatusForbidden, kubeProxyNoTaskMessage, kubeTestEchoPath)
 
-	end := f.p.BeginTask("task-none", "")
+	_, end := f.p.BeginTask("task-none", "")
 	expectRefusal("a task with no credential", http.StatusForbidden, kubeProxyNoCredentialMessage, kubeTestEchoPath)
 	end()
 
-	end = f.p.BeginTask("task-report", reportCredential())
+	_, end = f.p.BeginTask("task-report", reportCredential())
 	expectRefusal("a report credential", http.StatusForbidden, kubeProxyNoCredentialMessage, kubeTestEchoPath)
 	end()
 
-	end = f.p.BeginTask("task-misshapen", "not a credential")
-	expectRefusal("a misshapen credential", http.StatusForbidden, kubeProxyNoCredentialMessage, kubeTestEchoPath)
+	_, end = f.p.BeginTask("task-misshapen", "not a credential")
+	expectRefusal("a misshapen credential", http.StatusForbidden, kubeProxyUnaddressedMessage, kubeTestEchoPath)
 	end()
 
-	end = f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end = f.p.BeginTask("task-a", clusterCredential("alpha"))
 	defer end()
 	for _, path := range []string{"/", "/api/v1/pods", "/clusters", "/version"} {
 		expectRefusal("the path "+path, http.StatusNotFound, kubeProxyNotFoundMessage, path)
@@ -431,7 +431,7 @@ func TestATaskSwitchChangesTheCredentialAndTheConnections(t *testing.T) {
 	f := startKubeLoopback(t)
 	credA, credB := taskClusterCredential("alpha", "task-a"), taskClusterCredential("alpha", "task-b")
 
-	endA := f.p.BeginTask("task-a", credA)
+	_, endA := f.p.BeginTask("task-a", credA)
 	for range 2 {
 		if status, _, _ := f.get(t, kubeTestEchoPath); status != http.StatusOK {
 			t.Fatalf("status %d under task A, want 200", status)
@@ -449,7 +449,7 @@ func TestATaskSwitchChangesTheCredentialAndTheConnections(t *testing.T) {
 		t.Errorf("status %d between tasks, want 403", status)
 	}
 
-	endB := f.p.BeginTask("task-b", credB)
+	_, endB := f.p.BeginTask("task-b", credB)
 	defer endB()
 	if status, _, _ := f.get(t, kubeTestEchoPath); status != http.StatusOK {
 		t.Fatalf("status %d under task B, want 200", status)
@@ -473,7 +473,7 @@ func TestATaskSwitchChangesTheCredentialAndTheConnections(t *testing.T) {
 // returns.
 func TestARequestInFlightEndsWithItsTask(t *testing.T) {
 	f := startKubeLoopback(t)
-	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
 	type result struct {
 		status int
 		err    error
@@ -501,7 +501,7 @@ func TestARequestInFlightEndsWithItsTask(t *testing.T) {
 // ends the stream is cut rather than ended cleanly.
 func TestAWatchStreamsAndEndsWithItsTask(t *testing.T) {
 	f := startKubeLoopback(t)
-	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
 	resp, err := f.client.Get(f.p.URL + kubeTestWatchPath + "?watch=true")
 	if err != nil {
 		t.Fatal(err)
@@ -544,7 +544,7 @@ func TestAWatchStreamsAndEndsWithItsTask(t *testing.T) {
 func TestAnUpgradedConnectionEndsWithItsTask(t *testing.T) {
 	f := startKubeLoopback(t)
 	credential := clusterCredential("alpha")
-	end := f.p.BeginTask("task-a", credential)
+	_, end := f.p.BeginTask("task-a", credential)
 	addr := strings.TrimPrefix(f.p.URL, "http://")
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -652,7 +652,7 @@ func TestNoRequestCarriesAnotherTasksCredential(t *testing.T) {
 	}
 	for i := 1; i <= tasks; i++ {
 		begun.Add(1)
-		end := f.p.BeginTask(fmt.Sprintf("task-%d", i), credentials[i])
+		_, end := f.p.BeginTask(fmt.Sprintf("task-%d", i), credentials[i])
 		for range requestsPerTask {
 			await(t, completed, "a caller's request to return")
 		}
@@ -806,25 +806,121 @@ func TestATasksHarnessIsPointedAtTheLoopback(t *testing.T) {
 	}
 }
 
+// claimsCredential is a value shaped like a task credential with the given
+// claims.
+func claimsCredential(claims string) string {
+	return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".sig"
+}
+
 // TestTheTargetContextComesFromTheCredentialsClaims: the context is built
-// from a credential's target, and only from parts a GKE context can hold.
+// from a credential's target, and only from parts a GKE context can hold. A
+// credential that isn't known to be without a cluster counts as having one.
 func TestTheTargetContextComesFromTheCredentialsClaims(t *testing.T) {
-	encode := func(claims string) string {
-		return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".sig"
+	type reading struct {
+		context  string
+		targeted bool
 	}
-	for credential, want := range map[string]string{
-		clusterCredential("alpha"): "gke_proj_us-central1_alpha",
-		reportCredential():         "",
-		"":                         "",
-		"one.two":                  "",
-		"hdr.!!!.sig":              "",
-		encode(`{"nats":{"target":{"project":"proj","location":"us-central1","cluster":"a_b"}}}`):  "",
-		encode(`{"nats":{"target":{"project":"proj","location":"us-central1","cluster":"a\nb"}}}`): "",
-		encode(`{"nats":{"target":{"project":"","location":"us-central1","cluster":"alpha"}}}`):    "",
+	for credential, want := range map[string]reading{
+		clusterCredential("alpha"): {"gke_proj_us-central1_alpha", true},
+		reportCredential():         {"", false},
+		"":                         {"", true},
+		"one.two":                  {"", true},
+		"hdr.!!!.sig":              {"", true},
+		claimsCredential(`{"nats":{"target":{"project":"proj","location":"us-central1","cluster":"a_b"}}}`):           {"", true},
+		claimsCredential(`{"nats":{"target":{"project":"proj","location":"us-central1","cluster":"a\nb"}}}`):          {"", true},
+		claimsCredential(`{"nats":{"target":{"project":"","location":"us-central1","cluster":"alpha"}}}`):             {"", true},
+		claimsCredential(`{"nats":{"target":{"project":"example.com:proj","location":"us-central1","cluster":"a"}}}`): {"", true},
 	} {
-		if got := taskTargetContext(credential); got != want {
-			t.Errorf("taskTargetContext(%q) = %q, want %q", credential, got, want)
+		if context, targeted := taskTargetContext(credential); context != want.context || targeted != want.targeted {
+			t.Errorf("taskTargetContext(%q) = %q, %v; want %q, %v", credential, context, targeted, want.context, want.targeted)
 		}
+	}
+}
+
+// TestAClusterThisPathCantAddressIsSaidSo: a credential that names a cluster
+// whose name doesn't fit a context (a domain-scoped project) leaves the task
+// refused here, with a line in the log naming the task and not the
+// credential, and an answer that doesn't claim the task has no cluster. A
+// report credential, which has none, is told that, and logs nothing.
+func TestAClusterThisPathCantAddressIsSaidSo(t *testing.T) {
+	f := startKubeLoopback(t)
+	const logged = "can't address"
+	credential := claimsCredential(`{"nats":{"target":{"project":"example.com:proj","location":"us-central1","cluster":"alpha"}}}`)
+	target, end := f.p.BeginTask("task-domain-scoped", credential)
+	if target != "" {
+		t.Errorf("the task is held to %q, want no context", target)
+	}
+	status, body, _ := f.get(t, kubeTestEchoPath)
+	if status != http.StatusForbidden || !strings.Contains(body, kubeProxyUnaddressedMessage) || strings.Contains(body, kubeProxyNoCredentialMessage) {
+		t.Errorf("status %d, body %q; want a 403 saying the cluster can't be addressed", status, body)
+	}
+	end()
+	logs := f.logs.String()
+	if strings.Count(logs, logged) != 1 || !strings.Contains(logs, "task-domain-scoped") {
+		t.Errorf("want one line naming the task:\n%s", logs)
+	}
+	if strings.Contains(logs, credential) || strings.Contains(body, credential) {
+		t.Errorf("the credential is in the log or the answer:\n%s\n%s", logs, body)
+	}
+
+	target, end = f.p.BeginTask("task-report", reportCredential())
+	defer end()
+	if target != "" {
+		t.Errorf("a report task is held to %q, want no context", target)
+	}
+	if status, body, _ := f.get(t, kubeTestEchoPath); status != http.StatusForbidden || !strings.Contains(body, kubeProxyNoCredentialMessage) {
+		t.Errorf("a report task: status %d, body %q; want a 403 saying it has no cluster", status, body)
+	}
+	if got := strings.Count(f.logs.String(), logged); got != 1 {
+		t.Errorf("a report credential was logged as unaddressable:\n%s", f.logs)
+	}
+	if calls := f.up.seen(); len(calls) != 0 {
+		t.Errorf("the upstream saw %d requests, want none", len(calls))
+	}
+}
+
+// TestTheQueryPassesByteForByte: a query the reverse proxy's cleaner would
+// rewrite (a ";" separator, a bad escape) reaches the upstream as sent.
+func TestTheQueryPassesByteForByte(t *testing.T) {
+	f := startKubeLoopback(t)
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	defer end()
+	for _, query := range []string{
+		"watch=true;timeoutSeconds=5&labelSelector=app%3Dweb",
+		"a=1;b=2",
+		"fieldSelector=metadata.name%3Dx&bad=%zz&limit=5",
+		"labelSelector=a+in+(b,c)&x",
+	} {
+		status, _ := rawRequest(t, f.addr, fmt.Sprintf("GET %s?%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", kubeTestEchoPath, query, f.addr))
+		if status != http.StatusOK {
+			t.Fatalf("%s: status %d, want 200", query, status)
+		}
+		calls := f.up.seen()
+		if got := calls[len(calls)-1].query; got != query {
+			t.Errorf("the upstream saw the query %q, want %q", got, query)
+		}
+	}
+}
+
+// TestTheHarnessGetsTheContextTheLoopbackSettledOn: a credential that
+// decodes to a target but is refused for its size gives the harness no host
+// context, as the loopback holds the task to none.
+func TestTheHarnessGetsTheContextTheLoopbackSettledOn(t *testing.T) {
+	f := startKubeLoopback(t)
+	oversize := taskClusterCredential("alpha", strings.Repeat("x", maxTaskCredentialBytes))
+	if context, _ := taskTargetContext(oversize); context != "gke_proj_us-central1_alpha" {
+		t.Fatalf("the oversize credential decodes to %q; the test needs one that names a cluster", context)
+	}
+	w := &profileWorker{kubeProxy: f.p}
+	w.cfg.HarnessEnv = []string{"PATH=/bin", envKubeProxyHostContext + "=gke_proj_us-central1_host"}
+	cfg := Config{TaskID: "task-oversize", HarnessEnv: slices.Clone(w.cfg.HarnessEnv)}
+	end := w.beginKubeProxyTask(&cfg, &held{proxyToken: oversize})
+	defer end()
+	if want := []string{"PATH=/bin", EnvKubeProxyURL + "=" + f.p.URL}; !slices.Equal(cfg.HarnessEnv, want) {
+		t.Errorf("the task's environment = %q, want no host context: %q", cfg.HarnessEnv, want)
+	}
+	if status, body, _ := f.get(t, kubeTestEchoPath); status != http.StatusForbidden || !strings.Contains(body, kubeProxyUnaddressedMessage) {
+		t.Errorf("status %d, body %q; want the task refused here", status, body)
 	}
 }
 
@@ -901,7 +997,7 @@ func TestARotatedCAIsReadAgain(t *testing.T) {
 func TestATaskIsHeldToItsOwnCluster(t *testing.T) {
 	f := startKubeLoopback(t)
 	credential := clusterCredential("alpha")
-	end := f.p.BeginTask("task-a", credential)
+	_, end := f.p.BeginTask("task-a", credential)
 	defer end()
 	for _, path := range []string{
 		"/clusters/gke_proj_us-central1_beta/api/v1/pods",
@@ -983,7 +1079,7 @@ func TestThePathGateReadsThePathAsItWasSent(t *testing.T) {
 // local 404 with a task active, and nothing reaches the upstream.
 func TestABentPathIsRefusedHere(t *testing.T) {
 	f := startKubeLoopback(t)
-	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
 	defer end()
 	for _, path := range kubeTestBentPaths {
 		status, body := rawRequest(t, f.addr, fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, f.addr))
@@ -1000,7 +1096,7 @@ func TestABentPathIsRefusedHere(t *testing.T) {
 // absolute form, is refused here even with a task active.
 func TestTheLoopbackIsNotAProxyForOtherHosts(t *testing.T) {
 	f := startKubeLoopback(t)
-	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
 	defer end()
 	for name, request := range map[string]string{
 		"another Host":          fmt.Sprintf("GET %s HTTP/1.1\r\nHost: kube-proxy.example:8443\r\nConnection: close\r\n\r\n", kubeTestEchoPath),
@@ -1022,7 +1118,7 @@ func TestTheLoopbackIsNotAProxyForOtherHosts(t *testing.T) {
 // empty, is a local 503; no request goes upstream with an empty bearer.
 func TestWithoutAPodTokenNothingIsSent(t *testing.T) {
 	f := startKubeLoopback(t)
-	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
 	defer end()
 	expect503 := func(when string) {
 		t.Helper()
@@ -1065,7 +1161,7 @@ func TestWithoutAPodTokenNothingIsSent(t *testing.T) {
 func TestTrailersAndNominatedHeadersCantCarryACredential(t *testing.T) {
 	f := startKubeLoopback(t)
 	credential := clusterCredential("alpha")
-	end := f.p.BeginTask("task-a", credential)
+	_, end := f.p.BeginTask("task-a", credential)
 	defer end()
 	request := "POST " + kubeTestEchoPath + " HTTP/1.1\r\n" +
 		"Host: " + f.addr + "\r\n" +
@@ -1123,7 +1219,7 @@ func TestTrailersAndNominatedHeadersCantCarryACredential(t *testing.T) {
 func TestACallerThatStopsReadingIsLeftBehindAtTheBound(t *testing.T) {
 	f := startKubeLoopback(t)
 	f.p.drainTimeout = kubeTestShortDrain
-	end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
 	conn, err := net.Dial("tcp", f.addr)
 	if err != nil {
 		t.Fatal(err)

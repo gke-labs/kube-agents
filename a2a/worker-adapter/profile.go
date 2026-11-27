@@ -815,8 +815,11 @@ func (w *profileWorker) beginKubeProxyTask(cfg *Config, h *held) func() {
 		// environment; that is what the pod's kube-proxy is replaced in.
 		env = append(os.Environ(), env...)
 	}
-	cfg.HarnessEnv = kubeProxyTaskEnv(env, w.kubeProxy.URL, taskTargetContext(h.proxyToken))
-	return w.kubeProxy.BeginTask(cfg.TaskID, h.proxyToken)
+	// One reading of the credential: the context the harness is given is
+	// the one the loopback holds the task to.
+	target, end := w.kubeProxy.BeginTask(cfg.TaskID, h.proxyToken)
+	cfg.HarnessEnv = kubeProxyTaskEnv(env, w.kubeProxy.URL, target)
+	return end
 }
 
 // makeWriteRefusalFile makes the task's write-refusal record file empty

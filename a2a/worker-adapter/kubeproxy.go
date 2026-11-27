@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // The kube-proxy loopback carries a profile worker's kubectl from loopback
@@ -119,6 +120,7 @@ const (
 	// message.
 	kubeProxyNoTaskMessage       = "worker-adapter: this pod is running no task, so there is no cluster to read. kubectl works only while a task runs."
 	kubeProxyNoCredentialMessage = "worker-adapter: this task was given no cluster, so kubectl has nothing to read. This is the task's scope, not an error to work around."
+	kubeProxyUnaddressedMessage  = "worker-adapter: this task has a cluster, but one this path can't address, so kubectl can't reach it from here. Retrying won't change that; say so in the task's report."
 	kubeProxyNotProxyMessage     = "worker-adapter: this listener serves kubectl on this pod only."
 	kubeProxyNotFoundMessage     = "worker-adapter: only paths under " + kubeProxyPathPrefix + " are served, in their plain form: a cluster with no percent-encoding, and no . or .. segment."
 	kubeProxyOtherClusterMessage = "worker-adapter: this task reads one cluster, and the request names another. This is the task's scope, not an error to work around."
@@ -211,6 +213,8 @@ type kubeProxyTask struct {
 	// target is the kubeconfig context of the cluster the credential names:
 	// the only cluster the task's requests may name.
 	target string
+	// refusal is what a request is told when the task holds no credential.
+	refusal string
 	// ctx ends with the task; every request admitted under it runs inside.
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -457,8 +461,9 @@ func (p *KubeProxyLoopback) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer task.inflight.Done()
-	// The task's own cluster, byte for byte, or nothing is sent. kube-proxy
-	// checks the same against the credential; this is in front of that.
+	// The task's own cluster, byte for byte, or nothing is sent. The path
+	// may be enabled only against a kube-proxy that checks the same against
+	// the credential; this check is in front of that one.
 	if cluster != task.target {
 		writeKubeProxyStatus(w, http.StatusForbidden, kubeProxyOtherClusterMessage)
 		return
@@ -516,7 +521,7 @@ func (p *KubeProxyLoopback) admit() (*kubeProxyTask, string) {
 	case p.task == nil:
 		return nil, kubeProxyNoTaskMessage
 	case p.task.credential == "":
-		return nil, kubeProxyNoCredentialMessage
+		return nil, p.task.refusal
 	}
 	p.task.inflight.Add(1)
 	return p.task, ""
@@ -540,6 +545,11 @@ func (p *KubeProxyLoopback) podToken() (string, error) {
 func (p *KubeProxyLoopback) rewrite(r *httputil.ProxyRequest) {
 	r.SetURL(p.upstream)
 	r.Out.Host = p.upstream.Host
+	// ReverseProxy rewrites a query it can't parse (a ";" separator, a bad
+	// escape) before it calls this. The loopback decides nothing on the
+	// query, so the caller's goes on byte for byte and kube-proxy reads what
+	// kubectl sent; the upstream URL carries no query of its own.
+	r.Out.URL.RawQuery = r.In.URL.RawQuery
 	// Headers and declared trailers alike: a trailer is a header sent late.
 	for _, fields := range []http.Header{r.Out.Header, r.Out.Trailer} {
 		for name := range fields {
@@ -585,9 +595,9 @@ func (kubeProxyRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) 
 
 // newTask is a task's state, with a transport of its own: no connection is
 // shared between two tasks.
-func (p *KubeProxyLoopback) newTask(id, credential, target string) *kubeProxyTask {
+func (p *KubeProxyLoopback) newTask(id, credential, target, refusal string) *kubeProxyTask {
 	ctx, cancel := context.WithCancel(context.Background())
-	t := &kubeProxyTask{id: id, credential: credential, target: target, ctx: ctx, cancel: cancel, conns: map[*kubeProxyConn]struct{}{}}
+	t := &kubeProxyTask{id: id, credential: credential, target: target, refusal: refusal, ctx: ctx, cancel: cancel, conns: map[*kubeProxyConn]struct{}{}}
 	dialer := &net.Dialer{Timeout: kubeProxyDialTimeout}
 	t.transport = &http.Transport{
 		Proxy: nil, // straight to kube-proxy, whatever the pod's proxy env says
@@ -626,26 +636,38 @@ func (p *KubeProxyLoopback) newTask(id, credential, target string) *kubeProxyTas
 	return t
 }
 
-// BeginTask makes a task the active one and returns what ends it. credential
-// is the task's cluster credential as the dispatcher's confirm carried it;
-// one that is empty, isn't shaped like a credential or names no cluster the
-// loopback can read (a report credential, or claims that don't parse) leaves
-// the task with none, and its requests are answered 403 here. The returned function closes everything the task opened
-// and waits for its requests to return; it is safe to call more than once.
-func (p *KubeProxyLoopback) BeginTask(id, credential string) func() {
+// BeginTask makes a task the active one. It returns the kubeconfig context
+// of the cluster the task is held to, "" when there is none, and what ends
+// the task. credential is the task's cluster credential as the dispatcher's
+// confirm carried it. An empty one, or one whose claims name no cluster (a
+// report credential), leaves the task with none, and its requests are told
+// so. One that isn't shaped like a credential, whose claims can't be read,
+// or whose cluster doesn't fit a context name also leaves the task with
+// none, but that task has a cluster: it is logged once here, by task and
+// never by credential, and its requests are told the cluster can't be
+// addressed. Either way the answer is a local 403. The returned function
+// closes everything the task opened and waits for its requests to return;
+// it is safe to call more than once.
+func (p *KubeProxyLoopback) BeginTask(id, credential string) (string, func()) {
+	target, refusal := "", kubeProxyNoCredentialMessage
 	switch {
 	case credential == "":
 	case len(credential) > maxTaskCredentialBytes || !taskCredentialShape.MatchString(credential):
 		p.log.Warn("kube-proxy loopback: the task's cluster credential isn't shaped like one; the task's kubectl will be refused", "task", id)
-		credential = ""
+		refusal = kubeProxyUnaddressedMessage
+	default:
+		var targeted bool
+		if target, targeted = taskTargetContext(credential); target == "" && targeted {
+			p.log.Warn("kube-proxy loopback: the task's cluster credential names a cluster this path can't address (its claims can't be read, or its project, location or cluster doesn't fit a context name); the task's kubectl will be refused", "task", id)
+			refusal = kubeProxyUnaddressedMessage
+		}
 	}
-	// The cluster the credential names, which is all the task may ask for.
-	// With none to hold it to, nothing is sent.
-	target := taskTargetContext(credential)
+	// The cluster the credential names is all the task may ask for. With
+	// none to hold it to, nothing is sent.
 	if target == "" {
 		credential = ""
 	}
-	t := p.newTask(id, credential, target)
+	t := p.newTask(id, credential, target, refusal)
 	p.mu.Lock()
 	previous := p.task
 	p.task = t
@@ -656,7 +678,7 @@ func (p *KubeProxyLoopback) BeginTask(id, credential string) func() {
 		p.log.Warn("kube-proxy loopback: a task began while another was active; ending the earlier one", "task", id, "earlier", previous.id)
 		p.shut(previous)
 	}
-	return func() { p.endTask(t) }
+	return target, func() { p.endTask(t) }
 }
 
 // endTask clears t as the active task and closes everything opened under it.
@@ -755,40 +777,30 @@ func writeKubeProxyStatus(w http.ResponseWriter, code int, message string) {
 }
 
 // taskTargetContext is the kubeconfig context of the cluster a task's
-// credential names, read without verifying it, or "" when it names none or
-// can't be read. It chooses which cluster a kubectl that names none asks
-// for, and which cluster the loopback lets the task's requests name. It
-// grants nothing: the credential comes from the dispatcher's confirm, not
-// from the agent, and the path may be enabled only against a kube-proxy that
-// verifies the credential and holds each request to the cluster it names.
-func taskTargetContext(credential string) string {
-	parts := strings.Split(credential, ".")
-	if len(parts) != 3 {
-		return ""
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+// credential names, read without verifying it (taskcred.UnverifiedTarget),
+// and whether the credential has a cluster at all. The context is "" for a
+// credential with none (a report credential: not targeted), and for one
+// whose claims can't be read or whose project, location or cluster doesn't
+// fit a context name as credential_proxy_client.parse_gke_context reads it
+// (targeted, since such a credential is not known to be without a cluster).
+// The context chooses which cluster a kubectl that names none asks for, and
+// which cluster the loopback lets the task's requests name. It authorises
+// nothing: the path may be enabled only against a kube-proxy that verifies
+// the credential and holds each request to the cluster it names.
+func taskTargetContext(credential string) (context string, targeted bool) {
+	target, err := taskcred.UnverifiedTarget(credential)
 	if err != nil {
-		return ""
+		return "", true
 	}
-	var claims struct {
-		NATS struct {
-			Target *struct {
-				Project  string `json:"project"`
-				Location string `json:"location"`
-				Cluster  string `json:"cluster"`
-			} `json:"target"`
-		} `json:"nats"`
+	if target == nil {
+		return "", false
 	}
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.NATS.Target == nil {
-		return ""
-	}
-	t := claims.NATS.Target
-	for _, part := range []string{t.Project, t.Location, t.Cluster} {
+	for _, part := range []string{target.Project, target.Location, target.Cluster} {
 		if !gkeContextPart.MatchString(part) {
-			return ""
+			return "", true
 		}
 	}
-	return fmt.Sprintf(gkeContextFormat, t.Project, t.Location, t.Cluster)
+	return fmt.Sprintf(gkeContextFormat, target.Project, target.Location, target.Cluster), true
 }
 
 // kubeProxyTaskEnv is a task's harness environment with the pod's kube-proxy
