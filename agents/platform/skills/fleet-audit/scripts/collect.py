@@ -7,8 +7,8 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 --manifest-file` cross-checks the published document against.
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
-twenty-seven-check roster (§3.1–§3.28 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s twenty-check roster (§2.1–§2.20 of
+twenty-eight-check roster (§3.1–§3.28 of `governance/obtainability_audit_sop.md`),
+`compliance-audit`'s twenty-one-check roster (§2.1–§2.21 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -24,8 +24,9 @@ workload dump plus supplemental CRD and node-pool reads for §3.24/§3.26, a pod
 read for §3.28 that is issued only when a workload is short of available pods
 or mid-rollout, and the reads its declaration fields need; compliance issues
 several distinct `kubectl` and `gcloud` reads per cluster, seven of them
-best-effort (five because their CRDs are not installed everywhere, two because
-an identity may not list webhook configurations or EndpointSlices); ai-security reads
+best-effort cluster reads (five because their CRDs are not installed everywhere, two because
+an identity may not list webhook configurations or EndpointSlices) plus one deduplicated
+best-effort `gcloud projects describe` per unique project §2.21's Workload Identity annotations name; ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
 `collect_cluster` is a thin dispatcher over a per-stream *context builder* for
@@ -91,6 +92,7 @@ import stat
 import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -300,6 +302,121 @@ _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH = (
     "pods do not expose, so requests or health checks fail while the pods report Ready."
 )
 
+# §3.27 (`network-daemonset-missing-ccc-toleration`): a DaemonSet that sets up
+# networking on each node, read against the taints of the cluster's nodes.
+NETWORK_DAEMONSET_MISSING_TOLERATION_SLUG = "network-daemonset-missing-ccc-toleration"
+# The context key saying the cluster is Autopilot, where S1 binds this check.
+CONTEXT_AUTOPILOT = "autopilot"
+# The one system namespace 3.27 reads on a Standard cluster: where GKE's
+# documented ip-masq-agent manifest is applied by the cluster's owner. The
+# others (`gke-managed-*`, `gmp-system`, ...) hold objects that are not the
+# owner's to edit, with or without the add-on label.
+OWNER_APPLIED_SYSTEM_NAMESPACE = "kube-system"
+DAEMONSET_KIND = "DaemonSet"
+NODE_POOL_LABEL = "cloud.google.com/gke-nodepool"
+HOST_PATH_VOLUME = "hostPath"
+HOST_PATH_SEPARATOR = "/"
+# Where a network plug-in keeps its configuration and its binaries on a node
+# (kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/).
+# A mount of either directory, or of a path under it, marks a node-networking
+# agent.
+CNI_HOST_DIRECTORIES = ("/etc/cni/net.d", "/opt/cni/bin")
+# Where GKE's node image keeps those binaries. Matched whole only: other node
+# software lives in its subdirectories. With the two above it is the
+# `CNI_HOST_PATHS` of fleet-upgrade-verification's `upgrade_shape_tables.py`,
+# copied because this script ships and runs standalone.
+GKE_CNI_BINARY_DIRECTORY = "/home/kubernetes/bin"
+# The two taints GKE puts on a node to keep software built for another platform
+# off it: `node.kubernetes.io/os=windows:NoSchedule` on Windows Server nodes
+# ("helps ensure that the GKE scheduler does not attempt to run Linux
+# containers on Windows Server nodes",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/deploying-windows-app) and
+# `kubernetes.io/arch=arm64:NoSchedule` on Arm nodes ("prevents x86-compatible
+# workloads from being inadvertently scheduled to your Arm nodes",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/prepare-arm-workloads-for-deployment).
+# A DaemonSet that does not tolerate one is read as not built for that
+# platform, and the node as none of its nodes: a toleration there would start
+# an image the node cannot run.
+PLATFORM_SEPARATION_TAINT_KEYS = frozenset({"node.kubernetes.io/os", "kubernetes.io/arch"})
+# Two more taints that describe a node's state, not a node pool
+# (kubernetes.io/docs/reference/labels-annotations-taints/): a node a person
+# marked out of service, and one the cloud provider reports shut down.
+NODE_STATE_TAINT_KEYS = frozenset(
+    {"node.kubernetes.io/out-of-service", "node.cloudprovider.kubernetes.io/shutdown"}
+)
+# Taints a node carries only until its own start-up is done, so not a node
+# pool's standing taint: the one Cilium puts on a node until its agent is ready
+# ("Cilium runs on the node, initializes it and, once ready, removes the
+# aforementioned taint", docs.cilium.io/en/stable/installation/taints/), and
+# the cluster autoscaler's start-up prefixes ("meant to be used when there is
+# an operation that has to complete before any pods can run on the node"; the
+# `ignore-taint` prefix is "deprecated and treated as startup taints",
+# cluster-autoscaler/FAQ.md).
+NODE_STARTUP_TAINT_KEYS = frozenset({"node.cilium.io/agent-not-ready"})
+NODE_STARTUP_TAINT_KEY_PREFIXES = (
+    "startup-taint.cluster-autoscaler.kubernetes.io/",
+    "ignore-taint.cluster-autoscaler.kubernetes.io/",
+)
+# The taint effects that keep a pod off a node. `PreferNoSchedule` does not.
+TAINT_EFFECTS_KEEPING_PODS_OFF = frozenset({"NOSCHEDULE", "NOEXECUTE"})
+# The one node field a node affinity term may match on.
+NODE_NAME_FIELD = "metadata.name"
+# The node selector operators beside `NODE_SELECTOR_OP_IN`.
+NODE_SELECTOR_OP_NOT_IN = "NotIn"
+NODE_SELECTOR_OP_EXISTS = "Exists"
+NODE_SELECTOR_OP_DOES_NOT_EXIST = "DoesNotExist"
+NODE_SELECTOR_OP_GT = "Gt"
+NODE_SELECTOR_OP_LT = "Lt"
+DAEMONSET_STATUS_DESIRED = "desiredNumberScheduled"
+DAEMONSET_STATUS_READY = "numberReady"
+# The excerpt's sentences, in the order they are written. The counts come
+# before the taints because the report cuts a long excerpt at its end, and the
+# counts must survive a long list of taints.
+NETWORK_DAEMONSET_EXCERPT_LEAD = "{kind} (checked here because of: {marks}) cannot be placed on "
+NETWORK_DAEMONSET_EXCERPT_NODES = "{uncovered} of the cluster's {total} nodes"
+NETWORK_DAEMONSET_EXCERPT_READY = (
+    " It reports {ready} of {desired} pods ready, which counts only the nodes it can be placed on."
+)
+NETWORK_DAEMONSET_EXCERPT_TAINTS = " It has no toleration for {taints}."
+NETWORK_DAEMONSET_TAINT_WHERE = "{taint} ({where}, {count})"
+NETWORK_DAEMONSET_POOL_NOUN = "node pool"
+NETWORK_DAEMONSET_MORE_POOLS = " and {more} more"
+NETWORK_DAEMONSET_NODE_COUNT = "{total} node{plural}"
+NETWORK_DAEMONSET_SENTENCE_END = "."
+PLURAL_SUFFIX = "s"
+CONTEXT_NODES = "nodes"
+CONTEXT_RAW_WORKLOADS = "raw_workloads"
+# The most host mounts the excerpt names as the reason a DaemonSet was checked.
+NETWORK_DAEMONSET_MAX_MOUNTS_NAMED = 4
+NETWORK_DAEMONSET_MORE_MOUNTS = "{more} more plug-in mount{plural}"
+NETWORK_DAEMONSET_MARK_HOST_NETWORK = "hostNetwork: true with {capabilities}"
+# The Linux capabilities that let a container change the node's packet rules
+# and interfaces. Host networking alone is how many log, metrics and security
+# agents reach the node's ports, so it marks a node-networking agent only
+# together with one of these: GKE's documented ip-masq-agent manifest adds
+# both ("add: [\"NET_ADMIN\", \"NET_RAW\"]",
+# docs.cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
+# `privileged: true` is not read as one: it is how security agents run too.
+NETWORK_CAPABILITIES = ("NET_ADMIN", "NET_RAW")
+NETWORK_DAEMONSET_CAPABILITY_JOIN = ", "
+NETWORK_DAEMONSET_MARK_CNI_MOUNT = "mounts {path} from the node"
+# How the excerpt names the nodes that carry no node pool label.
+NETWORK_DAEMONSET_UNLABELLED_NODES = "nodes with no node pool label"
+# The most node pools the excerpt names for one taint before it counts the
+# rest: node auto-provisioning can create dozens. Every taint is written,
+# because the fix is one toleration per taint; the report's own limit on an
+# excerpt's length is the only thing that cuts them.
+NETWORK_DAEMONSET_MAX_POOLS_NAMED = 10
+NETWORK_DAEMONSET_LIST_JOIN = "; "
+NETWORK_DAEMONSET_POOL_JOIN = ", "
+NETWORK_DAEMONSET_WHERE_JOIN = " and "
+IMPACT_NETWORK_DAEMONSET_MISSING_TOLERATION = (
+    "This DaemonSet cannot be placed on the nodes of one or more node pools, so "
+    "those nodes come up without whatever it sets up on a node. Nothing reports "
+    "it: Kubernetes leaves those nodes out of the number of pods the DaemonSet "
+    "expects (DESIRED), so its ready count can be complete while they have none."
+)
+
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
 # A cluster is `<project>/<location>/<name>`; a project whose `clusters list`
@@ -411,6 +528,115 @@ _IMPACT_WEBHOOK_CA_IGNORE_EXPIRING = (
     "on every call and skip the webhook in silence."
 )
 
+COMPLIANCE_AUDIT_ID = "compliance-audit"
+# §2.21 `wi-gsa-iam-binding-unverifiable` (arm A): on a cluster with Workload
+# Identity enabled, a ServiceAccount whose `iam.gke.io/gcp-service-account`
+# annotation names a Google service account in a project this install cannot
+# read (`gcloud projects describe <project>` is explicitly refused).
+# Informational (`minor`), never "missing" or "broken": the IAM binding may be
+# in place in a project outside this install's read scope, and central-IAM
+# installs may declare intentional accounts under §3a. Arm B (a readable
+# account whose IAM policy lacks `roles/iam.workloadIdentityUser`) reserves
+# `wi-gsa-iam-binding-missing` and waits on the
+# `iam service-accounts get-iam-policy` allowlist entry (`#5027`).
+WI_GSA_BINDING_UNVERIFIABLE_SLUG = "wi-gsa-iam-binding-unverifiable"
+WI_GSA_ANNOTATION = "iam.gke.io/gcp-service-account"
+WI_IAM_ROLE = "roles/iam.workloadIdentityUser"
+WI_GSA_BINDING_SEVERITY = "minor"
+WI_PROJECT_DESCRIBE_FORMAT_FLAG = "--format"
+WI_PROJECT_DESCRIBE_FORMAT = "value(projectNumber)"
+WI_SERVICEACCOUNT_KIND = "ServiceAccount"
+WI_COMMAND_JOIN = "; "
+# GCP project IDs are 6-30 characters; 128 admits intentionally overlong invalid
+# project IDs (such as the 41-character certification fixture) while bounding
+# malformed annotations so a single label cannot blow `MAX_COMMAND_CHARS`.
+WI_MAX_PROJECT_ID_CHARS = 128
+# Below `audit_report.MAX_COMMAND_CHARS` (2000), which `finish` enforces on
+# every `checks_run` command copied from `commands[]`.
+WI_MAX_COMMAND_CHARS = 1900
+WI_CACHE_KWARG = "wi_project_cache"
+WI_PROJECT_RUNS_KEY = "wi_gsa_project_runs"
+WI_SA_COMMAND_KEY = "wi_sa_command"
+WI_PROJECT_READABLE = "readable"
+WI_PROJECT_REFUSED = "refused"
+WI_PROJECT_UNREAD = "unread"
+WI_GSA_IAM_DOMAIN_RE = re.compile(
+    r"^[^@\s]+@([a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?)\.iam\.gserviceaccount\.com$",
+    re.IGNORECASE,
+)
+WI_GSA_COMPUTE_DEFAULT_RE = re.compile(
+    r"^([0-9]{1,30})-compute@developer\.gserviceaccount\.com$",
+    re.IGNORECASE,
+)
+WI_GSA_APPSPOT_DEFAULT_RE = re.compile(
+    r"^([a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?)@appspot\.gserviceaccount\.com$",
+    re.IGNORECASE,
+)
+WI_GOOGLE_MANAGED_PROJECT_PREFIX = "gcp-sa-"
+WI_GOOGLE_MANAGED_PROJECTS = frozenset({"container-engine-robot"})
+# Failures that mean `gcloud projects describe` never established whether the
+# install's IAM identity may read the target project: credential-broker
+# throttling or transport errors, caller quota-project or OAuth-scope errors,
+# auth refresh failures, gRPC/HTTP 429 or 5xx, or gcloud crashes (same classes
+# as `scripts/verify_ci_pool_project.py` and `scripts/installer/installer_common.sh`).
+WI_PROJECT_UNREAD_PATTERNS = (
+    re.compile(r"\bcredential proxy\b|CREDENTIAL_PROXY_", re.IGNORECASE),
+    re.compile(
+        r"USER_PROJECT_DENIED|quota project|serviceusage\.services\.use"
+        r"|ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"invalid_grant|problem refreshing your current auth|reauthentication (?:required|failed)"
+        r"|\bUNAUTHENTICATED\b|invalid authentication credentials",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b"
+        r"|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"
+    ),
+    re.compile(
+        r"(?:HTTPError|HTTP Error|HTTP|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()"
+        r"(?:401|408|429|500|502|503|504)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bgcloud crashed\b|Temporary failure in name resolution|Name or service not known"
+        r"|Connection reset by peer|Unable to find the server at|dial tcp|TLS handshake timeout"
+        r"|unexpected EOF|server closed idle connection|timed out",
+        re.IGNORECASE,
+    ),
+)
+# Explicit target-project refusals from Cloud Resource Manager (`gcloud projects
+# describe`): caller lacks `resourcemanager.projects.get` (or project does not
+# exist — gcloud prints both together), 404/NOT_FOUND, or 400 Bad Request /
+# INVALID_ARGUMENT on an invalid project ID.
+WI_PROJECT_REFUSAL_PATTERNS = (
+    re.compile(
+        r"permission[ _]denied|does not have permission|not authorized to access project"
+        r"|denied on resource|403 forbidden"
+        r"|(?:httperror|http Error|http|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()403\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bnot[ _]found\b|may not exist"
+        r"|(?:httperror|http Error|http|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()404\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\binvalid[ _]argument\b|\bbad request\b|invalid project(?:\s+id)?|project id must|invalid value"
+        r"|(?:httperror|http Error|http|code|status)(?:['\"]?\s*[=:]\s*['\"]?|\s+\(?|\s*\()400\b",
+        re.IGNORECASE,
+    ),
+)
+_IMPACT_WI_GSA_BINDING_MISSING = (
+    "This ServiceAccount's iam.gke.io/gcp-service-account annotation names a Google "
+    "service account in a project this install cannot read, so this audit cannot "
+    "vouch that the account's IAM policy grants roles/iam.workloadIdentityUser to "
+    "this namespace and ServiceAccount; the binding may exist in a project outside "
+    "this install's read scope."
+)
+
 
 def _platform_script_dirs() -> tuple[str, ...]:
     checkout = Path(__file__).resolve().parents
@@ -441,6 +667,7 @@ for _shared_dir in _platform_script_dirs():
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+import credential_proxy_client  # noqa: E402
 # The Config Connector read that the collectors share: this file's `gcp` read
 # gives the compliance stream's entries their `kcc_unready` keys through it.
 # It sits beside this file, which a caller can load by path with this
@@ -1245,7 +1472,8 @@ DUMP_COMMAND_KINDS = (
     # volume and no credential of any kind; a claim is a request for storage,
     # not the storage.
     ",persistentvolumeclaims"
-    # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload).
+    # `namespaces,nodes` serve 3.24 (untargeted-compute-class-workload); `nodes`
+    # and `daemonsets` also serve 3.27 (network-daemonset-missing-ccc-toleration).
     ",namespaces,nodes"
     # `ingresses` serves 3.26 (ingress-gateway-healthcheck-mismatch).
     ",ingresses"
@@ -1671,10 +1899,14 @@ def workload_keys(dump: dict) -> set[tuple[str, str, str]]:
     }
 
 
-def _is_excluded_object(item: dict) -> bool:
-    """Standard S1 (system namespace), S2 (addon-managed), and S4 (opt-out) exclusions."""
+def _is_excluded_object(item: dict, *, system_namespaces: bool = True) -> bool:
+    """Standard S1 (system namespace), S2 (addon-managed), and S4 (opt-out) exclusions.
+
+    `system_namespaces=False` leaves S1 out, for 3.27, the one check that reads
+    an object its owner applies to `kube-system`.
+    """
     meta = item.get("metadata") or {}
-    if _is_system_namespace(meta.get("namespace", "")):  # S1
+    if system_namespaces and _is_system_namespace(meta.get("namespace", "")):  # S1
         return True
     labels = meta.get("labels") or {}
     annotations = meta.get("annotations") or {}
@@ -5239,6 +5471,244 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
     }
 
 
+def _node_networking_marks(template: dict) -> list[str]:
+    """What makes this pod template a node-networking agent, as the excerpt
+    states it; empty when nothing does: the host network together with a
+    network capability, or a host mount of a network plug-in directory."""
+    marks = []
+    if template.get("hostNetwork") is True:
+        added = set()
+        for container in (template.get("containers") or []) + (template.get("initContainers") or []):
+            if not isinstance(container, dict):
+                continue
+            capabilities = (container.get("securityContext") or {}).get("capabilities") or {}
+            added.update(str(c) for c in capabilities.get("add") or [])
+        held = [c for c in NETWORK_CAPABILITIES if c in added]
+        if held:
+            marks.append(
+                NETWORK_DAEMONSET_MARK_HOST_NETWORK.format(capabilities=NETWORK_DAEMONSET_CAPABILITY_JOIN.join(held))
+            )
+    mounts = []
+    for volume in template.get("volumes") or []:
+        if not isinstance(volume, dict) or not isinstance(volume.get(HOST_PATH_VOLUME), dict):
+            continue
+        path = str(volume[HOST_PATH_VOLUME].get("path") or "")
+        normalized = path.rstrip(HOST_PATH_SEPARATOR)
+        under_cni_directory = any(
+            normalized == directory or normalized.startswith(directory + HOST_PATH_SEPARATOR)
+            for directory in CNI_HOST_DIRECTORIES
+        )
+        if under_cni_directory or normalized == GKE_CNI_BINARY_DIRECTORY:
+            mark = NETWORK_DAEMONSET_MARK_CNI_MOUNT.format(path=path)
+            if mark not in mounts:
+                mounts.append(mark)
+    more = len(mounts) - NETWORK_DAEMONSET_MAX_MOUNTS_NAMED
+    marks.extend(mounts[:NETWORK_DAEMONSET_MAX_MOUNTS_NAMED])
+    if more > 0:
+        marks.append(NETWORK_DAEMONSET_MORE_MOUNTS.format(more=more, plural=_plural(more)))
+    return marks
+
+
+def _plural(count: int) -> str:
+    return PLURAL_SUFFIX if count != 1 else ""
+
+
+def _is_node_state_taint(key) -> bool:
+    """A taint that describes a node's state or start-up, not a node pool: the
+    ones the DaemonSet controller tolerates by itself, the node lifecycle's,
+    and the start-up taints a node sheds once it is ready."""
+    return (
+        key in _CONTROLLER_NODE_TAINT_KEYS
+        or key in NODE_STATE_TAINT_KEYS
+        or key in NODE_STARTUP_TAINT_KEYS
+        or str(key or "").startswith(NODE_STARTUP_TAINT_KEY_PREFIXES)
+    )
+
+
+def _node_selector_requirement_holds(requirement: dict, values_by_key: dict) -> bool:
+    """One `matchExpressions` or `matchFields` entry against a node's labels or
+    fields, with the operators the scheduler knows. Anything else matches
+    nothing, as an entry the API server would have refused."""
+    if not isinstance(requirement, dict):
+        return False
+    key, operator = requirement.get("key"), requirement.get("operator")
+    wanted = [str(v) for v in requirement.get("values") or []]
+    present = key in values_by_key
+    actual = str(values_by_key.get(key, ""))
+    if operator == NODE_SELECTOR_OP_IN:
+        return present and actual in wanted
+    if operator == NODE_SELECTOR_OP_NOT_IN:
+        return not present or actual not in wanted
+    if operator == NODE_SELECTOR_OP_EXISTS:
+        return present
+    if operator == NODE_SELECTOR_OP_DOES_NOT_EXIST:
+        return not present
+    if operator in (NODE_SELECTOR_OP_GT, NODE_SELECTOR_OP_LT):
+        try:
+            have, bound = int(actual), int(wanted[0])
+        except (ValueError, IndexError):
+            return False
+        return present and (have > bound if operator == NODE_SELECTOR_OP_GT else have < bound)
+    return False
+
+
+def _node_admits_daemon_pod(template: dict, node: dict) -> bool:
+    """Whether the template's `nodeSelector` and required node affinity admit
+    this node, which is the DaemonSet controller's test before it reads taints.
+
+    Written against the Node rather than reusing 3.24's
+    `_pool_satisfies_scheduling_selectors`, which reads a pool's configured
+    labels, takes an empty affinity term as matching every node and skips an
+    operator it does not know: each would report a node the DaemonSet's own
+    affinity excludes. `upgrade_retrospective._node_satisfies` is a third
+    reader of the same fields and also lets an empty term match every node.
+    """
+    meta = node.get("metadata") or {}
+    labels = meta.get("labels") or {}
+    for key, value in (template.get("nodeSelector") or {}).items():
+        if key not in labels or labels[key] != value:
+            return False
+    required = (
+        ((template.get("affinity") or {}).get("nodeAffinity") or {}).get("requiredDuringSchedulingIgnoredDuringExecution")
+        or {}
+    )
+    terms = required.get("nodeSelectorTerms") or []
+    if not terms:
+        return True
+    fields = {NODE_NAME_FIELD: meta.get("name", "")}
+    for term in terms:
+        if not isinstance(term, dict):
+            continue
+        expressions = term.get("matchExpressions") or []
+        field_matches = term.get("matchFields") or []
+        # A term with neither matches no node.
+        if not expressions and not field_matches:
+            continue
+        if all(_node_selector_requirement_holds(e, labels) for e in expressions) and all(
+            _node_selector_requirement_holds(f, fields) for f in field_matches
+        ):
+            return True
+    return False
+
+
+def _taint_text(taint: dict) -> str:
+    key = taint.get("key", "")
+    value = taint.get("value")
+    return f"{key}={value}:{taint.get('effect', '')}" if value else f"{key}:{taint.get('effect', '')}"
+
+
+def _uncovered_taint_text(taint: str, nodes_by_pool: dict[str, int]) -> str:
+    """One untolerated taint with where it is, for the excerpt: its node pools
+    by name, the first `NETWORK_DAEMONSET_MAX_POOLS_NAMED` of them, and how
+    many nodes carry it. The key `""` holds the nodes with no node pool label."""
+    pools = sorted(name for name in nodes_by_pool if name)
+    where = []
+    if pools:
+        named = pools[:NETWORK_DAEMONSET_MAX_POOLS_NAMED]
+        more = len(pools) - len(named)
+        where.append(
+            f"{NETWORK_DAEMONSET_POOL_NOUN}{_plural(len(pools))} {NETWORK_DAEMONSET_POOL_JOIN.join(named)}"
+            + (NETWORK_DAEMONSET_MORE_POOLS.format(more=more) if more else "")
+        )
+    if nodes_by_pool.get(""):
+        where.append(NETWORK_DAEMONSET_UNLABELLED_NODES)
+    total = sum(nodes_by_pool.values())
+    return NETWORK_DAEMONSET_TAINT_WHERE.format(
+        taint=taint,
+        where=NETWORK_DAEMONSET_WHERE_JOIN.join(where),
+        count=NETWORK_DAEMONSET_NODE_COUNT.format(total=total, plural=_plural(total)),
+    )
+
+
+def check_network_daemonset_missing_toleration(context: dict) -> list[dict]:
+    """§3.27 -- a node-networking DaemonSet with no toleration for a taint on a
+    node pool that has nodes.
+
+    The DaemonSet controller places a pod on every node the template's node
+    selector and affinity admit and whose taints it tolerates, and counts only
+    those nodes in `status.desiredNumberScheduled`. A pool tainted after the
+    agent was written -- a ComputeClass pool, a dedicated pool -- therefore
+    runs without it while the DaemonSet reports every pod ready.
+
+    Read from the Node objects rather than from `gcloud container node-pools
+    list`: a node's own taints and labels are what the controller reads, the
+    dump already holds them, and a pool with no node has nothing to cover.
+    S1 does not bind `kube-system` on a Standard cluster: GKE's documented
+    ip-masq-agent manifest is for Standard and is applied there by the
+    cluster's owner. The other system namespaces stay excluded, as objects
+    that are not the owner's to edit. On Autopilot S1 binds whole, because there "GKE
+    always deploys an `ip-masq-agent` DaemonSet" itself
+    (docs.cloud.google.com/kubernetes-engine/docs/concepts/ip-masquerade-agent)
+    and the system namespaces hold GKE's objects only. A host-network DaemonSet
+    an allowlist admitted to a user namespace is still read. S2 and S4 bind
+    everywhere, and so does the annotation GKE puts on the components it
+    manages.
+    """
+    nodes = [n for n in context.get(CONTEXT_NODES) or [] if isinstance(n, dict)]
+    autopilot = bool(context.get(CONTEXT_AUTOPILOT))
+    hits = []
+    for item in context.get(CONTEXT_RAW_WORKLOADS) or []:
+        if item.get("kind") != DAEMONSET_KIND or _is_excluded_object(item, system_namespaces=False):  # S2, S4
+            continue
+        meta = item.get("metadata") or {}
+        namespace = meta.get("namespace", "")
+        if _is_system_namespace(namespace) and (autopilot or namespace != OWNER_APPLIED_SYSTEM_NAMESPACE):  # S1
+            continue
+        if (meta.get("annotations") or {}).get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        template = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
+        marks = _node_networking_marks(template)
+        if not marks:
+            continue
+        tolerations = [t for t in template.get("tolerations") or [] if isinstance(t, dict)]
+        # taint text -> node pool name -> nodes carrying it untolerated
+        uncovered: dict[str, dict[str, int]] = {}
+        uncovered_nodes = 0
+        for node in nodes:
+            if not _node_admits_daemon_pod(template, node):
+                continue
+            pool_name = ((node.get("metadata") or {}).get("labels") or {}).get(NODE_POOL_LABEL) or ""
+            untolerated = [
+                t for t in (node.get("spec") or {}).get("taints") or []
+                if isinstance(t, dict)
+                and _normalize_taint_effect(t.get("effect")) in TAINT_EFFECTS_KEEPING_PODS_OFF
+                and not _is_node_state_taint(t.get("key"))
+                and not _tolerates_taint(tolerations, t)
+            ]
+            if not untolerated or any(t.get("key") in PLATFORM_SEPARATION_TAINT_KEYS for t in untolerated):
+                continue
+            uncovered_nodes += 1
+            for text in {_taint_text(t) for t in untolerated}:
+                by_pool = uncovered.setdefault(text, {})
+                by_pool[pool_name] = by_pool.get(pool_name, 0) + 1
+        if not uncovered:
+            continue
+        excerpt = (
+            NETWORK_DAEMONSET_EXCERPT_LEAD.format(kind=DAEMONSET_KIND, marks=NETWORK_DAEMONSET_LIST_JOIN.join(marks))
+            + NETWORK_DAEMONSET_EXCERPT_NODES.format(uncovered=uncovered_nodes, total=len(nodes))
+            + NETWORK_DAEMONSET_SENTENCE_END
+        )
+        status = item.get("status") or {}
+        desired, ready = status.get(DAEMONSET_STATUS_DESIRED), status.get(DAEMONSET_STATUS_READY)
+        if all(isinstance(v, int) and not isinstance(v, bool) for v in (desired, ready)):
+            excerpt += NETWORK_DAEMONSET_EXCERPT_READY.format(ready=ready, desired=desired)
+        excerpt += NETWORK_DAEMONSET_EXCERPT_TAINTS.format(
+            taints=NETWORK_DAEMONSET_LIST_JOIN.join(
+                _uncovered_taint_text(text, uncovered[text]) for text in sorted(uncovered)
+            )
+        )
+        hits.append(
+            {
+                "namespace": meta.get("namespace", ""),
+                "object": f"{DAEMONSET_KIND}/{meta.get('name', '')}",
+                "excerpt": excerpt,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return hits
+
+
 # --------------------------------------------------------------------------- #
 # obtainability-audit §3.28 `image-pull-failing`: a workload with a pod that
 # has failed to pull an image for ten minutes or more.
@@ -5655,7 +6125,7 @@ def read_pull_waiting_pods(
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all twenty checks of §2.
+# compliance-audit: all twenty-one checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -8927,6 +9397,14 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         _IMPACT_INGRESS_GATEWAY_HEALTHCHECK_MISMATCH,
     ),
     CheckSpec(
+        NETWORK_DAEMONSET_MISSING_TOLERATION_SLUG,
+        CHECK_KIND_CLUSTER,
+        check_network_daemonset_missing_toleration,
+        SEVERITY_MAJOR,
+        None,
+        IMPACT_NETWORK_DAEMONSET_MISSING_TOLERATION,
+    ),
+    CheckSpec(
         IMAGE_PULL_FAILING_SLUG,
         "workload",
         check_image_pull_failing,
@@ -9323,8 +9801,8 @@ def check_serviceentry_host_collision(context: dict) -> list[dict]:
 # one, because a fail-closed webhook with a dead backend refuses every request
 # its rules match today, and a config-management system is the first caller to
 # find out. Both reads are best-effort, like `ccnp` above: a cluster whose
-# identity cannot list webhook configurations keeps its other eighteen checks
-# (or nineteen when EndpointSlices alone fails), and any uncovered check reads
+# identity cannot list webhook configurations keeps its other nineteen checks
+# (or twenty when EndpointSlices alone fails), and any uncovered check reads
 # `Undetermined` there.
 WEBHOOK_DUMP_KINDS = "validatingwebhookconfigurations,mutatingwebhookconfigurations"
 ENDPOINTSLICE_DUMP_KINDS = "endpointslices"
@@ -9718,6 +10196,172 @@ def check_webhook_ca_bundle_expired(
     return hits
 
 
+# §2.21 `wi-gsa-iam-binding-unverifiable` (arm A): on a cluster with Workload
+def _classify_wi_project_describe(proj_run: Run) -> str:
+    """Classify a `gcloud projects describe` `Run` as readable, refused, or unread.
+
+    Only an explicit target-project refusal (`PERMISSION_DENIED`, `NOT_FOUND`,
+    or `INVALID_ARGUMENT` / `Bad Request` on the project ID, without consumer
+    `SERVICE_DISABLED`, `USER_PROJECT_DENIED`, or insufficient auth scopes)
+    establishes Arm A. Any timeout, spawn failure, policy/session-cap refusal,
+    credential-broker error, auth refresh failure, consumer/quota-project error,
+    429/5xx, or unrecognized stderr leaves the project unread (`Undetermined`).
+    """
+    if proj_run.rc == 0:
+        return WI_PROJECT_READABLE
+    if proj_run.rc < 0 or proj_run.rc in (
+        TIMEOUT_RC,
+        credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED,
+    ):
+        return WI_PROJECT_UNREAD
+    stderr = str(proj_run.stderr or "").strip()
+    if not stderr:
+        return WI_PROJECT_UNREAD
+    if any(code in stderr for code in credential_proxy_client.POLICY_BLOCKED_CODES):
+        return WI_PROJECT_UNREAD
+    if any(marker in stderr for marker in API_DISABLED_MARKERS):
+        return WI_PROJECT_UNREAD
+    if any(pattern.search(stderr) for pattern in WI_PROJECT_UNREAD_PATTERNS):
+        return WI_PROJECT_UNREAD
+    if any(pattern.search(stderr) for pattern in WI_PROJECT_REFUSAL_PATTERNS):
+        return WI_PROJECT_REFUSED
+    return WI_PROJECT_UNREAD
+
+
+class _WiProjectDescribeCache:
+    """Deduplicates `gcloud projects describe <project>` across a collector sweep."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inflight: dict[str, threading.Event] = {}
+        self._results: dict[str, Run] = {}
+
+    def describe(self, gsa_project: str, *, run: RunFn) -> tuple[str, Run]:
+        argv = [
+            *PROJECT_DESCRIBE_ARGV,
+            gsa_project,
+            WI_PROJECT_DESCRIBE_FORMAT_FLAG,
+            WI_PROJECT_DESCRIBE_FORMAT,
+        ]
+        cmd_text = shlex.join(argv)
+        while True:
+            with self._lock:
+                cached = self._results.get(gsa_project)
+                if cached is not None:
+                    return cmd_text, cached
+                waiter = self._inflight.get(gsa_project)
+                if waiter is None:
+                    waiter = threading.Event()
+                    self._inflight[gsa_project] = waiter
+                    owner = True
+                else:
+                    owner = False
+            if not owner:
+                waiter.wait()
+                continue
+            cacheable = False
+            result: Run | None = None
+            try:
+                result = run(argv)
+                verdict = _classify_wi_project_describe(result)
+                cacheable = verdict != WI_PROJECT_UNREAD or result.rc == TIMEOUT_RC
+            finally:
+                with self._lock:
+                    if cacheable and result is not None:
+                        self._results[gsa_project] = result
+                    self._inflight.pop(gsa_project, None)
+                    waiter.set()
+            return cmd_text, result
+
+
+def _wi_gsa_project(gsa_email: str) -> str:
+    """The GCP project id or number `gsa_email` belongs to, or `""` when none."""
+    email = str(gsa_email or "").strip()
+    if not email:
+        return ""
+    iam_match = WI_GSA_IAM_DOMAIN_RE.match(email)
+    if iam_match:
+        project = iam_match.group(1).lower()
+        if (
+            len(project) > WI_MAX_PROJECT_ID_CHARS
+            or project.startswith(WI_GOOGLE_MANAGED_PROJECT_PREFIX)
+            or project in WI_GOOGLE_MANAGED_PROJECTS
+        ):
+            return ""
+        return project
+    compute_match = WI_GSA_COMPUTE_DEFAULT_RE.match(email)
+    if compute_match:
+        return compute_match.group(1)
+    appspot_match = WI_GSA_APPSPOT_DEFAULT_RE.match(email)
+    if appspot_match:
+        project = appspot_match.group(1).lower()
+        return project if len(project) <= WI_MAX_PROJECT_ID_CHARS else ""
+    return ""
+
+
+def _in_scope_annotated_serviceaccounts(
+    serviceaccounts: list[dict],
+) -> list[tuple[dict, str, str, str, str]]:
+    """In-scope ServiceAccounts carrying a Workload Identity GSA annotation."""
+    annotated: list[tuple[dict, str, str, str, str]] = []
+    for item in serviceaccounts or []:
+        meta = item.get("metadata") or {}
+        ns = str(meta.get("namespace") or "")
+        sa_name = str(meta.get("name") or "")
+        if not ns or not sa_name or _is_system_namespace(ns):
+            continue
+        if _ADDON_MANAGER_MODE_LABEL in (meta.get("labels") or {}):
+            continue
+        annotations = meta.get("annotations") or {}
+        if annotations.get(_GKE_COMPONENT_ANNOTATION):
+            continue
+        gsa_email = str(annotations.get(WI_GSA_ANNOTATION) or "").strip()
+        gsa_project = _wi_gsa_project(gsa_email)
+        if not gsa_project:
+            continue
+        annotated.append((meta, ns, sa_name, gsa_email, gsa_project))
+    return annotated
+
+
+def check_wi_gsa_iam_binding_unverifiable(context: dict) -> list[dict]:
+    """§2.21 (arm A): a ServiceAccount naming a GSA in a project this install cannot read."""
+    describe = context.get("cluster_describe") or {}
+    workload_pool = ((describe.get("workloadIdentityConfig") or {}).get("workloadPool") or "").strip()
+    if not workload_pool:
+        return []
+    project_runs = context.get(WI_PROJECT_RUNS_KEY) or {}
+    if not project_runs:
+        return []
+    sa_cmd = str(context.get(WI_SA_COMMAND_KEY) or "").strip()
+    hits = []
+    for meta, ns, sa_name, gsa_email, gsa_project in _in_scope_annotated_serviceaccounts(
+        context.get("serviceaccounts") or []
+    ):
+        entry = project_runs.get(gsa_project)
+        if entry is None:
+            continue
+        cmd_text, proj_run = entry
+        if _classify_wi_project_describe(proj_run) != WI_PROJECT_REFUSED:
+            continue
+        hits.append(
+            {
+                "namespace": ns,
+                "object": f"{WI_SERVICEACCOUNT_KIND}/{sa_name}",
+                "command": f"{sa_cmd}{WI_COMMAND_JOIN}{cmd_text}" if sa_cmd else cmd_text,
+                "excerpt": (
+                    f"{WI_GSA_ANNOTATION}={gsa_email}; `{cmd_text}` exited {proj_run.rc}, "
+                    f"so this install cannot read project {gsa_project} or vouch that {gsa_email} "
+                    f"grants {WI_IAM_ROLE} to serviceAccount:{workload_pool}[{ns}/{sa_name}]"
+                ),
+                "severity": WI_GSA_BINDING_SEVERITY,
+                "impact": _IMPACT_WI_GSA_BINDING_MISSING,
+                "reconciler": reconciler_of(meta),
+                "release": release_of(meta),
+            }
+        )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
+
+
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec(
         "privileged-container",
@@ -9917,6 +10561,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_WEBHOOK_CA_FAIL_EXPIRED,
     ),
+    CheckSpec(
+        WI_GSA_BINDING_UNVERIFIABLE_SLUG,
+        "cluster",
+        check_wi_gsa_iam_binding_unverifiable,
+        WI_GSA_BINDING_SEVERITY,
+        None,
+        _IMPACT_WI_GSA_BINDING_MISSING,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -10024,6 +10676,8 @@ def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckS
     record = _record(paged_command_text(DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig), dump_run)
 
     context = build_context(dump, workloads)
+    # 3.27 reads system namespaces on a Standard cluster and not on Autopilot.
+    context[CONTEXT_AUTOPILOT] = bool(cluster.get("autopilot"))
     commands = {spec.slug: record for spec in checks}
     if any(spec.slug == INGRESS_GATEWAY_HEALTHCHECK_MISMATCH_SLUG for spec in checks):
         served_crd_runs: list[tuple[str, Run]] = []
@@ -10199,6 +10853,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "webhook-backend-unreachable": ("webhooks", "services", "endpointslices"),
     SERVICEENTRY_HOST_COLLISION_SLUG: ("serviceentries",),
     WEBHOOK_CA_BUNDLE_EXPIRED_SLUG: ("webhooks",),
+    WI_GSA_BINDING_UNVERIFIABLE_SLUG: ("serviceaccounts", "describe", "projects"),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -10415,7 +11070,14 @@ def _serviceentry_disposition(items: list[dict] | None, result: Run) -> str:
     )
 
 
-def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
+def _collect_compliance(
+    cluster: dict,
+    kubeconfig: Path,
+    checks: tuple[CheckSpec, ...],
+    *,
+    run: RunFn,
+    wi_project_cache: _WiProjectDescribeCache | None = None,
+) -> CollectedContext:
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
     commands: dict[str, dict] = {}
     # `cluster_name` is here for the two cluster-scoped checks, whose object is
@@ -10726,11 +11388,11 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # workload names, and a read narrowed to `default` left it nothing to find
     # -- every named account read as absent, so the check returned no hits on
     # any cluster while its command recorded a clean run.
-    parsed, result = paged(SERVICEACCOUNT_DUMP_KINDS)
+    parsed, sa_result = paged(SERVICEACCOUNT_DUMP_KINDS)
     if parsed is None:
-        raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
+        raise GateFailure(f"ServiceAccount dump gate failed (rc={sa_result.rc}): {sa_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), result)
+    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), sa_result)
     commands["default-sa-automount"] = sa_record
     commands["unbound-sa-automount"] = sa_record
 
@@ -10747,6 +11409,73 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     describe_record = _record(describe_command, result)
     for slug in ("workload-identity-off", "public-control-plane"):
         commands[slug] = describe_record
+
+    # §2.19 `wi-gsa-iam-binding-unverifiable` (arm A): one `gcloud projects describe`
+    # per unique project named by an in-scope ServiceAccount's Workload Identity
+    # annotation when Workload Identity is enabled on the cluster, deduplicated
+    # across the sweep. Only an explicit target-project refusal (`WI_PROJECT_REFUSED`)
+    # is the positive observation that this install cannot read the project to
+    # vouch for its binding; any timeout, broker/auth/429/5xx error, or consumer
+    # `SERVICE_DISABLED` (`WI_PROJECT_UNREAD`) leaves §2.19 `Undetermined` here.
+    context[WI_SA_COMMAND_KEY] = sa_record["command"]
+    wi_pool = ((parsed.get("workloadIdentityConfig") or {}).get("workloadPool") or "").strip()
+    wi_annotated = _in_scope_annotated_serviceaccounts(context["serviceaccounts"]) if wi_pool else []
+    wi_projects = sorted({gsa_project for _, _, _, _, gsa_project in wi_annotated})
+    project_cache = wi_project_cache if wi_project_cache is not None else _WiProjectDescribeCache()
+    wi_project_runs: dict[str, tuple[str, Run]] = {}
+    wi_unread_reason = ""
+    for gsa_project in wi_projects:
+        cmd_text, proj_run = project_cache.describe(gsa_project, run=run)
+        verdict = _classify_wi_project_describe(proj_run)
+        if verdict == WI_PROJECT_UNREAD:
+            if proj_run.rc == TIMEOUT_RC:
+                wi_unread_reason = (
+                    f"{UNDETERMINED_PREFIX} `{cmd_text}` did not finish within "
+                    f"{DEFAULT_TIMEOUT_S}s and was killed, so whether project {gsa_project!r} "
+                    "is readable by this install was not established. This check cleared "
+                    "nothing on this cluster."
+                )
+            else:
+                err_detail = proj_run.stderr.strip()[:ERROR_EXCERPT_CHARS]
+                detail_clause = f" ({err_detail})" if err_detail else ""
+                wi_unread_reason = (
+                    f"{UNDETERMINED_PREFIX} `{cmd_text}` failed without a target-project "
+                    f"refusal (rc={proj_run.rc}{detail_clause}), so whether project "
+                    f"{gsa_project!r} is readable by this install was not established. "
+                    "This check cleared nothing on this cluster."
+                )
+            break
+        wi_project_runs[gsa_project] = (cmd_text, proj_run)
+    if wi_unread_reason:
+        context.setdefault("unevaluated", {})[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = wi_unread_reason
+        context[WI_PROJECT_RUNS_KEY] = {}
+    else:
+        context[WI_PROJECT_RUNS_KEY] = wi_project_runs
+        if wi_project_runs:
+            wi_command_parts = [sa_record["command"]]
+            for _, (cmd_text, _) in sorted(wi_project_runs.items()):
+                candidate_chain = WI_COMMAND_JOIN.join([*wi_command_parts, cmd_text])
+                if len(candidate_chain) > WI_MAX_COMMAND_CHARS:
+                    break
+                wi_command_parts.append(cmd_text)
+            commands[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = _record(
+                WI_COMMAND_JOIN.join(wi_command_parts),
+                Run(
+                    [],
+                    0,
+                    sa_result.stdout
+                    + "".join(
+                        f"\n{proj}:{proj_run.rc}:{proj_run.stdout}"
+                        for proj, (_, proj_run) in sorted(wi_project_runs.items())
+                    ),
+                    "",
+                    sa_result.duration_s + sum(proj_run.duration_s for _, proj_run in wi_project_runs.values()),
+                ),
+            )
+        elif wi_pool:
+            commands[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = sa_record
+        else:
+            commands[WI_GSA_BINDING_UNVERIFIABLE_SLUG] = describe_record
 
     # Not attempted on Autopilot, where the API refuses it outright:
     # `node-pools list` answers HTTP 400 "Autopilot node pools cannot be
@@ -11628,6 +12357,7 @@ def collect_cluster(
     declarations: dict[tuple[str, str, str, str], set[str]] | None = None,
     releases: dict[tuple, dict] | None = None,
     namespaces: dict[tuple[str, str], dict] | None = None,
+    wi_project_cache: _WiProjectDescribeCache | None = None,
 ) -> dict:
     """One manifest `clusters[]` entry: every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
@@ -11650,7 +12380,10 @@ def collect_cluster(
             }
 
         try:
-            collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, run=run)
+            collector_kwargs: dict[str, object] = {"run": run}
+            if wi_project_cache is not None and audit_id == COMPLIANCE_AUDIT_ID:
+                collector_kwargs[WI_CACHE_KWARG] = wi_project_cache
+            collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, **collector_kwargs)
         except GateFailure as exc:
             return {
                 "name": target, "project": project, "location": location,
@@ -11693,6 +12426,8 @@ def collect_cluster(
         }
         if arm_specific:
             emitted["impact_authoritative"] = True
+        if isinstance(hit.get("command"), str) and hit["command"].strip():
+            emitted["command"] = hit["command"].strip()
         if isinstance(hit.get("pod_selector"), dict):
             emitted["pod_selector"] = hit["pod_selector"]
         if isinstance(hit.get("namespace_pdbs"), list):
@@ -11855,7 +12590,13 @@ def collect_cluster(
         for spec in checks:
             if spec.slug in not_applicable_slugs:
                 continue
-            if spec.kind != "workload" and spec.slug not in _WORKLOAD_ANCHORED_CLUSTER_CHECKS:
+            # 3.27 reads `kube-system` past S1 on a Standard cluster. On
+            # Autopilot S1 binds it whole, so there it examined this same
+            # empty set.
+            anchored = spec.slug in _WORKLOAD_ANCHORED_CLUSTER_CHECKS or (
+                spec.slug == NETWORK_DAEMONSET_MISSING_TOLERATION_SLUG and bool(cluster.get("autopilot"))
+            )
+            if spec.kind != "workload" and not anchored:
                 continue
             not_applicable_slugs.add(spec.slug)
             checks_not_applicable.append({"check": spec.slug, "reason": reason})
@@ -12014,6 +12755,7 @@ def collect_fleet(
         if shared_note:
             log(f"{KUBECONFIG_DIR}: {shared_note}")
 
+    wi_project_cache = _WiProjectDescribeCache() if audit_id == COMPLIANCE_AUDIT_ID else None
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
@@ -12026,6 +12768,7 @@ def collect_fleet(
                 declarations=declarations,
                 releases=releases,
                 namespaces=namespaces,
+                wi_project_cache=wi_project_cache,
             ): index
             for index, cluster in enumerate(clusters)
         }

@@ -931,6 +931,12 @@ def nightly_job(data: dict) -> str:
     return next((r.get("job") for r in reversed(sorted_nightly_runs(data)) if isinstance(r.get("job"), str) and night_part(r) == PART_MAIN), DEFAULT_NIGHTLY_JOB)
 
 
+def snowflake_start(build: str) -> datetime.datetime:
+    """The start a snowflake build ID (PROW_BUILD_ID_DIGITS digits) encodes."""
+    ms = (int(build) >> PROW_BUILD_ID_TIME_SHIFT) + PROW_BUILD_ID_EPOCH_MS
+    return datetime.datetime.fromtimestamp(ms / MILLIS_PER_SECOND, UTC)
+
+
 def build_started(build: str, first_seen: datetime.datetime) -> datetime.datetime:
     """When a pending build started, read from its snowflake ID. An ID of
     another length, or one that decodes to after ``first_seen`` (a build
@@ -938,9 +944,7 @@ def build_started(build: str, first_seen: datetime.datetime) -> datetime.datetim
     sighting stands in."""
     if len(build) != PROW_BUILD_ID_DIGITS:
         return first_seen
-    ms = (int(build) >> PROW_BUILD_ID_TIME_SHIFT) + PROW_BUILD_ID_EPOCH_MS
-    started = datetime.datetime.fromtimestamp(ms / MILLIS_PER_SECOND, UTC)
-    return min(started, first_seen)
+    return min(snowflake_start(build), first_seen)
 
 
 def running_nights(data: dict, now: datetime.datetime | None) -> list[dict]:

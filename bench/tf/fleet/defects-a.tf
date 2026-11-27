@@ -438,8 +438,9 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
 # file in a GitOps repository declares a member's name; only the parent is a
 # stable object. Each member has burst-ingest's shape (two pause replicas,
 # 10m / 128Mi, a budget, the default-deny policy, the restricted settings), so
-# the cost SOP's 3.1 `overrequest` names each one on memory and no other
-# stream names the namespace. No note declares them: they are findings.
+# the cost SOP's 3.1 `overrequest` files the family on memory, as one finding
+# on the parent, and no other stream names the namespace. No note declares
+# them: they are findings.
 #
 # The names are literals, not `random_uuid` and not `generate_name`. Each
 # pool project then holds the same three names on each apply, with no state
@@ -621,6 +622,492 @@ resource "kubernetes_job_v1" "reindex" {
   }
 
   wait_for_completion = false
+}
+
+# Posture (waste, a replaced pod behind a cut name): one Deployment whose name
+# has 58 characters, so Kubernetes cuts the names of its pods: a pod name is
+# the name and 5 generated characters, with no hash and no hyphen between
+# them. Its one pod is idle until 18:00 UTC. Then the pod uses its CPU limit
+# and holds 64Mi for 11 minutes, and at 18:11 UTC it deletes itself through
+# the API. The ReplicaSet makes a new pod, which is idle until the next day.
+# So outside the window below the live pod is idle, and the pod of the day
+# before is a replaced pod with a peak above the 20% bar of the cost SOP's 3.1
+# on both dimensions. An audit that reads only the live pod files
+# `overrequest` on the Deployment; an audit that also finds the replaced pod
+# behind its cut name files nothing.
+#
+# The cycle is the pod's own: no CronJob, no exec into the pod and no step of
+# the reconcile. A fixed hour, not a delay after the start. The Deployment has
+# no verdict from 18:00 to about 19:11 UTC: for 11 minutes the live pod is the
+# busy pod, and 3.1 does not read a pod in its first hour. The same holds from
+# the plant to the first replacement (up to one day), and for one day after a
+# delete call that failed on each try. The nightly lanes start at 00:00 UTC
+# and can run until 14:00 UTC, so 18:00 UTC is outside them; the weekend lane
+# and a run that a person starts can fall in the window. One replica: two
+# pods of one template delete themselves in the same minute, and one replica
+# behind a budget blocks a drain.
+#
+# A namespace of its own, because the Role can delete pods: it reaches no
+# other fixture. The ServiceAccount's token is mounted, as the
+# legacy-endpoints-writer's is, and the one policy is that namespace's shape
+# (no ingress, egress to the API server only). The apply does not wait for
+# the rollout: a slow pull must not fail a project's apply.
+# Catalogue role: long-name-replaced-pod.
+locals {
+  long_name_workload = {
+    name = "settlement-batch-reconciliation-exporter-for-partner-feeds"
+  }
+  long_name_cpu_request    = "100m"
+  long_name_cpu_limit      = "200m"
+  long_name_memory_request = "128Mi"
+  long_name_memory_limit   = "256Mi"
+}
+
+resource "kubernetes_namespace_v1" "seeded_long_name" {
+  metadata {
+    name   = "seeded-long-name"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_network_policy_v1" "long_name_apiserver_egress_only" {
+  metadata {
+    name      = "apiserver-egress-only"
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+
+  spec {
+    pod_selector {}
+    policy_types = ["Ingress", "Egress"]
+    egress {
+      ports {
+        port     = "443"
+        protocol = "TCP"
+      }
+      to {
+        ip_block {
+          cidr = "${cidrhost(google_container_cluster.seeded_a.services_ipv4_cidr, 1)}/32"
+        }
+      }
+      to {
+        ip_block {
+          cidr = "${google_container_cluster.seeded_a.endpoint}/32"
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service_account_v1" "long_name_cycle" {
+  metadata {
+    name      = "long-name-pod-cycle"
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+  automount_service_account_token = true
+}
+
+# delete on pods, for the pod's own delete call, and nothing else; namespaced.
+resource "kubernetes_role_v1" "long_name_cycle" {
+  metadata {
+    name      = "long-name-pod-cycle"
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+  rule {
+    api_groups = [""]
+    resources  = ["pods"]
+    verbs      = ["delete"]
+  }
+}
+
+resource "kubernetes_role_binding_v1" "long_name_cycle" {
+  metadata {
+    name      = "long-name-pod-cycle"
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role_v1.long_name_cycle.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account_v1.long_name_cycle.metadata[0].name
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+}
+
+resource "kubernetes_config_map_v1" "long_name_cycle" {
+  metadata {
+    name      = "long-name-pod-cycle"
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+  data = {
+    "cycle.py" = <<-PY
+      """One busy period each day, then this pod deletes itself.
+
+      Idle until BURST_HOUR_UTC. Then the script uses the CPU and holds memory
+      for BURST_SECONDS, and then it deletes its own pod through the API. The
+      ReplicaSet makes a new pod, which is idle until the next day. A cost
+      audit then sees an idle live pod, and a pod that the Deployment replaced
+      inside the last day with a peak above the audit's bar.
+      """
+      import os
+      import signal
+      import sys
+      import time
+      from datetime import datetime, timedelta, timezone
+
+      SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+      TOKEN_PATH = SERVICE_ACCOUNT_DIR + "/token"
+      CA_PATH = SERVICE_ACCOUNT_DIR + "/ca.crt"
+      NAMESPACE_PATH = SERVICE_ACCOUNT_DIR + "/namespace"
+      POD_NAME_ENV = "POD_NAME"
+      USER_AGENT = "long-name-pod-cycle/1.0"
+      DEFAULT_API_PORT = "443"
+      REQUEST_TIMEOUT_SECONDS = 20
+      # The delete call is tried this many times, with this wait between two
+      # tries: an API server that is away for some minutes (an upgrade of a
+      # zonal control plane) must not keep the busy pod as the live pod.
+      DELETE_ATTEMPTS = 20
+      DELETE_RETRY_SECONDS = 30
+      # The hour of the day, UTC, at which the busy period starts.
+      BURST_HOUR_UTC = 18
+      # Two buckets of the cost audit's CPU read (300 seconds each) and one
+      # minute: one whole bucket is busy at each position of the start.
+      BURST_SECONDS = 660
+      # Held for the busy period: half of the memory request.
+      BUSY_MEMORY_BYTES = 64 * 1024 * 1024
+      PAGE_BYTES = 4096
+      IDLE_STEP_SECONDS = 30
+      # How long the script waits for its end after the delete call.
+      DELETE_WAIT_SECONDS = 300
+      HTTP_OK = 200
+      HTTP_ACCEPTED = 202
+      HTTP_NO_ANSWER = 0
+
+
+      def next_burst(now):
+          """The next start of the busy hour that is after `now`. A pod that
+          starts in the busy hour waits for the next day, so the pod that
+          replaces a busy pod is idle."""
+          start = now.replace(hour=BURST_HOUR_UTC, minute=0, second=0, microsecond=0)
+          if start <= now:
+              start += timedelta(days=1)
+          return start
+
+
+      def pod_path(namespace, pod):
+          return "/api/v1/namespaces/" + namespace + "/pods/" + pod
+
+
+      def busy(seconds):
+          """Hold BUSY_MEMORY_BYTES, each page written, and use the CPU."""
+          block = bytearray(BUSY_MEMORY_BYTES)
+          for offset in range(0, BUSY_MEMORY_BYTES, PAGE_BYTES):
+              block[offset] = 1
+          end = time.monotonic() + seconds
+          while time.monotonic() < end:
+              pass
+          return len(block)
+
+
+      def delete_own_pod():
+          """One DELETE call on this pod. Returns (HTTP status, path)."""
+          # Imported here and not at the top: the idle pod then holds less
+          # memory, and the audit's memory read of the idle pod is lower.
+          import ssl
+          import urllib.error
+          import urllib.request
+
+          host = os.environ["KUBERNETES_SERVICE_HOST"]
+          port = os.environ.get("KUBERNETES_SERVICE_PORT", DEFAULT_API_PORT)
+          with open(TOKEN_PATH) as fh:
+              token = fh.read().strip()
+          with open(NAMESPACE_PATH) as fh:
+              namespace = fh.read().strip()
+          path = pod_path(namespace, os.environ[POD_NAME_ENV])
+          request = urllib.request.Request("https://" + host + ":" + port + path, method="DELETE")
+          request.add_header("Authorization", "Bearer " + token)
+          request.add_header("User-Agent", USER_AGENT)
+          context = ssl.create_default_context(cafile=CA_PATH)
+          try:
+              with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS, context=context) as response:
+                  return response.status, path
+          except urllib.error.HTTPError as exc:
+              return exc.code, path
+          except OSError:
+              return HTTP_NO_ANSWER, path
+
+
+      def main():
+          # The script is process 1 of its container, which gets no default
+          # action for a signal: without this line the pod ends only after
+          # its grace period.
+          signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+          start = next_burst(datetime.now(timezone.utc))
+          print("idle until " + start.isoformat(), flush=True)
+          while True:
+              left = (start - datetime.now(timezone.utc)).total_seconds()
+              if left <= 0:
+                  break
+              time.sleep(min(left, IDLE_STEP_SECONDS))
+          busy(BURST_SECONDS)
+          for attempt in range(1, DELETE_ATTEMPTS + 1):
+              status, path = delete_own_pod()
+              if status in (HTTP_OK, HTTP_ACCEPTED):
+                  print("deleted " + path + "; this pod ends now", flush=True)
+                  time.sleep(DELETE_WAIT_SECONDS)
+                  print("BROKEN: this pod is still here " + str(DELETE_WAIT_SECONDS) + " seconds after its delete call", flush=True)
+                  return 1
+              print("DELETE " + path + " returned " + str(status) + " (try " + str(attempt) + " of " + str(DELETE_ATTEMPTS) + ")", flush=True)
+              if attempt < DELETE_ATTEMPTS:
+                  time.sleep(DELETE_RETRY_SECONDS)
+          print("BROKEN: each DELETE call failed; this pod stays", flush=True)
+          return 1
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+    PY
+  }
+}
+
+resource "kubernetes_deployment_v1" "long_name_replaced_pod" {
+  metadata {
+    name      = local.long_name_workload.name
+    namespace = kubernetes_namespace_v1.seeded_long_name.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = local.long_name_workload.name }
+    }
+    template {
+      metadata {
+        labels = { app = local.long_name_workload.name }
+      }
+      spec {
+        service_account_name            = kubernetes_service_account_v1.long_name_cycle.metadata[0].name
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "exporter"
+          image   = "docker.io/library/python:3.14-slim"
+          command = ["python3", "/app/cycle.py"]
+          env {
+            name = "POD_NAME"
+            value_from {
+              field_ref {
+                field_path = "metadata.name"
+              }
+            }
+          }
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = local.long_name_cpu_request, memory = local.long_name_memory_request }
+            limits   = { cpu = local.long_name_cpu_limit, memory = local.long_name_memory_limit }
+          }
+          volume_mount {
+            name       = "script"
+            mount_path = "/app"
+            read_only  = true
+          }
+        }
+        volume {
+          name = "script"
+          config_map {
+            name = kubernetes_config_map_v1.long_name_cycle.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = false
+
+  depends_on = [
+    kubernetes_role_binding_v1.long_name_cycle,
+    kubernetes_network_policy_v1.long_name_apiserver_egress_only,
+  ]
+}
+
+# Posture (waste, a known CPU use): two Deployments whose real CPU use is in
+# the manifest, not in a measure. `cpu-flat` uses the CPU all the time, so
+# its limit holds it at 100% of its request. `cpu-burst` uses the CPU for 45
+# seconds at the start of each 10 minutes of the clock and is idle for the
+# rest, so its limit holds the burst at its request. In a bucket of 300
+# seconds the burst reads as 15% of the request, under the 20% bar of the
+# cost SOP's 3.1, so an audit with that bucket files `overrequest` on
+# `cpu-burst`, on CPU. In a bucket of 60 seconds the burst reads as 37% or
+# more, so an audit with that bucket files nothing. `cpu-flat` is the control:
+# no audit files it.
+#
+# The memory request of each is on the floor of 3.1's resize (64Mi), so only
+# the CPU can give a finding. The memory limit is above the request on
+# purpose: with requests equal to limits on both dimensions the pod is
+# Guaranteed, and the 3.1 finding on `cpu-burst` then has the guaranteed-qos
+# marker and can become an idle-workload finding (3.13) from day 14. No
+# token, no Service, no emptyDir. One replica each: a second replica adds
+# nothing to the reading. The script is process 1 and has no child process.
+# The pod template holds the hash of the script, so a change of the script
+# is a rollout: a running loop does not read its file again.
+# Catalogue role: cpu-burst-and-flat.
+locals {
+  cpu_burst_request        = "200m"
+  cpu_burst_limit          = "200m"
+  cpu_flat_request         = "100m"
+  cpu_flat_limit           = "100m"
+  cpu_cycle_memory_request = "64Mi"
+  cpu_cycle_memory_limit   = "128Mi"
+  # The pod template annotation that holds the sha256 of loop.py.
+  cpu_cycle_script_annotation = "seeded-script-sha256"
+  cpu_cycle_workloads = {
+    flat  = { name = "cpu-flat", request = local.cpu_flat_request, limit = local.cpu_flat_limit }
+    burst = { name = "cpu-burst", request = local.cpu_burst_request, limit = local.cpu_burst_limit }
+  }
+}
+
+resource "kubernetes_namespace_v1" "seeded_cpu_cycle" {
+  metadata {
+    name   = "seeded-cpu-cycle"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_config_map_v1" "cpu_cycle" {
+  metadata {
+    name      = "cpu-cycle"
+    namespace = kubernetes_namespace_v1.seeded_cpu_cycle.metadata[0].name
+  }
+  data = {
+    "loop.py" = <<-PY
+      """A CPU use that the manifest states: all the time, or in short bursts.
+
+      CPU_MODE is `flat` (use the CPU all the time; the container's limit
+      holds the use) or `burst` (use the CPU for BURST_SECONDS at the start of
+      each CYCLE_SECONDS of the clock, and nothing for the rest).
+      """
+      import os
+      import signal
+      import sys
+      import time
+
+      MODE_ENV = "CPU_MODE"
+      FLAT = "flat"
+      BURST = "burst"
+      MODES = (FLAT, BURST)
+      CYCLE_SECONDS = 600
+      BURST_SECONDS = 45
+      IDLE_STEP_SECONDS = 1
+      EXIT_USAGE = 2
+
+
+      def in_burst(epoch_seconds):
+          return epoch_seconds % CYCLE_SECONDS < BURST_SECONDS
+
+
+      def seconds_to_next_cycle(epoch_seconds):
+          return CYCLE_SECONDS - epoch_seconds % CYCLE_SECONDS
+
+
+      def run(mode):
+          if mode not in MODES:
+              print("BROKEN: " + MODE_ENV + " must be one of " + ", ".join(MODES), flush=True)
+              sys.exit(EXIT_USAGE)
+          while True:
+              now = time.time()
+              if mode == FLAT or in_burst(now):
+                  continue
+              time.sleep(min(IDLE_STEP_SECONDS, seconds_to_next_cycle(now)))
+
+
+      if __name__ == "__main__":
+          # The script is process 1 of its container, which gets no default
+          # action for a signal.
+          signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+          run(os.environ.get(MODE_ENV, ""))
+    PY
+  }
+}
+
+resource "kubernetes_deployment_v1" "cpu_cycle" {
+  for_each = local.cpu_cycle_workloads
+
+  metadata {
+    name      = each.value.name
+    namespace = kubernetes_namespace_v1.seeded_cpu_cycle.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = each.value.name }
+    }
+    template {
+      metadata {
+        labels = { app = each.value.name }
+        annotations = {
+          (local.cpu_cycle_script_annotation) = sha256(kubernetes_config_map_v1.cpu_cycle.data["loop.py"])
+        }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "loop"
+          image   = "docker.io/library/python:3.14-slim"
+          command = ["python3", "/app/loop.py"]
+          env {
+            name  = "CPU_MODE"
+            value = each.key
+          }
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = each.value.request, memory = local.cpu_cycle_memory_request }
+            limits   = { cpu = each.value.limit, memory = local.cpu_cycle_memory_limit }
+          }
+          volume_mount {
+            name       = "script"
+            mount_path = "/app"
+            read_only  = true
+          }
+        }
+        volume {
+          name = "script"
+          config_map {
+            name = kubernetes_config_map_v1.cpu_cycle.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = false
 }
 
 # Posture (rightsizing dependency): a Guaranteed-QoS workload, the second
@@ -909,6 +1396,105 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
   }
 }
 
+# Defect (capacity, reservations): the one pod that makes the autoscaler try
+# dev-reserved-pool (main.tf). The node selector names that pool and its
+# seeded-role label, and the toleration is for its taint, so no other pool can
+# hold the pod; inference-server above pins to pinned-inference-pool only, so
+# the two backlogs stay apart. The request (100m / 64Mi) fits an
+# n2-standard-2 node: the autoscaler asks for a scale-up only for a pod that
+# would fit, and the refused scale-up is the defect. The pod stays Pending.
+# One replica: each more replica is one more Pending pod for the cases that
+# read slot a's backlog. A default-deny policy, the restricted container
+# settings, requests and a memory limit keep the compliance and
+# obtainability audits to the findings that each planted workload has. The
+# README lists the two background findings of the fixture itself: the
+# stockout audit's 3.9 on the pool, and the upgrade retrospective's tentative
+# symptom on the Pending pod (no node has the labels that the pod selects,
+# which that collector reads as a removed node label; no manifest change
+# removes it while the pool has no node). Catalogue role:
+# missing-reservation-autoscaled.
+#
+# A namespace of its own, for the two watches of an install. The Deployment
+# never becomes available, so the stall watch
+# (agents/platform/scripts/stall_watch.py) would raise a controller-stall
+# alert for it on each install that watches the fleet: the annotation takes
+# the namespace out of that watch, as it does for the stalled Config
+# Connector stack (bench/tf/prebuilt/kcc-stalled-declaration). The annotation
+# does not stop the k8s event watcher, which forwards the pod's
+# FailedScheduling event; the eval install leaves the namespace out with an
+# alertExclude rule (EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE in
+# hack/ci-deploy.sh). The audits do not read the annotation, so they still
+# see the pool and the pod.
+resource "kubernetes_namespace_v1" "seeded_reservation" {
+  metadata {
+    name   = "seeded-reservation"
+    labels = local.fleet_labels
+    annotations = {
+      "kubeagents.x-k8s.io/stall-watch" = "exempt"
+    }
+  }
+  depends_on = [google_container_node_pool.dev_reserved_pool]
+}
+
+resource "kubernetes_deployment_v1" "reserved_batch" {
+  metadata {
+    name      = "reserved-batch"
+    namespace = kubernetes_namespace_v1.seeded_reservation.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "reserved-batch" }
+    }
+    template {
+      metadata {
+        labels = { app = "reserved-batch" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        node_selector = {
+          "cloud.google.com/gke-nodepool" = "dev-reserved-pool"
+          "seeded-role"                   = "missing-reservation-autoscaled"
+        }
+        toleration {
+          key      = "seeded-role"
+          operator = "Equal"
+          value    = "missing-reservation-autoscaled"
+          effect   = "NoSchedule"
+        }
+        container {
+          name  = "worker"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, as on
+          # token-reader.
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "100m", memory = "64Mi" }
+            limits   = { memory = "128Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # The pod never becomes Ready, which is the defect: an apply must not wait
+  # for the rollout.
+  wait_for_rollout = false
+}
+
 # Defect (cluster debugging, stall detection): a Deployment whose container
 # references a ConfigMap (inventory-flags) that does not exist through
 # envFrom. Its pods sit in CreateContainerConfigError, restartCount stays 0,
@@ -987,6 +1573,8 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
     defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
     scaled_zero = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+    cpu_cycle   = kubernetes_namespace_v1.seeded_cpu_cycle.metadata[0].name
+    reservation = kubernetes_namespace_v1.seeded_reservation.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.
@@ -1084,9 +1672,9 @@ resource "kubernetes_namespace_v1" "seeded_deprecation" {
   depends_on = [google_container_node_pool.seeded_a_default]
 }
 
-# This namespace is outside default_deny's for_each on purpose: the writer is
-# the fleet's one workload that uses the network, and a deny-all would starve
-# it. Same shape otherwise -- both policy types, no ingress rule -- with one
+# This namespace is outside default_deny's for_each on purpose: the writer
+# calls the API server, and a deny-all would starve it (seeded-long-name has
+# a policy of this shape for the same reason). Same shape otherwise -- both policy types, no ingress rule -- with one
 # egress allow: TCP 443 to the API server, both as the in-cluster Service IP
 # (the first address of the services range, what KUBERNETES_SERVICE_HOST
 # resolves to) and as the master endpoint, because a datapath that evaluates
@@ -2147,6 +2735,54 @@ resource "kubernetes_cron_job_v1" "cuda_pinned_trainer" {
   }
 }
 
+# Defect (role state-sync-controller): a controller workload in seeded-shapes
+# whose startup argument disables client-side Kubernetes API rate limiting
+# (--kube-api-qps=-1, a negative QPS), the shape
+# control-plane-configmap-lease-write-storm requires. The container process is
+# an inert sleep that ignores its positional argument and mounts no API token,
+# so the pod runs on the default pool without generating live API server write
+# load.
+resource "kubernetes_deployment_v1" "state_sync_controller" {
+  metadata {
+    name      = "state-sync-controller"
+    namespace = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "state-sync-controller" }
+    }
+    template {
+      metadata {
+        labels = { app = "state-sync-controller" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "controller"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "exec sleep infinity"]
+          args    = ["--kube-api-qps=-1"]
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # Presence is the apply's, state the scan's: see cache-on-emptydir.
+  wait_for_rollout = false
+}
+
 # Fixture (stall watch): a switched-off environment behind an in-cluster
 # gateway. Role `scaled-zero-gateway`. An operator scales the whole
 # environment to zero out of hours: the backend and the gateway's own proxy
@@ -2279,6 +2915,62 @@ resource "kubernetes_manifest" "scaled_zero_gateway_class" {
     kind       = "GatewayClass"
     metadata   = { name = "seeded-envoy" }
     spec       = { controllerName = local.scaled_zero_controller }
+  }
+}
+
+# Defect (role unaccepted-gateway-class, #1982, #7097): a cluster-scoped
+# GatewayClass referencing an unsupported controllerName (RFC 2606 example.com)
+# so no controller accepts it, plus a Gateway and HTTPRoute bound to it in
+# seeded-shapes. Because no controller owns this class, no Gateway Deployment,
+# Service, or cloud load balancer is provisioned, and the HTTPRoute stays
+# unprogrammed with zero pod/CPU footprint. The HTTPRoute carries no
+# backendRefs so obtainability §3.26 (ingress-gateway-healthcheck-mismatch)
+# stays silent on it. Both the Gateway and HTTPRoute carry the stall-watch
+# opt-out annotation (`kubeagents.x-k8s.io/stall-watch: exempt`) so the
+# periodic stall-watch cron does not fire controller-stall alerts on
+# seeded-shapes while the Gateway sits in GKE's default Accepted=Unknown /
+# Programmed=Unknown Pending state. GatewayClass seeded-envoy (Accepted=True
+# written by gateway_status.py below) and GKE's built-in GatewayClasses serve
+# as the accepted-class negative control on the same cluster. Asserted by
+# networking-unaccepted-gatewayclass.
+resource "kubernetes_manifest" "unaccepted_gateway_class" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "GatewayClass"
+    metadata   = { name = "seeded-unaccepted-gw" }
+    spec       = { controllerName = "example.com/unsupported-controller" }
+  }
+}
+
+resource "kubernetes_manifest" "unaccepted_gateway" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "Gateway"
+    metadata = {
+      name        = "seeded-unaccepted-gateway"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
+    }
+    spec = {
+      gatewayClassName = kubernetes_manifest.unaccepted_gateway_class.manifest.metadata.name
+      listeners        = [{ name = "http", protocol = "HTTP", port = 80 }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "unaccepted_route" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "HTTPRoute"
+    metadata = {
+      name        = "seeded-unaccepted-route"
+      namespace   = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
+      annotations = { "kubeagents.x-k8s.io/stall-watch" = "exempt" }
+    }
+    spec = {
+      parentRefs = [{ name = kubernetes_manifest.unaccepted_gateway.manifest.metadata.name }]
+      rules      = [{ matches = [{ path = { type = "PathPrefix", value = "/" } }] }]
+    }
   }
 }
 

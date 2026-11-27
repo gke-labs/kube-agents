@@ -80,6 +80,8 @@ VALUES = {
     "host_cluster": "host",
     "host_cluster_location": "us-east4",
     "host_location": "us-east4",
+    "collector_args": "",
+    "planted_remediation": "manual",
 }
 SWITCH_ENTRY = '.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")]'
 SWITCH_JSONPATH = (
@@ -171,8 +173,15 @@ def stack(tmp_path, monkeypatch):
 
 
 def _plant_steps(commands):
-    """`<pod> <container> <step>` of each plant.py exec (`env PYTHONDONTWRITEBYTECODE=1 python3 - <step>`)."""
-    return [(words[0], words[1], words[6]) for words in commands if words[2:5] == ["env", "PYTHONDONTWRITEBYTECODE=1", "python3"]]
+    """`<pod> <container> <step>` of each plant.py exec (`env PYTHONDONTWRITEBYTECODE=1 [NAME=value ...] python3 - <step>`)."""
+    steps = []
+    for words in commands:
+        if words[2:4] != ["env", "PYTHONDONTWRITEBYTECODE=1"] or "python3" not in words:
+            continue
+        at = words.index("python3")
+        if all("=" in word for word in words[4:at]) and words[at + 1] == "-":
+            steps.append((words[0], words[1], words[at + 2]))
+    return steps
 
 
 # --- unchanged-finding-wording: main.tf ----------------------------------------
@@ -335,7 +344,7 @@ def _wording_audit_report(tmp_path, broker_text=None):
         _candidates=lambda manifest: [({"name": "c"}, {"check": "x", "object": "o", "severity": "minor"})],
         adopt_collector_evidence=lambda findings, manifest: None,
         published_id=lambda finding: "id-1",
-        resolve_repo=lambda audit_id: "acme/fleet",
+        resolve_repo_or_no_forge=lambda audit_id: "acme/fleet",
         report_envelope=lambda *args, **kwargs: {"findings": args[2]["findings"]},
         write_report=write_report,
         reports_dir_for=lambda audit, repo: store,

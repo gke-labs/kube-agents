@@ -1781,6 +1781,69 @@ def test_delegated_to_needs_a_list_and_no_empty_matcher():
         DelegatedToVerifier(type="delegated_to", required_addressees=[".*"])
 
 
+def _counted(addressees: list[str] | None, count: int | None) -> None:
+    transcript.set("ok", _TRAJECTORY, child_addressees=addressees, child_count=count)
+
+
+def test_delegated_to_passes_on_exactly_one_child():
+    _counted(["platform"], 1)
+    res = DelegatedToVerifier(type="delegated_to", min_children=1, max_children=1).verify(5.0)
+    assert res.success, res.reason
+    assert "1 child task(s)" in res.reason
+
+
+def test_delegated_to_fails_a_chain_that_delegated_to_the_same_addressee_twice():
+    _counted(["platform"], 2)
+    res = DelegatedToVerifier(type="delegated_to", min_children=1, max_children=1).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "more than max_children 1" in res.reason and "['platform']" in res.reason
+
+
+def test_delegated_to_fails_a_chain_that_delegated_nothing_under_a_minimum():
+    _counted([], 0)
+    res = DelegatedToVerifier(type="delegated_to", min_children=1).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "fewer than min_children 1" in res.reason and "nobody" in res.reason
+
+
+def test_delegated_to_count_bounds_are_inclusive_and_combine_with_the_lists():
+    _counted(["tse", "platform"], 3)
+    assert DelegatedToVerifier(type="delegated_to", min_children=3, max_children=3).verify(5.0).success
+    assert DelegatedToVerifier(type="delegated_to", max_children=3, required_addressees=["tse"]).verify(5.0).success
+    res = DelegatedToVerifier(type="delegated_to", max_children=3, forbidden_addressees=["platform"]).verify(5.0)
+    assert not res.success and "forbidden" in res.reason
+
+
+def test_delegated_to_is_an_error_when_a_bound_is_set_and_the_count_is_unknown():
+    _counted(["platform"], None)
+    for check in (
+        DelegatedToVerifier(type="delegated_to", min_children=1),
+        DelegatedToVerifier(type="delegated_to", max_children=1),
+        DelegatedToVerifier(type="delegated_to", max_children=1, required_addressees=["platform"]),
+    ):
+        res = check.verify(5.0)
+        assert res.status == "error"
+        assert not res.success
+        assert "childCount" in res.reason
+    # A check without a bound never reads the count.
+    assert DelegatedToVerifier(type="delegated_to", required_addressees=["platform"]).verify(5.0).success
+
+
+def test_delegated_to_rejects_bad_count_bounds():
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", min_children=-1)
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", max_children=-1)
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", min_children=2, max_children=1)
+    with pytest.raises(ValueError):
+        DelegatedToVerifier(type="delegated_to", min_children=0)
+    assert DelegatedToVerifier(type="delegated_to", max_children=0).max_children == 0
+    assert DelegatedToVerifier(type="delegated_to", min_children=0, max_children=1).max_children == 1
+
+
 def test_delegated_to_is_published_and_registered():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
@@ -2165,6 +2228,64 @@ def test_an_any_of_pattern_is_an_alternative_to_the_phrases():
 def test_an_any_of_pattern_that_does_not_compile_is_rejected():
     with pytest.raises(re.error):
         ReportContainsVerifier(type="report_contains", any_of_patterns=["("])
+
+
+@pytest.mark.parametrize("field", ["required_patterns", "forbidden_patterns", "any_of_patterns"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "KA-7741-ORCHID",
+        r"\bticket KA-\d+",
+        "(?m)^(?:Status|state): ready$",
+        "(?i:ka)-7741-ORCHID",
+        "(?i)ka-(?-i:ORCHID)",
+        "(?=Ready)ready",
+        "(?!Ready)ready",
+        "{cluster:a}: Ready",
+        r"ka-[A-Z]+",
+        r"tier (?:A|B)\b",
+        "class [A]",
+    ],
+)
+def test_a_pattern_with_an_uppercase_literal_is_rejected(field, pattern):
+    """The report is lowercased before a pattern runs, so an uppercase letter
+    outside ``(?i)``, alone or in a class of nothing but such letters, is text
+    no report carries: where the pattern needs it, the required pattern misses
+    on every run and the forbid never fires, and in one branch or a negative
+    lookahead it is dead text."""
+    with pytest.raises(ValueError, match="in upper case"):
+        ReportContainsVerifier(type="report_contains", **{field: [pattern]})
+
+
+def test_an_uppercase_pattern_rejection_names_the_letters_once_each():
+    with pytest.raises(ValueError, match=r"spells 'K', 'A', 'O' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["KA-7741-OAK"])
+    with pytest.raises(ValueError, match=r"spells 'A-F', 'X' in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["0x[A-FX]+"])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "report", "status"),
+    [
+        ("ka-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i)KA-7741-ORCHID", "Ticket KA-7741-ORCHID is open.", "pass"),
+        ("(?i:KA)-7741-orchid", "Ticket KA-7741-ORCHID is open.", "pass"),
+        (r"\Aticket \S+ is\Z", "Ticket KA-7741-ORCHID is", "pass"),
+        ("(?P<ID>ka-[0-9a-fA-F]+) (?P=ID)", "KA-7F KA-7F", "pass"),
+        ("(?x) ka-7741 # The Ticket", "KA-7741", "pass"),
+        (r"ka-[A-Z0-9]+", "KA-7741", "pass"),
+        (r"ka-[^A-Z]", "KA-7741", "pass"),
+        (r"ka[\WA-Z]\d+", "KA-7741", "pass"),
+    ],
+)
+def test_an_uppercase_letter_that_is_not_a_literal_still_loads(pattern, report, status):
+    """An escape, a group name, a ``(?x)`` comment and a character class
+    with a member a lowercased report carries are not refused, and neither is
+    a letter under ``(?i)``; the verdict is the one the pattern gave before
+    the refusal existed."""
+    v = ReportContainsVerifier(type="report_contains", required_patterns=[pattern])
+    _stash(report)
+    assert v.verify(5.0).status == status
 
 
 # ------------------ the healthy-workload objective's shipped phrase list
@@ -10098,6 +10219,15 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four — seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation",
             "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom and seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
+            # The fourteen namespaces that seeded-a had with the shapes applied, before seeded-reservation. The count is not graded; a count word that is not in the check's list reads as a namespace name, so the list holds each word up to this number.
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 14 (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes, seeded-defaults)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: fourteen (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes, seeded-defaults)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: fourteen namespaces: seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes and seeded-defaults",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: thirteen (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes)",
+            # The fifteen namespaces that seeded-a has with the shapes applied. The count is not graded; a count word that is not in the check's list reads as a namespace name, so the list holds each word up to this number.
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 15 (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-reservation, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes, seeded-defaults)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: fifteen (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-reservation, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes, seeded-defaults)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: fifteen namespaces: seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-reservation, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes and seeded-defaults",
                     "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability: default-deny, seeded-debug: default-deny, seeded-capacity: default-deny, seeded-deprecation: apiserver-egress-only",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: the seeded-reliability namespace, the seeded-debug namespace, the seeded-capacity namespace and the seeded-deprecation namespace",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability & seeded-debug & seeded-capacity & seeded-deprecation",
@@ -10114,6 +10244,10 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: no policies in seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation carry none)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes, seeded-defaults)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: fourteen (none)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-long-name, seeded-cpu-cycle, seeded-reservation, seeded-qos, seeded-scaled-zero, seeded-deprecation, seeded-shapes, seeded-defaults)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: fifteen (none)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 without (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/0, seeded-debug/0, seeded-capacity/0, seeded-deprecation/0",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation?",
@@ -12512,3 +12646,98 @@ def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
     res = _state_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert res.raw["comments_since_start"] == 2
+
+
+def test_report_contains_expands_model_placeholder_from_runner_env(monkeypatch):
+    with pytest.raises(ValidationError, match="carries a model placeholder"):
+        ReportContainsVerifier(type="report_contains", required_phrases=["{model}"])
+    with pytest.raises(ValidationError, match="malformed model placeholder"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["{model:default}"])
+    # Uppercase literal guard still inspects surrounding text after {model} expands.
+    with pytest.raises(ValidationError, match="in upper case"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["Model: {model}"])
+    # Lookbehind around {model} reports placeholder expansion compile error without misnaming cluster placeholders.
+    with pytest.raises(re.error, match="once its placeholders are expanded"):
+        ReportContainsVerifier(type="report_contains", required_patterns=["(?<={model})foo"])
+    # Sibling verifiers reject {model} directly at validation time.
+    with pytest.raises(ValidationError, match="carries a model placeholder"):
+        ToolCalledVerifier(type="tool_called", tool_names=["x"], agent="cluster-{model}")
+    with pytest.raises(ValidationError, match="carries a model placeholder"):
+        LedgerIssueContainsVerifier(type="ledger_issue_contains", required_patterns=["{model}"])
+    # JSON and JSONPath snippets containing the word "model" are not placeholders.
+    json_check = ReportContainsVerifier(type="report_contains", forbidden_patterns=[r'\{"model": "model-default"\}'])
+    assert json_check.forbidden_patterns
+
+    check = ReportContainsVerifier(type="report_contains", required_patterns=["{model}"])
+    monkeypatch.delenv("MODEL_PROVIDER", raising=False)
+    monkeypatch.delenv("MODEL_DEFAULT_NAME", raising=False)
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_MODEL_NAME", "model-default")
+    _stash("I run on gemini-3.1-pro-preview.")
+    err = check.verify(timeout_sec=5.0)
+    assert err.status == "error"
+    assert "MODEL_DEFAULT_NAME" in err.reason
+
+    # Trailing-slash provider prefix with empty model half is rejected.
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "vertex_ai/")
+    err_empty = check.verify(timeout_sec=5.0)
+    assert err_empty.status == "error"
+
+    # Falls back to AGENT_MODEL and strips known provider prefixes (including ollama).
+    monkeypatch.delenv("MODEL_DEFAULT_NAME", raising=False)
+    monkeypatch.setenv("AGENT_MODEL", "ollama/meta-llama/Llama-3.1-8B-Instruct")
+    _stash("Running on Llama-3.1-8B-Instruct.")
+    assert check.verify(timeout_sec=5.0).success
+
+    # Falls back to AGENT_MODEL_NAME when MODEL_DEFAULT_NAME and AGENT_MODEL are absent.
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_MODEL_NAME", "vertex_ai/gemini-3.1-pro-preview")
+    _stash("I run on gemini-3.1-pro-preview.")
+    assert check.verify(timeout_sec=5.0).success
+
+    # Underscore model IDs match under both fold_decoration=False and fold_decoration=True.
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "deepseek_r1")
+    _stash("Running on deepseek_r1.")
+    assert check.verify(timeout_sec=5.0).success
+    folded_check = ReportContainsVerifier(type="report_contains", required_patterns=["{model}"], fold_decoration=True)
+    assert folded_check.verify(timeout_sec=5.0).success
+
+    monkeypatch.setenv("MODEL_PROVIDER", "vertex_ai")
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "gemini-3.1-pro-preview")
+    _stash("I am running on `gemini-3.1-pro-preview` via Google Cloud Vertex AI.")
+    assert check.verify(timeout_sec=5.0).success
+    _stash("I am running on Gemini 3.1 Pro Preview.")
+    assert check.verify(timeout_sec=5.0).success
+    _stash("I am running on gemini-2.5-flash.")
+    miss = check.verify(timeout_sec=5.0)
+    assert not miss.success
+    assert "model placeholder resolved to 'gemini-3.1-pro-preview'" in miss.reason
+
+    # openai_compatible keeps Hugging Face org prefix (e.g. google/gemma-3-27b-it) intact.
+    monkeypatch.setenv("MODEL_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "google/gemma-3-27b-it")
+    exact_check = ReportContainsVerifier(type="report_contains", required_patterns=["^{model}$"])
+    _stash("google/gemma-3-27b-it")
+    assert exact_check.verify(timeout_sec=5.0).success
+    _stash("gemma-3-27b-it")
+    assert exact_check.verify(timeout_sec=5.0).success
+
+    # hosted_vllm prefix is stripped when MODEL_PROVIDER=openai_compatible.
+    monkeypatch.delenv("MODEL_DEFAULT_NAME", raising=False)
+    monkeypatch.setenv("AGENT_MODEL", "hosted_vllm/google/gemma-3-27b-it")
+    _stash("google/gemma-3-27b-it")
+    assert exact_check.verify(timeout_sec=5.0).success
+
+    # Hyphenated Claude minor versions match dotted prose (e.g. "Claude Sonnet 4.5").
+    monkeypatch.setenv("MODEL_PROVIDER", "anthropic")
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "claude-sonnet-4-5")
+    _stash("I am running on Claude Sonnet 4.5 via Anthropic.")
+    assert check.verify(timeout_sec=5.0).success
+    _stash("I am running on Claude Sonnet 4.6 via Anthropic.")
+    assert not check.verify(timeout_sec=5.0).success
+
+    # Vertex Model Garden publisher paths trim to the model short name.
+    monkeypatch.setenv("MODEL_PROVIDER", "vertex_ai")
+    monkeypatch.setenv("MODEL_DEFAULT_NAME", "publishers/google/models/gemini-2.5-pro")
+    _stash("I am running on Gemini 2.5 Pro.")
+    assert check.verify(timeout_sec=5.0).success

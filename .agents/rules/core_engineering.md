@@ -72,8 +72,9 @@ password source when it contains `password`, `passwd`, `passcode`, `passphrase`,
 delimited `mfa`, or `auth`, `authentication`, `authorization` or `api` followed within one character
 by `key` (`tok` as well, after `api`), so `API_KEY` and `AUTH_KEY` match and `API_SERVER_KEY`,
 `AUTH_SIGNING_KEY` and `AUTH_TOKEN` do not; and a private-data source for words such as `salary` or
-`zip_code`. The account and certificate classes exist in the library, but the two clear-text queries
-drop them. A name is exempt again when it also contains `path`, `file` (not `profile`), a delimited
+`zip_code`, and for `card` or `account` followed within one character by `no`, `num` or `credit`,
+which matches across a word boundary, so `discard_note` and `CARD_NOTE` are private-data sources.
+The account and certificate classes exist in the library, but the two clear-text queries drop them. A name is exempt again when it also contains `path`, `file` (not `profile`), a delimited
 `url`, `hash`, `sha`, `md5`, `random`, `redact`, `censor`, `obfuscate`, `crypt` or `encode` (though
 `unencrypted` and `unencoded` are not exempt), or any character outside `[A-Za-z0-9_$.-]`, and the
 lookbehinds exclude `untrusted`, `is_trusted` and a `secret` that directly follows `is` or `is_`,

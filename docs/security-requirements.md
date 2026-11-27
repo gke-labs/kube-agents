@@ -95,8 +95,7 @@ The broker authenticates every caller. A caller presents an audience-bound proje
 token (one hour; the audience is per pod: `kubeagents-credential-proxy` for the sandbox,
 `kubeagents-credential-proxy-chat` for the gateway, `kubeagents-credential-proxy-watcher` for the
 watchers in the gateway Pod's `agent-api-auth` container, `kubeagents-credential-proxy-a2a-chat` for
-the A2A gateway when it consumes Google Chat, `kubeagents-credential-proxy-a2a-reports` for the A2A gateway on every install, `kubeagents-credential-proxy-mcp` for the A2A MCP server's pod unless `A2A_MCP_DOOR=false` (while the `PlatformAgent` controls its ServiceAccount), `kubeagents-credential-proxy-teams-inbound` for the Teams inbound receiver when it is enabled, and, under the operator's
-`A2A_SESSION_CLUSTER_VIEW` flag, `kubeagents-credential-proxy-session` for the session pods,
+the A2A gateway when it consumes Google Chat, `kubeagents-credential-proxy-a2a-reports` for the A2A gateway on every install, `kubeagents-credential-proxy-mcp` for the A2A MCP server's pod unless `A2A_MCP_DOOR=false` (while the `PlatformAgent` controls its ServiceAccount), `kubeagents-credential-proxy-teams-inbound` for the Teams inbound receiver when it is enabled, and, under the session pods' cluster view (on by default on the session route; the operator's `A2A_SESSION_CLUSTER_VIEW` overrides it), `kubeagents-credential-proxy-session` for the session pods,
 bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes,
 and, with an `AgentProfile` bound, `kubeagents-credential-proxy-profile`
 for each profile tier's ServiceAccount, as [spec-subagent-profiles.md](designs/spec-subagent-profiles.md) describes)
@@ -108,16 +107,10 @@ opens a third: its health listener on 8768 serves the Pod's readiness probe, rou
 alone to the runtime through a cluster with its own small circuit breaker, and is opened to no
 peer by the Service or the NetworkPolicy. The runtime's
 health-only one, closed unless `CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers `GET /healthz`
-and nothing else with a fixed `{"status":"ok"}` body, holds no route, credential or policy,
-shares the metrics listener's connection cap and deadline, and is opened by the broker's
-NetworkPolicy to no pod, so only a kubelet probe reaches it. The metrics-only one on 8766
-serves Prometheus counters whose label values are static enums and closed
-vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
-time with a ten-second deadline on each, and is the one port the broker's
-NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
-collector runs, and to the operator's own pods, selected by namespace and pod label, which
-read the counters into the `PlatformAgent`'s `status.usage`; both are readers of counters, and
-no other peer reaches it by selector; the site's security reference states the one residual above one replica, a shape the operator does not render today ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
+and nothing else with `healthz_response()` (`200 {"status":"ok"}` when active or holding Service endpoints during handoff before `SIGTERM`, `503 {"status":"standby"}` in warm standby, `503 {"status":"draining"}` on exec drain or shutdown), holds no route, credential or policy,
+shares the metrics listener's connection cap and deadline, and is opened to no peer by the broker's
+Service or NetworkPolicy.
+The listener on 8766 serves unauthenticated Prometheus `/metrics` (whose label values are static enums and closed vocabularies). Under `sizingProfile: auto` in-cluster, it also serves operator-only active-standby handoff endpoints (`/control/status`, `/control/activate`, `/control/drain`) gated by a bearer token from `<name>-credential-proxy-control` (`404` when standby control is disabled). It holds no workload CLI/API route or upstream credential, answers at most sixteen connections at a time with a ten-second deadline on each, and is the one port the broker's NetworkPolicy opens to `gke-gmp-system` (Managed Prometheus collector) and to the operator's own pods (for `status.usage`, `status.sizing`, and `/control/*` handoffs). No other peer reaches it by selector; the site's security reference states the one residual above one replica, a shape the operator does not render today ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount, the sandbox's, the A2A gateway's, and (unless
 `A2A_MCP_DOOR=false` or unowned) the MCP server's (plus, under their conditions, the session
 pods', profile tiers', and scope publisher's) and does not vary on which one

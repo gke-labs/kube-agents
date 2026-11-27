@@ -69,8 +69,8 @@ const (
 // ApiSession whose connect fails stays on the stateful broker for the rest of
 // the session (credential_proxy_client.py), and CredentialProxyExecReady would
 // flip on each miss. The 2s timeout is ample for a handler that returns a
-// constant. The stateful broker keeps its own probe: it rolls with Recreate,
-// so no other pod could take its traffic.
+// constant. The stateful broker keeps its own 5s/10s/5s/3 probe (under
+// sizingProfile: auto it uses active-standby RollingUpdate on :8766 handoff).
 const (
 	credentialProxyExecTierReadinessPeriodSeconds    int32 = 3
 	credentialProxyExecTierReadinessTimeoutSeconds   int32 = 2
@@ -178,6 +178,9 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	// broker's route, so an exec pod confers no teams-inbound role. Its
 	// callers binding stays, holding the receiver's account to its audience.
 	credentialProxyTeamsInboundAudienceEnvVar: true,
+	credentialProxyStandbyEnv:                 true,
+	credentialProxyControlFileEnv:             true,
+	credentialProxyPeerHealthURLEnv:           true,
 	// Not CREDENTIAL_PROXY_A2A_CHAT_CALLERS: the exec tier inherits the
 	// allowed callers, the A2A gateway among them on every install, and
 	// the binding is what holds that account to the a2a-chat audience. The
@@ -305,7 +308,9 @@ func credentialProxyExecTierLimitBytes(size string) string {
 //     ConfigMap;
 //   - cpu, memory and ephemeral-storage fixed at the tier's figures, its own
 //     state and /tmp emptyDir caps (credentialProxyExecTierStateSizeLimit),
-//     and the watermark gate's two limits set to those caps;
+//     the watermark gate's two limits set to those caps, and the slot cap pinned
+//     to credentialProxyMaxConcurrentCommands ("8") so stateful sizing-profile
+//     steps do not roll fixed-2Gi exec pods unnecessarily;
 //   - no Secret: no Secret-backed volume (forge credentials and CA bundles
 //     included) and no env read from one (chat, Teams and plugin credentials),
 //     dropped by source rather than by name so a Secret the broker gains later
@@ -337,6 +342,7 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	}
 	dep.Spec.Template.Labels = podLabels
 	delete(dep.Spec.Template.Annotations, secretEnvHashAnnotation)
+	delete(dep.Spec.Template.Annotations, credentialProxyTemplateHashAnnotation)
 
 	// The audit-report store's token goes too: a projected ServiceAccount
 	// token, which the by-source filter keeps, and an exec pod runs brokered
@@ -403,12 +409,15 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 				continue
 			}
 			// The watermark gate measures each scratch volume against the
-			// figure the kubelet evicts it on: the tier's own caps.
+			// figure the kubelet evicts it on: the tier's own caps, and the
+			// slot cap stays at credentialProxyMaxConcurrentCommands ("8") on fixed 2Gi.
 			switch e.Name {
 			case credentialProxyStateLimitEnv:
 				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierStateSizeLimit)
 			case credentialProxyTmpLimitEnv:
 				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierTmpSizeLimit)
+			case credentialProxyMaxConcurrentCommandsEnv:
+				e.Value = credentialProxyMaxConcurrentCommands
 			}
 			env = append(env, e)
 		}
@@ -504,7 +513,7 @@ func buildCredentialProxyExecTierPDB(agent *agentv1alpha1.PlatformAgent) *policy
 }
 
 // buildCredentialProxyExecTierNetworkPolicy admits the tier's callers (§3.3):
-// the sandbox, the session pods under the cluster-view flag, and the profile
+// the sandbox, the session pods under the session pods' cluster view, and the profile
 // namespace while there is a profile caller, on the credentialed port; and the
 // metrics port to Managed Prometheus and, where it is set, the operator. No
 // gateway and no agent pod: neither calls /v1/exec.

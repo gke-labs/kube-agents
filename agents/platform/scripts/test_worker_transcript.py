@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -44,6 +45,42 @@ REDACTOR = _load_redactor()
 
 def _scrub(kind, text):
     return worker_transcript.scrub_step_text(REDACTOR, kind, text, WITHHELD)
+
+
+# A time test with no limit in seconds: it compares two CPU times that it reads
+# one after the other in the same process, so the machine and a tracer (CI
+# runs these tests under `coverage`, which makes each Python line slower) slow
+# the two together. A limit in seconds holds on one machine and fails on a
+# slower one. For a growth test, the second read is the first read on a text
+# `TIME_GROWTH_SHRINK` times longer: a linear read needs that many times as
+# long, and a read whose cost is all quadratic the square of it.
+TIME_GROWTH_SHRINK = 4
+# Between the growth of a linear read (4) and of a quadratic read (16).
+TIME_GROWTH_BOUND = 8
+# Other work on the machine can only add time, so a pair is read again while it is over its bound.
+CPU_TIME_ATTEMPTS = 3
+
+
+def _cpu_seconds(read):
+    start = time.process_time()
+    read()
+    return time.process_time() - start
+
+
+def _cpu_seconds_of_a_pair(first, second, bound):
+    """The CPU time of `first()` and of `second()`, read one after the other.
+
+    A new pair is read, up to `CPU_TIME_ATTEMPTS` pairs, while `second` needs
+    more than `bound` times `first`; the pair with the least ratio counts.
+    """
+    best = None
+    for _ in range(CPU_TIME_ATTEMPTS):
+        pair = (_cpu_seconds(first), _cpu_seconds(second))
+        if best is None or pair[1] * best[0] < best[1] * pair[0]:
+            best = pair
+        if best[1] <= bound * best[0]:
+            break
+    return best
 
 
 class TestScrubStepText(unittest.TestCase):
@@ -476,12 +513,14 @@ class TestScrubStepText(unittest.TestCase):
             "redis-cli -a pre{run} S3cretValue9",
             "curl https://admin:pre{run} S3cretValue9@host/x",
         )
-        # Known limits, the same on main and pinned so a fix flips them: the
-        # URL userinfo rules stop at a literal backslash (run 2 and more
-        # leaves one), and inside a quoted `bash -c "…"` script the short and
-        # user:pass flag rules do not run (`sub_shell_segments`).
+        # Known limits, pinned so a fix flips them: the URL userinfo rules
+        # stop at a literal backslash the redactor can't read as a JSON escape
+        # (an even run leaves one before the space; an odd run's pairs now
+        # read as escapes, so the password is masked), and inside a quoted
+        # `bash -c "…"` script the short and user:pass flag rules do not run
+        # (`sub_shell_segments`).
         def known_limit(shape, run, wrapper):
-            if "https://admin:" in shape and run > 1:
+            if "https://admin:" in shape and run > 1 and run % 2 == 0:
                 return True
             return wrapper == "bash -c" and any(f in shape for f in ("-u admin:", "-ppre", "-a pre"))
 
@@ -1908,6 +1947,91 @@ class TestTokenPrinterReadKeepsItsVerdict(unittest.TestCase):
                 self.assertLess(time.process_time() - start, 1.0)
 
 
+class TestLongSimpleCommandIsWithheld(unittest.TestCase):
+    """A line that holds a simple command longer than `MAX_SIMPLE_COMMAND_CHARS`
+    is withheld with no read: one very long shell word costs each reader
+    quadratic time in `shlex`. A line of many short commands and no comment,
+    however long, keeps its verdict. The line is cut as it is and with its
+    comments off."""
+
+    LIMIT = worker_transcript.MAX_SIMPLE_COMMAND_CHARS
+    UNIT = "gh ab cde oc "
+    # The limit's check cuts the line two times at most and takes its comments
+    # off one time: the decision needs 1.0 to 1.5 times the CPU time of one cut.
+    DECISION_CUTS_BOUND = 4
+
+    def test_the_limit_is_on_one_simple_command_and_is_strict(self):
+        at_the_limit = "echo " + "a" * (self.LIMIT - len("echo "))
+        self.assertEqual(self.LIMIT, 65536)
+        self.assertEqual(len(at_the_limit), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(at_the_limit))
+        self.assertTrue(worker_transcript.command_reads_a_secret(at_the_limit + "a"))
+        # The wrapper that the feed, the bench record and the replay proxy call gives the same verdict.
+        self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": at_the_limit + "a"})))
+        # One long simple command among short ones withholds the line; one at the limit does not.
+        self.assertTrue(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "a" + "; pwd"))
+        self.assertFalse(worker_transcript.command_reads_a_secret("ls; " + at_the_limit + "; pwd"))
+        # A separator inside quotes ends no simple command: the quoted body is one piece.
+        quoted_body = "printf '%s' '" + "one line; of a body\n" * (self.LIMIT // 20 + 1) + "' > notes.txt"
+        self.assertTrue(worker_transcript.command_reads_a_secret(quoted_body))
+        # A line longer than the limit, of simple commands that are each short, is read.
+        many_short = "\n".join(["echo ok"] * (self.LIMIT // 4))
+        self.assertGreater(len(many_short), self.LIMIT)
+        self.assertFalse(worker_transcript.command_reads_a_secret(many_short))
+        self.assertTrue(worker_transcript.command_reads_a_secret(many_short + "\nprintenv"))
+
+    def test_a_command_of_a_real_size_is_served(self):
+        # Commands of 11 KB and of 37 KB, well below the limit, are served.
+        for command in (
+            "echo " + self.UNIT * 850,
+            "printf '%s' '" + self.UNIT * 2850 + "' > notes.txt",
+        ):
+            with self.subTest(length=len(command)):
+                self.assertLess(len(command), self.LIMIT)
+                self.assertFalse(worker_transcript.command_reads_a_secret(command))
+
+    def test_a_very_long_word_is_decided_in_linear_time(self):
+        # 270 KB to 1 MB in one shell word: quoted, with the quote not closed,
+        # a quoted body with line breaks, with no quote, behind a comment with
+        # an apostrophe, and short commands behind such a comment. With no
+        # limit, a reader takes the words of each from `shlex`, in 20 to 200
+        # times the CPU time of the decision here. The limit decides each
+        # after one or two cuts of the line. Three checks hold that, with no
+        # limit in seconds: no reader gets the line; the decision needs no
+        # more than `DECISION_CUTS_BOUND` times the CPU time of one cut of the
+        # same line; and it needs no more than `TIME_GROWTH_BOUND` times the
+        # CPU time of the decision for the line `TIME_GROWTH_SHRINK` times
+        # shorter.
+        for build, count in (
+            (lambda count: "echo '" + self.UNIT * count + "'", 80000),
+            (lambda count: "echo '" + self.UNIT * count, 80000),
+            (lambda count: "cat > notes.txt <<< '" + "line of a file body\n" * count + "'", 52000),
+            (lambda count: "echo " + "ghabcdeoc/" * count, 40000),
+            # An apostrophe in a comment: the cut of the line as it is gives short
+            # pieces, and the cut with the comments off gives the long quoted body.
+            (lambda count: "echo ok # don't stop\nprintf '%s' '" + "reset the dataset; abc def\n" * count + "' > notes.txt", 10000),
+            # Short commands behind that comment: only the cut of the line as it
+            # is gives the long piece, because the apostrophe opens a quote there.
+            (lambda count: "echo ok # don't stop\n" + "\n".join(["echo ok"] * count), 70000),
+        ):
+            command, short = build(count), build(count // TIME_GROWTH_SHRINK)
+
+            def decide(line=command):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+
+            def cut(line=command):
+                worker_transcript.split_shell_commands(worker_transcript.fold_shell_continuations(line))
+
+            with self.subTest(command=command[:24], chars=len(command)):
+                self.assertGreater(len(short), self.LIMIT)
+                with mock.patch.object(shlex, "shlex", side_effect=AssertionError("a reader took the words of the line")) as reader:
+                    cut_seconds, decision_seconds = _cpu_seconds_of_a_pair(cut, decide, self.DECISION_CUTS_BOUND)
+                    short_seconds, full_seconds = _cpu_seconds_of_a_pair(lambda: decide(short), decide, TIME_GROWTH_BOUND)
+                reader.assert_not_called()
+                self.assertLessEqual(decision_seconds, self.DECISION_CUTS_BOUND * cut_seconds)
+                self.assertLessEqual(full_seconds, TIME_GROWTH_BOUND * short_seconds)
+
+
 class TestSecretReadDetector(unittest.TestCase):
     WITHHELD_COMMANDS = [
         "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
@@ -2035,6 +2159,52 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get pods -fdb=1.yaml -o yaml",
         "kubectl get pods -Rf=db.yaml -o yaml",
         "kubectl --unknown-global-flag=x get pods",
+        # a credential read from the metadata server: each host and address,
+        # each client, an account by its name, the path behind a variable, a
+        # brace list, another version of the tree, upper case, a command that
+        # only prints the read
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        "curl -s -H Metadata-Flavor:Google http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/identity?audience=x",
+        "wget -qO- --header Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://metadata.goog/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://metadata:80/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s http://169.254.169.252:988/computeMetadata/v1/instance/service-accounts/default/token",
+        "curl -s 'http://[fd20:ce::254]/computeMetadata/v1/instance/service-accounts/default/token'",
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/{email,scopes,token}',
+        "curl -s http://metadata/computeMetadata/v1beta1/instance/service-accounts/default/token",
+        "CURL -S HTTP://METADATA.GOOGLE.INTERNAL/COMPUTEMETADATA/V1/INSTANCE/SERVICE-ACCOUNTS/DEFAULT/TOKEN",
+        'curl -s -H "metadata-flavor: google" "$MD/instance/service-accounts/builder@p.iam.gserviceaccount.com/token?scopes=x"',
+        'TOKEN=$(curl -s -H "Metadata-Flavor: Google" "$MD/instance/service-accounts/default/token" | jq -r .access_token)',
+        'kubectl exec p -- curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+        "python3 -c \"import urllib.request as u; print(u.urlopen(u.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor': 'Google'})).read())\"",
+        "bash -c 'curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/identity'",
+        "echo curl -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        # the last part of the path from one shell variable: its value can be
+        # `token`, and the text cannot tell, so the rule decides closed
+        "T=token; curl -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$T",
+        'curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/${FIELD}"',
+        "curl -s http://metadata/computeMetadata/v1/instance/service-accounts/default/$1?audience=x",
+        "f() { curl -s -H Metadata-Flavor:Google $MD/Instance/Service-Accounts/$SA/$2; }; f default token",
+        # the same with a quote or a backslash ahead of the variable, a brace
+        # form with an operator, and an account by its name
+        'curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/"$T',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/"$T"',
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/${1:-email}",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/${!T}",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/$@",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/$*",
+        "curl -s -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/'$T",
+        "kubectl exec p -- sh -c \"for f in email token; do curl -s -H 'Metadata-Flavor: Google' http://metadata/computeMetadata/v1/instance/service-accounts/default/\\$f; done\"",
+        "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/builder@p.iam.gserviceaccount.com/$MY_FIELD1",
+        # two backslashes ahead of the variable in a script in double quotes
+        "python3 -c \"import subprocess; subprocess.run('curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/\\\\$f', shell=True)\"",
+        # the sign outside the script and an escaped quote behind the variable,
+        # an escaped `?` behind it, and a `}` that ends the word
+        "H='Metadata-Flavor: Google'; MD=http://metadata.google.internal/computeMetadata/v1; kubectl exec p -- sh -c \"for f in email token; do curl -s -H \\\"$H\\\" \\\"$MD/instance/service-accounts/default/\\$f\\\"; done\"",
+        "curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$T\\?audience=https://example.com",
+        "curl -s -H 'Metadata-Flavor: Google' ${URL:-http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$T}",
+        # the sign outside the script, and the variable in escaped quotes of its own
+        "H='Metadata-Flavor: Google'; MD=http://metadata.google.internal/computeMetadata/v1; sh -c \"curl -s -H \\\"$H\\\" $MD/instance/service-accounts/default/\\\"\\$f\\\"\"",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -2113,6 +2283,38 @@ class TestSecretReadDetector(unittest.TestCase):
         "vault kv list secret/",
         "vault kv metadata get secret/db",
         "sops --version",
+        # the metadata server's paths that hold no credential, and a
+        # credential path with no sign of the metadata server
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/cluster-name',
+        "grep -rn instance/service-accounts/default/token docs/ | grep -v metadata/",
+        "grep -rn instance/service-accounts/default/token docs/metadata/",
+        "grep -rn instance/service-accounts/default/token docs/169-254-169-254.md",
+        # text that only looks like the credential path, with no sign and
+        # with one; the path with a host that only looks like a sign
+        "grep -rn service-accounts/default/token docs/",
+        "grep -rn service-accounts/default/token docs/ # metadata.goog",
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/tokens',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/xtoken',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ docs/token',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email -o token',
+        "curl -s http://metadata2/computeMetadata/v1/instance/service-accounts/default/token",
+        # a variable that is not the whole last part of an account's path, and
+        # a variable last part with no sign of the metadata server
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/$SA/email',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/$SA',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$DIR/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/$NAME.txt',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/x$T',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/$KEY',
+        'grep -rn "instance/service-accounts/default/$T" docs/',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/tokens/$T',
+        'curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ docs/$T',
+        # a list of the accounts with a redirect to a path from two variables
+        "curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/>$TMPDIR/$OUT",
     ]
 
     def test_covers_every_output_form(self):
@@ -2122,6 +2324,109 @@ class TestSecretReadDetector(unittest.TestCase):
         for cmd in self.SERVED_COMMANDS:
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_a_metadata_sign_counts_anywhere_on_the_line(self):
+        """The rule reads the whole text of the command: the sign of the
+        metadata server and the credential path can stand in two of its
+        simple commands, and on two of its lines."""
+        path = '"$MD/instance/service-accounts/default/token"'
+        for line in (
+            "MD=http://metadata.google.internal/computeMetadata/v1; curl -s " + path,
+            "MD=http://169.254.169.254/computeMetadata/v1 && curl -s " + path,
+            "H='Metadata-Flavor: Google'\ncurl -s -H \"$H\" " + path,
+            "curl -s " + path + " \\\n  -H 'Metadata-Flavor: Google'",
+            "curl -s " + path + " | jq . ; echo metadata.goog",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+        # Control: the same lines with no sign are served.
+        for line in ("MD=http://localhost:8080/v1; curl -s " + path, "curl -s " + path + " | jq ."):
+            with self.subTest(line=line):
+                self.assertFalse(worker_transcript.command_reads_a_secret(line))
+
+    def test_a_variable_ends_the_last_path_part_of_an_account(self):
+        """The variable must be the whole last part: the end of the text, a
+        blank, a quote, a backtick, a backslash or one of `? # ; | & ) < > } ]`
+        follows it. The rule reads the folded text, each account path in it,
+        and a sign on either side of the path."""
+        fetch = "curl -s -H Metadata-Flavor:Google http://metadata/computeMetadata/v1/instance/service-accounts/default/$T"
+        for end in ("", " -o out", "\t-o out", "\necho ok", '"', "'", "`", "?audience=x", "#frag", "; echo ok", "| jq .", "& wait", ")", "< /dev/null", "> out", '\\"', "}", "]"):
+            with self.subTest(end=end):
+                self.assertTrue(worker_transcript.command_reads_a_secret(fetch + end))
+        for more in (".txt", "-x", ",x", "$U", "{", "/", "/x", ":x", "=x", "+x", "%x", "~", "!"):
+            with self.subTest(more=more):
+                self.assertFalse(worker_transcript.command_reads_a_secret(fetch + more))
+        path = "$MD/instance/service-accounts/default/"
+        for line in (
+            "curl -s " + path + "$T -H 'Metadata-Flavor: Google'",
+            "curl -s " + path + "email; curl -s " + path + "$T; echo metadata.goog",
+            "curl -s -H Metadata-Flavor:Google " + path + "\\\n$T",
+            "curl -s -H Metadata-Flavor:Google " + path + "${1}",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(worker_transcript.command_reads_a_secret(line))
+
+    # A reading of the next test is this many passes of the pattern over a
+    # text: one pass needs about a millisecond, too short to compare.
+    VARIABLE_PATTERN_PASSES = 5
+
+    def test_a_run_of_variable_path_parts_reads_in_linear_time(self):
+        # 370 KB or more of account paths whose last part is a variable with
+        # more text behind it, or is cut short. The pattern starts from fixed
+        # text, and neither the account part nor the brace form can read past
+        # the next start, so the passes over a text need no more than
+        # `TIME_GROWTH_BOUND` times the CPU time of the passes over the same
+        # text `TIME_GROWTH_SHRINK` times shorter.
+        pattern = worker_transcript.METADATA_CREDENTIAL_PATH_VARIABLE_RE
+        for build, count, matches in (
+            (lambda count: "instance/service-accounts/default/$T " * count, 10000, 10000),
+            (lambda count: "instance/service-accounts/default/$T.x " * count, 10000, 0),
+            (lambda count: "instance/service-accounts/default/$" + "T" * count + ".x", 400000, 0),
+            (lambda count: "instance/service-accounts/" + "x" * count + "/$", 400000, 0),
+            (lambda count: "instance/service-accounts/default/${T " * count, 10000, 0),
+            (lambda count: "instance/service-accounts/" * count, 16000, 0),
+            (lambda count: "instance/service-accounts/default/" + "'" * count + "x", 400000, 0),
+            (lambda count: "instance/service-accounts/default/${" + "T" * count, 400000, 0),
+            (lambda count: "instance/service-accounts/x/${" * count, 13332, 0),
+        ):
+            text, short = build(count), build(count // TIME_GROWTH_SHRINK)
+
+            def passes(over=text):
+                for _ in range(self.VARIABLE_PATTERN_PASSES):
+                    pattern.findall(over)
+
+            with self.subTest(text=text[:40]):
+                self.assertEqual(len(pattern.findall(text)), matches)
+                short_seconds, full_seconds = _cpu_seconds_of_a_pair(lambda: passes(short), passes, TIME_GROWTH_BOUND)
+                self.assertLessEqual(full_seconds, TIME_GROWTH_BOUND * short_seconds)
+
+    def test_a_run_of_metadata_words_reads_in_linear_time(self):
+        # 390 KB or more of credential paths with no sign, of signs with no
+        # path, and of each part cut short. The path pattern starts from fixed
+        # text and reads to the next `/` or blank; the sign pattern is fixed
+        # text. One search of each needs at most 0.01 s of CPU time here. The
+        # bound is on the two searches of the rule, and on CPU time, as in the
+        # other linear-time tests of this file.
+        import time
+
+        for text, path, sign in (
+            ("instance/service-accounts/default/token " * 10000, True, False),
+            ("instance/service-accounts/" * 16000, False, False),
+            ("instance/service-accounts/" + "x" * 400000, False, False),
+            ("instance/service-accounts/default/toke " * 10000, False, False),
+            ("instance/service-accounts/default/" + "x" * 400000, False, False),
+            ("instance/service-accounts/default/{email,scopes} " * 8000, False, False),
+            ("Metadata-Flavor: Google http://metadata.google.internal/ " * 8000, False, True),
+            ("//metadata.x //metadata-x metadata.goo 169.254.169.25 " * 8000, False, False),
+        ):
+            with self.subTest(text=text[:40]):
+                start = time.process_time()
+                found = (
+                    bool(worker_transcript.METADATA_CREDENTIAL_PATH_RE.search(text)),
+                    bool(worker_transcript.METADATA_SERVER_SIGN_RE.search(text)),
+                )
+                self.assertLess(time.process_time() - start, 1.0)
+                self.assertEqual(found, (path, sign))
 
     # A command that prints a token or the environment (#5484).
     TOKEN_AND_ENVIRONMENT_PRINTS = [

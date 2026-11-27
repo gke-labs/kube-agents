@@ -52,9 +52,9 @@ var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
 	// kindLocation is the spec.harness.location a kind install sets (with
-	// "kind" for projectId and clusterName as well). No GKE location looks like
-	// this. It means: there is no GKE cluster to fetch credentials for, use the
-	// cluster the pod runs in.
+	// "kind" for projectId as well). No GKE location looks like this. It means:
+	// there is no GKE cluster to fetch credentials for, use the cluster the pod
+	// runs in.
 	kindLocation = "kind"
 	// inClusterContextName is the kubectl context the credential proxy and the
 	// agent use on kind.
@@ -91,8 +91,9 @@ const (
 	// it admits from that limit, so the limit is the CR's knob and the admitted
 	// count follows it; the two caps stay the operator's constants, and a CR
 	// override of either would detach them from the limit again.
-	credentialProxyMaxOutputBytes        = "8388608"
-	credentialProxyMaxConcurrentCommands = "8"
+	credentialProxyMaxOutputBytes           = "8388608"
+	credentialProxyMaxConcurrentCommands    = "8"
+	credentialProxyMaxConcurrentCommandsEnv = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS" // #nosec G101 -- Environment variable name, not a credential
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -635,6 +636,12 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
+	return buildConfigMapWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// buildConfigMapWith is buildConfigMap with the managed config's
+// model.api_key set to apiKey (renderConfigYAMLWith).
+func buildConfigMapWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -644,7 +651,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 			Name:      agent.Name + "-config",
 			Namespace: agent.Namespace,
 		},
-		Data: buildConfigMapData(agent, agentPlugins),
+		Data: buildConfigMapDataWith(agent, agentPlugins, apiKey),
 	}
 }
 
@@ -676,8 +683,14 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 // agent could still repoint its own model endpoint and keep that across restarts. Hence
 // the split: immutable keys are pinned, mutable operator-owned keys are merged.
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
+	return buildConfigMapDataWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// buildConfigMapDataWith is buildConfigMapData with the managed config's
+// model.api_key set to apiKey.
+func buildConfigMapDataWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) map[string]string {
 	data := map[string]string{
-		managedConfigKey:  renderConfigYAML(agent, agentPlugins),
+		managedConfigKey:  renderConfigYAMLWith(agent, agentPlugins, apiKey),
 		managedEnvKey:     renderManagedEnvForPlugins(agent, agentPlugins),
 		"leader_elect.py": leaderElectScript,
 	}
@@ -1058,6 +1071,7 @@ var DefaultBuiltInPlugins = []string{
 	"pr_opened",
 	"chat_metrics",
 	"eval_run_tag",
+	"model_identity",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -2270,6 +2284,13 @@ type managedDatabaseConfig struct {
 }
 
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
+	return renderConfigYAMLWith(agent, agentPlugins, agentPlaceholderAPIKey)
+}
+
+// renderConfigYAMLWith is renderConfigYAML with model.api_key set to apiKey:
+// the placeholder, or agentInferenceKeyConfigRef once the agent sends its
+// inference gateway key (reconcileConfigMap).
+func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, apiKey string) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 
 	cfg := struct {
@@ -2365,7 +2386,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Model.Default = agentModelName
 	cfg.Model.Model = agentModelName
 	cfg.Model.BaseURL = fmt.Sprintf("http://%s.%s.svc.cluster.local/v1", inferenceGatewayServiceName, agent.Namespace)
-	cfg.Model.APIKey = "none"
+	cfg.Model.APIKey = apiKey
 	// What `provider: custom` against a non-OpenAI base_url already resolves to
 	// (_resolve_plain_custom_api_mode in hermes_cli/runtime_provider.py), so this
 	// changes no behaviour — it only makes the value one the agent cannot rewrite.
@@ -2852,6 +2873,10 @@ type renderOptions struct {
 	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
 	// so the zero value renders byte-identical manifests.
 	enabledProfiles []string
+	// inferenceKeys is the classes whose callers this pass gives their
+	// inference gateway key (inference_key_callers.go). The zero value gives
+	// none, so it renders the agent as an install without keys.
+	inferenceKeys inferenceKeyCallers
 }
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
@@ -3742,6 +3767,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "MEMORY_PROVIDER",
 		Value: resolveMemoryProvider(agent),
 	})
+	// The agent class's inference gateway key, once the gateway serves it: the
+	// managed config's model.api_key expands it (renderConfigYAMLWith), and the
+	// pod's other in-process callers read it by this name. After the plugin
+	// merge, so a plugin's entry of the same name gives way (lastWinsEnv in
+	// buildBaseContainers). The platform-agent container alone: the shell
+	// sandbox stays keyless.
+	if env, ok := opts.inferenceKeys.envVar(inferenceKeyClassAgent, agentInferenceKeyEnv); ok {
+		envVars = append(envVars, env)
+	}
 
 	var runtimeClassName *string
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {
@@ -4892,10 +4926,12 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
-		// The most brokered commands that run at once; the child memory budget
-		// decides how many of them the limit admits. The broker's own default
-		// is the same figure; setting it here is what makes it the operator's.
-		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
+		// The most brokered commands that run at once: default/fixed profiles
+		// stay pinned at 8, while sizingProfile=auto steps 8 small, 12 medium,
+		// 16 fleet; the child memory budget further caps admission if a custom
+		// override lowers memory. Setting it here pins it as the operator's
+		// value rather than an overridable spec.deployment.env key.
+		{Name: credentialProxyMaxConcurrentCommandsEnv, Value: credentialProxySlotCapForAgent(agent, renderedSizingTier(agent))},
 		// The container's own memory limit, for the broker's child memory
 		// budget. See credentialProxyMemoryLimitEnv for why it is a
 		// resourceFieldRef and why it is reserved.
@@ -4934,6 +4970,15 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// credentialProxyStateLimitEnv for why they are values and why reserved;
 	// in the managed set, so the merge below reserves both names.
 	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
+	// The kubectl cost tier, for the broker's kubectl cost gate: a brokered
+	// cluster-wide read reserves its profiled peak from this column of the
+	// cost table, beside the output cap above in the child memory budget's
+	// terms. Normalised as the shell sandbox's copy is (kubectlCostTier),
+	// and reserved in mergeCredentialProxyEnv, so a value the normalisation
+	// refuses never reaches the broker raw.
+	if tier, ok := kubectlCostTier(agent); ok {
+		envVars = append(envVars, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
+	}
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -4983,8 +5028,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		envVars = append(envVars, corev1.EnvVar{Name: watcherSubscriptionEnvVar, Value: watcherPubsubSubscription(agent)})
 	}
 	if a2aSessionClusterViewEnabled(agent) {
-		// The session pods' audience. Rendered only with the flag, so a
-		// broker on an install without it has no session role to confer
+		// The session pods' audience. Rendered only under the session pods'
+		// cluster view (the session route's default, or the operator's flag),
+		// so a broker on an install without it has no session role to confer
 		// and a stray session token is "another audience", 401.
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},
@@ -5244,13 +5290,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// And one that could set the MCP callers could unbind the MCP
 		// ServiceAccount from its audience, or bind another to it.
 		credentialProxyMCPCallersEnvVar,
-		// The scope role's three: one that could set the audience or the
-		// callers would decide who holds the scope role, and one that could
+		// The scope role's four: one that could set the audience or the
+		// callers would decide who holds the scope role, one that could
 		// set the file would choose the declaration that bounds its
-		// arguments.
+		// arguments, and one that could set the management project would
+		// add a project its `clusters list` takes.
 		credentialProxyScopeAudienceEnvVar,
 		credentialProxyScopeCallersEnvVar,
 		credentialProxyScopeFileEnvVar,
+		credentialProxyScopeManagementProjectEnvVar,
 		// One that could set the hold file would lift an operator's hold.
 		credentialProxyHoldFileEnvVar,
 		credentialProxyCuratorAudienceEnvVar,
@@ -5323,6 +5371,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// what still holds when that happens.
 		"CREDENTIAL_PROXY_ENFORCE_READ_ONLY",
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
+		// In `managed` only when spec.deployment.env names a tier the
+		// normalisation keeps (kubectlCostTier); reserved by name so a
+		// valueFrom or an unnormalised literal never reaches the broker.
+		envKubectlCostTier,
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
 		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
@@ -5389,10 +5441,14 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	} {
 		reserved[name] = struct{}{}
 	}
-	// The audit-report store's names (auditReportStoreEnvNames).
+	// The audit-report store's names (auditReportStoreEnvNames) and broker
+	// active-standby control env vars.
 	for _, name := range auditReportStoreEnvNames {
 		reserved[name] = struct{}{}
 	}
+	reserved[credentialProxyStandbyEnv] = struct{}{}
+	reserved[credentialProxyControlFileEnv] = struct{}{}
+	reserved[credentialProxyPeerHealthURLEnv] = struct{}{}
 
 	result := append([]corev1.EnvVar{}, managed...)
 	for _, env := range custom {

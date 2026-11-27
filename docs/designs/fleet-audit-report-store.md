@@ -62,7 +62,9 @@ repository's store. With no public body to check it against, the next no-forge r
 `current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
 that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
 envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
-counted as resolved, as the ledger holds it. Over a gap, so is a previous id on a target the run did
+counted as resolved, as the ledger holds it; so is a previous id on an object a target's note
+names (`noted_objects`) — the collector read it but could not see the result, so the run did not
+see the finding go away. Over a gap, so is a previous id on a target the run did
 not check ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 
 Two runs have a repository setting but take the no-forge path, and they store marked envelopes. A run
@@ -113,7 +115,8 @@ in the run record, read as `finish` begins, else the in-flight note's, else null
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
 dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
-run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
+run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), the ids of
+its noted objects (`scheduled_noted_ids`), and the
 ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
 The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an
 on-demand run copies them from the record before it. A run that `precheck` closed from the stored
@@ -399,6 +402,18 @@ bench verifiers grade audit evals by parsing ids out of the published body, and 
 human or an external tool recovers a run's id set with no pod access. The identical block in
 remediation pull request bodies keeps both its write and its read, because reconciliation has to
 work from the live pull request list, which humans change between runs.
+
+### Shadow streams
+
+A shadow run (`start` and `finish` with `--store-only`, #5623) is a canary beside the job it may
+replace. It writes its report to the store and nothing else: no ledger, no forge or git write, no
+remediation and no chat. Its envelopes go to a stream of their own, so two runs of one audit never
+move each other's baseline: the triggering schedule's name when the worker exports it
+(`PROFILE_TRIGGER_STREAM`), or `<audit>-shadow` for a run started by hand. They are stored under the
+install's own store key, which is the one key the broker lets a profile write to, and the stream is
+the trigger's stream, as the broker also requires. A shadow envelope carries `shadow: true`, the
+stream, and `shadow_summary`, the summary a live run would have posted. The store is a shadow run's
+only output, so a write that fails fails the run.
 
 ## 5. Liveness
 

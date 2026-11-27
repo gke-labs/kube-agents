@@ -3,9 +3,9 @@
 # shape rather than a planted object: slot a runs the legacy dataplane with the
 # network policy add-on off, and its namespaces carry default-deny NetworkPolicies
 # that nothing enforces (seeded-reliability, seeded-debug, seeded-capacity,
-# seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-qos and
-# seeded-scaled-zero,
-# the apiserver-egress-only policy in seeded-deprecation, and default-deny in
+# seeded-stall, seeded-token, seeded-headroom, seeded-family, seeded-cpu-cycle,
+# seeded-reservation, seeded-qos and seeded-scaled-zero,
+# the apiserver-egress-only policies in seeded-deprecation and seeded-long-name, and default-deny in
 # seeded-shapes and seeded-defaults).
 # A dataplane change that turns enforcement on makes every one of those policies
 # take effect at once, which is the break the catalogue entry describes, so the

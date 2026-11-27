@@ -57,8 +57,9 @@ platformAgent:
     # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE (and
     # KUBEAGENTS_KUBECTL_COST_TIER, left unset here: set it to fleet only when
     # the clusters hold tens of thousands of Pods each) to the shell sandbox,
-    # where the audits run, sends the tier to the A2A gateway's session pods
-    # too, and passes every name it does not reserve to the
+    # where the audits run, sends the tier to the credential broker (which runs
+    # profile workers' kubectl) and the A2A gateway's session pods too, and
+    # passes every name it does not reserve to the
     # credential-proxy and agent-api-auth containers. The name here reaches the
     # container that reads it. MALLOC_ARENA_MAX is not on the
     # agent container's allowlist: set here it would reach the credential-proxy
@@ -82,21 +83,25 @@ platformAgent:
         value: "false"
     credentialProxy:
       # The broker that runs every credentialed command (gcloud, kubectl) in a
-      # pod of its own. It admits at most eight commands at once, a cap the
-      # operator fixes and no values file moves, and budgets each in-flight
-      # command against limits.memory: 128 MiB reserved for the child plus six
-      # copies of the 8 MiB output cap, 176 MiB a slot, after the broker's and
-      # Envoy's own reserves. The 2Gi default already covers all eight slots,
-      # so 8Gi admits nothing more in parallel. It buys headroom for a child
-      # that outgrows its reserve, as a kubectl or gcloud listing of a cluster
-      # with thousands of pods does: close to 1 GiB a slot with all eight in
-      # use (modeled), where the broker restarted under a 29-cluster fleet at
-      # the default. The CPU request is the CPU it runs at on Autopilot without
+      # pod of its own. On default and fixed sizing profiles it admits at most
+      # eight commands at once (under sizingProfile: auto it scales 8 -> 12 -> 16
+      # across small/medium/fleet), and budgets each in-flight command against
+      # limits.memory: 128 MiB reserved for the child plus six copies of the
+      # 8 MiB output cap, 176 MiB a slot, after the broker's and Envoy's own
+      # reserves. The 2Gi default already covers all eight slots, so 8Gi admits
+      # nothing more in parallel at small. It buys headroom for a child that
+      # outgrows its reserve, as a kubectl or gcloud listing of a cluster with
+      # thousands of pods does: close to 1 GiB a slot with all eight in use
+      # (modeled), where the broker restarted under a 29-cluster fleet at the
+      # default. The CPU request is the CPU it runs at on Autopilot without
       # bursting; on Standard or with bursting it may reach 8 vCPU. On
       # Standard the 4 vCPU request needs a node with more than that
-      # allocatable; the composition's default e2-standard-4 pool has less,
-      # and the proxy Deployment recreates its pod rather than rolling it, so
-      # add a larger pool before passing this file or the proxy stays Pending.
+      # allocatable; the composition's default e2-standard-4 pool has less. Since
+      # this file leaves sizingProfile unset, the proxy Deployment uses Recreate
+      # and waits Pending until a larger node pool fits; setting sizingProfile to
+      # auto uses active-standby RollingUpdate so an existing broker keeps
+      # serving while a surge pod stays Pending (a fresh install still waits for
+      # a larger pool before passing this file).
       # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
       # 10 GiB per-pod ceiling.
       resources:

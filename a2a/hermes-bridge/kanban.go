@@ -931,14 +931,16 @@ poll:
 					st := cardStep(c, settledCount, totalCount, "")
 					progText := fmt.Sprintf("Kanban specialist checks: %d/%d settled (%d running) — latest: %s (%s)",
 						settledCount, totalCount, totalCount-settledCount, st.Subtask.Title, st.Subtask.Verdict)
-					run.mu.Lock()
-					if act != nil {
-						b.publishSteps(run, act, []stepmsg.Step{st})
-						if run.state == stateRunning && act.heartbeatUnderBudget() {
-							b.publishProgress(run, progText)
+					func() {
+						run.mu.Lock()
+						defer run.mu.Unlock()
+						if act != nil {
+							b.publishSteps(run, act, []stepmsg.Step{st})
+							if run.state == stateRunning && act.heartbeatUnderBudget() {
+								b.publishProgress(run, progText)
+							}
 						}
-					}
-					run.mu.Unlock()
+					}()
 				}
 
 				if settledCount == totalCount {
@@ -954,17 +956,19 @@ poll:
 						if turnFiledCards && !sawUnsettled {
 							synthAck = ackText
 						}
-						run.mu.Lock()
-						// Only a synthesis that runs is announced: one card, or
-						// an answer of the turn's own, stands in as it is.
-						if act != nil && cardSynthesisRuns(run, turn, synthAck, relevant) {
-							b.publishSteps(run, act, []stepmsg.Step{{
-								Kind:    stepmsg.KindSynthesis,
-								Title:   fmt.Sprintf("Synthesizing findings across %d specialist card(s).", len(relevant)),
-								Thought: "Combining specialist reports into unified fleet response.",
-							}})
-						}
-						run.mu.Unlock()
+						func() {
+							run.mu.Lock()
+							defer run.mu.Unlock()
+							// Only a synthesis that runs is announced: one card, or
+							// an answer of the turn's own, stands in as it is.
+							if act != nil && cardSynthesisRuns(run, turn, synthAck, relevant) {
+								b.publishSteps(run, act, []stepmsg.Step{{
+									Kind:    stepmsg.KindSynthesis,
+									Title:   fmt.Sprintf("Synthesizing findings across %d specialist card(s).", len(relevant)),
+									Thought: "Combining specialist reports into unified fleet response.",
+								}})
+							}
+						}()
 						if !turnFiledCards {
 							cardReport := b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, "", relevant, parts)
 							if act != nil {

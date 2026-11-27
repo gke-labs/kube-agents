@@ -71,8 +71,9 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from contextvars import ContextVar
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import wraps
+from re import _constants as _regex_constants, _parser as _regex_parser
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
@@ -217,6 +218,23 @@ REPORT_STORE_ROOT = "/opt/data/fleet-audit/reports"
 # run that could not name its start (the key, null).
 _ENVELOPE_STARTED_KEY = "started_at"
 _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
+# The store's ring of earlier envelopes, beside `latest.json`
+# (audit_report.REPORT_RUNS_DIR); a planted previous run stays there after the
+# run under test has written its own `latest.json`, for as long as the ring,
+# which keeps the newest envelopes only, still holds it.
+_REPORT_RUNS_DIR = "runs"
+# The copy of the newest envelope, beside the ring (audit_report.REPORT_LATEST_NAME).
+_REPORT_LATEST_NAME = "latest.json"
+# Keys of the listing `report_store_command` prints for a `finding` block: the
+# selected findings, and how many envelopes hold the planted mark.
+_LISTED_FINDINGS_KEY = "findings"
+_LISTED_MARK_ENVELOPES_KEY = "mark_envelopes"
+# A literal IPv4 address or range, the thing a remediation command must not
+# carry where the SOP says the value is the owner's to give.
+_CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?(?![\d.])")
+_SHELL_COMMENT_PREFIX = "#"
+_SHELL_TRAILING_COMMENT = " #"
+_FLAG_PREFIX = "--"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
@@ -299,7 +317,143 @@ _NO_RECORDED_SLOT_REASON = (
     "a pattern names every recorded seeded-fleet slot and the runner recorded none: no seeded "
     "cluster was reached before the run"
 )
-_PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
+_PATTERN_EXPANSION_REASON = "a pattern does not compile once its placeholders are expanded"
+# `pattern_surface` lowercases the report, so a letter a pattern spells in upper
+# case outside `(?i)`, alone or in a class of such letters, is text no report carries.
+# Where the pattern needs that letter, a required pattern misses on every run
+# and a forbid never fires; in an optional part or one branch it is dead text.
+_UPPERCASE_PATTERN_REASON = (
+    "the report is lowercased before the pattern runs, so no report carries them and the part "
+    "of the pattern that spells them never matches; spell the letters in lower case, or open "
+    "the pattern with (?i)"
+)
+_MODEL_PLACEHOLDER = re.compile(r"\{model\}")
+_MODEL_PLACEHOLDER_LOOSE = re.compile(r"\{\s*model\b[^}\n]*\}", re.IGNORECASE)
+_MODEL_PLACEHOLDER_STAND_IN = "stand-in-model-1.0"
+_MODEL_PROVIDER_ENV_KEY = "MODEL_PROVIDER"
+_MODEL_ENV_KEYS = ("MODEL_DEFAULT_NAME", "AGENT_MODEL", "AGENT_MODEL_NAME")
+_NO_RECORDED_MODEL_REASON = (
+    "a pattern names {model} and the runner has no backing model recorded in "
+    "MODEL_DEFAULT_NAME, AGENT_MODEL, or AGENT_MODEL_NAME"
+)
+_ROUTER_MODEL_ALIASES = frozenset(
+    {"model-default", "hermes-agent", "model-fast", "model-reasoning", "custom"}
+)
+_MODEL_OPENAI_COMPATIBLE_PROVIDER = "openai_compatible"
+_MODEL_HOSTED_VLLM_PROVIDER = "hosted_vllm"
+_MODEL_SLASH_SEP = "/"
+_MODEL_DOUBLE_DASH_SEP = "--"
+_MODEL_ARN_PREFIX = "arn:"
+_MODEL_ARN_SEP = ":"
+_MODEL_ARN_FIELD_COUNT = 6
+_MODEL_RESOURCE_PREFIX = "projects/"
+_MODEL_RESOURCE_MIN_SEGMENTS = 6
+_MODEL_RESOURCE_LOCATIONS_INDEX = 2
+_MODEL_RESOURCE_LOCATIONS = "locations"
+_MODEL_PUBLISHER_PREFIX = "publishers/"
+_MODEL_PUBLISHER_MIN_SEGMENTS = 4
+_MODEL_PUBLISHER_MODELS_INDEX = 2
+_MODEL_PUBLISHER_MODELS = "models"
+_MODEL_TOKEN_SPLIT_RE = re.compile(r"[- ]+")
+_MODEL_TOKEN_JOIN = r"[- ]+"
+_MODEL_VERSION_TOKEN_JOIN = r"[- .]+"
+_MODEL_SHORT_VERSION_MAX_DIGITS = 2
+_MODEL_LEFT_BOUND = "(?<![a-z0-9-])(?<![a-z0-9][.])"
+_MODEL_RIGHT_BOUND = "(?![a-z0-9-]|[.][a-z0-9])"
+_KNOWN_PROVIDER_PREFIXES = frozenset(
+    {
+        "vertex_ai",
+        "gemini",
+        "google",
+        "anthropic",
+        "openai",
+        _MODEL_OPENAI_COMPATIBLE_PROVIDER,
+        _MODEL_HOSTED_VLLM_PROVIDER,
+        "custom",
+        "sap",
+        "azure",
+        "bedrock",
+        "databricks",
+        "chatgpt",
+        "ollama",
+        "xai",
+        "deepseek",
+        "mistral",
+        "cohere",
+        "groq",
+        "together_ai",
+        "fireworks_ai",
+    }
+)
+
+
+def _trim_model_resource(name: str) -> str:
+    """Keep the trailing model/resource ID of Vertex AI paths, Model Garden paths, and Bedrock ARNs."""
+    if name.startswith(_MODEL_RESOURCE_PREFIX):
+        segments = name.split(_MODEL_SLASH_SEP)
+        if (
+            len(segments) >= _MODEL_RESOURCE_MIN_SEGMENTS
+            and segments[_MODEL_RESOURCE_LOCATIONS_INDEX] == _MODEL_RESOURCE_LOCATIONS
+            and segments[-1]
+        ):
+            return segments[-1]
+        return ""
+    if name.startswith(_MODEL_PUBLISHER_PREFIX):
+        segments = name.split(_MODEL_SLASH_SEP)
+        if (
+            len(segments) >= _MODEL_PUBLISHER_MIN_SEGMENTS
+            and segments[_MODEL_PUBLISHER_MODELS_INDEX] == _MODEL_PUBLISHER_MODELS
+            and segments[-1]
+        ):
+            return segments[-1]
+        return ""
+    segments = name.split(_MODEL_SLASH_SEP)
+    for idx, segment in enumerate(segments):
+        if not segment.startswith(_MODEL_ARN_PREFIX):
+            continue
+        arn = _MODEL_SLASH_SEP.join(segments[idx:])
+        fields = arn.split(_MODEL_ARN_SEP, _MODEL_ARN_FIELD_COUNT - 1)
+        if len(fields) < _MODEL_ARN_FIELD_COUNT or not fields[_MODEL_ARN_FIELD_COUNT - 1]:
+            return ""
+        resource = fields[_MODEL_ARN_FIELD_COUNT - 1]
+        if _MODEL_SLASH_SEP in resource:
+            return resource.rsplit(_MODEL_SLASH_SEP, 1)[-1]
+        return resource.rsplit(_MODEL_ARN_SEP, 1)[-1]
+    return name
+
+
+def recorded_model() -> str:
+    """Resolve the backing model from the runner's environment.
+
+    ``hack/ci-deploy.sh`` exports ``MODEL_PROVIDER`` and ``MODEL_DEFAULT_NAME``;
+    ``hack/ci-eval-pr.sh`` exports ``AGENT_MODEL``; ``harness.py`` reads
+    ``AGENT_MODEL_NAME``.
+    """
+    env_provider = os.environ.get(_MODEL_PROVIDER_ENV_KEY, "").strip().casefold()
+    for key in _MODEL_ENV_KEYS:
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        if _MODEL_SLASH_SEP in raw:
+            prefix, rest = raw.split(_MODEL_SLASH_SEP, 1)
+            folded_prefix = prefix.strip().casefold()
+            strip_prefix = (
+                folded_prefix == env_provider
+                or (
+                    env_provider == _MODEL_OPENAI_COMPATIBLE_PROVIDER
+                    and folded_prefix == _MODEL_HOSTED_VLLM_PROVIDER
+                )
+                if env_provider
+                else folded_prefix in _KNOWN_PROVIDER_PREFIXES
+            )
+            if strip_prefix:
+                if not rest.strip():
+                    continue
+                raw = rest.strip()
+        raw = _trim_model_resource(raw)
+        if raw and raw.casefold() not in _ROUTER_MODEL_ALIASES:
+            return raw
+    raise LookupError(_NO_RECORDED_MODEL_REASON)
 
 
 # Emphasis and code markers, dropped before matching. The agent answers in
@@ -530,7 +684,10 @@ class ReportContainsVerifier(BaseVerifier):
     bullet into its unnegated neighbour before the regex runs. A literal
     space in a pattern therefore does not cross a line break; a phrase that
     may wrap says ``\\s+`` where it may. The text is lowercased before the
-    regex runs, so a pattern spells its letters in lower case.
+    regex runs, so a pattern spells its letters in lower case; one with an
+    uppercase letter outside ``(?i)``, alone or in a character class of
+    nothing but such letters, spells text no report carries and is refused
+    at spec load.
     ``required_patterns`` must each match somewhere; ``any_of_patterns``
     and ``any_of_phrases`` are one pool of alternatives: at least one of
     either has to match.
@@ -618,6 +775,11 @@ class ReportContainsVerifier(BaseVerifier):
                     f"{info.field_name} entry {phrase!r} carries a cluster placeholder, which only "
                     "the pattern lists expand; as a phrase it is literal text that never matches"
                 )
+            if _MODEL_PLACEHOLDER_LOOSE.search(phrase):
+                raise ValueError(
+                    f"{info.field_name} entry {phrase!r} carries a model placeholder, which only "
+                    "the pattern lists expand; as a phrase it is literal text that never matches"
+                )
         return phrases
 
     @field_validator("required_patterns", "forbidden_patterns", "any_of_patterns")
@@ -632,17 +794,83 @@ class ReportContainsVerifier(BaseVerifier):
                     f"pattern {pattern!r} carries a malformed cluster placeholder; the form is "
                     f"{{cluster:<slot>}} or {{cluster:{_CLUSTER_ANY}}}, lowercase, no spaces"
                 )
+            if _MODEL_PLACEHOLDER_LOOSE.search(_MODEL_PLACEHOLDER.sub("", pattern)):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a malformed model placeholder; the form is "
+                    "{model}, lowercase, no spaces"
+                )
             # A placeholder expands to a frame at verify time, so what has to
             # compile now is the pattern around a frame, not around a letter:
             # a lookbehind or a character class that is legal around `x` is
             # not around a variable-width group.
+            expanded = cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern))
+            expanded = cls.expand_model_placeholders(expanded, _MODEL_PLACEHOLDER_STAND_IN)
             try:
-                re.compile(cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern)))
+                re.compile(expanded)
             except re.error as exc:
                 # Re-raised as the same type, so a caller that catches re.error
                 # for a pattern that does not compile still does.
-                raise re.error(f"pattern {pattern!r} does not compile once its cluster placeholders are expanded: {exc}") from exc
+                raise re.error(f"pattern {pattern!r} does not compile once its placeholders are expanded: {exc}") from exc
+            uppercase = cls._uppercase_literals(expanded)
+            if uppercase:
+                raise ValueError(f"pattern {pattern!r} spells {', '.join(map(repr, uppercase))} in upper case; {_UPPERCASE_PATTERN_REASON}")
         return patterns
+
+    @staticmethod
+    def _uppercase_literals(pattern: str) -> list[str]:
+        """The letters ``pattern`` matches only in upper case, in order, once each.
+
+        Read from the parsed pattern, not its text, so an escape (``\\A``,
+        ``\\S``), a group name and a ``(?x)`` comment are not letters. A
+        character class counts only when nothing in it is text a lowercased
+        report carries (``[A-Z]``; the parser also reads ``(?:A|B)`` as one),
+        since a class may list both cases. Anything under ``(?i)`` or
+        ``(?i:...)`` is passed over.
+        """
+        # `re` exposes its parser only as private modules (`sre_parse` is their
+        # deprecated alias). A Python that moves them fails this module's
+        # import, so no pattern passes unread.
+        parsed = _regex_parser.parse(pattern)
+        found: list[str] = []
+
+        def uppercase_only(code: int) -> bool:
+            return chr(code) != chr(code).lower()
+
+        def class_members(items: list[tuple[Any, Any]]) -> list[str]:
+            """The members of a class no lowercased text matches, or none when
+            any member (or a negation) lets the class match such text."""
+            members = []
+            for op, av in items:
+                if op is _regex_constants.LITERAL and uppercase_only(av):
+                    members.append(chr(av))
+                elif op is _regex_constants.RANGE and all(uppercase_only(code) for code in range(av[0], av[1] + 1)):
+                    members.append(f"{chr(av[0])}-{chr(av[1])}")
+                else:
+                    return []
+            return members
+
+        def walk(node: Any, ignorecase: bool) -> None:
+            if isinstance(node, _regex_parser.SubPattern):
+                for op, av in node:
+                    if op is _regex_constants.LITERAL:
+                        letters = [chr(av)] if uppercase_only(av) else []
+                    elif op is _regex_constants.IN:
+                        letters = class_members(av)
+                    else:
+                        letters = []
+                    found.extend(letter for letter in letters if not ignorecase and letter not in found)
+                    if op is _regex_constants.SUBPATTERN:
+                        _group, add_flags, del_flags, inner = av
+                        scoped = (ignorecase or bool(add_flags & re.IGNORECASE)) and not del_flags & re.IGNORECASE
+                        walk(inner, scoped)
+                    elif op is not _regex_constants.IN:
+                        walk(av, ignorecase)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item, ignorecase)
+
+        walk(parsed, bool(parsed.state.flags & re.IGNORECASE))
+        return found
 
     @staticmethod
     def _stand_in_records(pattern: str) -> dict[str, tuple[str, str]]:
@@ -688,19 +916,78 @@ class ReportContainsVerifier(BaseVerifier):
             return cls._cluster_frame(*clusters[slot])
         return _CLUSTER_PLACEHOLDER.sub(frame_for, pattern)
 
-    def _expanded_patterns(self) -> tuple[list[str], list[str], list[str], dict[str, tuple[str, str]] | None]:
-        """The three pattern lists with their cluster placeholders expanded from
-        the runner's record, and the record used (None when no pattern asked,
-        so the record is read only then)."""
-        if not any(_CLUSTER_PLACEHOLDER.search(p) for p in self.forbidden_patterns + self.required_patterns + self.any_of_patterns):
-            return self.forbidden_patterns, self.required_patterns, self.any_of_patterns, None
-        clusters = recorded_clusters()
-        return (
-            [self.expand_cluster_placeholders(p, clusters) for p in self.forbidden_patterns],
-            [self.expand_cluster_placeholders(p, clusters) for p in self.required_patterns],
-            [self.expand_cluster_placeholders(p, clusters) for p in self.any_of_patterns],
-            clusters,
-        )
+    @staticmethod
+    def _model_frame(model: str, *, fold_decoration: bool = False) -> str:
+        """The regex for the recorded backing model, matching hyphenated, spaced, or dotted-version tokens."""
+        trimmed = _trim_model_resource(model.strip()) or model
+        raw = _INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", trimmed)) if fold_decoration else trimmed
+        norm = _normalize(raw).strip()
+        prefix_part = ""
+        leaf = norm
+        if _MODEL_SLASH_SEP in norm:
+            prefix, rest = norm.split(_MODEL_SLASH_SEP, 1)
+            if prefix.strip() and rest.strip():
+                prefix_part = f"(?:{re.escape(prefix.strip())}{_MODEL_SLASH_SEP})?"
+                leaf = rest.strip()
+        elif _MODEL_DOUBLE_DASH_SEP in norm:
+            prefix, rest = norm.split(_MODEL_DOUBLE_DASH_SEP, 1)
+            if prefix.strip() and rest.strip():
+                prefix_part = f"(?:{re.escape(prefix.strip())}{_MODEL_DOUBLE_DASH_SEP})?"
+                leaf = rest.strip()
+        raw_tokens = [tok for tok in _MODEL_TOKEN_SPLIT_RE.split(leaf) if tok]
+        if raw_tokens:
+            pieces = [re.escape(raw_tokens[0])]
+            for idx in range(1, len(raw_tokens)):
+                prev_tok, cur_tok = raw_tokens[idx - 1], raw_tokens[idx]
+                is_short_version_pair = (
+                    prev_tok.isdigit()
+                    and len(prev_tok) <= _MODEL_SHORT_VERSION_MAX_DIGITS
+                    and cur_tok.isdigit()
+                    and len(cur_tok) <= _MODEL_SHORT_VERSION_MAX_DIGITS
+                )
+                joiner = _MODEL_VERSION_TOKEN_JOIN if is_short_version_pair else _MODEL_TOKEN_JOIN
+                pieces.append(joiner + re.escape(cur_tok))
+            body = "".join(pieces)
+        else:
+            body = re.escape(leaf)
+        return f"(?:{_MODEL_LEFT_BOUND}{prefix_part}{body}{_MODEL_RIGHT_BOUND})"
+
+    @classmethod
+    def expand_model_placeholders(cls, pattern: str, model: str, *, fold_decoration: bool = False) -> str:
+        """``pattern`` with every ``{model}`` replaced by the recorded model frame."""
+        if not _MODEL_PLACEHOLDER.search(pattern):
+            return pattern
+        frame = cls._model_frame(model, fold_decoration=fold_decoration)
+        return _MODEL_PLACEHOLDER.sub(lambda _: frame, pattern)
+
+    def _expanded_patterns(
+        self,
+    ) -> tuple[list[str], list[str], list[str], dict[str, tuple[str, str]] | None, str | None]:
+        """The three pattern lists with their cluster and model placeholders
+        expanded from the runner's records (None when no pattern asked)."""
+        all_patterns = self.forbidden_patterns + self.required_patterns + self.any_of_patterns
+        forbidden = list(self.forbidden_patterns)
+        required = list(self.required_patterns)
+        any_of = list(self.any_of_patterns)
+        clusters: dict[str, tuple[str, str]] | None = None
+        model: str | None = None
+        if any(_CLUSTER_PLACEHOLDER.search(p) for p in all_patterns):
+            clusters = recorded_clusters()
+            forbidden = [self.expand_cluster_placeholders(p, clusters) for p in forbidden]
+            required = [self.expand_cluster_placeholders(p, clusters) for p in required]
+            any_of = [self.expand_cluster_placeholders(p, clusters) for p in any_of]
+        if any(_MODEL_PLACEHOLDER.search(p) for p in all_patterns):
+            model = recorded_model()
+            forbidden = [
+                self.expand_model_placeholders(p, model, fold_decoration=self.fold_decoration) for p in forbidden
+            ]
+            required = [
+                self.expand_model_placeholders(p, model, fold_decoration=self.fold_decoration) for p in required
+            ]
+            any_of = [
+                self.expand_model_placeholders(p, model, fold_decoration=self.fold_decoration) for p in any_of
+            ]
+        return forbidden, required, any_of, clusters, model
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -716,7 +1003,7 @@ class ReportContainsVerifier(BaseVerifier):
                     success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRESOLVED_ROLES_REASON}: {exc}"
                 )
         try:
-            forbidden_patterns, required_patterns, any_of_patterns, clusters = self._expanded_patterns()
+            forbidden_patterns, required_patterns, any_of_patterns, clusters, model = self._expanded_patterns()
         except KeyError as exc:
             return VerificationResult(
                 success=False, status="error", elapsed_time=time.monotonic() - start,
@@ -784,6 +1071,8 @@ class ReportContainsVerifier(BaseVerifier):
                 # can be read against what the agent wrote.
                 resolved = {slot: f"{name} ({location})" if location else name for slot, (name, location) in sorted(clusters.items())}
                 parts.append(f"cluster placeholders resolved to {resolved}")
+            if model is not None and (pattern_hits or pattern_missing or any_of_miss):
+                parts.append(f"model placeholder resolved to {model!r}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -1064,6 +1353,11 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
         result = entry.get("result")
         name = str(entry.get("name") or "")
         if not isinstance(result, str) or name.startswith(_KANBAN_TOOL_PREFIX):
+            continue
+        # A card's report relayed onto the conversation (the inject door's
+        # `report` posts) is a worker's own words too, as a kanban result is.
+        args = entry.get("args")
+        if isinstance(args, dict) and args.get("report") is True:
             continue
         if result == _WITHHELD_RESULT:
             withheld.append(f"a {name or 'tool'} result was withheld")
@@ -1970,6 +2264,11 @@ class ToolCalledVerifier(BaseVerifier):
                 raise ValueError(
                     f"agent selector pattern {pattern!r} carries a cluster placeholder, which only "
                     "report_contains's forbidden_patterns and any_of_patterns expand"
+                )
+            if _MODEL_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"agent selector pattern {pattern!r} carries a model placeholder, which only "
+                    "report_contains's pattern lists expand"
                 )
             compiled = re.compile(pattern)
             if compiled.fullmatch(""):
@@ -3697,6 +3996,12 @@ _NO_CHILD_ADDRESSEES_REASON = (
     "field, so this check could not be evaluated"
 )
 
+_NO_CHILD_COUNT_REASON = (
+    "the run did not report how many children its chain delegated: the record came "
+    "through a transport other than the inject door, or a door older than its "
+    "childCount field, so min_children/max_children could not be evaluated"
+)
+
 
 @VERIFIERS.register("delegated_to")
 class DelegatedToVerifier(BaseVerifier):
@@ -3705,23 +4010,35 @@ class DelegatedToVerifier(BaseVerifier):
     The inject door's read route names each child task's addressee once, in
     the order delegated (``childAddressees``): an AgentProfile's name, or
     ``platform``. The harness keeps that on the transcript
-    (``TranscriptSnapshot.child_addressees``). This reads it and nothing
-    else, so a case can grade which agent a session chose, which neither the
-    answer nor the trajectory says.
+    (``TranscriptSnapshot.child_addressees``), and the chain's child-task
+    count (``childCount``, ``TranscriptSnapshot.child_count``). This reads
+    those and nothing else, so a case can grade which agent a session chose,
+    and how often, which neither the answer nor the trajectory says.
 
     ``required_addressees``: Python regular expressions, each of which must
     ``re.fullmatch`` at least one addressee.
     ``forbidden_addressees``: Python regular expressions, none of which may
-    ``re.fullmatch`` any addressee. At least one of the two lists is set.
+    ``re.fullmatch`` any addressee.
+    ``min_children`` / ``max_children``: bounds, inclusive, on how many child
+    tasks the chain minted (``childCount``, kept as
+    ``TranscriptSnapshot.child_count``). That counts every delegation, so a
+    chain that delegated to ``platform`` three times counts 3 where the
+    addressees name ``platform`` once; ``min_children: 1`` with
+    ``max_children: 1`` asserts exactly one delegation. Non-negative, and
+    ``min_children`` is no greater than ``max_children``.
+    At least one of the four is set.
 
     Fails closed: a run that could not say (the api transport, which no CI
     lane uses, or a door older than the field) is ``status="error"``, never
-    a pass or a fail.
+    a pass or a fail. The addressees are needed on every run; the count only
+    when a bound is set.
     """
 
     type: Literal["delegated_to"]
     required_addressees: list[str] = Field(default_factory=list)
     forbidden_addressees: list[str] = Field(default_factory=list)
+    min_children: int | None = Field(default=None, ge=0)
+    max_children: int | None = Field(default=None, ge=0)
 
     @field_validator("required_addressees", "forbidden_addressees")
     @classmethod
@@ -3732,9 +4049,29 @@ class DelegatedToVerifier(BaseVerifier):
         return patterns
 
     @model_validator(mode="after")
-    def _one_list_set(self) -> "DelegatedToVerifier":
-        if not self.required_addressees and not self.forbidden_addressees:
-            raise ValueError("delegated_to needs required_addressees, forbidden_addressees, or both")
+    def _one_check_set(self) -> "DelegatedToVerifier":
+        if (
+            not self.required_addressees
+            and not self.forbidden_addressees
+            and self.min_children is None
+            and self.max_children is None
+        ):
+            raise ValueError(
+                "delegated_to needs at least one of required_addressees, forbidden_addressees, "
+                "min_children, max_children"
+            )
+        if (
+            self.min_children == 0
+            and self.max_children is None
+            and not self.required_addressees
+            and not self.forbidden_addressees
+        ):
+            # Every count is at least 0, so this alone could never fail.
+            raise ValueError("delegated_to min_children: 0 alone checks nothing; set a bound that can fail")
+        if self.min_children is not None and self.max_children is not None and self.min_children > self.max_children:
+            raise ValueError(
+                f"delegated_to min_children ({self.min_children}) is greater than max_children ({self.max_children})"
+            )
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
@@ -3754,16 +4091,33 @@ class DelegatedToVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_CHILD_ADDRESSEES_REASON,
             )
+        counted = self.min_children is not None or self.max_children is not None
+        if counted and snap.child_count is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_CHILD_COUNT_REASON,
+            )
         addressees = list(snap.child_addressees)
         missing = [p for p in self.required_addressees if not any(re.fullmatch(p, a) for a in addressees)]
         forbidden = [a for a in addressees if any(re.fullmatch(p, a) for p in self.forbidden_addressees)]
+        count = snap.child_count
+        too_few = count is not None and self.min_children is not None and count < self.min_children
+        too_many = count is not None and self.max_children is not None and count > self.max_children
         seen = addressees or "nobody"
-        if missing or forbidden:
+        if counted:
+            seen = f"{seen} in {count} child task(s)"
+        if missing or forbidden or too_few or too_many:
             parts = []
             if missing:
                 parts.append(f"no delegation went to an addressee matching {missing}")
             if forbidden:
                 parts.append(f"the chain delegated to forbidden addressee(s) {forbidden}")
+            if too_few:
+                parts.append(f"the chain minted {count} child task(s), fewer than min_children {self.min_children}")
+            if too_many:
+                parts.append(f"the chain minted {count} child task(s), more than max_children {self.max_children}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -5272,6 +5626,11 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
                 raise ValueError(
                     f"pattern {pattern!r} carries a cluster placeholder, which only report_contains "
+                    "expands; here it is literal text that never matches"
+                )
+            if _MODEL_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a model placeholder, which only report_contains "
                     "expands; here it is literal text that never matches"
                 )
             try:
@@ -8984,6 +9343,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
         "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
         "webhook-backend-unreachable", "serviceentry-host-collision", "webhook-ca-bundle-expired",
+        "wi-gsa-iam-binding-unverifiable",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -8992,7 +9352,8 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
         "pdb-overlapping", "untargeted-compute-class-workload", "hpa-aggressive-scaledown",
-        "ingress-gateway-healthcheck-mismatch", "image-pull-failing",
+        "ingress-gateway-healthcheck-mismatch", "network-daemonset-missing-ccc-toleration",
+        "image-pull-failing",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
@@ -9943,7 +10304,9 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool = False) -> str:
+def report_store_command(
+    audit: str, keys: tuple[str, ...] = (), excerpts: bool = False, fragments: tuple[str, ...] = (), mark: str = ""
+) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
@@ -9953,7 +10316,13 @@ def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool 
     and the ids of the findings in its ``document`` (this run's own, never ids it
     only carried), or the ``error`` that kept it unread. With ``excerpts``, also
     each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
-    which ``finish`` takes from the collector. The rest stays in the pod.
+    which ``finish`` takes from the collector. With ``fragments``, also
+    the ``title``, ``recommendation`` and ``remediation`` of each finding whose id contains
+    every fragment (``findings``); with ``mark``, how many envelopes of that
+    directory, ``latest.json`` and the ring, hold it (``mark_envelopes``). A
+    directory with a ring and no ``latest.json`` gives an entry with that count
+    alone: ``finish`` drops ``latest.json`` before it writes the ledger, and a
+    run that stops there has not lost the plant. The rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9973,9 +10342,34 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
                 str(f.get("id", "")): str((f.get("evidence") or {{}}).get("excerpt") or "")
                 for f in findings if isinstance(f, dict)
             }}
+        if {fragments!r}:
+            entry[{_LISTED_FINDINGS_KEY!r}] = [
+                {{"id": str(f.get("id", "")), "title": str(f.get("title", "")), "recommendation": f.get("recommendation"), "remediation": f.get("remediation")}}
+                for f in findings
+                if isinstance(f, dict) and all(part in str(f.get("id", "")) for part in {fragments!r})
+            ]
+        if {mark!r}:
+            ring = glob.glob(os.path.join(os.path.dirname(path), {_REPORT_RUNS_DIR!r}, "*.json"))
+            held = 0
+            for stored in [path, *ring]:
+                with open(stored, encoding="utf-8") as handle:
+                    held += {mark!r} in handle.read()
+            entry[{_LISTED_MARK_ENVELOPES_KEY!r}] = held
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
+if {mark!r}:
+    for runs in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*", "*", {_REPORT_RUNS_DIR!r}))):
+        if os.path.exists(os.path.join(os.path.dirname(runs), {_REPORT_LATEST_NAME!r})):
+            continue
+        try:
+            held = 0
+            for stored in glob.glob(os.path.join(runs, "*.json")):
+                with open(stored, encoding="utf-8") as handle:
+                    held += {mark!r} in handle.read()
+            out.append({{"path": runs, {_LISTED_MARK_ENVELOPES_KEY!r}: held}})
+        except Exception as exc:
+            out.append({{"path": runs, "error": str(exc)}})
 print({_REPORT_STORE_READ!r} + json.dumps(out))
 """
     return f"python3 -c {shlex.quote(script)}"
@@ -10010,10 +10404,16 @@ def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float)
 
 
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = (), excerpts: bool = False
+    shell: Callable[[str, float], str],
+    audit: str,
+    timeout: float,
+    keys: tuple[str, ...] = (),
+    excerpts: bool = False,
+    fragments: tuple[str, ...] = (),
+    mark: str = "",
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit, keys, excerpts), timeout)
+    reply = shell(report_store_command(audit, keys, excerpts, fragments, mark), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -10022,6 +10422,149 @@ def read_report_store(
     except (IndexError, json.JSONDecodeError):
         return None
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
+
+
+def _string_values(value: Any) -> Iterator[str]:
+    """Each string in ``value``, a JSON value: the values of its objects, the items of its lists."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
+
+
+def remediation_commands(note: str, prefix: str) -> list[list[str]]:
+    """The arguments of each command line in ``note`` that opens with ``prefix``.
+
+    Read as a shell reads the note: comment lines and trailing comments are
+    not commands, a backslash joins a line to the next, and the words of
+    ``prefix`` must be the line's first words (an empty ``prefix`` is every
+    command line). A line a shell could not split (an apostrophe in a
+    placeholder) is split on spaces instead.
+    """
+    want = prefix.split()
+    found = []
+    for line in note.replace(_SHELL_LINE_CONTINUATION, " ").splitlines():
+        # Cut the trailing comment before any split: an apostrophe on each
+        # side of the `#` would otherwise quote it into the command.
+        line = line.strip().split(_SHELL_TRAILING_COMMENT, 1)[0]
+        if not line or line.startswith(_SHELL_COMMENT_PREFIX):
+            continue
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            argv = line.split()
+        if argv[: len(want)] == want:
+            found.append(argv[len(want):])
+    return found
+
+
+def flag_values(argv: list[str], flag: str) -> list[str] | None:
+    """Each value ``flag`` takes in ``argv`` (``""`` for a bare flag), or None when it is absent.
+
+    The flag is matched whole: ``--enable-x`` is not ``--enable-x-on-y``.
+    """
+    values = []
+    for index, word in enumerate(argv):
+        if word == flag:
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            values.append("" if following.startswith(_FLAG_PREFIX) else following)
+        elif word.startswith(f"{flag}="):
+            values.append(word[len(flag) + 1:])
+    return values or None
+
+
+class StoredFindingCheck(BaseModel):
+    """One assertion over one finding of the stored document, read as data.
+
+    The finding is the one whose id contains every ``id_contains`` fragment.
+    ``remediation_kind`` is its ``remediation.kind``. The command fields read
+    ``remediation.note`` as commands (:func:`remediation_commands`): some line
+    opening with ``command_prefix`` must carry ``command_argument`` as a whole
+    word and every flag of ``command_flags``; no command line of the note,
+    whatever it opens with, may give a flag of ``no_cidr_value`` a literal
+    IPv4 address or range. ``forbidden_text`` must not occur
+    in the finding's ``recommendation`` or ``remediation``. ``title_contains``
+    must each occur in its ``title``: the witness that ``finish`` kept a
+    planted run's wording for this finding. ``title_lacks`` must each be
+    absent from it: the title holds nothing of a planted run's wording (the
+    impact, which ``finish`` keeps with the title, is not read). ``planted_mark`` is
+    the mark of a previous run the case's stack planted: when no envelope of
+    the store holds it, the plant is gone and the check is an error, not a pass.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id_contains: list[str] = Field(min_length=1)
+    remediation_kind: str | None = None
+    command_prefix: str | None = None
+    command_argument: str | None = None
+    command_flags: list[str] = Field(default_factory=list)
+    no_cidr_value: list[str] = Field(default_factory=list)
+    forbidden_text: list[str] = Field(default_factory=list)
+    title_contains: list[str] = Field(default_factory=list)
+    title_lacks: list[str] = Field(default_factory=list)
+    planted_mark: str | None = None
+
+    @model_validator(mode="after")
+    def _command_fields_need_a_prefix(self) -> "StoredFindingCheck":
+        reads_commands = bool(self.command_argument or self.command_flags or self.no_cidr_value)
+        if reads_commands and not self.command_prefix:
+            raise ValueError("command_argument, command_flags and no_cidr_value read the lines command_prefix names")
+        if self.command_prefix and not reads_commands:
+            raise ValueError("command_prefix alone asserts nothing: give command_argument, command_flags or no_cidr_value")
+        return self
+
+    def problems(self, finding: dict[str, Any]) -> list[str]:
+        """What this finding lacks, as reasons; empty when it passes."""
+        remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+        found = []
+        if self.remediation_kind is not None and remediation.get("kind") != self.remediation_kind:
+            found.append(f"remediation.kind is {remediation.get('kind')!r}, not {self.remediation_kind!r}")
+        if self.command_prefix:
+            lines = remediation_commands(str(remediation.get("note") or ""), self.command_prefix)
+            # A note with no such line gives no flag a literal range: that is
+            # the command check's red, never the range check's.
+            if not lines and (self.command_argument or self.command_flags):
+                found.append(f"remediation.note has no command line opening with {self.command_prefix!r}")
+            elif self.command_argument or self.command_flags:
+                complete = [
+                    argv
+                    for argv in lines
+                    if (not self.command_argument or self.command_argument in argv)
+                    and all(flag_values(argv, flag) is not None for flag in self.command_flags)
+                ]
+                if not complete:
+                    found.append(
+                        f"no {self.command_prefix!r} line names {self.command_argument!r} with every flag of {self.command_flags}"
+                    )
+            # Every command line, not only the prefixed ones: a second line
+            # in another spelling (`gcloud beta ...`) is still a command the
+            # reader is told to run.
+            every_line = remediation_commands(str(remediation.get("note") or ""), "")
+            for flag in self.no_cidr_value:
+                literal = [
+                    value for argv in every_line for value in flag_values(argv, flag) or [] if _CIDR_LITERAL_RE.search(value)
+                ]
+                if literal:
+                    found.append(f"{flag} is given a literal address or range: {literal}")
+        # The values, not a JSON dump of them: a dump escapes a quote, a line
+        # break and a letter outside ASCII, and it holds the key names too.
+        texts = list(_string_values([finding.get("recommendation"), finding.get("remediation")]))
+        held = [word for word in self.forbidden_text if any(word in text for text in texts)]
+        if held:
+            found.append(f"its recommendation or remediation holds {held}")
+        title = str(finding.get("title") or "")
+        missing = [word for word in self.title_contains if word not in title]
+        if missing:
+            found.append(f"its title does not hold {missing}")
+        kept = [word for word in self.title_lacks if word in title]
+        if kept:
+            found.append(f"its title holds {kept}")
+        return found
 
 
 class _StoredReportVerifier(_OnboardingPollVerifier):
@@ -10071,6 +10614,14 @@ class _StoredReportVerifier(_OnboardingPollVerifier):
 
     def _forced_envelope(self) -> dict[str, Any]:
         return {}
+
+    def _store_problem(self, envelopes: list[dict[str, Any]]) -> str:
+        """Why the store as it was read cannot be graded at all, or "": an error, not a fail."""
+        return ""
+
+    def _envelope_problem(self, envelope: dict[str, Any]) -> str:
+        """What a fresh envelope that passed every rule above still lacks, or ""."""
+        return ""
 
     def _read_listing(
         self,
@@ -10122,6 +10673,9 @@ class _StoredReportVerifier(_OnboardingPollVerifier):
         if not read_any:
             detail = f": {'; '.join(unread)}" if unread else ""
             return "error", f"{self._store_where()} could not be read{detail}", None
+        store_problem = self._store_problem(envelopes)
+        if store_problem:
+            return "error", store_problem, None
         fresh = []
         started_early = 0
         for envelope in envelopes:
@@ -10191,6 +10745,8 @@ class _StoredReportVerifier(_OnboardingPollVerifier):
                 failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
             elif unevidenced:
                 failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
+            elif lacking := self._envelope_problem(envelope):
+                failures.append(f"{envelope.get('repo')}: {lacking}")
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw
@@ -10224,6 +10780,8 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
     it: what the collector observed and ``finish`` published, read where it was
     stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
     also carries ids a run held without finding them.
+    ``finding`` reads one finding's title, recommendation and remediation as data
+    (:class:`StoredFindingCheck`).
 
     No envelope from this run is a fail: the audit published nothing where the
     store's readers look. A pod that cannot be read, or a run with no start
@@ -10232,6 +10790,7 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
 
     type: Literal["audit_report_stored"]
     audit: AuditId
+    finding: StoredFindingCheck | None = None
 
     def _stream(self) -> str:
         return self.audit
@@ -10245,3 +10804,40 @@ class AuditReportStoredVerifier(_StoredReportVerifier):
 
     def _state_shell(self) -> Callable[[str, float], str]:
         return onboarding.agent_shell
+
+    def _read_listing(
+        self,
+        shell: Callable[[str, float], str],
+        stream: str,
+        timeout: float,
+        keys: tuple[str, ...],
+        excerpts: bool,
+        state: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        # With a `finding` block the listing also carries the selected finding
+        # and the count of the envelopes that hold the planted mark.
+        if not self.finding:
+            return super()._read_listing(shell, stream, timeout, keys, excerpts, state)
+        listing = read_report_store(
+            shell, stream, timeout, keys, excerpts, tuple(self.finding.id_contains), self.finding.planted_mark or ""
+        )
+        return listing, None
+
+    def _store_problem(self, envelopes: list[dict[str, Any]]) -> str:
+        if self.finding and self.finding.planted_mark and not any(e.get(_LISTED_MARK_ENVELOPES_KEY) for e in envelopes):
+            return (
+                f"no stored {self.audit} envelope holds {self.finding.planted_mark!r}: the previous run the "
+                "stack planted is gone, so this run was not measured against it"
+            )
+        return ""
+
+    def _envelope_problem(self, envelope: dict[str, Any]) -> str:
+        if not self.finding:
+            return ""
+        if not envelope.get(_LISTED_FINDINGS_KEY):
+            return f"no finding in its document has an id containing every one of {self.finding.id_contains}"
+        return " | ".join(
+            f"{finding.get('id')}: {'; '.join(problems)}"
+            for finding in envelope[_LISTED_FINDINGS_KEY]
+            if (problems := self.finding.problems(finding))
+        )
