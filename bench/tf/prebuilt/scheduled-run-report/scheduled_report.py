@@ -27,8 +27,8 @@ does: a ring entry and `latest`. It's stamped an hour back, or just after the
 newest real run when that is newer, so the plant is the newest run, as
 `latest` is, and a real run in the last hour doesn't stop the case. When the
 ring has less than two free slots (the steady state of a busy stream), the
-oldest real entries are moved aside so the plant and one real run landing
-during the case still fit and no real run is pruned. A `latest` already there
+oldest real entries are moved aside, each with its writer record, so the plant
+and one real run landing during the case still fit and no real run is pruned. A `latest` already there
 is moved aside too. Every write lands under BROKER_STORE_ROOT. It refuses,
 writing nothing, when this container reads the broker store itself, when its
 store root is not BROKER_STORE_ROOT (by text and by real path), when an
@@ -78,6 +78,13 @@ RING_ASIDE = "eval-scheduled-run-ring-aside"
 # How far after the newest real run the plant is stamped when that run is
 # newer than REPORT_AGE, so the plant is the newest run, as `latest` is.
 AFTER_NEWEST = timedelta(seconds=1)
+# A ring entry's name, as the listener reads the ring (audit_report_store.py:
+# STAMP_RE); any other file in runs/ is not a run.
+STAMP_RE = re.compile(r"^[0-9]{8}T[0-9]{6}\.[0-9]{6}Z\Z")
+# The broker store's writer record beside a ring entry (audit_report_store.py:
+# REPORT_WRITER_SUFFIX). Its prune deletes a record whose entry is not in the
+# ring, so a record moves aside with its entry.
+WRITER_SUFFIX = ".writer"
 # A mark names the planted cluster, project and namespace and the finding id,
 # so it must be a DNS-1123 label of 3 to 32 characters, short enough to take
 # their suffixes.
@@ -236,7 +243,7 @@ def seed(audit_report, audit_id, mark, repo, now):
     if os.path.lexists(aside_dir):
         sys.exit(f"ERROR: an earlier plant was not torn down ({aside_dir} is still there); run teardown first.")
     runs = store / audit_report.REPORT_RUNS_DIR
-    real_runs = sorted(p.name for p in runs.glob("*.json")) if runs.is_dir() else []
+    real_runs = sorted(p.name for p in runs.glob("*.json") if STAMP_RE.match(p.stem)) if runs.is_dir() else []
     # Stamped an hour back, or just after the newest real run when that is
     # newer: a real run of the stream in the last hour must not stop the case.
     reported = now - REPORT_AGE
@@ -294,6 +301,9 @@ def seed(audit_report, audit_id, mark, repo, now):
         # Each named in the note before its move: teardown checks it exists.
         note["aside"].append(name)
         write_note(note_path, note)
+        writer = (runs / name).with_suffix(WRITER_SUFFIX)
+        if writer.is_file():
+            os.replace(writer, aside_dir / writer.name)
         os.replace(runs / name, aside_dir / name)
     if latest.is_file():
         # Named in the note before the move: teardown checks the backup exists.
@@ -383,11 +393,18 @@ def teardown_one(audit_report, note_path, note):
         held = aside_dir / Path(str(name)).name
         if Path(str(name)).name != name or not name.endswith(".json"):
             skipped = True
-        elif os.path.isfile(held):
-            if os.path.lexists(runs / name):
-                os.unlink(held)
-            else:
-                os.replace(held, runs / name)
+        else:
+            held_writer = held.with_suffix(WRITER_SUFFIX)
+            if os.path.isfile(held):
+                if os.path.lexists(runs / name):
+                    os.unlink(held)
+                else:
+                    os.replace(held, runs / name)
+            if os.path.isfile(held_writer):
+                if os.path.lexists(runs / held_writer.name):
+                    os.unlink(held_writer)
+                else:
+                    os.replace(held_writer, runs / held_writer.name)
     planted = note.get("latest_sha256")
     still_planted = latest.is_file() and (planted is None or sha256_of(latest) == planted)
     if planted is None and latest.is_file():

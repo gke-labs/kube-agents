@@ -15,9 +15,13 @@
 # A scenario driver for a case that asks about an audit run a scheduled task
 # wrote to the broker report store (#6110).
 #
-# It plants, in the broker store, one run of var.audit_id an hour old with one
-# critical finding whose cluster, project and namespace carry var.mark: what a
-# scheduled run on a profile worker leaves there. A case then asks what the
+# It plants, in the broker store, one run of var.audit_id with one critical
+# finding whose cluster, project and namespace carry var.mark: what a
+# scheduled run on a profile worker leaves there. The run is an hour old, or
+# just after the newest real run when that run is newer, so it is the newest
+# run. In a ring with fewer than two free slots, the oldest real entries move
+# to eval-scheduled-run-ring-aside/ in the store directory, with their writer
+# records, and come back on destroy. A case then asks what the
 # last audit found and checks that the reply names the mark. The shell sandbox
 # reads the plant only when it reads the broker store, which is the change
 # #6110 makes; on a sandbox that keeps its own file store the reply can't name
@@ -29,8 +33,8 @@
 # It writes the report with the function `finish` uses, and refuses unless its
 # store root is the broker store's. The destroy removes what the seed wrote,
 # by exact path, from the note the seed keeps beside the store, which it finds
-# by var.mark without resolving the repository again, and puts back any
-# `latest` the seed moved aside.
+# by var.mark without resolving the repository again, and puts back the ring
+# entries and any `latest` the seed moved aside.
 
 terraform {
   required_version = ">= 1.5.0"

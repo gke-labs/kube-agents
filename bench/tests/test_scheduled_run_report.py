@@ -535,3 +535,29 @@ def test_the_stack_keeps_shell_syntax_out_of_gitops_repo():
     variables = (STACK / "variables.tf").read_text(encoding="utf-8")
     block = variables[variables.index('variable "gitops_repo"') :]
     assert 'regex("^[A-Za-z0-9._/-]*$", var.gitops_repo)' in block
+
+
+def test_a_ring_entry_moves_aside_with_its_writer_record(store):
+    names = full_ring()
+    oldest = (stream() / "runs" / names[0]).with_suffix(plant.WRITER_SUFFIX)
+    oldest.write_text('{"writer": "shell"}')
+    before = snapshot(store)
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    # While aside, runs/ holds no record without its entry for the listener's
+    # prune to delete.
+    runs = stream() / "runs"
+    for record in runs.glob(f"*{plant.WRITER_SUFFIX}"):
+        assert (runs / f"{record.stem}.json").exists()
+    assert (stream() / plant.RING_ASIDE / oldest.name).is_file()
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert snapshot(store) == before
+
+
+def test_a_file_in_the_ring_that_is_no_stamp_is_not_a_run(store):
+    runs = stream() / "runs"
+    runs.mkdir(parents=True)
+    (runs / "zz-notes.json").write_text("{}")
+    before = snapshot(store)
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert snapshot(store) == before
