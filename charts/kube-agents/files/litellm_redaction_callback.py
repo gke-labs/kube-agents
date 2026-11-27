@@ -20,7 +20,8 @@ Anthropic tool input sent as a string) are decoded, walked as a document and
 re-encoded only if a rule changed them, so they stay valid JSON. A tool's
 output that is a whole JSON object or array (a chat tool message's string
 content, an Anthropic tool result's string or text parts, a Responses function
-call output, a top-level string in a Gemini function response's response) is
+call output, a top-level string in a Gemini function response's response, up
+to 64 of them) is
 decoded the same way, up to 256 KiB and 64 levels deep, and so is whole JSON
 inside it, two levels in at most. It still gets the text rules over its string
 too, and a string the structure rules mask whole where it sits is not opened,
