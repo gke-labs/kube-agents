@@ -644,20 +644,52 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 stack.extend((child, level + 1) for child in (node.values() if isinstance(node, dict) else node))
         return True
 
+    @staticmethod
+    def _context_keys() -> tuple:
+        """The sibling keys the structure rules read beside a value: a
+        mapping's kind (a Secret) and an env entry's name."""
+        module = sys.modules.get(AuditRedactor.__module__)
+        return (getattr(module, "KIND_KEY", "kind"), getattr(module, "ENV_NAME_KEY", "name"))
+
     def _masked_whole(self, root: Any, path: tuple) -> bool:
         """Whether the structure rules would mask the string at path in root
         whole (it sits under a credential key, in a Secret's data, as a
         credential env value). Such a string is never decoded: it stays a
         string and is masked as one."""
-        probe = copy.deepcopy(root)
-        self._put(probe, path, MASK_PROBE)
-        walked, _ = AuditRedactor.redact_counted(probe, self._rules)
+        # The structure rules look at most two levels up from a value: its
+        # key, its mapping (an env entry's name), and that mapping's own
+        # mapping (a Secret's kind beside data). So the probe is that much
+        # context only, a fixed cost whatever the size of root.
         try:
-            return self._get(walked, path) != MASK_PROBE
+            parent = self._get(root, path[:-1])
+            grand = self._get(root, path[:-2]) if len(path) >= 2 else None
+        except (KeyError, IndexError, TypeError):
+            return True
+        key = path[-1]
+        mini: Any = {key: MASK_PROBE}
+        context = self._context_keys()
+        if isinstance(parent, dict):
+            mini.update({k: parent[k] for k in context if k != key and isinstance(parent.get(k), str)})
+        elif isinstance(key, int):
+            mini = [MASK_PROBE]
+            key = 0
+        where: tuple = (key,)
+        if isinstance(grand, dict) and len(path) >= 2:
+            outer = {k: grand[k] for k in context if k != path[-2] and isinstance(grand.get(k), str)}
+            outer[path[-2] if not isinstance(path[-2], int) else "_"] = mini
+            if isinstance(path[-2], int):
+                outer["_"] = [mini]
+                where = ("_", 0, key)
+            else:
+                where = (path[-2], key)
+            mini = outer
+        walked, _ = AuditRedactor.redact_counted(mini, self._rules)
+        try:
+            return self._get(walked, where) != MASK_PROBE
         except (KeyError, IndexError, TypeError):
             return True
 
-    def _decode_output(self, path: tuple, value: Any, found: List[tuple], level: int = 0) -> None:
+    def _decode_output(self, path: tuple, value: Any, found: List[tuple], level: int = 0, budget: Optional[List[int]] = None) -> None:
         """Note value as a document to walk when it is a whole JSON object or
         array within the bounds, then the same for whole-JSON strings inside
         it. Anything else is left a string and matched as text."""
@@ -688,7 +720,8 @@ class KubeAgentsRedactionCallback(CustomLogger):
         found.append((path, value, document, self._style(value)))
         if level + 1 >= TOOL_OUTPUT_MAX_NESTING:
             return
-        nested = 0
+        # One budget per tool output, shared down the nesting.
+        budget = budget if budget is not None else [TOOL_OUTPUT_MAX_NESTED]
         stack: List[tuple] = [((), document)]
         while stack:
             rel, node = stack.pop()
@@ -696,11 +729,11 @@ class KubeAgentsRedactionCallback(CustomLogger):
             for key, child in items:
                 if isinstance(child, str):
                     body = child.strip()
-                    if not body or body[0] not in "{[" or nested >= TOOL_OUTPUT_MAX_NESTED:
+                    if not body or body[0] not in "{[" or budget[0] <= 0:
                         continue
-                    nested += 1
+                    budget[0] -= 1
                     if not self._masked_whole(document, rel + (key,)):
-                        self._decode_output(path + rel + (key,), child, found, level + 1)
+                        self._decode_output(path + rel + (key,), child, found, level + 1, budget)
                 elif isinstance(child, (dict, list)):
                     stack.append((rel + (key,), child))
 
@@ -737,12 +770,16 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 for key in GEMINI_FUNCTION_RESPONSE_KEYS:
                     response = part.get(key) if isinstance(part, dict) else None
                     body = response.get(GEMINI_RESPONSE_KEY) if isinstance(response, dict) else None
+                    budget = [TOOL_OUTPUT_MAX_NESTED]
                     for name, value in (body.items() if isinstance(body, dict) else ()):
+                        if not isinstance(value, str) or value.strip()[:1] not in ("{", "[") or budget[0] <= 0:
+                            continue
+                        budget[0] -= 1
                         # A string the structure rules mask whole where it
                         # sits stays a string.
-                        if isinstance(value, str) and value.strip()[:1] in ("{", "[") and self._masked_whole(body, (name,)):
+                        if self._masked_whole(body, (name,)):
                             continue
-                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found)
+                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found, 0, budget)
         return found
 
     @staticmethod
