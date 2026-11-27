@@ -312,7 +312,7 @@ class CaseSpec:
     positive entry that would have passed, or pass a negated one that would
     have failed, and never the other way. So on a record holding such a
     call to a named tool, the scorer sets aside a positive entry that
-    failed, a negated one that passed, and a mixed one whatever it recorded
+    failed, a negated one that passed, and a mixed one that passed or failed (an error stays, for rung 2)
     (``scoring._inject_lane_view``)."""
 
     worker_calls_checks: frozenset[str] = frozenset()
