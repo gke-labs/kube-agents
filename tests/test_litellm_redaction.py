@@ -740,6 +740,36 @@ class TestCallback(unittest.TestCase):
                 with self.subTest(text=text[:40], call=call):
                     self.assertNotIn(secret, get(self._run(req, call)))
 
+    def test_markers_and_plain_strings_do_not_use_the_nested_budget(self) -> None:
+        # Forty IPs become forty [ip:...] markers before decoding; the nested
+        # shell result is still decoded.
+        # The result comes first, so the walk reaches the markers before it.
+        doc = {"result": {"stdout": self._KEYED}, "pods": ["10.0.0.%d" % i for i in range(1, 41)],
+               "logs": ["[INFO] line %d" % i for i in range(40)]}
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": json.dumps(doc)}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+
+    def test_json_nested_under_a_secrets_data_string_is_masked_whole(self) -> None:
+        inner = json.dumps({"cfg": json.dumps({"v": "opaque-zz"})})
+        text = json.dumps({"kind": "Secret", "data": inner})
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-zz", out)
+
+    def test_a_number_under_a_credential_key_leaves_the_rest_to_the_structure_rules(self) -> None:
+        text = '{"token": 123456789, "auth": "opaque-value-xyz", "n": [1, 2]}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("123456789", out)
+        self.assertNotIn("opaque-value-xyz", out)
+        json.loads(out)
+
+    def test_an_operator_rule_matching_the_probe_word_does_not_stop_decoding(self) -> None:
+        config = dict(_RULES_CONFIG, rules=_RULES_CONFIG["rules"] + [{"name": "ours", "literal": "kube-agents"}])
+        hook = _load_callback_module(config).proxy_handler_instance
+        output = json.dumps({"exit_code": 0, "stdout": self._KEYED})
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
+        out = asyncio.run(hook.async_pre_call_hook({}, None, req, "agenerate_content"))
+        self.assertNotIn("opaque-value-xyz", json.dumps(out))
+
     def test_a_tool_output_with_a_repeated_key_gets_the_text_rules_only(self) -> None:
         # The decoder would keep one value; what the text says is what counts.
         text = '{"kind":"Secret","kind":"Other","data":{"k":"opaque-value-xyz"}}'

@@ -190,6 +190,10 @@ TOOL_OUTPUT_MAX_FIELDS = 64
 # Stands in for a string while asking whether the structure rules would mask
 # it whole where it sits (a credential key, a Secret's data, an env value).
 MASK_PROBE = "kube-agents-redaction-probe"
+# A text rule's marker standing as a bare JSON value, where a number was.
+BARE_MARKER = re.compile(r"\[REDACTED_[A-Z0-9_]+\](?=\s*[,}\]])")
+# A string that is one marker and nothing else.
+WHOLE_MARKER = re.compile(r"\[(?:REDACTED_[A-Z0-9_]+|[A-Za-z0-9_.\-]+:[0-9a-f]{12})\]\Z")
 TOOL_ROLE = "tool"
 TEXT_TYPE = "text"
 TEXT_KEY = "text"
@@ -636,6 +640,46 @@ class KubeAgentsRedactionCallback(CustomLogger):
         return indent, separators, "\n" if text.endswith("\n") else ""
 
     @staticmethod
+    def _quote_bare_markers(text: str) -> str:
+        """Quote each marker that stands where a JSON value goes, outside any
+        string (after a colon, a comma or an opening bracket), so the text
+        rules' result over JSON is JSON again. A marker inside a string,
+        escaped JSON included, is left alone."""
+        if "[REDACTED_" not in text:
+            return text
+        out: List[str] = []
+        in_string = escaped = False
+        last = ""
+        i = 0
+        while i < len(text):
+            c = text[i]
+            if in_string:
+                out.append(c)
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == '"':
+                    in_string = False
+                    last = c
+                i += 1
+                continue
+            if c == '"':
+                in_string = True
+            elif c == "[" and last in (":", ",", "["):
+                match = BARE_MARKER.match(text, i)
+                if match:
+                    out.append('"' + match.group(0) + '"')
+                    last = '"'
+                    i = match.end()
+                    continue
+            if not c.isspace():
+                last = c
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
     def _depth(document: Any, limit: int) -> bool:
         """Whether document nests no deeper than limit, without recursion."""
         stack = [(document, 1)]
@@ -654,59 +698,70 @@ class KubeAgentsRedactionCallback(CustomLogger):
         module = sys.modules.get(AuditRedactor.__module__)
         return (getattr(module, "KIND_KEY", "kind"), getattr(module, "ENV_NAME_KEY", "name"))
 
-    def _masked_whole(self, root: Any, path: tuple) -> bool:
+    def _masked_whole(self, root: Any, path: tuple, outer: Optional[tuple] = None) -> bool:
         """Whether the structure rules would mask the string at path in root
         whole (it sits under a credential key, in a Secret's data, as a
         credential env value). Such a string is never decoded: it stays a
-        string and is masked as one."""
+        string and is masked as one. outer is (mapping, key) for where root
+        itself sits when root was decoded from a string, so a value one level
+        into root still sees its grandparent."""
         # The structure rules look at most two levels up from a value: its
         # key, its mapping (an env entry's name), and that mapping's own
         # mapping (a Secret's kind beside data). So the probe is that much
-        # context only, a fixed cost whatever the size of root.
+        # context only, a fixed cost whatever the size of root, and it runs
+        # the structure walk alone: no text rule can rewrite the probe.
         try:
             parent = self._get(root, path[:-1])
-            grand = self._get(root, path[:-2]) if len(path) >= 2 else None
+            if len(path) >= 2:
+                grand, grand_key = self._get(root, path[:-2]), path[-2]
+            elif outer is not None:
+                grand, grand_key = outer
+            else:
+                grand, grand_key = None, None
         except (KeyError, IndexError, TypeError):
             return True
-        key = path[-1]
-        mini: Any = {key: MASK_PROBE}
         context = self._context_keys()
+        key = path[-1]
         if isinstance(parent, dict):
-            mini.update({k: parent[k] for k in context if k != key and isinstance(parent.get(k), str)})
-        elif isinstance(key, int):
-            mini = [MASK_PROBE]
-            key = 0
-        where: tuple = (key,)
-        if isinstance(grand, dict) and len(path) >= 2:
-            outer = {k: grand[k] for k in context if k != path[-2] and isinstance(grand.get(k), str)}
-            outer[path[-2] if not isinstance(path[-2], int) else "_"] = mini
-            if isinstance(path[-2], int):
-                outer["_"] = [mini]
-                where = ("_", 0, key)
-            else:
-                where = (path[-2], key)
-            mini = outer
-        walked, _ = AuditRedactor.redact_counted(mini, self._rules)
+            mini: Any = {k: parent[k] for k in context if k != key and isinstance(parent.get(k), str)}
+            mini[key] = MASK_PROBE
+            where: tuple = (key,)
+        else:
+            mini, where = [MASK_PROBE], (0,)
+        if isinstance(grand, dict) and isinstance(grand_key, str):
+            wrapper = {k: grand[k] for k in context if k != grand_key and isinstance(grand.get(k), str)}
+            wrapper[grand_key] = mini
+            mini, where = wrapper, (grand_key,) + where
+        elif isinstance(grand, list):
+            mini, where = [mini], (0,) + where
+        walked = AuditRedactor.redact(mini)
         try:
             return self._get(walked, where) != MASK_PROBE
         except (KeyError, IndexError, TypeError):
             return True
 
-    def _decode_output(self, path: tuple, value: Any, found: List[tuple], counts: Dict[str, int], level: int = 0, budget: Optional[List[int]] = None) -> None:
+    def _decode_output(self, path: tuple, value: Any, found: List[tuple], counts: Dict[str, int], level: int = 0,
+                       budget: Optional[List[int]] = None, outer: Optional[tuple] = None) -> bool:
         """Note value as a document to walk when it is a whole JSON object or
         array within the bounds, then the same for whole-JSON strings inside
-        it. Anything else is left a string and matched as text."""
+        it. Anything else is left a string and matched as text. Returns
+        whether value was decoded."""
         if not isinstance(value, str) or level >= TOOL_OUTPUT_MAX_NESTING:
-            return
+            return False
         body = value.strip()
         if not body or body[0] not in "{[" or len(value.encode("utf-8", "replace")) > TOOL_OUTPUT_MAX_BYTES:
-            return
+            return False
         # The text rules run first, over the string as it came, exactly as
         # they would without decoding; what is decoded is their result. The
         # structure rules can then only add to it, whatever the escapes or
         # layout of the original, and a re-encode only reformats text that
         # is already masked.
         masked, made = AuditRedactor.redact_counted(value, self._rules)
+        # A text rule writes its marker in place of a bare value (a number
+        # under a credential key) without quotes; quoted, the result is JSON
+        # again. A marker this lands on inside a string breaks the parse, and
+        # the output keeps the text rules' result.
+        masked = self._quote_bare_markers(masked)
         repeated = False
 
         def pairs(items: List[tuple]) -> Dict[str, Any]:
@@ -718,19 +773,19 @@ class KubeAgentsRedactionCallback(CustomLogger):
         try:
             document = json.loads(masked, object_pairs_hook=pairs)
         except (ValueError, RecursionError):
-            return
+            return False
         if not isinstance(document, (dict, list)) or not self._depth(document, TOOL_OUTPUT_MAX_DEPTH):
-            return
+            return False
         # A repeated key: the decoder keeps one value, so what the structure
         # rules would see differs from the text. Such output stays a string
         # and gets the text rules only, as before.
         if repeated:
-            return
+            return False
         found.append((path, masked, document, self._style(masked)))
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
         if level + 1 >= TOOL_OUTPUT_MAX_NESTING:
-            return
+            return True
         # One budget per tool output, shared down the nesting.
         budget = budget if budget is not None else [TOOL_OUTPUT_MAX_NESTED]
         stack: List[tuple] = [((), document)]
@@ -740,13 +795,18 @@ class KubeAgentsRedactionCallback(CustomLogger):
             for key, child in items:
                 if isinstance(child, str):
                     body = child.strip()
-                    if not body or body[0] not in "{[" or budget[0] <= 0:
+                    # A text rule's marker ([REDACTED_...], [ip:...]) and other
+                    # strings that aren't JSON never use the budget: it counts
+                    # only strings that decode.
+                    if not body or body[0] not in "{[" or WHOLE_MARKER.match(body) or budget[0] <= 0:
                         continue
-                    budget[0] -= 1
-                    if not self._masked_whole(document, rel + (key,)):
-                        self._decode_output(path + rel + (key,), child, found, counts, level + 1, budget)
+                    if self._masked_whole(document, rel + (key,), outer):
+                        continue
+                    if self._decode_output(path + rel + (key,), child, found, counts, level + 1, budget, (node, key)):
+                        budget[0] -= 1
                 elif isinstance(child, (dict, list)):
                     stack.append((rel + (key,), child))
+        return True
 
     def _tool_outputs(self, data: Dict[str, Any], counts: Dict[str, int]) -> List[tuple]:
         """(path, string, document, style) for each tool output that is a
