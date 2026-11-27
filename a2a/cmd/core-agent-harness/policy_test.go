@@ -605,6 +605,15 @@ func TestAPersonaShellRunsAnyCommand(t *testing.T) {
 		// not this shell's boundary (the sandbox and the broker are).
 		"echo x; kubectl delete pod p": true,
 		"rm -rf /":                     false,
+		// core-agent's sandbox, on by default, refuses a write target
+		// outside the workspace in this mode: a redirection, or a path a
+		// cp, mv, mkdir, tee and the like would write.
+		"kubectl get pods -o yaml > /home/agent/pods.yaml": false,
+		"cp /scratch/out /etc/out":                         false,
+		// Its search gate refuses a search-shaped command while the native
+		// grep and glob tools are registered.
+		"grep -rn checkout-gateway .": false,
+		"find . -name '*.yaml'":       false,
 	} {
 		if got := gate.CheckBash(context.Background(), cmd) == nil; got != want {
 			t.Errorf("CheckBash(%q) allowed=%v, want %v", cmd, got, want)
@@ -613,8 +622,8 @@ func TestAPersonaShellRunsAnyCommand(t *testing.T) {
 }
 
 // TestAnyShellCommandNeedsTheShellAndNoWrite: a policy that runs any shell
-// command must grant the shell, and may not grant a file write, whose
-// workspace scope that mode drops.
+// command must grant the shell, and may not grant a file write, which that
+// mode's path scope wouldn't confine.
 func TestAnyShellCommandNeedsTheShellAndNoWrite(t *testing.T) {
 	for name, p := range map[string]coreagentwire.Policy{
 		"no shell": {Tools: []string{"read_file"}, AnyShellCommand: true},
