@@ -68,6 +68,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -4474,6 +4475,25 @@ INFLIGHT_TTL_SECONDS = 2 * 60 * 60
 # The keys of the in-flight note that `start` writes.
 INFLIGHT_AUDIT_KEY = "audit"
 INFLIGHT_STARTED_KEY = "started_at"
+# The run id `start` made for a run in the shell, for `finish` to mark that
+# run's run-start record done (#6812). A profile worker's run id is its task
+# id, read from its own task credential instead.
+INFLIGHT_RUN_ID_KEY = "run_id"
+# A run id `start` makes when no task credential names one: this prefix and
+# RUN_ID_RANDOM_BYTES random bytes in hex, a DNS-1123 label.
+RUN_ID_LOCAL_PREFIX = "local-"
+RUN_ID_RANDOM_BYTES = 6
+# A Hermes-scheduled run in the shell has a per-run name of its own:
+# deploy/sandbox/session-command.sh exports it as HERMES_CRON_RUN, taken from
+# the run's working directory `<home>/cron/runs/<job>_<execution>`, and where
+# only the directory is there (the agent pod) it is read from the cwd the same
+# way, in the same grammar. The run id is this prefix and the first
+# RUN_ID_CRON_HEX hex digits of the name's sha256, a DNS-1123 label.
+CRON_RUN_ENV = "HERMES_CRON_RUN"
+CRON_RUNS_SEGMENT = "/cron/runs/"
+CRON_RUN_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+RUN_ID_CRON_PREFIX = "cron-"
+RUN_ID_CRON_HEX = 16
 
 
 def _in_flight_since(path: Path) -> float | None:
@@ -4515,7 +4535,7 @@ def _in_flight_since(path: Path) -> float | None:
         return None
 
 
-def claim_in_flight(audit_id: str) -> None:
+def claim_in_flight(audit_id: str, run_id: str | None = None) -> None:
     """Refuse a second `start` while a run of this stream is under way.
 
     Every path `start` scrubs — the run record, the declarations, the
@@ -4618,7 +4638,13 @@ def claim_in_flight(audit_id: str) -> None:
         staged = Path(f"{path}.tmp")
         try:
             staged.write_text(
-                json.dumps({INFLIGHT_AUDIT_KEY: audit_id, INFLIGHT_STARTED_KEY: time.time()}),
+                json.dumps(
+                    {
+                        INFLIGHT_AUDIT_KEY: audit_id,
+                        INFLIGHT_STARTED_KEY: time.time(),
+                        **({INFLIGHT_RUN_ID_KEY: run_id} if run_id else {}),
+                    }
+                ),
                 encoding="utf-8",
             )
             os.replace(staged, path)
@@ -4652,6 +4678,190 @@ def release_in_flight(audit_id: str) -> None:
     is a change to the SOP contract and not made here.
     """
     Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
+
+
+def cron_run_id() -> str | None:
+    """The run id of a Hermes-scheduled run in the shell, or None for any other run.
+
+    From HERMES_CRON_RUN when set, else from the cwd when it lies under
+    `<...>/cron/runs/<name>`, read as session-command.sh's
+    export_cron_run_var reads it; the name in that function's grammar alone.
+    The same for every command of one run, and for no other run, so `start`
+    and `finish` each compute it without the in-flight note.
+    """
+    name = os.environ.get(CRON_RUN_ENV, "")
+    if not name:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            return None
+        _, found, rest = cwd.partition(CRON_RUNS_SEGMENT)
+        name = rest.split("/", 1)[0] if found else ""
+    if not CRON_RUN_NAME_RE.match(name):
+        return None
+    return RUN_ID_CRON_PREFIX + hashlib.sha256(name.encode("utf-8")).hexdigest()[:RUN_ID_CRON_HEX]
+
+
+def new_run_id() -> str:
+    """The id of the run `start` is opening (#6812).
+
+    A profile worker's task id, from its own task credential: no other run
+    has it, so a late `finish` of an older task cannot mark this one done. A
+    Hermes-scheduled run in the shell: its cron run's id (`cron_run_id`),
+    which `finish` computes again for itself. A run started by hand in the
+    shell: a fresh random id, which `start` keeps in the in-flight note for
+    `finish`.
+    """
+    return (
+        _report_status().task_id_from_credential()
+        or cron_run_id()
+        or RUN_ID_LOCAL_PREFIX + secrets.token_hex(RUN_ID_RANDOM_BYTES)
+    )
+
+
+def run_is_scheduled(flag: bool = False) -> bool:
+    """Whether the run `start` is opening is a scheduled one (#6812).
+
+    `start` works this out itself, so no prompt has to remember a flag:
+
+    - a Hermes cron run: HERMES_CRON_RUN is set, or the cwd lies under
+      `<home>/cron/runs/<name>`, the detection `cron_run_id` makes for the run
+      id;
+    - a profile task whose task credential carries a builtin schedule's
+      trigger (`origin: builtin`, named `schedule/<name>`,
+      `report_status.task_trigger_is_schedule`).
+
+    `start --scheduled` (`flag`) is still taken as an override. Any other run,
+    one started by hand in the shell, is not scheduled.
+    """
+    return bool(flag) or cron_run_id() is not None or _report_status().task_trigger_is_schedule()
+
+
+def this_run_id(audit_id: str) -> str | None:
+    """The id of the run `finish` is closing, or None when it cannot be told.
+
+    The task credential's task id, or the cron run's id, each computed here
+    as `new_run_id` computed it, never read from the note. Only a run started
+    by hand in the shell falls back to the id `start` kept in the stream's
+    in-flight note. That note is the stream's, not the run's: such a run that
+    outlived its lease after a later `start` replaced the note reads the later
+    run's id, the known limit `release_in_flight` names. Read before `finish`
+    releases the note.
+    """
+    task = _report_status().task_id_from_credential() or cron_run_id()
+    if task:
+        return task
+    try:
+        note = json.loads(Path(inflight_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(note, dict) or note.get(INFLIGHT_AUDIT_KEY) != audit_id:
+        return None
+    run_id = note.get(INFLIGHT_RUN_ID_KEY)
+    status = _report_status()
+    return run_id if isinstance(run_id, str) and status.RUN_ID_RE.match(run_id) else None
+
+
+# One line per process for a run-start record the store would not take, so a
+# store that predates the records costs each run one line, not one per call.
+_RUN_START_LOGGED: set[str] = set()
+
+
+def _log_run_start_once(message: str) -> None:
+    if message not in _RUN_START_LOGGED:
+        _RUN_START_LOGGED.add(message)
+        log(message)
+
+
+def _run_start_store(audit_id: str, repo: str):
+    """The store root `report_status` reads run-start records from: the broker
+    client, or the file store's root."""
+    client = _report_store_client()
+    if client is not None:
+        return client
+    return str(Path(os.environ.get("FLEET_AUDIT_REPORTS_DIR") or REPORTS_DIR))
+
+
+def _run_start_refused(exc: BaseException) -> bool:
+    """Whether `exc` is a broker or listener that does not know the record's
+    name: a broker from before #6812 answers 404 for the route, a listener
+    400 for a run that is not a stamp."""
+    status = _report_status()
+    return isinstance(exc, status.ReportStoreError) and exc.status in (400, 404)
+
+
+def record_run_start(audit_id: str, repo: str, run_id: str, scheduled: bool, now: datetime) -> None:
+    """Write this run's run-start record (#6812). Best-effort: never stops the run.
+
+    A store that refuses it (an older broker or listener) or fails is logged
+    once, and the run goes on untracked: a reader then says nothing about it.
+    A stream with no store for `repo` yet (its first run there) is untracked
+    and says nothing: a record never creates a store.
+    """
+    status = _report_status()
+    try:
+        record = status.run_start_record(run_id, now.astimezone(timezone.utc).isoformat(), scheduled)
+        status.write_run_start(_run_start_store(audit_id, repo), audit_id, repo, record)
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 -- a record a store won't take must not stop the run
+        if _run_start_refused(exc):
+            _log_run_start_once(
+                f"NOTE: the report store does not take run-start records yet ({exc}); "
+                f"this run of {audit_id} goes on, and a reader will not see it if it does not finish."
+            )
+        else:
+            _log_run_start_once(
+                f"WARNING: the run-start record for {audit_id} was not written ({exc}); "
+                "this run goes on untracked."
+            )
+
+
+def mark_run_done(audit_id: str, run_id: str | None, repos: list, outcome: str, now: datetime) -> bool:
+    """Mark this run's run-start record done (#6812), matched by run id. Best-effort.
+
+    Reads the record named for `run_id` in the first of `repos` that holds one
+    and rewrites it with `done_at` and `outcome`, keeping its `started_at`. A
+    run with no record (its `start` was refused, or ran before records
+    existed) writes nothing: a done mark with no start would be no record. A
+    late `finish` of an older run marks that run's record alone, so a newer
+    run's stays unfinished. Returns whether a mark was written.
+    """
+    if not run_id:
+        return False
+    status = _report_status()
+    for repo in dict.fromkeys(repo for repo in repos if isinstance(repo, str) and repo):
+        try:
+            store = _run_start_store(audit_id, repo)
+            record = status.read_run_start(store, audit_id, repo, run_id)
+            if record is None:
+                continue
+            done = status.run_start_record(
+                run_id,
+                record["started_at"],
+                record.get("scheduled") is True,
+                done_at=now.astimezone(timezone.utc).isoformat(),
+                outcome=outcome,
+            )
+            status.write_run_start(store, audit_id, repo, done)
+            return True
+        except Exception as exc:  # noqa: BLE001 -- the run has published; the mark is for readers
+            if not _run_start_refused(exc):
+                _log_run_start_once(f"WARNING: the run-start record of {audit_id} was not marked done ({exc}).")
+    return False
+
+
+def _mark_finished(audit_id: str, run_id: str | None, stored: dict | None) -> None:
+    """`finish` published: mark its run done where `start` recorded it.
+
+    Where: the repository `start` recorded in the run record, then the one the
+    stored envelope names. The outcome is the envelope's `status`, or
+    `unstored` when the store did not keep it.
+    """
+    record = read_run_record(audit_id) or {}
+    repos = [record.get("repo"), (stored or {}).get("repo")]
+    outcome = str((stored or {}).get("status") or "unstored")
+    mark_run_done(audit_id, run_id, repos, outcome, datetime.now(timezone.utc))
 
 
 def inflight_started_at(audit_id: str, now: float) -> float | None:
@@ -23407,9 +23617,10 @@ def handle_start(args: argparse.Namespace) -> None:
     shadow = shadow_mode(args, "start")
     if shadow and getattr(args, "repo", None):
         raise ValidationError(f"--repo: a shadow run ({STORE_ONLY_FLAG}) publishes to no repository.")
-    claim_in_flight(audit_id)
+    run_id = new_run_id()
+    claim_in_flight(audit_id, run_id)
     try:
-        _start(args, audit_id, shadow=shadow)
+        _start(args, audit_id, run_id, shadow=shadow)
     except BaseException:
         # A `start` that raised left no run in flight, so the retry must not
         # be refused for its own failure. The refusal above sits outside this
@@ -23419,7 +23630,7 @@ def handle_start(args: argparse.Namespace) -> None:
         raise
 
 
-def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> None:
+def _start(args: argparse.Namespace, audit_id: str, run_id: str | None = None, *, shadow: bool = False) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -23446,6 +23657,19 @@ def _start(args: argparse.Namespace, audit_id: str, *, shadow: bool = False) -> 
     else:
         decision = resolve_reachable_repo(audit_id, opt_repo)
     repo, unreachable = decision.publish_repo, decision.unreachable
+    # As soon as the stream's repository is known, before anything else here
+    # can fail: a run that dies from here on leaves a record with no done
+    # mark, which readers show as a run that did not finish (#6812). A shadow
+    # run records none: its report goes to its own stream, and a shadow run
+    # that died would otherwise read as an unfinished run of the live audit.
+    if run_id and not shadow:
+        record_run_start(
+            audit_id,
+            repo,
+            run_id,
+            run_is_scheduled(bool(getattr(args, "scheduled", False))),
+            datetime.now(timezone.utc),
+        )
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
     # report there.
@@ -26448,6 +26672,8 @@ def handle_finish(args: argparse.Namespace) -> None:
         # A preview taken mid-run: the run is still in flight and keeps its note.
         _finish(args, audit_id)
         return
+    # Before the note is released below: in the shell it holds the run id.
+    run_id = this_run_id(audit_id)
     try:
         stored = _finish(args, audit_id)
     except ValidationError:
@@ -26473,6 +26699,9 @@ def handle_finish(args: argparse.Namespace) -> None:
         # cannot tell whose it is; run identity decides this and is not here.
         release_in_flight(audit_id)
         raise
+    # Only a published run is marked done: a `finish` that raised leaves its
+    # record unfinished, and readers say the last run did not finish.
+    _mark_finished(audit_id, run_id, stored)
     release_in_flight(audit_id)
     if getattr(args, "store_only", False):
         # The gate's record is the live stream's; a shadow run leaves it alone.
@@ -26803,6 +27032,7 @@ def _close_from_stored_document(
     # and on every failure the run goes on (the SOP's next step is the same
     # `precheck` once more, then the rest of the SOP, whose own `finish`
     # releases it), so only a close that published releases it here.
+    run_id = this_run_id(audit_id)
     try:
         stored = _finish(close, audit_id)
     except BrokerUnavailable:
@@ -26822,6 +27052,7 @@ def _close_from_stored_document(
         raise
     else:
         # While the verdict is still set: the record keeps `last_full_run_at`.
+        _mark_finished(audit_id, run_id, stored)
         release_in_flight(audit_id)
         _record_scheduled_digest(close, audit_id, stored)
     finally:
@@ -29032,6 +29263,15 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--repo",
         help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
+    )
+    start_parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help=(
+            "Mark the run's run-start record scheduled. Optional: start already marks a Hermes "
+            "cron run, or a profile task under a builtin schedule's trigger, scheduled by itself. "
+            "Do not pass it on a run a person asked for."
+        ),
     )
     start_parser.add_argument(
         STORE_ONLY_FLAG,

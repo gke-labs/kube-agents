@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import burst_reads, delegating_profile, idle_reply, pushed_report, scope_exclude, scope_hold, session_cap, stop_hook, worker_trajectory
+from kube_agents_bench import burst_reads, delegating_profile, idle_reply, pushed_report, relayed_report, scope_exclude, scope_hold, session_cap, stop_hook, worker_trajectory
 from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
 from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
 from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
@@ -158,6 +158,8 @@ HARNESS_WRITTEN_ENTRIES = frozenset(
         idle_reply.WAIT_ENTRY,
         session_cap.QUEUED_ENTRY,
         burst_reads.ENTRY,
+        relayed_report.POSTED_ENTRY,
+        relayed_report.REPLIES_ENTRY,
         worker_trajectory.GAP_ENTRY,
         worker_trajectory.NO_WORKER_CALLS_ENTRY,
     }

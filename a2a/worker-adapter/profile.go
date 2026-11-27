@@ -65,7 +65,9 @@ type ProfileWorkerConfig struct {
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
 	// Workdir is the harness's working directory, the workspace a
-	// core-agent grant's file tools are confined to.
+	// core-agent grant's file tools are confined to. A persona that grants
+	// the shell lifts that scope for its read tools (the shell reads
+	// anywhere it can reach anyway), and grants no file write.
 	Workdir string
 	// Relay is how the rendered persona's MCP servers reach the broker's
 	// relay (ProfileRelay, #5495). Empty drops every MCP server the persona
@@ -180,8 +182,8 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		logPersonaWarnings(cfg.Logger, w.persona)
 	}
 	// core-agent takes its tool grant in each turn's envelope, from the
-	// driver: the persona's replaces the session grant the pod's driver
-	// started with, or the worker stops here. Without a persona there is no
+	// driver: the persona's replaces the empty grant a profile pod's driver
+	// starts with (every tool refused), or the worker stops here. Without a persona there is no
 	// profile grant to give it.
 	if pw.Harness == persona.CoreAgent {
 		if w.persona == nil {
@@ -666,13 +668,16 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		} else {
 			removeConfig = remove
 			// The persona's flags (its tool allowlist and denylist, MCP and
-			// setting sources) after the base argv, which carries none.
+			// setting sources) after the base argv, which carries none. A
+			// harness that takes MCP in-process (core-agent) has no flags
+			// for it; its servers go in PersonaMCP, for each turn's envelope.
 			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
 			cfg.HarnessCommandNoDelegate = nil
 			// A harness that reads no config dir names none.
 			if kv := cfg.driver().ConfigDirEnv(dir); kv != "" {
 				cfg.HarnessEnv = append(cfg.HarnessEnv, kv)
 			}
+			cfg.PersonaMCP = w.persona.MCPServers
 		}
 	}
 	removeToken := w.writeTaskToken(h.proxyToken)

@@ -20,8 +20,10 @@ import (
 // coreagent.Snapshot: the instructions file's text and every skill's files,
 // into memory, so nothing written to those paths later in the turn is read.
 // The directory is rendered read-only to this process by a second UID
-// (#6713), and PrepareTurn checks it before each spawn. core-agent's own
-// skills loader (env interpolation, discovery) is not used.
+// (#6713); when the persona is required, coreagent.VerifyRendering checks it
+// (nothing writable, nothing owned by this user, the content manifest
+// matches) before it is read. core-agent's own skills loader (env
+// interpolation, discovery) is not used.
 //
 // A skill's listing and instructions come from memory. When the model loads
 // a skill, its instructions start with the skill's directory on disk, which
@@ -29,7 +31,8 @@ import (
 // Code, whose skills name "the base directory the harness gives").
 //
 // A missing dir is no persona, unless required: a pod configured for a
-// persona that finds none fails the turn rather than run without it.
+// persona that finds none fails the turn rather than run without it, as does
+// one that isn't a sealed rendering matching its manifest.
 func loadPersona(ctx context.Context, dir string, required bool) (string, []adktool.Toolset, error) {
 	if dir == "" {
 		return "", nil, nil
@@ -43,6 +46,13 @@ func loadPersona(ctx context.Context, dir string, required bool) (string, []adkt
 		// No persona rendered for this pod: the turn runs on core-agent's
 		// own prompt.
 		return "", nil, nil
+	}
+	if required {
+		// A pod configured for a persona reads only a sealed rendering that
+		// matches the manifest written beside it.
+		if err := coreagent.VerifyRendering(dir, personaOwnerUID); err != nil {
+			return "", nil, err
+		}
 	}
 	r, err := coreagent.Snapshot(dir)
 	if err != nil {
@@ -87,9 +97,8 @@ func (s baseDirSource) LoadInstructions(ctx context.Context, name string) (strin
 	base := filepath.Join(s.base, name)
 	header := skillBaseDirPrefix + base + "\n"
 	if scripts := s.scripts(name); len(scripts) > 0 {
-		// The shell runs a skill's script only by its absolute path, with
-		// no interpreter word in front, so say so where the skill's own text
-		// may say otherwise.
+		// The skill's own text may name its scripts by a relative path, so
+		// list each by the absolute path the shell finds it at.
 		header += skillScriptsNote
 		for _, rel := range scripts {
 			header += "- " + filepath.Join(base, rel) + "\n"
@@ -98,8 +107,11 @@ func (s baseDirSource) LoadInstructions(ctx context.Context, name string) (strin
 	return header + "\n" + text, nil
 }
 
-// skillScriptsNote introduces the list of a skill's scripts.
-const skillScriptsNote = "Run this skill's scripts directly by these absolute paths, with their arguments after them; a command that starts with an interpreter such as python3 or sh is refused:\n"
+// skillScriptsNote introduces the list of a skill's scripts. A persona that
+// ships scripts grants the shell, and a persona's shell runs any command
+// (toolgrant.CoreAgentGrant.AnyShellCommand), so the note names no form the
+// shell refuses.
+const skillScriptsNote = "Run this skill's scripts by these absolute paths, with their arguments after them:\n"
 
 // scripts are the executable files of skill name, relative to its directory.
 func (s baseDirSource) scripts(name string) []string { return s.exec[name] }
@@ -127,3 +139,8 @@ func executables(skills fs.FS) (map[string][]string, error) {
 	})
 	return exec, err
 }
+
+// personaOwnerUID is the user a rendering must not belong to: the harness's
+// own, which could make it writable again. Tests, which write the rendering
+// as the same user, turn the check off.
+var personaOwnerUID = os.Getuid()

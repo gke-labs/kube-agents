@@ -476,3 +476,62 @@ func TestChangeRequested_AParameterNamedForItIsNeverAChangeRequest(t *testing.T)
 		})
 	}
 }
+
+// TestChangeRequested_NeverReachesBelowAWake: the confirm's permit goes to a
+// confirmed turn's child (the first hop, as before #6861), but never to a
+// wake's child: a session-route confirm names no target to match a second
+// step against. A child's own children inherit from it, so the permit is gone
+// at depth 3 too.
+func TestChangeRequested_NeverReachesBelowAWake(t *testing.T) {
+	turn := TaskRef{ID: "turn", ChangeRequested: true}
+	if !childChangeRequested(turn) {
+		t.Fatal("a confirmed turn's child lost the permit (the first hop)")
+	}
+	wake := TaskRef{ID: "wake", Role: taskRoleWake, WakeDelegate: true, ChangeRequested: true}
+	if childChangeRequested(wake) {
+		t.Fatal("a wake's child (depth 2) carries the permit")
+	}
+	depth2 := TaskRef{ID: "child", Role: taskRoleChild, ParentTaskID: "wake", ChangeRequested: childChangeRequested(wake)}
+	if childChangeRequested(depth2) {
+		t.Fatal("the wake's child's child (depth 3) carries the permit")
+	}
+}
+
+// TestChangeRequested_AWakesProfileChildGetsNoPermit is the review's probe
+// (toshiowang, #7246): a woken session that carries its delegating turn's
+// confirm delegates to the cluster profile on a cluster nobody confirmed, and
+// the child is submitted without the permit, on its entry and its
+// submission's taskParameters, so it needs a fresh confirm.
+func TestChangeRequested_AWakesProfileChildGetsNoPermit(t *testing.T) {
+	t.Parallel()
+	r, spawn, _ := startFanOutRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/cr-wake-child"
+	wake, _, wexec, _ := wokenSession(t, r, spawn, conv, "prod-east needs a PodDisruptionBudget")
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == wake.TaskID {
+				rec.Tasks[i].ChangeRequested = true
+			}
+		}
+	})
+	if err := wexec.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "apply the PodDisruptionBudget", targetParams("p1", "us-east1", "prod-west"))); err != nil {
+		t.Fatal(err)
+	}
+	var child TaskRef
+	waitForRecord(t, r, conv, "the wake's child", func(rec *SessionRecord) bool {
+		for _, ref := range rec.Tasks {
+			if ref.ParentTaskID == wake.TaskID && ref.Role == taskRoleChild {
+				child = ref
+				return true
+			}
+		}
+		return false
+	})
+	if child.ChangeRequested {
+		t.Fatal("the wake's child is on record with the permit")
+	}
+	if _, got := submittedChange(t, childEnv(t, r, child)); got {
+		t.Fatal("the wake's profile child was submitted with changeRequested")
+	}
+}

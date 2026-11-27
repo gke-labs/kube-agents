@@ -156,7 +156,8 @@ func TestBadInputsAreRefused(t *testing.T) {
 	}
 }
 
-// TestCoreAgentModeIsAllow: the one mode a worker runs in.
+// TestCoreAgentModeIsAllow: the mode a worker runs in unless its grant has
+// Shell.
 func TestCoreAgentModeIsAllow(t *testing.T) {
 	if CoreAgentMode != "allow" {
 		t.Errorf("mode %q", CoreAgentMode)

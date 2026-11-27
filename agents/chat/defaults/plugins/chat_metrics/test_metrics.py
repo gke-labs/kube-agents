@@ -7,7 +7,9 @@ import http.client
 import json
 import os
 import re
+import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -743,6 +745,16 @@ class KanbanGaveUpTest(unittest.TestCase):
 
 _PROPOSALS_LINE = re.compile(r'^kubeagents_proposals_opened\{origin="([a-z]*)",platform="([a-z]*)"\} (\d+)$', re.M)
 _SESSION_KV_KEY = "test-session-kv-key"
+_PROXY = "http://egress.invalid:3128"
+# Prints the http proxy of the module's opener, then that of a default opener
+# of the same process, which shows that the variable reached the process.
+_OPENER_PROBE = (
+    "import urllib.request\n"
+    "from chat_metrics import metrics\n"
+    "def http_proxies(opener):\n"
+    "    return [h.proxies.get('http') for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]\n"
+    "print(http_proxies(metrics._SESSION_KV_OPENER), http_proxies(urllib.request.build_opener()))\n"
+)
 
 
 class _Ledger:
@@ -890,7 +902,7 @@ class ProposalsOpenedTest(unittest.TestCase):
         failures = (http.client.IncompleteRead(b"{", 10), http.client.BadStatusLine("garbage"))
         with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as logs:
             for failure in failures:
-                with mock.patch.object(metrics.urllib.request, "urlopen", side_effect=failure):
+                with mock.patch.object(metrics.urllib.request.OpenerDirector, "open", side_effect=failure):
                     self.assertEqual(last, self.gauge.counts())
                     exposition = metrics.ChatMetrics(proposals=self.gauge).render()
                 self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
@@ -918,6 +930,33 @@ class ProposalsOpenedTest(unittest.TestCase):
         match = re.search(r"^ORIGINS = \(([^)]*)\)$", server.read_text(), re.M)
         self.assertIsNotNone(match, "session_kv_server's ORIGINS moved; update this reader")
         self.assertEqual(tuple(re.findall(r'"([a-z]+)"', match.group(1))), metrics.ORIGINS)
+
+    def test_the_opener_takes_no_proxy_when_the_module_is_loaded_under_a_proxy_variable(self):
+        # The module builds its opener when it is imported. A pod that has a proxy
+        # variable has it at that time, so the module is loaded in a new process.
+        environment = {key: value for key, value in os.environ.items() if key.lower() not in ("no_proxy", "http_proxy")}
+        environment["http_proxy"] = _PROXY
+        done = subprocess.run(
+            [sys.executable, "-c", _OPENER_PROBE],
+            cwd=Path(__file__).resolve().parents[1], env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(f"[] [{_PROXY!r}]", done.stdout.strip())
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        # Session KV is on the pod's loopback. With a proxy variable and no NO_PROXY
+        # entry for 127.0.0.1, urllib hands the read and its bearer token to the proxy.
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}), mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            self.gauge.counts()
+        self.assertEqual([f"Bearer {_SESSION_KV_KEY}"], self.ledger.auth)
 
 
 class _FakeClock:

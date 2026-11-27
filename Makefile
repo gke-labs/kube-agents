@@ -1027,8 +1027,9 @@ docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.
 chart-sync: ## Sync the chart's CRD, RBAC-rule and admission-policy copies from k8s-operator/config, write config/profiles/role.yaml (the Role document's copy for the profile namespace), and regenerate files/footprint.yaml from the operator goldens (today and next mode); the webhook template is hand-maintained and only checked.
 	@./hack/sync-chart-manifests.sh
 
-chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies and config/profiles/role.yaml match k8s-operator/config, its hand-written webhook template matches config/webhook, and files/footprint.yaml matches the operator goldens (CI runs this; needs helm and PyYAML).
+chart-check: ## Verify the chart's CRD/RBAC/admission-policy copies and config/profiles/role.yaml match k8s-operator/config, its hand-written webhook template matches config/webhook, files/footprint.yaml matches the operator goldens, and rendered manifests contain no duplicate YAML keys (CI runs this; needs helm and PyYAML).
 	@./hack/sync-chart-manifests.sh --check
+	@python3 -m unittest discover -s tests -p 'test_chart_no_duplicate_keys.py' -v
 
 iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy copies (CI runs this via scripts/test_check_iac_parity.py).
 	@python3 -c "import yaml" 2>/dev/null || { \

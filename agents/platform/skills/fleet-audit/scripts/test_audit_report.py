@@ -10,9 +10,11 @@ commands that do touch the network are driven through a single recorded seam
 (audit_report.run_cmd) plus stubs for credential minting.
 """
 
+import base64
 import contextlib
 import copy
 import fnmatch
+import hashlib
 import importlib.util
 import io
 import argparse
@@ -49,6 +51,7 @@ import gitops_workspace  # noqa: E402
 import no_live_google_auth  # noqa: E402
 import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
+import report_status  # noqa: E402
 import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
 import workspace_paths  # noqa: E402
@@ -3366,6 +3369,8 @@ class TestAuditCatalogue(unittest.TestCase):
         for audit_id, spec in sorted(audit_report.AUDITS.items()):
             with self.subTest(audit=audit_id):
                 self.assertIn(audit_id, jobs, f"{audit_id} has no cron job")
+                # `start` works out "scheduled" for the run-start record by
+                # itself (#6812), so the prompt does not pass it there.
                 phrase = (
                     "pass --scheduled to precheck and finish"
                     if audit_id in PRECHECK_STREAMS
@@ -6062,7 +6067,10 @@ class TestStart(HarnessTestCase):
         note = Path(audit_report.inflight_path_for(AUDIT))
         self.assertNotIn(str(note.parent), self.err)
         self.assertIn("a lease on the stream, not a process", self.err)
-        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
+        # The run id (#6812) names the run for its run-start record, not a
+        # process, and the refusal never prints it.
+        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at", "run_id"})
+        self.assertNotIn(json.loads(note.read_text())["run_id"], self.err)
         # Refused means refused: the other run's note is still there.
         self.assertTrue(note.is_file())
         # There is no flag past the guard. The CLI had `--takeover` until
@@ -6595,6 +6603,213 @@ class TestStart(HarnessTestCase):
 # --------------------------------------------------------------------------- #
 # --dry-run
 # --------------------------------------------------------------------------- #
+
+
+class TestRunStartRecord(HarnessTestCase):
+    """`start` writes a run-start record and `finish` marks its own run's done (#6812)."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("findings_path_for", lambda audit_id: str(self.tmp_path / f"findings_{audit_id}.json"))
+        self.patch_attr("run_record_path_for", lambda audit_id: str(self.tmp_path / f"run_{audit_id}.json"))
+        self.patch_attr("declarations_path_for", lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"))
+        audit_report._RUN_START_LOGGED.clear()
+        self.addCleanup(audit_report._RUN_START_LOGGED.clear)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        # No cron run unless a test names one, wherever the suite runs from.
+        env = patch.dict(os.environ, {"HERMES_CRON_RUN": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def as_cron_run(self, name):
+        """This process is one Hermes cron run's command, as session-command.sh exports it."""
+        env = patch.dict(os.environ, {"HERMES_CRON_RUN": name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def records(self, repo="acme/fleet"):
+        directory = self.store_dir(repo=repo) / report_status.RUN_STARTS_DIR
+        if not directory.is_dir():
+            return {}
+        return {path.stem: json.loads(path.read_text()) for path in directory.glob("*.json")}
+
+    def unfinished(self):
+        return report_status.unfinished_run_of(str(self.reports_dir), AUDIT, "acme/fleet")
+
+    def as_task(self, task_id, trigger=None):
+        """This process holds a task credential naming `task_id`, as a profile worker does,
+        with `trigger` as its `nats.trigger` claim when given."""
+        token = self.tmp_path / "task-token"
+        nats = {"task": task_id}
+        if trigger is not None:
+            nats["trigger"] = trigger
+        claims = base64.urlsafe_b64encode(json.dumps({"nats": nats}).encode()).decode().rstrip("=")
+        token.write_text(f"e30.{claims}.sig")
+        env = patch.dict(os.environ, {report_status.TASK_TOKEN_FILE_ENV: str(token)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_start_records_the_run_and_finish_marks_it_done(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        note = json.loads(Path(audit_report.inflight_path_for(AUDIT)).read_text())
+        records = self.records()
+        self.assertEqual([note["run_id"]], list(records))
+        record = records[note["run_id"]]
+        self.assertTrue(note["run_id"].startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+        self.assertIs(record["scheduled"], True)
+        self.assertNotIn("done_at", record)
+        # Running: readers say the last run did not finish, beside the report.
+        self.assertEqual(note["run_id"], self.unfinished()["run_id"])
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        record = self.records()[note["run_id"]]
+        self.assertEqual(note["run_id"], record["run_id"])
+        self.assertIsInstance(record["done_at"], str)
+        self.assertTrue(record["outcome"])
+        self.assertIsNone(self.unfinished())
+
+    def test_a_run_started_by_hand_is_recorded_not_scheduled(self):
+        # The shell, no cron run, no task credential, no flag: a run a person asked for.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        (record,) = self.records().values()
+        self.assertTrue(record["run_id"].startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+        self.assertIs(record["scheduled"], False)
+
+    def test_a_hermes_cron_run_is_recorded_scheduled_without_the_flag(self):
+        # Rule (a): HERMES_CRON_RUN, or a cwd under <home>/cron/runs/<name>,
+        # the detection the run id uses. No prompt passes --scheduled.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        (record,) = self.records().values()
+        self.assertTrue(record["run_id"].startswith(audit_report.RUN_ID_CRON_PREFIX))
+        self.assertIs(record["scheduled"], True)
+        # Only the run directory, as in the agent pod.
+        self.as_cron_run("")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        directory = (self.tmp_path / "home/cron/runs/job_7c1e2a_e2").resolve()
+        directory.mkdir(parents=True)
+        os.chdir(directory)
+        self.assertTrue(audit_report.run_is_scheduled())
+        os.chdir(here)
+        self.assertFalse(audit_report.run_is_scheduled())
+
+    def test_a_profile_task_under_a_builtin_schedule_is_recorded_scheduled_without_the_flag(self):
+        # Rule (b): the task credential carries a builtin schedule's trigger.
+        self.as_task("task-sched", trigger={"name": f"schedule/{AUDIT}", "origin": "builtin", "stream": AUDIT})
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertIs(self.records()["task-sched"]["scheduled"], True)
+        # A task with no trigger, or one that is not a builtin schedule's, is not scheduled.
+        for trigger in (None, {"name": "slack", "origin": "builtin"}, {"name": f"schedule/{AUDIT}", "origin": "user"}):
+            with self.subTest(trigger=trigger):
+                self.as_task("task-other", trigger=trigger)
+                self.assertFalse(audit_report.run_is_scheduled())
+        # The flag is still taken as an override.
+        self.assertTrue(audit_report.run_is_scheduled(True))
+
+    def test_a_run_that_never_finished_reads_as_unfinished(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        # Its finish died on the forge: nothing was published, and the record
+        # keeps no done mark.
+        self.harness.failures = {"issue-update": 1, "issue-create": 1}
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 1, self.err)
+        unfinished = self.unfinished()
+        self.assertEqual("the last run did not finish", unfinished["note"])
+        self.assertTrue(unfinished["scheduled"])
+
+    def test_a_dry_run_marks_nothing(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.run_finish(make_doc(findings=[]), argv_extra=("--dry-run",)), 0, self.err)
+        (record,) = self.records().values()
+        self.assertNotIn("done_at", record)
+
+    def test_a_profile_task_is_its_own_run_and_a_late_finish_marks_only_its_own(self):
+        self.as_task("task-old")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.as_task("task-new")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.assertEqual({"task-old", "task-new"}, set(self.records()))
+        # The older task's finish lands after the newer one started.
+        self.as_task("task-old")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        records = self.records()
+        self.assertIn("done_at", records["task-old"])
+        self.assertNotIn("done_at", records["task-new"])
+        self.assertEqual("task-new", self.unfinished()["run_id"])
+
+    def test_a_cron_shell_run_marks_only_its_own_record_after_a_newer_start(self):
+        # Two Hermes cron runs of the stream in the shell: the older outlived
+        # its lease, and the newer run's `start` took the in-flight note over.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        older, newer = ("cron-" + hashlib.sha256(name.encode()).hexdigest()[:16]
+                        for name in ("job_7c1e2a_e1", "job_7c1e2a_e2"))
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        stale = json.loads(note.read_text())
+        self.assertEqual(older, stale["run_id"])
+        stale["started_at"] -= audit_report.INFLIGHT_TTL_SECONDS + 1
+        note.write_text(json.dumps(stale))
+        self.as_cron_run("job_7c1e2a_e2")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+        self.assertEqual(newer, json.loads(note.read_text())["run_id"])
+        # The older run's `finish`, now: it marks its own record, not the
+        # note's, so the newer run still reads as running.
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        records = self.records()
+        self.assertEqual({older, newer}, set(records))
+        self.assertIn("done_at", records[older])
+        self.assertNotIn("done_at", records[newer])
+        self.assertEqual(newer, self.unfinished()["run_id"])
+
+    def test_a_cron_run_id_comes_from_the_variable_or_the_run_directory(self):
+        want = "cron-" + hashlib.sha256(b"job_7c1e2a_e1").hexdigest()[:16]
+        self.as_cron_run("job_7c1e2a_e1")
+        self.assertEqual(want, audit_report.cron_run_id())
+        self.assertRegex(want, report_status.RUN_ID_RE)
+        # In the agent pod only the directory is there: read as session-command.sh reads it.
+        self.as_cron_run("")
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        for sub, expected in (
+            ("home/cron/runs/job_7c1e2a_e1", want),
+            ("home/cron/runs/job_7c1e2a_e1/sub/dir", want),
+            ("home/cron/other", None),
+            ("home/cron/runs/bad name", None),
+        ):
+            with self.subTest(cwd=sub):
+                directory = (self.tmp_path / sub).resolve()
+                directory.mkdir(parents=True, exist_ok=True)
+                os.chdir(directory)
+                self.assertEqual(expected, audit_report.cron_run_id())
+                os.chdir(here)
+        # A hand-started shell run has none, and `start` makes a random id.
+        self.assertTrue(audit_report.new_run_id().startswith(audit_report.RUN_ID_LOCAL_PREFIX))
+
+    def test_a_first_run_makes_no_store_for_its_record(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertFalse(self.store_dir().exists())
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertFalse(self.store_dir().exists())
+        self.assertNotIn("run-start", self.err)
+
+    def test_a_store_that_refuses_the_record_never_stops_the_run(self):
+        # An older broker or listener refuses the name (404 or 400): `start`
+        # says so once and goes on, and `finish` marks nothing and says nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        refusal = report_status.ReportStoreUnavailable("the report store is unavailable: HTTP 404 (not_found)", 404)
+        with patch.object(report_status, "write_run_start", side_effect=refusal), patch.object(
+            report_status, "read_run_start", side_effect=refusal
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--scheduled"]), 0, self.err)
+            self.assertEqual(1, self.err.count("does not take run-start records yet"))
+            self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assertNotIn("not marked done", self.err)
 
 
 class TestDryRun(BaseTestCase):
@@ -36227,6 +36442,15 @@ class TestShadowRun(BaseTestCase):
         self.open_chat_report.assert_not_called()
         self.append_chat_report.assert_not_called()
         self.save_chat_verdict.assert_not_called()
+
+    def test_a_shadow_start_writes_no_run_start_record(self):
+        # A shadow run's report goes to its own stream, so a run-start record
+        # under the live audit would show a shadow run that died as an
+        # unfinished live run (#6812).
+        record = mock.MagicMock(name="record_run_start")
+        self.patch_attr("record_run_start", record)
+        self.start(audit_report.STORE_ONLY_FLAG)
+        record.assert_not_called()
 
     def test_its_delta_is_against_its_own_previous_run(self):
         doc = make_doc(findings=THREE_SEVERITIES)

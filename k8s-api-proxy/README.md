@@ -286,8 +286,8 @@ still read them. An entry that is not an HTTP header name, or is `Host`, `Conten
 `Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets
 neither option.
 
-A program that needs only those two options on top of the binary does not rebuild the server from
-the packages: its `main` calls `proxyserver.Run` (`pkg/proxyserver`), which is what
+A program that needs only those two options on top of the binary, or one more TokenReview audience
+with callers of its own, does not rebuild the server from the packages: its `main` calls `proxyserver.Run` (`pkg/proxyserver`), which is what
 `cmd/k8s-api-proxy` calls.
 
 ```go
@@ -305,7 +305,24 @@ func main() {
 
 `Options.Authorize` and `Options.ExtraCallerHeaders` become the `Config` fields of the same names,
 and `Options.Version` is what `--version` and the startup log report after the name
-`k8s-api-proxy`. Everything else is the binary's: the same flags, environment variables and
+`k8s-api-proxy`.
+
+`Options.AudienceCallers` maps a TokenReview audience to the caller usernames admitted for it, and
+adds those entries to the audiences the flags and the environment configure. A caller admitted this
+way is held to its pod like any other TokenReview caller, so the proxy's ServiceAccount needs `get`
+on `pods` in that caller's namespace. An audience the server already accepts is an error at startup
+and not a union of the two caller lists, so an embedder cannot widen who `--audience` or
+`CREDENTIAL_PROXY_SESSION_AUDIENCE` admits. These are startup errors too: an audience name that is
+empty, padded with whitespace or holds a comma; an audience with no caller, or with a blank one; a
+caller that another audience already admits; and a non-empty map when `--auth-mode` does not include
+`token-review`. Each is an `*AudienceCallersError`, so an embedder that fills the map from settings
+of its own can find it with `errors.As` and name those settings. An empty map changes nothing.
+
+`proxyserver.NewHandler` returns the handler `Run` would serve for the same arguments and options,
+with the flags registered on a `flag.FlagSet` the caller passes and nothing started. It is for a
+program that serves the handler itself and for an embedder's tests of its `Options`.
+
+Everything else is the binary's: the same flags, environment variables and
 defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
 the binary exits on, and `nil` after `--version` or a drained shutdown. It registers the flags on
 `flag.CommandLine`, so a process calls it once. A flag that does not parse exits the process there;
@@ -447,6 +464,6 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
 `AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
-`AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.Options` and `pkg/mtlsauth` may change in any release. The version moves with every
+`AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.NewHandler`, `proxyserver.Options`, `proxyserver.AudienceCallersError` and `pkg/mtlsauth` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

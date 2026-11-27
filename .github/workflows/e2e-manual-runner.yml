@@ -180,14 +180,13 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
-          # Forwarded raw, not resolved here: execute_e2e_tests.py already picks
-          # REGISTRY, then REGISTRY_PREFIX, then
-          # <region>-docker.pkg.dev/<project>/kube-agents, and a second copy of
-          # that chain in the workflow is a second thing to keep in step. Both
-          # still have to reach it — unset here, a `rebuild_operator` run would
-          # push to the derived path whatever the environment configures.
+          # Where the suite pushes the images it builds (the example plugin,
+          # and the operator on a `rebuild_operator` run), forwarded raw:
+          # execute_e2e_tests.py picks REGISTRY, then
+          # <region>-docker.pkg.dev/<project>/kube-agents. REGISTRY_PREFIX is
+          # not forwarded: it names where the environment reads published
+          # images, which its identity may not write.
           REGISTRY: ${{ vars.REGISTRY }}
-          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           # GITOPS_*, not GH_*. On both environments the GH_ORG/GH_REPO pair
           # names the RELEASE repository, so handing it to a suite that mints a
           # GitHub App token would scope a live token at this repository.

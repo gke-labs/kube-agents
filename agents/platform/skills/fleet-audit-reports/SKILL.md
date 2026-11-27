@@ -23,6 +23,9 @@ to uses `no_forge/local`:
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
   run-over-run history that exists anywhere: the ledger issue rewrites itself in place.
+- `run-starts/<run id>.json` — one run-start record per run, newest 8 kept by the store's own
+  `received_at`: `start` writes it and `finish` marks it done. It is no report; `unfinished_run`
+  (below) is read from it.
 
 An envelope carries `audit_id`, `repo`, `started_at`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
@@ -77,6 +80,12 @@ this directory. `streams` and `runs` report it as `liveness`: `never` (no run st
 `running`, `died` (started over two hours ago and never finished), or `error`. A stream-level
 problem (a sibling repository's unreadable store, a bad lease note) comes back under `error` with
 exit 2 even when the listing is complete; report it, do not drop it.
+
+`streams` rows, and `show` for the newest run, carry `unfinished_run`: null, or `note` ("the last
+run did not finish"), `run_id`, `started_at` and `scheduled` when the newest run of that stream
+started and never reached `finish` (stopped, out of memory, past its deadline, or its pod lost). The
+report is then the run before it. Say so beside the answer, with its `started_at`; a finished run
+has null, and nothing extra to say.
 
 ## Query it; do not read it
 

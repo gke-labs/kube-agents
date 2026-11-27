@@ -107,6 +107,10 @@ VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
 RECORD_STRATEGY = "record"
 DOC_PREFIX = "okf:"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+# Hindsight is an in-cluster Service, or on the pod's loopback: a proxy from the
+# environment must not get the decision records, and urllib does not leave out
+# such a host by itself.
+_HINDSIGHT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_RECALL_MAX_TOKENS = 2048
 MAX_CONTEXT_LENGTH = 200
@@ -1763,7 +1767,7 @@ class Hindsight:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with _HINDSIGHT_OPENER.open(req, timeout=self.timeout) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else None
 
