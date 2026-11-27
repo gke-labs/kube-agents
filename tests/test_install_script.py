@@ -8067,31 +8067,31 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
                 self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
             with self.subTest(locale=locale, platform="google_chat"):
-                proc = self._interview("", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
+                proc = self._interview("", "", ["", "", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
                 out = proc.stdout + proc.stderr
                 self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
-                self.assertIn("went on ASKED=5", proc.stdout, out)
+                self.assertIn("went on ASKED=6", proc.stdout, out)
 
     def test_the_google_chat_home_channel_is_confirmed_too(self):
         # #3320 on Chat, which the gateway takes whenever it is enabled under
-        # next. Allowlist, topic, subscription, then the home channel.
-        lead = ["", "", ""]
+        # next. Allowlist, Chat project ID, topic, subscription, then the home channel.
+        lead = ["", "", "", ""]
         proc = self._interview("", "", lead + ["", "n", "spaces/AAA"], choice="1")
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("went on ASKED=7", proc.stdout, out)
         self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
         self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
         self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("", "", lead + ["", "y"], choice="1")
-        self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("went on ASKED=6", proc.stdout, proc.stdout + proc.stderr)
 
     def test_choosing_both_asks_the_gateway_prompts(self):
-        # Allowlist, topic, subscription and home for Chat, then Slack's five.
-        chat = ["", "", "", "spaces/AAA"]
+        # Allowlist, Chat project ID, topic, subscription and home for Chat, then Slack's five.
+        chat = ["", "", "", "", "spaces/AAA"]
         answers = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD", "C0123ABCD", "#ops"]
         proc = self._interview("", "", chat + answers, choice="3")
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("went on ASKED=10", proc.stdout, out)
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)", out)
         self.assertNotIn("comma-separated for several workspaces", out)
 
@@ -8101,7 +8101,7 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
         # digest, not that they go to Slack's home channel.
         for seeded, there in (("#general", None), ("C0123ABCD", "Slack's home channel")):
             with self.subTest(seeded=seeded):
-                chat = ["", "", "", "", "y"]
+                chat = ["", "", "", "", "", "y"]
                 answers = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD", "C0123ABCD", "#ops"]
                 proc = self._interview("", f"SLACK_HOME_CHANNEL={seeded}\n", chat + answers, choice="3")
                 out = proc.stdout + proc.stderr
@@ -8336,6 +8336,14 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
                                    'gcloud() { return 1; }')
         self.assertIn("rc=0", out)
         self.assertIn("CHECKLIST args=[] number=[]", out)
+
+    def test_the_menu_reads_the_chat_project_number_when_chat_project_id_is_set(self):
+        out = self._menu_checklist(
+            'google_chat_enabled=true\nexport CHAT_PROJECT_ID=workspace-chat-proj\n'
+            'gcloud() { if [ "$1 $2 $3" = "projects describe workspace-chat-proj" ]; then echo 777888999; else echo 111222333; fi; }'
+        )
+        self.assertIn("rc=0", out)
+        self.assertIn("CHECKLIST args=[] number=[777888999]", out)
 
     def test_the_menu_reads_google_chat_on_the_way_the_generator_does(self):
         out = self._menu_checklist("google_chat_enabled=yes slack_enabled=false")
@@ -8624,7 +8632,7 @@ class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
         )
 
     def test_each_google_chat_prompt_defaults_to_its_own_current_value(self):
-        for var in ("allowed_users", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
+        for var in ("allowed_users", "chat_project_id", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
             with self.subTest(var=var):
                 self.assertRegex(
                     self._SOURCE,

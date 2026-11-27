@@ -1299,15 +1299,20 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_guard_pubsub_subscription_refuses_when_differs_from_state(self):
-        proc = self._run_guard(
-            "guard_pubsub_subscription",
-            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
-            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
-            tfvar_chat_sub_name='"custom-chat-events-sub"',
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("chat_subscription_name resolved to 'custom-chat-events-sub', but this state manages Pub/Sub subscription 'platform-agent-chat-events-sub'", proc.stderr)
-        self.assertIn('CHAT_SUB_NAME="platform-agent-chat-events-sub"', proc.stderr)
+        for addr in (
+            "module.chat_pubsub[0].google_pubsub_subscription.chat_events[0]",
+            "module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+        ):
+            with self.subTest(addr=addr):
+                proc = self._run_guard(
+                    "guard_pubsub_subscription",
+                    state_list=addr,
+                    state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+                    tfvar_chat_sub_name='"custom-chat-events-sub"',
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("chat_subscription_name resolved to 'custom-chat-events-sub', but this state manages Pub/Sub subscription 'platform-agent-chat-events-sub'", proc.stderr)
+                self.assertIn('CHAT_SUB_NAME="platform-agent-chat-events-sub"', proc.stderr)
 
     def test_guard_pubsub_subscription_refuses_when_topic_differs_from_state(self):
         proc = self._run_guard(
@@ -3703,7 +3708,17 @@ class ImportOverrideTest(unittest.TestCase):
     _IMPORT_ERROR_DETAIL = "on ../../modules/kube-agents-scope-resolver/main.tf line 249 (stub)"
     _IMPORT_FAILURE = [*_IMPORT_PREAMBLE, "|", f"| {_IMPORT_ERROR}", "|", f"|   {_IMPORT_ERROR_DETAIL}", "|"]
 
-    def _run(self, func_call, import_rc=0, create_cluster="true", enable_chat="false", import_output=None):
+    def _run(
+        self,
+        func_call,
+        import_rc=0,
+        create_cluster="true",
+        enable_chat="false",
+        chat_project_id='""',
+        chat_manage_project="true",
+        state_lines=(),
+        import_output=None,
+    ):
         """Run one adoption function against stubs that record each import.
 
         Returns the process, one line per `terraform import` with its
@@ -3721,6 +3736,8 @@ class ImportOverrideTest(unittest.TestCase):
             captured = root / "captured-scope-override.tf"
             failure = root / "import-failure.txt"
             failure.write_text("".join(f"{line}\n" for line in (import_output or self._IMPORT_FAILURE)))
+            state_file = root / "state-list.txt"
+            state_file.write_text("".join(f"{line}\n" for line in state_lines))
             provider_override = comp / _PROVIDER_OVERRIDE
             scope_override = (comp / _scope_resolver_source() / _SCOPE_OVERRIDE).resolve()
             # An empty state; a console that enables cluster KMS (two
@@ -3731,7 +3748,7 @@ class ImportOverrideTest(unittest.TestCase):
             (bin_dir / "terraform").write_text(
                 f"#!{bash}\n"
                 'case "$1" in\n'
-                "  state) exit 0 ;;\n"
+                f'  state) cat "{state_file}"; exit 0 ;;\n'
                 "  console) read -r expr\n"
                 '    case "${expr#var.}" in\n'
                 "      project_id) echo '\"test-project\"' ;;\n"
@@ -3741,6 +3758,8 @@ class ImportOverrideTest(unittest.TestCase):
                 "      kms_keyring_name) echo '\"platform-agent-keyring\"' ;;\n"
                 "      kms_key_name) echo '\"k8s-secret-encryption-key\"' ;;\n"
                 f"      enable_google_chat) echo '{enable_chat}' ;;\n"
+                f"      chat_project_id) echo '{chat_project_id}' ;;\n"
+                f"      chat_manage_project) echo '{chat_manage_project}' ;;\n"
                 "      chat_topic_name) echo '\"platform-agent-chat-events\"' ;;\n"
                 "      chat_subscription_name) echo '\"platform-agent-chat-events-sub\"' ;;\n"
                 "      *) echo null ;;\n"
@@ -3889,6 +3908,48 @@ class ImportOverrideTest(unittest.TestCase):
         )
         # Line for line, less the script's comment header: the recipe omits it.
         self.assertEqual(_override_body(body), _override_body(text))
+
+    def test_adopt_pubsub_uses_indexed_addresses_chat_project_id_and_manage_gate(self):
+        proc, seen, _, _ = self._run(
+            "adopt_pubsub",
+            enable_chat="true",
+            chat_project_id='"workspace-chat-proj"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(seen), 1, seen)
+        self.assertIn(
+            "module.chat_pubsub[0].google_pubsub_topic.chat_events[0] projects/workspace-chat-proj/topics/platform-agent-chat-events",
+            seen[0],
+        )
+
+        for state_lines in (
+            (
+                "module.chat_pubsub[0].google_pubsub_topic.chat_events[0]",
+                "module.chat_pubsub[0].google_pubsub_subscription.chat_events[0]",
+            ),
+            (
+                "module.chat_pubsub[0].google_pubsub_topic.chat_events",
+                "module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            ),
+        ):
+            with self.subTest(state_lines=state_lines):
+                proc, seen, _, _ = self._run(
+                    "adopt_pubsub",
+                    enable_chat="true",
+                    state_lines=state_lines,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(seen, [])
+                self.assertEqual(proc.stderr, "")
+
+        proc, seen, _, _ = self._run(
+            "adopt_pubsub",
+            enable_chat="true",
+            chat_manage_project="false",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(seen, [])
+        self.assertEqual(proc.stderr, "")
 
 
 if __name__ == "__main__":

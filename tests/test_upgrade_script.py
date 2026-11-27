@@ -3966,6 +3966,31 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST args=[] number=987654321 env=/x/install.env topic=t", "SUMMARY"])
         self.assertEqual(calls, "")
 
+    def test_a_full_upgrade_reads_chat_project_number_when_chat_project_id_differs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text(
+                "PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+            )
+            proc, calls = self._run(
+                "full",
+                {
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_PROJECT_ID": "workspace-chat-proj",
+                    "CHAT_MANAGE_PROJECT": "false",
+                    "NAMESPACE": "kubeagents-system",
+                },
+                helper="",
+                install_env_file=str(install_env),
+                env={"HOME": tmp, "TERM": "dumb"},
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(calls, "projects describe workspace-chat-proj --format=value(projectNumber)\n")
+        self.assertIn("projects/workspace-chat-proj/topics/platform-agent-chat-events", out)
+        self.assertIn("service-123456@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn("https://chat.google.com/dm/123456", out)
+
 
 class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):
     """#3615. The chat checklist's re-run command names the run's install.env,

@@ -203,12 +203,14 @@ the `secrets: inherit` gap
 `GH_APP_ID`, which drops every secret the same way.
 
 `ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, `HERMES_DASHBOARD_ENABLED`, `WEB_CONSOLE_ENABLED`,
-`ENABLE_DRIFT_DETECTOR`, `VERTEX_MANAGE_SERVING_PROJECT`, and `CHAT_MANAGE_PROJECT` are checked there too,
-for spelling rather than presence. All seven reach `install.sh` as boolean flags
-(`--enable-*`, `--vertex-manage-serving-project`, `--chat-manage-project`), whose validators take `true` or
+`ENABLE_DRIFT_DETECTOR`, and `VERTEX_MANAGE_SERVING_PROJECT` are checked there too,
+for spelling rather than presence. All six reach `install.sh` as boolean flags
+(`--enable-*`, `--vertex-manage-serving-project`), whose validators take `true` or
 `false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
-`True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into
+`True`/`yes`/`y`/`1`/`on`. (`provision_environment.sh` also validates `CHAT_MANAGE_PROJECT`
+and forwards `--chat-project-id` and `--chat-manage-project` when set in its environment;
+`render_install_env.sh` and the workflow `env:` blocks do not map them yet.) `provision_environment.sh` folds the second list into
 the first, so an environment that deployed on `True` keeps deploying; a spelling
 neither list recognises is refused before the teardown rather than by
 `install.sh` after it. A variable holding nothing but a space or a tab is

@@ -7276,7 +7276,7 @@ run_menu_system() {
         # The DM link in the Google Chat checklist is this project's number,
         # read here rather than inherited: install.env never records it.
         if is_truthy "$google_chat_enabled"; then
-          local menu_chat_project="${chat_project_id:-$project_id}"
+          local menu_chat_project="${CHAT_PROJECT_ID:-$project_id}"
           project_number="$(gcloud projects describe "$menu_chat_project" --format="value(projectNumber)" 2>/dev/null || echo "")"
         fi
         PROJECT_NUMBER="$project_number" CHAT_PROJECT_NUMBER="$project_number" print_chat_setup_checklists
@@ -7883,6 +7883,8 @@ main() {
     allowed_users_hint="empty list"
   fi
   local chat_project_id="${PARAM_CHAT_PROJECT_ID:-}"
+  local chat_summary_project=""
+  local chat_summary_project_number=""
   local chat_manage_project="${PARAM_CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}"
   if ! is_bool_spelling "$chat_manage_project"; then
     print_error "--chat-manage-project must be either true or false."
@@ -9656,8 +9658,8 @@ main() {
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"
-  local chat_summary_project="${chat_project_id:-$project_id}"
-  local chat_summary_project_number="$project_number"
+  chat_summary_project="${chat_project_id:-$project_id}"
+  chat_summary_project_number="$project_number"
   if [ "${google_chat_enabled:-false}" = "true" ]; then
     if [ -n "${chat_project_id:-}" ] && [ "$chat_project_id" != "$project_id" ]; then
       chat_summary_project_number="$(gcloud projects describe "$chat_project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"

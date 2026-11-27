@@ -268,7 +268,10 @@ readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
 # The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
 readonly HELM_UNINSTALL_TIMEOUT="10m"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
-readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
+readonly CHAT_TOPIC_ADDRESS="module.chat_pubsub[0].google_pubsub_topic.chat_events[0]"
+readonly CHAT_TOPIC_LEGACY_ADDRESS="module.chat_pubsub[0].google_pubsub_topic.chat_events"
+readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events[0]"
+readonly CHAT_SUBSCRIPTION_LEGACY_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
 # What `terraform output -raw <name>` prints when the state records other
 # outputs but not that one: the shape of a state from before the output was
@@ -301,6 +304,7 @@ readonly STOCKOUT_SINK_ADDRESS="google_logging_project_sink.stockout_alerts[0]"
 # passthrough instead of naming a key that does not exist.
 readonly GUARDED_SUBSCRIPTIONS=(
   "enable_google_chat|$CHAT_SUBSCRIPTION_ADDRESS|chat_subscription_name|chat_topic_name|unacknowledged Google Chat events|CHAT_SUB_NAME|CHAT_TOPIC_NAME"
+  "enable_google_chat|$CHAT_SUBSCRIPTION_LEGACY_ADDRESS|chat_subscription_name|chat_topic_name|unacknowledged Google Chat events|CHAT_SUB_NAME|CHAT_TOPIC_NAME"
   "enable_drift_pubsub|$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|drift_pubsub_topic|unacknowledged GKE audit records, the out-of-band changes the drift detector exists to report||"
   "enable_stockout_investigator|$STOCKOUT_SUBSCRIPTION_ADDRESS|stockout_pubsub_subscription|stockout_pubsub_topic|unacknowledged stockout alerts||"
 )
@@ -887,10 +891,13 @@ adopt_kms() {
 # by the in_state check, so a steady-state apply does no gcloud work here.
 adopt_pubsub() {
   [[ "$(tfvar enable_google_chat)" == "true" ]] || return 0
+  [[ "$(tfvar chat_manage_project)" != "false" ]] || return 0
 
-  local project topic sub
+  local project chat_project topic sub
   load_state
   project=$(tfvar project_id)
+  chat_project=$(tfvar chat_project_id)
+  [[ -n "$chat_project" ]] && project="$chat_project"
   topic=$(tfvar chat_topic_name)
   sub=$(tfvar chat_subscription_name)
 
@@ -902,19 +909,20 @@ adopt_pubsub() {
   # whenever the topic is absent from GCP while the subscription is not: a
   # half-finished console setup, or a destroy that stopped partway.
   #
-  # address <TAB> gcloud-kind <TAB> resource id <TAB> requires-in-state
-  local topic_address="module.chat_pubsub[0].google_pubsub_topic.chat_events"
+  # address <TAB> legacy-address <TAB> gcloud-kind <TAB> resource id <TAB> requires-in-state <TAB> requires-legacy-in-state
   local -a targets=(
-    "$topic_address	topics	projects/$project/topics/$topic	"
-    "module.chat_pubsub[0].google_pubsub_subscription.chat_events	subscriptions	projects/$project/subscriptions/$sub	$topic_address"
+    "$CHAT_TOPIC_ADDRESS	$CHAT_TOPIC_LEGACY_ADDRESS	topics	projects/$project/topics/$topic		"
+    "$CHAT_SUBSCRIPTION_ADDRESS	$CHAT_SUBSCRIPTION_LEGACY_ADDRESS	subscriptions	projects/$project/subscriptions/$sub	$CHAT_TOPIC_ADDRESS	$CHAT_TOPIC_LEGACY_ADDRESS"
   )
 
-  local adopted=0 address kind id requires
+  local adopted=0 address legacy_address kind id requires requires_legacy
   for target in "${targets[@]}"; do
-    IFS=$'\t' read -r address kind id requires <<<"$target"
+    IFS=$'\t' read -r address legacy_address kind id requires requires_legacy <<<"$target"
 
-    in_state "$address" && continue
-    if [[ -n "$requires" ]] && ! in_state "$requires"; then
+    if in_state "$address" || { [[ -n "$legacy_address" ]] && in_state "$legacy_address"; }; then
+      continue
+    fi
+    if [[ -n "$requires" ]] && ! in_state "$requires" && { [[ -z "$requires_legacy" ]] || ! in_state "$requires_legacy"; }; then
       log "not adopting $id: its topic is not under management, so importing it would plan a replacement"
       continue
     fi
