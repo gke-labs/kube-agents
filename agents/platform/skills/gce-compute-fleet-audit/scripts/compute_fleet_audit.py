@@ -8,15 +8,37 @@ governance/gce_compute_fleet_sop.md.
 Ships alongside its SOP as this stream's own collector rather than folded
 into `fleet-audit/scripts/collect.py`: that driver enumerates GKE clusters and
 fetches per-cluster kubeconfigs, neither of which this stream needs — its
-targets are GCP projects, read directly with `gcloud compute`. It emits the
+targets are GCP projects, read directly with `gcloud compute` and, for §2.6,
+`gcloud logging read`. It emits the
 run manifest that design's §2 specifies, the same one `collect.py` emits, so
 `audit_report.py finish --manifest-file` cross-checks the model's
 `checks_run` against what actually ran. It used to print a whole findings
 document instead, which no reader joins on: `adopt_collector_evidence` never
 saw it and the model's retyped excerpts shipped in place of the observed ones.
 
-All four of the SOP's checks are implemented here:
+All five of the SOP's checks are implemented here:
 
+- `node-conntrack-saturation` reads one day of the serial console log in
+  Cloud Logging for the kernel's line `nf_conntrack: table full, dropping
+  packet`, and names each GKE node pool whose nodes wrote it. It reads the
+  line and no share of `nf_conntrack_max`: GKE collects no figure for the
+  table by default. The read asks only for the node pools that the check
+  listed, by the base name that a pool's instance group gives its nodes, so
+  it returns the lines of those pools' nodes (the ones that a repair or the
+  autoscaler deleted since too) and of no other instance. A node whose serial console does not reach Cloud
+  Logging would read clean, so the check also lists the RUNNING GKE nodes
+  whose `serial-port-logging-enable` metadata value is `true` and names the
+  node pools of the rest in the target's `notes` as not visible. A page
+  holds the newest 1,000 lines; while a page is full the check reads again
+  without the node pools already seen, so one busy pool does not hide
+  another. Node pools whose objects are spelled alike inside a finding id are
+  one finding that names each. On a day with no such line it asks for any one
+  serial console entry of the node pools of its first read in the last 30
+  days; with none, nothing shows that the project stores that log, and
+  `notes` says so. A first read that fails, or a control read that fails,
+  leaves the check unevaluated; a later read of the kernel's line that fails
+  leaves the node pools that it did not reach in `limitations` and
+  `noted_objects`.
 - `gce-startup-script-status` enumerates with `compute instances list`, keeps
   the RUNNING instances that actually run a startup script — its own metadata
   or the project's common metadata, read with `compute project-info describe` —
@@ -47,7 +69,7 @@ reachable: `gcloud monitoring` exposes no metric read the credential proxy's
 allowlist could carry, and `osconfig.googleapis.com` is not enabled on the
 reference install. Keeping it as a permanent `checks_unevaluated` entry would have kept the
 whole stream's ledger partial forever over one unimplementable check, so the
-stream now audits the four things it can actually establish. §2.3 of the SOP
+stream now audits only the things it can actually establish. §2.3 of the SOP
 records the surface it would need.
 
 Field contracts assumed of `gcloud ... --format=json` output:
@@ -55,6 +77,21 @@ Field contracts assumed of `gcloud ... --format=json` output:
 - `compute instances list` items carry `name`, `status`, a `zone` selfLink
   whose last segment is the zone, and `metadata.items[].key`. Only `RUNNING`
   instances have serial console output to read.
+- A GKE node's instance carries the labels `goog-k8s-cluster-name`,
+  `goog-k8s-cluster-location` and `goog-k8s-node-pool-name` (read on GKE
+  Standard 1.35.8 nodes, 2026-11-24, and on a 1.36.4 node, 2026-11-26); an
+  instance without the first is not a GKE node. §2.6 lists the nodes with a read of its own, filtered on that
+  label.
+- A Cloud Logging entry of the serial console log carries the resource type
+  `gce_instance`, the instance's name under the label
+  `compute.googleapis.com/resource_name`, the console line under
+  `textPayload` and a `timestamp` (read on the entries of a live test,
+  2026-11-24).
+- A managed instance group names each instance with its base name, a hyphen
+  and four characters (the Compute Engine reference of
+  `instanceGroupManagers`, `baseInstanceName`, read 2026-11-26), and a GKE
+  node pool's nodes are such instances (every node name read in three
+  projects that day has the form).
 - `compute project-info describe` carries the project's common metadata under
   `commonInstanceMetadata.items[].key`, the same shape one item deeper.
 - `compute instances get-serial-port-output` returns **text, not JSON**, so it
@@ -120,7 +157,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 AUDIT_ID = "gce-compute-fleet-audit"
 
@@ -209,6 +246,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import logging_reads  # noqa: E402
 import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
@@ -243,6 +281,7 @@ STARTUP_SLUG = "gce-startup-script-status"
 MIG_SLUG = "mig-convergence-stalled"
 SOLE_TENANT_SLUG = "sole-tenant-headroom"
 SNAPSHOT_SLUG = "orphaned-snapshots"
+CONNTRACK_SLUG = "node-conntrack-saturation"
 
 # §2.1's fatal markers, as `google_metadata_script_runner` prints them. The
 # guest agent current images ship logs `Script "startup-script" failed with
@@ -286,7 +325,7 @@ SNAPSHOT_SCHEDULE_KEYS = ("sourceSnapshotSchedulePolicy", "sourceSnapshotSchedul
 # §2.4's threshold, as a percentage of the node group's aggregate capacity.
 SOLE_TENANT_UTILISATION_PCT = 90
 
-# `--format=json(...)` projections of the five list reads, each the fields
+# `--format=json(...)` projections of the list reads, each the fields
 # its reader names in the contract above and nothing else. An instance's
 # whole resource (network interfaces, disks, labels, scheduling, shielded-VM
 # config) is tens of times the four fields §2.1 reads, and a project with
@@ -299,6 +338,20 @@ SOLE_TENANT_UTILISATION_PCT = 90
 # so §2.1 would read no console on any project whose common metadata sets no
 # startup script.
 INSTANCES_FORMAT = "--format=json(name,status,zone,metadata.items[].key)"
+# §2.6's own read of the project's GKE nodes. The three labels are the ones GKE
+# puts on a node's instance; the check reads them to tell a node from another
+# instance and to name its cluster and node pool. They are spelled one by one
+# so that no other label, which may hold a customer's own text, is read. The
+# read is apart from §2.1's so that §2.1's command, and the error text that
+# quotes it, stay as they are.
+GKE_CLUSTER_LABEL = "goog-k8s-cluster-name"
+GKE_LOCATION_LABEL = "goog-k8s-cluster-location"
+GKE_POOL_LABEL = "goog-k8s-node-pool-name"
+GKE_NODES_FILTER = f"--filter=status={RUNNING_STATUS} AND labels.{GKE_CLUSTER_LABEL}:*"
+GKE_NODES_FORMAT = (
+    "--format=json(name,status,zone,"
+    f"labels.{GKE_CLUSTER_LABEL},labels.{GKE_LOCATION_LABEL},labels.{GKE_POOL_LABEL})"
+)
 MIGS_FORMAT = "--format=json(name,size,targetSize,status,currentActions,zone,region)"
 NODE_GROUPS_FORMAT = "--format=json(name,size,zone,region,autoscalingPolicy)"
 DISKS_FORMAT = "--format=json(name,selfLink)"
@@ -315,7 +368,164 @@ SEVERITY = {
     MIG_SLUG: "major",
     SOLE_TENANT_SLUG: "minor",
     SNAPSHOT_SLUG: "minor",
+    CONNTRACK_SLUG: "major",
 }
+
+# §2.6 reads the kernel's own words for a full connection tracking table. GKE's
+# troubleshooting page names the line as the sign of the fault ("These can be
+# logged in the serial console of the node"), and a live test on GKE Standard
+# 1.35.8 found it in Cloud Logging, under the serial console log, within 90
+# seconds (2026-11-20, one node, one run). The same test found it on a node of
+# a cluster with GKE Dataplane V2 and on a node with the Ubuntu image, and on
+# both, 300 connections that a pod opened raised the kernel table's count by
+# about as many (2026-11-26, one node and one run each).
+CONNTRACK_FULL_TEXT = "nf_conntrack: table full, dropping packet"
+SERIAL_CONSOLE_LOG_ID = "serialconsole.googleapis.com/serial_port_1_output"
+CONNTRACK_LOG_FILTER = (
+    'resource.type="gce_instance" '
+    f'AND log_id("{SERIAL_CONSOLE_LOG_ID}") '
+    f'AND textPayload:"{CONNTRACK_FULL_TEXT}"'
+)
+# The window is the audit's own cadence (cron `45 7 * * *`): each run reads the
+# day since the one before it.
+CONNTRACK_FRESHNESS_HOURS = 24
+CONNTRACK_FRESHNESS = f"{CONNTRACK_FRESHNESS_HOURS}h"
+# One page of `entries:list`. The kernel limits how often it writes the line,
+# so the number of lines is not the number of dropped packets, and a read that
+# fills the page with lines of the day says "this many or more", which the
+# excerpt then states.
+CONNTRACK_LOG_LIMIT = 1000
+# The read repeats while a page comes back full. A node that drops packets all
+# day writes far more than one page of lines, and the read returns the newest
+# first, so one busy node pool would use up the page and hide another. Each
+# round leaves out the groups that an earlier page named: their pool has its
+# finding. The verdict is for each node pool (it wrote the line or it did
+# not), so the rounds stop at the first page that is not full of lines of the
+# day: one that came back short, or one that reached a line older than the
+# window.
+CONNTRACK_READ_ROUNDS = 5
+# How many groups one read names. A group's base name has at most 58
+# characters, and the command with this many stays under MAX_COMMAND_CHARS,
+# so a finding's evidence shows the read whole (a test holds that for one
+# read; the target's joined record of every read can still count later reads
+# as "N more read(s)").
+CONNTRACK_GROUPS_PER_READ = 25
+# A project with more groups than CONNTRACK_FIRST_READS reads of that size
+# hold gets larger reads, so that every group is asked for in that many reads
+# and the rest of CONNTRACK_READS_MAX is left for the rounds. Such a read's
+# command is longer than a finding's evidence shows whole. A read never names
+# more than CONNTRACK_GROUPS_PER_READ_MAX groups: a Logging query is at most
+# 20,000 characters (the Cloud Logging quotas page, read 2026-11-26).
+CONNTRACK_FIRST_READS = 10
+CONNTRACK_GROUPS_PER_READ_MAX = 250
+# The most reads of the kernel's line for one project in one run: a bound on
+# what one run spends of the project's Cloud Logging read quota.
+CONNTRACK_READS_MAX = 20
+# How the report tool spells an object inside a finding id
+# (`audit_report._id_segment`): every run of other characters is one hyphen.
+LEDGER_SEGMENT_FOLD = re.compile(r"[^a-z0-9]+")
+LEDGER_SEGMENT_HYPHEN = "-"
+NAMES_JOIN = ", "
+# The fields of a serial console log entry that §2.6 reads.
+LOG_LABELS_KEY = "labels"
+LOG_INSTANCE_NAME_LABEL = "compute.googleapis.com/resource_name"
+LOG_TEXT_KEY = "textPayload"
+LOG_TIMESTAMP_KEY = "timestamp"
+# A node pool's nodes are the instances of a managed instance group, and the
+# group names each one with its base name, a hyphen and four characters. The
+# filter names a listed node's group by that base name, in one regex term (as
+# the broker's own exclusion clause is: Cloud Logging can refuse a filter with
+# many AND/OR terms). It so returns the lines of the pool's nodes, the ones
+# that a repair or the autoscaler deleted since too, and no line of any other
+# instance: not of a cluster that the declared scope excludes, and not of a
+# VM that is no GKE node. A node pool that was made again under the same name
+# gets a group with another base name (seen on four clusters made in turn
+# under one name, 2026-11-26), so the lines of the earlier pool are not read.
+GROUP_SUFFIX_HYPHEN = "-"
+GROUP_SUFFIX_RANDOM_CHARS = 4
+GROUP_SUFFIX_PATTERN = f"{GROUP_SUFFIX_HYPHEN}[a-z0-9]{{{GROUP_SUFFIX_RANDOM_CHARS}}}"
+GROUP_SUFFIX_CHARS = len(GROUP_SUFFIX_HYPHEN) + GROUP_SUFFIX_RANDOM_CHARS
+# A Compute Engine instance name (RFC 1035), so a filter may hold it as it is.
+INSTANCE_NAME_PATTERN = re.compile(r"[a-z](?:[-a-z0-9]*[a-z0-9])?\Z")
+GROUPED_NAME_PATTERN = re.compile(r"[a-z][-a-z0-9]*" + GROUP_SUFFIX_PATTERN + r"\Z")
+CONNTRACK_FOR_NAMES = f' AND labels."{LOG_INSTANCE_NAME_LABEL}"=~"^(?:{{names}})$"'
+NAME_OR = "|"
+# The groups of one clause, before the suffix of their instances.
+NAME_GROUPS_OPEN = "(?:"
+NAME_GROUPS_CLOSE = ")"
+# `gcloud logging read` and the broker's relay add the read's time bound only
+# to a filter that does not hold this word (`logging_reads.freshness_filter`),
+# and a cluster or a node pool can be named with it. The filter spells the
+# word's last letter as a class of one, which matches the same names and is
+# not the word.
+FILTER_TIME_WORD = logging_reads.FRESHNESS_SKIP_WORD
+FILTER_TIME_WORD_SPELLED = f"{FILTER_TIME_WORD[:-1]}[{FILTER_TIME_WORD[-1]}]"
+# How many node names one finding's excerpt lists before it counts the rest.
+CONNTRACK_NODES_SHOWN = 5
+# The metadata key that sends an instance's serial console to Cloud Logging,
+# and the value that turns it on. GKE sets it on its nodes; a cluster can be
+# made without it, and then a full table on its nodes writes nothing that this
+# check can read. The read below asks for the RUNNING GKE nodes whose value is
+# on and returns names only: a node's other metadata values hold credentials
+# (`kube-env`), so no value is ever printed.
+SERIAL_LOGGING_KEY = "serial-port-logging-enable"
+SERIAL_LOGGING_ON = "true"
+SERIAL_LOGGING_FILTER = (
+    f"{GKE_NODES_FILTER} AND metadata.items.key['{SERIAL_LOGGING_KEY}']['value']='{SERIAL_LOGGING_ON}'"
+)
+SERIAL_LOGGING_FORMAT = "--format=json(name,zone)"
+# The control read. The metadata value says that a node sends its serial
+# console to Cloud Logging; it does not say that the project keeps the log. An
+# exclusion on the project's sink, a sink to another project, or the
+# organization policy `compute.disableSerialPortLogging` leaves the value at
+# "true" and stores no line. So when a run finds no kernel line, it asks for
+# any one serial console entry of the node pools of its first read, with no
+# text filter.
+# None means that the check has no sign that this log reaches Cloud Logging
+# here, and "clean" would rest on nothing. The window is the log bucket's
+# default retention and not the audit's day, because a healthy node can write
+# nothing for weeks: on one test project 6 of 15 nodes wrote a line in a day,
+# 11 in a week and all 15 in 30 days (2026-11-26). So the control proves the
+# path as of some day in that window; an exclusion added since is not seen.
+SERIAL_CONTROL_FRESHNESS_DAYS = 30
+SERIAL_CONTROL_FRESHNESS = f"{SERIAL_CONTROL_FRESHNESS_DAYS}d"
+SERIAL_CONTROL_LIMIT = 1
+SERIAL_CONTROL_FILTER = f'resource.type="gce_instance" AND log_id("{SERIAL_CONSOLE_LOG_ID}")'
+CONNTRACK_IMPACT = (
+    "The kernel dropped new connections on these nodes because the connection tracking "
+    "table was full. Pods there kept reading Ready while requests to and from them failed."
+)
+# How a GKE node pool is named in a finding. A single instance takes §2.1's
+# form, INSTANCE_OBJECT_FORMAT.
+NODE_POOL_OBJECT = "NodePool/{location}/{cluster}/{pool}"
+CONNTRACK_AT_LEAST = "At least "
+CONNTRACK_POOL_EXCERPT = (
+    "{prefix}{lines} kernel line(s) `{text}` in the serial console log between {first} and "
+    "{last}, on {nodes} node(s) of node pool {pool} in cluster {cluster} ({location}): {names}."
+)
+CONNTRACK_INSTANCE_EXCERPT = (
+    "{prefix}{lines} kernel line(s) `{text}` in the serial console log between {first} and "
+    "{last}, on GKE node {name}, whose instance names no node pool."
+)
+# Two node pools whose objects have one form inside a finding id: the ledger
+# cannot tell them apart, so they are one finding that names both.
+CONNTRACK_SHARED_ID_EXCERPT = (
+    "{prefix}{lines} kernel line(s) `{text}` in the serial console log between {first} and "
+    "{last}, on {nodes} node(s) of {count} node pools whose names give one finding id "
+    "({pools}): {names}."
+)
+CONNTRACK_SHARED_ID_POOL = "{pool} in cluster {cluster} ({location})"
+# A GKE node whose instance carries no node pool label, as a note names it.
+CONNTRACK_UNLABELLED_NODE = "node {name} ({zone}), which names no pool"
+CONNTRACK_MORE_NODES = " and {more} more"
+# RFC 3339 down to the second: what an excerpt shows of an entry's timestamp.
+STAMP_SECONDS_CHARS = 19
+STAMP_UTC_SUFFIX = "Z"
+# The form of those characters. Cloud Logging writes an entry's timestamp in UTC.
+STAMP_SECONDS_FORMAT = "%Y-%m-%dT%H:%M:%S"
+UNKNOWN_TIME_TEXT = "an unknown time"
+# What a failed read's reason says when the command wrote nothing to stderr.
+NO_STDERR_TEXT = "no stderr"
 
 # Structural non-applicability: the enumeration ran, came back empty, and the
 # check has no object to hold its condition against. A `checks_not_applicable`
@@ -494,12 +704,101 @@ ROTATED_NOTE_NAMES = 10
 ROTATED_NOTE_MORE = ", and {more} more"
 # The manifest key that holds the target's notes.
 NOTES_KEY = "notes"
-# The manifest key that lists every instance the note covers, with no limit,
-# as `{check, object, command}`, `command` being the instance's own read. `finish` refuses a `resolved_because` for one of
-# them: the audit did not see that finding go away.
+# The manifest key that lists every object whose result a check could not see,
+# with no limit, as `{check, object}` and, where one read says so in the same
+# words on every run, `command`: an instance's own console read, or §2.6's
+# read of the nodes' logging switch. `finish` refuses a `resolved_because` for
+# one of them: the audit did not see that finding go away.
 NOTED_OBJECTS_KEY = "noted_objects"
 # An instance's finding identity (`check_startup_script`).
 INSTANCE_OBJECT_FORMAT = "ComputeInstance/{zone}/{name}"
+
+# §2.6's structural case, the counterpart of NO_INSTANCES_REASON: the read ran
+# and no RUNNING instance is a GKE node, so there is no node whose table could
+# be full.
+NO_GKE_NODES_REASON = (
+    "No RUNNING Compute Engine instance on this project is a GKE node visible to the "
+    "audit identity: `compute instances list`, asked for RUNNING instances with GKE's "
+    "cluster label, returned none, so §2.6 has no node whose connection tracking table "
+    "could be full. Structural, not a missed read. " + AUTOPILOT_INVISIBLE_NOTE
+)
+# Every GKE node on the project belongs to a cluster that the declared scope
+# leaves out. The operator's choice, so not a coverage gap.
+EXCLUDED_GKE_NODES_REASON = (
+    "Every RUNNING GKE node on this project belongs to a cluster that the install's "
+    "declared scope leaves out ({total} node(s)), so §2.6 has no node in scope whose "
+    "connection tracking table could be full. Structural, not a missed read."
+)
+# The `checks_unevaluated` cases for §2.6: a read of this run failed, so
+# nothing was read about the nodes' tables and a stale finding must not be
+# called fixed on the strength of this run. Each sentence is the plain cause.
+# The target's `limitations` carries it as it is, because a chat report shows
+# that text: no command, no exit code, no error text and no section number.
+# The `checks_unevaluated` reason adds the command, its exit code and its error
+# text (CONNTRACK_READ_ERROR), which stay in the manifest.
+UNREAD_GKE_NODES_REASON = (
+    "The list of this project's GKE nodes could not be read, so the check read nothing "
+    "about their connection tracking tables."
+)
+UNREAD_SERIAL_LOGGING_REASON = (
+    "The check reads a node's serial console log in Cloud Logging, and the read of which of "
+    "the {total} RUNNING GKE node(s) on this project send that log there failed."
+)
+UNREAD_CONNTRACK_LOG_REASON = (
+    "The read of the serial console log in Cloud Logging failed, so no line of the "
+    "{total} RUNNING GKE node(s) on this project was read."
+)
+UNREAD_SERIAL_CONTROL_REASON = (
+    "The check found no kernel line, and its control read of the serial console log failed, "
+    "so nothing shows that this log reaches Cloud Logging for the {total} RUNNING GKE "
+    "node(s) on this project."
+)
+CONNTRACK_READ_ERROR = "{cause} The read: {error}"
+CONNTRACK_UNEVALUATED_LIMITATION = (
+    "node-conntrack-saturation could not be evaluated on this project. {cause}"
+)
+# The standing states in which §2.6 ran and could not see: nodes that do not
+# send their serial console to Cloud Logging, and a project that keeps none of
+# that log. Each is a customer's setting that lasts, so it is a note and not a
+# limitation or an unevaluated check: either of those is a coverage gap that
+# would hold every finding of this stream open for as long as the setting
+# stands. A note is shown and counted as no gap, and `noted_objects` names the
+# node pools it covers, so `finish` does not call an earlier finding on one of
+# them resolved: the run did not see it go away.
+# Node pools, not nodes, and no node count: the name of a node changes with each
+# repair and the count with each scale-up, and a note that changes each day
+# keeps `precheck` from closing a run on the stored document.
+SERIAL_LOGGING_OFF_NOTE = (
+    "node-conntrack-saturation: a full connection tracking table is not visible on nodes of "
+    "{count} node pool(s) on this project. Their serial console does not reach Cloud "
+    "Logging (`serial-port-logging-enable` is not `true`): {names}."
+)
+# No names, and short. On an install with no ledger the report's notes line is
+# `<lead>: project/<id>: <note>`, and a line over the chat card's 300 characters
+# costs the summary its card. This note fits for one noted project with the
+# longest project id; a test holds it there. The notes with names do not fit.
+NO_SERIAL_ENTRIES_NOTE = (
+    "node-conntrack-saturation: no serial console entry of a GKE node reached Cloud Logging "
+    "here in the last {days} days, so a full connection tracking table is not visible. A log "
+    "exclusion or a policy can cause this."
+)
+# The read did not reach every node pool: the pages that it read were full of
+# busier pools' lines, the run's reads ran out, or a read failed after another
+# had succeeded. The findings from the pages that were read stand, and each
+# node pool that was not reached is a noted object, so an earlier finding on
+# it is not called resolved.
+CONNTRACK_UNREAD_FULL_LIMITATION = (
+    "node-conntrack-saturation did not reach {count} node pool(s) on this project, so a full "
+    "connection tracking table there is not reported. The check stopped after {reads} read(s): "
+    "the lines of busier node pools filled its pages, or the project has more node pools than "
+    "one run reads."
+)
+CONNTRACK_UNREAD_FAILED_LIMITATION = (
+    "node-conntrack-saturation did not reach {count} node pool(s) on this project, so a full "
+    "connection tracking table there is not reported. A read of the serial console log failed "
+    "after {reads} read(s)."
+)
+CONNTRACK_LATER_READ_FAILED_LOG = "{project}: a later read of the serial console log failed: {error}"
 
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
 # apply, and §2.5's is a legal-hold exclusion it cannot see. `needs_triage` is
@@ -605,7 +904,7 @@ class SlugReads:
 def _joined_record(reads: SlugReads) -> dict:
     """One `commands` entry covering every read that backed one check.
 
-    Most of the four checks take more than one read — an enumeration plus a
+    Most of the checks take more than one read — an enumeration plus a
     serial read per instance, a node-group list plus `list-nodes` per group, an
     enumeration of disks plus one of snapshots — and publishing only the last
     names a command that cannot reproduce the verdict, which is the one thing
@@ -1226,6 +1525,376 @@ def check_sole_tenant_headroom(group: dict, nodes: list) -> tuple[dict | None, b
     )
 
 
+def gke_nodes(instances: list) -> dict[tuple[str, str], dict]:
+    """`{(zone, name): {"cluster", "location", "pool"}}` for each RUNNING
+    instance that carries GKE's cluster label. An instance name is unique per
+    zone, not per project, so the key carries both. A node whose labels name no
+    location takes its zone, which is the location of a zonal cluster."""
+    nodes: dict[tuple[str, str], dict] = {}
+    for item in instances or []:
+        if not isinstance(item, dict) or item.get("status") != RUNNING_STATUS:
+            continue
+        labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
+        cluster = str(labels.get(GKE_CLUSTER_LABEL) or "").strip()
+        name = str(item.get("name") or "").strip()
+        zone = _last_segment(str(item.get("zone") or ""))
+        # A name that is no Compute Engine name is not one this check can ask
+        # the log for: the filter holds node names as they are.
+        if not cluster or not zone or not INSTANCE_NAME_PATTERN.match(name):
+            continue
+        nodes[(zone, name)] = {
+            "cluster": cluster,
+            "location": str(labels.get(GKE_LOCATION_LABEL) or "").strip() or zone,
+            "pool": str(labels.get(GKE_POOL_LABEL) or "").strip(),
+        }
+    return nodes
+
+
+def instance_keys(listed: list) -> set[tuple[str, str]]:
+    """`(zone, name)` for each item of a `compute instances list` read."""
+    keys: set[tuple[str, str]] = set()
+    for item in listed or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        zone = _last_segment(str(item.get("zone") or ""))
+        if name and zone:
+            keys.add((zone, name))
+    return keys
+
+
+def pool_names(nodes: dict[tuple[str, str], dict], keys) -> list[str]:
+    """The node pools of the nodes `keys` names, in words for a note, sorted
+    and without repeats. A node whose pool is not labelled is named itself."""
+    names = set()
+    for zone, name in keys:
+        node = nodes[(zone, name)]
+        if node["pool"]:
+            names.add(CONNTRACK_SHARED_ID_POOL.format(pool=node["pool"], cluster=node["cluster"], location=node["location"]))
+        else:
+            names.add(CONNTRACK_UNLABELLED_NODE.format(name=name, zone=zone))
+    return sorted(names)
+
+
+def node_objects(nodes: dict[tuple[str, str], dict], keys) -> list[str]:
+    """The finding identities of the nodes `keys` names, sorted and without
+    repeats: a node pool for a node whose pool is labelled, else the instance,
+    as `check_conntrack_saturation` names them."""
+    objects = set()
+    for zone, name in keys:
+        node = nodes[(zone, name)]
+        if node["pool"]:
+            objects.add(NODE_POOL_OBJECT.format(location=node["location"], cluster=node["cluster"], pool=node["pool"]))
+        else:
+            objects.add(INSTANCE_OBJECT_FORMAT.format(zone=zone, name=name))
+    return sorted(objects)
+
+
+def _stamp(timestamp: str) -> str:
+    """An entry's timestamp cut to the second, for an excerpt."""
+    return f"{timestamp[:STAMP_SECONDS_CHARS]}{STAMP_UTC_SUFFIX}" if timestamp else UNKNOWN_TIME_TEXT
+
+
+def conntrack_units(nodes: dict[tuple[str, str], dict], keys) -> dict[str, dict]:
+    """What the log read asks for, for the nodes `keys` names:
+    `{unit: {"object", "node", "exact"}}`.
+
+    A unit is a group's base name (the node's name without its last hyphen and
+    four characters). A node with no pool label, or whose name is not of a
+    group's form, is a unit by its exact name (`exact`). The object is the
+    node's finding identity as `node_objects` gives it: the node pool, or the
+    instance for a node with no pool label. `gke_nodes` admits only names that
+    a filter can hold as they are.
+    """
+    units: dict[str, dict] = {}
+    for zone, name in sorted(keys):
+        node = nodes[(zone, name)]
+        (obj,) = node_objects(nodes, [(zone, name)])
+        exact = not (node["pool"] and GROUPED_NAME_PATTERN.match(name))
+        unit = name if exact else name[:-GROUP_SUFFIX_CHARS]
+        units.setdefault(unit, {"object": obj, "node": node if node["pool"] else None, "exact": exact})
+    return units
+
+
+def conntrack_unit(units: dict[str, dict], name: str) -> str | None:
+    """The unit of `units` that the instance `name` belongs to, or None."""
+    exact = units.get(name)
+    if exact and exact["exact"]:
+        return name
+    if GROUPED_NAME_PATTERN.match(name):
+        group = name[:-GROUP_SUFFIX_CHARS]
+        if group in units and not units[group]["exact"]:
+            return group
+    return None
+
+
+def _conntrack_lines(entries: list):
+    """`(name, timestamp)` for each Cloud Logging entry that carries the
+    kernel's line and names its instance. A timestamp that does not read as a
+    time is `""`, so an excerpt says the time is unknown and a malformed
+    string never replaces a real time in the first and last."""
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get(LOG_TEXT_KEY)
+        if not isinstance(text, str) or CONNTRACK_FULL_TEXT not in text:
+            continue
+        labels = entry.get(LOG_LABELS_KEY) if isinstance(entry.get(LOG_LABELS_KEY), dict) else {}
+        name = str(labels.get(LOG_INSTANCE_NAME_LABEL) or "").strip()
+        if name:
+            yield name, str(entry.get(LOG_TIMESTAMP_KEY) or "") if _entry_time(entry) is not None else ""
+
+
+def ledger_segment(value: str) -> str:
+    """`value` as the report tool spells it inside a finding id. Two objects
+    with one spelling are one finding there, and a document that carries both
+    is refused whole (`audit_report.validate_findings`)."""
+    return LEDGER_SEGMENT_FOLD.sub(LEDGER_SEGMENT_HYPHEN, value.strip().lower()).strip(LEDGER_SEGMENT_HYPHEN)
+
+
+def shown_names(names: list[str]) -> str:
+    """The first CONNTRACK_NODES_SHOWN of `names`, and how many more there are."""
+    shown = NAMES_JOIN.join(names[:CONNTRACK_NODES_SHOWN])
+    if len(names) > CONNTRACK_NODES_SHOWN:
+        shown += CONNTRACK_MORE_NODES.format(more=len(names) - CONNTRACK_NODES_SHOWN)
+    return shown
+
+
+def check_conntrack_saturation(entries: list, units: dict[str, dict], *, at_least: bool = False) -> list[dict]:
+    """§2.6: one hit for each GKE node pool whose nodes' serial console log
+    carries the kernel's line for a full connection tracking table.
+
+    `entries` are Cloud Logging entries, `units` is `conntrack_units`' answer,
+    and `at_least` says that a read filled its page, so every count is a
+    floor. A pool is the unit because a node's name changes with each repair
+    and upgrade, and a finding per node would open a new one each time; the
+    lines of a node that was deleted since count for its pool, because its
+    name still carries the group's base name. An entry of an instance that is
+    in no unit gets no hit. Node pools whose objects have one spelling inside
+    a finding id (`ledger_segment`; cluster `prod` with pool `web-default`, and
+    cluster `prod-web` with pool `default`) are one hit that names each of
+    them. No text from inside the guest reaches the excerpt: the line it
+    quotes is this file's constant, and the names come from the entry's
+    labels, which the platform sets.
+    """
+    groups: dict[str, dict] = {}
+    for name, stamp in _conntrack_lines(entries):
+        unit = conntrack_unit(units, name)
+        if unit is None:
+            continue
+        obj = units[unit]["object"]
+        group = groups.setdefault(ledger_segment(obj), {"objects": {}, "name": name, "lines": {}, "stamps": []})
+        group["objects"][obj] = units[unit]["node"]
+        group["lines"][name] = group["lines"].get(name, 0) + 1
+        if stamp:
+            group["stamps"].append(stamp)
+    hits: list[dict] = []
+    prefix = CONNTRACK_AT_LEAST if at_least else ""
+    for key in sorted(groups):
+        group = groups[key]
+        objects = sorted(group["objects"])
+        pools = [group["objects"][obj] for obj in objects if group["objects"][obj]]
+        total = sum(group["lines"].values())
+        first = _stamp(min(group["stamps"], default=""))
+        last = _stamp(max(group["stamps"], default=""))
+        # Most lines first, then by name, so the excerpt is the same on every run.
+        ranked = sorted(group["lines"].items(), key=lambda pair: (-pair[1], pair[0]))
+        names = shown_names([f"{name} ({count})" for name, count in ranked])
+        if len(pools) > 1:
+            excerpt = CONNTRACK_SHARED_ID_EXCERPT.format(
+                prefix=prefix, lines=total, text=CONNTRACK_FULL_TEXT, first=first, last=last,
+                nodes=len(ranked), count=len(pools), names=names,
+                pools=NAMES_JOIN.join(
+                    CONNTRACK_SHARED_ID_POOL.format(pool=pool["pool"], cluster=pool["cluster"], location=pool["location"])
+                    for pool in pools
+                ),
+            )
+        elif pools:
+            excerpt = CONNTRACK_POOL_EXCERPT.format(
+                prefix=prefix, lines=total, text=CONNTRACK_FULL_TEXT, first=first, last=last,
+                nodes=len(ranked), pool=pools[0]["pool"], cluster=pools[0]["cluster"],
+                location=pools[0]["location"], names=names,
+            )
+        else:
+            excerpt = CONNTRACK_INSTANCE_EXCERPT.format(
+                prefix=prefix, lines=total, text=CONNTRACK_FULL_TEXT, first=first, last=last, name=group["name"],
+            )
+        hits.append(
+            {
+                "object": objects[0],
+                "excerpt": excerpt[:MAX_EXCERPT_CHARS],
+                "impact": CONNTRACK_IMPACT,
+                "needs_triage": None,
+            }
+        )
+    return hits
+
+
+def run_logging_read(
+    argv: list[str], *, run: RunFn, project: str, filter_text: str, freshness: datetime.timedelta, limit: int,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+) -> Run:
+    """One `gcloud logging read`, served by the broker's Cloud API relay when it can be.
+
+    `fleet_stockout.run_logging_read` is the same function; this script ships
+    alone, so it carries its own. `argv` is the `gcloud` command and the other
+    arguments say the same read. The relay returns the entries `gcloud` prints,
+    as a JSON list, so the `Run` parses the same either way; when the relay
+    does not give the whole answer, `argv` runs. `timeout_s` bounds the read as
+    a whole.
+    """
+    started = time.monotonic()
+    try:
+        stdout = logging_reads.read_json(
+            project, logging_reads.freshness_filter(filter_text, freshness), limit, timeout_s=timeout_s
+        )
+    except logging_reads.ReadTimedOut as timed_out:
+        return Run(argv, TIMEOUT_RC, "", str(timed_out), time.monotonic() - started)
+    if stdout is not None:
+        return Run(argv, 0, stdout, "", time.monotonic() - started)
+    spent = int(time.monotonic() - started)
+    # A relay that is not there answers at once, and `gcloud` then has the whole time.
+    return run(argv, timeout=max(timeout_s - spent, 1)) if spent else run(argv)
+
+
+def names_clause(units: dict[str, dict], asked: list[str]) -> str:
+    """The filter clause that keeps the entries of the units `asked` and of no
+    other instance. It never holds FILTER_TIME_WORD, whatever a unit is named."""
+    groups = [unit for unit in asked if not units[unit]["exact"]]
+    names = [NAME_GROUPS_OPEN + NAME_OR.join(groups) + NAME_GROUPS_CLOSE + GROUP_SUFFIX_PATTERN] if groups else []
+    names += [unit for unit in asked if units[unit]["exact"]]
+    return CONNTRACK_FOR_NAMES.format(names=NAME_OR.join(names).replace(FILTER_TIME_WORD, FILTER_TIME_WORD_SPELLED))
+
+
+def groups_per_read(total: int) -> int:
+    """How many units one read names in a project with `total` units:
+    CONNTRACK_GROUPS_PER_READ, or more where that many would not reach every
+    unit in CONNTRACK_FIRST_READS reads, and never over
+    CONNTRACK_GROUPS_PER_READ_MAX."""
+    spread = -(-total // CONNTRACK_FIRST_READS)
+    return min(max(CONNTRACK_GROUPS_PER_READ, spread), CONNTRACK_GROUPS_PER_READ_MAX)
+
+
+class ConntrackLines(NamedTuple):
+    """What `read_conntrack_lines` read."""
+
+    # One `(command, result, entries)` for each read that returned a page, in order.
+    pages: list
+    # The units that no read reached: the pages were full of other units'
+    # lines, the run's reads ran out, or a read failed.
+    unread: list
+    # The command and result of a read that failed; the pages before it stand.
+    failed: tuple | None
+
+
+def _entry_time(entry) -> datetime.datetime | None:
+    """A log entry's own time to the second, or None when it carries none that reads as one."""
+    text = str(entry.get(LOG_TIMESTAMP_KEY) or "") if isinstance(entry, dict) else ""
+    try:
+        stamp = datetime.datetime.strptime(text[:STAMP_SECONDS_CHARS], STAMP_SECONDS_FORMAT)
+    except ValueError:
+        return None
+    return stamp.replace(tzinfo=datetime.timezone.utc)
+
+
+def within_window(entries: list, since: datetime.datetime) -> list:
+    """The entries stamped at or after the start of the second that holds `since`.
+
+    `gcloud` and the relay add a read's time bound only to a filter without
+    the word `timestamp`, and a clause that is added to the filter after this
+    collector wrote it (an excluded cluster's name) can hold that word. So the
+    collector holds the window itself too, on each entry's own time. An entry
+    with no time that reads as one stays. A finding says that the time is
+    unknown only when none of its lines carries a timestamp.
+    """
+    # An entry's time is cut to the second, so the window's start is too: a
+    # line of the window's first second stays.
+    start = since.replace(microsecond=0)
+    kept = []
+    for entry in entries:
+        stamp = _entry_time(entry)
+        if stamp is None or stamp >= start:
+            kept.append(entry)
+    return kept
+
+
+def read_conntrack_lines(
+    project: str, units: dict[str, dict], *, run: RunFn, since: datetime.datetime
+) -> ConntrackLines:
+    """The serial console entries of `units` that carry the kernel's line.
+
+    One read names `groups_per_read` units and returns one page, newest
+    first. While a page is full, the next round asks for the units that the
+    page did not name, up to CONNTRACK_READ_ROUNDS rounds, so the lines of one
+    node pool cannot hide another's; a full page that named every unit asked
+    for leaves nothing hidden. A read that fails, or the
+    CONNTRACK_READS_MAX-th read, ends the reading; the pages before it are
+    kept, and the units not reached are `unread`.
+
+    A page keeps the entries `within_window` of `since` only. A page that
+    reached an older entry holds every newer line of the units asked for,
+    because a page is newest first, so it ends the rounds for them.
+    """
+    pages: list = []
+    unread: list[str] = []
+    pending = sorted(units)
+    size = groups_per_read(len(pending))
+    while pending:
+        asked, pending = pending[:size], pending[size:]
+        for _round in range(CONNTRACK_READ_ROUNDS):
+            if len(pages) >= CONNTRACK_READS_MAX:
+                return ConntrackLines(pages, unread + asked + pending, None)
+            filter_text = CONNTRACK_LOG_FILTER + names_clause(units, asked)
+            argv = [
+                GCLOUD, "logging", "read", filter_text,
+                "--project", project, "--freshness", CONNTRACK_FRESHNESS,
+                "--limit", str(CONNTRACK_LOG_LIMIT), "--format", "json",
+            ]
+            result = run_logging_read(
+                argv, run=run, project=project, filter_text=filter_text,
+                freshness=datetime.timedelta(hours=CONNTRACK_FRESHNESS_HOURS), limit=CONNTRACK_LOG_LIMIT,
+            )
+            page = _json_list(result)
+            if page is None:
+                return ConntrackLines(pages, unread + asked + pending, (argv, result))
+            returned = len(page)
+            page = within_window(page, since)
+            pages.append((shlex.join(argv), result, page))
+            if returned < CONNTRACK_LOG_LIMIT or len(page) < returned:
+                asked = []
+                break
+            seen = {conntrack_unit(units, name) for name, _stamp_text in _conntrack_lines(page)}
+            left = [unit for unit in asked if unit not in seen]
+            if len(left) == len(asked):
+                # A full page that names none of the units asked for: another
+                # round would read the same page.
+                break
+            asked = left
+            if not asked:
+                break
+        unread += asked
+    return ConntrackLines(pages, unread, None)
+
+
+def _json_list(result: Run) -> list | None:
+    """`result`'s output as a JSON list, or None when the read failed, printed
+    nothing or printed anything else: the gate of `run_and_gate`, for a `Run`
+    that is already there."""
+    if result.rc != 0 or not (result.stdout or "").strip():
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _failure_text(argv: list[str], result: Run) -> str:
+    """One clipped sentence that names a failed read, for a reason."""
+    stderr = (result.stderr or "").strip()
+    return f"{' '.join(argv)} failed (rc={result.rc}): {stderr[:ERROR_CLIP_CHARS] or NO_STDERR_TEXT}"
+
+
 def _emit(slug: str, hit: dict, command: str = "") -> dict:
     emitted = {
         "check": slug,
@@ -1552,6 +2221,161 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 hit = check_orphaned_snapshot(snapshot, active, now)
                 if hit:
                     candidates.append(_emit(SNAPSHOT_SLUG, hit))
+
+        # --- 2.6 connection tracking table full ----------------------------- #
+        # None of this check's own reads is gated to the project: a refused log
+        # read must not cost the project its four other checks. It costs this
+        # check its verdict, which `checks_unevaluated` then says.
+        nodes_argv = [
+            GCLOUD, "compute", "instances", "list", "--project", project,
+            GKE_NODES_FILTER, GKE_NODES_FORMAT,
+        ]
+        listed_nodes, nodes_result = run_and_gate(nodes_argv, run=run)
+        all_nodes = gke_nodes(listed_nodes if isinstance(listed_nodes, list) else [])
+        # The nodes of a cluster the operator left out of the declared scope
+        # are no nodes here: the log read names only the node pools below, so
+        # it returns no line of theirs. Not a coverage gap.
+        left_out = frozenset(
+            key
+            for key, node in all_nodes.items()
+            if (project, node["location"], node["cluster"]) in declared_scope.excluded_clusters
+        )
+        nodes = {key: node for key, node in all_nodes.items() if key not in left_out}
+        # Why the check reached no verdict, and the failed read's own text.
+        conntrack_cause = conntrack_error = ""
+        if not isinstance(listed_nodes, list):
+            conntrack_cause = UNREAD_GKE_NODES_REASON
+            conntrack_error = _failure_text(nodes_argv, nodes_result)
+        elif not nodes:
+            reason = EXCLUDED_GKE_NODES_REASON.format(total=len(left_out)) if left_out else NO_GKE_NODES_REASON
+            not_applicable.append({"check": CONNTRACK_SLUG, "reason": reason})
+        else:
+            reads.setdefault(CONNTRACK_SLUG, SlugReads()).add(shlex.join(nodes_argv), nodes_result)
+            logging_argv = [
+                GCLOUD, "compute", "instances", "list", "--project", project,
+                SERIAL_LOGGING_FILTER, SERIAL_LOGGING_FORMAT,
+            ]
+            logged, logged_result = run_and_gate(logging_argv, run=run)
+            if not isinstance(logged, list):
+                conntrack_cause = UNREAD_SERIAL_LOGGING_REASON.format(total=len(nodes))
+                conntrack_error = _failure_text(logging_argv, logged_result)
+            else:
+                switch_command = shlex.join(logging_argv)
+                reads[CONNTRACK_SLUG].add(switch_command, logged_result)
+                covered = instance_keys(logged) & set(nodes)
+                uncovered = sorted(set(nodes) - covered)
+                # The node pools this run could not see. The value is the read of
+                # the logging switch where that read says why, else empty.
+                unseen: dict[str, str] = {}
+                if uncovered:
+                    named = pool_names(nodes, uncovered)
+                    notes.append(SERIAL_LOGGING_OFF_NOTE.format(count=len(named), names=shown_names(named)))
+                    unseen.update(dict.fromkeys(node_objects(nodes, uncovered), switch_command))
+                # The findings of this run, as the ledger spells their objects.
+                found: set[str] = set()
+                units = conntrack_units(nodes, covered)
+                # A limitation on node pools that no read reached; it is said
+                # only where the check stays evaluated.
+                unread_limitation = ""
+                if units:
+                    # Before the first read, so that a read's own bound is never the wider one.
+                    started = datetime.datetime.now(datetime.timezone.utc)
+                    lines = read_conntrack_lines(
+                        project, units, run=run,
+                        since=started - datetime.timedelta(hours=CONNTRACK_FRESHNESS_HOURS),
+                    )
+                    if not lines.pages:
+                        failed_argv, failed_result = lines.failed
+                        conntrack_cause = UNREAD_CONNTRACK_LOG_REASON.format(total=len(nodes))
+                        conntrack_error = _failure_text(failed_argv, failed_result)
+                    else:
+                        entries: list = []
+                        # The read that first returned a line of each object.
+                        first_read: dict[str, str] = {}
+                        for command, result, page in lines.pages:
+                            reads[CONNTRACK_SLUG].add(command, result)
+                            entries += page
+                            for instance, _stamp_text in _conntrack_lines(page):
+                                unit = conntrack_unit(units, instance)
+                                if unit:
+                                    first_read.setdefault(ledger_segment(units[unit]["object"]), command)
+                        # A full page anywhere makes every count a floor.
+                        floor = any(len(page) >= CONNTRACK_LOG_LIMIT for _command, _result, page in lines.pages)
+                        for hit in check_conntrack_saturation(entries, units, at_least=floor):
+                            spelled = ledger_segment(hit["object"])
+                            candidates.append(_emit(CONNTRACK_SLUG, hit, first_read[spelled]))
+                            found.add(spelled)
+                        if lines.unread:
+                            # The node pools that no read reached: not reported
+                            # this run, and an earlier finding on one stays open.
+                            missed = sorted({units[unit]["object"] for unit in lines.unread})
+                            limitation = (
+                                CONNTRACK_UNREAD_FAILED_LIMITATION if lines.failed else CONNTRACK_UNREAD_FULL_LIMITATION
+                            )
+                            unread_limitation = limitation.format(count=len(missed), reads=len(lines.pages))
+                            if lines.failed:
+                                log(CONNTRACK_LATER_READ_FAILED_LOG.format(project=project, error=_failure_text(*lines.failed)))
+                            for obj in missed:
+                                unseen.setdefault(obj, "")
+                        if not entries:
+                            # A day with no line. Lines would have shown that the
+                            # log reaches Cloud Logging; with none, the control
+                            # asks for any entry of the node pools of the first read.
+                            control_filter = SERIAL_CONTROL_FILTER + names_clause(
+                                units, sorted(units)[: groups_per_read(len(units))]
+                            )
+                            control_argv = [
+                                GCLOUD, "logging", "read", control_filter,
+                                "--project", project, "--freshness", SERIAL_CONTROL_FRESHNESS,
+                                "--limit", str(SERIAL_CONTROL_LIMIT), "--format", "json",
+                            ]
+                            control_result = run_logging_read(
+                                control_argv, run=run, project=project, filter_text=control_filter,
+                                freshness=datetime.timedelta(days=SERIAL_CONTROL_FRESHNESS_DAYS),
+                                limit=SERIAL_CONTROL_LIMIT,
+                            )
+                            control = _json_list(control_result)
+                            if control is not None:
+                                control = within_window(
+                                    control, started - datetime.timedelta(days=SERIAL_CONTROL_FRESHNESS_DAYS)
+                                )
+                            if control is None:
+                                conntrack_cause = UNREAD_SERIAL_CONTROL_REASON.format(total=len(nodes))
+                                conntrack_error = _failure_text(control_argv, control_result)
+                            else:
+                                control_command = shlex.join(control_argv)
+                                reads[CONNTRACK_SLUG].add(control_command, control_result)
+                                if not control:
+                                    notes.append(NO_SERIAL_ENTRIES_NOTE.format(days=SERIAL_CONTROL_FRESHNESS_DAYS))
+                                    for obj in node_objects(nodes, covered):
+                                        unseen.setdefault(obj, "")
+                if not conntrack_cause:
+                    if unread_limitation:
+                        limitations.append(unread_limitation)
+                    # A pool with a finding this run was seen; the rest of the
+                    # unseen pools keep an earlier finding from being resolved.
+                    # One entry for each spelling that the ledger knows. Only the
+                    # switch read is written on an entry: it is the same text on
+                    # every run. A log read names that day's groups, and its text
+                    # on every entry would be most of a large manifest; the
+                    # target's `commands` record shows the first reads whole and
+                    # counts the rest.
+                    noted: dict[str, dict] = {}
+                    for obj, command in sorted(unseen.items()):
+                        if ledger_segment(obj) not in found:
+                            item = {"check": CONNTRACK_SLUG, "object": obj}
+                            if command:
+                                item["command"] = command
+                            noted.setdefault(ledger_segment(obj), item)
+                    noted_objects += list(noted.values())
+        if conntrack_cause:
+            unevaluated.append(
+                {
+                    "check": CONNTRACK_SLUG,
+                    "reason": CONNTRACK_READ_ERROR.format(cause=conntrack_cause, error=conntrack_error),
+                }
+            )
+            limitations.append(CONNTRACK_UNEVALUATED_LIMITATION.format(cause=conntrack_cause))
     except ComputeApiDisabled:
         log(f"{project}: Compute Engine API is not enabled; nothing here to audit")
         return None

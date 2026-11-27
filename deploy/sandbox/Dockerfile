@@ -672,8 +672,9 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          imports it at load
 #   logging_reads.py       a `gcloud logging read` through the broker's Cloud API
 #                          relay (credential_proxy_client.ApiSession), for the
-#                          stockout collector and the readiness report's audit-log
-#                          rules; when the relay does not answer, they run gcloud
+#                          stockout collector, the GCE compute collector and the
+#                          readiness report's audit-log rules; when the relay does
+#                          not answer, they run gcloud
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py`, submit-suggestion,

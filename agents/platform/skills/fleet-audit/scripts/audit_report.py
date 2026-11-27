@@ -514,11 +514,13 @@ AUDITS: dict[str, AuditSpec] = {
             "mig-convergence-stalled",
             "sole-tenant-headroom",
             "orphaned-snapshots",
+            "node-conntrack-saturation",
         ),
-        # Every check reads Compute Engine objects that belong to a project, so
+        # Every check reads objects that belong to a project (Compute Engine
+        # objects, and for the last one the project's serial console log), so
         # the collector names one `project/<id>` entry per project and nothing
         # else. Declaring the partition is what makes a run that enumerated
-        # some other kind of target -- and so ran none of these four anywhere --
+        # some other kind of target -- and so ran none of these five anywhere --
         # report a gap instead of passing silently.
         scopes=(
             (
@@ -528,6 +530,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "mig-convergence-stalled",
                     "sole-tenant-headroom",
                     "orphaned-snapshots",
+                    "node-conntrack-saturation",
                 ),
             ),
         ),
@@ -537,9 +540,10 @@ AUDITS: dict[str, AuditSpec] = {
         # repository declaration may keep off the ledger; the waste audit
         # already lets an owner declare the same shape for a kept disk. One
         # arm, one object kind (`Snapshot/<name>`), so no arm rule. The other
-        # three are live faults no declaration excuses: a startup script that
+        # four are live faults no declaration excuses: a startup script that
         # failed on the last boot, a group creating and deleting at once, a
-        # reservation with less than one host free.
+        # reservation with less than one host free, a node whose kernel dropped
+        # connections on a full connection tracking table.
         declarable=("orphaned-snapshots",),
     ),
     "upgrade-retrospective": AuditSpec(
@@ -1398,6 +1402,7 @@ CHECK_PHRASES = {
     "mig-convergence-stalled": "{object} instance group isn't converging",
     "sole-tenant-headroom": "sole-tenant nodes are nearly full",
     "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+    "node-conntrack-saturation": "{object} dropped connections on a full connection tracking table",
     # Upgrade Retrospective
     "upgrade-operation-failed": "an upgrade operation failed",
     "upgrade-broke-workload": "{object} broke after the upgrade",
@@ -1863,8 +1868,8 @@ MAX_TEXT_CHARS = 1500
 MAX_NOTE_CHARS = 2000
 # A target's `notes`: what the collector read but could not show, written for
 # the reader and never counted as a coverage gap (`scope_notes`). The GCE
-# collector's rotated serial consoles are the one producer
-# (docs/designs/fleet-audit-collector-manifest.md).
+# collector is the one producer: rotated serial consoles, and what its
+# conntrack check could not see (docs/designs/fleet-audit-collector-manifest.md).
 SCOPE_NOTES_KEY = "notes"
 # The key on `finish`'s JSON line that holds the targets' notes as
 # `{target, note}` objects (`notes_payload`). It is on the line only when a
@@ -1918,10 +1923,10 @@ NOTES_LEAD = "Read but not visible, which is not a coverage gap"
 NOTES_SECTION_CAP = 6_000
 # The row that says what the cap left out, wherever the cap applied.
 MORE_NOTES_ROW = "…and {more} more; the stored report carries every full note"
-# A collected target's manifest entry may list the objects its `notes` names
+# A collected target's manifest entry may list objects that a check did not see
 # as `{check, object}` (and `namespace` where the check has one, and an
-# optional `command`, the object's own read): each one an object a check read
-# but could not see. `finish` refuses a `resolved_because`
+# optional `command`, the read that says so): each one an object whose result
+# a check could not see. `finish` refuses a `resolved_because`
 # entry for one of them (`refuse_resolved_over_notes`), because the run did
 # not see the finding go away.
 NOTED_OBJECTS_KEY = "noted_objects"

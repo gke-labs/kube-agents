@@ -636,7 +636,7 @@ log entries.
 The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector
 (`fleet_health.py`, the chat-only fleet health sweep, reads the Managed Prometheus `query` route the same way,
 and `gke_cluster_reads.py` makes the Cluster Agent reconcile's GKE list and get reads;
-`logging_reads.py` makes the stockout collector's and the readiness report's log reads, and falls back to `gcloud logging read`),
+`logging_reads.py` makes the stockout collector's, the GCE compute collector's and the readiness report's log reads, and falls back to `gcloud logging read`),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
 `ApiSession()` instead of from `google.auth`, keeps its URL literals as the commercial endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's
