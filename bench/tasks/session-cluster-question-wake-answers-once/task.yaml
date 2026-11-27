@@ -1,7 +1,8 @@
 # WHAT THIS GRADES: a `/session` turn that delegates a cluster question ends
-# in an answer, not in the delegation depth bound. With the session cluster
-# view off (the default), a session pod can't see the cluster, so it hands the
-# question to the platform agent. The platform agent often hands the work on
+# in an answer, not in the delegation depth bound. A session pod without the
+# session cluster view can't see the cluster, so it hands the question to the
+# platform agent. (Since #6993 the session route turns the view on by
+# default, and with it the session may answer from its own reads.) The platform agent often hands the work on
 # and replies with an interim line ("checking cluster namespaces and pods").
 # The session's wake turn read that as a reason to delegate again, and each
 # wake did, until the chain ended on "delegation refused: this conversation
@@ -13,7 +14,10 @@
 # depth bound and just answers, so the chain can end without a refusal
 # notice; the count still sees every delegation, the repeats the addressee
 # list names once. It sets no minimum: a session pod with the cluster view can
-# answer this question from its own reads without delegating at all.
+# answer this question from its own reads without delegating at all. A batch
+# of two children in one turn also counts two and fails: for this one
+# question the expected shape is a single hand-off, and the count can't tell
+# a batch from a wake that delegated again.
 #
 # What is checked first is the refusal itself. The wake's answer has no fixed
 # wording, and it may honestly say only that the platform agent returned an
@@ -23,20 +27,23 @@
 # `spec.mode: next` install, where the gateway routes `/session ...` to a
 # session pod and the read route follows the chain to the wake. Under the api
 # transport the text reaches the platform agent as an ordinary prompt, no
-# delegation chain exists, and the check passes without testing anything.
-# That's why it forbids phrases rather than requiring any: it can't red the
-# api lane for a reason that lane can't show.
+# delegation chain exists, and the refusal-phrase check passes without
+# testing anything; it forbids phrases rather than requiring any so it can't
+# red the api lane for a reason that lane can't show. The child-count check
+# reports an error there instead, never a pass or a fail, since that lane has
+# no chain to count.
 id: session-cluster-question-wake-answers-once
 name: A session's delegated cluster question ends in an answer, not the depth bound
 prompt: >-
   /session what namespaces exist in this cluster, and which of them have pods
   that are not running?
 expected_output: >-
-  The session delegates the question to the platform agent once and then
-  answers in one reply: either the namespaces and any pods that are not
-  running, or a plain statement that the platform agent returned only an
-  interim answer and the details will need another turn. It does not delegate
-  again, and the conversation does not end on a delegation refusal.
+  The session answers in one reply, either from its own reads (with the
+  session cluster view) or after delegating the question to the platform agent
+  at most once: either the namespaces and any pods that are not running, or a
+  plain statement that the platform agent returned only an interim answer and
+  the details will need another turn. It does not delegate again, and the
+  conversation does not end on a delegation refusal.
 infrastructure:
   deployer: noop
 validated: false
