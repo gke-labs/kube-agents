@@ -10343,13 +10343,21 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         lock = self._tmp_path / "state.lock"
         trapped = self._tmp_path / "trapped"
         release = self._tmp_path / "release"
+        wait_fifo = self._tmp_path / "wait.fifo"
         lifecycle_sh = compose_dir / "lifecycle.sh"
+        # Wait for SIGINT via a shell-builtin `read` on a self-opened FIFO
+        # rather than a foreground `sleep` loop: while bash waits for an
+        # external child (`sleep`), it runs the `INT` trap only if the child
+        # reports `WIFSIGNALED` with `SIGINT`, so a signal arriving as `sleep`
+        # exits normally with status 0 is discarded under load (#7512).
         lifecycle_sh.write_text(f"""#!/bin/bash
 interrupted=""
 trap 'interrupted=1' INT
+mkfifo "{wait_fifo}"
+exec 3<>"{wait_fifo}"
 : > "{lock}"
 echo "apply started"
-while [ -z "$interrupted" ]; do sleep 0.1; done
+while [ -z "$interrupted" ]; do read -r -t 1 <&3 || true; done
 : > "{trapped}"
 while [ ! -e "{release}" ]; do sleep 0.1; done
 echo "Interrupt received. Gracefully shutting down..."
