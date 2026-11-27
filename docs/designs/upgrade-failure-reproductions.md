@@ -326,7 +326,7 @@ default-deny NetworkPolicy sat unenforced, switching enforcement on changed noth
 pool upgrade rebuilt the node with calico and cut traffic; the trigger is the enforcement switch
 applied at the rebuild, not a version change.
 
-Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in twelve of its sixteen seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-stall`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-cpu-cycle`, `seeded-qos`, `seeded-scaled-zero`, `seeded-shapes`, `seeded-defaults`; `seeded-security` and `seeded-intent` have none on purpose, and `seeded-deprecation` and `seeded-long-name` have an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
+Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in thirteen of its seventeen seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-stall`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-cpu-cycle`, `seeded-reservation`, `seeded-qos`, `seeded-scaled-zero`, `seeded-shapes`, `seeded-defaults`; `seeded-security` and `seeded-intent` have none on purpose, and `seeded-deprecation` and `seeded-long-name` have an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/16.sh`, evidence
 `bench/upgrade-scenarios/evidence/16/dataplane.txt`, and item 16 of the harness README. Detection,

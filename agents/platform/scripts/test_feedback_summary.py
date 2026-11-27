@@ -155,7 +155,7 @@ litellm_request_total_latency_metric_bucket{le="+Inf",model="claude-opus-5"} 10
 litellm_request_total_latency_metric_count{model="claude-opus-5"} 10
 """
 
-BROKER_METRICS = """# HELP kubeagents_tool_invocations_total Counter of credential broker tool executions
+BROKER_TOOLS_METRICS = """# HELP kubeagents_tool_invocations_total Counter of credential broker tool executions
 # TYPE kubeagents_tool_invocations_total counter
 kubeagents_tool_invocations_total{status="success",subcommand="get",tool="kubectl"} 14500
 kubeagents_tool_invocations_total{status="error",subcommand="get",tool="kubectl"} 400
@@ -166,6 +166,16 @@ kubeagents_tool_invocations_total{status="blocked",subcommand="delete",tool="kub
 kubeagents_tool_invocations_total{status="success",subcommand="logs",tool="kubectl"} 100
 kubeagents_tool_invocations_total{status="success",subcommand="top",tool="kubectl"} 15
 """
+
+BROKER_METRICS = (
+    BROKER_TOOLS_METRICS
+    + """# HELP kubeagents_vcs_stockout_proposals Stockout-investigator proposals the install authored in its managed repositories, by state as the forge reports it now; closed is closed without a merge.
+# TYPE kubeagents_vcs_stockout_proposals gauge
+kubeagents_vcs_stockout_proposals{state="open"} 1
+kubeagents_vcs_stockout_proposals{state="merged"} 3
+kubeagents_vcs_stockout_proposals{state="closed"} 1
+"""
+)
 
 SCALE = {
     "namespaces": 48,
@@ -219,6 +229,7 @@ class RenderTest(unittest.TestCase):
         # The full fixture fills the block: a new line moves the cap with it.
         self.assertEqual(len(lines), fs.SUMMARY_MAX_LINES)
         self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n", text)
+        self.assertIn("  stockoutProposals: 5 authored (1 open, 3 merged, 1 closed) (as the forge reports)\n", text)
         self.assertIn("mode: next", text)
         self.assertIn(f"version: {TAG}", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
@@ -257,6 +268,40 @@ class RenderTest(unittest.TestCase):
         for forbidden in (CLUSTER, PROJECT, NAMESPACE, "ya29.", "list pods", "s1", "us-central1"):
             self.assertNotIn(forbidden, text, forbidden)
         self.assertEqual(fs.audit(text, [CLUSTER, PROJECT, NAMESPACE]), [])
+
+    def test_stockout_proposals_line_renders_zero_and_omits_when_absent(self):
+        zeros = (
+            'kubeagents_vcs_stockout_proposals{state="open"} 0\n'
+            'kubeagents_vcs_stockout_proposals{state="merged"} 0\n'
+            'kubeagents_vcs_stockout_proposals{state="closed"} 0\n'
+        )
+        text_zero = fs.render(full_snapshot(broker_metrics=zeros))
+        self.assertIn("  stockoutProposals: 0 authored (0 open, 0 merged, 0 closed) (as the forge reports)\n", text_zero)
+
+        older_broker = 'kubeagents_tool_invocations_total{status="success",subcommand="get",tool="kubectl"} 10\n'
+        text_absent = fs.render(full_snapshot(broker_metrics=older_broker))
+        self.assertNotIn("stockoutProposals:", text_absent)
+
+        text_no_broker = fs.render(full_snapshot(broker_metrics=None))
+        self.assertNotIn("stockoutProposals:", text_no_broker)
+
+        # Unknown states and negative values are ignored cleanly; fixed template words do not trigger audit leaks.
+        noisy = (
+            'kubeagents_vcs_stockout_proposals{state="bogus"} 99\n'
+            'kubeagents_vcs_stockout_proposals{state="open"} -2\n'
+            'kubeagents_vcs_stockout_proposals{state="merged"} 2\n'
+        )
+        text_noisy = fs.render(full_snapshot(broker_metrics=noisy))
+        self.assertIn("  stockoutProposals: 2 authored (0 open, 2 merged, 0 closed) (as the forge reports)\n", text_noisy)
+        self.assertEqual(fs.audit(text_noisy, ["open", "merged", "closed", "authored", "stockoutProposals"]), [])
+        self.assertIsNone(
+            fs.summarise_stockout_proposals(
+                [
+                    fs.Sample(fs.STOCKOUT_PROPOSALS_FAMILY, {fs.STOCKOUT_PROPOSALS_STATE_LABEL: "open"}, float("nan")),
+                    fs.Sample(fs.STOCKOUT_PROPOSALS_FAMILY, {fs.STOCKOUT_PROPOSALS_STATE_LABEL: "merged"}, float("inf")),
+                ]
+            )
+        )
 
     def test_audit_names_a_leaked_identifier(self):
         self.assertEqual(fs.audit(f"all good on {CLUSTER}", [CLUSTER, PROJECT]), [CLUSTER])
@@ -494,9 +539,9 @@ class RenderTest(unittest.TestCase):
     def test_the_brokers_text_and_the_status_render_the_same_rows(self):
         """The operator folds the broker's text as summarise_broker_tools does, so a
         status built from the same samples renders byte for byte the same lines."""
-        from_text = fs.render(full_snapshot())
+        from_text = fs.render(full_snapshot(broker_metrics=BROKER_TOOLS_METRICS))
         rows = []
-        for pair, total, counts in fs.summarise_broker_tools(fs.parse_prometheus(BROKER_METRICS)):
+        for pair, total, counts in fs.summarise_broker_tools(fs.parse_prometheus(BROKER_TOOLS_METRICS)):
             tool, _, sub = pair.partition(fs.TOOL_PAIR_SEPARATOR)
             rows.append({"tool": tool, "subcommand": sub or fs.NONE, "total": total, **counts})
         from_status = fs.render(full_snapshot(cr=cr_with_top_tools(rows), broker_metrics=None))
@@ -1074,10 +1119,14 @@ class GatewayCopyTest(unittest.TestCase):
 
     def test_broker_subcommands_match_credential_proxy_vocabulary(self):
         import credential_proxy as cp
+        import vcs_readings
 
         for tool in ("kubectl", "gcloud", "git", "gh"):
             self.assertEqual(fs.BROKER_SUBCOMMANDS[tool], cp._subcommand_vocabulary(tool))
         self.assertEqual(fs.BROKER_SUBCOMMANDS["feedback"], frozenset({cp.FEEDBACK_AUDIT_SUBCOMMAND}))
+        self.assertEqual(fs.STOCKOUT_PROPOSALS_FAMILY, vcs_readings.VCS_STOCKOUT_PROPOSALS_METRIC)
+        self.assertEqual(fs.STOCKOUT_PROPOSALS_STATE_LABEL, cp.VCS_READINGS_STATE_LABEL)
+        self.assertEqual(fs.STOCKOUT_PROPOSALS_STATES, vcs_readings.STATES)
 
 
 if __name__ == "__main__":

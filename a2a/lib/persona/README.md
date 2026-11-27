@@ -107,6 +107,7 @@ manifest is left out, because a skill's files are rendered.
 that `scope` selects, for a tree that is not a persona directory. The
 session worker uses it on its Claude Code home, where only `CLAUDE.md` and
 `skills/` are the image's and the harness keeps its own state beside them.
+Another harness's worker runs it over that harness's persona directory.
 Paths outside the scope are not entered, and a manifest entry outside it is
 refused.
 

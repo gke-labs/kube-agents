@@ -958,8 +958,9 @@ resource "kubernetes_deployment_v1" "long_name_replaced_pod" {
 # The memory request of each is on the floor of 3.1's resize (64Mi), so only
 # the CPU can give a finding. The memory limit is above the request on
 # purpose: with requests equal to limits on both dimensions the pod is
-# Guaranteed, and the 3.1 finding on `cpu-burst` then has the guaranteed-qos
-# marker and can become an idle-workload finding (3.13) from day 14. No
+# Guaranteed, and the 3.1 finding that an audit with the 300-second bucket
+# files on `cpu-burst` then has the guaranteed-qos marker and can become an
+# idle-workload finding (3.13) from day 14. No
 # token, no Service, no emptyDir. One replica each: a second replica adds
 # nothing to the reading. The script is process 1 and has no child process.
 # The pod template holds the hash of the script, so a change of the script
@@ -1396,6 +1397,105 @@ resource "kubernetes_horizontal_pod_autoscaler_v2" "inference_server" {
   }
 }
 
+# Defect (capacity, reservations): the one pod that makes the autoscaler try
+# dev-reserved-pool (main.tf). The node selector names that pool and its
+# seeded-role label, and the toleration is for its taint, so no other pool can
+# hold the pod; inference-server above pins to pinned-inference-pool only, so
+# the two backlogs stay apart. The request (100m / 64Mi) fits an
+# n2-standard-2 node: the autoscaler asks for a scale-up only for a pod that
+# would fit, and the refused scale-up is the defect. The pod stays Pending.
+# One replica: each more replica is one more Pending pod for the cases that
+# read slot a's backlog. A default-deny policy, the restricted container
+# settings, requests and a memory limit keep the compliance and
+# obtainability audits to the findings that each planted workload has. The
+# README lists the two background findings of the fixture itself: the
+# stockout audit's 3.9 on the pool, and the upgrade retrospective's tentative
+# symptom on the Pending pod (no node has the labels that the pod selects,
+# which that collector reads as a removed node label; no manifest change
+# removes it while the pool has no node). Catalogue role:
+# missing-reservation-autoscaled.
+#
+# A namespace of its own, for the two watches of an install. The Deployment
+# never becomes available, so the stall watch
+# (agents/platform/scripts/stall_watch.py) would raise a controller-stall
+# alert for it on each install that watches the fleet: the annotation takes
+# the namespace out of that watch, as it does for the stalled Config
+# Connector stack (bench/tf/prebuilt/kcc-stalled-declaration). The annotation
+# does not stop the k8s event watcher, which forwards the pod's
+# FailedScheduling event; the eval install leaves the namespace out with an
+# alertExclude rule (EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE in
+# hack/ci-deploy.sh). The audits do not read the annotation, so they still
+# see the pool and the pod.
+resource "kubernetes_namespace_v1" "seeded_reservation" {
+  metadata {
+    name   = "seeded-reservation"
+    labels = local.fleet_labels
+    annotations = {
+      "kubeagents.x-k8s.io/stall-watch" = "exempt"
+    }
+  }
+  depends_on = [google_container_node_pool.dev_reserved_pool]
+}
+
+resource "kubernetes_deployment_v1" "reserved_batch" {
+  metadata {
+    name      = "reserved-batch"
+    namespace = kubernetes_namespace_v1.seeded_reservation.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "reserved-batch" }
+    }
+    template {
+      metadata {
+        labels = { app = "reserved-batch" }
+      }
+      spec {
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        node_selector = {
+          "cloud.google.com/gke-nodepool" = "dev-reserved-pool"
+          "seeded-role"                   = "missing-reservation-autoscaled"
+        }
+        toleration {
+          key      = "seeded-role"
+          operator = "Equal"
+          value    = "missing-reservation-autoscaled"
+          effect   = "NoSchedule"
+        }
+        container {
+          name  = "worker"
+          image = "registry.k8s.io/pause:3.9"
+          # Compliance SOP 2.11's two container-level settings, as on
+          # token-reader.
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "100m", memory = "64Mi" }
+            limits   = { memory = "128Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  # The pod never becomes Ready, which is the defect: an apply must not wait
+  # for the rollout.
+  wait_for_rollout = false
+}
+
 # Defect (cluster debugging, stall detection): a Deployment whose container
 # references a ConfigMap (inventory-flags) that does not exist through
 # envFrom. Its pods sit in CreateContainerConfigError, restartCount stays 0,
@@ -1475,6 +1575,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
     scaled_zero = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
     cpu_cycle   = kubernetes_namespace_v1.seeded_cpu_cycle.metadata[0].name
+    reservation = kubernetes_namespace_v1.seeded_reservation.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.

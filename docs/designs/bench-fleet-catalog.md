@@ -96,12 +96,12 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Sixty fixtures: fifty-three across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Sixty-one fixtures: fifty-four across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
-fixtures are on slot `a`, across the sixteen seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-long-name`, `seeded-cpu-cycle`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
-defect node pools, the declared zonal pool and the pool that names a missing reservation. Slot `c` is the configuration outlier, on its control plane and on its default
+fixtures are on slot `a`, across the seventeen seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-reservation`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-long-name`, `seeded-cpu-cycle`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
+defect node pools, the declared zonal pool and the two pools that name a missing reservation. Slot `c` is the configuration outlier, on its control plane and on its default
 pool, and since the ComputeClass fixtures (`defects-c.tf`) also the one cluster whose only pool
 carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool,
 ComputeClass `reserved-ccc` with no pool, which names a reservation that does not exist,
@@ -136,6 +136,7 @@ its roles are never published.
 | `hpa-saturated`                     | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                                                                                                                                         |
 | `declared-single-zone-pool`         | a       | 0   | `declared-zonal-pool`, a single-zone autoscaling pool held at zero nodes behind a NoSchedule taint; declared on purpose in the GitOps repository's `knowledge/`, so the capacity audit lists it under Declared intent                                                                                                                         |
 | `missing-reservation-pool`          | a       | 0   | `missing-reservation-pool`, a pool with no autoscaling held at zero nodes behind a NoSchedule taint, bound to one named reservation (`SPECIFIC_RESERVATION`) that exists in no zone of the project; GKE accepts the pool and refuses its first node                                                                                           |
+| `missing-reservation-autoscaled`    | a       | 0   | `dev-reserved-pool`, a pool that autoscales from 0 to 1 node and names the same missing reservation, and `deployment/reserved-batch` in `seeded-reservation`, whose one pod only that pool can hold; GKE refuses each node that the autoscaler asks for, and the pod stays Pending                                                            |
 | `deprecated-api-caller`             | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                                                                                                                                 |
 | `idle-nodepool`                     | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                                                                                                                                           |
 | `default-pool-headroom`             | a       | 0   | seeded-a's default pool itself, three e2-standard-2 nodes asserted to keep 100m CPU unrequested each for the next planted fixture; not a defect, the room the slot's fixtures schedule into                                                                                                                                                   |
@@ -304,8 +305,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` (or, for a finished Job, on `status.completionTime`) returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-eight of the fifty-three are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
-`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `cpu-burst-and-flat`, `declared-single-zone-pool`, `missing-reservation-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
+Forty-nine of the fifty-four are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `cpu-burst-and-flat`, `declared-single-zone-pool`, `missing-reservation-pool`, `missing-reservation-autoscaled`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,

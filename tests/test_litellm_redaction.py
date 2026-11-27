@@ -616,6 +616,200 @@ class TestCallback(unittest.TestCase):
              lambda r: r["input"][0]["content"][0]["image_url"][len("data:image/png;base64,"):], "aresponses"),
         ]
 
+    # A value only a key-name rule masks: the text rules don't know "auth".
+    _KEYED = '{"auth":"opaque-value-xyz","name":"web"}'
+    _KEYED_OUT = '{"auth":"[REDACTED_SECRET]","name":"web"}'
+
+    def test_json_tool_output_gets_the_structure_rules_at_each_position(self) -> None:
+        cases = [
+            ({"messages": [{"role": "tool", "tool_call_id": "x", "content": self._KEYED}]},
+             lambda r: r["messages"][0]["content"], "completion"),
+            ({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": self._KEYED}]}]},
+             lambda r: r["messages"][0]["content"][0]["content"], "anthropic_messages"),
+            ({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x",
+                                                         "content": [{"type": "text", "text": self._KEYED}]}]}]},
+             lambda r: r["messages"][0]["content"][0]["content"][0]["text"], "anthropic_messages"),
+            ({"input": [{"type": "function_call_output", "call_id": "c", "output": self._KEYED}]},
+             lambda r: r["input"][0]["output"], "aresponses"),
+            ({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {"output": self._KEYED}}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["functionResponse"]["response"]["output"], "agenerate_content"),
+            ({"contents": [{"role": "user", "parts": [{"function_response": {"name": "t", "response": {"output": self._KEYED}}}]}]},
+             lambda r: r["contents"][0]["parts"][0]["function_response"]["response"]["output"], "agenerate_content"),
+        ]
+        for req, get, call in cases:
+            with self.subTest(call=call, req=json.dumps(req)[:60]):
+                self.assertEqual(get(self._run(req, call)), self._KEYED_OUT)
+
+    def test_a_changed_tool_output_keeps_its_layout_and_an_unchanged_one_its_bytes(self) -> None:
+        secret = {"kind": "Secret", "metadata": {"name": "s"}, "data": {"k": "c2VjcmV0"}}
+        for text in (json.dumps(secret, indent=2) + "\n", json.dumps(secret, indent=4), json.dumps(secret, separators=(",", ":")),
+                     json.dumps(secret, indent="\t")):
+            with self.subTest(text=text[:30]):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                want = json.loads(text)
+                want["data"]["k"] = "[REDACTED_SECRET]"
+                indent = None if "\n" not in text.strip() else ("\t" if "\t" in text else len(text.split("\n")[1]) - len(text.split("\n")[1].lstrip()))
+                separators = (",", ": ") if indent is not None else (",", ":")
+                self.assertEqual(out, json.dumps(want, indent=indent, separators=separators) + ("\n" if text.endswith("\n") else ""))
+        odd = '{"a": "b",   "c": 1}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": odd}]})["messages"][0]["content"]
+        self.assertEqual(out, odd)
+
+    def test_json_inside_a_decoded_tool_output_is_decoded_too(self) -> None:
+        # The nested value only a key-name rule masks: the text rules leave it,
+        # so only the nested decoding catches it, and the changed inner
+        # document keeps its indent.
+        stdout = json.dumps({"auth": "opaque-value-xyz", "name": "web"}, indent=2)
+        output = json.dumps({"exit_code": 0, "stdout": stdout, "stderr": ""})
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
+        out = json.loads(self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]["output"])
+        self.assertEqual(out["exit_code"], 0)
+        self.assertEqual(json.loads(out["stdout"])["auth"], "[REDACTED_SECRET]")
+        self.assertTrue(out["stdout"].startswith('{\n  "auth"'), "the inner document keeps its indent")
+
+    def test_a_gemini_response_secret_with_a_json_data_string_is_masked_whole(self) -> None:
+        response = {"kind": "Secret", "data": json.dumps({"cfg": json.dumps({"v": "opaque-zz"})})}
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": response}}]}]}
+        out = self._run(req, "agenerate_content")
+        self.assertNotIn("opaque-zz", json.dumps(out))
+
+    def test_a_bare_pseudonym_marker_still_lets_the_output_decode(self) -> None:
+        config = dict(_RULES_CONFIG, rules=_RULES_CONFIG["rules"] + [{"name": "acct", "pattern": "4[0-9]{8}", "action": "pseudonym"}])
+        hook = _load_callback_module(config).proxy_handler_instance
+        text = '{"account": 412345678, "auth": "opaque-value-xyz"}'
+        out = asyncio.run(hook.async_pre_call_hook({}, None, {"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]}, "completion"))
+        content = out["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", content)
+        self.assertNotIn("412345678", content)
+        json.loads(content)
+
+    def test_a_number_a_second_text_pass_masks_stays_valid_json(self) -> None:
+        text = '{"token":\n  123456789,\n  "auth": "opaque-value-xyz"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("123456789", out)
+        self.assertNotIn("opaque-value-xyz", out)
+        json.loads(out)
+
+    def test_tool_output_past_the_bounds_or_not_whole_json_is_matched_as_text(self) -> None:
+        big = json.dumps({"auth": "opaque-value-xyz", "pad": "x" * (256 * 1024)})
+        deep = '{"auth":"opaque-value-xyz","d":' + "[" * 64 + "1" + "]" * 64 + "}"
+        prefixed = "result: " + self._KEYED
+        for text in (big, deep, prefixed, "[1, 2"):
+            with self.subTest(text=text[:40]):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertEqual(out, text, "left to the text rules, which don't mask a value only its key names")
+        # Two levels under the bound is decoded.
+        ok = '{"auth":"opaque-value-xyz","d":' + "[" * 62 + "1" + "]" * 62 + "}"
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": ok}]})["messages"][0]["content"]
+        self.assertIn("[REDACTED_SECRET]", out)
+
+    def test_decoding_tool_output_never_masks_less_than_the_text_rules_did(self) -> None:
+        # A JSON string under a credential key, and a number there, are masked
+        # whole as before decoding; decoding must not open them up.
+        cases = [
+            ('{"token": "{\\"v\\":\\"opaque-zz\\"}"}', "opaque-zz"),
+            ('{"token": 123456789, "n":"x"}', "123456789"),
+            ('{"password": 98765432}', "98765432"),
+            ('{"outer": {"token": "[\\"opaque-zz\\"]"}}', "opaque-zz"),
+        ]
+        for text, secret in cases:
+            with self.subTest(text=text):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertNotIn(secret, out)
+        # The same at the Gemini response level, where the response is already
+        # a mapping: a JSON string under a credential key stays a string and is
+        # masked whole.
+        for key in ("token", "password", "apiKey"):
+            with self.subTest(key=key):
+                req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {key: '{"v":"opaque-zz"}'}}}]}]}
+                out = self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]
+                self.assertNotIn("opaque-zz", json.dumps(out))
+        # A Secret's data value that is itself JSON is masked whole, not opened.
+        secret = json.dumps({"kind": "Secret", "data": {"cfg": '{"v":"opaque-zz"}'}})
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": secret}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-zz", out)
+
+    def test_a_tool_output_whose_escapes_end_a_value_stays_text(self) -> None:
+        # The text rules mask a bare value through a \\u escape; decoded, the
+        # escape would end it. Such output keeps the text rules' result.
+        for escape in ("\\u0020", "\\u0022", "\\u002c", "\\u007d", "\\u00a0", "\\u2028"):
+            with self.subTest(escape=escape):
+                text = '{"cmd":"mysql --password=abc' + escape + 'opaqueBBB"}'
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertNotIn("opaqueBBB", out)
+        # An escape for an ordinary character (Go writes < > & this way) still
+        # lets the output be decoded.
+        text = '{"auth":"opaque-value-xyz","html":"\\u003cb\\u003e"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+
+    def test_escapes_and_split_values_in_tool_output_stay_masked(self) -> None:
+        # The text rules run over the output as it came, before it is decoded,
+        # so a match that needs the escaped form (a URL password through an
+        # escape, a value through \\f, a key id before an escaped letter, a
+        # private key across strings) masks what it masked before.
+        cases = [
+            ('{"u":"postgres://app:s3cr\\u003cetzz@10.0.0.5:5432/app"}', "etzz"),
+            ('{"u":"redis://default:ab\\/cdzz@cache:6379","e":"bob@example.com"}', "cdzz"),
+            ('{"u": "postgres://admin:hunter2\\"zzqqsecret@db.internal.example.com/x", "e": "bob@example.com"}', "hunter2"),
+            ('{"log":"API_TOKEN=abcd1234\\fwxyz9876"}', "wxyz9876"),
+            ('{"k": "AKIAIOSFODNN7EXAMPL5\\u005f", "e": "bob@example.com"}', "AKIAIOSFODNN7EXAMPL5"),
+            ('{"stdout_lines": ["secret=-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEAbodybodybody", "-----END RSA PRIVATE KEY-----"]}', "bodybodybody"),
+            ('{"cmd":"mysql --password=abc\\u0020opaqueBBB"}', "opaqueBBB"),
+        ]
+        for text, secret in cases:
+            for req, get, call in (
+                ({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]}, lambda r: r["messages"][0]["content"], "completion"),
+                ({"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {"output": text}}}]}]},
+                 lambda r: json.dumps(r["contents"][0]["parts"][0]["functionResponse"]["response"]), "agenerate_content"),
+            ):
+                with self.subTest(text=text[:40], call=call):
+                    self.assertNotIn(secret, get(self._run(req, call)))
+
+    def test_markers_and_plain_strings_do_not_use_the_nested_budget(self) -> None:
+        # Forty IPs become forty [ip:...] markers before decoding; the nested
+        # shell result is still decoded.
+        # The result comes first, so the walk reaches the markers before it.
+        doc = {"result": {"stdout": self._KEYED}, "pods": ["10.0.0.%d" % i for i in range(1, 41)],
+               "logs": ["[INFO] line %d" % i for i in range(40)]}
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": json.dumps(doc)}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+
+    def test_json_nested_under_a_secrets_data_string_is_masked_whole(self) -> None:
+        inner = json.dumps({"cfg": json.dumps({"v": "opaque-zz"})})
+        text = json.dumps({"kind": "Secret", "data": inner})
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-zz", out)
+
+    def test_a_number_under_a_credential_key_leaves_the_rest_to_the_structure_rules(self) -> None:
+        text = '{"token": 123456789, "auth": "opaque-value-xyz", "n": [1, 2]}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("123456789", out)
+        self.assertNotIn("opaque-value-xyz", out)
+        json.loads(out)
+
+    def test_an_operator_rule_matching_the_probe_word_does_not_stop_decoding(self) -> None:
+        config = dict(_RULES_CONFIG, rules=_RULES_CONFIG["rules"] + [{"name": "ours", "literal": "kube-agents"}])
+        hook = _load_callback_module(config).proxy_handler_instance
+        output = json.dumps({"exit_code": 0, "stdout": self._KEYED})
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
+        out = asyncio.run(hook.async_pre_call_hook({}, None, req, "agenerate_content"))
+        self.assertNotIn("opaque-value-xyz", json.dumps(out))
+
+    def test_a_tool_output_with_a_repeated_key_gets_the_text_rules_only(self) -> None:
+        # The decoder would keep one value; what the text says is what counts.
+        text = '{"kind":"Secret","kind":"Other","data":{"k":"opaque-value-xyz"}}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", out)
+        self.assertIn('"kind":"Other"', out, "left as text, both keys kept")
+
+    def test_a_changed_tool_output_stays_valid_json_whatever_whitespace_its_strings_hold(self) -> None:
+        for text in ('["nicole,\u00a0x", {"password":"opaque-abc"}, 1]', '{"a\u2028":"b", "password":"opaque-abc"}'):
+            with self.subTest(text=text):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                json.loads(out)
+                self.assertNotIn("opaque-abc", out)
+
     def test_payloads_in_url_safe_or_unpadded_base64_and_image_jpg_are_kept(self) -> None:
         # Forms providers accept: the URL-safe alphabet, no padding, and the
         # common image/jpg label. Each is kept byte for byte as it came.

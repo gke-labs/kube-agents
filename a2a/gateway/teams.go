@@ -294,7 +294,7 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		tokenPath:      tokenPath,
 		tenantID:       strings.TrimSpace(tenantID),
 		adaptiveCards:  adaptiveCards,
-		client:         &http.Client{Timeout: teamsRelayTimeout},
+		client:         newRelayHTTPClient(teamsRelayTimeout),
 		log:            log,
 		seen:           map[string]bool{},
 		serviceURLs:    map[string]string{},

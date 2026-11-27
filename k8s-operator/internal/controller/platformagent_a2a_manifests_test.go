@@ -7656,3 +7656,59 @@ func TestTheSessionCapResolvesBeforeAnythingRendersFromTheRoute(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildA2AGatewayDeploymentForwardsLiteralProxyEnv(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "UNRELATED_FLAG", Value: "true"},
+			{Name: "HTTP_PROXY", Value: "http://proxy.corp.example:3128"},
+			{Name: "HTTPS_PROXY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "proxy-secret"},
+				Key:                  "https-proxy",
+			}}},
+			{Name: "NO_PROXY", Value: "127.0.0.1,localhost,.svc,.svc.cluster.local"},
+			{Name: "http_proxy", Value: "http://lower-proxy.corp.example:3128"},
+			{Name: "https_proxy", Value: "http://lower-https.corp.example:3128"},
+			{Name: "no_proxy", Value: ".cluster.local"},
+			{Name: "HTTPS_PROXY", Value: "http://https-proxy.corp.example:3128"},
+		},
+	}
+
+	dep := buildA2AGatewayDeployment(agent)
+	env := dep.Spec.Template.Spec.Containers[0].Env
+	var gotProxy []corev1.EnvVar
+	for _, ev := range env {
+		if ev.Name == "UNRELATED_FLAG" {
+			t.Fatalf("non-proxy env var UNRELATED_FLAG must not be forwarded to a2a-gateway")
+		}
+		if a2aGatewayProxyEnvNames[ev.Name] {
+			if ev.ValueFrom != nil {
+				t.Fatalf("proxy env %s forwarded with ValueFrom; only literal values are allowed", ev.Name)
+			}
+			gotProxy = append(gotProxy, ev)
+		}
+	}
+	want := []corev1.EnvVar{
+		{Name: "HTTP_PROXY", Value: "http://proxy.corp.example:3128"},
+		{Name: "NO_PROXY", Value: "127.0.0.1,localhost,.svc,.svc.cluster.local"},
+		{Name: "http_proxy", Value: "http://lower-proxy.corp.example:3128"},
+		{Name: "https_proxy", Value: "http://lower-https.corp.example:3128"},
+		{Name: "no_proxy", Value: ".cluster.local"},
+		{Name: "HTTPS_PROXY", Value: "http://https-proxy.corp.example:3128"},
+	}
+	if !reflect.DeepEqual(gotProxy, want) {
+		t.Fatalf("forwarded proxy env = %+v, want %+v", gotProxy, want)
+	}
+
+	// An agent without proxy env entries renders none on the gateway.
+	plain := a2aTestAgent()
+	plain.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "OTHER_VAR", Value: "1"}},
+	}
+	for _, ev := range buildA2AGatewayDeployment(plain).Spec.Template.Spec.Containers[0].Env {
+		if a2aGatewayProxyEnvNames[ev.Name] {
+			t.Errorf("unexpected proxy env %s rendered without proxy settings", ev.Name)
+		}
+	}
+}
