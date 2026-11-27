@@ -10,3 +10,4 @@
 #   - a row added after its release was tagged.
 # The check then requires the row's release to contain the named commit. A reviewer must check that
 # the commit is the one that shipped the row's change. Remove the entry when its row goes.
+cd29c96cbb50d2e94e780fb1e9ba607b50ddb444 the credential proxy probes readiness on port 8768

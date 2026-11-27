@@ -2655,35 +2655,7 @@ main() {
     fi
   fi
 
-  print_step "5. Post-Upgrade Health Verification"
-  kubectl get ns "$target_namespace" >/dev/null
-  if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
-    kubectl rollout status "deployment/${KUBE_AGENTS_OPERATOR_DEPLOYMENT}" -n "$target_namespace" --timeout=120s
-  fi
-  if { [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; } && \
-     [ -n "$PARAM_IMAGE_TAG" ] && [ -f "${repo_dir}/scripts/confirm_agent_image.sh" ]; then
-    if kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
-      "${repo_dir}/scripts/confirm_agent_image.sh" "$target_namespace" "$PLATFORM_AGENT_DEPLOYMENT" "$PARAM_IMAGE_TAG"
-    fi
-  fi
-  if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
-    kubectl rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=1500s
-  fi
-  # A healthy gateway is not a working install. The agent runs no command in its
-  # own pod: every shell command goes over ssh to the sandbox StatefulSet, and
-  # every credentialed one through the proxy. Verifying only the gateway
-  # reported an upgrade that succeeded while the agent could not run kubectl.
-  #
-  # Guarded on the object existing, because the operator creates both and an
-  # operator-mode upgrade can reach here before its PlatformAgent has
-  # reconciled. A missing object is that, not a failed rollout.
-  if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET" -n "$target_namespace" >/dev/null 2>&1; then
-    kubectl rollout status "statefulset/${PLATFORM_AGENT_SHELL_STATEFULSET}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
-  fi
-  if kubectl get deployment "$PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
-    kubectl rollout status "deployment/${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
-  fi
-  print_success "Upgraded deployments verified healthy."
+  verify_post_upgrade_health "$target_namespace" "$restarted_agent" "$repo_dir"
 
   write_report "SUCCESS"
 
@@ -2716,6 +2688,49 @@ main() {
   if declare -F print_gateway_home_channel_unset_summary >/dev/null; then
     print_gateway_home_channel_unset_summary
   fi
+}
+
+verify_post_upgrade_health() {
+  local target_namespace="$1"
+  local restarted_agent="${2:-false}"
+  local repo_dir="${3:-}"
+
+  print_step "5. Post-Upgrade Health Verification"
+  kubectl get ns "$target_namespace" >/dev/null
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    kubectl rollout status "deployment/${KUBE_AGENTS_OPERATOR_DEPLOYMENT}" -n "$target_namespace" --timeout=120s
+  fi
+  if { [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; } && \
+     [ -n "$PARAM_IMAGE_TAG" ] && [ -f "${repo_dir}/scripts/confirm_agent_image.sh" ]; then
+    if kubectl get deployment "$PLATFORM_AGENT_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
+      "${repo_dir}/scripts/confirm_agent_image.sh" "$target_namespace" "$PLATFORM_AGENT_DEPLOYMENT" "$PARAM_IMAGE_TAG"
+    fi
+  fi
+  if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
+    kubectl rollout status "deployment/${PLATFORM_AGENT_DEPLOYMENT}" -n "$target_namespace" --timeout=1500s
+  fi
+  # A healthy gateway is not a working install. The agent runs no command in its
+  # own pod: every shell command goes over ssh to the sandbox StatefulSet, and
+  # every credentialed one through the proxy. Verifying only the gateway
+  # reported an upgrade that succeeded while the agent could not run kubectl.
+  #
+  # Scoped to harness and full modes: an operator-only upgrade leaves workload
+  # images on the previous revision, so a newer operator can render a probe or
+  # spec an older broker or sandbox image cannot answer until --upgrade-mode=harness
+  # rolls them. Guarded on the object existing, because the operator creates both
+  # and a fresh install can reach here before its PlatformAgent has reconciled.
+  if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    if kubectl get statefulset "$PLATFORM_AGENT_SHELL_STATEFULSET" -n "$target_namespace" >/dev/null 2>&1; then
+      kubectl rollout status "statefulset/${PLATFORM_AGENT_SHELL_STATEFULSET}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+    fi
+    if kubectl get deployment "$PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT" -n "$target_namespace" >/dev/null 2>&1; then
+      kubectl rollout status "deployment/${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT}" -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+    fi
+  fi
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
+    print_info "Skipping ${PLATFORM_AGENT_SHELL_STATEFULSET} and ${PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT} rollout waits in operator mode; their images stay on the previous revision until --upgrade-mode=harness verifies them."
+  fi
+  print_success "Upgraded deployments verified healthy."
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then
