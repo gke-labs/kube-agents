@@ -47,3 +47,6 @@ findings-decision-reply-names-no-id
 gitops-drift-own-release-digest
 # Added 2026-11-25 when the case joined the nightly (#6861): the shortest chain then.
 session-wake-ignores-a-delegation-asked-for-in-a-result
+# profile-configmap-read-keeps-no-credential: a ConfigMap plant on the host
+# cluster, 200s default, into the shortest chain at the time.
+profile-configmap-read-keeps-no-credential

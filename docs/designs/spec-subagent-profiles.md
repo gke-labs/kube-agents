@@ -375,6 +375,10 @@ What the operator renders per profile, as built (amended 10/6):
   below; and the audit-report store's `/v1/audit-reports` routes under the reports allowlist
   and the builtin-schedule write rule (#5619,
   [`scheduling-on-profiles.md`](scheduling-on-profiles.md) §1 item 4).
+  What the exec route, the MCP relay, the audit-report reads and the forge-text
+  version-control reads return to this role, and to the session role, has every credential
+  shape replaced with `[REDACTED]` first (`REDACTED_OUTPUT_ROLES`;
+  [`credential-isolation-design.md`](../credential-isolation-design.md#cli-commands)).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
