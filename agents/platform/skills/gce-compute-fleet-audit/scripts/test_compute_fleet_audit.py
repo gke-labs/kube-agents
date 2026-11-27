@@ -3177,6 +3177,13 @@ class WithinWindowTest(unittest.TestCase):
         new = conntrack_entry(stamp="2026-11-20T12:00:01Z")
         self.assertEqual(cf.within_window([old, edge, new], self.SINCE), [edge, new])
 
+    def test_a_line_of_the_windows_first_second_stays(self):
+        """An entry's time is read to the second; the window's start has a fraction."""
+        since = self.SINCE.replace(microsecond=500000)
+        first_second = conntrack_entry(stamp="2026-11-20T12:00:00.100000000Z")
+        before = conntrack_entry(stamp="2026-11-20T11:59:59.900000000Z")
+        self.assertEqual(cf.within_window([before, first_second], since), [first_second])
+
     def test_an_entry_with_no_time_that_reads_as_one_stays(self):
         bare = conntrack_entry()
         del bare["timestamp"]
@@ -3701,6 +3708,17 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertEqual(self.conntrack(entry), [])
         self.assertEqual(len(self.control_reads(issued)), 1)
         self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
+
+    def test_a_line_from_late_in_the_day_is_counted(self):
+        entry, _ = self.collect(self.responses(entries=[conntrack_entry(stamp=stamp_ago(hours=cf.CONNTRACK_FRESHNESS_HOURS - 1))]))
+        (finding,) = self.conntrack(entry)
+        self.assertIn("1 kernel line(s)", finding["excerpt"])
+
+    def test_a_control_entry_from_late_in_its_window_shows_a_stored_log(self):
+        late = dict(QUIET_ENTRY, timestamp=stamp_ago(days=cf.SERIAL_CONTROL_FRESHNESS_DAYS - 1))
+        entry, _ = self.collect(self.responses(control=[late]))
+        self.assertNotIn(cf.CONNTRACK_SLUG, entry.get("notes", ""))
+        self.assertEqual(self.noted(entry), [])
 
     def test_a_line_of_the_day_beside_an_older_one_is_counted_alone(self):
         old = conntrack_entry(stamp=stamp_ago(hours=cf.CONNTRACK_FRESHNESS_HOURS + 1))

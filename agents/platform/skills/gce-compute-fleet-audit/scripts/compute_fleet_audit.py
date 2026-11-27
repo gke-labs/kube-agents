@@ -392,14 +392,17 @@ CONNTRACK_FRESHNESS_HOURS = 24
 CONNTRACK_FRESHNESS = f"{CONNTRACK_FRESHNESS_HOURS}h"
 # One page of `entries:list`. The kernel limits how often it writes the line,
 # so the number of lines is not the number of dropped packets, and a read that
-# fills the page says "this many or more", which the excerpt then states.
+# fills the page with lines of the day says "this many or more", which the
+# excerpt then states.
 CONNTRACK_LOG_LIMIT = 1000
 # The read repeats while a page comes back full. A node that drops packets all
 # day writes far more than one page of lines, and the read returns the newest
 # first, so one busy node pool would use up the page and hide another. Each
 # round leaves out the groups that an earlier page named: their pool has its
 # finding. The verdict is for each node pool (it wrote the line or it did
-# not), so the rounds stop at the first page that is not full.
+# not), so the rounds stop at the first page that is not full of lines of the
+# day: one that came back short, or one that reached a line older than the
+# window.
 CONNTRACK_READ_ROUNDS = 5
 # How many groups one read names. A group's base name has at most 58
 # characters, and the command with this many stays under MAX_COMMAND_CHARS,
@@ -780,10 +783,10 @@ NO_SERIAL_ENTRIES_NOTE = (
     "exclusion or a policy can cause this."
 )
 # The read did not reach every node pool: the pages that it read were full of
-# busier pools' lines, or a read failed after another had succeeded. The
-# findings from the pages that were read stand, and each node pool that was
-# not reached is a noted object, so an earlier finding on it is not called
-# resolved.
+# busier pools' lines, the run's reads ran out, or a read failed after another
+# had succeeded. The findings from the pages that were read stand, and each
+# node pool that was not reached is a noted object, so an earlier finding on
+# it is not called resolved.
 CONNTRACK_UNREAD_FULL_LIMITATION = (
     "node-conntrack-saturation did not reach {count} node pool(s) on this project, so a full "
     "connection tracking table there is not reported. The check stopped after {reads} read(s): "
@@ -1799,13 +1802,16 @@ def within_window(entries: list, since: datetime.datetime) -> list:
     the word `timestamp`, and a clause that is added to the filter after this
     collector wrote it (an excluded cluster's name) can hold that word. So the
     collector holds the window itself too, on each entry's own time. An entry
-    with no time that reads as one stays, and its finding says the time is
-    unknown.
+    with no time that reads as one stays. A finding says that the time is
+    unknown only when none of its lines carries a timestamp.
     """
+    # An entry's time is cut to the second, so the window's start is too: a
+    # line of the window's first second stays.
+    start = since.replace(microsecond=0)
     kept = []
     for entry in entries:
         stamp = _entry_time(entry)
-        if stamp is None or stamp >= since:
+        if stamp is None or stamp >= start:
             kept.append(entry)
     return kept
 
