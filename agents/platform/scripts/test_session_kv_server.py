@@ -4624,6 +4624,67 @@ class TestGatewayCallsRefuseAProxy(unittest.TestCase):
         self.assertEqual([("POST", "/api/sessions/k8s-evt-1/chat", "Bearer gateway-key")], server.seen)
 
 
+class TestGatewayCallsFollowNoRedirect(unittest.TestCase):
+    """The two calls send the gateway key in the `Authorization` header. urllib sends a
+    POST again as a GET for a 301, 302 or 303 answer, with the same header, and a 200
+    answer to that GET read as a session made or a turn started."""
+
+    HEADERS = {"Authorization": "Bearer gateway-key"}
+
+    def _serve(self, handler) -> str:
+        import http.server
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_a_redirect_answer_is_a_failure_and_the_key_goes_nowhere_else(self):
+        import http.server
+
+        seen_elsewhere = []
+
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                seen_elsewhere.append((self.command, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = _answer  # noqa: N815 - the stdlib's names
+
+            def log_message(self, *args):
+                pass
+
+        elsewhere = self._serve(Elsewhere)
+        # urllib followed a 301, 302 or 303 for a POST before; it never followed a 307 or 308.
+        for status in (301, 302, 303, 307, 308):
+
+            class Redirect(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):  # noqa: N802 - the stdlib's name
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                    self.send_response(status)
+                    self.send_header("Location", elsewhere + "/api/sessions")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+                def log_message(self, *args):
+                    pass
+
+            gateway = self._serve(Redirect)
+            for name, call in (
+                ("create", lambda: session_kv_server._create_gateway_session(gateway, "k8s-evt-1", self.HEADERS)),
+                ("chat", lambda: session_kv_server._start_agent_turn(gateway, "k8s-evt-1", "q", self.HEADERS)),
+            ):
+                with self.subTest(status=status, call=name):
+                    del seen_elsewhere[:]
+                    attempt = call()
+                    self.assertEqual(seen_elsewhere, [])
+                    self.assertEqual((attempt.outcome, attempt.detail), (session_kv_server.START_FATAL, f"http-{status}"))
+
+
 class TestGatewayApiToken(unittest.TestCase):
     """Which `API_SERVER_KEY` the loopback callers send.
 
