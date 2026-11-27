@@ -39,11 +39,11 @@
 # The fault is planted once and not held. The check reads the last 24 hours
 # of the log, so one burst of the kernel's line is what a run needs, and the
 # node is healthy again seconds later. The lines of a run stay in the
-# project's log after the cluster is gone. A compute audit of the same project
-# in the next 24 hours reads them and files nothing on them: the check files
-# no finding on an instance that is not running, and names it in the target's
-# notes. So a later run of this case cannot pass on an earlier run's lines,
-# and no finding of this case stays behind for another case's audit.
+# project's log after the cluster is gone. A later compute audit of the same
+# project does not read them: the check asks the log only for the node pools
+# that it lists as running. So a later run of this case cannot pass on an
+# earlier run's lines, and no finding of this case stays behind for another
+# case's audit.
 #
 # The default network, as prebuilt/networking-pod-cidr-slash24-exhaustion:
 # the lane's runner holds no Compute network role.

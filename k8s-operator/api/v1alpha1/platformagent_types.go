@@ -363,17 +363,14 @@ type ScopeExcludeSpec struct {
 	// by project number refuses its location and name in any project. A GCP
 	// metadata read that names it is refused too (a cluster describe, a
 	// node-pool read, the gke MCP server's get_cluster, get_node_pool and
-	// list_node_pools), and a logging read leaves out its entries (a node's
-	// serial console entries carry no cluster name: the GCE audit reads them
-	// with the project's and drops them). A session's
+	// list_node_pools), and a logging read leaves out its entries. A session's
 	// or profile task's gcloud container clusters list and operations list
 	// leave it out as well (by name, so a same-named cluster elsewhere too).
 	// Every other caller's project-wide reads stay allowed (the project's
 	// cluster list, for one), and these still cover it through them only:
 	// the daily upgrade-readiness watch's version table (its in-cluster
 	// readiness rules skip the cluster), the networking audit's subnet usage,
-	// the GCE audit's instance listing and serial console read, and the gke
-	// MCP server's list_clusters.
+	// the GCE audit's instance listing, and the gke MCP server's list_clusters.
 	// The broker enforces it, not IAM: the agent's roles still reach the
 	// cluster, so the service account itself is not fenced off.
 	// +kubebuilder:validation:MaxItems=100

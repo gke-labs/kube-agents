@@ -1348,9 +1348,7 @@ spec:
   `gcloud logging read` or the broker's Logging relay, leaves out the cluster's entries. The broker
   adds one clause to the filter that matches the cluster's name, in any project and location, so a
   cluster that shares an excluded cluster's name loses its entries too. It refuses a
-  filter it can't add one to safely. A node's serial console entry carries no cluster name, so
-  the clause does not match it: the GCE audit's read of the project's serial console log returns
-  that cluster's lines too, and the audit drops them.
+  filter it can't add one to safely.
 
   A session's or profile task's `gcloud container clusters list` and `gcloud container operations
 list` leave an excluded cluster out too. The broker adds a `--filter` clause that matches its name,
@@ -1366,7 +1364,7 @@ list` leave an excluded cluster out too. The broker adds a `--filter` clause tha
   - the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, which
     grade its versions and skip their in-cluster readiness rules;
   - the networking audit's subnet usage, since its pods still hold their IPs;
-  - the GCE audit's instance listing, and its serial console read as described above;
+  - the GCE audit's instance listing;
   - the third-party `gke` MCP server's `list_clusters`.
 
   The upgrade-readiness watch used to read inside an excluded cluster too. It no longer does,
