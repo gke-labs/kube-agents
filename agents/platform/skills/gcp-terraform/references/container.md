@@ -28,6 +28,24 @@ decides.
   above, those fields force replacement too.
 - No `deletion_protection`. Its `deletion_policy` defaults to `DELETE`;
   leave it.
+- **Machine-family migration pre-flight.** Before changing `machine_type` to a
+  new machine family (`n2`, `n2d`, `n4`, `c3`, `c4`) or authoring a replacement
+  `google_container_node_pool` in a new family from an existing source pool, run
+  `/opt/data/scripts/machine_family_preflight.py` against the source pool and
+  target family:
+
+  ```bash
+  python3 /opt/data/scripts/machine_family_preflight.py \
+    --project <project> --location <location> --cluster <cluster> \
+    --node-pool <source-pool> --target-family <target-family>
+  ```
+
+  Surface every `[BLOCKER]` and `[WARNING]` from the pre-flight output
+  (Persistent Disk `pd-*` rejected on `n4`/`c4`, `pd-standard` on `c3`,
+  Hyperdisk boot disks on `n2`/`n2d`, Local SSD settings unsupported on `n4` or
+  requiring `*-lssd` shapes on `c3`/`c4`, disabled Shielded VM / Secure Boot /
+  vTPM, Confidential VM incompatibilities, or GKE version floors) before writing
+  HCL, and never copy rejected `node_config` fields into the target pool.
 
 ### `describe` to arguments
 

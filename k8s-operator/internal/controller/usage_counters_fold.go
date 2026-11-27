@@ -470,6 +470,9 @@ type usageScrapedPod struct {
 	// any pod but a broker's. Not folded either: the poll sums it across the
 	// broker pods read and projects the top rows (usageTopToolsForPoll).
 	ToolPairs map[usageToolPair]usageToolCounts
+	// SlackConnected is the A2A gateway's kubeagents_a2a_gateway_slack_connected
+	// gauge reading; nil when the body did not export the series.
+	SlackConnected *bool
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

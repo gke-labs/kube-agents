@@ -218,14 +218,14 @@ func TestTheReasonsRankedAboveTheStreamsAreTheChainsFirstThree(t *testing.T) {
 	want := []string{conditionReasonInvalidGitRepoURL, conditionReasonCorruptManagedRepos, conditionReasonMinterPruningHeld}
 	var got []string
 	for _, reason := range degradedConditionReasons {
-		if degradedRanksAboveBusStreams(reason) {
+		if degradedRanksAbove(reason, conditionReasonA2ABusStreamsMissing) {
 			got = append(got, reason)
 		}
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("ranked above the bus streams: %v, want %v", got, want)
 	}
-	if degradedRanksAboveBusStreams(conditionReasonA2ABusStreamsMissing) || degradedRanksAboveBusStreams(reasonRBACIncomplete) {
+	if degradedRanksAbove(conditionReasonA2ABusStreamsMissing, conditionReasonA2ABusStreamsMissing) || degradedRanksAbove(reasonRBACIncomplete, conditionReasonA2ABusStreamsMissing) {
 		t.Error("the streams reason and RBACIncomplete must not rank above the streams")
 	}
 }
@@ -290,5 +290,68 @@ func TestAParkMovesDegradedToANewGeneration(t *testing.T) {
 	applyParkBusStreamsDegraded(agent, edit, cond, metav1.Now())
 	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
 		t.Errorf("the pass after the write: edit %d, want keep", edit)
+	}
+}
+
+func TestAParkPreservesAndTransitionsSlackConnectionFailed(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Generation = 2
+	slackEnabled := true
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Slack: &agentv1alpha1.SlackSpec{Enabled: &slackEnabled},
+	}
+	slackDown := metav1.Condition{
+		Type: slackConnectedConditionType, Status: metav1.ConditionFalse,
+		Reason: slackConnectedReasonFailed, Message: slackConnectedFailedMessage,
+	}
+
+	// SlackConnected=False sets Degraded/SlackConnectionFailed when no higher reason holds.
+	meta.SetStatusCondition(&agent.Status.Conditions, slackDown)
+	edit, cond := parkBusStreamsDegraded(agent)
+	if edit != busStreamsDegradedSet || cond.Reason != conditionReasonSlackConnectionFailed || cond.Message != slackConnectedFailedMessage || cond.ObservedGeneration != 2 {
+		t.Fatalf("Slack down during park: edit=%d cond=%+v, want Set/%s", edit, cond, conditionReasonSlackConnectionFailed)
+	}
+	applyParkBusStreamsDegraded(agent, edit, cond, metav1.Now())
+	// Idempotent on repeat pass.
+	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
+		t.Fatalf("repeat pass with SlackConnectionFailed current: edit=%d, want keep", edit)
+	}
+
+	// Higher-ranked A2ABusStreamsMissing replaces SlackConnectionFailed.
+	meta.SetStatusCondition(&agent.Status.Conditions, busStreamsPresent(metav1.ConditionFalse))
+	edit, cond = parkBusStreamsDegraded(agent)
+	if edit != busStreamsDegradedSet || cond.Reason != conditionReasonA2ABusStreamsMissing {
+		t.Fatalf("streams missing over Slack down: edit=%d cond=%+v, want Set/%s", edit, cond, conditionReasonA2ABusStreamsMissing)
+	}
+	applyParkBusStreamsDegraded(agent, edit, cond, metav1.Now())
+
+	// When streams recover while Slack is still down, Degraded falls back to SlackConnectionFailed.
+	meta.SetStatusCondition(&agent.Status.Conditions, busStreamsPresent(metav1.ConditionTrue))
+	edit, cond = parkBusStreamsDegraded(agent)
+	if edit != busStreamsDegradedSet || cond.Reason != conditionReasonSlackConnectionFailed {
+		t.Fatalf("streams recovered with Slack still down: edit=%d cond=%+v, want Set/%s", edit, cond, conditionReasonSlackConnectionFailed)
+	}
+	applyParkBusStreamsDegraded(agent, edit, cond, metav1.Now())
+
+	// Higher-ranked A2AGatewayWaitingForTasks is kept over SlackConnectionFailed.
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: degradedConditionType, Status: metav1.ConditionTrue,
+		Reason: conditionReasonA2AGatewayWaitingForTasks, Message: "waiting", ObservedGeneration: 2,
+	})
+	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
+		t.Fatalf("Slack down under A2AGatewayWaitingForTasks: edit=%d, want keep", edit)
+	}
+
+	// When Slack recovers while Degraded holds SlackConnectionFailed, Degraded falls back to a spec refusal or clears.
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: degradedConditionType, Status: metav1.ConditionTrue,
+		Reason: conditionReasonSlackConnectionFailed, Message: slackConnectedFailedMessage, ObservedGeneration: 2,
+	})
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: slackConnectedConditionType, Status: metav1.ConditionTrue,
+		Reason: slackConnectedReasonConnected, Message: slackConnectedUpMessage,
+	})
+	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedClear {
+		t.Fatalf("Slack recovered with no spec refusal: edit=%d, want clear", edit)
 	}
 }

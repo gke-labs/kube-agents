@@ -639,6 +639,21 @@ get_candidate_registry_prefix() {
   fi
 }
 
+# Lists the registries a release is published to, one per line: the registry
+# prefix, then ADDITIONAL_RELEASE_REGISTRY_PREFIX when it is set and names
+# another registry. The promotion, the image signing and the chart publication
+# each walk this list, so a release is the same set of artifacts in each.
+release_registry_prefixes() {
+  local registry_prefix additional_prefix
+  registry_prefix="$(get_registry_prefix)"
+  additional_prefix="${ADDITIONAL_RELEASE_REGISTRY_PREFIX:-}"
+  additional_prefix="${additional_prefix%/}"
+  echo "${registry_prefix}"
+  if [ -n "${additional_prefix}" ] && [ "${additional_prefix}" != "${registry_prefix}" ]; then
+    echo "${additional_prefix}"
+  fi
+}
+
 # Whether a registry host is an Artifact Registry Docker host
 # (AR_REGISTRY_HOST_PATTERN).
 # Arguments: $1 = registry host
@@ -2466,10 +2481,14 @@ promote_image_tag() {
 
 # Clean Promotion: tags a commit's verified container images with the release
 # version without rebuilding. The images are read from the candidate registry
-# (get_candidate_registry_prefix) and published to the registry prefix. When
-# those are two registries the candidate registry gets the version tag too,
-# first: rollback_environment.sh looks for the previous release's version in
-# the registry an environment is installed from.
+# (get_candidate_registry_prefix) and published to each release registry
+# (release_registry_prefixes), all from the one source, one registry after
+# another: every image is in the registry prefix before the first is written
+# to an additional registry, so a failure there leaves the registry prefix
+# whole. When the candidate registry is not the registry prefix it gets the
+# version tag too, before the registry prefix does: rollback_environment.sh
+# looks for the previous release's version in the registry an environment is
+# installed from.
 promote_release_images() {
   local commit_sha="${1:-}"
   local release_version="${2:-}"
@@ -2517,13 +2536,25 @@ promote_release_images() {
     return 1
   fi
 
-  for img in "${images[@]}"; do
-    local source_image="${candidate_prefix}/${img}:${resolved_commit}"
-    echo "  • Promoting ${img}..."
-    if [ "${candidate_prefix}" != "${registry_prefix}" ]; then
-      promote_image_tag "${source_image}" "${candidate_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
-    fi
-    promote_image_tag "${source_image}" "${registry_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
-    echo "    ✅ Promoted ${img} to ${release_version}"
+  local release_prefixes=() release_prefix release_prefix_lines
+  release_prefix_lines="$(release_registry_prefixes)" || return 1
+  while IFS= read -r release_prefix; do release_prefixes+=("${release_prefix}"); done <<<"${release_prefix_lines}"
+
+  for release_prefix in "${release_prefixes[@]}"; do
+    for img in "${images[@]}"; do
+      local source_image="${candidate_prefix}/${img}:${resolved_commit}"
+      if [ "${release_prefix}" = "${registry_prefix}" ]; then
+        echo "  • Promoting ${img}..."
+      else
+        echo "  • Publishing ${img} to ${release_prefix}..."
+      fi
+      if [ "${release_prefix}" = "${registry_prefix}" ] && [ "${candidate_prefix}" != "${registry_prefix}" ]; then
+        promote_image_tag "${source_image}" "${candidate_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
+      fi
+      promote_image_tag "${source_image}" "${release_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
+      if [ "${release_prefix}" = "${registry_prefix}" ]; then
+        echo "    ✅ Promoted ${img} to ${release_version}"
+      fi
+    done
   done
 }

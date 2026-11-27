@@ -1173,6 +1173,14 @@
 # one forge and one GitOps repository per leased project).
 ./tasks/cluster-profile-finds-the-managed-repository/task.yaml
 
+# gke-compute-classes pre-flight machine-family migration validator probe
+# (#5733): migrating a legacy N1 node pool (pd-standard, localSsdCount: 2,
+# enableSecureBoot: false, enableVtpm: false) to N4 runs
+# /opt/data/scripts/machine_family_preflight.py and surfaces security, disk, and
+# Local SSD blockers before generating ComputeClass or NodePool YAML.
+# deployer: noop, read-only, no fixture, transcript-only.
+./tasks/compute-class-machine-family-preflight-probe/task.yaml
+
 # gke-compute-classes skill probe (#2528): Pods that name no ComputeClass stay
 # Pending on a labelled, untainted pool that does not grow. Graded on two
 # verdict lines: the cause is the missing class and not a stockout, and the
@@ -1215,6 +1223,16 @@
 # kubelet-config finding and the pool it names. The same full audit and band
 # as consistency-drift-outlier.
 ./tasks/consistency-kubelet-config-pool-outlier/task.yaml
+
+# #6492: the waste audit reads the CPU peak in buckets of one minute. Over
+# seeded-cpu-cycle (role cpu-burst-and-flat): cpu-burst uses its whole CPU
+# request for 45 seconds in each 10 minutes, which is under the bar of the
+# overrequest check in a bucket of 300 seconds and above it in a bucket of 60.
+# Graded on the cost ledger: no finding id for cpu-burst or for cpu-flat, the
+# control.
+# The same full audit as cost-declared-intent-no-finding. deployer: noop,
+# read-only over the seeded fleet.
+./tasks/cost-cpu-burst-no-overrequest/task.yaml
 
 # Completed generated-name Job family grouping (#2900, #3005, #6955, #7098):
 # expected_fail: true until #6955 groups finished Jobs (`reindex-<uuid>` in

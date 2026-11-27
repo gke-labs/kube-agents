@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1038,12 +1040,12 @@ func startRigOnBackend(t *testing.T, backend string, spawn spawner, opts ...func
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}
@@ -2193,4 +2195,67 @@ func TestGchatPullCountsResetEachInterval(t *testing.T) {
 	refuse(false)
 	waitSummary(n, "emptyPulls>0 failedPulls=0",
 		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
+}
+
+func TestGoogleChatAdapterRelayBypassesHTTPProxy(t *testing.T) {
+	runWithProxyEnv(t, "TestGoogleChatAdapterRelayBypassesHTTPProxy", func(proxyURL string) {
+		const relayBase = "http://platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+		assertEnvProxyActive(t, relayBase+gchatRelayAPIPath, proxyURL)
+
+		var relayHits atomic.Int32
+		relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Host != "" {
+				http.Error(w, "unexpected proxy request "+r.URL.String(), http.StatusBadRequest)
+				return
+			}
+			relayHits.Add(1)
+			if r.URL.Path != gchatRelayAPIPath {
+				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"response":{"name":"spaces/AAA/messages/1"}}`)
+		}))
+		defer relaySrv.Close()
+
+		tokFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokFile, []byte("test-projected-token"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Use a non-loopback cluster hostname because Go's http.ProxyFromEnvironment
+		// never proxies 127.0.0.1/localhost; DialContext remaps only the target host
+		// to relaySrv so any proxied call still dials the trap proxy.
+		a, err := NewGoogleChatAdapter(relayBase, tokFile, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("NewGoogleChatAdapter: %v", err)
+		}
+		transport, ok := a.client.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("client.Transport = %T, want *http.Transport", a.client.Transport)
+		}
+		if transport.Proxy != nil {
+			t.Fatal("client.Transport.Proxy != nil; in-cluster relay client must ignore proxy env vars")
+		}
+		relayAddr := relaySrv.Listener.Addr().String()
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if addr == "platform-agent-credential-proxy.kubeagents-system.svc.cluster.local:8765" {
+				return dialer.DialContext(ctx, network, relayAddr)
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}
+
+		var out struct {
+			Name string `json:"name"`
+		}
+		if err := a.apiCall([]string{"spaces", "messages"}, "create", map[string]any{"parent": "spaces/AAA"}, &out); err != nil {
+			t.Fatalf("apiCall failed under HTTP_PROXY: %v", err)
+		}
+		if out.Name != "spaces/AAA/messages/1" {
+			t.Fatalf("response name = %q, want spaces/AAA/messages/1", out.Name)
+		}
+		if got := relayHits.Load(); got != 1 {
+			t.Fatalf("relay received %d request(s), want 1", got)
+		}
+	})
 }

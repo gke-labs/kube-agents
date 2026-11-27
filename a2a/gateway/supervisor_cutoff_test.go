@@ -59,13 +59,13 @@ func startCutoffRigNames(t *testing.T, cutoff time.Time, names *lib.ProfileNames
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)),
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)),
 		lib.WithProfileSupervisorCutoff(cutoff), lib.WithProfileNames(names))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatal(err)
 	}

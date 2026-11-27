@@ -19,6 +19,8 @@ from tests.testing.common import (
     get_isolated_test_env,
 )
 from tests.testing.release import (
+    MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
+    MOCK_AR_ACCESS_TOKEN,
     MOCK_GH_TOKEN,
     MOCK_GH_USER,
     MOCK_NONEXISTENT_TAG,
@@ -430,6 +432,185 @@ class PublishHelmChartScriptTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
         finally:
             temp_dir.cleanup()
+
+
+class PublishToEachReleaseRegistryTest(unittest.TestCase):
+    """With ADDITIONAL_RELEASE_REGISTRY_PREFIX set, the one packaged chart is
+    pushed to the registry prefix and then to the additional registry, and
+    signed in each. Helm logs in to the additional registry with the access
+    token it is handed, read from stdin."""
+
+    _ADDITIONAL_HOST = MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX.split("/")[0]
+    _ADDITIONAL_CHART = f"{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/charts/kube-agents:{MOCK_TARGET_RELEASE_TAG}"
+
+    def _publish(self, env, existing_images=()):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_git_binary(bin_dir)
+        _, helm_log = create_mock_helm_binary(bin_dir)
+        _, cosign_log = create_mock_cosign_binary(bin_dir)
+        create_mock_docker_binary(bin_dir, existing_images=existing_images)
+        full_env = get_isolated_test_env(
+            overrides={
+                "CI": "true",
+                "GITHUB_REPOSITORY": MOCK_DEFAULT_RELEASE_REPO,
+                "GH_TOKEN": MOCK_GH_TOKEN,
+                "GH_USER": MOCK_GH_USER,
+                **env,
+            },
+            bin_dir=str(bin_dir),
+        )
+        proc = subprocess.run(
+            ["bash", str(_PUBLISH_HELM_CHART_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+        )
+        helm = pathlib.Path(helm_log).read_text().splitlines()
+        cosign = pathlib.Path(cosign_log).read_text().splitlines() if pathlib.Path(cosign_log).exists() else []
+        return proc, helm, cosign
+
+    def test_one_package_is_pushed_and_signed_in_both_registries(self):
+        proc, helm, cosign = self._publish(
+            {
+                "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
+                "ADDITIONAL_RELEASE_REGISTRY_TOKEN": MOCK_AR_ACCESS_TOKEN,
+            }
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pushes = [line.split() for line in helm if " push " in line]
+        self.assertEqual(
+            [words[-1] for words in pushes],
+            [f"oci://{MOCK_DEFAULT_REGISTRY_PREFIX}/charts", f"oci://{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/charts"],
+        )
+        self.assertEqual(pushes[0][-2], pushes[1][-2], "both pushes take the one package")
+        logins = [line for line in helm if "registry login" in line]
+        self.assertEqual(len(logins), 2)
+        self.assertIn(f"registry login ghcr.io -u {MOCK_GH_USER} --password-stdin", logins[0])
+        self.assertIn(f"registry login {self._ADDITIONAL_HOST} -u oauth2accesstoken --password-stdin", logins[1])
+        self.assertEqual(len([line for line in cosign if " sign " in line]), 2)
+        self.assertIn(MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX + "/charts/kube-agents@sha256:", cosign[-1])
+        for text in (proc.stdout, proc.stderr, "\n".join(helm), "\n".join(cosign)):
+            self.assertNotIn(MOCK_AR_ACCESS_TOKEN, text)
+            self.assertNotIn(MOCK_GH_TOKEN, text)
+
+    def test_no_access_token_means_no_helm_login_to_the_additional_registry(self):
+        proc, helm, _ = self._publish({"ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len([line for line in helm if "registry login" in line]), 1)
+        self.assertEqual(len([line for line in helm if " push " in line]), 2)
+
+    def test_a_chart_already_in_the_additional_registry_is_signed_and_not_pushed_again(self):
+        proc, helm, cosign = self._publish(
+            {
+                "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
+                "ADDITIONAL_RELEASE_REGISTRY_TOKEN": MOCK_AR_ACCESS_TOKEN,
+            },
+            existing_images=[self._ADDITIONAL_CHART],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            [line.split()[-1] for line in helm if " push " in line], [f"oci://{MOCK_DEFAULT_REGISTRY_PREFIX}/charts"]
+        )
+        self.assertEqual(len([line for line in cosign if " sign " in line]), 2)
+
+    def test_the_access_token_goes_to_no_registry_that_is_not_artifact_registry(self):
+        """The token is a Google credential. A second registry on another host
+        is pushed to on whatever login the caller already holds."""
+        other = "registry.example.com/kube-agents"
+        proc, helm, cosign = self._publish(
+            {"ADDITIONAL_RELEASE_REGISTRY_PREFIX": other, "ADDITIONAL_RELEASE_REGISTRY_TOKEN": MOCK_AR_ACCESS_TOKEN}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        logins = [line for line in helm if "registry login" in line]
+        self.assertEqual(len(logins), 1)
+        self.assertIn("registry login ghcr.io", logins[0])
+        self.assertEqual([line.split()[-1] for line in helm if " push " in line][-1], f"oci://{other}/charts")
+        self.assertEqual(len([line for line in cosign if " sign " in line]), 2)
+
+    def test_a_signing_failure_in_the_additional_registry_fails_the_run(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_git_binary(bin_dir)
+        create_mock_helm_binary(bin_dir)
+        create_mock_docker_binary(bin_dir)
+        cosign = bin_dir / "cosign"
+        cosign.write_text(
+            f'#!/bin/sh\ncase "$*" in *"{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}"*) exit 1 ;; esac\nexit 0\n'
+        )
+        cosign.chmod(0o755)
+        proc = subprocess.run(
+            ["bash", str(_PUBLISH_HELM_CHART_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={
+                    "CI": "true",
+                    "GITHUB_REPOSITORY": MOCK_DEFAULT_RELEASE_REPO,
+                    "GH_TOKEN": MOCK_GH_TOKEN,
+                    "GH_USER": MOCK_GH_USER,
+                    "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
+                    "ADDITIONAL_RELEASE_REGISTRY_TOKEN": MOCK_AR_ACCESS_TOKEN,
+                },
+                bin_dir=str(bin_dir),
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"Failed to sign Helm chart {MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/", proc.stderr)
+        self.assertIn(f"Successfully published Helm chart {MOCK_TARGET_RELEASE_TAG} to oci://{MOCK_DEFAULT_REGISTRY_PREFIX}/charts", proc.stdout)
+        self.assertNotIn(f"to oci://{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/charts.", proc.stdout)
+
+    def test_a_push_failure_in_the_additional_registry_fails_the_run(self):
+        """With the chart already published to and signed in the registry prefix."""
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_git_binary(bin_dir)
+        helm_path, _ = create_mock_helm_binary(bin_dir)
+        _, cosign_log = create_mock_cosign_binary(bin_dir)
+        create_mock_docker_binary(bin_dir)
+        refusing = (
+            "#!/bin/sh\n"
+            f'if [ "$1" = "push" ] && [ "$3" = "oci://{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/charts" ]; then\n'
+            '  echo "mock push refused" >&2\n  exit 1\nfi\n'
+        )
+        helm_path.write_text(refusing + helm_path.read_text().split("\n", 1)[1])
+        proc = subprocess.run(
+            ["bash", str(_PUBLISH_HELM_CHART_SH), MOCK_TARGET_RELEASE_TAG],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={
+                    "CI": "true",
+                    "GITHUB_REPOSITORY": MOCK_DEFAULT_RELEASE_REPO,
+                    "GH_TOKEN": MOCK_GH_TOKEN,
+                    "GH_USER": MOCK_GH_USER,
+                    "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
+                    "ADDITIONAL_RELEASE_REGISTRY_TOKEN": MOCK_AR_ACCESS_TOKEN,
+                },
+                bin_dir=str(bin_dir),
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"Failed to push Helm chart to oci://{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/charts", proc.stderr)
+        self.assertIn(f"to oci://{MOCK_DEFAULT_REGISTRY_PREFIX}/charts.", proc.stdout)
+        self.assertEqual(len([line for line in pathlib.Path(cosign_log).read_text().splitlines() if " sign " in line]), 1)
+
+    def test_unset_publishes_to_the_registry_prefix_alone(self):
+        for additional in ("", MOCK_DEFAULT_REGISTRY_PREFIX):
+            with self.subTest(additional=additional):
+                proc, helm, cosign = self._publish(
+                    {"ADDITIONAL_RELEASE_REGISTRY_PREFIX": additional, "ADDITIONAL_RELEASE_REGISTRY_TOKEN": MOCK_AR_ACCESS_TOKEN}
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(len([line for line in helm if " push " in line]), 1)
+                self.assertEqual(len([line for line in helm if "registry login" in line]), 1)
+                self.assertEqual(len([line for line in cosign if " sign " in line]), 1)
 
 
 if __name__ == "__main__":

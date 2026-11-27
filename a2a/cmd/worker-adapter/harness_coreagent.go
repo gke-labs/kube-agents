@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"strings"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/coreagent"
 )
 
 // coreAgentBuilder starts core-agent-harness (a2a/cmd/core-agent-harness),
@@ -54,3 +56,10 @@ func (coreAgentBuilder) env(env []string, _ func(string) bool) []string {
 
 // userSettings: none; the harness reads no settings file.
 func (coreAgentBuilder) userSettings(func(string) string) string { return "" }
+
+// configDir is the rendered persona the harness reads, which the session
+// check verifies against its manifest; personaCovers is what a rendering
+// holds there (coreagent.Names).
+func (coreAgentBuilder) configDir(func(string) string) string { return coreAgentPersonaDir }
+
+func (coreAgentBuilder) personaCovers(rel string) bool { return coreagent.Covers(rel) }
