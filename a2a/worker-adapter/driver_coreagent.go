@@ -25,9 +25,10 @@ import (
 // carries them back.
 type coreAgentDriver struct {
 	// Policy is the turn's tool policy, set by NewCoreAgentDriver from the
-	// worker's grant (the session allowlist today). MCP is the turn's MCP
-	// servers, set each turn by WithMCP from the persona's (adapter.run,
-	// turnDriver); the pod's driver carries none.
+	// worker's grant: the session allowlist on a session pod, the persona's on
+	// a profile worker (WithPolicy). MCP is the turn's MCP servers, set each
+	// turn by WithMCP from the persona's (adapter.run, turnDriver); the pod's
+	// driver carries none.
 	Policy coreagentwire.Policy
 	MCP    []coreagentwire.MCPServer
 	// Instructions are the session pod's system-prompt lines, sent in each
@@ -54,6 +55,13 @@ func newCoreAgentDriver() coreAgentDriver {
 const coreAgentErrorToken = "error_during_execution" // #nosec G101 -- a failure reason token, not a credential
 
 func (coreAgentDriver) Harness() persona.Harness { return persona.CoreAgent }
+
+// WithPolicy is the driver with p in its envelopes; the conversation history
+// it holds is shared.
+func (d coreAgentDriver) WithPolicy(p coreagentwire.Policy) Driver {
+	d.Policy = p
+	return d
+}
 
 // WithMCP is the driver with servers in its envelopes; the conversation
 // history it holds is shared, as every turn of the pod's needs it.
