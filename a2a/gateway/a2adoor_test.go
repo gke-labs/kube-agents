@@ -40,6 +40,9 @@ type a2aRig struct {
 	base    string
 	salt    []byte
 	nextRPC int
+	// stop ends the gateway's run, and ran closes when it has returned.
+	stop func()
+	ran  chan struct{}
 }
 
 func startA2ARig(t *testing.T) *a2aRig {
@@ -70,14 +73,21 @@ type a2aRigTuning struct {
 	config      func(*Config)
 	// spawn, when set, is the gateway's session spawner.
 	spawn *fakeSpawner
+	// url, when set, is a bus already started and provisioned that the
+	// gateway joins instead of starting its own: a second gateway on the
+	// first one's bus, as after a handover.
+	url string
 }
 
 // startA2ARigTuned is startA2ARigWith with a2aRigTuning's hooks.
 func startA2ARigTuned(t *testing.T, stack func(*A2ADoor) Adapter, tune a2aRigTuning) *a2aRig {
 	t.Helper()
-	s := startServer(t)
-	url := s.ClientURL()
-	provision(t, url)
+	url := tune.url
+	if url == "" {
+		s := startServer(t)
+		url = s.ClientURL()
+		provision(t, url)
+	}
 
 	mapFile := filepath.Join(t.TempDir(), "a2a-door-principal-map")
 	fixture := fmt.Sprintf("%s%s %s\n%s%s %s\n",
@@ -148,9 +158,10 @@ func startA2ARigTuned(t *testing.T, stack func(*A2ADoor) Adapter, tune a2aRigTun
 	if g.backend != a2aBackend {
 		t.Fatalf("a gateway whose only ingress is the A2A door attributes to %q, want %q", g.backend, a2aBackend)
 	}
-	go func() { _ = g.Run(ctx) }()
+	ran := make(chan struct{})
+	go func() { _ = g.Run(ctx); close(ran) }()
 
-	rig := &a2aRig{g: g, door: door, bus: bus, url: url, base: "http://" + ln.Addr().String(), salt: salt}
+	rig := &a2aRig{g: g, door: door, bus: bus, url: url, base: "http://" + ln.Addr().String(), salt: salt, stop: cancel, ran: ran}
 	waitFor(t, "the door to install its handler", func() bool {
 		door.handlerMu.RLock()
 		defer door.handlerMu.RUnlock()

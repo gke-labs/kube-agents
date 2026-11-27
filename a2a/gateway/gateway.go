@@ -751,6 +751,11 @@ func New(o Options) (*Gateway, error) {
 	if sink, ok := o.Adapter.(ProbeSink); ok {
 		sink.SetProbe(g.probeConversation)
 	}
+	// The door task index, for a door that must answer for a task it didn't
+	// see start (a handover): see TaskLocator.
+	if sink, ok := o.Adapter.(TaskLocatorSink); ok {
+		sink.SetTaskLocator(g.reg.LocateDoorTask)
+	}
 	// The session registry as a read, for an adapter that has to decide on
 	// its own goroutine whether a conversation is one the gateway is in (the
 	// Slack adapter's session-thread rule, and the side door composite in
@@ -1059,6 +1064,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	g.startProfileDirectory(ctx)
 	g.startTriggerIngress(ctx)
 	go g.reapLoop(ctx)
+	go g.sweepDoorTasks(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
 		go g.capQueueLoop(ctx)
@@ -3759,7 +3765,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		rec.addTurnToSession(requester, ref.SteerAuthors, ref.SteerAuthorsOverflow)
 	}
 	rec.LastTaskActivity = time.Now().UTC()
-	rec.trimHistory()
+	trimmed := rec.trimHistory()
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
 	g.relays[taskID] = &relayState{local: true}
@@ -3769,6 +3775,23 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+	} else if isDoorSession(rec.Key) {
+		// The door task entry, once the record lists the task: written
+		// before, a term-start sweep reading between the two would take it
+		// for an orphan. Only a chain's root, the one task the door knows
+		// (doorVisible): a child or a wake would be an entry nothing reads.
+		if ref.rootID() == taskID {
+			if err := g.reg.IndexDoorTask(ctx, taskID, rec.Key); err != nil {
+				g.log.Error("door task index write failed", "taskId", taskID, "err", err)
+			}
+		}
+		// The trimmed tasks left the record with this write, so their door
+		// entries would lead nowhere: dropped now rather than on a read.
+		for _, id := range trimmed {
+			if err := g.reg.DropDoorTask(ctx, id); err != nil {
+				g.log.Warn("door task index cleanup failed", "taskId", id, "err", err)
+			}
+		}
 	}
 
 	// PublishSeq rather than Publish: the sequence the server assigns is the

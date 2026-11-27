@@ -33,7 +33,8 @@ The code assumes one process in four places, each of which would misbehave on it
   conversation lock).
 
 The HTTP doors (inject and A2A) keep their conversations in memory too, so a request and its
-follow-up have to reach the same replica.
+follow-up have to reach the same replica. (The A2A door reads a task back from its record after
+a handover, but not a turn in flight.)
 
 ## Decision: active-standby first
 
@@ -198,12 +199,14 @@ Process memory doesn't move, and the bus doesn't hold what nobody was subscribed
   failover posts anew instead of editing), the Slack board's per-row tap guard and last-sent
   blocks, the once-per-sender dropped-message notice, the Slack interaction state of a question
   someone was answering.
-- **Lost, functional:** an HTTP door's in-memory conversation. A client that submitted to the old
-  replica finds nothing on the new one, though the task may have run or may still be running. The
-  A2A door says so: its not-found error carries `reason: not-held-since-serving`, the new replica's
-  `servingSince` and `mayHaveRun: true`, and a client that resubmits should expect possible
-  duplicate work, since the `messageId` dedupe doesn't survive either (decided on #5633). Door state that survives a failover is part of the
-  multi-replica rebuild, #4206.
+- **Lost, functional:** an HTTP door's in-memory conversation, in part. The A2A door reads a task
+  it doesn't hold from its conversation's session record and the task's stream, through a
+  `doortasks.<id>` index entry the record bounds, so `tasks/get`, `tasks/cancel` and a
+  follow-up reach a task the old replica accepted. A task past that (out of its record's 50-task
+  history, its session reaped, or its end off the stream) still reads as not found, with the reason `not-held-since-serving`, the new replica's `servingSince` and `mayHaveRun: true`. The
+  `messageId` dedupe doesn't survive a handover, so a client that resubmits should expect
+  possible duplicate work, and the inject door's transcripts are lost. Both are follow-ups
+  under #4206.
 
 ### Reaching the active replica over HTTP
 
@@ -388,5 +391,5 @@ door conversations in KV. Fenced writes (step 1) are the one piece phase one alr
 - **The A2A door across a failover (answered).** The door says plainly that it lost track of a
   task across a failover: a task the new active replica doesn't hold is reported with a reason,
   when that replica started serving, and `mayHaveRun: true`, because the task may have finished
-  or may still be running (#5633). Moving the conversations to KV, so a
-  client can poll the new active replica, is part of #4206.
+  or may still be running (#5633). The new active replica now reads the task from its record and
+  stream while the record lists it; the rest of #4206 adds the dedupe and the inject door.

@@ -471,6 +471,16 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	}
 }
 
+// SetTaskLocator hands the door task index to every door that can use it
+// (TaskLocatorSink); implemented unconditionally, as SetProbe is.
+func (s *sideDoorAdapter) SetTaskLocator(locate TaskLocator) {
+	for _, d := range s.doors {
+		if sink, ok := d.Door.(TaskLocatorSink); ok {
+			sink.SetTaskLocator(locate)
+		}
+	}
+}
+
 // SetHome hands the Home tab's admission rule and board reader to the
 // primary, the half with a home view; implemented unconditionally for the
 // same reason as SetProbe.

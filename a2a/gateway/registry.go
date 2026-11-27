@@ -835,11 +835,12 @@ func (rec *SessionRecord) takeCardsPending(rootID string) bool {
 // entry, nor a stopped task not yet seen to end (CancelUnsent, or Canceled
 // with StopPending), which may still run. A history whose live nodes alone
 // pass the cap keeps them all; a batch holds at most lib.DelegateBatchMax
-// children, so that is bounded.
-func (rec *SessionRecord) trimHistory() {
+// children, so that is bounded. It returns the ids it dropped, whose door
+// task entries go with them (doorTaskPrefix).
+func (rec *SessionRecord) trimHistory() []string {
 	over := len(rec.Tasks) - taskHistoryCap
 	if over <= 0 {
-		return
+		return nil
 	}
 	live := map[string]bool{}
 	if rec.ActiveTask != nil {
@@ -863,14 +864,17 @@ func (rec *SessionRecord) trimHistory() {
 		}
 	}
 	kept := make([]TaskRef, 0, len(rec.Tasks)-over)
+	var dropped []string
 	for _, ref := range rec.Tasks {
 		if over > 0 && !live[ref.ID] {
 			over--
+			dropped = append(dropped, ref.ID)
 			continue
 		}
 		kept = append(kept, ref)
 	}
 	rec.Tasks = kept
+	return dropped
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to
@@ -1560,7 +1564,9 @@ func (r *Registry) IndexTask(ctx context.Context, taskID, sessionKey string) err
 
 // DropTask retires a task's index entry once its terminal event has been
 // rendered — the stream is the durable record; the index only routes live
-// events, and one key per task forever is unbounded growth.
+// events, and one key per task forever is unbounded growth. A door task
+// keeps a separate entry the relay never reads (IndexDoorTask), so the door
+// can still find a finished task's record after a handover.
 //
 // Fenced by the indexed session's record, as IndexTask is, and conditional
 // on the index entry's revision, not the record's. At term 0 it's the plain

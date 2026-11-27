@@ -96,6 +96,9 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 				g.log.Error("reap: session record delete failed", "session", fresh.Key, "err", err)
 			} else {
 				g.log.Info("reaped expired session record", "session", fresh.Key, "lastActivity", fresh.LastActivity)
+				if err := g.reg.DropDoorTasks(ctx, fresh); err != nil {
+					g.log.Warn("reap: door task index cleanup failed", "session", fresh.Key, "err", err)
+				}
 				if fresh.ActiveTask != nil {
 					_ = g.reg.DropTask(ctx, fresh.ActiveTask.TaskID)
 					g.mu.Lock()
