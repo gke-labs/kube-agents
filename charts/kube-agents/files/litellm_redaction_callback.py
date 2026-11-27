@@ -184,6 +184,8 @@ TOOL_OUTPUT_MAX_NESTING = 3
 # How many nested strings one tool output may have decoded; past that the
 # rest stay strings inside it.
 TOOL_OUTPUT_MAX_NESTED = 32
+# How many top-level strings of one Gemini function response are decoded.
+TOOL_OUTPUT_MAX_FIELDS = 64
 # Stands in for a string while asking whether the structure rules would mask
 # it whole where it sits (a credential key, a Secret's data, an env value).
 MASK_PROBE = "kube-agents-redaction-probe"
@@ -771,10 +773,14 @@ class KubeAgentsRedactionCallback(CustomLogger):
                     response = part.get(key) if isinstance(part, dict) else None
                     body = response.get(GEMINI_RESPONSE_KEY) if isinstance(response, dict) else None
                     # Each top-level string is a tool output of its own, with its
-                    # own nesting budget; the probe below is a fixed cost.
+                    # own nesting budget; the probe below is a fixed cost. Past
+                    # TOOL_OUTPUT_MAX_FIELDS of them the rest stay strings and
+                    # are walked as before (the key-name rules still see them).
+                    fields = 0
                     for name, value in (body.items() if isinstance(body, dict) else ()):
-                        if not isinstance(value, str) or value.strip()[:1] not in ("{", "["):
+                        if not isinstance(value, str) or value.strip()[:1] not in ("{", "[") or fields >= TOOL_OUTPUT_MAX_FIELDS:
                             continue
+                        fields += 1
                         # A string the structure rules mask whole where it
                         # sits stays a string.
                         if self._masked_whole(body, (name,)):
