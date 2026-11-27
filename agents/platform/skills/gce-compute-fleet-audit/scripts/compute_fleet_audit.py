@@ -1630,7 +1630,9 @@ def conntrack_unit(units: dict[str, dict], name: str) -> str | None:
 
 def _conntrack_lines(entries: list):
     """`(name, timestamp)` for each Cloud Logging entry that carries the
-    kernel's line and names its instance."""
+    kernel's line and names its instance. A timestamp that does not read as a
+    time is `""`, so an excerpt says the time is unknown and a malformed
+    string never replaces a real time in the first and last."""
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
@@ -1640,7 +1642,7 @@ def _conntrack_lines(entries: list):
         labels = entry.get(LOG_LABELS_KEY) if isinstance(entry.get(LOG_LABELS_KEY), dict) else {}
         name = str(labels.get(LOG_INSTANCE_NAME_LABEL) or "").strip()
         if name:
-            yield name, str(entry.get(LOG_TIMESTAMP_KEY) or "")
+            yield name, str(entry.get(LOG_TIMESTAMP_KEY) or "") if _entry_time(entry) is not None else ""
 
 
 def ledger_segment(value: str) -> str:

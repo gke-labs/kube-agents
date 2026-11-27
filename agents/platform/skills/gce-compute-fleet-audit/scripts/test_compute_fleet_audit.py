@@ -3165,6 +3165,20 @@ class ConntrackSaturationTest(unittest.TestCase):
         self.assertIn("1 kernel line(s)", hit["excerpt"])
         self.assertIn("between an unknown time and an unknown time", hit["excerpt"])
 
+    def test_a_timestamp_that_does_not_read_as_a_time_is_an_unknown_time(self):
+        (hit,) = cf.check_conntrack_saturation([conntrack_entry(stamp="yesterday")], self.UNITS)
+        self.assertIn("between an unknown time and an unknown time", hit["excerpt"])
+        self.assertNotIn("yesterday", hit["excerpt"])
+
+    def test_a_malformed_timestamp_does_not_replace_a_real_time(self):
+        real = "2026-11-20T19:59:32.454392524Z"
+        entries = [conntrack_entry(stamp=real), conntrack_entry(stamp="yesterday"), conntrack_entry(stamp="zzzz")]
+        (hit,) = cf.check_conntrack_saturation(entries, self.UNITS)
+        self.assertIn("3 kernel line(s)", hit["excerpt"])
+        self.assertIn("between 2026-11-20T19:59:32Z and 2026-11-20T19:59:32Z", hit["excerpt"])
+        self.assertNotIn("yesterday", hit["excerpt"])
+        self.assertNotIn("zzzz", hit["excerpt"])
+
 
 class WithinWindowTest(unittest.TestCase):
     """The window that the collector holds itself, on each entry's own time."""
