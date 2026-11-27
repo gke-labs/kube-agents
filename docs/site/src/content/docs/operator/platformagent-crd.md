@@ -2343,6 +2343,8 @@ _and_ beyond the agent's own repair:
 - `terminal.*`: where the shell runs, one sandbox per Pod, reached the same way by every profile;
 - `database.journal_mode`, when the agent Pod has a runtime class: one data volume per Pod, and a
   corrupted database is found only after the sessions in it are unreadable;
+- `security.allow_lazy_installs`: pinned to `false`; every required dependency ships in the image,
+  so runtime package downloads stay off across profiles and restarts;
 - `sessions.auto_prune` and `sessions.retention_days`, from `spec.harness.retention`: one period for
   every profile, which no profile can lengthen;
 - one `hooks.outbound` entry that posts tool calls and model requests to the bridge's loopback

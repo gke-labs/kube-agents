@@ -229,6 +229,76 @@ func TestManagedConfigPinsJournalModeUnderARuntimeClass(t *testing.T) {
 	}
 }
 
+func TestManagedConfigPinsSecurityAllowLazyInstallsFalse(t *testing.T) {
+	cases := map[string]*agentv1alpha1.PlatformAgent{
+		"nil security spec": newTestPlatformAgent(),
+		"custom service account": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: "custom-sa"}
+			return a
+		}(),
+		"egress allowlist": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Security = &agentv1alpha1.SecuritySpec{EgressPolicy: "Allowlist"}
+			return a
+		}(),
+	}
+
+	for name, agent := range cases {
+		t.Run(name, func(t *testing.T) {
+			data := buildConfigMapData(agent, nil)
+			var cfg map[string]any
+			if err := yaml.Unmarshal([]byte(data[managedConfigKey]), &cfg); err != nil {
+				t.Fatalf("managed config does not parse as YAML: %v", err)
+			}
+			sec, ok := cfg["security"].(map[string]any)
+			if !ok {
+				t.Fatalf("managed config missing security map, got:\n%s", data[managedConfigKey])
+			}
+			got, ok := sec["allow_lazy_installs"].(bool)
+			if !ok || got != false {
+				t.Errorf("security.allow_lazy_installs = %v (%T), want false", sec["allow_lazy_installs"], sec["allow_lazy_installs"])
+			}
+			for key, overlay := range data {
+				if key != managedConfigKey && strings.Contains(overlay, "allow_lazy_installs") {
+					t.Errorf("allow_lazy_installs leaked into %q:\n%s", key, overlay)
+				}
+			}
+		})
+	}
+
+	t.Run("survives plugin config merge and plugin cannot override", func(t *testing.T) {
+		agent := newTestPlatformAgent()
+		plugin := &agentv1alpha1.AgentPlugin{
+			ObjectMeta: metav1.ObjectMeta{Name: "customplugin", Namespace: agent.Namespace},
+			Spec: agentv1alpha1.AgentPluginSpec{
+				Image: "example.com/plugin:v1",
+				Config: "platforms:\n  slack:\n    extra:\n      custom_flag: true\n" +
+					"security:\n  allow_lazy_installs: true\n",
+			},
+		}
+		rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+		var cfg map[string]any
+		if err := yaml.Unmarshal([]byte(rendered), &cfg); err != nil {
+			t.Fatalf("managed config does not parse as YAML: %v", err)
+		}
+		platforms, _ := cfg["platforms"].(map[string]any)
+		slack, _ := platforms["slack"].(map[string]any)
+		extra, _ := slack["extra"].(map[string]any)
+		if got, ok := extra["custom_flag"].(bool); !ok || !got {
+			t.Fatalf("plugin config did not merge into platforms.slack.extra (merge path not exercised), got:\n%s", rendered)
+		}
+		sec, ok := cfg["security"].(map[string]any)
+		if !ok {
+			t.Fatalf("managed config lost security map after plugin merge, got:\n%s", rendered)
+		}
+		got, ok := sec["allow_lazy_installs"].(bool)
+		if !ok || got != false {
+			t.Errorf("security.allow_lazy_installs = %v, want false (plugin must not override)", sec["allow_lazy_installs"])
+		}
+	})
+}
+
 // The memory subtree is no longer rendered into the managed scope: it is
 // profile-shaped (the front door's per-user provider is exactly what a
 // kanban-spawned specialist must not get), and the scope is machine-global. The

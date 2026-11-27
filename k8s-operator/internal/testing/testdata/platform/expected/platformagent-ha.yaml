@@ -422,6 +422,8 @@ data:
         enabled: false
         extra:
           adaptive_cards: true
+    security:
+      allow_lazy_installs: false
     sessions:
       auto_prune: true
       retention_days: 90
