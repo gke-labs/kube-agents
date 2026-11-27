@@ -2804,13 +2804,16 @@ class ReportCredentialRoutesTest(unittest.TestCase):
                 ("GET", "{stream}/latest"),
                 ("GET", "{stream}/runs"),
                 ("GET", "{stream}/runs/{run}"),
+                ("GET", "{stream}/runs/{start}"),
                 ("PUT", "{stream}/runs/{run}"),
+                ("PUT", "{stream}/runs/{start}"),
                 ("PUT", "{stream}/latest"),
                 ("DELETE", "{stream}/latest"),
             ],
             [
                 (method, pattern.pattern.replace(credential_proxy._REPORT_STREAM, "{stream}").replace(
-                    credential_proxy._REPORT_RUN_STAMP, "{run}"))
+                    credential_proxy._REPORT_RUN_STAMP, "{run}").replace(
+                    credential_proxy._REPORT_RUN_START, "{start}"))
                 for method, pattern in credential_proxy.REPORT_CREDENTIAL_ROUTES
             ],
         )

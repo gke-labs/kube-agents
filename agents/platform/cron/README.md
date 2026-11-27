@@ -229,8 +229,10 @@ jsonpath projection; StorageClasses and PersistentVolumes), plus
 `gcloud logging read` over the Admin Activity log when a registered rule reads
 it; the saved report names those objects, pods and nodes among them, and a
 fail-closed webhook with no reachable backend names its configuration and its
-Service, which is tenant-written text, so the entry declares `risk: high` as
-`stall-watch` does. A project
+Service, which is tenant-written text, and the chat message names the first
+budget, webhook configuration, maintenance exclusion, node pool or readiness
+rule that blocks each blocked cluster it lists, so the entry declares
+`risk: high` as `stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -245,8 +247,8 @@ project at all, a ledger it refuses to overwrite, and an agent image missing the
 report script end the same way. A failure a retry may clear (a timeout, a
 sandbox that failed) says instead that it tries again tomorrow, or at its next
 scheduled run when its roster entry is not daily;
-beside projects that were keyed, the table is partial, posted once with the
-reason, and the ledger's `table_errors` keeps it. The remedy is
+beside projects that were keyed, the table is partial, posted once naming the
+project, with the reason in its log line, and the ledger's `table_errors` keeps it. The remedy is
 `resourcemanager.projects.get` on the credential (every read role the install
 binds carries it, as `cluster_agent_reconcile.py` relies on, so a credential
 without it is a custom grant) or the project id in place of the number
@@ -269,10 +271,20 @@ writes the files on this side, under `<agent home>/upgrade-readiness/`:
 `reports/<version>/`, with `latest.md` pointing at the newest, the ten newest
 kept per version and a retired version's directory removed with it. Each run starts
 from an empty rollout record, so a saved report's progress table is a
-first-run baseline, not a week-over-week comparison. Its stdout, one line per
-report with the pending clusters, the blocked ones, and the file's path on the
-gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
-sandbox and cannot open that path, which is why the line carries the verdicts.
+first-run baseline, not a week-over-week comparison. Its stdout is what
+`deliver: "chat"` posts, in plain words: per report, a bold headline that
+counts the clusters not ready for the version yet (or the ready ones, when
+none is blocked), one line per blocked cluster naming the first thing that
+blocks it and the fix where its kind has one (five, fewer when the whole post
+would pass the 1,900 bytes the A2A gateway posts as one message, then a count),
+how many more are ready or could not be fully checked, and the date the next
+report is due. The reports come first, then the lines about reads that
+failed, then the notices. The agent's own tools run in
+the sandbox and cannot open the saved report, which is why the message
+carries the verdicts and the reasons. Each line's technical twin, with the
+pending clusters, the reasons and remedies per project and the report's path
+on the gateway pod, goes to `logs/upgrade_readiness_watch.log` under the agent
+home.
 `--dry-run` prints what a tick would do and changes nothing, the failure
 marker included.
 
@@ -286,10 +298,10 @@ hour Hermes gives a `no_agent` script: the version table and the readiness
 runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
-line names each project with a read error and its reason (the budget, the
-sandbox's error, a failed listing, an unresolved project number, a refusal under the
+line names the projects, or the locations in them, with a read error (six, then a count), and its log line the reason for each (the budget, the
+sandbox's error, a failed listing or a location's server config, an unresolved project number, a refusal under the
 declared scope with the install's remedy), the
-ledger's `table_errors` keeps the last tick's, and a version's own line names
+ledger's `table_errors` keeps the last tick's, and a version's own line, or its log line, names
 the project whose readiness run was not started or was cut short (a version
 none of whose projects ran is not recorded and is retried tomorrow),
 and each sweep runs the projects least recently run first, so a budget that
@@ -301,7 +313,8 @@ that still pended it and none does, or a readiness run (which lists every
 cluster of its project, reached by the table or not) showed every cluster
 pending it as no longer below it, a report that
 graded none of a version's pending clusters is written but not recorded (the
-chat line says "none graded" and the version is tried again tomorrow), and the
+chat line says the clusters could not be read, and that it tries again tomorrow or that an admin
+must act first), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
@@ -329,7 +342,7 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 ## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
 
 The daily watch reads a cluster only while a release channel offers it a version it is below, and
-posts one line per report. The weekly pair reads every cluster of the roster's projects whatever its
+posts one short message a tick, a few lines per report. The weekly pair reads every cluster of the roster's projects whatever its
 version (a declared scope refuses a project outside it), and ends in one message a person reads.
 
 `upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
@@ -371,7 +384,8 @@ nothing on success: the brief speaks for the week and the queue for each finding
 not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
 is one line each, since both leave the week's findings where the brief cannot act on them; a
 failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
-on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
+on the next clean run; a record it cannot write is said every run. Each line is plain words; the reasons per project, the queue's refusals and
+the copy's error go to `logs/upgrade_readiness_review.log` under the agent home. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
 
 `upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
 budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric
@@ -1056,6 +1070,18 @@ For `kind: "cron"`, `cron/jobs.py` sets `display` to the raw expression
 back to `display` only for interval jobs — which neither roster has. So `display`
 is a second copy of `expr` that can rot silently. Keep the two identical.
 
+## Suspending jobs on one install
+
+An install turns shipped jobs off without a new image through `PlatformAgent`
+`spec.schedules` (`suspendAll` and per-id `overrides`). The operator renders it
+into `KUBE_AGENTS_BUILTIN_SCHEDULES` on the gateway container, and the
+entrypoint passes that to `profile_scaffold.py --cron-suspend` in the platform
+scaffold and force-sync steps. `suspend_cron_jobs` then writes `enabled: false`
+on each suspended job this roster ships, in the same write as the merge. It is
+the one exception to "the image wins every key it ships": a volume can hold
+`enabled: false` for a job this file enables. It can only hold a job off, and
+it never touches a job this file does not ship.
+
 ## Retiring a watchdog
 
 `profile_scaffold.merge_cron_store` adds and overwrites but never prunes.
@@ -1158,8 +1184,8 @@ rule outlives the memory of why:
   in-flight note per stream on the sandbox pod's own volume, at
   `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
   the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
-  this README otherwise calls "the volume"), holding the stream id and a start
-  time, honoured for two hours and removed by a `finish` that published or
+  this README otherwise calls "the volume"), holding the stream id, a start
+  time and the run id, honoured for two hours and removed by a `finish` that published or
   died (exit 0 or 1); `finish --dry-run` and a `finish` that exited 2 keep it,
   so a note beside a rejected document is a live run, not a stale one. The note spans one
   `start`-`finish` pair, so a multi-repository loop reclaims it at each
@@ -1215,7 +1241,11 @@ last scheduled run's stored document when the collector manifest digests the
 same, which is what spares a static fleet the by-hand drafting every day. It
 is in the prompt and not in the SOP, because a scheduled run and an on-demand
 run read the same SOP: an SOP that passed the flag would let every on-demand
-run of its stream go silent, or be closed from a stored document.
+run of its stream go silent, or be closed from a stored document. `start`
+needs no flag: it marks the run's run-start record scheduled by itself, for a
+Hermes cron run or a profile task under a builtin schedule's trigger, so a
+reader can tell a scheduled run that did not finish from an on-demand one
+([report store design §5](../../../docs/designs/fleet-audit-report-store.md#5-liveness)).
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
 prompt has the phrase `pass --scheduled to precheck and finish` (`pass

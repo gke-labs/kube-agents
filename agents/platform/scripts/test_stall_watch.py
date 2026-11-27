@@ -1236,14 +1236,14 @@ class SessionKv(Base):
             seen.update(url=request.full_url, method=request.get_method(), auth=request.get_header("Authorization"), body=request.data, timeout=timeout)
             return io.BytesIO(b'{"status": "injected"}')
 
-        with patch.dict(os.environ, {stall_watch.SESSION_KV_AUTH_ENV: "tok"}), patch.object(stall_watch.urllib.request, "urlopen", urlopen):
+        with patch.dict(os.environ, {stall_watch.SESSION_KV_AUTH_ENV: "tok"}), patch.object(stall_watch.urllib.request.OpenerDirector, "open", side_effect=urlopen):
             self.assertEqual(REAL_SESSION_KV("/sessions/s/inject", {"message": "{}"}), {"status": "injected"})
         self.assertEqual(seen["url"], "http://127.0.0.1:8699/sessions/s/inject")
         self.assertEqual((seen["method"], seen["auth"], json.loads(seen["body"])), ("POST", "Bearer tok", {"message": "{}"}))
         self.assertEqual(seen["timeout"], stall_watch.SESSION_KV_TIMEOUT_SECONDS)
 
     def test_an_answer_that_is_not_a_json_object_is_a_refusal_not_a_crash(self):
-        with patch.object(stall_watch.urllib.request, "urlopen", lambda request, timeout: io.BytesIO(b"null")):
+        with patch.object(stall_watch.urllib.request.OpenerDirector, "open", side_effect=lambda request, timeout: io.BytesIO(b"null")):
             with self.assertRaises(ValueError):
                 REAL_SESSION_KV(stall_watch.HEALTHZ_PATH)
             with patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
@@ -1258,7 +1258,7 @@ class SessionKv(Base):
         def urlopen(request, timeout):
             raise http.client.IncompleteRead(b"{", 10)
 
-        with patch.object(stall_watch.urllib.request, "urlopen", urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+        with patch.object(stall_watch.urllib.request.OpenerDirector, "open", side_effect=urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
             lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertEqual(len(lines), 1)
         self.assertIn("answer could not be read", lines[0])
@@ -1280,7 +1280,7 @@ class SessionKv(Base):
                     body = healthz if path == stall_watch.HEALTHZ_PATH else session if path == stall_watch.SESSIONS_PATH else injected
                     return io.BytesIO(json.dumps(body).encode())
 
-                with patch.object(stall_watch.urllib.request, "urlopen", urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+                with patch.object(stall_watch.urllib.request.OpenerDirector, "open", side_effect=urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
                     lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
                 self.assertEqual(len(lines), 1, lines)
                 self.assertTrue(lines[0].startswith(stall_watch.INJECT_FAILED_PREFIX), lines[0])
@@ -1289,7 +1289,7 @@ class SessionKv(Base):
         def urlopen(request, timeout):
             raise http.client.RemoteDisconnected("Remote end closed connection without response")
 
-        with patch.object(stall_watch.urllib.request, "urlopen", urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
+        with patch.object(stall_watch.urllib.request.OpenerDirector, "open", side_effect=urlopen), patch.object(stall_watch, "session_kv", REAL_SESSION_KV):
             lines, _ = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}})
         self.assertIn("could not be reached", lines[0])
         self.assertNotIn("could not be read", lines[0])

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -21,6 +22,8 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 // Config is the adapter's contract with its pod: everything here arrives as
@@ -126,6 +129,10 @@ type Config struct {
 	// Driver is the harness's headless contract (driver.go). Nil means
 	// Claude Code, the harness every argv below is built for.
 	Driver Driver
+	// PersonaMCP are the persona's MCP servers, for a harness that takes
+	// them in-process (core-agent): each turn's are built from these (and,
+	// once #6789 lands, the delegate server when the turn may delegate).
+	PersonaMCP []persona.MCPServer
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
@@ -225,6 +232,11 @@ type Config struct {
 	// in it, scrubbed and capped, and served only on the pod's loopback.
 	// nil records nothing.
 	Trajectory *TrajectoryStore
+
+	// panicSeam, a test's, runs at each panicSeam point (panic.go) with the
+	// point and its detail, so a test can raise a panic there. Nil outside
+	// tests.
+	panicSeam func(point, detail string)
 }
 
 // Addressee is the executor's token on the task subjects.
@@ -424,10 +436,23 @@ type adapter struct {
 	// status payloads need them directly.
 	taskID, contextID, correlationID string
 
-	mu        sync.Mutex
-	finalized bool
-	finalErr  error
-	appended  map[string]bool // artifact name -> first chunk already out
+	mu sync.Mutex
+	// finalized is finalize's claim, taken before it publishes; terminalTried
+	// is set once a terminal publish has been tried, by finalize or by the
+	// panic fallback (publishPanicTerminal), and finalState is the state of
+	// the claimed terminal. A panic between the claim and the publish leaves
+	// finalized without terminalTried, which the fallback reads.
+	finalized     bool
+	terminalTried bool
+	finalState    lib.TaskState
+	finalErr      error
+	appended      map[string]bool // artifact name -> first chunk already out
+	// harness is the task's running harness, once supervise has started its
+	// reap, so the panic recovery can kill it and wait for the reap.
+	harness *harnessProc
+	// panicked marks a task a recovered panic ended: nothing of its answer
+	// is published after it (panic.go).
+	panicked atomic.Bool
 	// tools writes the task's per-tool log lines (Config.ToolLines), or is
 	// nil and writes none.
 	tools *toolLog
@@ -766,7 +791,12 @@ type turnOutcome struct {
 // own on.
 func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
 	a.costSeen, a.costKnown = plan.costSeen, plan.costKnown
-	out := a.run(ctx, origin, originSeq, plan)
+	var out turnOutcome
+	if perr := taskguard.Guard(a.log, "task", []any{"task", a.cfg.TaskID}, func() {
+		out = a.run(ctx, origin, originSeq, plan)
+	}); perr != nil {
+		out = a.failPanicked(perr)
+	}
 	out.costSeen, out.costKnown = a.costSeen, a.costKnown
 	return out
 }
@@ -798,6 +828,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		skipSubmitted = true
 	}
 
+	a.seam(seamBeforeExec, cfg.TaskID)
 	exec, err := a.c.NewTaskExecution(origin, a.from, cfg.Addressee())
 	if err != nil {
 		return done(Result{}, fmt.Errorf("task execution: %w", err))
@@ -892,8 +923,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return done(Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err))
 	}
 
-	// The delegate tool is decided per task: off on a wake, whatever the
-	// pod was started with (delegateOffForTask). A task with the tool off
+	// The delegate tool is decided per task: off on a wake the gateway
+	// didn't let delegate again (its via without delegate: true), whatever
+	// the pod was started with (delegateOffForTask). A task with the tool off
 	// gets neither the listener nor the harness flags, the same shape as a
 	// pod started with A2A_DELEGATE_TOOL=off.
 	delegate := cfg.DelegateSocket != "" && !delegateOffForTask(origin)
@@ -931,6 +963,13 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 				"socket", socket)
 		}
 	}
+
+	// A harness that takes its MCP servers in-process gets this turn's in its
+	// envelope, built from source here each turn so nothing an earlier turn
+	// added carries over. The delegate server joins later (#6789); nil now.
+	// The turn's driver stays local: a reused pod's next turn, or a wake,
+	// starts again from the pod's.
+	drv = turnDriver(drv, cfg.PersonaMCP, nil)
 
 	if delegate {
 		// The agents this turn's requester may delegate to, as the gateway
@@ -1133,8 +1172,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			took := time.Since(reapStart)
 			proc.reaped()
 			proc.killLeftovers()
+			close(proc.reapDone)
 			done <- reapOutcome{err, took}
 		}()
+		// From here a panic's recovery can stop this process and wait for
+		// its reap (failPanicked). A respawn records each new process.
+		a.setHarness(proc)
 	}
 	startReap(proc)
 
@@ -1309,6 +1352,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					case EventProgress:
 						a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
 					case EventActivity:
+						a.seam(seamActivity, ev.Tool)
 						a.tools.started(ev)
 						a.cfg.Trajectory.Record(a.taskID, ev.Tool, ev.Input, nil, time.Now())
 						a.publishActivity(ctx, ev)
@@ -1447,7 +1491,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				// a child and turn the canceled task into a completed one.
 				// In respawn mode a held steer taken for the next process
 				// (nextPrompt) means this process's turn has its result.
-				if sawResult || nextPrompt != "" || exited || canceled || deadlineHit || refused != nil || stopForAbandon() {
+				if sawResult || nextPrompt != "" || exited || canceled || deadlineHit || refused != nil || stopForAbandon() || a.failClosed() {
 					ask.reply <- delegateReply{Message: "this turn has already ended"}
 					continue
 				}
@@ -1561,7 +1605,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			halt(stopDeadline)
 		}
 		pendingStops()
-		if len(halted) > 0 || a.abandoned() || waitErr != nil {
+		if len(halted) > 0 || a.abandoned() || waitErr != nil || a.failClosed() {
 			log.Info("no further harness process for the held steer; refusing it",
 				"task", a.taskID, "stops", halted, "exitErr", waitErr)
 			break
@@ -1613,13 +1657,19 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	refuseHeld()
 
 	// Harness exited and stdout is drained. Decide the terminal in strict
-	// precedence: a write refusal that stopped the harness (no result line
-	// is read after it), then a clean deliverable (cancel lost the race,
-	// legal per the payload spec), then deadline, then cancel, then failure
-	// with evidence.
+	// precedence: an abandon (the dispatcher's terminal), a stdout decode
+	// that panicked (failed closed), a write refusal that stopped the
+	// harness (no result line is read after it), then a clean deliverable
+	// (cancel lost the race, legal per the payload spec), then deadline,
+	// then cancel, then failure with evidence.
+	var scanPanic *taskguard.PanicError
 	switch {
 	case a.abandoned():
 		return Result{Abandoned: true}, nil
+	case errors.As(proc.scanErr(), &scanPanic) || a.failClosed():
+		a.panicked.Store(true)
+		state := lib.StateFailed
+		return Result{State: state}, a.finalize(state, taskguard.Reason, "")
 	case slices.Contains(halted, stopEvicted) && !delegated && refused == nil:
 		// SIGTERM landed between processes (pendingStops). As in the loop's
 		// arm, a delegated turn and a write refusal keep their own ends.
@@ -1717,6 +1767,9 @@ func (a *adapter) publishUsage(ctx context.Context, t resultTelemetry) {
 // so it joins the call to a refused-call log record without changing what
 // the input matches.
 func (a *adapter) publishActivity(ctx context.Context, ev Event) {
+	if a.failClosed() {
+		return
+	}
 	fields := map[string]any{
 		"tool":  ev.Tool,
 		"input": ev.Input,
@@ -1743,13 +1796,23 @@ func (a *adapter) publishArtifactChunk(ctx context.Context, name string, part li
 // in one artifact-update: a progress line's text and the chat message that
 // marks it.
 func (a *adapter) publishArtifactChunks(ctx context.Context, name string, parts []lib.Part, last bool) {
-	a.mu.Lock()
-	appendChunk := a.appended[name]
-	a.appended[name] = true
-	a.mu.Unlock()
+	if a.failClosed() {
+		return
+	}
+	appendChunk := a.markAppended(name)
 	if err := a.publishArtifactParts(ctx, name, parts, appendChunk, last); err != nil {
 		a.log.Warn("artifact publish failed", "name", name, "err", err)
 	}
+}
+
+// markAppended records that name's first chunk is out, and reports whether
+// one already was.
+func (a *adapter) markAppended(name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	appendChunk := a.appended[name]
+	a.appended[name] = true
+	return appendChunk
 }
 
 // progressParts is one progress line as the hermes-bridge publishes it
@@ -1819,6 +1882,10 @@ func (a *adapter) publishDelegate(ctx context.Context, req lib.DelegateRequest) 
 // Empty output still yields one empty chunk: completed must carry a result
 // artifact (assertion 18).
 func (a *adapter) publishResult(text string) error {
+	if a.failClosed() {
+		return errPanicked
+	}
+	a.seam(seamResult, a.taskID)
 	ctx, cancel := context.WithTimeout(context.Background(), terminalPublishTimeout)
 	defer cancel()
 	chunks := chunkString(text, resultChunkSize)
@@ -1900,19 +1967,47 @@ func truncateRunes(s string, n int) string {
 // finalize publishes the one terminal event, exactly once per process, on a
 // fresh context (the caller's may already be dead - eviction). A reason
 // travels as the status message; evidence (partial output) rides along when
-// present.
+// present. A task a panic ended (failClosed) gets the failed taskguard.Reason
+// terminal, whatever the caller asked for.
 func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	if a.abandoned() {
 		return errAbandoned
 	}
-	a.mu.Lock()
-	if a.finalized {
-		defer a.mu.Unlock()
-		return a.finalErr
+	if a.failClosed() {
+		// Whatever terminal the caller decided, a task a panic ended fails
+		// with taskguard's reason and nothing of its output.
+		state, reason, evidence = lib.StateFailed, taskguard.Reason, ""
 	}
-	a.finalized = true
-	a.mu.Unlock()
+	if claimed, err := a.claimFinal(state); !claimed {
+		return err
+	}
+	a.seam(seamFinalize, a.taskID)
+	err := a.publishTerminal(state, reason, evidence)
+	a.recordTerminal(err)
+	return err
+}
 
+// claimFinal takes finalize's once-claim for a terminal of state. claimed
+// false means a finalize already took it, and err is that one's result.
+func (a *adapter) claimFinal(state lib.TaskState) (claimed bool, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.finalized {
+		return false, a.finalErr
+	}
+	a.finalized, a.finalState = true, state
+	return true, nil
+}
+
+// recordTerminal records a tried terminal publish and its error.
+func (a *adapter) recordTerminal(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.terminalTried, a.finalErr = true, err
+}
+
+// publishTerminal publishes the terminal status-update and logs its outcome.
+func (a *adapter) publishTerminal(state lib.TaskState, reason, evidence string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), terminalPublishTimeout)
 	defer cancel()
 
@@ -1956,9 +2051,6 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 	} else {
 		a.log.Info("terminal published", "task", a.taskID, "state", state, "reason", reason)
 	}
-	a.mu.Lock()
-	a.finalErr = err
-	a.mu.Unlock()
 	return err
 }
 

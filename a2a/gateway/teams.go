@@ -294,7 +294,7 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		tokenPath:      tokenPath,
 		tenantID:       strings.TrimSpace(tenantID),
 		adaptiveCards:  adaptiveCards,
-		client:         &http.Client{Timeout: teamsRelayTimeout},
+		client:         newRelayHTTPClient(teamsRelayTimeout),
 		log:            log,
 		seen:           map[string]bool{},
 		serviceURLs:    map[string]string{},
@@ -757,16 +757,46 @@ func (a *TeamsAdapter) PostNotify(space, thread, text string) (message, landed s
 	if err != nil {
 		return "", "", err
 	}
-	// A top-level post in a channel starts a thread Teams addresses as the
-	// channel id with the post's activity id; later chunks and a person's
-	// reply under it key that thread, so that is where it landed. A thread
-	// post, a post into a home that is itself a thread, and a post in a group
-	// or personal chat (which Teams does not thread) landed where they were
-	// sent.
-	if strings.TrimSpace(thread) == "" && message != "" && teamsIsChannelID(conversation) {
-		return message, conversation + teamsThreadToken + message, nil
+	return message, teamsNotifyLanded(conversation, thread, message), nil
+}
+
+// PostNotifyMessage is PostMessage for the chat.notify route's home posts
+// (notifyChatPoster): the message laid out as a card when it carries a
+// chat message, with the rating controls when the notifier marked it for
+// rating (an alert or a report the agent posted on its own), into the same
+// conversation PostNotify posts into, and where it landed back.
+func (a *TeamsAdapter) PostNotifyMessage(home, thread string, m OutMessage) (message, landed string, err error) {
+	conversation := strings.TrimSpace(thread)
+	if conversation == "" {
+		conversation = strings.TrimSpace(home)
 	}
-	return message, conversation, nil
+	if !teamsIsConversationID(conversation) {
+		return "", "", fmt.Errorf("teams: not a conversation id: %q", conversation)
+	}
+	message, err = a.PostMessage(teamsConversationID(conversation), m)
+	if err != nil {
+		return "", "", err
+	}
+	landed = teamsNotifyLanded(conversation, thread, message)
+	if landed != conversation {
+		// A press on the post, and a reply typed under it, arrive keyed by
+		// the thread the post started, so its question is filed there.
+		a.rehomeQuestion(message, teamsConversationID(conversation), teamsConversationID(landed))
+	}
+	return message, landed, nil
+}
+
+// teamsNotifyLanded is where a home post landed. A top-level post in a
+// channel starts a thread Teams addresses as the channel id with the
+// post's activity id; later chunks and a person's reply under it key that
+// thread, so that is where it landed. A thread post, a post into a home
+// that is itself a thread, and a post in a group or personal chat (which
+// Teams does not thread) landed where they were sent.
+func teamsNotifyLanded(conversation, thread, message string) string {
+	if strings.TrimSpace(thread) == "" && message != "" && teamsIsChannelID(conversation) {
+		return conversation + teamsThreadToken + message
+	}
+	return conversation
 }
 
 // teamsIsConversationID reports a Teams conversation id: one token with no
@@ -875,7 +905,7 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 // so the gateway posts its text; with cards off a chat message falls back
 // to its text (ErrTextOnly). Text is rendered as a card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
-// (teams_press.go); an edit that names no task removes it. An answer marked
+// (teams_press.go); an edit that names no task removes it. A message marked
 // for feedback (m.Feedback) carries the rating controls on its card, once
 // the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
@@ -926,7 +956,8 @@ func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage)
 // EditNotifyMessage is EditMessage for the chat.notify route's home posts
 // (notifyChatEditor): the activity messageID in the thread when one is
 // named, else in home, edited in place, so a keyed home post (an alert its
-// triage updates) stays one message rather than one per update.
+// triage updates) stays one message rather than one per update, and keeps
+// its rating controls.
 func (a *TeamsAdapter) EditNotifyMessage(home, thread, messageID string, m OutMessage) error {
 	conversation := strings.TrimSpace(thread)
 	if conversation == "" {

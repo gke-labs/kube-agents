@@ -39,6 +39,11 @@ except ImportError:
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
 DEFAULT_LEGACY_CRON_RISK: str = "low"
+# The keys of the suspend setting the operator renders from PlatformAgent
+# spec.schedules into KUBE_AGENTS_BUILTIN_SCHEDULES (imageCronPolicy in
+# k8s-operator/internal/controller/platformagent_image_cron.go).
+CRON_SUSPEND_ALL_KEY = "suspendAll"
+CRON_SUSPEND_OVERRIDES_KEY = "overrides"
 DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS: float = 15.0
 DEFAULT_HERMES_HOME = "/opt/data"
 
@@ -595,6 +600,97 @@ def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
     return {**store, "jobs": kept}
 
 
+def parse_cron_suspend(text: str) -> dict | None:
+    """Read the operator's suspend setting; None when `text` is empty.
+
+    Exits on a document it cannot read, before anything is overlaid: the caller's
+    whole overlay is skipped for this start (the entrypoint warns), so the
+    volume's roster stays as the last start wrote it, and a profile not yet
+    scaffolded is not created. Guessing "nothing suspended" instead would start
+    every job an operator turned off. The operator always writes a readable
+    document; this guards a hand-set variable.
+    """
+    if not text.strip():
+        return None
+    try:
+        setting = json.loads(text)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: --cron-suspend is not JSON: {exc}")
+    overrides = setting.get(CRON_SUSPEND_OVERRIDES_KEY, {}) if isinstance(setting, dict) else None
+    if (
+        not isinstance(overrides, dict)
+        # A key this does not know is a misspelled one: read as absent, it would be
+        # the "nothing suspended" guess.
+        or not set(setting).issubset({CRON_SUSPEND_ALL_KEY, CRON_SUSPEND_OVERRIDES_KEY})
+        or not isinstance(setting.get(CRON_SUSPEND_ALL_KEY, False), bool)
+        or not all(isinstance(v, bool) for v in overrides.values())
+    ):
+        raise SystemExit(
+            f"ERROR: --cron-suspend must be an object with only a boolean {CRON_SUSPEND_ALL_KEY} "
+            f"and a {CRON_SUSPEND_OVERRIDES_KEY} object of booleans"
+        )
+    return {
+        CRON_SUSPEND_ALL_KEY: setting.get(CRON_SUSPEND_ALL_KEY, False),
+        CRON_SUSPEND_OVERRIDES_KEY: overrides,
+    }
+
+
+def suspend_cron_jobs(store: object, image: object, setting: dict | None) -> object:
+    """Hold off the image's jobs the operator's setting suspends.
+
+    The image decides `enabled` (`merge_cron_store`); this is the one thing an
+    install may say on top of it. A job the image ships runs only when the
+    image enables it and the setting doesn't suspend it: an override naming its
+    id decides, and with none, `suspendAll` does. So the setting can only hold a
+    job off, never start one the image ships disabled, and lifting it returns
+    the job to the image's value on the next start. Jobs the image doesn't ship
+    (an operator's own) are left alone, as is every key but `enabled`.
+    """
+    if setting is None or not isinstance(store, dict) or not isinstance(image, dict):
+        return store
+    jobs, image_jobs = store.get("jobs"), image.get("jobs")
+    if not isinstance(jobs, list) or not isinstance(image_jobs, list):
+        return store
+    shipped = {str(j.get("id", "")): j for j in image_jobs if isinstance(j, dict) and j.get("id")}
+    overrides = setting[CRON_SUSPEND_OVERRIDES_KEY]
+    out: list[object] = []
+    for job in jobs:
+        image_job = shipped.get(str(job.get("id", ""))) if isinstance(job, dict) else None
+        if image_job is None:
+            out.append(job)
+            continue
+        suspended = overrides.get(str(job["id"]), setting[CRON_SUSPEND_ALL_KEY])
+        out.append({**job, "enabled": bool(image_job.get("enabled", True)) and not suspended})
+    return {**store, "jobs": out}
+
+
+def _suspend_after_overlay(home: Path, template_dir: Path, setting: dict | None) -> None:
+    """Apply `suspend_cron_jobs` to the roster the overlay left on the volume.
+
+    The merge already applies it in its one write, so this pass changes a file
+    only where the merge did not run: on a first scaffold the volume had no
+    roster, the image's copy lands as shipped, and it has to be held off just
+    the same.
+    """
+    if setting is None:
+        return
+    for relative in MERGE_PATHS:
+        parts = relative.split("/")
+        destination = home.joinpath(*parts)
+        current = read_json(destination)
+        suspended = suspend_cron_jobs(current, read_json(template_dir.joinpath(*parts)), setting)
+        if current is None or suspended == current:
+            continue
+        try:
+            scratch = destination.with_name(destination.name + ".tmp")
+            scratch.write_text(json.dumps(suspended, indent=2) + "\n", encoding="utf-8")
+            os.replace(scratch, destination)
+        except OSError as exc:
+            # Loud, and not raised, as in _merge_after_overlay: the rest of the
+            # overlay is still worth having. What is lost is the suspension.
+            log(f"WARN: could not suspend jobs in {relative}; they run as the image ships them ({exc})")
+
+
 def _merge_after_overlay(
     home: Path,
     template_dir: Path,
@@ -602,6 +698,7 @@ def _merge_after_overlay(
     prior: dict[str, object],
     cron_job_ids: tuple[str, ...] | None = None,
     cron_retire_ids: tuple[str, ...] = (),
+    cron_suspend: dict | None = None,
 ) -> None:
     """Restore the merged form of every MERGE_PATHS entry the copy just replaced.
 
@@ -612,7 +709,8 @@ def _merge_after_overlay(
     The retire pass runs last, on the merged result, because the ids it deletes
     are by definition ones the image no longer ships — `merge_cron_store` will
     have carried the volume's copies through untouched, which is exactly what
-    has to be undone.
+    has to be undone. The operator's suspend setting goes on in the same write
+    (`suspend_cron_jobs`), so no file ever holds the merge without it.
     """
     for relative, previous in prior.items():
         parts = relative.split("/")
@@ -623,9 +721,11 @@ def _merge_after_overlay(
             continue
         destination = home.joinpath(*parts)
         with cron_jobs_lock(destination.parent) if parts[0] == "cron" else contextlib.nullcontext():
-            merged = retire_cron_jobs(
-                merge_cron_store(read_json(source), previous, cron_job_ids),
-                cron_retire_ids,
+            image = read_json(source)
+            merged = suspend_cron_jobs(
+                retire_cron_jobs(merge_cron_store(image, previous, cron_job_ids), cron_retire_ids),
+                image,
+                cron_suspend,
             )
             try:
                 # Temp file and os.replace, not a plain write: a torn jobs.json is
@@ -648,6 +748,7 @@ def overlay_template(
     items: tuple[str, ...] | None = None,
     cron_job_ids: tuple[str, ...] | None = None,
     cron_retire_ids: tuple[str, ...] = (),
+    cron_suspend: dict | None = None,
 ) -> None:
     """Copy a baked template onto a profile home (overwrites).
 
@@ -659,7 +760,9 @@ def overlay_template(
     overwritten with the rest, and then rewritten as a merge of the two. See
     `merge_cron_store` for why a file can be both image-owned and runtime state,
     and what `cron_job_ids` narrows that merge to; `cron_retire_ids` names the
-    ids to delete from the volume outright (see `retire_cron_jobs`).
+    ids to delete from the volume outright (see `retire_cron_jobs`), and
+    `cron_suspend` the operator's setting that holds shipped jobs off (see
+    `suspend_cron_jobs`).
     """
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
@@ -690,7 +793,8 @@ def overlay_template(
                     shutil.copytree(src, dest, dirs_exist_ok=True)
                 else:
                     shutil.copy2(src, dest)
-            _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
+            _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids, cron_suspend)
+            _suspend_after_overlay(home, template_dir, cron_suspend)
     if plugins_dir and plugins_dir.is_dir():
         try:
             shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
@@ -758,7 +862,16 @@ def main() -> None:
             "for jobs this release moved elsewhere (see retire_cron_jobs)."
         ),
     )
+    ap.add_argument(
+        "--cron-suspend",
+        default="",
+        help=(
+            "The operator's suspend setting for the image's cron jobs, as the JSON document "
+            "in KUBE_AGENTS_BUILTIN_SCHEDULES; empty applies none (see suspend_cron_jobs)."
+        ),
+    )
     args = ap.parse_args()
+    cron_suspend = parse_cron_suspend(args.cron_suspend)
     hermes_home = Path(os.environ.get("HERMES_HOME", DEFAULT_HERMES_HOME))
 
     if args.share_npm_cache:
@@ -790,6 +903,7 @@ def main() -> None:
         tuple(args.items.split()) or None,
         tuple(args.cron_jobs.split()) or None,
         tuple(args.cron_retire.split()),
+        cron_suspend,
     )
     print(str(home))
 
