@@ -1170,8 +1170,9 @@
 # `cluster` profile to open a pull request adding a PodDisruptionBudget for
 # the no-pdb-workload fixture on the job's GitOps repository, graded on that
 # pull request (pull_request_opened, the budget file only) and an unchanged
-# cluster. deployer: noop. Red until #4457 (the structured confirm) and #6168
-# (the persona's version-control skill) land; its record shows when they do.
+# cluster. deployer: noop. Red on an install that predates #4457 (the
+# structured confirm) or #6422 (the persona's version-control skill); both
+# have been on main since 2026-11-20.
 ./tasks/cluster-profile-confirmed-pdb-pull-request/task.yaml
 
 # A cluster profile task that names no repository finds the one it may use
