@@ -1663,7 +1663,7 @@ Enables external integrations. Only the enabled ones need to be present.
 - **`repositories[].baseBranch`** — on a `gitops` or `managed` entry, the branch every pull request (a merge request on GitLab) onto that repository must target; absent means the repository's own default branch. [`spec.integration.repositories[].baseBranch`](#specintegrationrepositoriesbasebranch) says what the credential broker does with it and the spellings the schema accepts.
 - **`github`** — deprecated alias for one forge with `provider: github`: `org` is its `namespace` and `gitRepo`, when set, is one `gitops` repository on it; the two resolve identically. Set `forges`/`repositories` or `github`, not both; a resource setting both is refused by a CEL rule on the CRD and by the webhook.
 
-  This is still the spelling `install.sh` and the `full-install` Terraform composition write for a github.com install (a GitLab, Bitbucket or GitHub Enterprise Server install writes `forges`/`repositories`; see [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/)). The Helm chart renders one GitHub forge with no `credentialsRef`, no `caBundleRef`, no host other than a spelling of github.com, and at most one repository, the `gitops` one, with no namespace of its own, this way whichever values key set it, because `helm upgrade` does not update CRDs and an older CRD would prune `forges`.
+  This is still the spelling `install.sh` and the `full-install` Terraform composition write for a github.com install (a GitLab, Bitbucket or GitHub Enterprise Server install writes `forges`/`repositories`; see [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/)). The Helm chart renders one GitHub forge with no `credentialsRef`, no `caBundleRef`, no host other than a spelling of github.com, and at most one repository, the `gitops` one, with no namespace of its own, this way whichever values key set it, because `helm upgrade` does not update CRDs and an older CRD would prune `forges`. To register more repositories on such an install, see [Adding repositories to a github.com install](#adding-repositories-to-a-githubcom-install).
 
   It does so only where the forge declares a namespace or the repository, and the repository is one the operator would accept for GitHub: `name`, `owner/name`, or an `http(s)://`, `ssh://` or `git://` URL, a schemeless host or an scp remote on `github.com`, `www.github.com` or `ssh.github.com`, with no port, naming `owner/name`. A repository the operator would refuse renders as the lists, so the refusal names the entry that was written. A repository that sets `baseBranch` renders as the lists too, since the alias has no place for it.
 
@@ -1800,6 +1800,50 @@ Any other, an empty string, a JSON `null` or a value that is not a string (a num
 The credential broker's repository gate reads every typed entry, keyed by its `type`, host and path, so an entry counts only for the forge whose provider it names.
 
 Each same-organization `context_repos` entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's `snapshot` read, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). On a `gitlab` forge, a private context repository is readable the same way when the forge's Secret holds `read-token` — see [Private context repositories](/kube-agents/install/gitlab/#private-context-repositories). Nothing that writes consults the key: a context repository stays refused by every version-control verb but `capabilities` and `snapshot`.
+
+### Adding repositories to a github.com install
+
+An install that `install.sh` made for github.com has the deprecated `github` block: the installer writes `org` and `gitRepo` from `GITOPS_ORG` and `GITOPS_REPO`. To register more repositories, move to `forges` and `repositories`, and clear the `github` block in the same change. If the lists are added and the block still has a value, the chart stops the upgrade with this message:
+
+```text
+set platformAgent.integration.forges and repositories, or platformAgent.integration.github, not both
+```
+
+Set `org` and `gitRepo` to empty strings beside the two lists. The chart then renders the lists and no `github` key:
+
+```yaml
+platformAgent:
+  integration:
+    github:
+      org: ""
+      gitRepo: ""
+    forges:
+      - name: github
+        provider: github
+        namespace: my-org
+    repositories:
+      - forge: github
+        repository: infra
+        role: gitops
+      - forge: github
+        repository: app-one
+        role: managed
+      - forge: github
+        repository: runbooks
+        role: context
+```
+
+The list must hold the GitOps repository with `role: gitops`. The lists do not take it from the block that you cleared.
+
+On an install made with `install.sh`, the installer writes the `github` block itself, so put these keys in the `TF_VAR_extra_helm_values` line in `install.env`, which a full-mode `install.sh` or `upgrade.sh` run applies. `install.env` holds one such line, so if it already has a `platformAgent` key, put `integration={...}` inside that key ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) says how the line works):
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={integration={github={org="",gitRepo=""},forges=[{name="github",provider="github",namespace="my-org"}],repositories=[{forge="github",repository="infra",role="gitops"},{forge="github",repository="app-one",role="managed"},{forge="github",repository="runbooks",role="context"}]}}}'
+```
+
+On a bare Helm install, set the block in your values file. If a file of your own sets `github`, you can remove those keys there instead of emptying them.
+
+Every repository in the list must be in one GitHub organization, the one where the GitHub App is installed: see [Single-organization scoping boundary](/kube-agents/deploy/token-minter/#single-organization-scoping-boundary). The operator skips a repository in another organization when it writes the token minter policies, so the agent gets no token for it.
 
 ### `spec.integration.repositories[].baseBranch`
 
